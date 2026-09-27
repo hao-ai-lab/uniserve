@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
-use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
+use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall};
 
 use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
@@ -1822,6 +1822,97 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     assert!(
         stats.encoder.cached.load(Ordering::Relaxed) >= 1,
         "input image was not encoded and retained in the encoder cache"
+    );
+}
+
+/// An input image with a latent encoder writes its latent block with a call
+/// of its own, which ends the context prefill before it; its vision block
+/// then joins the next context prefill, with the prompt tokens after it.
+#[test]
+fn a_latent_image_block_is_written_by_its_own_call() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(2);
+    let mut executor = SimExecutor::new(sim);
+    let boundary = executor.observe();
+    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let mut request = generation_request(
+        RequestId(95),
+        image_input(vec![1, 2], vec![3, 4], 0x95, 4, 5),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        4,
+    );
+    request.multimodal_inputs.images[0].encoders = vec![
+        ImageEncoderInput {
+            encoder: ImageIngestStep::VaeEncode,
+            num_kv_tokens: Some(6),
+            max_kv_tokens: None,
+        },
+        ImageEncoderInput {
+            encoder: ImageIngestStep::VitEncode,
+            num_kv_tokens: Some(5),
+            max_kv_tokens: None,
+        },
+    ];
+    let mut events = handle.submit(request).expect("submit request");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut finished = false;
+    while !finished && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(EngineCoreOutput::Finished { reason, .. }) => {
+                assert_ne!(reason, FinishReason::Error);
+                finished = true;
+            }
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = jh.join();
+    assert!(finished, "the latent-image request did not finish");
+
+    let calls: Vec<Call> = boundary
+        .try_iter()
+        .filter_map(|event| match event {
+            BatchEvent::Submitted(batch) => Some(batch),
+            BatchEvent::Resolved { .. } => None,
+        })
+        .flat_map(|batch| batch.requests.into_iter().map(|(call, _)| call))
+        .filter(|call| call.request_key.request_id == RequestId(95))
+        .collect();
+    let context: Vec<_> = calls
+        .iter()
+        .take_while(|call| call.code != CallKind::Forward(ForwardMode::Decode))
+        .collect();
+    assert_eq!(
+        context.iter().map(|call| call.code).collect::<Vec<_>>(),
+        vec![
+            CallKind::Forward(ForwardMode::Prefill),
+            CallKind::Media(MediaCall::LatentEncoding),
+            CallKind::Forward(ForwardMode::Prefill),
+            CallKind::Media(MediaCall::VisionEncoding),
+            CallKind::Forward(ForwardMode::Prefill),
+        ]
+    );
+    // The prompt before the image, alone.
+    assert_eq!(context[0].input_token_ids, vec![1, 2]);
+    assert!(context[0].vision_inputs.is_empty());
+    // The latent block's own extension.
+    assert_eq!(context[2].latent_feature_input, context[1].encoder_output);
+    assert!(context[2].input_token_ids.is_empty());
+    assert!(context[2].vision_inputs.is_empty());
+    // The vision block at the start of the context prefill that follows.
+    assert_eq!(context[4].input_token_ids, vec![3, 4]);
+    assert_eq!(context[4].vision_inputs.len(), 1);
+    assert_eq!(context[4].vision_inputs[0].offset, 0);
+    assert_eq!(
+        Some(context[4].vision_inputs[0].feature.clone()),
+        context[3].encoder_output
     );
 }
 

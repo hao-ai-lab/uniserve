@@ -421,7 +421,23 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
 
     let token_input = v.token_input.as_ref().map(|value| tensor_ref(b, value));
     let token_output = v.token_output.as_ref().map(|value| tensor_ref(b, value));
-    let vision_input = v.vision_input.as_ref().map(|value| tensor_ref(b, value));
+    let vision_inputs = {
+        let items = v
+            .vision_inputs
+            .iter()
+            .map(|input| {
+                let feature = tensor_ref(b, &input.feature);
+                fbs::VisionInput::create(
+                    b,
+                    &fbs::VisionInputArgs {
+                        offset: input.offset,
+                        feature: Some(feature),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        Some(b.create_vector(&items))
+    };
     let latent_feature_input = v
         .latent_feature_input
         .as_ref()
@@ -479,7 +495,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             outputs,
             token_input,
             token_output,
-            vision_input,
+            vision_inputs,
             latent_feature_input,
             encoder_output,
             latent_input,

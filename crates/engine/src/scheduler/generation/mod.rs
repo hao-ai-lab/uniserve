@@ -26,10 +26,12 @@ use uniserve_worker_ipc::{
     CallCoordinates, DEFAULT_COMPONENT, ForwardMode, LatentParams, MediaCall, TransferMode,
 };
 
-use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
+use uniserve_core::{
+    GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput, RequestId, SamplingParams,
+};
 use uniserve_worker_ipc::{
     Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, DrawLayout,
-    Readout, RequestKey, RequestOutput, Rng, SamplingState, ShapeBound, TensorRef,
+    Readout, RequestKey, RequestOutput, Rng, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
 
 use crate::scheduler::image_artifact::png_artifact_dims_b64;
@@ -163,11 +165,12 @@ fn logprob_result_bytes(
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GenerationPhase {
-    /// Encode staged input images before continuing text prefill.
-    Encode,
-    /// Write the current input image's encoder feature into KV.
+    /// Write the current latent input-image block's encoder feature into KV
+    /// (`RequestState::input_image_features`) with a call of its own.
     IngestState,
-    /// Prefill prompt tokens.
+    /// Ingest the context: prefill prompt tokens and the vision blocks of
+    /// input images between them, encoding each block first
+    /// (`Scheduler::next_context_computation`).
     Prefill,
     /// Decode understanding (text) tokens.
     DecodeUnd,
@@ -201,10 +204,14 @@ pub(crate) enum GenerationPhase {
     CommitCanvas,
 }
 
-/// Image extension consumes an encoder feature rather than token inputs.
+/// Image extension writes one image block with a call of its own: a latent
+/// encoder's feature, or a generated image's feedback vision feature, which
+/// declares a completion predicate. The vision blocks of input images are
+/// instead attention blocks of a context prefill (`is_prompt_extend`).
 pub(super) fn consumes_image_features(call: &Call) -> bool {
     call.code == CallKind::Forward(ForwardMode::Prefill)
-        && (call.vision_input.is_some() || call.latent_feature_input.is_some())
+        && (call.latent_feature_input.is_some()
+            || (!call.vision_inputs.is_empty() && call.completion_output.is_some()))
 }
 
 /// Feedback encoders and KV writes produce a predicate for their device successor.
@@ -220,12 +227,33 @@ pub(super) fn is_feedback_computation(call: &Call) -> bool {
         && call.completion_output.is_some()
 }
 
-/// Prompt extension writes prompt tokens into KV: a prefill with no
-/// image-feature input and no completion predicate. It samples the next token
-/// unless its request is a readout or generates canvases, whose prompt only
-/// conditions its canvases; the `CloseKv` write is the prefill that declares a
-/// completion instead. A canvas-generating request's block commit is a prompt
-/// extension too, of the tokens of its stopped block.
+/// Returns the forward rows a prefill `call` stages in its numerical call:
+/// one per vision block, and one per run of prompt tokens before, between or
+/// after its blocks; one for any other prefill.
+pub(super) fn prefill_rows(call: &Call) -> usize {
+    let mut rows = call.vision_inputs.len();
+    let mut text_start = 0u32;
+    for input in &call.vision_inputs {
+        if input.offset > text_start {
+            rows += 1;
+            text_start = input.offset;
+        }
+    }
+    let text = u32::try_from(call.input_token_ids.len()).unwrap_or(u32::MAX);
+    if text > text_start {
+        rows += 1;
+    }
+    rows.max(1)
+}
+
+/// Prompt extension, a context prefill, writes prompt tokens into KV together
+/// with the vision blocks of the input images between them
+/// (`Call::vision_inputs`): a prefill with no image extension and no
+/// completion predicate. It samples the next token unless its request is a
+/// readout or generates canvases, whose prompt only conditions its canvases;
+/// the `CloseKv` write is the prefill that declares a completion instead. A
+/// canvas-generating request's block commit is a prompt extension too, of the
+/// tokens of its stopped block.
 pub(super) fn is_prompt_extend(call: &Call) -> bool {
     call.code == CallKind::Forward(ForwardMode::Prefill)
         && !consumes_image_features(call)
@@ -283,12 +311,25 @@ impl RequestState {
                 self.canvas_commit.clear();
                 self.phase = GenerationPhase::Canvas;
             }
+            // A context prefill writes its prompt tokens and the vision
+            // blocks between them; an image's positions count once its last
+            // block is written.
             CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
                 let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
+                let advance = self
+                    .context_advance(count, call.vision_inputs.len(), self.block_cursor())
+                    .ok_or(GenerationResultError::Progress {
+                        detail: "context_blocks_mismatch",
+                    })?;
                 self.num_computed_prompt_tokens =
                     self.num_computed_prompt_tokens.saturating_add(count);
-                self.logical_position = self.logical_position.saturating_add(count);
-                self.kv_visible_len = self.kv_visible_len.saturating_add(count);
+                self.logical_position = self.logical_position.saturating_add(advance.logical);
+                self.kv_visible_len = self.kv_visible_len.saturating_add(advance.kv);
+                self.num_ingested_images = advance.cursor.image;
+                self.image_encoder_index = advance.cursor.encoder;
+                // The blocks it wrote lead the context features.
+                let written = call.vision_inputs.len().min(self.context_features.len());
+                self.context_features.drain(..written);
             }
             CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                 // The worker reports the KV extent the feature write reached.
@@ -313,6 +354,8 @@ impl RequestState {
                     }
                     self.replayable = false;
                 } else {
+                    // A latent input-image block; context ingestion continues
+                    // with the image's next block, or after the image.
                     let image = &self.req.multimodal_inputs.images[self.num_ingested_images];
                     self.image_encoder_index = self.image_encoder_index.saturating_add(1);
                     self.input_image_features = None;
@@ -321,10 +364,8 @@ impl RequestState {
                             self.logical_position.saturating_add(image.num_positions);
                         self.num_ingested_images = self.num_ingested_images.saturating_add(1);
                         self.image_encoder_index = 0;
-                        self.phase = GenerationPhase::Prefill;
-                    } else {
-                        self.phase = GenerationPhase::Encode;
                     }
+                    self.phase = GenerationPhase::Prefill;
                 }
             }
             // A prefill that neither extends the prompt nor reads a feature is
@@ -466,7 +507,7 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
         inputs: Vec::new(),
         outputs: Vec::new(),
         token_output: None,
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -487,20 +528,31 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
     }
 }
 
-/// Plans a prefill of prompt tokens `start..end`, with a sampled-token output
-/// unless the request is a readout or generates canvases.
+/// Plans a context prefill: prompt tokens `start..end` and the vision
+/// `blocks` of the input images between them, which write `block_tokens` KV
+/// tokens together, with a sampled-token output unless the request is a
+/// readout or generates canvases, or the context ends with a block of this
+/// call.
 ///
 /// The RNG coordinate is `end`, the exclusive prompt end. The prompt of a
 /// readout or of a canvas-generating request only conditions its canvases, so
-/// its prefill samples nothing and declares no RNG coordinate. Fails with
-/// `InvalidPromptRange` for an empty range or one past the prompt.
+/// its prefill samples nothing and declares no RNG coordinate. A context that
+/// ends with an image block samples nothing either: understanding decode
+/// then starts from BOS, as after a trailing latent block. Fails with
+/// `InvalidPromptRange` for a range past the prompt, or an empty one that
+/// carries no block.
 pub(super) fn plan_prompt(
     request: &GenerationRequest,
     start: u32,
     end: u32,
+    blocks: Vec<VisionInput>,
+    block_tokens: u32,
     sampling_state: Option<SamplingState>,
 ) -> Result<Call, PlanningError> {
-    if start >= end || end as usize > request.prompt_token_ids.len() {
+    if start > end
+        || (start == end && blocks.is_empty())
+        || end as usize > request.prompt_token_ids.len()
+    {
         return Err(PlanningError::InvalidPromptRange {
             start,
             end,
@@ -508,9 +560,15 @@ pub(super) fn plan_prompt(
         });
     }
     let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
-    call.bounds.max_tokens = end.saturating_sub(start);
+    call.bounds.max_tokens = end.saturating_sub(start).saturating_add(block_tokens);
     call.input_token_ids = request.prompt_token_ids[start as usize..end as usize].to_vec();
-    if request.is_readout() || request.is_canvas_generation() {
+    // A block after the call's last prompt token, at the prompt's end.
+    let ends_with_block = blocks
+        .last()
+        .is_some_and(|block| block.offset == end.saturating_sub(start))
+        && end as usize == request.prompt_token_ids.len();
+    call.vision_inputs = blocks;
+    if request.is_readout() || request.is_canvas_generation() || ends_with_block {
         return finish_plan(request, call, 0);
     }
     call.token_output = Some(output_tensor(0, DType::I64));
@@ -694,7 +752,7 @@ pub(super) fn plan_image_extend(
     let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = capacity;
     match encoder.encoder {
-        ImageIngestStep::VitEncode => call.vision_input = Some(feature),
+        ImageIngestStep::VitEncode => call.vision_inputs = vec![VisionInput { offset: 0, feature }],
         ImageIngestStep::VaeEncode => call.latent_feature_input = Some(feature),
     }
     call.completion_output = feedback.then(|| output_tensor(0, DType::U8));
@@ -1121,8 +1179,9 @@ pub(crate) fn validate_generation_result(
 
     // A feature write must reach exactly `start + tokens` when the encoder
     // declared an exact token count, and otherwise stay within the call's
-    // token capacity above `start`.
-    if consumes_image_features(call) {
+    // token capacity above `start`. A context prefill with vision blocks
+    // declares its exact extent: its prompt tokens and blocks.
+    if consumes_image_features(call) || !call.vision_inputs.is_empty() {
         let (start, num_kv_tokens) = image_kv.ok_or(GenerationResultError::Progress {
             detail: "image_kv_input_missing",
         })?;
@@ -1477,10 +1536,17 @@ pub(crate) struct RequestState {
     pub(super) num_computed_prompt_tokens: u32,
     /// Context images whose every encoder feature has been written into KV.
     pub(super) num_ingested_images: usize,
-    /// Next encoder of the current context image.
+    /// Next encoder of the current context image: with `num_ingested_images`,
+    /// the block cursor (`RequestState::block_cursor`).
     pub(super) image_encoder_index: usize,
-    /// Encoder feature of the current context image awaiting its KV write.
+    /// Encoder feature of the current latent block awaiting its KV write.
     pub(super) input_image_features: Option<TensorRef>,
+    /// Encoder products of the vision blocks from the accepted block cursor
+    /// on, in context order, for the context prefills that inject them. The
+    /// blocks of in-flight context prefills lead the list until their
+    /// results are accepted, so a planned call that is not submitted leaves
+    /// its blocks' products in place.
+    pub(super) context_features: Vec<TensorRef>,
     /// A single committed round-close token was deferred: it is the next
     /// decode's input, and that decode's completion decides the round.
     pub(super) round_closing: bool,
@@ -1642,14 +1708,108 @@ impl RequestState {
         (remaining == 0 && rows > 0).then_some(rows)
     }
 
-    /// Returns the pending image step, if one exists.
-    pub(super) fn pending_image_step(&self) -> Option<ImageIngestStep> {
-        self.req
-            .multimodal_inputs
-            .images
-            .get(self.num_ingested_images)?
-            .encoders
-            .get(self.image_encoder_index)
-            .map(|input| input.encoder)
+    /// Returns the accepted block cursor: the next input-image block to
+    /// write into the context.
+    pub(super) fn block_cursor(&self) -> BlockCursor {
+        BlockCursor {
+            image: self.num_ingested_images,
+            encoder: self.image_encoder_index,
+        }
     }
+
+    /// Returns the input-image block at `cursor` with its image, or `None`
+    /// past the last block.
+    pub(super) fn input_block(
+        &self,
+        cursor: BlockCursor,
+    ) -> Option<(&ImageInput, &ImageEncoderInput)> {
+        let image = self.req.multimodal_inputs.images.get(cursor.image)?;
+        Some((image, image.encoders.get(cursor.encoder)?))
+    }
+
+    /// Returns the number of input-image blocks from `from` up to `to`.
+    pub(super) fn blocks_between(&self, from: BlockCursor, to: BlockCursor) -> usize {
+        let images = &self.req.multimodal_inputs.images;
+        let ordinal = |cursor: BlockCursor| {
+            images[..cursor.image.min(images.len())]
+                .iter()
+                .map(|image| image.encoders.len())
+                .sum::<usize>()
+                + cursor.encoder
+        };
+        ordinal(to).saturating_sub(ordinal(from))
+    }
+
+    /// Returns the cursor of the block after the one at `cursor`.
+    pub(super) fn next_block(&self, cursor: BlockCursor) -> Option<BlockCursor> {
+        let image = self.req.multimodal_inputs.images.get(cursor.image)?;
+        Some(if cursor.encoder + 1 < image.encoders.len() {
+            BlockCursor {
+                image: cursor.image,
+                encoder: cursor.encoder + 1,
+            }
+        } else {
+            BlockCursor {
+                image: cursor.image + 1,
+                encoder: 0,
+            }
+        })
+    }
+
+    /// Returns what a context prefill of `text` prompt tokens and `blocks`
+    /// vision blocks adds to the context when the block cursor is at `from`.
+    ///
+    /// Returns `None` when a block is not a vision block of an input image
+    /// with an exact KV length; submission validation requires every vision
+    /// block of an input image to declare one.
+    pub(super) fn context_advance(
+        &self,
+        text: u32,
+        blocks: usize,
+        from: BlockCursor,
+    ) -> Option<ContextAdvance> {
+        let mut advance = ContextAdvance {
+            logical: text,
+            kv: text,
+            cursor: from,
+        };
+        for _ in 0..blocks {
+            let (image, input) = self.input_block(advance.cursor)?;
+            if input.encoder != ImageIngestStep::VitEncode {
+                return None;
+            }
+            advance.kv = advance.kv.checked_add(input.num_kv_tokens?)?;
+            let next = self.next_block(advance.cursor)?;
+            if next.image != advance.cursor.image {
+                advance.logical = advance.logical.saturating_add(image.num_positions);
+            }
+            advance.cursor = next;
+        }
+        Some(advance)
+    }
+}
+
+/// A position in a request's sequence of input-image blocks: an image and
+/// the next of its encoders to write. Each encoder of an input image writes
+/// one block of the image into the context, in encoder order, at the image's
+/// prompt position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct BlockCursor {
+    /// Index of the image in the request's input images.
+    pub(crate) image: usize,
+    /// Index of the block's encoder in the image's encoders.
+    pub(crate) encoder: usize,
+}
+
+/// What a context prefill adds to its request's context
+/// (`RequestState::context_advance`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextAdvance {
+    /// Logical positions: one per prompt token, plus the positions of each
+    /// image whose last block the call writes.
+    pub(crate) logical: u32,
+    /// KV tokens: one per prompt token, plus each block's exact KV length.
+    pub(crate) kv: u32,
+    /// The block cursor after the call.
+    pub(crate) cursor: BlockCursor,
 }

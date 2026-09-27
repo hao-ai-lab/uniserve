@@ -398,18 +398,16 @@ impl Scheduler {
                     // `process_generation_result` has already moved the request
                     // to `PublishKv`.
                     (false, _) if !is_prompt_extend(&call) => return,
-                    // Input-image state ingest. The encoder index wraps to zero
-                    // once the image's last encoder output has been ingested.
+                    // Latent input-image block ingest. The encoder index wraps
+                    // to zero once the image's last block has been written.
                     (true, false) => {
+                        self.free_consumed_products(id, &call);
                         let is_final_step = self
                             .running
                             .get(&id)
                             .is_some_and(|state| state.image_encoder_index == 0);
-                        if is_final_step {
-                            self.free_transient_products(id);
-                        }
 
-                        // Ingesting the last image of a fully consumed prompt
+                        // Writing the last image of a fully consumed prompt
                         // starts a readout's canvases, a canvas-generating
                         // request's first block, or understanding decode from
                         // BOS.
@@ -528,7 +526,9 @@ impl Scheduler {
                 }
 
                 // Prompt extension. Partial prefill remains in ingest until every
-                // text and multimodal position has been consumed.
+                // text and multimodal position has been consumed. The vision
+                // blocks it wrote no longer need their request-local products.
+                self.free_consumed_products(id, &call);
                 let Some(st) = self.running.get(&id) else {
                     return;
                 };
@@ -559,6 +559,19 @@ impl Scheduler {
                     } else {
                         Phase::Canvas
                     };
+                    return;
+                }
+
+                // A context that ends with an image block sampled nothing:
+                // understanding decode starts from BOS, as after a trailing
+                // latent block.
+                if call.token_output.is_none() {
+                    let bos = self.ctrl.bos;
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.next_token = bos;
+                        st.round_token_ids.clear();
+                        st.phase = Phase::DecodeUnd;
+                    }
                     return;
                 }
 
@@ -799,25 +812,25 @@ impl Scheduler {
             CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {
                 match is_feedback_computation(&call) {
-                    // Input-image encoding: the product feeds the next state
-                    // ingest and, when the request writes the encoder cache,
-                    // becomes a shared cache entry.
+                    // Input-image encoding of the next block the context needs
+                    // (`next_context_encode`): the product feeds the call that
+                    // writes the block and, when the request writes the
+                    // encoder cache, becomes a shared cache entry.
                     false => {
-                        let encoder_cache_key = self.running.get(&id).and_then(|state| {
-                            let image = state
-                                .req
-                                .multimodal_inputs
-                                .images
-                                .get(state.num_ingested_images)?;
-                            let encoder = image.encoders.get(state.image_encoder_index)?;
-                            state.req.cache.write.then(|| {
-                                encoder_cache_key(
-                                    image.hash,
-                                    state.image_encoder_index,
-                                    encoder.encoder,
-                                )
+                        let Some((block, step, block_cache_key)) =
+                            self.next_context_encode(id).and_then(|(block, step)| {
+                                let state = self.running.get(&id)?;
+                                let (image, _) = state.input_block(block)?;
+                                let key =
+                                    state.req.cache.write.then(|| {
+                                        encoder_cache_key(image.hash, block.encoder, step)
+                                    });
+                                Some((block, step, key))
                             })
-                        });
+                        else {
+                            return self.finish(id, FinishReason::Error);
+                        };
+                        let encoder_cache_key = block_cache_key;
                         let Some(feature) = call.encoder_output.clone() else {
                             return self.finish(id, FinishReason::Error);
                         };
@@ -887,9 +900,17 @@ impl Scheduler {
                             feature.clone()
                         };
 
+                        // A latent block is written by its own extension; a
+                        // vision block joins the context prefill that reaches
+                        // it. Encodes follow the blocks' context order.
                         if let Some(st) = self.running.get_mut(&id) {
-                            st.input_image_features = Some(selected_product);
-                            st.phase = Phase::IngestState;
+                            if step == ImageIngestStep::VaeEncode {
+                                st.input_image_features = Some(selected_product);
+                                st.phase = Phase::IngestState;
+                            } else {
+                                debug_assert!(block.image >= st.num_ingested_images);
+                                st.context_features.push(selected_product);
+                            }
                         }
 
                         if !free_products.is_empty() {
@@ -963,8 +984,33 @@ impl Scheduler {
         );
     }
 
-    /// Frees the request's transient products: uncached input-image encoder
-    /// outputs, feedback encoder outputs, and the device feedback source.
+    /// Frees the request-local encoder products an image-writing `call`
+    /// consumed: its latent feature or its vision blocks' features. Products
+    /// the encoder cache holds stay pinned until the request finishes, and
+    /// products of blocks the context has not reached yet stay held.
+    pub(super) fn free_consumed_products(&mut self, id: RequestId, call: &Call) {
+        let consumed: Vec<TensorRef> = call
+            .latent_feature_input
+            .iter()
+            .chain(call.vision_inputs.iter().map(|input| &input.feature))
+            .cloned()
+            .collect();
+        let freed = self
+            .running
+            .get_mut(&id)
+            .map(|state| {
+                let (freed, kept) = std::mem::take(&mut state.transient_encoder_products)
+                    .into_iter()
+                    .partition(|product| consumed.contains(product));
+                state.transient_encoder_products = kept;
+                freed
+            })
+            .unwrap_or_default();
+        self.free_buffers(freed.into_iter().map(|product| product.buffer_id()));
+    }
+
+    /// Frees the request's transient products: uncached encoder outputs,
+    /// feedback encoder outputs, and the device feedback source.
     pub(super) fn free_transient_products(&mut self, id: RequestId) {
         let products = self
             .running

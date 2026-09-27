@@ -327,6 +327,17 @@ pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCa
     })
 }
 
+/// A request's context projected through its in-flight calls
+/// (`Scheduler::scheduled_context`).
+pub(super) struct ScheduledContext {
+    /// Model position after the in-flight calls.
+    pub(super) logical: u32,
+    /// KV length after the in-flight calls, at their submitted maxima.
+    pub(super) physical: u32,
+    /// The next input-image block no accepted or in-flight call writes.
+    pub(super) blocks: BlockCursor,
+}
+
 /// The lanes one media call occupies while it is in flight.
 ///
 /// A component lane measured in media units carries `units`; a demand with
@@ -1045,7 +1056,7 @@ impl Scheduler {
             },
 
             token_output: None,
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -1461,18 +1472,34 @@ impl Scheduler {
     /// Pending work contributes its submitted maximum; accepted lengths remain
     /// request state and are never advanced by this scheduling calculation.
     pub(super) fn scheduled_token_lengths(&self, id: RequestId) -> Option<(u32, u32)> {
+        self.scheduled_context(id)
+            .map(|context| (context.logical, context.physical))
+    }
+
+    /// Returns the input images whose every block the request's accepted and
+    /// in-flight calls write.
+    pub(super) fn num_scheduled_images(&self, id: RequestId) -> Option<usize> {
+        self.scheduled_context(id)
+            .map(|context| context.blocks.image)
+    }
+
+    /// Projects the request's accepted context through its in-flight calls:
+    /// logical and KV extents, and the input-image block cursor.
+    pub(super) fn scheduled_context(&self, id: RequestId) -> Option<ScheduledContext> {
         let state = self.running.get(&id)?;
         let (mut logical, mut physical) = (state.logical_position, state.kv_visible_len);
-        let mut image_index = state.num_ingested_images;
-        let mut encoder_index = state.image_encoder_index;
+        let mut blocks = state.block_cursor();
         let mut feedback_index = state.feedback_encoder_index;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
             match call.code {
+                // A context prefill adds its prompt tokens and vision blocks.
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
                     let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
-                    logical = logical.saturating_add(count);
-                    physical = physical.saturating_add(count);
+                    let advance = state.context_advance(count, call.vision_inputs.len(), blocks)?;
+                    logical = logical.saturating_add(advance.logical);
+                    physical = physical.saturating_add(advance.kv);
+                    blocks = advance.cursor;
                 }
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     physical = physical.saturating_add(call.bounds.max_tokens);
@@ -1484,13 +1511,13 @@ impl Scheduler {
                             feedback_index = 0;
                         }
                     } else {
-                        let image = state.req.multimodal_inputs.images.get(image_index)?;
-                        encoder_index += 1;
-                        if encoder_index == image.encoders.len() {
+                        // A latent input-image block.
+                        let image = state.req.multimodal_inputs.images.get(blocks.image)?;
+                        let next = state.next_block(blocks)?;
+                        if next.image != blocks.image {
                             logical = logical.saturating_add(image.num_positions);
-                            encoder_index = 0;
-                            image_index += 1;
                         }
+                        blocks = next;
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => physical = physical.saturating_add(1),
@@ -1502,7 +1529,11 @@ impl Scheduler {
                 _ => {}
             }
         }
-        Some((logical, physical))
+        Some(ScheduledContext {
+            logical,
+            physical,
+            blocks,
+        })
     }
 
     /// The coordinates the next call of this request executes at.
@@ -1655,16 +1686,9 @@ impl Scheduler {
                             Phase::FeedbackEncode
                         }
                     } else {
-                        let image = state
-                            .req
-                            .multimodal_inputs
-                            .images
-                            .get(state.num_ingested_images)?;
-                        if state.image_encoder_index + 1 == image.encoders.len() {
-                            Phase::Prefill
-                        } else {
-                            Phase::Encode
-                        }
+                        // A latent input-image block: context ingestion
+                        // continues after it.
+                        Phase::Prefill
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => Phase::PublishKv,
@@ -1690,7 +1714,8 @@ impl Scheduler {
             Phase::Prefill
                 if self.num_scheduled_prompt_tokens(id)?
                     >= state.req.prompt_token_ids.len() as u32
-                    && state.num_ingested_images >= state.req.multimodal_inputs.images.len() =>
+                    && self.num_scheduled_images(id)?
+                        >= state.req.multimodal_inputs.images.len() =>
             {
                 if state.req.is_readout() {
                     Phase::Readout
@@ -1878,13 +1903,15 @@ impl Scheduler {
             {
                 return false;
             }
-            // Ordinary pipelining needs the whole prompt submitted and every
-            // context image ingested, and counts each in-flight call as one
+            // Ordinary pipelining needs the whole prompt and every context
+            // image block submitted, and counts each in-flight call as one
             // token toward `max_und_tokens`.
             return self
                 .num_scheduled_prompt_tokens(id)
                 .is_some_and(|count| count as usize >= state.req.prompt_token_ids.len())
-                && state.num_ingested_images >= state.req.multimodal_inputs.images.len()
+                && self
+                    .num_scheduled_images(id)
+                    .is_some_and(|count| count >= state.req.multimodal_inputs.images.len())
                 && state.num_generated_tokens.saturating_add(queue.len())
                     < state.req.max_und_tokens;
         }
@@ -1944,11 +1971,11 @@ impl Scheduler {
     /// Determines the next pipelined computation from its submitted predecessor.
     ///
     /// Returns `None`, among other cases, when the request is not running or
-    /// has no call in flight, has not yet submitted its whole prompt or
-    /// ingested every context image, cannot chain from its last in-flight
+    /// has no call in flight, has not yet submitted its whole prompt or every
+    /// block of its context images, cannot chain from its last in-flight
     /// call (an image decode whose request does not feed the device image
     /// product back, or a completed feedback round whose request does not
-    /// sample a feedback continuation), or projects to an encode or ingest
+    /// sample a feedback continuation), or projects to a latent ingest
     /// phase.
     pub(super) fn pending_successor_code(&self, id: RequestId) -> Option<CallKind> {
         if !self.inflight.has_pending_calls(id) {
@@ -1956,7 +1983,7 @@ impl Scheduler {
         }
         let state = self.running.get(&id)?;
         if self.num_scheduled_prompt_tokens(id)? < state.req.prompt_token_ids.len() as u32
-            || state.num_ingested_images < state.req.multimodal_inputs.images.len()
+            || self.num_scheduled_images(id)? < state.req.multimodal_inputs.images.len()
         {
             return None;
         }
@@ -1997,7 +2024,7 @@ impl Scheduler {
                     ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
                 }
             }
-            Phase::Encode | Phase::IngestState => return None,
+            Phase::IngestState => return None,
         })
     }
 

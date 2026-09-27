@@ -48,8 +48,8 @@ use crate::{
     ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
     MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
     SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
-    TransferHandle, TransferMode, TransferTransport, WorkerEndpoint, WorkerInfo, WorkerRequest,
-    WorkerResponse, WorkerResponseError,
+    TransferHandle, TransferMode, TransferTransport, VisionInput, WorkerEndpoint, WorkerInfo,
+    WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 /// Result type returned by FlatBuffers codec calls.
@@ -672,7 +672,21 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .unwrap_or_default(),
         token_input: call.token_input().map(tensor_ref_from_table).transpose()?,
         token_output: call.token_output().map(tensor_ref_from_table).transpose()?,
-        vision_input: call.vision_input().map(tensor_ref_from_table).transpose()?,
+        vision_inputs: call
+            .vision_inputs()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        Ok(VisionInput {
+                            offset: item.offset(),
+                            feature: tensor_ref_from_table(item.feature())?,
+                        })
+                    })
+                    .collect::<CodecResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
         latent_feature_input: call
             .latent_feature_input()
             .map(tensor_ref_from_table)

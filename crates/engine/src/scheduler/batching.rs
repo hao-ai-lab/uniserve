@@ -19,10 +19,21 @@
 //! A pass's prefill calls, and likewise its decode calls, travel as one
 //! numerical call, which workers evaluate with graphs captured at startup; a
 //! prefill or decode batch holds at most the calls those graphs hold, as
-//! the workers report it (`Scheduler::call_limit`).
+//! the workers report it (`Scheduler::call_limit`). A context prefill with
+//! vision blocks stages several forward rows; a pass's prefill rows, like its
+//! canvas rows, stay within the rows a worker stages per call (`PassRows`).
 
 use super::*;
-use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
+use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode, VisionInput};
+
+/// Forward rows a pass may still add to its numerical calls, within the rows
+/// a worker stages per call: canvas rows across its token-denoising calls,
+/// and context rows across its prefill calls.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PassRows {
+    pub(super) canvas: usize,
+    pub(super) context: usize,
+}
 
 /// Returns the KV capacity, in tokens, that must be allocated before a decode
 /// that writes position `pos` and `spec_len` further positions.
@@ -218,10 +229,13 @@ impl Scheduler {
         } else {
             0
         };
-        // Canvas rows staged by this pass across its token-denoising calls,
-        // bounded by the worker's per-call row staging.
-        let mut canvas_rows_left =
-            (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
+        // Forward rows staged by this pass, bounded by the worker's per-call
+        // row staging.
+        let row_staging = (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
+        let mut rows_left = PassRows {
+            canvas: row_staging,
+            context: row_staging,
+        };
         let limits = [
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Forward(ForwardMode::Decode),
@@ -302,13 +316,15 @@ impl Scheduler {
             } else {
                 budget
             };
-            if let Some(mut call) =
-                self.next_generation_computation(id, call_budget, canvas_rows_left)
-            {
+            if let Some(mut call) = self.next_generation_computation(id, call_budget, rows_left) {
                 // A planned call joins its computation's batch only while it
                 // has room; otherwise it waits for a later pass, as a call
-                // without resources does below.
-                if full(&code_batches, call.code) {
+                // without resources does below. A context prefill plans
+                // within the pass's context rows.
+                let prefill = call.code == CallKind::Forward(ForwardMode::Prefill);
+                if full(&code_batches, call.code)
+                    || (prefill && generation::prefill_rows(&call) > rows_left.context)
+                {
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_kv_units_sent = state
                             .num_kv_units_sent
@@ -375,9 +391,13 @@ impl Scheduler {
                         let start = self.scheduled_readout_rows(id)?;
                         state.readout_rows_covering(start, call.input_token_ids.len())
                     });
-                    canvas_rows_left = canvas_rows_left.saturating_sub(rows.unwrap_or(0));
+                    rows_left.canvas = rows_left.canvas.saturating_sub(rows.unwrap_or(0));
                 } else if call.canvas.is_some() {
-                    canvas_rows_left = canvas_rows_left.saturating_sub(1);
+                    rows_left.canvas = rows_left.canvas.saturating_sub(1);
+                } else if prefill {
+                    rows_left.context = rows_left
+                        .context
+                        .saturating_sub(generation::prefill_rows(&call));
                 }
 
                 // Identify the call by its batch and row, and stamp the
@@ -632,10 +652,12 @@ impl Scheduler {
     /// Determines the next call kind without mutating request or resource state.
     ///
     /// A call chained onto the request's in-flight calls takes precedence.
-    /// Otherwise an input image anchored at the scheduled prompt cursor is
-    /// encoded before more text, and the request's phase decides. Returns
-    /// `None` when the request is not running, waits on its image-branch
-    /// reservation, or has no call to issue.
+    /// Otherwise, while the context is ingested, an input-image block the
+    /// next context prefill needs is encoded first
+    /// (`Scheduler::next_context_encode`); a block whose product the encoder
+    /// cache holds still reports its encoder here. Otherwise the request's
+    /// phase decides. Returns `None` when the request is not running, waits
+    /// on its image-branch reservation, or has no call to issue.
     pub(super) fn peek_next_call_variant(&self, id: RequestId) -> Option<CallKind> {
         let st = self.running.get(&id)?;
         if st.image_reservation_pending {
@@ -644,25 +666,15 @@ impl Scheduler {
         if let Some(variant) = self.pending_successor_code(id) {
             return Some(variant);
         }
-        if st.has_context_images()
-            && st.phase == Phase::Prefill
-            && st
-                .req
-                .multimodal_inputs
-                .images
-                .get(st.num_ingested_images)
-                .is_some_and(|item| Some(item.position) == self.num_scheduled_prompt_tokens(id))
+        if st.phase == Phase::Prefill
+            && let Some((_, step)) = self.next_context_encode(id)
         {
-            return st.pending_image_step().map(|step| match step {
+            return Some(match step {
                 ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
                 ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
             });
         }
         Some(match st.phase {
-            Phase::Encode => match st.pending_image_step()? {
-                ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
-                ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
-            },
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
             Phase::Prefill => CallKind::Forward(ForwardMode::Prefill),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
@@ -800,11 +812,11 @@ impl Scheduler {
         // and denoising only read the request's KV.
         let (_, visible) = self.scheduled_token_lengths(request_id)?;
         let kv_lengths = match call.code {
+            // A context prefill's bound counts its prompt tokens and its
+            // vision blocks' exact KV lengths.
             CallKind::Forward(ForwardMode::Prefill) => Some(KvLengths {
                 visible,
-                input: if is_prompt_extend(&call) {
-                    call.input_token_ids.len().min(u32::MAX as usize) as u32
-                } else if consumes_image_features(&call) {
+                input: if is_prompt_extend(&call) || consumes_image_features(&call) {
                     call.bounds.max_tokens
                 } else {
                     1
@@ -881,6 +893,23 @@ impl Scheduler {
             Vec::new()
         };
 
+        let context_segments = if is_prompt_extend(&call) && !call.vision_inputs.is_empty() {
+            let segments = self.context_segments(request_id, &call);
+            let Some(segments) = segments.filter(|segments| {
+                kv_lengths
+                    .as_ref()
+                    .is_some_and(|lengths| segments.iter().sum::<u32>() == lengths.input)
+            }) else {
+                self.invariant_broken(
+                    "a context prefill's vision blocks are the request's next vision blocks",
+                );
+                return None;
+            };
+            segments
+        } else {
+            Vec::new()
+        };
+
         let mut call_block_tables = Vec::new();
         let mut call_new_cache_units = Vec::new();
         let mut call_forward = ForwardBatch::default();
@@ -939,9 +968,19 @@ impl Scheduler {
                     });
                 }
             }
-            // One forward row per call that appends KV: it attends to the
-            // visible prefix plus its input and persists the input in KV.
-            if lengths.input > 0 {
+            // A context prefill with vision blocks appends one forward row per
+            // segment, in context order: the prompt tokens between blocks, and
+            // each block, which the worker evaluates as one attention block.
+            // Every other call that appends KV has one row. Each row attends
+            // to the visible prefix and the rows before it, and persists its
+            // tokens in KV.
+            if !context_segments.is_empty() {
+                let mut end = lengths.visible;
+                for &segment in &context_segments {
+                    end += segment;
+                    call_forward.push(0, request_pool_idx, end, segment, true);
+                }
+            } else if lengths.input > 0 {
                 call_forward.push(
                     0,
                     request_pool_idx,
@@ -1160,12 +1199,21 @@ impl Scheduler {
         };
         call.component = entry;
 
-        let image_kv = if consumes_image_features(&call) {
+        // An image extension writes its block's KV, and a context prefill
+        // with vision blocks exactly its bound: its prompt tokens and blocks.
+        let image_kv = if consumes_image_features(&call) || !call.vision_inputs.is_empty() {
             let Some(lengths) = kv_lengths else {
                 self.invariant_broken("an image extension declares its KV input range");
                 return None;
             };
-            Some((lengths.visible, num_image_kv_tokens))
+            Some((
+                lengths.visible,
+                if consumes_image_features(&call) {
+                    num_image_kv_tokens
+                } else {
+                    Some(lengths.input)
+                },
+            ))
         } else {
             None
         };
@@ -1376,7 +1424,8 @@ impl Scheduler {
     /// Prompt text and input images still to ingest go through
     /// `next_context_computation`; otherwise the request's next phase decides.
     /// A canvas pass takes the next readout rows that fit both `budget`
-    /// tokens and `canvas_rows` rows. Returns `None` when nothing can be
+    /// tokens and the pass's canvas `rows`, and a context prefill the
+    /// segments that fit its context rows. Returns `None` when nothing can be
     /// planned now, including when the KV capacity a call needs, the
     /// image-branch reservation, or room for one whole canvas row is
     /// unavailable.
@@ -1384,16 +1433,19 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         budget: usize,
-        canvas_rows: usize,
+        rows: PassRows,
     ) -> Option<Call> {
+        let canvas_rows = rows.canvas;
         let (logical_position, kv_visible_len) = self.scheduled_token_lengths(id)?;
         let context_pending = self.running.get(&id).is_some_and(|st| {
             self.num_scheduled_prompt_tokens(id)
                 .is_some_and(|count| count < st.req.prompt_token_ids.len() as u32)
-                || st.num_ingested_images < st.req.multimodal_inputs.images.len()
+                || self
+                    .num_scheduled_images(id)
+                    .is_some_and(|count| count < st.req.multimodal_inputs.images.len())
         });
         if context_pending {
-            return self.next_context_computation(id, budget);
+            return self.next_context_computation(id, budget, rows.context);
         }
         if self.running.get(&id)?.image_reservation_pending
             && !self.promote_gen_branch_reservation(id)
@@ -1403,7 +1455,6 @@ impl Scheduler {
         let phase = self.next_generation_phase(id)?;
         let image_id = self.running.get(&id)?.image_id;
         match phase {
-            Phase::Encode => None,
             Phase::Prefill => {
                 let st = self.running.get(&id)?;
                 let n = st.req.prompt_token_ids.len();
@@ -1420,7 +1471,14 @@ impl Scheduler {
                 let sampling_state = self.build_token_masks(id, 0, 0);
 
                 self.plan_computation(id, |_scheduler, request| {
-                    generation::plan_prompt(request, cursor as u32, end as u32, sampling_state)
+                    generation::plan_prompt(
+                        request,
+                        cursor as u32,
+                        end as u32,
+                        Vec::new(),
+                        0,
+                        sampling_state,
+                    )
                 })
             }
             Phase::DecodeUnd => {
@@ -1592,7 +1650,7 @@ impl Scheduler {
                     )
                 })
             }
-            Phase::IngestState => self.next_context_computation(id, budget),
+            Phase::IngestState => self.next_context_computation(id, budget, rows.context),
             Phase::Readout => {
                 // Whole rows join the pass in report order while they fit its
                 // remaining tokens and canvas rows.
@@ -1697,139 +1755,277 @@ impl Scheduler {
         }
     }
 
-    /// Plans the next ordered text or image context-ingest transition within `budget`.
+    /// Plans the next context-ingest call within `budget` tokens.
+    ///
+    /// The context is the prompt with the blocks of its input images at their
+    /// positions: each encoder of an image writes one block, in encoder order.
+    /// A vision block is written by a context prefill together with the prompt
+    /// tokens around it, as one attention block of that call; a latent block
+    /// is written by an image extension of its own, which ends the preceding
+    /// context prefill. Every block's encoder product exists before the call
+    /// that writes it: the next block the context needs is encoded first
+    /// (`next_context_encode`), or pinned from the encoder cache without a
+    /// call.
+    ///
+    /// A context prefill holds prompt tokens and whole vision blocks, within
+    /// the pass's `budget` and the long-prefill threshold; a block that would
+    /// not fit waits for the next chunk, which it starts, and a chunk that
+    /// starts with a block may exceed the threshold within the budget. Its
+    /// forward rows (`generation::prefill_rows`) stay within `context_rows`.
+    /// Returns `None` when nothing can be planned now, including when the
+    /// next block does not fit this pass or the request's KV capacity is
+    /// unavailable.
     pub(super) fn next_context_computation(
         &mut self,
         id: RequestId,
         budget: usize,
+        context_rows: usize,
     ) -> Option<Call> {
         let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
         let (_, kv_visible_len) = self.scheduled_token_lengths(id)?;
 
-        // An image anchored at the current text cursor takes precedence over
-        // further text ingestion so logical multimodal order is preserved.
-        let image = self
-            .running
-            .get(&id)?
-            .req
-            .multimodal_inputs
-            .images
-            .get(self.running.get(&id)?.num_ingested_images)
-            .cloned();
-        if let Some(image) = image.as_ref()
-            && image.position as usize == cursor
-        {
+        // A latent block's encoder product awaits its own extension.
+        if self.running.get(&id)?.phase == Phase::IngestState {
             let state = self.running.get(&id)?;
-            let step_index = state.image_encoder_index;
-            let step = image.encoders.get(step_index)?.encoder;
-
-            // Once an encoded feature exists, apply its declared KV effect at
-            // its scheduled positions and reserve the required cache pages.
-            if state.phase == Phase::IngestState {
-                let feature = state.input_image_features.clone()?;
-                let encoder_input = *image.encoders.get(step_index)?;
-                // Submission validated every input encoder's capacity.
-                let Ok(physical_bound) = encoder_input.kv_token_capacity(&self.generation_limits)
-                else {
-                    self.invariant_broken("a queued input encoder has a valid KV capacity");
-                    return None;
-                };
-
-                if !self.ensure_request_capacity(
-                    id,
-                    kv_visible_len as usize,
-                    kv_visible_len.saturating_add(physical_bound) as usize,
-                ) {
-                    return None;
-                }
-
-                return self.plan_computation(id, |scheduler, request| {
-                    generation::plan_image_extend(
-                        &scheduler.generation_limits,
-                        request,
-                        encoder_input,
-                        feature,
-                        false,
-                        false,
-                        None,
-                        None,
-                    )
-                });
-            }
-
-            // Encoder-cache hits are pinned before entering ingest state. If
-            // request ownership disappears during acquisition, release the pin.
-            let cache_read = state.req.cache.read;
-            let cache_key = encoder_cache_key(image.hash, step_index, step);
-            let cached = if cache_read {
-                self.storage.encoder_cache.lookup_product(cache_key)
-            } else {
-                None
+            let feature = state.input_image_features.clone()?;
+            let (_, encoder_input) = state.input_block(state.block_cursor())?;
+            let encoder_input = *encoder_input;
+            // Submission validated every input encoder's capacity.
+            let Ok(physical_bound) = encoder_input.kv_token_capacity(&self.generation_limits)
+            else {
+                self.invariant_broken("a queued input encoder has a valid KV capacity");
+                return None;
             };
-            if let Some(cached_product) = cached {
-                let product = self.storage.encoder_cache.acquire(cache_key)?;
-                if product != cached_product {
-                    return None;
-                }
-                let Some(state) = self.running.get_mut(&id) else {
-                    let _ = self.storage.encoder_cache.release(cache_key, &product);
-                    return None;
-                };
-                state.encoder_cache_pins.push(EncoderCachePin {
-                    key: cache_key,
-                    product: product.clone(),
-                });
-                state.input_image_features = Some(product);
-                state.phase = Phase::IngestState;
-                return self.next_context_computation(id, budget);
+            if !self.ensure_request_capacity(
+                id,
+                kv_visible_len as usize,
+                kv_visible_len.saturating_add(physical_bound) as usize,
+            ) {
+                return None;
             }
-
-            // A cache miss schedules the encoder. Completion derives the same
-            // key from the immutable image input when cache writes are enabled.
             return self.plan_computation(id, |scheduler, request| {
-                generation::plan_encode(
+                generation::plan_image_extend(
                     &scheduler.generation_limits,
                     request,
-                    step,
-                    image.b64.clone(),
-                    None,
+                    encoder_input,
+                    feature,
                     false,
+                    false,
+                    None,
+                    None,
                 )
             });
         }
 
-        // Select a text chunk bounded by the request budget, scheduler chunk
-        // limit, and next image position.
-        let (prompt_len, next_image) = {
-            let st = self.running.get(&id)?;
-            let prompt_len = st.req.prompt_token_ids.len();
-            let next_image = image
-                .as_ref()
-                .map_or(prompt_len, |image| image.position as usize);
-            (prompt_len, next_image)
+        // Encode the next block the context needs. A product the encoder
+        // cache holds is pinned for the request instead, without a call.
+        while let Some((block, step)) = self.next_context_encode(id) {
+            let state = self.running.get(&id)?;
+            let (image, _) = state.input_block(block)?;
+            let cache_key = encoder_cache_key(image.hash, block.encoder, step);
+            let image_b64 = image.b64.clone();
+            let cached = if state.req.cache.read {
+                self.storage.encoder_cache.lookup_product(cache_key)
+            } else {
+                None
+            };
+            let Some(cached_product) = cached else {
+                // A cache miss schedules the encoder. Nothing else of the
+                // request is planned while it is in flight, so its completion
+                // finds the same block here.
+                return self.plan_computation(id, |scheduler, request| {
+                    generation::plan_encode(
+                        &scheduler.generation_limits,
+                        request,
+                        step,
+                        image_b64,
+                        None,
+                        false,
+                    )
+                });
+            };
+            let product = self.storage.encoder_cache.acquire(cache_key)?;
+            if product != cached_product {
+                return None;
+            }
+            // If request ownership disappeared during acquisition, release
+            // the pin.
+            let Some(state) = self.running.get_mut(&id) else {
+                let _ = self.storage.encoder_cache.release(cache_key, &product);
+                return None;
+            };
+            state.encoder_cache_pins.push(EncoderCachePin {
+                key: cache_key,
+                product: product.clone(),
+            });
+            if step == ImageIngestStep::VaeEncode {
+                state.input_image_features = Some(product);
+                state.phase = Phase::IngestState;
+                return self.next_context_computation(id, budget, context_rows);
+            }
+            state.context_features.push(product);
+        }
+
+        // Select the next chunk: prompt tokens up to the budget, and each
+        // encoded vision block they reach whole. A latent block or a block
+        // not yet encoded ends the chunk.
+        let limit = budget.max(1).min(self.config.long_prefill_threshold);
+        let (end, blocks, block_tokens) = {
+            let state = self.running.get(&id)?;
+            let prompt_len = state.req.prompt_token_ids.len();
+            let mut end = cursor;
+            let mut used = 0usize;
+            let mut rows = 0usize;
+            let mut blocks = Vec::new();
+            let mut block_tokens = 0u32;
+            let mut block = self.scheduled_context(id)?.blocks;
+            // In-flight context prefills hold the leading features.
+            let in_flight = state.blocks_between(state.block_cursor(), block);
+            loop {
+                let next = state.input_block(block);
+                let text_stop = next.map_or(prompt_len, |(image, _)| image.position as usize);
+                // A run of prompt tokens is one forward row, as is a block.
+                let room = if rows < context_rows {
+                    limit.saturating_sub(used)
+                } else {
+                    0
+                };
+                let taken = text_stop.saturating_sub(end).min(room);
+                if taken > 0 {
+                    rows += 1;
+                }
+                end += taken;
+                used += taken;
+                let Some((_, input)) = next else {
+                    break;
+                };
+                let Some(feature) = state.context_features.get(in_flight + blocks.len()) else {
+                    break;
+                };
+                if end < text_stop
+                    || input.encoder != ImageIngestStep::VitEncode
+                    || rows >= context_rows
+                {
+                    break;
+                }
+                // Submission validated every vision block's exact KV length.
+                let Some(tokens) = input.num_kv_tokens else {
+                    self.invariant_broken("an input vision block declares its exact KV length");
+                    return None;
+                };
+                // A block joins only whole: one that would overflow the chunk
+                // starts the next one, where it may exceed the threshold
+                // within the pass's budget.
+                let fits =
+                    used + tokens as usize <= limit || (used == 0 && tokens as usize <= budget);
+                if !fits {
+                    break;
+                }
+                blocks.push(VisionInput {
+                    offset: u32::try_from(end - cursor).unwrap_or(u32::MAX),
+                    feature: feature.clone(),
+                });
+                rows += 1;
+                used += tokens as usize;
+                block_tokens = block_tokens.saturating_add(tokens);
+                block = state.next_block(block)?;
+            }
+            (end, blocks, block_tokens)
         };
-        if cursor >= prompt_len {
+        if end == cursor && blocks.is_empty() {
             return None;
         }
 
-        let end = cursor
-            .saturating_add(budget.max(1).min(self.config.long_prefill_threshold))
-            .min(prompt_len)
-            .min(next_image.max(cursor + 1));
-
+        let written = end - cursor + block_tokens as usize;
         if !self.ensure_request_capacity(
             id,
             kv_visible_len as usize,
-            kv_visible_len as usize + end - cursor,
+            kv_visible_len as usize + written,
         ) {
             return None;
         }
 
         let sampling_state = self.build_token_masks(id, 0, 0);
-
         self.plan_computation(id, |_scheduler, request| {
-            generation::plan_prompt(request, cursor as u32, end as u32, sampling_state)
+            generation::plan_prompt(
+                request,
+                cursor as u32,
+                end as u32,
+                blocks,
+                block_tokens,
+                sampling_state,
+            )
         })
+    }
+
+    /// Returns the next input-image block to encode before the context can
+    /// advance, with its encoder, or `None` when the next context call needs
+    /// no encode.
+    ///
+    /// Walks the blocks after the accepted block cursor, whose leading
+    /// products `context_features` holds: the latent block at the scheduled
+    /// prompt cursor is encoded for its own extension; vision blocks are
+    /// encoded in order ahead of the context prefill that writes them, while
+    /// their image lies within the long-prefill threshold of the scheduled
+    /// prompt cursor. The walk stops at a latent block past that cursor,
+    /// which the chunk before it does not reach. A request plans nothing
+    /// while its encode is in flight, so the encode's completion identifies
+    /// its block by the same walk.
+    pub(super) fn next_context_encode(
+        &self,
+        id: RequestId,
+    ) -> Option<(BlockCursor, ImageIngestStep)> {
+        let state = self.running.get(&id)?;
+        if state.phase == Phase::IngestState {
+            return None;
+        }
+        let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
+        let reach = cursor.saturating_add(self.config.long_prefill_threshold);
+        let mut block = state.block_cursor();
+        let mut encoded = 0;
+        while let Some((image, input)) = state.input_block(block) {
+            let position = image.position as usize;
+            if input.encoder == ImageIngestStep::VaeEncode {
+                return (position == cursor).then_some((block, input.encoder));
+            }
+            if position > cursor && position >= reach {
+                return None;
+            }
+            if encoded == state.context_features.len() {
+                return Some((block, input.encoder));
+            }
+            encoded += 1;
+            block = state.next_block(block)?;
+        }
+        None
+    }
+
+    /// Returns the forward-row lengths of a context prefill `call` with vision
+    /// blocks, in context order: the prompt tokens before, between and after
+    /// its blocks, and each block's exact KV length. The blocks are the
+    /// request's next ones after its scheduled block cursor.
+    fn context_segments(&self, id: RequestId, call: &Call) -> Option<Vec<u32>> {
+        let state = self.running.get(&id)?;
+        let mut block = self.scheduled_context(id)?.blocks;
+        let mut segments = Vec::with_capacity(2 * call.vision_inputs.len() + 1);
+        let mut text_start = 0u32;
+        for input in &call.vision_inputs {
+            if input.offset < text_start {
+                return None;
+            }
+            if input.offset > text_start {
+                segments.push(input.offset - text_start);
+                text_start = input.offset;
+            }
+            let (_, encoder) = state.input_block(block)?;
+            segments.push(encoder.num_kv_tokens?);
+            block = state.next_block(block)?;
+        }
+        let text = u32::try_from(call.input_token_ids.len()).ok()?;
+        if text > text_start {
+            segments.push(text - text_start);
+        }
+        Some(segments)
     }
 
     /// Chooses whether a committed round-close token opens a branch or finishes the request.

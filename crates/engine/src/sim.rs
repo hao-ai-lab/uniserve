@@ -704,10 +704,11 @@ impl SimEngine {
             work @ (CallKind::Forward(ForwardMode::Prefill)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)) => {
-                // A call that ingests vision or latent features extends KV by
-                // its token bound but leaves logical positions to the model.
+                // A call that writes image blocks, alone or among the prompt
+                // tokens of a context prefill, extends KV by its token bound
+                // but leaves logical positions to the model.
                 let visual_state =
-                    call.vision_input.is_some() || call.latent_feature_input.is_some();
+                    !call.vision_inputs.is_empty() || call.latent_feature_input.is_some();
                 let samples_token = call.token_output.is_some();
                 if visual_state {
                     request.positions_from_model = true;
@@ -1407,7 +1408,7 @@ mod tests {
             token_input: None,
 
             token_output: Some(token_output(CallId::new(batch_id, request_index))),
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,

@@ -326,6 +326,14 @@ table CallCoordinates {
   flow_step:uint;
 }
 
+/// One image block of a context prefill, decoded into `VisionInput`: the
+/// vision-encoder `feature` the block injects, written before the call's
+/// input token `offset`.
+table VisionInput {
+  offset:uint;
+  feature:TensorRef (required);
+}
+
 /// One planned computation, decoded into `Call` and checked by
 /// `Call::validate`; relationships to other calls and to the batch's tables
 /// are checked by `Batch::validate`.
@@ -348,7 +356,7 @@ table Call {
   outputs:[TensorRef];
   token_input:TensorRef;
   token_output:TensorRef;
-  vision_input:TensorRef;
+  vision_inputs:[VisionInput];
   latent_feature_input:TensorRef;
   encoder_output:TensorRef;
   latent_input:TensorRef;

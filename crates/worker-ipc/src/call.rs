@@ -543,6 +543,20 @@ impl Readout {
 /// Component used when a deployment does not partition a model by capability.
 pub const DEFAULT_COMPONENT: &str = "model";
 
+/// One image block of a context prefill.
+///
+/// The block writes the vision-encoder product `feature` into KV as one
+/// attention block, before the call's input token `offset`: the call's
+/// context is its input tokens `[0, offset)`, then the block, then the
+/// tokens from `offset` on. Blocks sharing an offset follow in list order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisionInput {
+    /// Input tokens of the call that precede the block.
+    pub offset: u32,
+    /// Vision-encoder features the block injects.
+    pub feature: TensorRef,
+}
+
 /// One immutable computation with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
@@ -576,8 +590,9 @@ pub struct Call {
     /// Sampled token and continuation bit in one I64 scalar. The worker packs
     /// it with `tagged_token_values` in `uniserve_worker.sampling.sampler`.
     pub token_output: Option<TensorRef>,
-    /// Vision features consumed by multimodal forward.
-    pub vision_input: Option<TensorRef>,
+    /// Image blocks a prefill injects, in context order: each block's
+    /// vision-encoder feature and the input token it precedes.
+    pub vision_inputs: Vec<VisionInput>,
     /// VAE features consumed by multimodal forward.
     pub latent_feature_input: Option<TensorRef>,
     /// Features produced by the selected image encoder.
@@ -629,7 +644,7 @@ impl Call {
         self.inputs
             .iter()
             .chain(self.token_input.iter())
-            .chain(self.vision_input.iter())
+            .chain(self.vision_inputs.iter().map(|input| &input.feature))
             .chain(self.latent_feature_input.iter())
             .chain(self.latent_input.iter())
             .chain(self.image_input.iter())
@@ -666,7 +681,7 @@ impl Call {
     pub fn buffer_inputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.inputs
             .iter()
-            .chain(self.vision_input.iter())
+            .chain(self.vision_inputs.iter().map(|input| &input.feature))
             .chain(self.latent_feature_input.iter())
             .chain(self.image_input.iter())
     }
@@ -878,7 +893,10 @@ impl Call {
             input.validate()?;
             ensure_valid!(
                 input.request_key == self.request_key
-                    || Some(input) == self.vision_input.as_ref()
+                    || self
+                        .vision_inputs
+                        .iter()
+                        .any(|vision| &vision.feature == input)
                     || Some(input) == self.latent_feature_input.as_ref(),
                 "request-local tensor belongs to another request"
             );
