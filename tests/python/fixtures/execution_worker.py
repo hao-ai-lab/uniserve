@@ -29,6 +29,7 @@ def execution_worker(
     execution: WorkerConfig | None = None,
     max_batch_tokens: int = 8192,
     max_request_pool_size: int = 128,
+    encoder_cache_entries: int | None = None,
     max_batch_calls: int | None = None,
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     bindings: Mapping[str, ComponentBinding] | None = None,
@@ -46,6 +47,11 @@ def execution_worker(
         worker_config = replace(
             worker_config,
             max_batch_calls=int(max_batch_calls),
+        )
+    if encoder_cache_entries is not None:
+        worker_config = replace(
+            worker_config,
+            encoder_cache_entries=int(encoder_cache_entries),
         )
     policy = (
         WorkerConfig(

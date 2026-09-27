@@ -12,7 +12,9 @@ back in the official shape. The tests check what a client observes:
 - a fact stated at the start of the prompt is read back at prompt lengths
   around the 1023-token sliding window and beyond it, where only the full
   attention layers still see it;
-- attached images, one or eight, are read in ``x_images`` order.
+- attached images, one or eight, are read in ``x_images`` order;
+- a stream of distinct images longer than the encoder cache retains is read
+  in full, each image answered after the cache fills.
 
 The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
 (BF16) and ``UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL`` (NVFP4). The worker
@@ -40,6 +42,7 @@ from tests.python.e2e.http_helpers import (
     server_process,
 )
 from uniserve_models import loading as models
+from uniserve_worker.config.execution import WorkerConfig
 
 pytestmark = [
     pytest.mark.e2e,
@@ -240,3 +243,38 @@ def test_attached_images_are_read_in_order(served, count):
         response["usage"]["input_tokens"] - text_only["usage"]["input_tokens"]
     )
     assert added >= soft + 2 * count
+
+
+def test_distinct_images_beyond_the_encoder_cache_are_read(served):
+    """Every image of a stream longer than the encoder cache is read.
+
+    The served worker keeps the default encoder cache budget. Each request
+    attaches one image no earlier request used, so every image is encoded
+    and, past the budget, encoded while the cache holds its full set of
+    retained features.
+    """
+    base_url, _ = served
+    entries = WorkerConfig().encoder_cache_entries
+    names = list(COLORS)
+    with httpx.Client(timeout=600.0) as client:
+        for index in range(entries + 8):
+            # The size identifies the image; the color is the expected answer.
+            color = names[index % len(names)]
+            size = (64 + index % 64, 64 + index // 64)
+            body = {
+                "model": SERVED_MODEL,
+                "state": "The attached image is a plain color swatch.",
+                "questions": {
+                    "color": {
+                        "type": "choice",
+                        "instructions": "Which color fills Image 1?",
+                        "criteria": dict.fromkeys(COLORS),
+                    }
+                },
+                "x_images": [_png(COLORS[color], size)],
+            }
+            response = client.post(f"{base_url}/v1/systemone", json=body)
+            assert response.status_code == 200, (index, response.text)
+            answer = response.json()["answers"]["color"]
+            _assert_well_formed(answer)
+            assert _choice(answer) == color, (index, answer)
