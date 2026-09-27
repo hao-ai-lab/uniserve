@@ -20,15 +20,17 @@ and call kind, and every call replays the smallest bucket that holds its
 canvases; after startup a call no captured bucket holds fails. A canvas
 step graph holds the whole step: the pass, the head and the sampler of
 every chunk, and the commit of the stepped state, for the one sampling the
-deployment serves. A readout graph holds the pass up to the final layer's
-attention output (``TokenDenoiser.attend``), over the bucket's canvases'
-worth of tokens in up to twice as many sequences, so it serves canvases of
-any length up to the model's; the rest of the final layer, the output norm
-and the head run after the replay on the live slot rows alone
-(``TokenDenoiser.finish``), whose number and candidates vary from call to
-call. Every sequence of a canvas graph, padding included, is at most one
-canvas long, which bounds its attention launch. Padding sequences read no
-prefix, and a padding step row starts a canvas in the sentinel slot zero.
+deployment serves; a call whose rows all start their canvas replays its own
+graph, whose pass skips the self-conditioning signal, zero at step zero. A
+readout graph holds the pass up to the final layer's attention output
+(``TokenDenoiser.attend``), over the bucket's canvases' worth of tokens in
+up to twice as many sequences, so it serves canvases of any length up to
+the model's; the rest of the final layer, the output norm and the head run
+after the replay on the live slot rows alone (``TokenDenoiser.finish``),
+whose number and candidates vary from call to call. Every sequence of a
+canvas graph, padding included, is at most one canvas long, which bounds
+its attention launch. Padding sequences read no prefix, and a padding step
+row starts a canvas in the sentinel slot zero.
 """
 
 from __future__ import annotations
@@ -192,7 +194,13 @@ class CanvasRunner(ModelRunner):
         scale = self.model.backbone.embedding_scale
 
         sampler.start_canvas(state, vocab_size=vocab)
-        hidden = self.model(inputs.canvas)
+        # A canvas's first pass has a zero self-conditioning signal, whose
+        # mixing is exactly the unweighted norm (``SelfConditioning``).
+        hidden = self.model(
+            replace(inputs.canvas, self_conditioning=None)
+            if inputs.first
+            else inputs.canvas
+        )
 
         results = torch.empty(
             (rows, 1 + length), dtype=torch.int64, device=hidden.device
@@ -279,7 +287,8 @@ class CanvasRunner(ModelRunner):
         ineligible call. Otherwise returns ``(key, padded_batch, True)``: a
         readout key is ``("canvas", rows)`` and its padded batch holds the
         canvas pass's input alone; a step key is ``("canvas_step", rows,
-        sampling)``.
+        sampling, first)``, where ``first`` is whether every row starts its
+        canvas; padding rows start one too.
 
         Raises:
             CUDAGraphError: The call holds more canvases than every bucket,
@@ -309,6 +318,7 @@ class CanvasRunner(ModelRunner):
                 "canvas_step",
                 rows,
                 padded.inputs.sampling[0],
+                padded.inputs.first,
             )
         else:
             padded = _pad_readout(batch, rows, length, widths)
