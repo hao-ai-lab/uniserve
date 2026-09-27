@@ -1585,6 +1585,11 @@ impl Scheduler {
                 // the block, so the block's steps run back to back without
                 // waiting for each result. A step past the block's step limit
                 // is never queued, since the last step always stops it.
+                //
+                // A block's first step may likewise be queued behind the
+                // prefill that completes its context: the prompt's last
+                // chunk, or the previous block's commit, which makes the
+                // planned step the next block's step zero.
                 let st = self.running.get(&id)?;
                 let canvas = st.req.canvas.as_ref()?;
                 let canvas_length = canvas.canvas_length as usize;
@@ -1597,10 +1602,26 @@ impl Scheduler {
                 {
                     return None;
                 }
-                let block = st.canvas_block;
-                let step = st
-                    .canvas_step
-                    .saturating_add(u32::try_from(pending).unwrap_or(u32::MAX));
+                let queued = self.inflight.pending_calls.get(&id);
+                let steps_in_flight = queued.map_or(0, |calls| {
+                    calls
+                        .iter()
+                        .filter(|inflight| inflight.call.canvas.is_some())
+                        .count()
+                });
+                let commit_in_flight = st.phase == Phase::CommitCanvas
+                    && queued.is_some_and(|calls| {
+                        calls
+                            .iter()
+                            .any(|inflight| is_prompt_extend(&inflight.call))
+                    });
+                let (block, first_step) = if commit_in_flight {
+                    (st.canvas_block.saturating_add(1), 0)
+                } else {
+                    (st.canvas_block, st.canvas_step)
+                };
+                let step =
+                    first_step.saturating_add(u32::try_from(steps_in_flight).unwrap_or(u32::MAX));
                 if step >= canvas.max_steps {
                     return None;
                 }

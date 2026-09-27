@@ -1586,9 +1586,15 @@ impl Scheduler {
                     Phase::Prefill
                 }
                 // Steps queued behind the accepted one that stopped the block
-                // are no-ops; the block's commit follows them.
+                // are no-ops; the block's commit follows them. A step queued
+                // behind the commit itself starts the next block.
                 CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
-                    if state.phase == Phase::CommitCanvas {
+                    let behind_commit = self.inflight.pending_calls.get(&id).is_some_and(|calls| {
+                        calls
+                            .iter()
+                            .any(|inflight| is_prompt_extend(&inflight.call))
+                    });
+                    if state.phase == Phase::CommitCanvas && !behind_commit {
                         Phase::CommitCanvas
                     } else {
                         Phase::Canvas
@@ -1837,9 +1843,19 @@ impl Scheduler {
                     < state.req.max_und_tokens;
         }
 
-        // Other successor kinds require a completion predicate and an exact
-        // projected physical variant match.
-        predecessor.call.completion_output.is_some()
+        // Other successor kinds require an exact projected physical variant
+        // match and, unless they follow unconditionally, a completion
+        // predicate. The canvas pass that follows the prefill completing a
+        // context (a readout's pass or a block's first step) always runs,
+        // since the prefill cannot stop the request, so it carries no
+        // predicate. It reads the KV the prefill writes, and only the
+        // worker's device order puts the write first: forwards run in
+        // submission order on one stream, and a forward on an execution lane
+        // forks from and joins back into the device's control stream
+        // (`ModelExecutor.forward` in uniserve_worker).
+        let unconditional = target == CallKind::Forward(ForwardMode::TokenDenoising)
+            && is_prompt_extend(&predecessor.call);
+        (predecessor.call.completion_output.is_some() || unconditional)
             && self
                 .pending_successor_code(id)
                 .is_some_and(|variant| variant == target)

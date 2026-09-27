@@ -503,3 +503,48 @@ fn a_block_diffusion_runtime_serves_only_readouts() {
         );
     }
 }
+
+/// With room for two batches in flight, a readout's canvas pass is queued
+/// behind the prefill that completes its prompt, before that prefill
+/// resolves, and the answer is unchanged.
+#[test]
+fn a_readout_pass_is_queued_behind_its_prompt_prefill() {
+    let mut sim = readout_worker();
+    sim.set_queue_depth(2);
+    sim.set_results_on_wait(true);
+    let running = Running::start(sim, SchedulerConfig::default());
+    let request = readout_request(11, prompt(40, 1000), vec![row(32, &[(3, &[7, 8])])]);
+    let answer = events(running.submit(request.clone()));
+    running.handle.shutdown();
+    assert!(!running.thread.join().unwrap(), "the scheduler failed");
+    assert_answered(&answer, &request);
+
+    // The submission of the first batch holding a call of `code`.
+    let history: Vec<BatchEvent> = running.batches.try_iter().collect();
+    let submitted = |code: CallKind| {
+        history
+            .iter()
+            .position(|event| match event {
+                BatchEvent::Submitted(batch) => {
+                    batch.requests.iter().any(|(call, _)| call.code == code)
+                }
+                BatchEvent::Resolved { .. } => false,
+            })
+            .unwrap()
+    };
+    let prefill = submitted(CallKind::Forward(ForwardMode::Prefill));
+    let pass = submitted(CallKind::Forward(ForwardMode::TokenDenoising));
+    let BatchEvent::Submitted(prefill_batch) = &history[prefill] else {
+        unreachable!("the position names a submission");
+    };
+    let prefill_resolved = history
+        .iter()
+        .position(|event| {
+            matches!(event, BatchEvent::Resolved { batch_id } if *batch_id == prefill_batch.id)
+        })
+        .unwrap();
+    assert!(
+        pass < prefill_resolved,
+        "the readout pass waited for its prefill to resolve"
+    );
+}
