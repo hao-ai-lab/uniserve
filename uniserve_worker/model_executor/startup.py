@@ -161,39 +161,83 @@ def stage_text(
 
 
 def capture_lengths(
-    shape: PrefillShape, row_tokens: int, page_tokens: int
+    shape: PrefillShape,
+    row_tokens: int,
+    pages: Sequence[tuple[int, int]],
+    units: int,
 ) -> tuple[int, ...]:
     """Return the row lengths of the startup batch that captures ``shape``.
 
-    The rows total the bucket's tokens and number its ``live_rows``, or more
-    when a row, which holds at most ``row_tokens`` (the most one request
-    appends in a call), cannot hold its share, up to one less than the
-    bucket's row count; tokens those rows cannot hold become the bucket's
-    padding sequence. The tokens are spread over the rows in whole pages of
-    ``page_tokens``, the largest page of any cache group, so the batch
-    occupies ``max(rows, ceil(tokens / page_tokens))`` pages of each group
-    at most: no more than the unit pool must hold for any batch of that many
-    rows and tokens the engine forms.
+    ``pages`` holds ``(page_tokens, units_per_page)`` of every cache group
+    and ``units`` the unit pool's allocatable units, which the batch's pages
+    fit. The batch numbers the bucket's ``live_rows`` rows, or more when a
+    row, which holds at most ``row_tokens`` (the most one request appends in
+    a call), cannot hold its share, up to one less than the bucket's row
+    count and at most the rows the pool holds a page of every group for. It
+    holds the most tokens up to the bucket's whose rows fit the pool;
+    tokens it does not hold become the bucket's padding sequence. Its rows
+    hold exactly ``prefill_units`` units: the fewest any batch of as many
+    rows and tokens holds (see ``_spread``).
     """
+    row_units = sum(count for _, count in pages)
     rows = max(shape.live_rows, ceil_div(shape.token_bucket, row_tokens))
-    rows = max(1, min(rows, shape.row_bucket - 1))
-    remaining = min(shape.token_bucket, rows * row_tokens)
-    pages = max(rows, ceil_div(remaining, page_tokens))
-    lengths = []
-    for index in range(rows):
-        left = rows - index
-        # An even share of the remaining pages, keeping one token for each
-        # later row; the last row takes what remains.
-        length = min(
-            ceil_div(pages, left) * page_tokens,
-            row_tokens,
-            remaining - (left - 1),
+    rows = max(1, min(rows, shape.row_bucket - 1, units // row_units))
+
+    def cost(lengths):
+        return sum(
+            count * ceil_div(length, page)
+            for length in lengths
+            for page, count in pages
         )
-        if left == 1:
-            length = min(remaining, row_tokens)
-        lengths.append(length)
-        remaining -= length
-        pages -= ceil_div(length, page_tokens)
+
+    # One token per row always fits, since the pool holds a page of every
+    # group for each row; the most tokens whose rows fit is searched above
+    # it. A spread that no row cap admits counts as not fitting.
+    fitted = (1,) * rows
+    low, high = rows, min(shape.token_bucket, rows * row_tokens)
+    while low < high:
+        tokens = (low + high + 1) // 2
+        lengths = _spread(rows, tokens, row_tokens, pages)
+        if lengths is not None and cost(lengths) <= units:
+            low, fitted = tokens, lengths
+        else:
+            high = tokens - 1
+    return fitted
+
+
+def _spread(
+    rows: int,
+    tokens: int,
+    row_tokens: int,
+    pages: Sequence[tuple[int, int]],
+) -> tuple[int, ...] | None:
+    """Spread ``tokens`` over ``rows`` rows in the fewest pages of each group.
+
+    A group whose pages ``tokens`` overfills at one page per row needs
+    ``ceil(tokens / page_tokens)`` pages, which it reaches when every row but
+    one holds whole pages; the others need one page per row, which they
+    reach when no row exceeds their page. Page sizes are powers of two, so
+    the overfilled groups' pages are the smaller ones and divide the largest
+    of them, the step: every row holds whole steps up to the smallest other
+    page, and the last row also holds the remainder below one step. Returns
+    None when rows of at most ``row_tokens`` tokens cannot be spread so.
+    """
+    packed = [page for page, _ in pages if ceil_div(tokens, page) > rows]
+    step = max(packed, default=1)
+    cap = min(
+        (page for page, _ in pages if ceil_div(tokens, page) <= rows),
+        default=row_tokens,
+    )
+    cap = min(cap, row_tokens)
+    if cap < step:
+        return None
+
+    steps, remainder = divmod(tokens, step)
+    base, extra = divmod(steps, rows)
+    lengths = [(base + (index < extra)) * step for index in range(rows)]
+    lengths[-1] += remainder
+    if min(lengths) < 1 or max(lengths) > cap:
+        return None
     return tuple(lengths)
 
 
@@ -208,11 +252,12 @@ def prepare_prefill(
 
     Buckets are ordered by token-times-row footprint, so the first capture
     sizes the runner's shared prefill output. Each capture stages the
-    ``capture_lengths`` rows of its bucket on zeroed scratch KV units, with
-    the bucket's causality and embedding replacement, through serving's
-    staging with its real paged attention input: per-table block tables,
-    device start pages for windowed tables and their host mirrors; the
-    runner's ``select_graph_shape`` pads them to the bucket.
+    ``capture_lengths`` rows of its bucket on zeroed scratch KV units, which
+    the pool's allocatable units hold, with the bucket's causality and
+    embedding replacement, through serving's staging with its real paged
+    attention input: per-table block tables, device start pages for windowed
+    tables and their host mirrors; the runner's ``select_graph_shape`` pads
+    them to the bucket.
 
     Raises:
         ValueError: A bucket is prepared on a worker without a KV cache.
@@ -224,7 +269,10 @@ def prepare_prefill(
     cache = runner.kv_cache
     if cache is None:
         raise ValueError("prefill capture requires the worker KV cache")
-    page_tokens = max(group.page_tokens for group in cache.shapes)
+    pages = tuple(
+        (group.page_tokens, group.units_per_page) for group in cache.shapes
+    )
+    units = cache.info.num_units - 1
     for shape in sorted(
         shapes,
         key=lambda item: (
@@ -233,7 +281,7 @@ def prepare_prefill(
         ),
         reverse=True,
     ):
-        lengths = capture_lengths(shape, row_tokens, page_tokens)
+        lengths = capture_lengths(shape, row_tokens, pages, units)
         count = sum(map(cache.page_units, lengths))
         with cache.startup_units(count) as scratch:
             batch = stage_text(

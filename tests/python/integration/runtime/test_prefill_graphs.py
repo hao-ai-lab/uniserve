@@ -9,7 +9,9 @@ write the KV of eager execution of the same calls, and a replayed call copies
 no device value to the host. After startup, a prefill or decode call no
 captured graph holds fails instead of running eagerly, and the worker
 reports the most rows its prefill and decode graphs hold, at most the rows
-its KV unit pool holds a page of each cache group for.
+its KV unit pool holds a page of each cache group for. On pools of few
+units, whose cache groups have pages of different sizes, startup captures
+every prefill bucket a batch the pool holds selects, and each replays.
 """
 
 from __future__ import annotations
@@ -35,6 +37,10 @@ from uniserve_worker.bootstrap.components import supported_calls
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
+from uniserve_worker.model_executor.graph_inputs import (
+    prefill_captures,
+    prefill_units,
+)
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -78,11 +84,13 @@ UNITS = 1024
 
 
 @contextmanager
-def _diffusion_gemma_worker(root, *, graphs):
+def _diffusion_gemma_worker(root, *, graphs, units=UNITS, slots=4):
     """Bind a DiffusionGemma worker's staged calls over a fresh unit pool.
 
     Startup captures prefill graphs when ``graphs`` is set and runs prefill
-    eagerly otherwise. Yields the executor and the pool's manager.
+    eagerly otherwise. The pool holds ``units`` units and the worker
+    ``slots`` request slots, which also bound its calls. Yields the executor
+    and the pool's manager.
     """
     source = models.read_config(root)
     model = models.load_model(
@@ -94,8 +102,8 @@ def _diffusion_gemma_worker(root, *, graphs):
         device="cuda:0",
         model_dtype="bfloat16",
         block_size=16,
-        max_batch_calls=4,
-        max_request_pool_size=4,
+        max_batch_calls=slots,
+        max_request_pool_size=slots,
         max_batch_tokens=768,
         max_sequence_tokens=SEQUENCE,
         prefill_cuda_graph=graphs,
@@ -105,14 +113,14 @@ def _diffusion_gemma_worker(root, *, graphs):
     processor = source.image_processor
     cache = PrefixCache(
         model.text.cache_config,
-        num_units=UNITS,
+        num_units=units,
         block_size=16,
         device="cuda:0",
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_units=UNITS),
-        request_pool_size=4,
+        info=cache_info(model.text, config, num_units=units),
+        request_pool_size=slots,
         table_width=64,
     )
     runner = ModelExecutor(model, config, image_processor=processor)
@@ -123,16 +131,18 @@ def _diffusion_gemma_worker(root, *, graphs):
             ),
             kv_cache=manager,
             latent_pool=None,
-            decode_predicates=torch.zeros(5, dtype=torch.bool, device="cuda:0"),
-            max_calls=4,
-            request_slots=4,
+            decode_predicates=torch.zeros(
+                slots + 1, dtype=torch.bool, device="cuda:0"
+            ),
+            max_calls=slots,
+            request_slots=slots,
             latent_capacity_units=0,
             table_widths=graph_table_widths(model, config, manager),
             max_inflight=1,
         )
         runner.capture(tokenizer=None, latents=None)
         runner.complete_startup()
-        yield runner, manager
+        yield runner, manager, config
     finally:
         runner.close()
         manager.close()
@@ -293,6 +303,7 @@ def test_prefill_graph_replay_matches_eager_execution(tmp_path, kind):
         with _diffusion_gemma_worker(tmp_path, graphs=graphs) as (
             runner,
             manager,
+            _,
         ):
             slots = range(1, len(prompt) + 1)
             _install(manager, slots, retired=0)
@@ -538,3 +549,89 @@ def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
             _cache_values(manager), before, strict=True
         ):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@SM100
+@torch.inference_mode()
+@pytest.mark.parametrize("units", [12, *range(17, 24), 28])
+def test_a_small_pool_replays_every_prefill_bucket(tmp_path, units):
+    """Every prefill bucket a small pool's batches select captures and replays.
+
+    The test model's cache groups have 16- and 32-token pages of one unit
+    each, and twelve request slots bound its calls, so these pools hold
+    fewer rows and tokens than its buckets' configured sizes. The worker
+    starts, and for every bucket of ``prefill_captures`` over this pool, the
+    batch of the fewest rows and tokens it serves, with its tokens spread
+    evenly over its rows, fits the pool and replays a graph.
+    """
+    diffusion_gemma_checkpoint(
+        tmp_path, text=NATIVE_TEXT, vision=NATIVE_VISION, unit_scores=True
+    )
+    with _diffusion_gemma_worker(
+        tmp_path, graphs=True, units=units, slots=12
+    ) as (runner, manager, config):
+        pages = tuple(
+            (shape.page_tokens, shape.units_per_page)
+            for shape in manager.shapes
+        )
+        shapes = prefill_captures(
+            config,
+            max_rows=min(12, (units - 1) // manager.row_units),
+            max_tokens=min(768, manager.token_capacity),
+            image_builder=False,
+            feature_injection=True,
+            pool=(pages, units - 1),
+        )
+        assert shapes
+
+        generator = torch.Generator().manual_seed(29)
+        previous = {}
+        for shape in shapes:
+            # A bucket serves batches of at least its live rows and more
+            # tokens than the next smaller bucket of its rows and kind.
+            kind = (shape.row_bucket, shape.causal, shape.embeddings)
+            rows = shape.live_rows
+            tokens = max(rows, previous.get(kind, 0) + 1)
+            previous[kind] = shape.token_bucket
+            lengths = [tokens // rows] * rows
+            for index in range(tokens % rows):
+                lengths[index] += 1
+            assert prefill_units(pages, rows, tokens) <= units - 1
+            assert sum(map(manager.page_units, lengths)) <= units - 1
+
+            entries, unit = [], 1
+            for slot, length in enumerate(lengths, start=1):
+                for group, page in enumerate(manager.shapes):
+                    count = ceil_div(length, page.page_tokens)
+                    held = count * page.units_per_page
+                    entries.append(
+                        (
+                            slot,
+                            group,
+                            0,
+                            tuple(range(unit, unit + held)),
+                            count * page.page_tokens,
+                        )
+                    )
+                    unit += held
+            manager.block_tables.install(tuple(entries))
+
+            batch = _rows(
+                tuple(
+                    torch.randint(7, 58, (length,), generator=generator)
+                    for length in lengths
+                ),
+                prefix=0,
+                selections=(TokenSelection.LAST_LOGITS,) * rows,
+                causal=shape.causal,
+                embeddings=tuple(
+                    torch.randn((length, 32), generator=generator).to(
+                        torch.bfloat16
+                    )
+                    for length in lengths
+                )
+                if shape.embeddings
+                else None,
+            )
+            output = _call(runner, manager, batch)
+            assert output.stats.cuda_graph_replays == 1, shape
