@@ -10,6 +10,7 @@ when a kernel supports their layout.
 from ._activation import (
     gelu_and_mul,
     silu_and_mul,
+    softcap,
     swiglu,
     swiglu_absmax,
     value_first_swiglu,
@@ -61,6 +62,7 @@ __all__ = [
     "scaled_residual_rms_norm_",
     "scaled_residual_rms_norm_absmax_",
     "silu_and_mul",
+    "softcap",
     "swiglu",
     "swiglu_absmax",
     "topk_softmax",

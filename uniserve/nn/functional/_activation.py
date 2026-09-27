@@ -348,3 +348,40 @@ def swiglu_absmax(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return :func:`swiglu` and the FP32 absmax of its rounded output."""
     return _swiglu(value, gate, value_bias, gate_bias, absmax=True)
+
+
+def softcap(
+    x: torch.Tensor,
+    cap: float,
+    *,
+    dtype: torch.dtype = torch.float32,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Bound values to ``(-cap, cap)`` as ``tanh(x / cap) * cap``.
+
+    Evaluates ``torch.tanh(x.float() / cap) * cap`` in FP32, rounded once to
+    ``dtype`` (or ``out``'s dtype). On CUDA one launch reads ``x`` and
+    writes the result, bit-identical to that tensor expression; ``out``, a
+    contiguous tensor of ``x``'s shape, receives it directly.
+    """
+    from uniserve_kernels import activation
+
+    if out is not None:
+        dtype = out.dtype
+    if x.is_cuda:
+        target = (
+            torch.empty(x.shape, dtype=dtype, device=x.device)
+            if out is None
+            else out
+        )
+        require_kernel(
+            "softcap",
+            activation.unsupported_softcap(x, target),
+            x=x,
+            out=target,
+        )
+        activation.softcap(x, cap, target)
+        return target
+
+    capped = (torch.tanh(x.float() / cap) * cap).to(dtype)
+    return capped if out is None else out.copy_(capped)
