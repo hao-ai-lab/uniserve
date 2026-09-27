@@ -4,11 +4,13 @@ The provider serves W4A4 NVFP4 experts whose activations use the static
 calibrated scales of ``up_gate.input_quantizer`` and
 ``down.input_quantizer``, with SiLU (``Swiglu``) or tanh-approximated GELU
 (``Geglu``) gating, over routing the model has already computed. One call
-encodes the hidden states to NVFP4 with FlashInfer's ``fp4_quantize`` and
-launches ``trtllm_fp4_block_scale_routed_moe``, which permutes the routed
-tokens, runs the gated FC1 GEMM with FP32 accumulation, encodes the gated
-product to NVFP4 inside its epilogue, runs FC2, and combines each token's
-routes with its FP32 route weights into the BF16 output.
+reads hidden states in that NVFP4 input encoding, as a caller stored them or
+as FlashInfer's ``fp4_quantize`` encodes BF16 hidden states (see
+``NVFP4Operator``), and launches ``trtllm_fp4_block_scale_routed_moe``,
+which permutes the routed tokens, runs the gated FC1 GEMM with FP32
+accumulation, encodes the gated product to NVFP4 inside its epilogue, runs
+FC2, and combines each token's routes with its FP32 route weights into the
+BF16 output.
 
 The kernels read expert weights in TensorRT-LLM's shuffled row order:
 ``up_gate`` with its up and gate halves interleaved and shuffled
@@ -22,16 +24,16 @@ portable reference decode them identically, and only one copy stays
 resident. The intermediate width is read unpadded.
 
 Every buffer of a call comes from PyTorch's caching allocator. FlashInfer's
-public calls take no caller workspace and allocate the encoded hidden
-states and their block scales, the routing permutation and per-expert tile
-metadata, the FC1 and FC2 intermediates and both GEMM work areas
-themselves; the provider allocates the output the caller receives. Eager
-calls return them to the allocator; a CUDA graph capture draws them from
-the graph's private pool, which keeps them at fixed addresses for every
+public calls take no caller workspace and allocate the hidden states'
+encoding (when the call encodes them), the routing permutation and
+per-expert tile metadata, the FC1 and FC2 intermediates and both GEMM work
+areas themselves; the provider allocates the output the caller receives.
+Eager calls return them to the allocator; a CUDA graph capture draws them
+from the graph's private pool, which keeps them at fixed addresses for every
 replay. Nothing is context-owned, so ``workspace_buffers`` is empty. Kernel
 selection for a token count happens on the host at call time from
-FlashInfer's tactic cache; capture must follow an eager call at the
-captured token count, as for every prepared operator.
+FlashInfer's tactic cache; capture must follow an eager call at the captured
+token count, as for every prepared operator.
 """
 
 from __future__ import annotations
@@ -40,21 +42,18 @@ import torch
 
 from uniserve.quantization import RowOrder
 
-from . import NVFP4Backend
-from . import Operator as _Operator
+from . import NVFP4Backend, NVFP4Operator
 
 
-class _TrtllmGen(_Operator):
+class _TrtllmGen(NVFP4Operator):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        from flashinfer import fp4_quantize
         from flashinfer.fused_moe import (
             ActivationType,
             trtllm_fp4_block_scale_routed_moe,
         )
         from flashinfer.tllm_enums import RoutingMethodType
 
-        self._quantize = fp4_quantize
         self._kernel = trtllm_fp4_block_scale_routed_moe
         module = self.module
         self._activation = (
@@ -105,7 +104,6 @@ class _TrtllmGen(_Operator):
             device=device,
         )
         alpha13 = fields13["tensor_scale"] * input13
-        self._input_scale = input13.reciprocal()
         self._gate_scale = alpha13
         self._linear_scale = alpha13 * input2.reciprocal()
         self._down_scale = fields2["tensor_scale"] * input2
@@ -120,20 +118,14 @@ class _TrtllmGen(_Operator):
 
     def __call__(self, hidden, topk_ids, topk_weights):
         self._validate(hidden, topk_ids, topk_weights)
-        output = torch.empty_like(hidden)
+        output = torch.empty(
+            hidden.shape, dtype=torch.bfloat16, device=hidden.device
+        )
         tokens = hidden.shape[0]
         if not tokens:
             return output
 
-        # The kernels read the linear token-major [T, H / 16] block scales.
-        values, scales = self._quantize(
-            hidden.contiguous(),
-            global_scale=self._input_scale,
-            is_sf_swizzled_layout=False,
-        )
-        scales = scales.view(torch.float8_e4m3fn).reshape(
-            tokens, hidden.shape[1] // 16
-        )
+        values, scales = self._encoded(hidden)
         self._kernel(
             topk_ids=(topk_ids.contiguous(), topk_weights.contiguous()),
             routing_bias=None,
@@ -171,7 +163,7 @@ class _TrtllmGen(_Operator):
         # Release the borrowed weight fields and derived scales, so a closed
         # operator never keeps a replaced encoding resident.
         self._fc1 = self._fc2 = self._fc1_scale = self._fc2_scale = None
-        self._input_scale = self._gate_scale = None
+        self._gate_scale = None
         self._linear_scale = self._down_scale = None
 
 

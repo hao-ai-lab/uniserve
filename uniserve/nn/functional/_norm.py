@@ -8,11 +8,16 @@ evaluate the same formula with tensor operations.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch.nn import functional as F
 from uniserve_kernels.triton import require_kernel
 
 from ._tensors import check_output, result
+
+if TYPE_CHECKING:
+    from uniserve.quantization import Quantizer
 
 
 def _rms(value: torch.Tensor, eps: float) -> torch.Tensor:
@@ -125,6 +130,7 @@ def sandwich_rms_norm(
     eps: float,
     scale: torch.Tensor | None = None,
     norms: tuple[tuple, ...] = (),
+    encodings: tuple[Quantizer | None, ...] = (),
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """Add post-normalized sublayer outputs to a residual stream.
 
@@ -141,10 +147,15 @@ def sandwich_rms_norm(
     (vectors over the width or numbers); a ``None`` weight normalizes
     without one. Every step rounds to the residual dtype exactly as that
     tensor expression does, and each normalization accumulates in FP32; all
-    normalizations share ``eps``. Returns the stream and the tuple of
-    normalizations. Inputs are not modified. On CUDA one launch evaluates
-    the whole expression and its results are bit-identical to the
-    :func:`rms_norm` launches and tensor operations it replaces.
+    normalizations share ``eps``. ``encodings`` pairs normalizations, in
+    order, with a calibrated NVFP4 ``Quantizer`` or ``None``: a
+    normalization with a quantizer returns as
+    ``quantizer.quantize(normalization)``, a ``QuantizedTensor`` with linear
+    block scales, as the consumer that reads that encoding would encode it.
+    Returns the stream and the tuple of normalizations. Inputs are not
+    modified. On CUDA one launch evaluates the whole expression, encodings
+    included, and its results are bit-identical to the :func:`rms_norm`
+    launches, tensor operations and encodings it replaces.
     """
     from uniserve_kernels.norm import sandwich
 
@@ -164,18 +175,41 @@ def sandwich_rms_norm(
                 "normalization weights must match the final width and device"
             )
 
+    if len(encodings) > len(norms):
+        raise ValueError("sandwich encodings exceed the normalizations")
+    encodings = tuple(encodings) + (None,) * (len(norms) - len(encodings))
+
     if residual.is_cuda:
         require_kernel(
             "sandwich_rms_norm",
-            sandwich.unsupported(residual, updates, weight, scale, norms),
+            sandwich.unsupported(
+                residual, updates, weight, scale, norms, encodings
+            ),
             residual=residual,
             **{f"update{i}": update for i, (update, _) in enumerate(updates)},
             scale=scale,
         )
         stream = torch.empty_like(residual)
-        outputs = tuple(torch.empty_like(residual) for _ in norms)
+        outputs = tuple(
+            torch.empty_like(residual)
+            if quantizer is None
+            else quantizer.empty(
+                tuple(residual.shape),
+                dtype=residual.dtype,
+                device=residual.device,
+            )
+            for quantizer in encodings
+        )
         sandwich.sandwich(
-            residual, updates, weight, scale, norms, eps, stream, outputs
+            residual,
+            updates,
+            weight,
+            scale,
+            norms,
+            eps,
+            stream,
+            outputs,
+            encodings,
         )
         return stream, outputs
 
@@ -200,7 +234,10 @@ def sandwich_rms_norm(
         for factor in factors:
             value = value * factor
         normalized.append(value)
-    return stream, tuple(normalized)
+    return stream, tuple(
+        value if quantizer is None else quantizer.quantize(value)
+        for value, quantizer in zip(normalized, encodings, strict=True)
+    )
 
 
 def _autocast_dtype(value: torch.Tensor) -> torch.dtype:

@@ -91,8 +91,12 @@ class FusedMoE(nn.Module):
         sum_k topk_weights[t, k] * down_e(act(gate_e(x_t)) * up_e(x_t)),
         e = topk_ids[t, k],
 
-    where ``act`` is SiLU or tanh-approximated GELU. Routing belongs to the
-    model; this module consumes its result. Tensor-parallel binding splits
+    where ``act`` is SiLU or tanh-approximated GELU. ``hidden`` may arrive
+    already encoded as ``up_gate.input_quantizer.quantize(hidden)`` would
+    encode it (a producer that stores its rows in that encoding directly,
+    such as ``sandwich_rms_norm``, saves the separate encoding pass); the
+    kernels then read it as stored. Routing belongs to the model; this
+    module consumes its result. Tensor-parallel binding splits
     ``I`` across the tensor-parallel group and sums the partial outputs once
     after combining the experts. Expert-parallel binding
     (``uniserve.distributed.partition_experts``) keeps the global experts

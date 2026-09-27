@@ -50,6 +50,17 @@ class Operator:
             raise RuntimeError("expert operator is closed")
         if hidden.shape[0] > self.size.num_tokens:
             raise ValueError("routed tokens exceed the prepared token capacity")
+        # Hidden states may arrive already in the encoding the experts read
+        # them in (see ``FusedMoE``), with the linear block scales every
+        # provider gathers token rows from.
+        if isinstance(hidden, QuantizedTensor) and (
+            hidden.quantizer != self.module.up_gate.input_quantizer
+            or hidden.scale_layout is not ScaleLayout.LINEAR
+        ):
+            raise ValueError(
+                "encoded hidden states must use the experts' input encoding "
+                "with linear block scales"
+            )
 
     def __call__(
         self,
@@ -71,6 +82,50 @@ class Operator:
         self._closed = True
         self.module = None
         self.workspace = {}
+
+
+class NVFP4Operator(Operator):
+    """An operator whose kernels read NVFP4 hidden states.
+
+    The kernels gather token rows of ``[T, H / 2]`` packed E2M1 values and
+    linear ``[T, H / 16]`` E4M3 block scales encoded with the static
+    calibrated scale of ``up_gate.input_quantizer``. Hidden states already
+    in that encoding (as ``sandwich_rms_norm`` stores a normalization the
+    experts read) are read as stored; BF16 hidden states are encoded with
+    FlashInfer's ``fp4_quantize``, which stores the same bytes.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        from flashinfer import fp4_quantize
+
+        self._quantize = fp4_quantize
+        # The encoder's global scale is 1 / s for the static scale s.
+        self._input_scale: torch_lib.Tensor | None = torch_lib.tensor(
+            [self.module.up_gate.input_quantizer.calibrated_scale],
+            dtype=torch_lib.float32,
+            device=self.module.up_gate.weight.device,
+        ).reciprocal()
+
+    def _encoded(self, hidden):
+        """Return the E2M1 values and E4M3 block scales of ``hidden``."""
+        tokens, width = hidden.shape
+        if isinstance(hidden, QuantizedTensor):
+            fields = hidden.buffers()
+            values, scales = fields["values"], fields["block_scale"]
+        else:
+            values, scales = self._quantize(
+                hidden.contiguous(),
+                global_scale=self._input_scale,
+                is_sf_swizzled_layout=False,
+            )
+        return values, scales.view(torch_lib.float8_e4m3fn).reshape(
+            tokens, width // 16
+        )
+
+    def close(self) -> None:
+        super().close()
+        self._input_scale = None
 
 
 class Backend:

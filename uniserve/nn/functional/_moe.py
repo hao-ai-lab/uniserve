@@ -17,7 +17,12 @@ def _dense(weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
 
 def _encoded(value: torch.Tensor, quantizer) -> torch.Tensor:
-    """Round activations through their static encoding, as kernels read them."""
+    """Round activations through their static encoding, as kernels read them.
+
+    Activations already in that encoding decode as they are stored.
+    """
+    if isinstance(value, QuantizedTensor):
+        return value.dequantize()
     return value if quantizer is None else quantizer.round_trip(value)
 
 
@@ -86,8 +91,9 @@ def fused_moe(
 ) -> torch.Tensor:
     """Evaluate routed experts one selected expert at a time.
 
-    ``hidden`` is ``[T, H]``; ``up_gate`` is ``[E, 2I, H]`` (up rows then
-    gate rows) and ``down`` is ``[E, H, I]``, dense or encoded. ``topk_ids``
+    ``hidden`` is ``[T, H]``, dense or already in ``input_quantizers[0]``'s
+    encoding; ``up_gate`` is ``[E, 2I, H]`` (up rows then gate rows) and
+    ``down`` is ``[E, H, I]``, dense or encoded. ``topk_ids``
     and ``topk_weights`` are ``[T, K]``. ``input_quantizers`` are the static
     activation encodings read by the two projections, or None. Each expert's
     projections run in the hidden dtype; the weighted combination

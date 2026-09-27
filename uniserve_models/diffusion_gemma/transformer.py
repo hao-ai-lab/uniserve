@@ -274,6 +274,9 @@ class Layer(nn.Module, PhasedLayer):
                 (self.moe.input_norm.weight,),
                 self.moe.router.input_factors(),
             ),
+            # The experts' input is stored in the encoding their first
+            # projection reads (None for dense experts).
+            encodings=(None, self.moe.experts.up_gate.input_quantizer),
         )
 
         dense = self.mlp(dense_input)
