@@ -737,14 +737,17 @@ def _prepare_predicates(
     for `capture_predicates`. The buffer is sealed once every row is
     captured, and `BatchState.predicate_values` reads it after the copies
     complete. I64 relay predicates are not captured here; `_consume_predicates`
-    hands them to execution as device tensors.
+    hands them to execution as device tensors. Nor are the predicates of
+    calls gated on the device (`calls.device_gated`).
     """
     # Predicate rows occupy one compact completion buffer regardless of whether
     # their source is already local or will arrive through a prepared transfer.
     scheduled = tuple(
         call
         for call in state.batch.calls
-        if call.predicate is not None and call.predicate.dtype is DType.U8
+        if call.predicate is not None
+        and call.predicate.dtype is DType.U8
+        and not calls.device_gated(call)
     )
     if not scheduled:
         return

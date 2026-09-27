@@ -622,7 +622,11 @@ def publish_forward_values(
             call.kind is ForwardMode.TOKEN_DENOISING and call.canvas is not None
         ):
             outcomes[index] = canvas.publish_step(
-                call, value, request_tables=request_tables, state=state
+                call,
+                value,
+                request_tables=request_tables,
+                state=state,
+                tensor_store=tensor_store,
             )
         elif call.kind is ForwardMode.TOKEN_DENOISING:
             # Canvas rows of one call arrive in row order.

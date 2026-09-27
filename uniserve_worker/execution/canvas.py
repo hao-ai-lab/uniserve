@@ -33,10 +33,12 @@ from uniserve_worker.model_executor.input_batch import (
 )
 from uniserve_worker.protocol.call import Call, CallStatus, ForwardMode
 from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.storage.canvas_slots import STEP_CONTINUED
 
 if TYPE_CHECKING:
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.canvas_slots import CanvasSlots
+    from uniserve_worker.storage.tensor_store import TensorStore
 
 
 def prepare_rows(
@@ -253,15 +255,19 @@ def publish_step(
     *,
     state: BatchState,
     request_tables: BlockTables | None,
+    tensor_store: TensorStore,
 ) -> PendingOutput:
-    """Capture a canvas step's stop flag and tokens and stage its outcome.
+    """Capture a canvas step's outcome and tokens and stage its outcome.
 
     ``value`` is the row's int64 ``[1 + canvas]`` vector (``CanvasRunner``):
-    its stop flag and its truncated argmax canvas. Both are captured into
-    the batch's output buffer, which reaches the host with the batch's one
+    its outcome and its truncated argmax canvas. Both are captured into the
+    batch's output buffer, which reaches the host with the batch's one
     completion copy; ``PendingOutput.materialize`` reports the tokens as the
-    call's committed tokens when the flag is set. The outcome reports the
-    request's coordinates unchanged, since the step wrote no KV.
+    call's committed tokens when the step stopped the block, and a skipped
+    step as predicated. The call's completion output receives, on the
+    device, whether the block continues after the step: the predicate of a
+    step queued behind it. The outcome reports the request's coordinates
+    unchanged, since the step wrote no KV.
 
     Raises:
         WorkerError: ``invalid_descriptor`` when the value does not hold the
@@ -273,6 +279,12 @@ def publish_step(
     ):
         raise invalid_descriptor("a canvas step does not cover its canvas")
     request.token.canvas_range = state.output_buffer.capture(value)
+    write = request.completion_write
+    if write is not None:
+        (view,) = tensor_store.producer_write_views((write,))
+        tensor_store.publish_writes(
+            (write,), (value[:1] == STEP_CONTINUED).to(view.dtype)
+        )
 
     cache = calls.cache_coordinates(request, tables=request_tables)
     request.status = CallStatus.OK

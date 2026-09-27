@@ -12,8 +12,12 @@ step zero start their canvas before the pass reads it, and after the pass
 the sampler scores the full-canvas logits, decides each row's next canvas
 and stop, and writes the next pass's self-conditioning embedding. The
 stepped state returns to the rows' request slots (``CanvasSlots``). Each row
-reports its stop flag and its end-of-sequence truncated argmax canvas as one
-int64 ``[1 + canvas]`` vector, which the batch copies to the host once.
+reports its outcome (``STEP_CONTINUED`` or ``STEP_STOPPED``) and its
+end-of-sequence truncated argmax canvas as one int64 ``[1 + canvas]``
+vector, which the batch copies to the host once. A step queued behind the
+one that stopped its block runs as a no-op, decided on the device from its
+slot's continuation flag: its state stays as the stopping step left it,
+and it reports ``STEP_SKIPPED``.
 
 On CUDA, startup captures one graph per canvas row bucket (``canvas_rows``)
 and call kind, and every call replays the smallest bucket that holds its
@@ -49,6 +53,7 @@ from uniserve.nn.attention import (
     SequenceLengths,
 )
 from uniserve.runtime.cuda_graph import CUDAGraphError
+from uniserve_worker.storage.canvas_slots import STEP_CONTINUED, STEP_SKIPPED
 
 from .graph_inputs import _fixed_view, capture_hidden, replay_hidden
 from .input_batch import CanvasStepInput, InputBatch, ReadoutInput
@@ -180,9 +185,13 @@ class CanvasRunner(ModelRunner):
         constants, and the sampler steps them. The stepped state returns to
         the rows' slots.
 
-        Returns one int64 ``[1 + canvas]`` vector per row: 1 when the step
-        finished the row's block and 0 otherwise, followed by the block's
-        argmax tokens, padded after its first end-of-sequence token.
+        Returns one int64 ``[1 + canvas]`` vector per row: ``STEP_STOPPED``
+        when the step finished the row's block and ``STEP_CONTINUED``
+        otherwise, followed by the block's argmax tokens, padded after its
+        first end-of-sequence token. A row whose block an earlier step
+        stopped (its slot's ``CanvasSlots.live`` flag is clear and it is not
+        at step zero) is computed but not committed, and reports
+        ``STEP_SKIPPED``.
         """
         slots = self.canvas_slots
         if slots is None:
@@ -192,6 +201,13 @@ class CanvasRunner(ModelRunner):
         vocab = slots.vocab_size
         embedding = self.model.backbone.embedding.weight
         scale = self.model.backbone.embedding_scale
+
+        # A queued step runs only while its block continues; step zero
+        # starts a block and always runs. Decided on the device, so the call
+        # never waits for the host to observe the step before it.
+        active = (state.step == 0) | (
+            slots.live.index_select(0, inputs.slots) != 0
+        )
 
         sampler.start_canvas(state, vocab_size=vocab)
         # A canvas's first pass has a zero self-conditioning signal, whose
@@ -236,7 +252,16 @@ class CanvasRunner(ModelRunner):
             results[start:stop, 0] = decision.finished[:, 0]
             results[start:stop, 1:] = decision.tokens
 
-        slots.commit(inputs.slots, inputs.views)
+        # Skipped rows commit into the sentinel slot zero instead, which
+        # leaves their slots as the stopping step left them.
+        results[:, 0].masked_fill_(~active, STEP_SKIPPED)
+        targets = torch.where(
+            active, inputs.slots, torch.zeros_like(inputs.slots)
+        )
+        slots.commit(targets, inputs.views)
+        slots.live.index_copy_(
+            0, targets, (results[:, 0] == STEP_CONTINUED).to(slots.live.dtype)
+        )
         return tuple(results.unbind(0))
 
     def kernels(self) -> list[dict[str, object]]:
