@@ -16,14 +16,14 @@ from __future__ import annotations
 import math
 from typing import Any
 
-import httpx
+import aiohttp
 
 # Sample-name suffixes whose difference across a window is meaningful.
 _COUNTER_SUFFIXES = ("_total", "_sum", "_count")
 
 
 async def scrape_metrics(
-    client: httpx.AsyncClient, base_url: str
+    session: aiohttp.ClientSession, base_url: str
 ) -> str | None:
     """Return the server's `/metrics` exposition text, if it serves one.
 
@@ -31,14 +31,15 @@ async def scrape_metrics(
     metrics (or with them disabled) still completes its benchmark point.
     """
     try:
-        response = await client.get(
-            base_url.rstrip("/") + "/metrics", timeout=15.0
-        )
+        async with session.get(
+            base_url.rstrip("/") + "/metrics",
+            timeout=aiohttp.ClientTimeout(total=15.0),
+        ) as response:
+            if response.status != 200:
+                return None
+            return await response.text(errors="replace")
     except Exception:
         return None
-    if response.status_code != 200:
-        return None
-    return response.text
 
 
 def parse_samples(text: str) -> dict[str, float]:

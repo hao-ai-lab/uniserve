@@ -9,9 +9,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-import httpx
+import aiohttp
 import pytest
+from aiohttp import web
 
+from tests.python.fixtures.http_stub import stub_server
 from uniserve_eval.datasets.systemone import SystemOneDataset
 from uniserve_eval.metrics import summarize
 from uniserve_eval.pipeline.run import run_point
@@ -191,23 +193,18 @@ def test_djev_request_carries_one_state_in_its_schema() -> None:
 def _send(endpoint: str, body: dict[str, Any]) -> RequestRecord:
     """Send the example's readout to a server that answers with `body`."""
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == endpoint
-        return httpx.Response(200, json=body)
+    async def handler(request: web.Request) -> web.Response:
+        assert request.path == endpoint
+        return web.json_response(body)
 
     async def run() -> RequestRecord:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
-            task = SystemOneTask(_point(endpoint=endpoint))
-            request = task.build_request(_example())
-            return await send_request(
-                client,
-                "http://server",
-                request,
-                "home:0",
-                task="systemone",
-            )
+        async with stub_server(handler) as base_url:
+            async with aiohttp.ClientSession() as session:
+                task = SystemOneTask(_point(endpoint=endpoint))
+                request = task.build_request(_example())
+                return await send_request(
+                    session, base_url, request, "home:0", task="systemone"
+                )
 
     return asyncio.run(run())
 

@@ -9,7 +9,8 @@ timing, token usage with its provenance, generated text, and decoded media.
 
 All timestamps are ``time.perf_counter`` values on the same clock as
 ``RequestRecord.start_time``. Streamed events carry the client receipt time
-that ``SseParser`` stamps into their ``_client_t`` field.
+that ``SseParser`` stamps into their ``_client_t`` field. Requests run on the
+caller's ``aiohttp.ClientSession``.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-import httpx
+import aiohttp
 
 from ..types import (
     DJEV_EVALUATE,
@@ -28,6 +29,7 @@ from ..types import (
     TaskRequest,
 )
 from .decision import send_decision
+from .http import post_json, response_lines
 from .images import ImageOutputError, decode_openai_image_parts
 from .openai import OpenAIChat
 from .sse import aiter_sse_events
@@ -35,7 +37,7 @@ from .video import VideoOutputError, inspect_video_bytes
 
 
 async def send_request(
-    client: httpx.AsyncClient,
+    session: aiohttp.ClientSession,
     base_url: str,
     request: TaskRequest,
     request_id: str,
@@ -56,7 +58,7 @@ async def send_request(
 
     Returns:
         The closed record. HTTP status and response-content failures carry
-        their own classifiers; any raised ``Exception``, including httpx
+        their own classifiers; any raised ``Exception``, including aiohttp
         connection errors and timeouts, becomes ``transport_failure``.
         Exceptions outside ``Exception``, such as ``asyncio.CancelledError``,
         propagate.
@@ -75,18 +77,18 @@ async def send_request(
     )
     try:
         if request.endpoint == VIDEOS_SYNC:
-            await _send_video(client, url, payload, record)
+            await _send_video(session, url, payload, record)
         elif request.endpoint == IMAGES_GENERATIONS:
-            await _send_images(client, url, payload, record)
+            await _send_images(session, url, payload, record)
         elif request.endpoint in (SYSTEMONE, DJEV_EVALUATE):
-            await send_decision(client, url, request.endpoint, payload, record)
+            await send_decision(session, url, request.endpoint, payload, record)
         elif request.stream:
             await _send_chat_stream(
-                client, url, payload, record, prompt_len, output_len_fallback
+                session, url, payload, record, prompt_len, output_len_fallback
             )
         else:
             await _send_chat(
-                client, url, payload, record, prompt_len, output_len_fallback
+                session, url, payload, record, prompt_len, output_len_fallback
             )
     except Exception as error:  # noqa: BLE001 - benchmarks emit structured failures.
         record.mark_transport_exception(error)
@@ -94,7 +96,7 @@ async def send_request(
 
 
 async def _send_images(
-    client: httpx.AsyncClient,
+    session: aiohttp.ClientSession,
     url: str,
     payload: dict[str, Any],
     record: RequestRecord,
@@ -109,19 +111,17 @@ async def _send_images(
     apply, and every image of a successful response is assigned the
     whole-response latency.
     """
-    response = await client.post(url, json=payload)
-    record.note_http(response.status_code)
-    record.close_now()
-    if response.status_code >= 400:
+    response = await post_json(session, url, payload, record)
+    if response.status >= 400:
         record.mark_failure(
-            f"transport_status_{response.status_code}", response.text[:500]
+            f"transport_status_{response.status}", response.text[:500]
         )
         return
     try:
         data = response.json()
     except Exception:
         record.mark_failure(
-            f"transport_status_{response.status_code}", response.text[:500]
+            f"transport_status_{response.status}", response.text[:500]
         )
         return
     body_ok, classifier = _classify_images(data)
@@ -141,7 +141,7 @@ async def _send_images(
 
 
 async def _send_chat(
-    client: httpx.AsyncClient,
+    session: aiohttp.ClientSession,
     url: str,
     payload: dict[str, Any],
     record: RequestRecord,
@@ -150,14 +150,12 @@ async def _send_chat(
 ) -> None:
     """Execute a non-streaming chat request and record text, images, and usage."""  # noqa: E501
     # Latency closes when the complete body has arrived, before parsing.
-    response = await client.post(url, json=payload)
-    record.note_http(response.status_code)
-    record.close_now()
+    response = await post_json(session, url, payload, record)
     try:
         data = response.json()
     except Exception:
         record.mark_failure(
-            f"transport_status_{response.status_code}", response.text[:500]
+            f"transport_status_{response.status}", response.text[:500]
         )
         return
     choices = data.get("choices") if isinstance(data, dict) else None
@@ -191,18 +189,18 @@ async def _send_chat(
     # request failed.
     if image_error is not None:
         return
-    if response.status_code < 400 and bool(content or record.decoded_images):
+    if response.status < 400 and bool(content or record.decoded_images):
         record.mark_success()
     else:
         record.mark_failure(
-            f"transport_status_{response.status_code}"
-            if response.status_code >= 400
+            f"transport_status_{response.status}"
+            if response.status >= 400
             else "empty_completion"
         )
 
 
 async def _send_chat_stream(
-    client: httpx.AsyncClient,
+    session: aiohttp.ClientSession,
     url: str,
     payload: dict[str, Any],
     record: RequestRecord,
@@ -215,22 +213,22 @@ async def _send_chat_stream(
     latency, TTFT, ITL, and image latencies derive from per-event receipt
     stamps rather than from when this function processes them.
     """
-    async with client.stream("POST", url, json=payload) as response:
+    async with session.post(url, json=payload) as response:
         # Reject transport or framing mismatches before interpreting event data.
         # Any status other than 200 fails, including other 2xx codes.
-        record.note_http(response.status_code)
-        if response.status_code != 200:
-            body = await response.aread()
+        record.note_http(response.status)
+        if response.status != 200:
+            body = await response.read()
             record.close_now()
             record.mark_failure(
-                f"transport_status_{response.status_code}",
+                f"transport_status_{response.status}",
                 body.decode("utf-8", errors="replace")[:500],
             )
             return
         # A JSON body in reply to a stream request carries no event timing and
         # gets its own classifier.
         if _is_json_content_type(response.headers.get("content-type", "")):
-            await response.aread()
+            await response.read()
             record.close_now()
             record.mark_failure(
                 "response_expected_sse",
@@ -242,7 +240,7 @@ async def _send_chat_stream(
         # generic transport failure. Without `stop_on`, the body is read until
         # the server closes it; latency still closes at the last event stamp.
         events = await aiter_sse_events(
-            response.aiter_lines(),
+            response_lines(response.content),
             stamp_time=True,
             on_parse_error="record",
         )
@@ -306,7 +304,7 @@ async def _send_chat_stream(
 
 
 async def _send_video(
-    client: httpx.AsyncClient,
+    session: aiohttp.ClientSession,
     url: str,
     payload: dict[str, Any],
     record: RequestRecord,
@@ -316,24 +314,20 @@ async def _send_video(
     Latency closes once the complete body has been read, before the MP4 is
     inspected.
     """
-    async with client.stream("POST", url, json=payload) as response:
-        record.note_http(response.status_code)
-        body = await response.aread()
-        record.close_now()
-        if response.status_code >= 400:
-            record.mark_failure(
-                f"transport_status_{response.status_code}",
-                body.decode("utf-8", errors="replace")[:500],
-            )
-            return
-        try:
-            record.decoded_video = inspect_video_bytes(
-                body, declared_mime=response.headers.get("content-type", "")
-            )
-        except VideoOutputError as error:
-            record.mark_failure(error.classifier, str(error))
-            return
-        record.mark_success()
+    response = await post_json(session, url, payload, record)
+    if response.status >= 400:
+        record.mark_failure(
+            f"transport_status_{response.status}", response.text[:500]
+        )
+        return
+    try:
+        record.decoded_video = inspect_video_bytes(
+            response.data, declared_mime=response.content_type
+        )
+    except VideoOutputError as error:
+        record.mark_failure(error.classifier, str(error))
+        return
+    record.mark_success()
 
 
 def _classify_images(payload: Any) -> tuple[bool, str]:
