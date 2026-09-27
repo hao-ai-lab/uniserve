@@ -355,6 +355,7 @@ def stage_canvas(
     *,
     length: int,
     sampling: CanvasSampling | None = None,
+    step: int = 0,
 ) -> InputBatch:
     """Stage synthetic canvas rows through serving's staging path.
 
@@ -362,7 +363,8 @@ def stage_canvas(
     over a one-token prefix on its scratch ``tables``, read-only and
     non-causal as every canvas is. Without ``sampling`` the rows are
     readout canvases of token zero reading one slot; with it they are step
-    zero of block zero of the slots' resident canvases under that sampling.
+    ``step`` of block zero of the slots' resident canvases under that
+    sampling.
     """
     rows = len(tables)
     prefix = 1
@@ -399,6 +401,7 @@ def stage_canvas(
             request_pool_idx=slot,
             canvas_length=length,
             seed=slot,
+            step=step,
             sampling=sampling,
             **common,
         )
@@ -413,14 +416,15 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
     """Capture every canvas row bucket of a token denoiser, largest first.
 
     Each bucket captures a readout pass and, when the entry generates
-    canvases, a canvas step of the served sampling over request slots one
-    upward, whose resident state stays scratch until a request starts its
-    canvas there. The rows are staged through serving's staging with the
+    canvases, two canvas steps of the served sampling over request slots one
+    upward, one whose rows all start their canvas and one whose rows
+    continue it; their resident state stays scratch until a request starts
+    its canvas there. The rows are staged through serving's staging with the
     real read-only attention input over one-token prefixes on scratch KV
     units, and the runner pads them to their bucket. The largest readout
     bucket, captured first, sizes the runner's shared readout output. A
     step's warm call runs the sampler's chunk shapes before their capture.
-    Without graph pools, one readout row and one step row run eagerly.
+    Without graph pools, one row of each kind runs eagerly.
 
     Raises:
         ValueError: A bucket is prepared on a worker without a KV cache.
@@ -429,15 +433,21 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
     if cache is None:
         raise ValueError("canvas capture requires the worker KV cache")
     slots = entry.canvas_slots
-    kinds = (None,) if slots is None else (None, slots.constants)
+    # A readout, then a first step and a continuing step.
+    kinds = (
+        ((None, 0),)
+        if slots is None
+        else ((None, 0), (slots.constants, 0), (slots.constants, 1))
+    )
     for rows in reversed(entry.canvas_rows if entry.pools else (1,)):
-        for sampling in kinds:
+        for sampling, step in kinds:
             with cache.startup_units(rows * cache.page_units(1)) as scratch:
                 batch = stage_canvas(
                     entry.input_buffers,
                     scratch_tables(cache, scratch, (1,) * rows),
                     length=entry.canvas_length,
                     sampling=sampling,
+                    step=step,
                 )
                 entry.capture_batch(batch, entry.batch_forward)
 

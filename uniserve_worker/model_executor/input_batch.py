@@ -265,7 +265,8 @@ class CanvasStepInput:
     ``views`` the same staged tensors by ``CanvasSlots`` field. ``slots``
     holds the rows' request slots as a device int64 ``[rows]`` vector,
     through which the stepped state returns to its slots, and ``sampling``
-    each row's sampler constants.
+    each row's sampler constants. ``first`` is whether every row starts its
+    canvas (step zero), whose self-conditioning signal is zero.
     """
 
     canvas: CanvasInput
@@ -273,6 +274,7 @@ class CanvasStepInput:
     views: dict[str, torch.Tensor]
     slots: torch.Tensor
     sampling: tuple[CanvasSampling, ...]
+    first: bool = False
 
     @property
     def attention(self):

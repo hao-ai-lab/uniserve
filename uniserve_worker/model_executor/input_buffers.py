@@ -953,6 +953,7 @@ class CanvasBuffers(AttentionBuffers):
             views,
             vectors["step_slots"],
             tuple(row.sampling for row in rows),
+            first=all(row.step == 0 for row in rows),
         )
 
     def _candidate_backing(self, size):
