@@ -12,7 +12,9 @@ soft tokens enter the prompt between its image markers.
 
 import base64
 import io
+import logging
 import math
+import threading
 import time
 from dataclasses import replace
 from functools import partial
@@ -66,6 +68,7 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     CallStatus,
+    ErrorCode,
     ForwardMode,
     MediaCall,
     Readout,
@@ -504,3 +507,136 @@ def test_image_soft_tokens_fill_the_prompt_between_their_markers(tmp_path):
         rtol=1e-5,
         atol=1e-6,
     )
+
+
+def _encode(batch, image, soft):
+    """A vision-encoding batch of ``REQUEST`` for an inline ``image``."""
+    feature = TensorRef(
+        request_key=REQUEST,
+        producer_call_id=CallId(batch, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.BF16,
+        shape_bound=ShapeBound((DeviceDim(soft * 32),)),
+    )
+    call = _call(
+        batch,
+        MediaCall.VISION_ENCODING,
+        4,
+        bounds=Bounds(max_tokens=soft, max_latent_bytes=feature.max_bytes),
+        input_image=image,
+        encoder_output=feature,
+    )
+    return Batch(
+        batch_id=batch,
+        collective_seq=batch,
+        calls=(call,),
+        buffer_allocations=(
+            BufferAllocation(feature.buffer_id, 0, feature.max_bytes),
+        ),
+    )
+
+
+def _admitted_prefill(batch, tokens, input_images):
+    """``REQUEST``'s admission with the prefill of its first ``tokens``."""
+    tables = _tables(len(tokens))
+    return replace(
+        _prefill(batch, 0, tokens=tokens),
+        commands=(_admission(input_images=input_images),),
+        new_cache_units=tuple(
+            CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)
+            for table in tables
+        ),
+    )
+
+
+def test_a_later_text_batch_completes_while_an_image_is_preparing(tmp_path):
+    """Preparing an inline image holds only the batch that encodes it.
+
+    The image is prepared on the rank's host lane. While every lane thread
+    is busy, an independent request's prefill submitted after the encode
+    runs to completion; the encode completes once the lane frees.
+    """
+    diffusion_gemma_checkpoint(tmp_path)
+    image = _png(torch.Generator().manual_seed(5))
+    other = RequestKey(0, 8, 1)
+    worker = _worker(tmp_path, queue_depth=4)
+    lane = worker.host_tasks
+    release = threading.Event()
+    with worker:
+        try:
+            _completion(
+                _run(worker, _admitted_prefill(1, [7, 8, 9, BEGIN_IMAGE], 1))
+            )
+
+            # Occupy the lane's threads, leaving one task of capacity for the
+            # image, which then queues behind them.
+            while lane.max_inflight - lane.reserved > 1:
+                lane.reserve().submit(release.wait)
+            encode = worker.submit(_encode(2, image, soft=70))
+            worker.advance()
+
+            # Group g of the other request owns units 33 + 64 * g.
+            tables = tuple(
+                BlockTable(2, group, 0, (33 + 64 * group,), PAGE)
+                for group in (0, 1)
+            )
+            prefill = Batch(
+                batch_id=3,
+                collective_seq=3,
+                commands=(
+                    Start(
+                        NewRequest(
+                            other,
+                            2,
+                            generation=GenerationParams(
+                                sampling=SamplingParams()
+                            ),
+                        )
+                    ),
+                ),
+                calls=(
+                    Call(
+                        request_key=other,
+                        call_id=CallId(3, 0),
+                        coordinates=CallCoordinates(0, 0, 0),
+                        kind=ForwardMode.PREFILL,
+                        bounds=Bounds(max_tokens=3),
+                        input_token_ids=(7, 8, 9),
+                    ),
+                ),
+                block_tables=tables,
+                new_cache_units=tuple(
+                    CacheUnitAllocation(2, table.group_id, table.unit_ids)
+                    for table in tables
+                ),
+                forward_call_indices=(0,),
+                request_pool_indices=(2,),
+                seq_lens=(3,),
+                query_lens=(3,),
+                write_kv=(True,),
+            )
+            _completion(_run(worker, prefill))
+            assert worker.poll(encode) is None
+        finally:
+            release.set()
+
+        _completion(_drain(worker, encode))
+
+
+def test_an_undecodable_image_fails_its_encode_with_the_reason(
+    tmp_path, caplog
+):
+    """A payload that is not an image fails the encoding batch as invalid."""
+    diffusion_gemma_checkpoint(tmp_path)
+    payload = base64.b64encode(b"not an image").decode()
+    worker = _worker(tmp_path, queue_depth=2)
+    with worker, caplog.at_level(logging.WARNING):
+        _completion(
+            _run(worker, _admitted_prefill(1, [7, 8, 9, BEGIN_IMAGE], 1))
+        )
+        (record,) = _run(worker, _encode(2, payload, soft=70)).completions
+
+    assert record.status is CallStatus.ERROR
+    assert record.error_code is ErrorCode.INVALID_CALL
+    assert "inline image payload is not a valid encoded image" in caplog.text

@@ -9,6 +9,7 @@
 //! candidate, so the expected answer is known exactly. Tests observe calls at
 //! the executor boundary, the protocol the worker consumes.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -20,10 +21,10 @@ use uniserve_core::{
     MultimodalInputs, ReadoutRow, ReadoutSlot, RejectionKind, Request, RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    BatchEvent, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig, SchedulerStats,
-    SimEngine, SimExecutor, SpecialTokenIds, sim_candidate_logprob,
+    BatchEvent, ComponentConfig, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig,
+    SchedulerStats, SimEngine, SimExecutor, SpecialTokenIds, sim_candidate_logprob,
 };
-use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall};
+use uniserve_worker_ipc::{Call, CallKind, ComponentInfo, ForwardMode, MediaCall};
 
 /// Canvas token that marks an answer slot.
 const MASK: u32 = 4;
@@ -136,15 +137,21 @@ impl Running {
 
     /// Stops the scheduler and returns every batch it submitted, in order.
     fn stop(self) -> Vec<ExecutionBatch> {
-        self.handle.shutdown();
-        assert!(!self.thread.join().unwrap(), "the scheduler failed");
-        self.batches
-            .try_iter()
+        self.stop_with_resolutions()
+            .into_iter()
             .filter_map(|event| match event {
                 BatchEvent::Submitted(batch) => Some(batch),
                 BatchEvent::Resolved { .. } => None,
             })
             .collect()
+    }
+
+    /// Stops the scheduler and returns every submission and resolution the
+    /// executor saw, in order.
+    fn stop_with_resolutions(self) -> Vec<BatchEvent> {
+        self.handle.shutdown();
+        assert!(!self.thread.join().unwrap(), "the scheduler failed");
+        self.batches.try_iter().collect()
     }
 }
 
@@ -457,6 +464,86 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
     assert_eq!(canvas.coordinates.logical_position, 25);
     assert_eq!(canvas.coordinates.kv_visible_len, 25);
     assert_eq!(forward.seq_lens, vec![41]);
+}
+
+/// The worker prepares each inline input image as one task on its rank's
+/// host lane, so an image encode waits in the scheduler while the lane is
+/// full instead of reaching the worker: with one host task per rank, image
+/// encodes of different requests are never in flight together, and every
+/// request is still answered.
+#[test]
+fn an_image_encode_waits_for_a_free_host_lane_task() {
+    let mut sim = readout_worker();
+    // A deep queue and results delivered only when the scheduler waits keep
+    // every ready encode schedulable at once, leaving the lane to bound them.
+    sim.set_queue_depth(16);
+    sim.set_results_on_wait(true);
+    let info = sim.mut_info_for_test();
+    info.host_lane_capacity = 1;
+    info.components = vec![ComponentInfo {
+        name: "model".to_owned(),
+        config: ComponentConfig::parallel(vec![0], Default::default()),
+        outputs: Vec::new(),
+    }];
+    info.media_components = BTreeMap::from([(MediaCall::VisionEncoding, "model".to_owned())]);
+    let running = Running::start(sim, SchedulerConfig::default());
+
+    // Each prompt opens with its image, so every encode is ready at once.
+    let requests: Vec<_> = (0..3u64)
+        .map(|index| {
+            let mut request = readout_request(
+                20 + index,
+                prompt(16, 1000),
+                vec![row(16, &[(1, &[50, 51])])],
+            );
+            request.multimodal_inputs.images.push(ImageInput {
+                hash: 200 + index,
+                b64: "aW1hZ2U=".into(),
+                position: 0,
+                num_positions: 9,
+                encoders: vec![ImageEncoderInput {
+                    encoder: ImageIngestStep::VitEncode,
+                    num_kv_tokens: Some(9),
+                    max_kv_tokens: None,
+                }],
+            });
+            request
+        })
+        .collect();
+    let streams: Vec<_> = requests
+        .iter()
+        .map(|request| running.submit(request.clone()))
+        .collect();
+    for (stream, request) in streams.into_iter().zip(&requests) {
+        assert_answered(&events(stream), request);
+    }
+    let timeline = running.stop_with_resolutions();
+
+    // Encodes in flight after each submission: a batch's encodes stay in
+    // flight until its result is resolved.
+    let mut in_flight: HashMap<u64, usize> = HashMap::new();
+    let mut encodes = 0;
+    for event in timeline {
+        match event {
+            BatchEvent::Submitted(batch) => {
+                let count = batch
+                    .requests
+                    .iter()
+                    .filter(|(call, _)| call.code == CallKind::Media(MediaCall::VisionEncoding))
+                    .count();
+                encodes += count;
+                in_flight.insert(batch.id, count);
+                assert!(
+                    in_flight.values().sum::<usize>() <= 1,
+                    "image encodes exceeded the host lane: {in_flight:?}"
+                );
+            }
+            BatchEvent::Resolved { batch_id } => {
+                in_flight.remove(&batch_id);
+            }
+        }
+    }
+    assert_eq!(encodes, requests.len());
 }
 
 /// A ready canvas pass takes the step before another request's remaining

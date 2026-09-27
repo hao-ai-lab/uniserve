@@ -332,7 +332,7 @@ pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCa
 /// A component lane measured in media units carries `units`; a demand with
 /// zero `units` holds its component lane exclusively, one request at a time.
 /// `host_ranks` names the host lanes the call places tasks on.
-struct LaneDemand {
+pub(super) struct LaneDemand {
     /// The worker and component whose device lane the call occupies, taken
     /// from the request's placement (`Placement::affinity`). Admission places
     /// a media request on a worker for every media component, so a request's
@@ -349,9 +349,10 @@ struct LaneDemand {
 /// Lane occupancy across the media calls in flight.
 ///
 /// `lane_occupancy` rebuilds it from the in-flight calls at the start of each
-/// media pass, and the pass charges each call it selects.
+/// media pass, and at the first inline-image encoder call of a generation
+/// pass; the pass charges each call it selects.
 #[derive(Default)]
-struct LaneLedger {
+pub(super) struct LaneLedger {
     /// The request holding each exclusive component lane.
     exclusive: HashMap<(crate::WorkerId, String), RequestId>,
     /// Media units in flight on each unit-measured component lane.
@@ -366,7 +367,12 @@ impl LaneLedger {
     ///
     /// Every host rank must have room for the call's tasks. An exclusive
     /// component lane admits further calls of the request already holding it.
-    fn admits(&self, demand: &LaneDemand, request: RequestId, scheduler: &Scheduler) -> bool {
+    pub(super) fn admits(
+        &self,
+        demand: &LaneDemand,
+        request: RequestId,
+        scheduler: &Scheduler,
+    ) -> bool {
         if demand.host_ranks.iter().any(|(worker, rank, tasks)| {
             let capacity = scheduler.host_lane_capacity(worker);
             let key = (worker.clone(), *rank);
@@ -393,7 +399,7 @@ impl LaneLedger {
     }
 
     /// Marks the lanes one request's call occupies until it completes.
-    fn occupy(&mut self, demand: &LaneDemand, request: RequestId) {
+    pub(super) fn occupy(&mut self, demand: &LaneDemand, request: RequestId) {
         for (worker, rank, tasks) in &demand.host_ranks {
             *self.host.entry((worker.clone(), *rank)).or_default() += tasks;
         }
@@ -744,14 +750,45 @@ impl Scheduler {
             .map_or(1, |(_, info)| info.host_lane_capacity.max(1))
     }
 
-    /// Accumulates the lanes the media calls in flight occupy.
-    fn lane_occupancy(&self) -> LaneLedger {
+    /// Returns the host lanes one encoder call carrying inline image bytes
+    /// occupies.
+    ///
+    /// The worker prepares an inline input image (decoding, resizing,
+    /// normalization) as one host task on each rank of the component that
+    /// encodes it, and the call holds those tasks until its result returns.
+    /// The component is the one the worker routes `media_call` to, or the
+    /// default component, as `Placement::worker_target` resolves it.
+    pub(super) fn image_lane_demand(
+        &self,
+        request: RequestKey,
+        media_call: MediaCall,
+    ) -> LaneDemand {
+        let component = self
+            .media_component(media_call)
+            .unwrap_or_else(|| DEFAULT_COMPONENT.to_owned());
+        LaneDemand {
+            component: None,
+            units: 0,
+            host_ranks: self.host_lane_ranks(request, Some(&component), 1),
+        }
+    }
+
+    /// Accumulates the lanes the media calls in flight occupy, including the
+    /// host tasks preparing the inline images of generation encoder calls.
+    pub(super) fn lane_occupancy(&self) -> LaneLedger {
         let mut ledger = LaneLedger::default();
         for (id, queue) in &self.inflight.pending_calls {
             for inflight in queue {
                 let CallKind::Media(media_call) = inflight.call.code else {
                     continue;
                 };
+                if inflight.call.input_image.is_some() {
+                    ledger.occupy(
+                        &self.image_lane_demand(inflight.call.request_key, media_call),
+                        *id,
+                    );
+                    continue;
+                }
                 let units = match &inflight.input {
                     InflightInput::Media {
                         decode: Some(range),
