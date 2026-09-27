@@ -171,6 +171,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_model_len: effective_max_model_len,
         workers: config.engine.workers.clone(),
         transfer: config.engine.transfer.clone(),
+        data_parallel_size: config.engine.data_parallel_size,
         worker_process,
         bos: control_tokens.bos,
         eos: control_tokens.eos,

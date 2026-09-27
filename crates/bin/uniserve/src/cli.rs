@@ -155,9 +155,18 @@ pub(crate) struct SharedRuntimeArgs {
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
     pub worker_python: std::path::PathBuf,
-    /// Number of physical worker processes when configuration is omitted.
+    /// Number of physical worker processes of each replica when configuration
+    /// is omitted; they form one tensor-parallel group.
     #[arg(long = "worker-ranks", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
+    /// Number of independent model replicas. Each replica runs its own
+    /// scheduler, KV cache and worker ranks, and every request is served by
+    /// the replica with the fewest requests in flight. Without `--workers`,
+    /// the replicas take `--worker-ranks` ranks each, placed in blocks over
+    /// `--worker-hosts`; a `--workers` file lists the replicas as equal
+    /// consecutive blocks of groups.
+    #[arg(long = "data-parallel-size", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub data_parallel_size: usize,
     /// Path to a JSON deployment configuration: the Worker instances to serve,
     /// each one's node/device ranks, and the components placed on them.
     #[arg(long, value_name = "FILE", value_parser = read_workers)]
@@ -388,21 +397,23 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
-            // Without a written configuration a deployment serves one
-            // component over every rank. A model whose components are placed
-            // differently -- on disjoint ranks, or with distinct partitions --
-            // is served by writing that configuration, which `--workers`
-            // parses into exactly the type this builds.
+            // Without a written configuration each replica serves one
+            // component over its `--worker-ranks` ranks. A model whose
+            // components are placed differently -- on disjoint ranks, or with
+            // distinct partitions -- is served by writing that configuration,
+            // which `--workers` parses into exactly the type this builds.
             workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
-                vec![WorkerConfig::placed(
+                WorkerConfig::replicated(
                     &self.rank_hosts(),
                     &self.device,
+                    self.data_parallel_size,
                     self.worker_ranks,
                     queue_depth,
                     WorkerConfig::single_component(DEFAULT_COMPONENT, self.worker_ranks),
-                )]
+                )
             }),
             transfer: self.transfer.clone().unwrap_or_default(),
+            data_parallel_size: self.data_parallel_size,
             worker_process,
         }
     }

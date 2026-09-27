@@ -80,6 +80,10 @@ pub struct EngineSettings {
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_vmm`.
     pub transfer: TransferConfig,
+    /// Number of independent replicas `workers` forms, as equal consecutive
+    /// blocks of groups. Each replica runs its own scheduler and KV pool, and
+    /// the engine client routes every request to one of them.
+    pub data_parallel_size: usize,
     /// Worker process arguments completed with resolved model assets before spawn.
     pub worker_process: WorkerProcessArgs,
 }
@@ -107,6 +111,7 @@ impl Default for EngineSettings {
                 WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )],
             transfer: TransferConfig::default(),
+            data_parallel_size: 1,
             worker_process: WorkerProcessArgs {
                 resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
                 ..WorkerProcessArgs::default()

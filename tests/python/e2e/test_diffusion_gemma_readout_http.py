@@ -19,7 +19,9 @@ back in the official shape. The tests check what a client observes:
 The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
 (BF16) and ``UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL`` (NVFP4). The worker
 interpreter is ``UNISERVE_WORKER_PYTHON``, else the repository's
-``.venv/bin/python``.
+``.venv/bin/python``. ``UNISERVE_DIFFUSION_GEMMA_SERVE_ARGS`` adds
+``uniserve serve`` arguments that select the deployment topology, such as
+``--data-parallel-size 4``; every topology serves the same answers.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ import io
 import json
 import math
 import os
+import shlex
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -103,6 +106,7 @@ def served(request, tmp_path_factory) -> Iterator[tuple[str, Path]]:
         python,
         "--max-model-len",
         "8192",
+        *shlex.split(os.environ.get("UNISERVE_DIFFUSION_GEMMA_SERVE_ARGS", "")),
     ]
     log = tmp_path_factory.mktemp(request.param) / "server.log"
     with server_process(args, base_url, log, timeout_s=1800.0):
