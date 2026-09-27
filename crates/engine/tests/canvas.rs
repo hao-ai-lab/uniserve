@@ -424,3 +424,73 @@ fn unschedulable_or_unseeded_canvases_are_refused() {
         );
     }
 }
+
+/// A prompt that waits while a block denoises is prefilled within the
+/// prefill window instead of after the block stops, although the block's
+/// next step is ready at every pass.
+#[test]
+fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
+    let mut sim = worker(1_000);
+    sim.set_queue_depth(1);
+    sim.set_results_on_wait(true);
+    let config = SchedulerConfig {
+        max_num_batched_tokens: 64,
+        long_prefill_threshold: 64,
+        ..SchedulerConfig::default()
+    };
+    // Both requests are queued before the scheduler starts, so the first
+    // pass prefills the short prompt and the start of the long one. Request
+    // 2's block stops at its third step, and it generates one block.
+    let generating = canvas_request(2, 16, CANVAS as usize);
+    assert_eq!(sim_canvas_stop_step(RequestId(2), 0, MAX_STEPS), 2);
+    let waiting = canvas_request(3, 200, CANVAS as usize);
+    let mut executor = SimExecutor::new(sim);
+    let observed = executor.observe();
+    let scheduler =
+        Scheduler::with_config(Box::new(executor), SpecialTokenIds::default(), config).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let generating_events = handle.submit(Request::BlockDiffusion(generating)).unwrap();
+    let waiting_events = handle.submit(Request::BlockDiffusion(waiting)).unwrap();
+    let thread = thread::spawn(move || scheduler.run(rx));
+    assert_eq!(
+        published_blocks(&events(generating_events)),
+        vec![text(2, 0..16)]
+    );
+    assert_eq!(
+        published_blocks(&events(waiting_events)),
+        vec![text(3, 0..16)]
+    );
+    handle.shutdown();
+    assert!(!thread.join().unwrap());
+
+    // The index of the first submitted batch that holds a call matching
+    // `select`.
+    let batches: Vec<ExecutionBatch> = observed
+        .try_iter()
+        .filter_map(|event| match event {
+            BatchEvent::Submitted(batch) => Some(batch),
+            BatchEvent::Resolved { .. } => None,
+        })
+        .collect();
+    let first = |select: &dyn Fn(&Call) -> bool| {
+        batches
+            .iter()
+            .position(|batch| batch.requests.iter().any(|(call, _)| select(call)))
+            .unwrap()
+    };
+    let prompt_done = first(&|call: &Call| {
+        call.request_key.request_id == RequestId(3)
+            && call.code == CallKind::Forward(ForwardMode::Prefill)
+            && call.coordinates.kv_visible_len + call.input_token_ids.len() as u32 == 200
+    });
+    let block_stopped = first(&|call: &Call| {
+        call.request_key.request_id == RequestId(2)
+            && call.canvas.is_some_and(|step| step.step == 2)
+    });
+    assert!(
+        prompt_done < block_stopped,
+        "the long prompt finished prefilling in batch {prompt_done}, after the block \
+         that stopped in batch {block_stopped}"
+    );
+}
