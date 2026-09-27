@@ -586,22 +586,30 @@ class Executor:
         starts = tuple(
             command for command in batch.commands if isinstance(command, Start)
         )
-        for start in starts:
-            slots = self.worker.requests.apply_commands((start,))
-            if slots and self.worker.decode_state is not None:
-                self.worker.decode_state.reset(slots)
-            if slots and self.worker.canvas_slots is not None:
-                self.worker.canvas_slots.reset(slots)
-            if slots and start.request.diffusion is not None:
-                # A video request's seeded noise is drawn while this batch and
-                # the ones before latent preparation run on the device.
-                begin_noise(
-                    self.worker.runner,
-                    self.worker.requests.get(
-                        start.request.request_key.request_id
-                    ),
-                    self.worker.requests,
-                )
+        # Admitted slots reset together once the Starts are applied, so a
+        # batch admitting many requests costs one set of device writes; a
+        # failing Start still leaves every slot admitted before it reset.
+        admitted: list[int] = []
+        try:
+            for start in starts:
+                slots = self.worker.requests.apply_commands((start,))
+                admitted.extend(slots)
+                if slots and start.request.diffusion is not None:
+                    # A video request's seeded noise is drawn while this batch
+                    # and the ones before latent preparation run on the
+                    # device.
+                    begin_noise(
+                        self.worker.runner,
+                        self.worker.requests.get(
+                            start.request.request_key.request_id
+                        ),
+                        self.worker.requests,
+                    )
+        finally:
+            if admitted and self.worker.decode_state is not None:
+                self.worker.decode_state.reset(admitted)
+            if admitted and self.worker.canvas_slots is not None:
+                self.worker.canvas_slots.reset(admitted)
 
         state.predecessors = self.worker.requests.predecessors(batch.calls)
         validate_batch(
@@ -612,12 +620,20 @@ class Executor:
             predecessors=state.predecessors,
         )
 
-        for command in batch.commands:
-            if isinstance(command, Start):
-                continue
-            slots = self.worker.requests.apply_commands((command,))
-            if slots and self.worker.decode_state is not None:
-                self.worker.decode_state.reset(slots)
+        # Slots other commands return reset together, once, after them.
+        returned: dict[int, None] = {}
+        try:
+            for command in batch.commands:
+                if isinstance(command, Start):
+                    continue
+                returned.update(
+                    dict.fromkeys(
+                        self.worker.requests.apply_commands((command,))
+                    )
+                )
+        finally:
+            if returned and self.worker.decode_state is not None:
+                self.worker.decode_state.reset(tuple(returned))
 
         # Predecessor outputs no call of this batch reads are revoked before
         # input acquisition; ``_execute_batch`` revokes the rest after launch.
@@ -843,8 +859,9 @@ class Executor:
         ):
             if store is not None:
                 forget_exports(store.exports, state.retirement_exports)
-        for key in state.retirement_local_requests:
-            self.retire_request(key, retained=retained)
+        self.retire_requests(
+            tuple(state.retirement_local_requests), retained=retained
+        )
 
         # Slot reset itself submits writes; their completion permits
         # address reuse.
@@ -983,34 +1000,47 @@ class Executor:
                     frozenset((request_key,)), retained=retained
                 )
 
-    def _release_request(
-        self, request_id: int, retained: frozenset[BufferId]
+    def _release_requests(
+        self, request_ids: Sequence[int], retained: frozenset[BufferId]
     ) -> None:
-        """Release a drained request's storage on this rank.
+        """Release drained requests' storage on this rank.
 
         Buffers in ``retained`` are kept; every other export and tensor-store
-        product the request owns is released with its KV imports and cache
+        product the requests own is released with their KV imports and cache
         state, decode state, canvas state, block tables, prefix slots, media
-        mux state and latent slot.
+        mux state and latent slots. The slot resets of all the requests are
+        issued together, so a burst of finishing requests costs one set of
+        device writes rather than one per request.
         """
-        request = self.worker.requests.peek(request_id)
-        if request is not None:
+        ids = tuple(int(request_id) for request_id in request_ids)
+        requests = tuple(
+            request
+            for request_id in ids
+            if (request := self.worker.requests.peek(request_id)) is not None
+        )
+        keys = tuple(request.request_key for request in requests)
+        slots = tuple(request.request_pool_idx for request in requests)
+
+        if requests:
             if self.worker.kv_cache is not None:
                 self.worker.kv_cache.imports.cancel_requests(
-                    frozenset((request.request_key,)), retained=retained
+                    frozenset(keys), retained=retained
                 )
             if self.worker.decode_state is not None:
-                self.worker.decode_state.reset((request.request_pool_idx,))
+                self.worker.decode_state.reset(slots)
             if self.worker.canvas_slots is not None:
-                self.worker.canvas_slots.reset((request.request_pool_idx,))
+                self.worker.canvas_slots.reset(slots)
             if self.worker.block_tables is not None:
-                self.worker.block_tables.release((request.request_pool_idx,))
+                self.worker.block_tables.release(slots)
 
         if self.worker.kv_cache is not None:
-            self.worker.kv_cache.drop(request_id)
-        if request is not None and self.worker.block_tables is not None:
-            self.worker.block_tables.release_prefixes(request.request_key)
+            for request_id in ids:
+                self.worker.kv_cache.drop(request_id)
+        if self.worker.block_tables is not None:
+            for key in keys:
+                self.worker.block_tables.release_prefixes(key)
 
+        owners = frozenset(ids)
         for store in (
             self.worker.tensor_store,
             self.worker.kv_cache,
@@ -1020,45 +1050,52 @@ class Executor:
                 selected = tuple(
                     buffer
                     for buffer in store.exports
-                    if int(buffer.owner.request_id) == request_id
+                    if int(buffer.owner.request_id) in owners
                     and buffer not in retained
                 )
                 store.release_buffers(selected)
 
-        if request is not None:
-            self.worker.tensor_store.release_requests(
-                (request.request_key,), retained=retained
-            )
+        if requests:
+            self.worker.tensor_store.release_requests(keys, retained=retained)
         if self.worker.media_mux is not None:
-            self.worker.media_mux.drop(request_id)
-        if request is not None and self.worker.latent_pool is not None:
-            self.worker.latent_pool.release_slots((request.request_pool_idx,))
+            for request_id in ids:
+                self.worker.media_mux.drop(request_id)
+        if requests and self.worker.latent_pool is not None:
+            self.worker.latent_pool.release_slots(slots)
 
     def drop_request(self, request_id: int) -> None:
         """Release a drained request and remove its admission from the pool."""
         request_id = int(request_id)
-        self._release_request(request_id, frozenset())
+        self._release_requests((request_id,), frozenset())
         self.worker.requests.drop(request_id)
 
-    def retire_request(
+    def retire_requests(
         self,
-        request_key: RequestKey,
+        request_keys: Sequence[RequestKey],
         *,
         retained: frozenset[BufferId] = frozenset(),
     ) -> None:
-        """Retire exactly ``request_key``'s epoch on this rank.
+        """Retire exactly the epochs ``request_keys`` name on this rank.
 
-        Does nothing when that epoch is not resident or is already retired.
-        The caller must have waited for its readers to drain, as
+        Epochs that are not resident or are already retired are skipped.
+        The caller must have waited for their readers to drain, as
         ``_advance_retirement`` does through the stores' ``retirement_ready``
         checks. Buffers in ``retained`` are kept.
         """
-        request = self.worker.requests.peek(request_key.request_id)
-        if (
-            request is None
-            or request.request_key != request_key
-            or request.retired
-        ):
+        live = []
+        for key in request_keys:
+            request = self.worker.requests.peek(key.request_id)
+            if (
+                request is not None
+                and request.request_key == key
+                and not request.retired
+            ):
+                live.append(key.request_id)
+        if not live:
             return
-        self._release_request(request_key.request_id, retained)
-        self.worker.requests.retire(request_key.request_id)
+
+        # A key named twice retires once.
+        live = list(dict.fromkeys(live))
+        self._release_requests(live, retained)
+        for request_id in live:
+            self.worker.requests.retire(request_id)
