@@ -481,66 +481,59 @@ impl Scheduler {
 
     /// Chooses the highest-priority execution lane that has schedulable work.
     ///
-    /// A ready canvas pass takes the decode lane first: it completes a
-    /// readout, which releases the request's KV, or advances a generating
-    /// block, so prefill never holds it back. Otherwise prefill wins while
-    /// fewer than `PREFILL_WINDOW_CREDITS` batches carrying
-    /// `BatchKind::Prefill` calls await their results; past
-    /// that, ready decode work takes the pass, and prefill runs only when no
-    /// decode is ready. Prefill still shares a decode-lane pass within the
-    /// mixed-prefill token budget. `BatchKind::Media` readiness never selects
-    /// a lane: with only such work ready this returns `None`, and
-    /// `assemble_batch` then applies no lane filter.
+    /// A ready readout pass takes the decode lane first: one pass answers
+    /// the readout and releases its KV. Otherwise prefill wins while fewer
+    /// than `PREFILL_WINDOW_CREDITS` batches carrying `BatchKind::Prefill`
+    /// calls await their results; past that window, ready decode work takes
+    /// the pass, and prefill runs only when no decode is ready.
+    ///
+    /// A generating block's canvas steps are decode work under this window,
+    /// not ahead of it: a block's next step is ready again as soon as the
+    /// step before it is submitted, so a prompt ordered behind every ready
+    /// step would wait until the running blocks stop instead of joining
+    /// their canvas batches.
+    ///
+    /// Prefill still shares a decode-lane pass within the mixed-prefill token
+    /// budget. `BatchKind::Media` readiness never selects a lane: with only
+    /// such work ready this returns `None`, and `assemble_batch` then applies
+    /// no lane filter.
     pub(super) fn select_batch_kind(&self, ids: &[RequestId]) -> Option<BatchKind> {
-        let mut canvas_ready = false;
-        let mut projected_decode_ready = false;
-        let mut committed_decode_ready = false;
+        let mut readout_ready = false;
+        let mut decode_ready = false;
         let mut prefill_ready = false;
         for id in ids.iter().copied() {
-            if self
-                .running
-                .get(&id)
-                .map(|state| state.terminal_intent.is_terminal())
-                .unwrap_or(true)
-            {
+            let Some(state) = self.running.get(&id) else {
+                continue;
+            };
+            if state.terminal_intent.is_terminal() {
                 continue;
             }
             let Some(call_type) = self.peek_next_call_variant(id) else {
                 continue;
             };
-            match batch_kind(call_type) {
-                BatchKind::Decode => {
-                    if self.can_schedule_next(id) {
-                        if call_type == CallKind::Forward(ForwardMode::TokenDenoising) {
-                            canvas_ready = true;
-                        } else if self.inflight.has_pending_calls(id) {
-                            projected_decode_ready = true;
-                        } else {
-                            committed_decode_ready = true;
-                        }
-                    }
-                }
-                BatchKind::Prefill => {
-                    if self.can_schedule_next(id) {
-                        prefill_ready = true;
-                    }
-                }
+            let lane = batch_kind(call_type);
+            if lane == BatchKind::Media || !self.can_schedule_next(id) {
+                continue;
+            }
+            match lane {
+                BatchKind::Decode if state.req.is_readout() => readout_ready = true,
+                BatchKind::Decode => decode_ready = true,
+                BatchKind::Prefill => prefill_ready = true,
                 BatchKind::Media => {}
             }
         }
-        if canvas_ready {
+        let prefill_window_open = self
+            .inflight
+            .pending_batches
+            .values()
+            .filter(|batch| batch.prefill)
+            .count()
+            < PREFILL_WINDOW_CREDITS;
+        if readout_ready {
             Some(BatchKind::Decode)
-        } else if prefill_ready
-            && self
-                .inflight
-                .pending_batches
-                .values()
-                .filter(|batch| batch.prefill)
-                .count()
-                < PREFILL_WINDOW_CREDITS
-        {
+        } else if prefill_ready && prefill_window_open {
             Some(BatchKind::Prefill)
-        } else if committed_decode_ready || projected_decode_ready {
+        } else if decode_ready {
             Some(BatchKind::Decode)
         } else if prefill_ready {
             Some(BatchKind::Prefill)
