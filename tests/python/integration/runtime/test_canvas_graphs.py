@@ -15,6 +15,8 @@ without a graph over a copy of each request, prefilled in the same call:
   sixth canvas, so both calls have one shape and the replay's padding row
   is the only difference.
 
+A readout reading more slots than the largest readout tail graph holds
+replays the tails in chunks and returns the eager pass's log-probabilities.
 After startup, a call of more canvases than every bucket fails instead of
 running eagerly. A worker whose KV unit pool holds fewer requests than its
 call bound starts, and replays calls of as many canvases as the pool holds.
@@ -23,6 +25,7 @@ call bound starts, and replays calls of as many canvases as the pool holds.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 import torch
@@ -45,6 +48,7 @@ from uniserve_worker.bootstrap.capacity import (
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
+from uniserve_worker.model_executor.canvas_runner import SLOT_BUCKETS
 from uniserve_worker.model_executor.input_batch import (
     CanvasRow,
     CanvasStepRow,
@@ -353,6 +357,55 @@ def test_canvas_graph_replay_matches_eager_execution(tmp_path):
             assert torch.equal(
                 bank[1 : ROWS + 1], bank[COPY + 1 : 2 * COPY + 1]
             )
+
+
+@SM100
+@torch.inference_mode()
+def test_a_readout_of_more_slots_than_every_tail_replays_in_chunks(tmp_path):
+    """Slots beyond the largest tail graph replay it again, copying nothing.
+
+    Every token of nine canvases, one of them half a canvas long, is a slot
+    with two candidates, more slots than the largest readout tail holds, so
+    the replay reads them in two chunks; it returns the eager pass's
+    log-probabilities within the rounding their different shapes allow.
+    """
+    _checkpoint(tmp_path)
+    with _worker(tmp_path) as (runner, manager, slots):
+        _install(manager, EXTRA)
+        prompt, readout, _ = _scenario(slots)
+        _run(runner, manager, prompt[:6], ForwardMode.PREFILL)
+        _run(runner, manager, prompt[6:], ForwardMode.PREFILL)
+
+        generator = torch.Generator().manual_seed(17)
+
+        def every_token(row):
+            tokens = row.query_tokens
+            return replace(
+                row,
+                slot_tokens=tuple(range(tokens)),
+                candidate_offsets=tuple(range(0, 2 * tokens + 1, 2)),
+                candidate_ids=tuple(
+                    torch.randint(
+                        7, VOCAB, (2 * tokens,), generator=generator
+                    ).tolist()
+                ),
+            )
+
+        rows = tuple(every_token(readout[slot]) for slot in range(3, EXTRA + 1))
+        reads = sum(len(row.slot_tokens) for row in rows)
+        assert len(rows) <= runner.canvas_runner.canvas_rows[-1]
+        assert SLOT_BUCKETS[-1] < reads <= 2 * SLOT_BUCKETS[-1]
+
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            output = _run(runner, manager, rows, ForwardMode.TOKEN_DENOISING)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        assert output.stats.cuda_graph_replays == 1
+        replayed = _values(output)
+        eager = _values(_eager(runner, manager, rows))
+        for actual, expected in zip(replayed, eager, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @SM100
