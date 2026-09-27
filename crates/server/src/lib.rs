@@ -79,7 +79,7 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
 /// # Errors
 ///
 /// Fails when the model assets cannot be resolved, when the per-run call
-/// bound (`max_batch` clamped to `max_num_seqs`) or `max_num_batched_tokens`
+/// bound (`max_batch`) or `max_num_batched_tokens`
 /// does not fit the worker's `u32` fields, when the engine fails to start, or
 /// when the model description cannot be bound to the capabilities the engine
 /// reports.
@@ -100,16 +100,11 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         "starting UniServe Rust engine"
     );
 
-    // The worker's per-run call bound is `max_batch` clamped to
-    // `max_num_seqs`, with both treated as at least one.
-    let max_batch_calls = u32::try_from(
-        config
-            .engine
-            .max_batch
-            .max(1)
-            .min(config.engine.max_num_seqs.max(1)),
-    )
-    .context("max_batch exceeds the worker field width")?;
+    // Admission limits running requests, not the worker's execution capacity.
+    // Media workers retain two internal state slots even when admission permits
+    // only one request. Keep their configured batch capacity independent.
+    let max_batch_calls = u32::try_from(config.engine.max_batch.max(1))
+        .context("max_batch exceeds the worker field width")?;
     let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)
         .context("max_num_batched_tokens exceeds the worker field width")?;
 
