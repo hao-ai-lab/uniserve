@@ -5,6 +5,8 @@ tokens through the NVLink all-to-all at every call. Each rank's tokens return
 with the complete routed sum over all experts, whichever rank holds them, and
 a rank without tokens of its own still serves the other rank's tokens routed
 to its experts by joining the step. Replaying a captured step reproduces it.
+The fused MegaMoE exchange serves NVFP4 experts with the same step protocol
+and gates with each layer's declared nonlinearity.
 """
 
 import socket
@@ -16,6 +18,7 @@ from torch.nn import functional as F
 
 from uniserve.distributed import partition_experts
 from uniserve.model import TextSize
+from uniserve.nn import functional
 from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import Quantizer, ScaleLayout
 from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
@@ -188,21 +191,27 @@ E4M3_2_NEG_6 = 0x08
 INPUT_SCALES = (2.0**-4, 1.0)
 
 
-def _nvfp4(codes, device):
-    """Encode positive E2M1 ``codes [E, rows, K]`` at block scale 2**-6."""
+def _nvfp4(codes, device, block_scale=None):
+    """Encode E2M1 ``codes [E, rows, K]`` with unit tensor scales.
+
+    ``block_scale`` holds one E4M3 byte per ``[E, rows, K / 16]`` block;
+    every block takes 2**-6 when it is omitted.
+    """
     experts, rows, width = codes.shape
     values = (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
+    if block_scale is None:
+        block_scale = torch.full(
+            (experts, rows, width // 16), E4M3_2_NEG_6, dtype=torch.long
+        )
     return (
         Quantizer("nvfp4")
         .from_tensors(
             {
                 "values": values.to(device).contiguous(),
-                "block_scale": torch.full(
-                    (experts * rows, width // 16),
-                    E4M3_2_NEG_6,
-                    dtype=torch.uint8,
-                    device=device,
-                ),
+                "block_scale": block_scale.to(torch.uint8)
+                .reshape(experts * rows, width // 16)
+                .to(device)
+                .contiguous(),
                 "tensor_scale": torch.ones(experts, device=device),
             },
             shape=(experts, rows, width),
@@ -423,6 +432,194 @@ def test_nvfp4_hidden_states_cross_the_exchange_encoded(provider):
     mp.spawn(
         _run_encoded,
         (_free_port(), provider),
+        nprocs=len(TOKENS),
+        join=True,
+    )
+
+
+E4M3_ONE = 0x38  # the E4M3 byte encoding 1.0
+# Probe gates. At -3.75 and -3.375 erf GELU departs from the tanh
+# approximation by more than a quarter; the others span SiLU's and GELU's
+# curvature elsewhere.
+GATES = (-3.75, -3.375, -1.5, -0.75, 0.375, 0.75, 1.5, 3.0)
+
+
+def _probe_experts():
+    """E2M1 codes and block scales whose channels isolate each gate.
+
+    Expert e's channel 16m has up value 6 and gate ``GATES[(m + e) % 8]``
+    for a token whose hidden column 0 holds 6, and every other channel is
+    zero: up rows read column 0 with weight one, gate rows with weight +-0.5
+    at block scale ``|g| / 3``, which E4M3 represents exactly for these
+    gates. The FC2 input encoding then stores ``act(g) * 6`` as six times
+    its block scale, and the diagonal down projection copies it to output
+    column 16m. Each expert rotates the gates, so a token served by another
+    expert than its route names returns other values.
+    """
+    probes = torch.arange(0, INTERMEDIATE, 16)
+    rotation = (probes[None, :] // 16 + torch.arange(EXPERTS)[:, None]) % len(
+        GATES
+    )
+    gates = torch.tensor(GATES)[rotation]
+    up_gate = torch.zeros(EXPERTS, 2 * INTERMEDIATE, HIDDEN, dtype=torch.long)
+    up_gate_scale = torch.full(
+        (EXPERTS, 2 * INTERMEDIATE, HIDDEN // 16), E4M3_ONE, dtype=torch.long
+    )
+    up_gate[:, probes, 0] = 2
+    up_gate[:, INTERMEDIATE + probes, 0] = torch.where(gates > 0, 1, 9)
+    up_gate_scale[:, INTERMEDIATE + probes, 0] = (
+        (gates.abs() / 3).to(torch.float8_e4m3fn).view(torch.uint8).long()
+    )
+
+    down = torch.zeros(EXPERTS, HIDDEN, INTERMEDIATE, dtype=torch.long)
+    down[:, torch.arange(INTERMEDIATE), torch.arange(INTERMEDIATE)] = 2
+    down_scale = torch.full(
+        (EXPERTS, HIDDEN, INTERMEDIATE // 16), E4M3_ONE, dtype=torch.long
+    )
+    return (up_gate, up_gate_scale), (down, down_scale)
+
+
+@torch.inference_mode()
+def _run_megamoe(rank, port, activation):
+    device = torch.device("cuda", rank)
+    with initialize_process_groups(
+        rank=0,
+        local_rank=rank,
+        world_size=1,
+        device=device,
+        experts=(rank, len(TOKENS), Rendezvous("127.0.0.1", port)),
+    ) as groups:
+        up_gate, down = _probe_experts()
+        quantizers = (
+            Quantizer("nvfp4", calibrated_scale=1.0),
+            # The FC2 input scale keeps every probe's block scale a normal
+            # E4M3.
+            Quantizer("nvfp4", calibrated_scale=2.0**-7),
+        )
+        module = FusedMoE(
+            EXPERTS,
+            HIDDEN,
+            INTERMEDIATE,
+            top_k=1,
+            activation=activation,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        partition_experts(module, groups.experts)
+        local = module.expert_slice
+        module.up_gate.weight = torch.nn.Parameter(
+            _nvfp4(up_gate[0][local], device, up_gate[1][local]),
+            requires_grad=False,
+        )
+        module.down.weight = torch.nn.Parameter(
+            _nvfp4(down[0][local], device, down[1][local]),
+            requires_grad=False,
+        )
+        module.up_gate.input_quantizer, module.down.input_quantizer = quantizers
+
+        # The first rank routes token e to expert e, over both ranks'
+        # experts; the second rank has no tokens and serves its experts'
+        # routes by joining the step.
+        tokens = EXPERTS if rank == 0 else 0
+        hidden = torch.zeros(
+            tokens, HIDDEN, device=device, dtype=torch.bfloat16
+        )
+        hidden[:, 0] = 6.0
+        ids = torch.arange(tokens, dtype=torch.int32, device=device)[:, None]
+        weights = torch.ones(tokens, 1, device=device)
+
+        exchange = ExpertExchange(
+            groups.experts,
+            max_tokens=CAPACITY,
+            top_k=1,
+            num_experts=EXPERTS,
+            hidden_size=HIDDEN,
+            device=device,
+            transport="megamoe",
+            intermediate_size=INTERMEDIATE,
+            activation=activation,
+        )
+        stream = CUDAStream.external(torch.cuda.Stream(device=device))
+        stream.wait(torch.cuda.current_stream(device))
+        with (
+            stream,
+            ExecutionContext(
+                module, stream=stream, experts=exchange
+            ) as context,
+        ):
+            context.prepare(TextSize(CAPACITY, 1))
+
+            def step(states):
+                """One expert step: this rank's tokens, or a join."""
+                exchange.begin(CAPACITY)
+                try:
+                    output = (
+                        module(states, ids, weights)
+                        if tokens
+                        else hidden.new_empty((0, HIDDEN))
+                    )
+                    context.join_expert_layers()
+                finally:
+                    exchange.end()
+                return output
+
+            # The probe rows encode exactly, so the experts' input encoding
+            # of them stages the bytes the kernel's own encoder stores.
+            encoded = (
+                module.up_gate.input_quantizer.quantize(hidden)
+                if tokens
+                else hidden
+            )
+            with context.activate():
+                eager = step(hidden).clone()
+                stored = step(encoded).clone()
+            with CUDAGraph(context=context) as graph:
+                graph.capture(lambda: step(hidden))
+                captured = graph.replay()
+                stream.synchronize()
+
+        for actual in (eager, stored, captured):
+            assert actual.shape == (tokens, HIDDEN)
+        if not tokens:
+            return
+        # Hidden states stored in the experts' encoding are read as stored.
+        assert torch.equal(stored, eager)
+
+        # The portable reference over every expert encodes the FC2 input
+        # with exact FP32 division and the exact nonlinearity.
+        expected = functional.fused_moe(
+            hidden.float(),
+            _nvfp4(up_gate[0], device, up_gate[1]),
+            _nvfp4(down[0], device, down[1]),
+            ids,
+            weights,
+            activation=activation,
+            input_quantizers=quantizers,
+        )
+        # The kernel's approximate nonlinearity and reciprocal may round a
+        # block scale near an E4M3 midpoint to the neighboring value: one
+        # E4M3 step, at most 2**-3 of the value, plus the BF16 output
+        # rounding.
+        for actual in (eager, captured):
+            torch.testing.assert_close(
+                actual.float(), expected, rtol=2**-3 + _gamma(1), atol=0
+            )
+
+
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+def test_megamoe_ranks_gate_with_the_declared_nonlinearity(activation):
+    """The fused MegaMoE exchange applies each expert's gate nonlinearity.
+
+    Tokens of one rank reach experts on both ranks, while the other rank
+    has no tokens and joins; eager calls, calls on hidden states stored in
+    the experts' input encoding, and graph replays return the portable
+    reference's routed equation.
+    """
+    if torch.cuda.device_count() < len(TOKENS):
+        pytest.fail(f"expert exchange needs {len(TOKENS)} GPUs")
+    mp.spawn(
+        _run_megamoe,
+        (_free_port(), activation),
         nprocs=len(TOKENS),
         join=True,
     )

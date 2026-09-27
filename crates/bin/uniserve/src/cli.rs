@@ -85,6 +85,24 @@ impl From<SchedulerPolicyArg> for SchedulingPolicy {
     }
 }
 
+/// Expert-parallel token exchange accepted by the command line.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ExpertExchangeArg {
+    /// FlashInfer's NVLink all-to-all around each rank's grouped experts.
+    Alltoall,
+    /// The fused CuTeDSL MegaMoE kernel (NVFP4 experts).
+    Megamoe,
+}
+
+impl From<ExpertExchangeArg> for uniserve_engine::ExpertExchange {
+    fn from(value: ExpertExchangeArg) -> Self {
+        match value {
+            ExpertExchangeArg::Alltoall => Self::AllToAll,
+            ExpertExchangeArg::Megamoe => Self::MegaMoe,
+        }
+    }
+}
+
 /// Arguments for the `serve` command.
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
@@ -173,6 +191,11 @@ pub(crate) struct SharedRuntimeArgs {
     /// other layer stay data-parallel.
     #[arg(long = "expert-parallel", default_value_t = false)]
     pub expert_parallel: bool,
+    /// How expert-parallel replicas exchange tokens at every expert layer:
+    /// the NVLink all-to-all around each rank's grouped expert kernel, or
+    /// the fused MegaMoE kernel, which serves NVFP4 experts.
+    #[arg(long = "expert-exchange", value_enum, default_value = "alltoall")]
+    pub expert_exchange: ExpertExchangeArg,
     /// Path to a JSON deployment configuration: the Worker instances to serve,
     /// each one's node/device ranks, and the components placed on them.
     #[arg(long, value_name = "FILE", value_parser = read_workers)]
@@ -420,7 +443,7 @@ impl SharedRuntimeArgs {
             }),
             transfer: self.transfer.clone().unwrap_or_default(),
             data_parallel_size: self.data_parallel_size,
-            expert_parallel: self.expert_parallel,
+            expert_parallel: self.expert_parallel.then_some(self.expert_exchange.into()),
             worker_process,
         }
     }

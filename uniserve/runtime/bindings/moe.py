@@ -71,15 +71,30 @@ class MoEBinding:
                 max(size.num_tokens, self.size.num_tokens),
                 max(size.batch_size, self.size.batch_size),
             )
-        provider = moe_backend.resolve(
-            self.backend, module=self.module, device=self.device
-        )
-        requirements = provider.workspace_buffers(module=self.module, size=size)
-        operator = provider.prepare(
-            module=self.module,
-            size=size,
-            workspace=self.allocate(requirements, self.device),
-        )
+        if self.exchange is not None and self.exchange.transport == "megamoe":
+            # The fused kernel exchanges, computes and combines in one launch
+            # over the exchange's symmetric staging.
+            from ..backends.moe import megamoe
+
+            provider = megamoe.Backend()
+            reason = provider.unsupported(self.module)
+            if reason is not None:
+                raise ValueError(f"MegaMoE cannot serve this layer: {reason}")
+            operator = provider.prepare_fused(
+                module=self.module, size=size, buffer=self.exchange.fused
+            )
+        else:
+            provider = moe_backend.resolve(
+                self.backend, module=self.module, device=self.device
+            )
+            requirements = provider.workspace_buffers(
+                module=self.module, size=size
+            )
+            operator = provider.prepare(
+                module=self.module,
+                size=size,
+                workspace=self.allocate(requirements, self.device),
+            )
         if previous is not None:
             previous.close()
         self.operator = operator
@@ -117,7 +132,9 @@ class MoEBinding:
             if self.exchange is None
             else {
                 "expert_parallel": self.module.expert_group.size,
-                "exchange": "flashinfer_mnnvl_alltoall",
+                "exchange": "megamoe"
+                if self.exchange.transport == "megamoe"
+                else "flashinfer_mnnvl_alltoall",
                 # The representation hidden states travel in.
                 "payload": "nvfp4"
                 if isinstance(self.operator, moe_backend.NVFP4Operator)
@@ -142,26 +159,34 @@ class MoEBinding:
             return operator(hidden, topk_ids, topk_weights, combine=combine)
 
         operator = self.prepare(TextSize(hidden.shape[0], 1))
-        if isinstance(operator, moe_backend.NVFP4Operator):
-            # NVFP4 experts read their input encoding, so the hidden states
-            # travel in it: rows already stored in it as they are, BF16
-            # rows (a join's empty rows included) encoded here to the bytes
-            # the operator would encode after the exchange. The
-            # representation is thus a property of the layer, the same on
-            # every rank of the step, including ranks that only join it.
-            hidden = operator.encode(hidden)
-        received = exchange.dispatch(
-            id(self.module),
-            hidden,
-            topk_ids,
-            topk_weights,
-            invalid_expert=self._invalid_expert,
-        )
-        # The local experts combine their routes into this rank's partial
-        # sums, and the exchange sums the ranks' partials (FP32, one BF16
-        # rounding); uncombined, those combined rows are the one-route
-        # Routes of unit weight.
-        output = exchange.combine(operator(*received), hidden.shape[0])
+        if exchange.transport == "megamoe":
+            # The fused kernel exchanges, runs the experts and combines in
+            # one launch over the exchange's symmetric staging.
+            exchange.enter(id(self.module))
+            output = operator(hidden, topk_ids, topk_weights)
+        else:
+            if isinstance(operator, moe_backend.NVFP4Operator):
+                # NVFP4 experts read their input encoding, so the hidden
+                # states travel in it: rows already stored in it as they
+                # are, BF16 rows (a join's empty rows included) encoded here
+                # to the bytes the operator would encode after the exchange.
+                # The representation is thus a property of the layer, the
+                # same on every rank of the step, including ranks that only
+                # join it.
+                hidden = operator.encode(hidden)
+            received = exchange.dispatch(
+                id(self.module),
+                hidden,
+                topk_ids,
+                topk_weights,
+                invalid_expert=self._invalid_expert,
+            )
+            # The local experts combine their routes into this rank's
+            # partial sums, and the exchange sums the ranks' partials (FP32,
+            # one BF16 rounding).
+            output = exchange.combine(operator(*received), hidden.shape[0])
+        # Uncombined, the combined rows are the one-route Routes of unit
+        # weight.
         if combine:
             return output
         assert self._unit is not None

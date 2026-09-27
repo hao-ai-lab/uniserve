@@ -190,6 +190,21 @@ pub struct WorkerProcessArgs {
     pub expert_parallel: Option<ExpertParallelPlacement>,
 }
 
+/// How an expert-parallel world moves each token to its experts and back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpertExchange {
+    /// FlashInfer's NVLink all-to-all dispatch and combine around each
+    /// rank's grouped expert kernel.
+    #[default]
+    #[serde(rename = "alltoall")]
+    AllToAll,
+    /// The fused CuTeDSL MegaMoE kernel, which dispatches, runs the experts
+    /// and combines in one launch per layer over NVSHMEM; NVFP4 experts only.
+    #[serde(rename = "megamoe")]
+    MegaMoe,
+}
+
 /// One single-rank replica's place in an expert-parallel world.
 ///
 /// The world's ranks are the data-parallel replicas in order: replica `rank`
@@ -205,6 +220,8 @@ pub struct ExpertParallelPlacement {
     /// reserves it once the deployment's hosts are known; world rank 0 serves
     /// it on a socket the head binds.
     pub address: Option<String>,
+    /// How the world exchanges tokens at every expert layer.
+    pub exchange: ExpertExchange,
 }
 
 /// Parks until one descriptor becomes readable or `timeout` expires.

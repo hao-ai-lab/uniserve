@@ -24,6 +24,12 @@ flash_attn_4 = [
   "flash-attn-4[cu13]==4.0.0b30",
   "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
+# The fused expert-parallel MegaMoE kernel (``uniserve_kernels.megamoe``):
+# NVSHMEM's Python bindings over the locked native library.
+megamoe = [
+  "nvshmem4py-cu13==0.4.0",
+  "nvidia-cutlass-dsl[cu13]==4.6.2",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -33,4 +39,4 @@ where = ["src"]
 include = ["uniserve_kernels*"]
 
 [tool.setuptools.package-data]
-uniserve_kernels = ["py.typed", "csrc/*.cu", "attention/vsa_native/csrc/*.cu", "attention/vsa_native/csrc/*.cuh", "attention/vsa_native/LICENSE", "diffusion/*.json", "diffusion/csrc/*.cu", "diffusion/csrc/*.cpp", "peer_storage/csrc/*.cpp"]
+uniserve_kernels = ["py.typed", "csrc/*.cu", "attention/vsa_native/csrc/*.cu", "attention/vsa_native/csrc/*.cuh", "attention/vsa_native/LICENSE", "megamoe/LICENSE", "diffusion/*.json", "diffusion/csrc/*.cu", "diffusion/csrc/*.cpp", "peer_storage/csrc/*.cpp"]

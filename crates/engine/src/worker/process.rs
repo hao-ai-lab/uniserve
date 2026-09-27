@@ -421,6 +421,7 @@ impl WorkerProcessArgs {
                     "size": placement.size,
                     "address": placement.address,
                     "listen_fd": expert_listen_fd,
+                    "exchange": placement.exchange,
                 }),
                 None => Value::Null,
             },

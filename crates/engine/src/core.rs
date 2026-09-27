@@ -353,11 +353,12 @@ pub struct EngineConfig {
     /// blocks of groups; each replica is served by its own engine core
     /// ([`EngineCore::replicas`]). One means the workers form one engine.
     pub data_parallel_size: usize,
-    /// Whether the data-parallel replicas shard the model's routed experts:
-    /// each replica is then one rank, keeps its share of every expert layer
-    /// and exchanges tokens with the other replicas at those layers, while
-    /// attention and every other layer stay data-parallel.
-    pub expert_parallel: bool,
+    /// Whether the data-parallel replicas shard the model's routed experts,
+    /// and how they exchange tokens: each replica is then one rank, keeps
+    /// its share of every expert layer and exchanges tokens with the others
+    /// at those layers, while attention and every other layer stay
+    /// data-parallel. `None` keeps every expert on every replica.
+    pub expert_parallel: Option<crate::worker::ExpertExchange>,
     /// Rank launch defaults refined by each WorkerGroup configuration.
     ///
     /// Every constructor also reads the model identifier (`model`) and
@@ -413,7 +414,7 @@ impl EngineConfig {
             )],
             transfer: TransferConfig::default(),
             data_parallel_size: 1,
-            expert_parallel: false,
+            expert_parallel: None,
             worker_process,
             bos: 0,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
@@ -528,7 +529,7 @@ impl EngineCore {
         // exchange joins one rank per replica, and a replica with tensor
         // parallel attention would also need its own expert partition.
         anyhow::ensure!(
-            !config.expert_parallel
+            config.expert_parallel.is_none()
                 || (size > 1
                     && replicas
                         .iter()
@@ -607,13 +608,14 @@ impl EngineCore {
                         .storage_fraction
                         .unwrap_or(config.worker_process.kv_storage_fraction),
                     transfer: transfer.clone(),
-                    expert_parallel: config.expert_parallel.then_some(
+                    expert_parallel: config.expert_parallel.map(|exchange| {
                         crate::worker::ExpertParallelPlacement {
                             rank: index as u32,
                             size: size as u32,
                             address: None,
-                        },
-                    ),
+                            exchange,
+                        }
+                    }),
                     ..config.worker_process.clone()
                 });
             }
@@ -650,7 +652,7 @@ impl EngineCore {
                 workers: replica.to_vec(),
                 transfer,
                 data_parallel_size: 1,
-                expert_parallel: false,
+                expert_parallel: None,
                 ..config.clone()
             };
             cores.push(Self::assemble(replica_config, Box::new(executor), waker)?);
@@ -1052,7 +1054,7 @@ mod tests {
                     WorkerConfig::single_component("model", ranks),
                 ),
                 data_parallel_size: replicas,
-                expert_parallel: true,
+                expert_parallel: Some(crate::worker::ExpertExchange::AllToAll),
                 ..EngineConfig::sim("sim-model")
             };
             let error = EngineCore::replicas(config)

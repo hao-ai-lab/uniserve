@@ -274,6 +274,11 @@ def test_row_orders_permute_each_expert_without_changing_values():
         # Row i of either half goes to 128-row block i // 64, at offset
         # i % 64 in its first (first half) or second (second half) 64 rows.
         RowOrder.INTERLEAVED_64: 128 * (half // 64) + half % 64 + 64 * second,
+        # Row i of either half goes to 32-row block i // 16, at offset
+        # i % 16 in its second (first half) or first (second half) 16 rows.
+        RowOrder.INTERLEAVED_16: 32 * (half // 16)
+        + half % 16
+        + 16 * (1 - second),
     }
     for order, position in positions.items():
         for layout in ScaleLayout:

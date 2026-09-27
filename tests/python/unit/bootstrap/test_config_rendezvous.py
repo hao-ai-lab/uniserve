@@ -50,6 +50,7 @@ def test_an_expert_parallel_replica_names_its_world_and_store(tmp_path):
             "size": 4,
             "address": "10.0.0.2:29600",
             "listen_fd": 9,
+            "exchange": "megamoe",
         },
     )
     world = args.expert_parallel
@@ -59,17 +60,54 @@ def test_an_expert_parallel_replica_names_its_world_and_store(tmp_path):
         29600,
     )
     assert world.rendezvous.listen_fd == 9
+    assert args.execution.expert_exchange == "megamoe"
 
 
 @pytest.mark.parametrize(
     ("world", "message"),
     [
         # Only the world's rank 0 serves its store, from an inherited socket.
-        ({"rank": 1, "size": 4, "address": "h:1", "listen_fd": 9}, "rank 0"),
-        ({"rank": 0, "size": 4, "address": "h:1", "listen_fd": None}, "rank 0"),
+        (
+            {
+                "rank": 1,
+                "size": 4,
+                "address": "h:1",
+                "listen_fd": 9,
+                "exchange": "alltoall",
+            },
+            "rank 0",
+        ),
+        (
+            {
+                "rank": 0,
+                "size": 4,
+                "address": "h:1",
+                "listen_fd": None,
+                "exchange": "alltoall",
+            },
+            "rank 0",
+        ),
         # One replica shares no experts.
-        ({"rank": 0, "size": 1, "address": "h:1", "listen_fd": 9}, "two"),
-        ({"rank": 4, "size": 4, "address": "h:1", "listen_fd": None}, "rank"),
+        (
+            {
+                "rank": 0,
+                "size": 1,
+                "address": "h:1",
+                "listen_fd": 9,
+                "exchange": "alltoall",
+            },
+            "two",
+        ),
+        (
+            {
+                "rank": 4,
+                "size": 4,
+                "address": "h:1",
+                "listen_fd": None,
+                "exchange": "alltoall",
+            },
+            "rank",
+        ),
     ],
 )
 def test_a_malformed_expert_parallel_world_is_refused(
@@ -100,6 +138,7 @@ def test_an_expert_parallel_replica_is_one_rank(tmp_path, capsys):
                 "size": 2,
                 "address": "h:1",
                 "listen_fd": 9,
+                "exchange": "alltoall",
             },
         )
     assert "only rank" in capsys.readouterr().err

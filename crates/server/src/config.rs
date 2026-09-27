@@ -84,9 +84,9 @@ pub struct EngineSettings {
     /// blocks of groups. Each replica runs its own scheduler and KV pool, and
     /// the engine client routes every request to one of them.
     pub data_parallel_size: usize,
-    /// Whether the data-parallel replicas shard the model's routed experts
-    /// and exchange tokens at every expert layer.
-    pub expert_parallel: bool,
+    /// Whether the data-parallel replicas shard the model's routed experts,
+    /// and how they exchange tokens at every expert layer.
+    pub expert_parallel: Option<uniserve_engine::ExpertExchange>,
     /// Worker process arguments completed with resolved model assets before spawn.
     pub worker_process: WorkerProcessArgs,
 }
@@ -115,7 +115,7 @@ impl Default for EngineSettings {
             )],
             transfer: TransferConfig::default(),
             data_parallel_size: 1,
-            expert_parallel: false,
+            expert_parallel: None,
             worker_process: WorkerProcessArgs {
                 resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
                 ..WorkerProcessArgs::default()
