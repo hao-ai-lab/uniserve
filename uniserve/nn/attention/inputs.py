@@ -248,97 +248,133 @@ class PagedInput:
         blocks must cover every appended position, which must lie at or
         after the row's start page.
         """  # noqa: D205
-        if (
-            not isinstance(blocks, tuple)
-            or type(block_size) is not int
-            or block_size < 1
-            or len(blocks) != len(query_lengths)
-            or len(blocks) != len(prefix_lengths)
-        ):
-            raise ValueError(
-                "block lists and sequence lengths must have matching batch "
-                "sizes"
-            )
-        starts = (0,) * len(blocks) if start_pages is None else start_pages
-        if (
-            not isinstance(starts, tuple)
-            or len(starts) != len(blocks)
-            or any(type(page) is not int or page < 0 for page in starts)
-        ):
-            raise ValueError(
-                "start pages must give one nonnegative page per block row"
-            )
+        table, addresses = paged_append(
+            blocks,
+            query_lengths=query_lengths,
+            prefix_lengths=prefix_lengths,
+            block_size=block_size,
+            start_pages=start_pages,
+        )
         queries = SequenceLengths.from_lengths(query_lengths, device=device)
         prefixes = SequenceLengths.from_lengths(prefix_lengths, device=device)
         flags = (causal,) * len(blocks) if type(causal) is bool else causal
         _causal(flags, len(blocks))
-
-        if any(not isinstance(row, tuple) for row in blocks) or not set(
-            map(type, chain.from_iterable(blocks))
-        ) <= {int}:
-            raise ValueError(
-                "physical block IDs must be nonnegative int32 integers"
-            )
-        for row, query, prefix, start in zip(
-            blocks, query_lengths, prefix_lengths, starts, strict=True
-        ):
-            if (start + len(row)) * block_size < prefix + query or (
-                query and prefix < start * block_size
-            ):
-                raise ValueError(
-                    "block table does not cover the prefix and query"
-                )
-
-        # Short rows are zero-padded to the shared table width; padded
-        # entries are never read because lengths bound the valid span.
-        count = len(blocks)
-        width = max(map(len, blocks), default=0)
-        table = np.zeros((count, width), dtype=np.int64)
-        try:
-            for index, row in enumerate(blocks):
-                table[index, : len(row)] = row
-        except OverflowError:
-            raise ValueError(
-                "physical block IDs must be nonnegative int32 integers"
-            ) from None
-        if table.size and (
-            table.min() < 0 or table.max() > np.iinfo(np.int32).max
-        ):
-            raise ValueError(
-                "physical block IDs must be nonnegative int32 integers"
-            )
-
-        # One physical token address per appended query position, in the
-        # row's columns counted from its start page, gathered for every
-        # position at once: token t of row r is position prefix[r] + t
-        # - first[r], where first[r] is the row's first token.
-        lengths = np.asarray(query_lengths, dtype=np.int64)
-        owners = np.repeat(np.arange(count), lengths)
-        first = np.cumsum(lengths) - lengths
-        positions = (
-            np.asarray(prefix_lengths, dtype=np.int64)[owners]
-            + np.arange(owners.size)
-            - first[owners]
-        )
-        columns = (
-            positions // block_size - np.asarray(starts, dtype=np.int64)[owners]
-        )
-        addresses = table[owners, columns] * block_size + positions % block_size
-
         return cls(
             queries,
             prefixes,
             BlockTable(
-                torch.from_numpy(table.astype(np.int32)).to(device),
+                torch.from_numpy(table).to(device),
                 block_size,
                 None
                 if start_pages is None
-                else torch.tensor(starts, dtype=torch.int32, device=device),
-                None if start_pages is None else starts,
+                else torch.tensor(
+                    start_pages, dtype=torch.int32, device=device
+                ),
+                start_pages,
             ),
             torch.from_numpy(addresses).to(device),
             flags,
         )
+
+
+def paged_append(
+    blocks: tuple[tuple[int, ...], ...],
+    *,
+    query_lengths: tuple[int, ...],
+    prefix_lengths: tuple[int, ...],
+    block_size: int,
+    start_pages: tuple[int, ...] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Lay out appending each query to its prefix on the host.
+
+    Each row of ``blocks`` holds the physical blocks of its logical pages
+    from its entry of ``start_pages`` on (page zero when ``None``). The
+    blocks must cover every appended position, which must lie at or after
+    the row's start page.
+
+    Returns:
+        The zero-padded int32 block table ``[rows, width]`` and the int64
+        physical token address of every appended position, row after row.
+
+    Raises:
+        ValueError: If the rows, lengths and start pages disagree in number,
+            a length or start page is negative, a block id is not a
+            nonnegative int32 Python int, or a row does not cover its prefix
+            and query.
+    """
+    if (
+        not isinstance(blocks, tuple)
+        or type(block_size) is not int
+        or block_size < 1
+        or len(blocks) != len(query_lengths)
+        or len(blocks) != len(prefix_lengths)
+    ):
+        raise ValueError(
+            "block lists and sequence lengths must have matching batch sizes"
+        )
+    if any(
+        type(length) is not int or length < 0
+        for length in (*query_lengths, *prefix_lengths)
+    ):
+        raise ValueError("sequence lengths must be nonnegative integers")
+    starts = (0,) * len(blocks) if start_pages is None else start_pages
+    if (
+        not isinstance(starts, tuple)
+        or len(starts) != len(blocks)
+        or any(type(page) is not int or page < 0 for page in starts)
+    ):
+        raise ValueError(
+            "start pages must give one nonnegative page per block row"
+        )
+
+    if any(not isinstance(row, tuple) for row in blocks) or not set(
+        map(type, chain.from_iterable(blocks))
+    ) <= {int}:
+        raise ValueError(
+            "physical block IDs must be nonnegative int32 integers"
+        )
+    for row, query, prefix, start in zip(
+        blocks, query_lengths, prefix_lengths, starts, strict=True
+    ):
+        if (start + len(row)) * block_size < prefix + query or (
+            query and prefix < start * block_size
+        ):
+            raise ValueError("block table does not cover the prefix and query")
+
+    # Short rows are zero-padded to the shared table width; padded entries
+    # are never read because lengths bound the valid span.
+    count = len(blocks)
+    width = max(map(len, blocks), default=0)
+    table = np.zeros((count, width), dtype=np.int64)
+    try:
+        for index, row in enumerate(blocks):
+            table[index, : len(row)] = row
+    except OverflowError:
+        raise ValueError(
+            "physical block IDs must be nonnegative int32 integers"
+        ) from None
+    if table.size and (table.min() < 0 or table.max() > np.iinfo(np.int32).max):
+        raise ValueError(
+            "physical block IDs must be nonnegative int32 integers"
+        )
+
+    # One physical token address per appended query position, in the row's
+    # columns counted from its start page, gathered for every position at
+    # once: token t of row r is position prefix[r] + t - first[r], where
+    # first[r] is the row's first token.
+    lengths = np.asarray(query_lengths, dtype=np.int64)
+    owners = np.repeat(np.arange(count), lengths)
+    first = np.cumsum(lengths) - lengths
+    positions = (
+        np.asarray(prefix_lengths, dtype=np.int64)[owners]
+        + np.arange(owners.size)
+        - first[owners]
+    )
+    columns = (
+        positions // block_size - np.asarray(starts, dtype=np.int64)[owners]
+    )
+    addresses = table[owners, columns] * block_size + positions % block_size
+    return table.astype(np.int32), addresses
 
 
 @dataclass(frozen=True, slots=True)

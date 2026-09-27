@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from uniserve_worker.errors import invalid_descriptor
@@ -87,8 +88,13 @@ def prepare_rows(
         )
 
     start = int(calls.require_progress(request).logical_position)
-    tokens = torch.tensor(call.input_token_ids, dtype=torch.int64)
+    # The token tuple converts through NumPy, which reads Python ints far
+    # faster than a tensor construction does.
+    tokens = torch.from_numpy(np.asarray(call.input_token_ids, dtype=np.int64))
     offsets = readout.candidate_offsets
+    # Every canvas of the call starts at the same position, so canvases of
+    # one length share one read-only position vector.
+    positions: dict[int, torch.Tensor] = {}
     rows, first, slot_index = [], 0, 0
     for length in lengths:
         # Slots are sorted by token index, so each canvas takes the run of
@@ -106,7 +112,9 @@ def prepare_rows(
             CanvasRow(
                 forward_mode=ForwardMode.TOKEN_DENOISING,
                 request_pool_idx=slot,
-                positions=torch.arange(start, start + length),
+                positions=positions.setdefault(
+                    length, torch.arange(start, start + length)
+                ),
                 seq_len=visible,
                 write_kv=False,
                 causal=False,

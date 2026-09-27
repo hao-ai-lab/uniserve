@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+import numpy as np
 import torch
 
 from uniserve.diffusion.canvas import CanvasState
@@ -438,20 +439,44 @@ class AttentionBuffers(InputBuffers):
             True,
         )
 
-    def _positions(self, source, offset, count):
-        if source.ndim == 1:
-            source = source.unsqueeze(0)
+    def _stage_positions(self, sources, lengths):
+        """Copy the rows' positions into the packed position columns.
+
+        Each source is ``[tokens]`` or ``[axes, tokens]`` with one or three
+        axes over its row's tokens; a one-axis row fills axis zero only.
+        Rows whose positions share an axis count and a device stage with one
+        copy of their concatenation, the rest row by row.
+        """
+        shaped = []
+        for source, count in zip(sources, lengths, strict=True):
+            if source.ndim == 1:
+                source = source.unsqueeze(0)
+            if (
+                source.ndim != 2
+                or source.shape[0] not in (1, 3)
+                or source.shape[1] != count
+            ):
+                raise ValueError(
+                    "positions must have one or three axes over the token span"
+                )
+            shaped.append(source)
+
         if (
-            source.ndim != 2
-            or source.shape[0] not in (1, 3)
-            or source.shape[1] != count
+            len({source.shape[0] for source in shaped}) == 1
+            and len({source.device for source in shaped}) == 1
         ):
-            raise ValueError(
-                "positions must have one or three axes over the token span"
+            packed = shaped[0] if len(shaped) == 1 else torch.cat(shaped, 1)
+            self.positions[: packed.shape[0], : packed.shape[1]].copy_(
+                packed, non_blocking=True
             )
-        self.positions[: source.shape[0], offset : offset + count].copy_(
-            source, non_blocking=True
-        )
+            return
+
+        offset = 0
+        for source, count in zip(shaped, lengths, strict=True):
+            self.positions[: source.shape[0], offset : offset + count].copy_(
+                source, non_blocking=True
+            )
+            offset += count
 
     def _vector(self, target, source):
         if source.numel() > target.numel():
@@ -642,17 +667,20 @@ class TokenBuffers(AttentionBuffers):
         # Multimodal text uses one three-axis representation for prefill and
         # decode. Spatial coordinates of ordinary text stay zero; numerical
         # layers can consume the prepared axes directly on every replay.
-        offset, axes = 0, 3 if self.image_builder is not None else 1
+        self._stage_positions(tuple(row.positions for row in rows), lengths)
+        axes = max(
+            3 if self.image_builder is not None else 1,
+            *(
+                1 if row.positions.ndim == 1 else row.positions.shape[0]
+                for row in rows
+            ),
+        )
+        offset = 0
         for row, length in zip(rows, lengths, strict=True):
             if input_ids is None:
                 self.input_ids[offset : offset + length].copy_(
                     row.token_ids.reshape(-1), non_blocking=True
                 )
-
-            self._positions(row.positions, offset, length)
-            axes = max(
-                axes, 1 if row.positions.ndim == 1 else row.positions.shape[0]
-            )
 
             if row.token_embeddings is not None:
                 values = row.token_embeddings.reshape(length, -1)
@@ -835,14 +863,23 @@ class CanvasBuffers(AttentionBuffers):
         if total > self.max_tokens:
             raise ValueError("canvas tokens exceed input-buffer capacity")
 
-        # Rows pack back to back; each row's slots shift by the tokens of the
-        # rows before it.
+        # Rows pack back to back: their tokens and positions stage with one
+        # copy each, and each row's slots shift by the tokens of the rows
+        # before it.
+        values = tuple(row.token_ids.reshape(-1) for row in rows)
+        packed = None
+        if len({value.device for value in values}) == 1:
+            packed = adjacent_view(values)
+            packed = torch.cat(values) if packed is None else packed
+            self.input_ids[:total].copy_(packed, non_blocking=True)
+        self._stage_positions(tuple(row.positions for row in rows), lengths)
+
         slots, groups, offset = [], [], 0
         for row, length in zip(rows, lengths, strict=True):
-            self.input_ids[offset : offset + length].copy_(
-                row.token_ids.reshape(-1), non_blocking=True
-            )
-            self._positions(row.positions, offset, length)
+            if packed is None:
+                self.input_ids[offset : offset + length].copy_(
+                    row.token_ids.reshape(-1), non_blocking=True
+                )
             offsets = row.candidate_offsets
             for index, token in enumerate(row.slot_tokens):
                 slots.append(offset + token)
@@ -854,29 +891,27 @@ class CanvasBuffers(AttentionBuffers):
         count = len(slots)
         slot_tokens = self.slot_tokens[:count]
         slot_tokens.copy_(
-            torch.tensor(slots, dtype=torch.int64), non_blocking=True
+            torch.from_numpy(np.asarray(slots, dtype=np.int64)),
+            non_blocking=True,
         )
 
         # A [slots, width] matrix holds every slot's candidates, padded with
         # its first one; the selection names the real entries in order.
-        width = max(map(len, groups))
-        matrix = torch.tensor(
-            [group + (group[0],) * (width - len(group)) for group in groups],
-            dtype=torch.int64,
+        # Both stage from one host array into the shared backing.
+        sizes = np.fromiter(map(len, groups), dtype=np.int64, count=count)
+        width = int(sizes.max())
+        host = np.empty(count * width + int(sizes.sum()), dtype=np.int64)
+        matrix = host[: count * width].reshape(count, width)
+        for index, group in enumerate(groups):
+            matrix[index, : len(group)] = group
+            matrix[index, len(group) :] = group[0]
+        host[count * width :] = np.flatnonzero(
+            np.arange(width)[None, :] < sizes[:, None]
         )
-        selection = torch.tensor(
-            [
-                slot * width + index
-                for slot, group in enumerate(groups)
-                for index in range(len(group))
-            ],
-            dtype=torch.int64,
-        )
-        backing = self._candidate_backing(matrix.numel() + selection.numel())
-        candidates = backing[: matrix.numel()].view(count, width)
-        candidates.copy_(matrix, non_blocking=True)
-        selected = backing[matrix.numel() : matrix.numel() + selection.numel()]
-        selected.copy_(selection, non_blocking=True)
+        backing = self._candidate_backing(host.size)
+        backing[: host.size].copy_(torch.from_numpy(host), non_blocking=True)
+        candidates = backing[: count * width].view(count, width)
+        selected = backing[count * width : host.size]
 
         canvas = CanvasInput(
             self.input_ids[:total], self.positions[0, :total], staged
@@ -911,8 +946,9 @@ class CanvasBuffers(AttentionBuffers):
         count, length = len(rows), state.canvas_length
         if count * length > self.max_tokens:
             raise ValueError("canvas tokens exceed input-buffer capacity")
-        for index, row in enumerate(rows):
-            self._positions(row.positions, index * length, length)
+        self._stage_positions(
+            tuple(row.positions for row in rows), (length,) * count
+        )
         columns = {
             "step_slots": [row.request_pool_idx for row in rows],
             "step_seeds": [row.seed for row in rows],
@@ -1014,16 +1050,14 @@ class DiffusionBuffers(AttentionBuffers):
         if sum(lengths) > self.max_tokens:
             raise ValueError("image sequences exceed input-buffer capacity")
 
-        positions, offset = [], 0
-        for index, (row, size, length) in enumerate(
-            zip(rows, sizes, lengths, strict=True)
-        ):
-            if row.timestep is None or row.positions is None:
-                raise ValueError(
-                    "image denoising requires positions and a timestep"
-                )
+        if any(row.timestep is None or row.positions is None for row in rows):
+            raise ValueError(
+                "image denoising requires positions and a timestep"
+            )
+        self._stage_positions(tuple(row.positions for row in rows), lengths)
 
-            self._positions(row.positions, offset, length)
+        positions, offset = [], 0
+        for index, (row, length) in enumerate(zip(rows, lengths, strict=True)):
             positions.append(self.positions[:, offset : offset + length])
             self.timesteps[index].copy_(row.timestep.reshape(()))
             offset += length
