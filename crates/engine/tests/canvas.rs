@@ -348,6 +348,66 @@ fn a_blocks_steps_are_queued_behind_the_step_in_flight() {
     }
 }
 
+/// With room for two batches in flight, each block's first step is queued
+/// behind the prefill that completes its context, the prompt's last chunk
+/// or the previous block's commit, before that prefill resolves; the
+/// published text is unchanged.
+#[test]
+fn a_blocks_first_step_is_queued_behind_the_prefill_before_it() {
+    let mut sim = worker(40);
+    sim.set_queue_depth(2);
+    sim.set_results_on_wait(true);
+    let running = Running::start(sim, SchedulerConfig::default());
+    let answer = events(running.submit(canvas_request(6, 24, 1_000)));
+    let history = running.stop_events();
+
+    assert_eq!(
+        published_blocks(&answer),
+        vec![text(6, 0..16), text(6, 16..32), text(6, 32..40)]
+    );
+    assert_eq!(finish_of(&answer), (FinishReason::Eos, 41));
+
+    // Each call with its batch, in submission order, and the index of each
+    // batch's resolution.
+    let mut calls = Vec::new();
+    let mut submitted = std::collections::HashMap::new();
+    let mut resolved = std::collections::HashMap::new();
+    for (index, event) in history.iter().enumerate() {
+        match event {
+            BatchEvent::Submitted(batch) => {
+                submitted.insert(batch.id, index);
+                calls.extend(
+                    batch
+                        .requests
+                        .iter()
+                        .map(|(call, _)| (batch.id, call.clone())),
+                );
+            }
+            BatchEvent::Resolved { batch_id } => {
+                resolved.insert(*batch_id, index);
+            }
+        }
+    }
+    let mut first_steps = 0;
+    for (position, (batch, call)) in calls.iter().enumerate() {
+        if call.canvas.is_none_or(|step| step.step != 0) {
+            continue;
+        }
+        let (prefill_batch, _) = calls[..position]
+            .iter()
+            .rev()
+            .find(|(_, earlier)| earlier.code == CallKind::Forward(ForwardMode::Prefill))
+            .unwrap();
+        assert!(
+            submitted[batch] < resolved[prefill_batch],
+            "step zero of block {} waited for the prefill before it",
+            call.canvas.unwrap().block
+        );
+        first_steps += 1;
+    }
+    assert_eq!(first_steps, 3);
+}
+
 /// The completion limit truncates the block that reaches it, and no block
 /// follows.
 #[test]
