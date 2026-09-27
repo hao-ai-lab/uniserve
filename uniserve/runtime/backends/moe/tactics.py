@@ -84,9 +84,14 @@ DEFAULT_TOKENS = (
 def table_key(provider: str, module) -> tuple:
     """The table key of ``provider`` evaluating the ``FusedMoE`` ``module``.
 
-    (device name, FlashInfer version, provider, weight format, experts,
-    hidden width, resident intermediate width, top-k, activation). The
-    weight format is the encoding (``nvfp4``) or the dense dtype name.
+    (device name, FlashInfer version, provider, weight format, resident
+    experts, hidden width, resident intermediate width, top-k, activation).
+    The weight format is the encoding (``nvfp4``) or the dense dtype name.
+    The experts are those resident on this rank, the problem the grouped
+    kernel runs: the table measures every expert resident with routes over
+    all of them, so an expert-parallel layer's local share (a fraction of
+    the experts, an expert offset, and received rows that mostly skip) has
+    no entry and runs the kernel's default tactic.
     """
     import flashinfer
 
@@ -101,7 +106,7 @@ def table_key(provider: str, module) -> tuple:
         flashinfer.__version__,
         provider,
         encoding,
-        module.num_experts,
+        weight.shape[0],
         module.hidden_size,
         module.down.weight.shape[2],
         module.top_k,
