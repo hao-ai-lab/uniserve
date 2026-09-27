@@ -805,8 +805,20 @@ class Executor:
         Waits for the release work's events, then for every store to report
         the closed requests and freed buffers ready, then forgets their
         exports and retires this rank's closed request epochs. Retiring
-        submits slot-reset writes, so fresh events are recorded and a later
-        call returns True once they complete.
+        submits slot-reset writes; retirement finishes once they are issued,
+        without waiting for them to run.
+
+        The batch's result acknowledges its ``Finish`` and ``Free`` commands,
+        and the engine reuses a released request row or cache unit only in a
+        batch it builds after reading that result. The reset writes are
+        issued on the device's current stream before the result is sent, and
+        every later batch issues its device work on that stream, or on a
+        batch stream that first waits for it (``prepare.reserve_outputs``),
+        so each reuse runs after the resets. Each rank orders its own stream
+        this way, so the same holds with several data- or expert-parallel
+        ranks. Waiting for the resets to complete would instead hold the
+        result behind every batch launched after this one, whose work
+        precedes the resets on the stream.
 
         Returns:
             Whether retirement has finished.
@@ -859,17 +871,13 @@ class Executor:
         ):
             if store is not None:
                 forget_exports(store.exports, state.retirement_exports)
+        # The slot resets are stream-ordered before any reuse of the retired
+        # rows (see the docstring), so no completion fence is recorded.
         self.retire_requests(
             tuple(state.retirement_local_requests), retained=retained
         )
-
-        # Slot reset itself submits writes; their completion permits
-        # address reuse.
-        state.retirement_events = (
-            self._record_retirement_events() if closed else ()
-        )
         state.retirement_cleaned = True
-        return not state.retirement_events
+        return True
 
     def _close_batch(self, state: BatchState) -> None:
         """Release an owned batch whose result is consumed or abandoned.

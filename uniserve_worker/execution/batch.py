@@ -153,9 +153,10 @@ class BatchState:
     # Retirement of the batch's ``Finish`` and ``Free`` commands, recorded by
     # `Executor._retire_commands` and advanced by
     # `Executor._advance_retirement`. ``retirement_events`` fence the device
-    # writes each retirement stage submits, and ``retirement_cleaned`` is set
-    # once the stores have retired the closed requests and freed buffers (at
-    # once for a batch without such commands).
+    # work issued up to the batch's launch, including its request-state
+    # writes, and ``retirement_cleaned`` is set once the stores have retired
+    # the closed requests and freed buffers (at once for a batch without such
+    # commands).
     retirement_requests: frozenset[RequestKey] = frozenset()
     retirement_local_requests: frozenset[RequestKey] = frozenset()
     retirement_buffers: frozenset[BufferId] = frozenset()
