@@ -323,9 +323,10 @@ class WorkerConfig:
     captured graph holds fails, and the worker reports the rows its graphs
     hold so the engine never forms one. Turning ``prefill_cuda_graph`` off
     runs prefill eagerly, for debugging.
-    ``flow_cuda_graph`` captures image denoising calls at the
-    ``flow_graph_shapes`` and ``flow_graph_batch_sizes`` combinations and
-    replays those whose exact input signature was captured.
+    ``flow_cuda_graph`` (on by default) captures image denoising calls at
+    the ``flow_graph_shapes`` and ``flow_graph_batch_sizes`` combinations
+    and replays those whose exact input signature was captured; turning it
+    off runs image denoising eagerly, for debugging.
     """
 
     device: str = "cpu"
@@ -366,7 +367,7 @@ class WorkerConfig:
     prefill_graph_token_sizes: tuple[int, ...] = (
         DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
     )
-    flow_cuda_graph: bool = False
+    flow_cuda_graph: bool = True
     flow_graph_batch_sizes: tuple[int, ...] = (1, 2, 3, 4)
     flow_graph_shapes: tuple[tuple[int, int], ...] = (
         (1152, 2048),
@@ -490,7 +491,7 @@ def worker_config_from_namespace(
             default=DEFAULT_DECODE_GRAPH_BATCH_SIZES,
         ),
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
-        flow_cuda_graph=bool(getattr(namespace, "flow_cuda_graph", False)),
+        flow_cuda_graph=bool(getattr(namespace, "flow_cuda_graph", True)),
         prefill_graph_token_sizes=_parse_positive_int_csv(
             namespace.prefill_graph_token_sizes,
             default=DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
