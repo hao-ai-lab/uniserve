@@ -12,6 +12,12 @@ SGLang (``layers/moe/token_dispatcher/flashinfer.py:235-555``) and vLLM
 Hidden states of NVFP4 experts travel in the experts' calibrated input
 encoding rather than BF16, as SGLang's NVFP4 dispatch sends them.
 
+With the ``megamoe`` transport the exchange instead owns the NVSHMEM
+symmetric staging of the fused MegaMoE kernel
+(``uniserve.runtime.backends.moe.megamoe``), which dispatches, runs the
+experts and combines in one launch per layer; the step protocol below is the
+same, since that kernel pairs the ranks' launches too.
+
 ``ExpertExchange`` owns one ``MoeAlltoAll`` workspace for one worker and
 expert group, shared by every expert layer and execution context of the
 worker, which run their expert layers on one stream, one after another; the
@@ -36,6 +42,8 @@ agreement vLLM makes with ``coordinate_batch_across_dp``
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 import torch.distributed as dist
 
@@ -52,7 +60,10 @@ class ExpertExchange:
     exchange at the same point of its startup, because the workspace maps
     peer memory. ``max_tokens`` bounds every step's per-rank capacity. The
     workspace stays mapped until process exit; FlashInfer caches it
-    process-wide.
+    process-wide. ``transport`` selects the NVLink all-to-all (``alltoall``)
+    or the fused MegaMoE kernel (``megamoe``, NVFP4 experts), which also
+    needs the experts' gated width ``intermediate_size`` and gate
+    ``activation``.
     """
 
     def __init__(
@@ -64,12 +75,10 @@ class ExpertExchange:
         num_experts: int,
         hidden_size: int,
         device: torch.device,
+        transport: Literal["alltoall", "megamoe"] = "alltoall",
+        intermediate_size: int | None = None,
+        activation: str | None = None,
     ) -> None:
-        from flashinfer.comm.comm_backend import TorchDistBackend
-        from flashinfer.comm.mapping import Mapping
-        from flashinfer.comm.mnnvl import MnnvlConfig
-        from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll
-
         if group.size < 2 or max_tokens < 1:
             raise ValueError(
                 "an expert exchange spans two or more ranks and one token"
@@ -77,6 +86,50 @@ class ExpertExchange:
         self.group = group
         self.max_tokens = max_tokens
         self.device = device
+        self.transport = transport
+        self.fused = None
+        if transport == "megamoe":
+            if intermediate_size is None or activation is None:
+                raise ValueError(
+                    "the MegaMoE transport needs the experts' width and gate"
+                )
+            from uniserve.runtime.backends.moe.megamoe import MegaMoEBuffer
+
+            self.fused = MegaMoEBuffer(
+                group,
+                max_tokens=max_tokens,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden=hidden_size,
+                intermediate=intermediate_size,
+                activation=activation,
+                device=device,
+            )
+        elif transport != "alltoall":
+            raise ValueError(f"unknown expert transport {transport!r}")
+        else:
+            self._alltoall = self._build_alltoall(
+                group, max_tokens, top_k, num_experts, hidden_size, device
+            )
+
+        # The host step state: the open step's per-rank capacity and the
+        # expert layers it has exchanged at, by module identity.
+        self.capacity = 0
+        self.invoked: set[int] = set()
+        # The capacities each registered step kind's graphs serve, in
+        # registration order, which every rank follows alike.
+        self._kinds: list[frozenset[int]] = []
+        self._records = torch.zeros((group.size, 3), dtype=torch.int64)
+        # Whether the last agreement found every rank leaving the group.
+        self.released = False
+
+    @staticmethod
+    def _build_alltoall(group, max_tokens, top_k, num_experts, hidden, device):
+        """Map the group's MNNVL all-to-all workspace, collectively."""
+        from flashinfer.comm.comm_backend import TorchDistBackend
+        from flashinfer.comm.mapping import Mapping
+        from flashinfer.comm.mnnvl import MnnvlConfig
+        from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll
 
         # FlashInfer's Mapping describes expert parallelism inside a
         # TP-sized container; attention stays data-parallel on every rank.
@@ -90,27 +143,16 @@ class ExpertExchange:
             enable_attention_dp=True,
         )
         with torch.cuda.device(device):
-            self._alltoall = MoeAlltoAll(
+            return MoeAlltoAll(
                 mapping,
                 max_tokens,
                 top_k,
                 num_experts,
-                hidden_size=hidden_size,
+                hidden_size=hidden,
                 mnnvl_config=MnnvlConfig(
                     comm_backend=TorchDistBackend(group._require())
                 ),
             )
-
-        # The host step state: the open step's per-rank capacity and the
-        # expert layers it has exchanged at, by module identity.
-        self.capacity = 0
-        self.invoked: set[int] = set()
-        # The capacities each registered step kind's graphs serve, in
-        # registration order, which every rank follows alike.
-        self._kinds: list[frozenset[int]] = []
-        self._records = torch.zeros((group.size, 3), dtype=torch.int64)
-        # Whether the last agreement found every rank leaving the group.
-        self.released = False
 
     @property
     def kinds(self) -> tuple[frozenset[int], ...]:
@@ -190,6 +232,16 @@ class ExpertExchange:
         self.capacity = 0
         self.invoked.clear()
 
+    def enter(self, module: int) -> None:
+        """Record that the open step reaches expert layer ``module``.
+
+        Raises:
+            RuntimeError: No step is open.
+        """
+        if not self.capacity:
+            raise RuntimeError("an expert exchange runs inside an open step")
+        self.invoked.add(module)
+
     def dispatch(
         self,
         module: int,
@@ -219,11 +271,11 @@ class ExpertExchange:
         the ranks' payload lists.
 
         Raises:
+            RuntimeError: No step is open.
             ValueError: ``hidden`` exceeds the step capacity or is encoded
                 otherwise.
         """
-        if not self.capacity:
-            raise RuntimeError("an expert exchange runs inside an open step")
+        self.enter(module)
         if hidden.shape[0] > self.capacity:
             raise ValueError("a rank's tokens exceed the step capacity")
         encoded = isinstance(hidden, QuantizedTensor)
@@ -243,7 +295,6 @@ class ExpertExchange:
         else:
             states = [hidden]
 
-        self.invoked.add(module)
         # The states, then the ids the all-to-all routes by, then the
         # weights, as SGLang's NVFP4 dispatch orders them
         # (layers/moe/token_dispatcher/flashinfer.py:369-407).

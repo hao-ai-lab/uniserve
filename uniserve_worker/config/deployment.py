@@ -871,9 +871,11 @@ def _expert_parallel(
     """Resolve the replica's expert-parallel world, when the launch names one.
 
     The descriptor's optional ``expert_parallel`` object carries ``rank``,
-    ``size``, the store ``address`` and, for rank 0 only, the ``listen_fd``
-    of the socket that rank serves the store on. A replica joins with its
-    only rank, so the group's own process world must be that one rank.
+    ``size``, the store ``address``, for rank 0 only the ``listen_fd`` of
+    the socket that rank serves the store on, and the token ``exchange``
+    (``alltoall`` or ``megamoe``, which ``WorkerConfig.expert_exchange``
+    records). A replica joins with its only rank, so the group's own process
+    world must be that one rank.
 
     Raises:
         ValueError: The object is malformed, the rank lies outside a world of
@@ -888,9 +890,16 @@ def _expert_parallel(
         "size",
         "address",
         "listen_fd",
+        "exchange",
     }:
         raise ValueError(
-            "expert_parallel must carry rank, size, address and listen_fd"
+            "expert_parallel must carry rank, size, address, listen_fd and "
+            "exchange"
+        )
+    if value["exchange"] not in ("alltoall", "megamoe"):
+        raise ValueError(
+            f"unknown expert exchange {value['exchange']!r}; expected "
+            "alltoall or megamoe"
         )
 
     rank, size = value["rank"], value["size"]

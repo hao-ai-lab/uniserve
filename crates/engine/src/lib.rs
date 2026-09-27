@@ -50,7 +50,7 @@ pub use crate::sim::{
     BatchEvent, SimEngine, SimExecutor, sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
 };
 pub use crate::worker::{
-    BatchSubmitError, ExpertParallelPlacement, FlashInferBackend, FlashInferBackendParseError,
-    LaneConfig, WorkerExecutor, WorkerGroup, WorkerProcessArgs,
+    BatchSubmitError, ExpertExchange, ExpertParallelPlacement, FlashInferBackend,
+    FlashInferBackendParseError, LaneConfig, WorkerExecutor, WorkerGroup, WorkerProcessArgs,
 };
 pub use uniserve_worker_ipc::{AttentionBackend, DEFAULT_COMPONENT};

@@ -335,6 +335,10 @@ class WorkerConfig:
     device: str = "cpu"
     rank: int = 0
     world_size: int = 1
+    # How an expert-parallel replica exchanges tokens at every expert layer:
+    # "alltoall" (NVLink all-to-all around the grouped expert kernel) or
+    # "megamoe" (the fused MegaMoE kernel, NVFP4 experts).
+    expert_exchange: str = "alltoall"
     # Tokens per KV page of the cache group with the widest token rows; None
     # until resolved.
     block_size: int | None = None
@@ -501,6 +505,11 @@ def worker_config_from_namespace(
         ),
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
         prefill_outputs=bool(getattr(namespace, "prefill_outputs", True)),
+        expert_exchange=str(
+            (getattr(namespace, "expert_parallel", None) or {}).get(
+                "exchange", "alltoall"
+            )
+        ),
         flow_cuda_graph=bool(getattr(namespace, "flow_cuda_graph", True)),
         prefill_graph_token_sizes=_parse_positive_int_csv(
             namespace.prefill_graph_token_sizes,

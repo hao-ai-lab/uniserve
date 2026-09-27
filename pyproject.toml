@@ -51,7 +51,7 @@ gpu = [
     "flashinfer-python==0.6.18",
     "ninja>=1.13",
     "requests[socks]>=2",
-    "uniserve-kernels[peer_storage,sparse_attention,flash_attn_4]",
+    "uniserve-kernels[peer_storage,sparse_attention,flash_attn_4,megamoe]",
 ]
 
 [tool.uv.sources]
@@ -116,6 +116,9 @@ extend-exclude = [
     "refs",
     "target",
     ".venv",
+    # Vendored FlashInfer MegaMoE kernel sources keep their upstream style so
+    # they stay diffable against the drop they came from.
+    "uniserve_kernels/src/uniserve_kernels/megamoe",
 ]
 
 [tool.ruff.lint]

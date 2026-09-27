@@ -50,6 +50,12 @@ class RowOrder(Enum):
     # of the second half. A gated GEMM whose epilogue reads 64-column
     # subtiles so pairs each linear subtile with its gate subtile.
     INTERLEAVED_64 = "interleaved-64"
+    # The two row halves interleave in 16-row blocks, the second half's
+    # first: 32-row block ``b`` stores rows ``[16b, 16b + 16)`` of the second
+    # half, then the same rows of the first half. The fused MegaMoE gated
+    # GEMM reads each 16-channel gate block (the second half of ``up_gate``)
+    # followed by its up block.
+    INTERLEAVED_16 = "interleaved-16"
 
 
 def _row_block(order: RowOrder) -> int:
@@ -79,6 +85,12 @@ def _logical_rows(order: RowOrder, rows: int) -> torch.Tensor:
         # hold first-half rows and its last 64 the matching second-half rows.
         block, within = positions // 128, positions % 128
         return block * 64 + within % 64 + (within // 64) * (rows // 2)
+
+    if order is RowOrder.INTERLEAVED_16:
+        # Physical row q lies in 32-row block q // 32; its first 16 rows
+        # hold second-half rows and its last 16 the matching first-half rows.
+        block, within = positions // 32, positions % 32
+        return block * 16 + within % 16 + (1 - within // 16) * (rows // 2)
 
     # Physical position q of a 32-row block holds block row (q % 8) * 4 +
     # q // 8, the inverse of the shuffle's r -> (r % 4) * 8 + r // 4.

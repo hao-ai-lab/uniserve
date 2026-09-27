@@ -146,6 +146,7 @@ curl -s http://127.0.0.1:8000/v1/systemone \
 | `--worker-ranks` | `1` | Ranks, forming one tensor-parallel group, in each replica's default Worker instance when `--workers` is omitted |
 | `--data-parallel-size` | `1` | Independent model replicas, each with its own scheduler, KV cache and ranks; every request goes to the replica with the fewest requests in flight. With `--workers`, the file lists the replicas as equal consecutive blocks of Worker instances |
 | `--expert-parallel` | Off | Shard the routed experts of a mixture-of-experts model across the data-parallel replicas, one rank each: every replica keeps its share of each expert layer and exchanges tokens with the others over NVLink at every such layer, while attention and every other layer stay data-parallel |
+| `--expert-exchange` | `alltoall` | How expert-parallel replicas exchange tokens at every expert layer: `alltoall` runs FlashInfer's NVLink all-to-all around each GPU's grouped expert kernel; `megamoe` runs the fused MegaMoE kernel, which dispatches, computes and combines in one launch per layer over NVSHMEM and serves NVFP4 experts |
 | `--workers` | One `model` entry over every rank of each replica | Path to a JSON deployment configuration: Worker instances, node/device ranks, and the components placed on them |
 | `--max-model-len` | Model configuration | Context-length ceiling |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
@@ -183,7 +184,7 @@ uniserve serve /models/diffusiongemma-26B-A4B-it \
   --data-parallel-size 4
 ```
 
-Adding `--expert-parallel` keeps the four replicas' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the replicas exchange tokens at each expert layer. Every expert layer then runs in steps the replicas take together: a replica without work joins each step another replica starts, and all replicas pad a step to the largest one's captured graph.
+Adding `--expert-parallel` keeps the four replicas' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the replicas exchange tokens at each expert layer. Every expert layer then runs in steps the replicas take together: a replica without work joins each step another replica starts, and all replicas pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `--expert-exchange megamoe` fuses each expert layer's exchange and expert computation into one kernel.
 
 For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).
 

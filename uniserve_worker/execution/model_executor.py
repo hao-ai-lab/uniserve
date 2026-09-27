@@ -1416,7 +1416,8 @@ class ModelExecutor:
 
         Every expert-parallel ``FusedMoE`` of the model shares the exchange
         of its group, sized for ``max_tokens`` tokens per rank, the most one
-        staged call holds; ``None`` when no layer is expert-parallel.
+        staged call holds, over the transport ``WorkerConfig.expert_exchange``
+        names; ``None`` when no layer is expert-parallel.
         Construction maps peer memory collectively, so every rank of the
         group builds it at this same point of its startup. The exchange
         serializes its layers on one stream, so an expert-parallel worker
@@ -1468,6 +1469,9 @@ class ModelExecutor:
             num_experts=first.num_experts,
             hidden_size=first.hidden_size,
             device=first.up_gate.weight.device,
+            transport=self.worker_config.expert_exchange,
+            intermediate_size=first.intermediate_size,
+            activation=first.activation,
         )
 
     def _register_expert_steps(self):
