@@ -203,13 +203,16 @@ def test_the_completion_limit_truncates_inside_a_canvas(served):
     assert reply["usage"]["completion_tokens"] == 100
 
 
-def test_a_seed_repeats_its_reply(served):
+# A negative seed names the unsigned 64-bit seed with the same bits, above
+# 2**63 - 1, the upper half of the range unseeded requests also draw from.
+@pytest.mark.parametrize("seed", [77, -1])
+def test_a_seed_repeats_its_reply(served, seed):
     """The same prompt, parameters and seed served alone give one reply.
 
     The seed selects the request's sampling stream, so a request served
     again by itself draws the same canvases and returns the same reply.
     """
-    body = _body(APPLES, seed=77, **_thinking(True))
+    body = _body(APPLES, seed=seed, **_thinking(True))
     first = _complete(served, body)
     again = _complete(served, body)
 
