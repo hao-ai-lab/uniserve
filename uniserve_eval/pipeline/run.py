@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-import httpx
+import aiohttp
 import numpy as np
 
 from ..artifacts import ArtifactWriter
@@ -66,9 +66,9 @@ async def run_point(
         point: The resolved benchmark point to execute.
         output_dir: The bundle directory; it must be absent or empty.
         launch: The `describe_launch` provenance record, if any.
-        timeout_s: The httpx timeout in seconds, applied to each connect,
-            read, write, and pool wait of a benchmark request; the
-            `/version` provenance fetch uses its own shorter timeout.
+        timeout_s: The total timeout in seconds of each benchmark request,
+            from connection to the end of its body; the `/metrics` and
+            `/version` fetches use their own shorter timeout.
 
     Returns:
         The summary and bundle directory. A point whose validation fails
@@ -134,15 +134,17 @@ async def run_point(
         # makes a finite-rate arrival schedule reproducible.
         np.random.seed(point.load.seed)
 
-        # The connection pool is unbounded, so the only client-side limit on
-        # in-flight requests is `run_load`'s optional `max_concurrency`
-        # semaphore.
-        limits = httpx.Limits(
-            max_connections=None, max_keepalive_connections=None
-        )
-        async with httpx.AsyncClient(
-            timeout=timeout_s, limits=limits
-        ) as client:
+        # The connection pool is unbounded (`limit=0`), so the only
+        # client-side limit on in-flight requests is `run_load`'s optional
+        # `max_concurrency` semaphore. One aiohttp session with a total
+        # per-request timeout is the client of the SGLang and vLLM serving
+        # benchmarks; it adds well under a millisecond per request even at
+        # hundreds of concurrent requests.
+        connector = aiohttp.TCPConnector(limit=0)
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as session:
 
             async def submit(
                 example: Example, scheduled: float | None
@@ -163,7 +165,7 @@ async def run_point(
                     else point.sampling.max_tokens or 0
                 )
                 record = await send_request(
-                    client,
+                    session,
                     base_url.rstrip("/"),
                     request,
                     request_id=example.id,
@@ -184,7 +186,7 @@ async def run_point(
             async def snapshot_metrics() -> None:
                 """Scrape server counters just before the measured window."""
                 nonlocal metrics_before
-                metrics_before = await scrape_metrics(client, base_url)
+                metrics_before = await scrape_metrics(session, base_url)
 
             # Sampling spans warmup, the settle pause, and the measured
             # window.
@@ -221,8 +223,8 @@ async def run_point(
 
             # Counters and provenance are fetched after the measured window
             # closes.
-            metrics_after = await scrape_metrics(client, base_url)
-            server_version = await _fetch_server_version(client, base_url)
+            metrics_after = await scrape_metrics(session, base_url)
+            server_version = await _fetch_server_version(session, base_url)
 
         summary = build_summary(
             point,
@@ -404,7 +406,7 @@ def _run_state(
 
 
 async def _fetch_server_version(
-    client: httpx.AsyncClient, base_url: str
+    session: aiohttp.ClientSession, base_url: str
 ) -> dict[str, Any] | None:
     """Fetch optional server provenance without affecting benchmark completion.
 
@@ -414,15 +416,15 @@ async def _fetch_server_version(
         The response object, or None on a non-200 status, a body that is not
         a JSON object, or any `Exception` raised by the request or decoding.
     """  # noqa: E501
-    # The short per-call timeout overrides the client's request timeout.
+    # The short per-call timeout overrides the session's request timeout.
     try:
-        response = await client.get(
-            base_url.rstrip("/") + "/version", timeout=15.0
-        )
-        if response.status_code == 200 and isinstance(
-            payload := response.json(), dict
-        ):
-            return payload
+        async with session.get(
+            base_url.rstrip("/") + "/version",
+            timeout=aiohttp.ClientTimeout(total=15.0),
+        ) as response:
+            if response.status != 200:
+                return None
+            payload = await response.json(content_type=None)
     except Exception:
         return None
-    return None
+    return payload if isinstance(payload, dict) else None

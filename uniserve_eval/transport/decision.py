@@ -11,13 +11,14 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
+import aiohttp
 
 from ..types import DJEV_EVALUATE, RequestRecord
+from .http import post_json
 
 
 async def send_decision(
-    client: httpx.AsyncClient,
+    session: aiohttp.ClientSession,
     url: str,
     endpoint: str,
     payload: dict[str, Any],
@@ -36,19 +37,17 @@ async def send_decision(
     the endpoint's answer structure, and `incomplete_answers` when a
     requested question has no answer.
     """
-    response = await client.post(url, json=payload)
-    record.note_http(response.status_code)
-    record.close_now()
-    if response.status_code >= 400:
+    response = await post_json(session, url, payload, record)
+    if response.status >= 400:
         record.mark_failure(
-            f"transport_status_{response.status_code}", response.text[:500]
+            f"transport_status_{response.status}", response.text[:500]
         )
         return
     try:
         data = response.json()
     except Exception:
         record.mark_failure(
-            f"transport_status_{response.status_code}", response.text[:500]
+            f"transport_status_{response.status}", response.text[:500]
         )
         return
 
