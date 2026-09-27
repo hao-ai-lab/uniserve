@@ -3,8 +3,11 @@
 On CUDA, automatic selection chooses only native kernels:
 
 - the TensorRT-LLM (trtllm-gen) paged kernels and UniServe's prefix-block
-  kernel on SM100, for causal and non-causal paged rows and for segmented
-  prefix reads whose queries see their whole current block;
+  kernels on SM100, for causal and non-causal paged rows and for segmented
+  prefix reads whose queries see their whole current block; the
+  prefix-block kernels read every paged row of full-attention layers (head
+  dimension 512 without a history window) and the non-causal rows of the
+  others;
 - FlashAttention-4 on SM90 and the SM100 family, for dense, variable-length,
   visible-endpoint and segmented inputs and for paged rows without a history
   window. Its SM100 head-dimension-256 kernel accepts neither per-sequence key
@@ -213,9 +216,13 @@ def _names(batch, *, head_dim, window, architecture):
         return (*block, *fa4)
     if isinstance(batch, PagedInput):
         # Non-causal blocks read their own keys and a prefix window with
-        # the prefix-block kernel. TensorRT-LLM context kernels bound a
-        # history window only along the causal diagonal.
-        block = ("prefix_block",) if not any(batch.causal) else ()
+        # the prefix-block kernel, and the causal prefill chunks of
+        # full-attention layers (head dimension 512 without a history
+        # window) read their history with its causal kernel. TensorRT-LLM
+        # context kernels bound a history window only along the causal
+        # diagonal.
+        full = head_dim == 512 and window is None
+        block = ("prefix_block",) if full or not any(batch.causal) else ()
         trtllm = ("trtllm",) if window is None or all(batch.causal) else ()
         ordinary = (
             ("sgl_kernel",) if batch.block_table.block_size % 256 == 0 else ()
