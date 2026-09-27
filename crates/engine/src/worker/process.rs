@@ -207,6 +207,10 @@ impl Default for WorkerProcessArgs {
             block_size: None,
             max_batch_calls: 128,
             max_batch_tokens: 16_384,
+            // The engine's default running-request limit plus the largest
+            // row reserve a runtime keeps outside it.
+            max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
+                + crate::scheduler::MAX_FLOW_PREFIX_ROWS) as u32,
             attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
             capability_groups: Vec::new(),
             transfer: Default::default(),
@@ -444,6 +448,10 @@ impl WorkerProcessArgs {
         fields.insert("block_size".into(), json!(self.block_size));
         fields.insert("max_batch_calls".into(), json!(self.max_batch_calls));
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
+        fields.insert(
+            "max_request_pool_size".into(),
+            json!(self.max_request_pool_size),
+        );
         fields.insert("max_model_len".into(), json!(self.max_model_len));
         fields.insert("max_video_seconds".into(), json!(self.max_video_seconds));
         fields.insert("min_video_seconds".into(), json!(self.min_video_seconds));

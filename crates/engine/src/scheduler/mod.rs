@@ -38,12 +38,14 @@ mod config;
 mod stats;
 pub(crate) mod stats_report;
 
+pub(crate) use config::MAX_NUM_SEQS;
+use config::MAX_NUM_WAITING;
 pub use config::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulingPolicy,
 };
-use config::{MAX_NUM_SEQS, MAX_NUM_WAITING};
 pub(crate) use execution::consuming_calls;
+pub(crate) use run::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,

@@ -1392,6 +1392,46 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
     Ok(())
 }
 
+/// Workers launched by the engine hold a request row for every running
+/// request the engine is configured to keep resident, beyond the worker's
+/// own default pool.
+#[test]
+fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<()> {
+    const RUNNING: usize = 200;
+
+    let mut config = EngineConfig::sim("stub");
+    config.runtime_family = RuntimeFamily::Ar;
+    config.generation_limits = uniserve_core::GenerationLimits {
+        features: uniserve_core::GenerationFeatures::UNDERSTANDING,
+        latent_downsample: 1,
+        max_cfg_branches: 1,
+        ..Default::default()
+    };
+    config.max_num_seqs = RUNNING;
+    config.workers = vec![WorkerConfig::placed(
+        &["localhost".to_owned()],
+        "cpu",
+        WORLD_SIZE,
+        2,
+        WorkerConfig::single_component("model", WORLD_SIZE),
+    )];
+    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    let engine = {
+        let _launch_guard = CHILD_LAUNCH_ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child-launch environment lock is poisoned"))?;
+        EngineCore::new(config)?
+    };
+    let request_rows = engine.info().request_slots as usize;
+    engine.shutdown();
+
+    assert!(
+        request_rows >= RUNNING,
+        "{request_rows} request rows cannot hold {RUNNING} running requests"
+    );
+    Ok(())
+}
+
 #[test]
 fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
@@ -2871,6 +2911,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "block_size": 16,
     "max_batch_calls": 8,
     "max_batch_tokens": 256,
+    "max_request_pool_size": 129,
     "max_model_len": 8192,
     "max_video_seconds": 15.0,
     "graph_policy": "off",

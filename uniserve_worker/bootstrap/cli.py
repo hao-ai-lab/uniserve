@@ -48,6 +48,7 @@ REQUIRED_FIELDS = (
     "block_size",
     "max_batch_calls",
     "max_batch_tokens",
+    "max_request_pool_size",
     "max_model_len",
     "max_video_seconds",
     "model_dtype",
