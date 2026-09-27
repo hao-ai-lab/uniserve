@@ -1586,15 +1586,31 @@ impl Scheduler {
             }
             Phase::Canvas => {
                 // One step of the request's block is one read-only canvas row
-                // of the pass. A step follows only the accepted result of the
-                // previous one, which decides whether the block stopped.
+                // of the pass. The next step may be queued behind the steps
+                // still in flight, predicated on the last one's completion:
+                // the worker runs it as a no-op once an earlier step stopped
+                // the block, so the block's steps run back to back without
+                // waiting for each result. A step past the block's step limit
+                // is never queued, since the last step always stops it.
                 let st = self.running.get(&id)?;
-                let canvas_length = st.req.canvas.as_ref()?.canvas_length as usize;
-                if self.inflight.has_pending_calls(id) || canvas_rows == 0 || canvas_length > budget
+                let canvas = st.req.canvas.as_ref()?;
+                let canvas_length = canvas.canvas_length as usize;
+                let pending = self.inflight.num_pending_calls(id);
+                if (pending > 0
+                    && !self
+                        .can_queue_successor(id, CallKind::Forward(ForwardMode::TokenDenoising)))
+                    || canvas_rows == 0
+                    || canvas_length > budget
                 {
                     return None;
                 }
-                let (block, step) = (st.canvas_block, st.canvas_step);
+                let block = st.canvas_block;
+                let step = st
+                    .canvas_step
+                    .saturating_add(u32::try_from(pending).unwrap_or(u32::MAX));
+                if step >= canvas.max_steps {
+                    return None;
+                }
                 self.plan_computation(id, |_scheduler, request| {
                     generation::plan_canvas_step(request, block, step)
                 })

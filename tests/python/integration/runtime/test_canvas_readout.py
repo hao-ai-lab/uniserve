@@ -89,10 +89,11 @@ SLOT = 1
 REQUEST = RequestKey(0, 7, 1)
 
 
-def _worker(root, **settings):
+def _worker(root, queue_depth=1, **settings):
     """A CPU worker serving the checkpoint at ``root``.
 
-    ``settings`` replace further ``WorkerConfig`` fields.
+    It holds up to ``queue_depth`` batches at once; ``settings`` replace
+    further ``WorkerConfig`` fields.
     """
     loaded = models.read_config(root)
     config = replace(
@@ -108,7 +109,7 @@ def _worker(root, **settings):
         sampling_group=Communicator(device=torch.device("cpu")),
         tokenizer=None,
         allowed_calls=None,
-        queue_depth=1,
+        queue_depth=queue_depth,
         completion_payload_bytes=1 << 16,
         attention="torch",
         host_slots=(0, 1),
@@ -117,7 +118,11 @@ def _worker(root, **settings):
 
 def _run(worker, batch):
     """Submit one batch and drive the worker until its report is ready."""
-    submission = worker.submit(batch)
+    return _drain(worker, worker.submit(batch))
+
+
+def _drain(worker, submission):
+    """Drive the worker until a submitted batch's report is ready."""
     deadline = time.monotonic() + 60.0
     while True:
         worker.advance()

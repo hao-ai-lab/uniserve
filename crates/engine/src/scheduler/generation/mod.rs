@@ -592,8 +592,10 @@ pub(super) fn plan_readout(
 /// sampler state in the request's slot. Its `max_tokens` is the canvas
 /// length, which the step denoises and which a stopping step reports as its
 /// committed tokens; its completion payload bound covers those tokens at
-/// four bytes each. Fails with `NotCanvasGeneration` for a request without
-/// canvas sampling.
+/// four bytes each. Its completion output is true while the block continues
+/// after the step: the predicate of the next step, which the scheduler may
+/// queue before this one resolves. Fails with `NotCanvasGeneration` for a
+/// request without canvas sampling.
 pub(super) fn plan_canvas_step(
     request: &GenerationRequest,
     block: u32,
@@ -606,6 +608,7 @@ pub(super) fn plan_canvas_step(
     let mut call = computation(request, CallKind::Forward(ForwardMode::TokenDenoising));
     call.bounds.max_tokens = canvas.canvas_length;
     call.canvas = Some(CanvasStep { block, step });
+    call.completion_output = Some(output_tensor(0, DType::U8));
     let mut call = finish_plan(request, call, 0)?;
     call.bounds.max_completion_bytes = u64::from(canvas.canvas_length).saturating_mul(4);
     Ok(call)

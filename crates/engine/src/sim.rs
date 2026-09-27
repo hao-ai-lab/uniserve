@@ -831,6 +831,9 @@ impl SimEngine {
                 // deterministic log-probability per readout candidate, or runs
                 // one step of the request's generation canvas.
                 if let Some(step) = call.canvas {
+                    // A step queued behind the one that stopped its block is
+                    // predicated on that step's false completion and never
+                    // reaches this branch.
                     anyhow::ensure!(
                         step == request.canvas,
                         "canvas call {:?} runs {step:?}, but the request's canvas is at {:?}",
@@ -869,6 +872,11 @@ impl SimEngine {
                             block: step.block + 1,
                             step: 0,
                         };
+                        // The block stops here, so a step queued behind this
+                        // one is a no-op.
+                        if let Some(completion) = call.completion_output.as_ref() {
+                            request.predicate_values.insert(completion.clone(), false);
+                        }
                     }
                 }
                 if let Some(readout) = &call.readout {

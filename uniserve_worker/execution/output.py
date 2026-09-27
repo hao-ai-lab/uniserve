@@ -47,6 +47,7 @@ from uniserve_worker.protocol.output import (
 )
 from uniserve_worker.protocol.transfer import KvTransfer, Locator
 from uniserve_worker.sampling.result import LogprobValues, SamplerRow
+from uniserve_worker.storage.canvas_slots import STEP_SKIPPED, STEP_STOPPED
 from uniserve_worker.storage.latent_pool import LatentStaging, LatentUpdate
 from uniserve_worker.storage.output import OutputBuffer
 from uniserve_worker.storage.tensor_store import TensorRead, TensorRecord
@@ -512,6 +513,9 @@ class PendingOutput:
         runtime = self.progress
         tokens = self.token.committed_tokens
         suppressed = status is CallStatus.PREDICATED
+        # A canvas step queued behind the one that stopped its block ran as
+        # a no-op (`STEP_SKIPPED`), which reports as a predicated call.
+        skipped = False
         if not suppressed:
             try:
                 # A `finish` callback consumes every host task result. Without
@@ -558,11 +562,12 @@ class PendingOutput:
                         struct.pack(f"<{len(words)}i", *words),
                     )
                 if self.token.canvas_range is not None:
-                    stopped, *canvas = self._buffer.read_tokens(
+                    outcome, *canvas = self._buffer.read_tokens(
                         *self.token.canvas_range
                     )
+                    skipped = outcome == STEP_SKIPPED
                     self.token.committed_tokens = (
-                        tuple(canvas) if stopped else ()
+                        tuple(canvas) if outcome == STEP_STOPPED else ()
                     )
             except Exception:
                 logger.exception(
@@ -619,6 +624,9 @@ class PendingOutput:
                                 kv_visible_len=visible,
                             )
 
+        if skipped and status is CallStatus.OK:
+            status = CallStatus.PREDICATED
+            suppressed = True
         # A predicated call did not run, so it reports the request's accepted
         # coordinates and carries no error code.
         if status is CallStatus.PREDICATED:

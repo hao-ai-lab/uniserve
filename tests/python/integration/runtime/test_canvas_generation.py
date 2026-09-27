@@ -10,8 +10,11 @@ public model driven directly by the block-diffusion sampler of
 ``uniserve.diffusion.canvas``: a prompt pass that writes a prefix cache,
 then per step a canvas pass that reads it with the previous step's
 self-conditioning, in FP32 on the CPU with the torch attention backend. A
-step that does not continue its slot's canvas, or of a canvas whose sampling
-is not the one the worker serves, is refused.
+step may be queued behind the one before it, predicated on that step's
+completion, as the engine queues steps; queued behind the finishing step it
+is predicated and leaves the canvas as the finishing step left it. A step
+that does not continue its slot's canvas, or of a canvas whose sampling is
+not the one the worker serves, is refused.
 """
 
 from dataclasses import replace
@@ -31,6 +34,7 @@ from tests.python.integration.runtime.test_canvas_readout import (
     SLOT,
     _attention,
     _call,
+    _drain,
     _paged,
     _prefill,
     _run,
@@ -64,6 +68,8 @@ from uniserve_worker.protocol.call import (
     CanvasStep,
     ForwardMode,
 )
+from uniserve_worker.protocol.identity import CallId
+from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 
 pytestmark = pytest.mark.integration
 
@@ -90,6 +96,10 @@ SAMPLING = sampler.CanvasSampling(
     eos_ids=(1, 6),
     pad_id=0,
 )
+# Sampling whose blocks stop at their first step: every argmax canvas is
+# stable without history, and every mean entropy is below the threshold.
+EARLY = replace(ADMITTED, confidence_threshold=100.0, stability_threshold=0)
+EARLY_SAMPLING = replace(SAMPLING, confidence=100.0, stability=0)
 
 
 def _admission(canvas=ADMITTED):
@@ -104,14 +114,27 @@ def _admission(canvas=ADMITTED):
     )
 
 
-def _step(batch, context, block, step):
-    """One canvas step over the ``context``-token cached prefix."""
+def _step(batch, context, block, step, predicate=None):
+    """One canvas step over the ``context``-token cached prefix.
+
+    The step's completion output reports whether its block continues; a
+    queued step is predicated on the ``predicate`` of the step before it.
+    """
     call = _call(
         batch,
         ForwardMode.TOKEN_DENOISING,
         context,
         bounds=Bounds(max_tokens=CANVAS, max_completion_bytes=4 * CANVAS),
         canvas=CanvasStep(block, step),
+        completion_output=TensorRef(
+            request_key=REQUEST,
+            producer_call_id=CallId(batch, 0),
+            output_index=0,
+            generation=batch,
+            dtype=DType.U8,
+            shape_bound=ShapeBound(),
+        ),
+        predicate=predicate,
     )
     return Batch(
         batch_id=batch,
@@ -129,7 +152,8 @@ def _step(batch, context, block, step):
 class _Reference:
     """The public model and sampler stepping one canvas directly."""
 
-    def __init__(self, root):
+    def __init__(self, root, sampling=SAMPLING):
+        self.sampling = sampling
         self.model = load_diffusion_gemma(root)
         config = self.model.text.cache_config
         tables = len(plan_units(config, block_size=PAGE).tables)
@@ -147,7 +171,7 @@ class _Reference:
             1,
             CANVAS,
             backbone.embedding.embedding_dim,
-            stability=SAMPLING.stability,
+            stability=sampling.stability,
             dtype=backbone.embedding.weight.dtype,
         )
 
@@ -206,7 +230,7 @@ class _Reference:
             denoiser.backbone.embedding.weight,
             denoiser.backbone.embedding_scale,
             state,
-            SAMPLING,
+            self.sampling,
             scores=sampler.CanvasScores.empty(1, CANVAS),
             decision=decision,
             workspace=sampler.CanvasWorkspace.empty(
@@ -224,7 +248,7 @@ class _Reference:
 def _block(run, context, block, first_batch):
     """Step block ``block`` until it finishes; return its steps' tokens."""
     reported = []
-    for step in range(SAMPLING.steps):
+    for step in range(ADMITTED.max_steps):
         tokens = run(first_batch + step, context, block, step)
         reported.append(tokens)
         if tokens:
@@ -232,17 +256,9 @@ def _block(run, context, block, first_batch):
     return reported
 
 
-def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
-    """Two blocks, the second over the committed first, match the reference.
-
-    Every step before a block's finishing step reports no tokens, the
-    finishing step reports the block, and the step counts agree.
-    """
-    diffusion_gemma_checkpoint(tmp_path)
-    generator = torch.Generator().manual_seed(37)
-    prompt = torch.randint(7, 58, (13,), generator=generator).tolist()
-
-    reference = _Reference(tmp_path)
+def _expected_blocks(root, prompt, sampling=SAMPLING):
+    """The reference's steps' tokens of two blocks after ``prompt``."""
+    reference = _Reference(root, sampling)
     try:
         with torch.no_grad():
             reference.extend(prompt, 0)
@@ -265,19 +281,37 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
             )
     finally:
         reference.close()
+    return expected
+
+
+def _admitted_prompt(worker, prompt, canvas=ADMITTED):
+    """Admit the request with ``canvas`` sampling and prefill ``prompt``."""
+    prefill = replace(
+        _prefill(1, 0, tokens=prompt),
+        commands=(_admission(canvas),),
+        block_tables=_tables(13 + 2 * CANVAS),
+        new_cache_units=tuple(
+            CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)
+            for table in _tables(13 + 2 * CANVAS)
+        ),
+    )
+    assert _run(worker, prefill).completions[0].status is CallStatus.OK
+
+
+def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
+    """Two blocks, the second over the committed first, match the reference.
+
+    Every step before a block's finishing step reports no tokens, the
+    finishing step reports the block, and the step counts agree.
+    """
+    diffusion_gemma_checkpoint(tmp_path)
+    generator = torch.Generator().manual_seed(37)
+    prompt = torch.randint(7, 58, (13,), generator=generator).tolist()
+    expected = _expected_blocks(tmp_path, prompt)
 
     worker = _worker(tmp_path, canvas_sampling=ADMITTED)
     with worker:
-        prefill = replace(
-            _prefill(1, 0, tokens=prompt),
-            commands=(_admission(),),
-            block_tables=_tables(13 + 2 * CANVAS),
-            new_cache_units=tuple(
-                CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)
-                for table in _tables(13 + 2 * CANVAS)
-            ),
-        )
-        assert _run(worker, prefill).completions[0].status is CallStatus.OK
+        _admitted_prompt(worker, prompt)
 
         def run(batch, context, block, step):
             (record,) = _run(
@@ -302,6 +336,88 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
     assert actual == expected
     # Each block ends with the one step that reports all of its tokens.
     assert [len(tokens) for tokens in expected if tokens] == [CANVAS, CANVAS]
+
+
+def _queued_block(worker, context, block, first_batch):
+    """Step block ``block`` with each step queued behind the one in flight.
+
+    Each step after the first is submitted before the step it follows
+    reports, predicated on that step's completion. Returns the records of
+    every step through the finishing one, then the record of the step
+    queued behind it, if the step limit allows one.
+    """
+    calls, submissions, records = [], [], []
+
+    def submit(step):
+        predicate = calls[-1].completion_output if calls else None
+        batch = _step(first_batch + step, context, block, step, predicate)
+        calls.append(batch.calls[0])
+        submissions.append(worker.submit(batch))
+
+    submit(0)
+    step = 0
+    while True:
+        if step + 1 < EARLY.max_steps:
+            submit(step + 1)
+        (record,) = _drain(worker, submissions[step]).completions
+        records.append(record)
+        if record.committed_tokens or step + 1 == EARLY.max_steps:
+            break
+        step += 1
+    if len(submissions) > len(records):
+        records.append(_drain(worker, submissions[-1]).completions[0])
+    return records
+
+
+def test_queued_steps_give_the_blocks_of_steps_that_wait(tmp_path):
+    """Steps queued back to back match the reference.
+
+    With sampling whose blocks stop at their first step, the steps through
+    each block's finishing one report as the reference steps do, and the
+    step queued behind the finishing one reports predicated, with no
+    tokens: it does not run the finished block again. The next block, over
+    the committed first, still matches the reference.
+    """
+    diffusion_gemma_checkpoint(tmp_path)
+    generator = torch.Generator().manual_seed(37)
+    prompt = torch.randint(7, 58, (13,), generator=generator).tolist()
+    expected = _expected_blocks(tmp_path, prompt, EARLY_SAMPLING)
+
+    worker = _worker(tmp_path, queue_depth=2, canvas_sampling=EARLY)
+    actual, queued = [], []
+    with worker:
+        _admitted_prompt(worker, prompt, EARLY)
+        batch = 2
+        for block in (0, 1):
+            context = 13 + block * CANVAS
+            records = _queued_block(worker, context, block, batch)
+            batch += len(records)
+            finishing = next(
+                index
+                for index, record in enumerate(records)
+                if record.committed_tokens
+            )
+            for record in records[: finishing + 1]:
+                assert record.status is CallStatus.OK
+                actual.append(tuple(record.committed_tokens))
+            queued.extend(records[finishing + 1 :])
+            if block == 0:
+                commit = replace(
+                    _prefill(batch, 13, tokens=list(actual[-1])),
+                    block_tables=_tables(13 + 2 * CANVAS),
+                )
+                assert (
+                    _run(worker, commit).completions[0].kv_visible_len
+                    == 13 + CANVAS
+                )
+                batch += 1
+        _run(worker, Batch(batch_id=batch, commands=(Finish(REQUEST),)))
+
+    assert actual == expected
+    assert len(queued) == 2
+    for record in queued:
+        assert record.status is CallStatus.PREDICATED
+        assert not record.committed_tokens
 
 
 def _first_step_status(root, admitted, step):

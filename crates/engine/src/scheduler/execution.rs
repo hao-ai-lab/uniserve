@@ -1585,8 +1585,14 @@ impl Scheduler {
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     Phase::Prefill
                 }
+                // Steps queued behind the accepted one that stopped the block
+                // are no-ops; the block's commit follows them.
                 CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
-                    Phase::Canvas
+                    if state.phase == Phase::CommitCanvas {
+                        Phase::CommitCanvas
+                    } else {
+                        Phase::Canvas
+                    }
                 }
                 CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Readout,
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {

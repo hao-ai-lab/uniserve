@@ -10,8 +10,10 @@
 //! starts. The simulator stops block `b` of request `r` at step
 //! `sim_canvas_stop_step(r, b, max_steps)` and fills it with the synthetic
 //! text `sim_text_token(r, i)` followed by EOS, so the expected output is
-//! known exactly. Tests observe calls at the executor boundary, the protocol
-//! the worker consumes.
+//! known exactly. A step may be queued behind the one still in flight,
+//! predicated on its completion; behind the step that stops the block it is
+//! a no-op. Tests observe calls at the executor boundary, the protocol the
+//! worker consumes.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -109,15 +111,21 @@ impl Running {
 
     /// Stops the scheduler and returns every batch it submitted, in order.
     fn stop(self) -> Vec<ExecutionBatch> {
-        self.handle.shutdown();
-        assert!(!self.thread.join().unwrap(), "the scheduler failed");
-        self.batches
-            .try_iter()
+        self.stop_events()
+            .into_iter()
             .filter_map(|event| match event {
                 BatchEvent::Submitted(batch) => Some(batch),
                 BatchEvent::Resolved { .. } => None,
             })
             .collect()
+    }
+
+    /// Stops the scheduler and returns its executor's submissions and
+    /// resolutions, in order.
+    fn stop_events(self) -> Vec<BatchEvent> {
+        self.handle.shutdown();
+        assert!(!self.thread.join().unwrap(), "the scheduler failed");
+        self.batches.try_iter().collect()
     }
 }
 
@@ -276,6 +284,68 @@ fn blocks_are_denoised_published_and_committed_until_eos() {
             .all(|(call, _)| call.token_output.is_none()),
         "block-diffusion generation samples no token by decode"
     );
+}
+
+/// With room for two batches in flight, each step of a block is queued
+/// before the step it follows resolves, predicated on that step's
+/// completion. The step behind the one that stops the block is a no-op, and
+/// the commit follows once it resolves; the published text is unchanged.
+#[test]
+fn a_blocks_steps_are_queued_behind_the_step_in_flight() {
+    let mut sim = worker(40);
+    sim.set_queue_depth(2);
+    sim.set_results_on_wait(true);
+    let running = Running::start(sim, SchedulerConfig::default());
+    let answer = events(running.submit(canvas_request(5, 24, 1_000)));
+    let history = running.stop_events();
+
+    assert_eq!(
+        published_blocks(&answer),
+        vec![text(5, 0..16), text(5, 16..32), text(5, 32..40)]
+    );
+    assert_eq!(finish_of(&answer), (FinishReason::Eos, 41));
+
+    // Each canvas step with its batch's submission and resolution indices.
+    let mut submitted = std::collections::HashMap::new();
+    let mut resolved = std::collections::HashMap::new();
+    let mut steps = Vec::new();
+    for (index, event) in history.iter().enumerate() {
+        match event {
+            BatchEvent::Submitted(batch) => {
+                submitted.insert(batch.id, index);
+                for (call, _) in &batch.requests {
+                    if let Some(step) = call.canvas {
+                        steps.push((batch.id, step.block, step.step, call.predicate.is_some()));
+                    }
+                }
+            }
+            BatchEvent::Resolved { batch_id } => {
+                resolved.insert(*batch_id, index);
+            }
+        }
+    }
+    for block in 0..3u32 {
+        let stop = sim_canvas_stop_step(RequestId(5), block, MAX_STEPS);
+        let block_steps: Vec<_> = steps.iter().filter(|step| step.1 == block).collect();
+        // Every step up to the stopping one runs, in order, and at most one
+        // more is queued behind it within the step limit.
+        let expected_last = (stop + 1).min(MAX_STEPS - 1);
+        assert_eq!(
+            block_steps.iter().map(|step| step.2).collect::<Vec<_>>(),
+            (0..=expected_last).collect::<Vec<_>>(),
+            "block {block}"
+        );
+        for pair in block_steps.windows(2) {
+            let (previous, next) = (pair[0], pair[1]);
+            assert!(next.3, "a queued step carries its predicate");
+            assert!(
+                submitted[&next.0] < resolved[&previous.0],
+                "step {} of block {block} waited for step {}",
+                next.2,
+                previous.2
+            );
+        }
+    }
 }
 
 /// The completion limit truncates the block that reaches it, and no block

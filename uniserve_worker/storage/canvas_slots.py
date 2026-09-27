@@ -18,6 +18,12 @@ argmax history, and a request that carries other sampling is refused
 skips or repeats a step of its canvas is refused before any device work
 (``advance``); ``reset`` forgets a slot's canvas when a request is admitted
 to it or released from it.
+
+A step may be queued behind the one before it, before that one's result is
+known. Each slot therefore also keeps, on the device, whether its block
+continues after the step it ran last (``live``): a queued step whose block
+an earlier step stopped runs as a no-op (``CanvasRunner.step``), and its
+result row reports ``STEP_SKIPPED``.
 """
 
 from __future__ import annotations
@@ -36,6 +42,10 @@ from uniserve_worker.protocol.batch import CanvasSampling
 # Sampler state fields kept per slot, each a bank with one row per slot and
 # a staging area with one row per canvas of a pass.
 FIELDS = ("canvas", "history", "self_conditioning")
+# The first value of a canvas step's int64 result row: the step left its
+# block running, stopped it, or was skipped since an earlier step had
+# stopped it.
+STEP_CONTINUED, STEP_STOPPED, STEP_SKIPPED = 0, 1, 2
 # Bytes of one step chunk's FP32 logits and BF16 sampling weights, the two
 # vocabulary-wide tensors of a step. A pass steps as many whole canvases at
 # a time as fit (at least one), so its transient logits and its workspace
@@ -160,6 +170,10 @@ class CanvasSlots:
         for tensor in tensors.values():
             tensor.zero_()
         self.banks = {name: tensors[name] for name in FIELDS}
+        # uint8 [slots + 1]: 1 while the slot's block continues after the
+        # step it ran last. Step zero sets it, and a step that stops the
+        # block clears it.
+        self.live = tensors["live"]
         # One step chunk's sampler scratch, which every chunk of every pass
         # reuses in stream order.
         self.workspace = sampler.CanvasWorkspace.empty(
@@ -255,7 +269,8 @@ class CanvasSlots:
         staging (``staged_<field>``) one row per canvas of a pass. A row of
         ``canvas`` holds int64 tokens ``[canvas]``, of ``history`` the int64
         argmax canvases ``[history_depth, canvas]``, and of
-        ``self_conditioning`` the embeddings ``[canvas, hidden]``.
+        ``self_conditioning`` the embeddings ``[canvas, hidden]``. ``live``
+        holds one uint8 continuation flag per slot and the sentinel.
 
         Raises:
             ValueError: When a dimension is not positive or the history depth
@@ -280,7 +295,7 @@ class CanvasSlots:
                     (count, canvas_length, hidden_size), dtype
                 ),
             }.items()
-        }
+        } | {"live": BufferConfig((counts[""],), torch.uint8)}
 
     def close(self) -> None:
         """Release the banks and the workspace once every reader has retired."""
