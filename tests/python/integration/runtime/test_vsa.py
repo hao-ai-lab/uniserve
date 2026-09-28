@@ -219,13 +219,15 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
         torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("provider", ["cute", "flashinfer", "triton"])
 @torch.inference_mode()
-def test_row_production_over_many_intervals_matches_one_call(stream):
+def test_row_production_over_many_intervals_matches_one_call(provider, stream):
     """Rows produced interval by interval equal the single-call result.
 
     Small exchange intervals give several packed segments; the fine
     attention is launched once for the whole domain and every interval
-    composes its own rows.
+    composes its own rows. The first interval is the dense prefix tile,
+    whose rows attend the complete valid key domain.
     """
     torch.manual_seed(2207)
     projections = torch.randn(
@@ -238,7 +240,7 @@ def test_row_production_over_many_intervals_matches_one_call(stream):
     live = torch.arange(256, device="cuda") < 64 * 2 + 40
 
     stream.wait(torch.cuda.current_stream())
-    with ExecutionContext(module, stream=stream, vsa="cute") as context:
+    with ExecutionContext(module, stream=stream, vsa=provider) as context:
         context.prepare(None)
         batch = module.select(
             q, k, inputs, selected_tiles=1, workspace=workspace
