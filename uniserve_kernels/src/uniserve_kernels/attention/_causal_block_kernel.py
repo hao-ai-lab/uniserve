@@ -107,6 +107,8 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
             has_start_page=has_start_page,
             has_lse=has_lse,
             lse_base2=lse_base2,
+            # The causal kernel launches in ordinary stream order.
+            pdl=False,
         )
         # Warp 10 schedules the tiles; warp 11 stays idle.
         self.scheduler_warp = 10

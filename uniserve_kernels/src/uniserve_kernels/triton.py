@@ -9,9 +9,15 @@ Eligibility checks such as ``activation.unsupported`` start from
 :func:`unsupported_operands` and return the first unmet condition as a
 reason string, or ``None`` when a kernel accepts the operands. Callers on
 CUDA raise with that reason instead of evaluating a slower substitute.
+
+:func:`dependent_launch` decides per device whether kernels that opt in
+launch as programmatic dependents of the preceding kernel on their stream;
+Triton kernels open with :func:`pdl_prologue` to take part.
 """
 
 from __future__ import annotations
+
+import functools
 
 import torch
 
@@ -23,7 +29,9 @@ except Exception:  # pragma: no cover
     tl = None
 
 __all__ = [
+    "dependent_launch",
     "launchable",
+    "pdl_prologue",
     "records_autograd",
     "require_kernel",
     "tl",
@@ -47,6 +55,50 @@ def launchable(device: torch.device | str) -> bool:
         and torch.device(device).type == "cuda"
         and torch.cuda.is_available()
     )
+
+
+@functools.cache
+def dependent_launch(device: torch.device) -> bool:
+    """Return whether kernels on ``device`` use programmatic dependent launch.
+
+    ``device`` is a CUDA device with an index, such as a tensor's device.
+    Programmatic dependent launch (PDL) lets the GPU schedule a kernel's
+    grid while the preceding kernel on the stream still runs: the preceding
+    grid releases it with ``griddepcontrol.launch_dependents``, and the
+    dependent grid's ``griddepcontrol.wait`` blocks until every preceding
+    grid has completed and its memory operations are visible. A kernel that
+    opts in executes the wait in every thread before its first global
+    memory access, so only launch, scheduling and the prologue before the
+    wait overlap the preceding kernel, and results match ordinary stream
+    order; a kernel launched without the attribute still waits for the
+    preceding kernel to complete. CUDA graph capture records the dependency
+    as a programmatic edge, so graph replays overlap the same boundaries.
+
+    PDL is used on compute capability 10.x, the devices whose step time it
+    reduces; other devices launch every kernel in ordinary stream order.
+    """
+    major, _minor = torch.cuda.get_device_capability(device)
+    return major == 10
+
+
+if triton is not None:
+
+    @triton.jit
+    def pdl_prologue(PDL: tl.constexpr):  # noqa: N803
+        """Wait for the preceding grid, then release the next one.
+
+        A kernel launched with ``launch_pdl=PDL`` calls this before any
+        global memory access, with ``PDL`` from :func:`dependent_launch`.
+        The wait precedes every read of the preceding kernel's outputs and
+        every write the preceding kernel could still read. The release sits
+        right after it: the next grid starts only once every program of
+        this grid is resident, so its programs occupy no slot this grid
+        still needs, and they block in their own wait until this grid
+        completes. Without ``PDL`` the kernel contains neither instruction.
+        """
+        if PDL:
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
 
 
 def records_autograd(*tensors: torch.Tensor | None) -> bool:

@@ -42,7 +42,13 @@ import torch
 
 from uniserve_kernels.norm.rms import MAX_WIDTH, row_launch
 from uniserve_kernels.quantization import nvfp4_encode
-from uniserve_kernels.triton import tl, triton, unsupported_operands
+from uniserve_kernels.triton import (
+    dependent_launch,
+    pdl_prologue,
+    tl,
+    triton,
+    unsupported_operands,
+)
 
 #: Rows are 16-bit floating values.
 ROW_DTYPES = (torch.bfloat16, torch.float16)
@@ -142,6 +148,7 @@ if triton is not None:
         NORM_FACTORED: tl.constexpr,  # noqa: N803
         NORM_SCALARS: tl.constexpr,  # noqa: N803
         NORM_ENCODED: tl.constexpr,  # noqa: N803
+        PDL: tl.constexpr,  # noqa: N803
     ):
         """Sandwich-normalize one contiguous row.
 
@@ -154,8 +161,11 @@ if triton is not None:
         ``norm_values[i]`` (``[rows, WIDTH / 2]`` packed E2M1),
         ``norm_block_scales[i]`` (``[rows, WIDTH / 16]`` E4M3) and, from the
         first row, ``norm_tensor_scales[i]``. Every ``.to(dtype)`` marks a
-        rounding point of the composition.
+        rounding point of the composition. ``PDL`` launches run
+        :func:`pdl_prologue` before the first load.
         """
+        pdl_prologue(PDL)
+
         dtype = stream_ptr.dtype.element_ty
         row = tl.program_id(0).to(tl.int64)
         columns = tl.arange(0, BLOCK)
@@ -433,6 +443,7 @@ def sandwich(
     second, second_routes, second_weight = (
         terms[1] if len(terms) == 2 else (first, None, None)
     )
+    pdl = dependent_launch(stream.device)
     # Absent pointers stand in as the stream; the kernel never reads them.
     _sandwich_kernel[(rows,)](
         residual,
@@ -472,5 +483,7 @@ def sandwich(
         tuple(f is not None for f in factors),
         tuple(scalars),
         tuple(quantizer is not None for quantizer in encodings),
+        pdl,
         num_warps=warps,
+        launch_pdl=pdl,
     )
