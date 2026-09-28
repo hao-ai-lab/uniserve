@@ -83,7 +83,12 @@ class _Operator(BaseOperator):
     ):
         self.bind(batch)
 
-        if not _flashinfer.uses_row_major_inputs(q.device):
+        # Callers hand over row-major prepared rows; the head-flattened BSR
+        # path needs them head-first. Without prepared rows, prepare_rows
+        # packs the inputs itself in the layout this device consumes.
+        if packed is not None and not _flashinfer.uses_row_major_inputs(
+            q.device
+        ):
             packed = packed.transpose(1, 2).contiguous()
         return _flashinfer.prepare_rows(
             self._state,
