@@ -144,9 +144,9 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
 
 
 @pytest.mark.parametrize(
-    ("parallel_kind", "precision", "grouping"),
+    ("parallel_kind", "precision", "grouping", "max_running_requests"),
     [
-        (kind, precision, "whole")
+        (kind, precision, "whole", 2)
         for kind in (
             "ulysses2",
             "ulysses4",
@@ -163,14 +163,20 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
         )
         for precision in ("quality", "balanced", "performance", "maximum")
     ]
-    + [("ulysses4", "balanced", grouping) for grouping in ("split", "mixed")]
+    + [("ulysses4", "balanced", grouping, 2) for grouping in ("split", "mixed")]
     + [
-        ("tensor2_ulysses4", "balanced", grouping)
+        ("tensor2_ulysses4", "balanced", grouping, 2)
         for grouping in ("split", "mixed")
-    ],
+    ]
+    # A single admitted request still needs the worker's two state slots.
+    + [("ulysses4", "quality", "whole", 1)],
 )
 def test_component_bindings_release_cancelled_requests(
-    tmp_path: Path, parallel_kind: str, precision: str, grouping: str
+    tmp_path: Path,
+    parallel_kind: str,
+    precision: str,
+    grouping: str,
+    max_running_requests: int,
 ) -> None:
     model_value = os.environ.get("UNISERVE_H3_MODEL")
     if not model_value or not Path(model_value).is_dir():
@@ -390,7 +396,7 @@ def test_component_bindings_release_cancelled_requests(
         "--max-batch",
         "2",
         "--max-running-requests",
-        "2",
+        str(max_running_requests),
         "--max-num-batched-tokens",
         "2",
         "--chunked-prefill-size",
