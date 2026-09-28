@@ -2,8 +2,11 @@
 
 This module is the autoregressive half of the numerical path that
 ``forward`` drives. ``prepare_forward`` packs a prefill, decode or verify
-call into a ``TokenRow``, or into a visual-state row when a prefill carries
-image features. ``prepare_sampling`` turns the model's logits into
+call into a ``TokenRow``, or into a visual-state row when a prefill writes
+generated-image feedback or an input image's latent. ``prepare_context``
+packs a context prefill, whose prompt tokens run between input-image vision
+blocks, into one row per segment, and ``finish_context`` reads its rows'
+outputs. ``prepare_sampling`` turns the model's logits into
 ``SamplingMetadata`` for the sampler, or into a direct outcome when the call
 samples nothing. ``publish_sample`` stages the sampled result and the
 request progress it implies on the call's ``PendingOutput``.
@@ -36,6 +39,7 @@ from uniserve_worker.protocol.call import (
     DrawLayout,
     ForwardMode,
     SamplingState,
+    VisionInput,
 )
 from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.sampling import sampler as sampling
@@ -60,6 +64,32 @@ if TYPE_CHECKING:
     from uniserve_worker.storage.tensor_store import TensorStore
 
 
+def writes_context(call: Call) -> bool:
+    """Whether ``call`` is a context prefill that writes vision blocks.
+
+    Such a prefill carries input-image vision blocks between its prompt
+    tokens (``Call.vision_inputs``) and declares no completion output;
+    ``prepare_context`` packs it and ``finish_context`` reads its outputs.
+    """
+    return (
+        call.kind is ForwardMode.PREFILL
+        and bool(call.vision_inputs)
+        and call.completion_output is None
+    )
+
+
+def _writes_visual_state(call: Call) -> bool:
+    """Whether a prefill writes one visual-state row of image features.
+
+    That is generated-image feedback, whose single vision or latent feature
+    closes the image, or an input image's latent block; a context prefill's
+    vision blocks are rows of its segments instead.
+    """
+    return not writes_context(call) and (
+        bool(call.vision_inputs) or call.latent_feature_input is not None
+    )
+
+
 def prepare_forward(
     call: Call,
     *,
@@ -71,8 +101,10 @@ def prepare_forward(
 ) -> TokenRow | DiffusionRow:
     """Pack one prefill, decode or verify call into a model-forward row.
 
-    A prefill with a vision or latent feature input becomes a visual-state
-    row. Other rows start at the request's current logical position: a
+    A prefill of generated-image feedback or of an input image's latent
+    becomes a visual-state row; a context prefill with vision blocks is
+    packed by ``prepare_context``. Other rows start at the request's current
+    logical position: a
     prefill selects all logits when prompt log probabilities are requested
     and the last logits otherwise, a decode feeds one token, and a verify
     feeds the current token followed by the draft tokens and selects all
@@ -88,9 +120,9 @@ def prepare_forward(
         raise invalid_descriptor("sequence call has no admitted sampling state")
 
     mode = call.kind if isinstance(call.kind, ForwardMode) else None
-    if mode is ForwardMode.PREFILL and (
-        call.vision_input is not None or call.latent_feature_input is not None
-    ):
+    if writes_context(call):
+        raise invalid_descriptor("a context prefill packs one row per segment")
+    if mode is ForwardMode.PREFILL and _writes_visual_state(call):
         return _prepare_visual(
             call,
             request,
@@ -215,7 +247,7 @@ def prepare_sampling(
     start = int(calls.require_progress(request).logical_position)
     mode = call.kind
 
-    if call.vision_input is not None or call.latent_feature_input is not None:
+    if _writes_visual_state(call):
         return _prepare_visual_sampling(
             call,
             task,
@@ -307,11 +339,13 @@ def publish_sample(
     """Stage a sampled selection and the request progress it implies.
 
     A prefill or decode advances the logical position by its computed tokens
-    and the RNG counter by one. A verify binds device tensors offset from its
-    base coordinates and records those coordinates on ``request.token`` so
-    host materialization can resolve the accepted span. A visual call
-    advances the RNG counter by one and its position as ``_finish_visual``
-    does.
+    and the RNG counter by one; a prefill's prompt scoring adds to the ranges
+    already staged, so a context prefill's last text row (``task``, after
+    ``finish_context``) publishes as a prompt chunk. A verify binds device
+    tensors offset from its base coordinates and records those coordinates
+    on ``request.token`` so host materialization can resolve the accepted
+    span. A visual call advances the RNG counter by one and its position as
+    ``_finish_visual`` does.
 
     ``sample_work`` may be None only for a decode whose selection came from
     graph replay (``graph_decode_samples``).
@@ -323,7 +357,7 @@ def publish_sample(
         raise RuntimeError("only captured decode may omit sampling inputs")
     penalty_base = None if sample_work is None else sample_work.penalty_base
 
-    if call.vision_input is not None or call.latent_feature_input is not None:
+    if _writes_visual_state(call):
         request.progress = replace(
             calls.require_progress(request),
             rng_counter=calls.require_progress(request).rng_counter + (1),
@@ -332,8 +366,6 @@ def publish_sample(
         logical_position = start + (
             max(1, 1 if flow is None else int(flow.rope_advance))
             if call.completion_output is not None
-            else _vision_span(task)
-            if call.vision_input is not None
             else 1
         )
         publish_runtime_sample(
@@ -361,7 +393,7 @@ def publish_sample(
                 parameters.return_prompt_logprobs
                 or int(parameters.n_prompt_logprobs) > 0
             ):
-                request.token.prompt_logprob_ranges = prompt_logprob_details(
+                request.token.prompt_logprob_ranges += prompt_logprob_details(
                     request,
                     start,
                     cast(torch.Tensor, task.token_ids),
@@ -454,20 +486,22 @@ def _prepare_visual(
     """Build a visual-state row from a prefill's image features.
 
     Consumes the call's single vision or latent feature tensor onto its first
-    device and builds the row at the request's logical position.
+    device and builds the row at the request's logical position. A vision
+    feature is generated-image feedback, whose row closes the image.
 
     Raises:
-        WorkerError: When, for example, both or neither feature input is set,
-            the tensor lacks ``FeatureMetadata``, or the row exceeds the
-            call's token bound.
+        WorkerError: When, for example, the call carries other than exactly
+            one feature input, the tensor lacks ``FeatureMetadata``, or the
+            row exceeds the call's token bound.
     """
-    reference = call.vision_input or call.latent_feature_input
-    if reference is None or (
-        call.vision_input is not None and call.latent_feature_input is not None
-    ):
+    features = tuple(block.feature for block in call.vision_inputs)
+    if call.latent_feature_input is not None:
+        features += (call.latent_feature_input,)
+    if len(features) != 1:
         raise invalid_descriptor(
             "visual extend requires exactly one feature tensor"
         )
+    (reference,) = features
     read = tensor_store.consume(
         reference,
         consumer_call_id=call.call_id,
@@ -481,17 +515,17 @@ def _prepare_visual(
         )
 
     position = int(calls.require_progress(request).logical_position)
-    close_image = call.completion_output is not None
     sample_token = call.token_output is not None
     task: TokenRow | DiffusionRow
-    if call.vision_input is not None:
+    if call.vision_inputs:
         task = image.vision_state_row(
             call,
             read.tensor,
             metadata.height,
             metadata.width,
             position,
-            close_image=close_image,
+            seq_len=calls.cache_coordinates(request, tables=request_tables)[1],
+            close_image=True,
             logits=sample_token,
             request_tables=request_tables,
             model_runner=model_runner,
@@ -536,7 +570,7 @@ def _prepare_visual_sampling(
     """
     request = state.pending_output(call.request_key.request_id)
 
-    value = output if call.vision_input is not None else None
+    value = output if call.vision_inputs else None
     commit_kv(
         task,
         task.query_tokens,
@@ -572,17 +606,18 @@ def _prepare_visual_sampling(
     )
 
 
-def _vision_span(task: TokenRow | DiffusionRow) -> int:
-    """Return the logical positions a vision row's temporal axis occupies.
+def _next_position(row: TokenRow) -> int:
+    """Return the logical position after a context row.
 
-    Features sharing one temporal position span one; features at
-    consecutive positions span their count.
+    A row occupies the positions of its temporal axis: a prompt run one per
+    token, and a vision block one per feature at consecutive positions, or
+    one when its features share a temporal position.
     """
-    positions = task.positions
+    positions = row.positions
     if positions is None:
-        raise RuntimeError("a vision row has no positions")
+        raise RuntimeError("a context row has no positions")
     temporal = positions if positions.ndim == 1 else positions[0]
-    return int(temporal.max() - temporal.min()) + 1
+    return int(temporal.max()) + 1
 
 
 def _finish_visual(
@@ -596,8 +631,7 @@ def _finish_visual(
     """Advance the logical position past a visual row and stage its outcome.
 
     A call that closes the image advances by the image builder's RoPE advance
-    (at least one); another vision row advances past the positions it
-    occupies (``_vision_span``); a latent row keeps its position.
+    (at least one); an input image's latent row keeps its position.
     """
     request = state.pending_output(call.request_key.request_id)
     position = int(calls.require_progress(request).logical_position)
@@ -608,12 +642,226 @@ def _finish_visual(
             logical_position=position
             + max(1, 1 if flow is None else int(flow.rope_advance)),
         )
-    elif call.vision_input is not None:
-        request.progress = replace(
-            calls.require_progress(request),
-            logical_position=position + _vision_span(task),
-        )
     return image.state_outcome(call, request_tables=request_tables, state=state)
+
+
+def prepare_context(
+    call: Call,
+    *,
+    state: BatchState,
+    tensor_store: TensorStore,
+    request_tables: BlockTables | None,
+    model_runner: ModelExecutor,
+) -> tuple[TokenRow, ...]:
+    """Pack a context prefill into one row per segment, in context order.
+
+    The call's prompt tokens run between its vision blocks: each block enters
+    at its ``VisionInput.offset`` into the call's tokens as one non-causal
+    row over its encoder features (``image.vision_state_row``), and each run
+    of prompt tokens before, between or after the blocks as one causal row.
+    Each row continues where the previous one ends, in KV and in logical
+    position (``_next_position``). The rows form one numerical call whose
+    attention writes every row's KV before any row reads it, so each row
+    attends to the request's prefix and the rows before it, and a block's
+    features attend to each other in both directions.
+
+    Prompt runs select all logits when prompt log probabilities are
+    requested; otherwise the last row selects its last logits when the call
+    samples a token, and every other row only writes KV. The block features
+    are consumed onto the call's first device.
+
+    Raises:
+        WorkerError: ``invalid_descriptor`` when the request has no admitted
+            sampling, the blocks are out of order or outside the call's
+            tokens, a sampled call ends with a block, a feature lacks
+            ``FeatureMetadata``, or the rows disagree with the call's token
+            bound or its forward rows.
+    """
+    request = state.pending_output(call.request_key.request_id)
+    parameters = require_sampling(request)
+    scores_prompt = bool(
+        parameters.return_prompt_logprobs
+        or int(parameters.n_prompt_logprobs) > 0
+    )
+    tokens = call.input_token_ids
+
+    # Segments in context order: (start, stop) spans of the call's tokens
+    # and the blocks at their offsets.
+    segments: list[tuple[int, int] | VisionInput] = []
+    start = 0
+    for block in call.vision_inputs:
+        offset = int(block.offset)
+        if offset < start or offset > len(tokens):
+            raise invalid_descriptor(
+                "context blocks must lie in order within the call's tokens"
+            )
+        if offset > start:
+            segments.append((start, offset))
+        segments.append(block)
+        start = offset
+    if len(tokens) > start:
+        segments.append((start, len(tokens)))
+    if call.token_output is not None and isinstance(segments[-1], VisionInput):
+        raise invalid_descriptor("a sampled context prefill ends with tokens")
+
+    slot, visible, _capacity = calls.cache_coordinates(
+        request, tables=request_tables
+    )
+    position = int(calls.require_progress(request).logical_position)
+    device = model_runner.call_devices(call)[0]
+    rows: list[TokenRow] = []
+    for index, segment in enumerate(segments):
+        if isinstance(segment, VisionInput):
+            read = tensor_store.consume(
+                segment.feature, consumer_call_id=call.call_id, device=device
+            )
+            request.feature_reads.append(read)
+            metadata = read.metadata
+            if not isinstance(metadata, FeatureMetadata):
+                raise invalid_descriptor(
+                    "a vision block requires encoder feature metadata"
+                )
+            row = image.vision_state_row(
+                call,
+                read.tensor,
+                metadata.height,
+                metadata.width,
+                position,
+                seq_len=visible,
+                close_image=False,
+                logits=False,
+                request_tables=request_tables,
+                model_runner=model_runner,
+                state=state,
+            )
+        else:
+            begin, stop = segment
+            last = index == len(segments) - 1
+            row = TokenRow(
+                forward_mode=ForwardMode.PREFILL,
+                token_ids=torch.tensor(tokens[begin:stop], dtype=torch.long),
+                positions=torch.arange(
+                    position, position + stop - begin, dtype=torch.long
+                ),
+                selection=TokenSelection.ALL_LOGITS
+                if scores_prompt
+                else TokenSelection.LAST_LOGITS
+                if last and call.token_output is not None
+                else TokenSelection.CACHE,
+                request_pool_idx=slot,
+                seq_len=visible,
+                write_kv=True,
+                causal=True,
+            )
+        rows.append(row)
+        position = _next_position(row)
+        visible += row.query_tokens
+
+    # The engine sizes the call's KV and forward rows from the blocks'
+    # declared lengths; each row must be the one it declared.
+    inputs = state.batch
+    descriptors = state.forward_indices.get(calls.call_identity(call), ())
+    if (
+        sum(row.query_tokens for row in rows) > int(call.bounds.max_tokens)
+        or len(descriptors) != len(rows)
+        or any(
+            inputs.request_pool_indices[descriptor] != slot
+            or inputs.query_lens[descriptor] != row.query_tokens
+            or inputs.seq_lens[descriptor] != row.seq_len + row.query_tokens
+            for descriptor, row in zip(descriptors, rows, strict=True)
+        )
+    ):
+        raise invalid_descriptor(
+            "context rows disagree with the call's forward rows"
+        )
+    return tuple(rows)
+
+
+def finish_context(
+    call: Call,
+    rows: tuple[tuple[TokenRow, torch.Tensor, torch.Tensor], ...],
+    *,
+    state: BatchState,
+    request_tables: BlockTables | None,
+    decode_state: DecodeState | None,
+) -> tuple[TokenRow, torch.Tensor, SamplingMetadata] | PendingOutput:
+    """Commit a context prefill's KV and read its prompt runs' outputs.
+
+    ``rows`` are the call's ``(row, value, request_pool_index)`` triples from
+    ``prepare_context``, in context order. The call commits every row's KV.
+    Prompt runs are scored in order when prompt log probabilities are
+    requested (``prompt_logprob_details``); the vision blocks between them
+    score nothing, so a run after a block scores its first token against
+    the preceding run's last logits.
+
+    A call that samples nothing stages its outcome at the position after its
+    last row. A sampling call ends with a prompt run, which publishes as a
+    prompt chunk: request progress stands at the run's start, and the
+    returned ``(row, logits, sampling_metadata)`` feeds ``publish_sample``,
+    which scores the run and advances past it.
+
+    Raises:
+        WorkerError: From ``prompt_logprob_details`` or
+            ``build_sampling_metadata``.
+        RuntimeError: When the KV commit exceeds the request's page tables.
+    """
+    request = state.pending_output(call.request_key.request_id)
+    parameters = require_sampling(request)
+    scores_prompt = bool(
+        parameters.return_prompt_logprobs
+        or int(parameters.n_prompt_logprobs) > 0
+    )
+    last, last_value, sampling_index = rows[-1]
+    commit_kv(
+        last,
+        last.query_tokens,
+        request,
+        request_tables=request_tables,
+        decode_state=decode_state,
+    )
+
+    # A sampled call's last run is scored when its sample publishes; prompt
+    # runs are the causal rows.
+    samples = call.token_output is not None
+    scored = rows[:-1] if samples else rows
+    if scores_prompt:
+        for row, value, _index in scored:
+            if not row.causal:
+                continue
+            request.token.prompt_logprob_ranges += prompt_logprob_details(
+                request,
+                int(cast(torch.Tensor, row.positions)[0]),
+                cast(torch.Tensor, row.token_ids),
+                value,
+                decode_state=decode_state,
+                state=state,
+            )
+
+    if not samples:
+        return token_outcome(
+            call,
+            request=request,
+            task=last,
+            tokens=last.query_tokens,
+            logical_position=_next_position(last),
+            request_tables=request_tables,
+            state=state,
+        )
+
+    start = int(cast(torch.Tensor, last.positions)[0])
+    request.progress = replace(
+        calls.require_progress(request), logical_position=start
+    )
+    sample = build_sampling_metadata(
+        call,
+        last_value[-1],
+        request,
+        positions=(start + last.query_tokens,),
+        request_pool_index=sampling_index,
+        decode_state=decode_state,
+        state=state,
+    )
+    return last, last_value, sample
 
 
 def graph_decode_samples(
@@ -1395,4 +1643,11 @@ def require_sampling(request: PendingOutput) -> SamplingParams:
     return request.request.sampling
 
 
-__all__ = ["prepare_forward", "prepare_sampling", "publish_sample"]
+__all__ = [
+    "finish_context",
+    "prepare_context",
+    "prepare_forward",
+    "prepare_sampling",
+    "publish_sample",
+    "writes_context",
+]
