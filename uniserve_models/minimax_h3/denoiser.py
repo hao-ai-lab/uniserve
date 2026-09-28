@@ -22,6 +22,7 @@ from typing import cast
 import torch
 
 from uniserve.diffusion import CleanSampleEulerSolver, Schedule
+from uniserve.media import image
 from uniserve.model import LatentInput, VideoDenoiser
 from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
 from uniserve.nn.attention import vsa
@@ -91,9 +92,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         window, overlap = self.NATIVE_WINDOW_FRAMES, self.NATIVE_OVERLAP_FRAMES
         return max(overlap + window, requested + (overlap - requested) % window)
 
-    def make_size(self, num_frames: int, num_text_tokens: int) -> DenoiserSize:
+    def make_size(
+        self, num_frames: int, frame: image.Config, num_text_tokens: int
+    ) -> DenoiserSize:
         """Build this network's size descriptor for one admitted request."""
-        return DenoiserSize(num_frames, num_text_tokens)
+        return DenoiserSize(num_frames, frame, num_text_tokens)
 
     def layout_size(self, size: DenoiserSize) -> DenoiserSize:
         """Return the smallest layout that holds ``size``.
@@ -102,23 +105,26 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         prompt's own tiles.
         """
         return DenoiserSize(
-            size.num_frames, math.ceil(size.num_text_tokens / 64) * 64
+            size.num_frames,
+            size.frame,
+            math.ceil(size.num_text_tokens / 64) * 64,
         )
 
     def holds(self, layout: DenoiserSize, size: DenoiserSize) -> bool:
         """Whether ``layout`` evaluates a request of ``size``.
 
         A layout holds every prompt that fits its text region at its own frame
-        count. The packed shapes, the audio and video regions and every index
-        table depend on the layout alone; only the validity of the text tiles
-        and the rotary coordinates, whose media timeline starts at the exact
-        prompt length, differ within a layout, and the request's state carries
-        them. Frame counts are not padded: the video tile domain sets the
-        sparse selection budget and the audio timeline.
+        count and raster. The packed shapes, the audio and video regions and
+        every index table depend on the layout alone; only the validity of the
+        text tiles and the rotary coordinates, whose media timeline starts at
+        the exact prompt length, differ within a layout, and the request's state
+        carries them. Frame counts are not padded: the video tile domain sets
+        the sparse selection budget and the audio timeline.
         """
         return (
             layout == self.layout_size(layout)
             and layout.num_frames == size.num_frames
+            and layout.frame == size.frame
             and layout.num_text_tokens >= size.num_text_tokens
         )
 
@@ -185,6 +191,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return build_packing(
             num_text_tokens=size.num_text_tokens,
             num_frames=size.num_frames,
+            height=size.frame.height,
+            width=size.frame.width,
             token_multiple=64 * math.lcm(4, self._sequence_group().size),
             text_rows=None if layout is None else layout.num_text_tokens,
         )
@@ -200,11 +208,12 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         # Complete canonical samples across all ranks; ``output_layout``
         # selects this rank's rows.
         if modality == "video":
-            # The 48x84 latent raster yields 24x42 tokens per frame at
-            # patch 2x2.
+            # The latent raster is 16x compressed, and each 2x2 patch is one
+            # token: 24x42 tokens per frame for either served raster.
+            tokens = (size.frame.height // 32) * (size.frame.width // 32)
             return video_latent_frames(
                 size.num_frames
-            ) * 24 * 42, self.config.video_channels * 4
+            ) * tokens, self.config.video_channels * 4
         if modality == "audio":
             return 2 * audio_latent_frames(
                 size.num_frames
@@ -213,14 +222,14 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
     def noise_shape(self, modality: str, size: DenoiserSize) -> tuple[int, ...]:
         if modality == "video":
-            # Native draws keep the [C, T, 48, 84] latent layout before
-            # patching.
+            # Native draws keep the [C, T, H / 16, W / 16] latent layout
+            # before patching.
             return (
                 1,
                 self.config.video_channels,
                 video_latent_frames(size.num_frames),
-                48,
-                84,
+                size.frame.height // 16,
+                size.frame.width // 16,
             )
         return self.latent_shape(modality, size)
 

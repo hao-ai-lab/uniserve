@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::config::EngineSettings;
 use crate::profile::assets::{ResolvedModelFiles, resolve_model_file, resolve_pipeline_index};
 use crate::profile::omni::bagel::BagelProfile;
+use crate::profile::omni::resolution::ResolutionName;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
@@ -494,8 +495,13 @@ impl InputProcessor {
                     "model_max_seconds": MAX_VIDEO_SECONDS,
                     "suggested_seconds": suggested_seconds,
                     "fps": VIDEO_FPS, "width": 1344, "height": 768,
+                    "default_aspect_ratio": "16:9",
+                    "aspect_ratios": {
+                        "16:9": {"width": 1344, "height": 768},
+                        "9:16": {"width": 768, "height": 1344},
+                    },
                     "max_prompt_tokens": self.config.max_model_tokens(),
-                    "request_fields": ["model", "prompt", "seconds", "seed"],
+                    "request_fields": ["model", "prompt", "seconds", "seed", "aspect_ratio"],
                 })
             }
             _ => serde_json::Value::Null,
@@ -517,6 +523,7 @@ impl InputProcessor {
             prompt,
             seed,
             seconds,
+            aspect_ratio,
         } = request;
         crate::openai::utils::check_model_served(&model, self.served_model_name())?;
         if prompt.trim().is_empty() {
@@ -525,7 +532,7 @@ impl InputProcessor {
                 Some("prompt"),
             ));
         }
-        let (_, sampling) = self.video_sampling(request_id, seconds, seed)?;
+        let (_, sampling) = self.video_sampling(request_id, seconds, seed, aspect_ratio)?;
         // Tokenize and bound the prompt before deriving any media allocation.
         let prompt_token_ids = self
             .tokenizer
@@ -576,6 +583,7 @@ impl InputProcessor {
         request_id: &crate::serving::ServeRequestId,
         seconds: Option<f64>,
         seed: u64,
+        aspect_ratio: Option<ResolutionName>,
     ) -> std::result::Result<(f64, uniserve_core::DiffusionSamplingParams), crate::openai::ApiError>
     {
         let ModelParameters::MiniMaxH3 {
@@ -600,6 +608,15 @@ impl InputProcessor {
         // Each H3 video media unit consumes a temporal latent window and emits its
         // non-overlapping frame interval; the model owns overlap reconstruction.
         let video_units = (frame_count - 5) / 17;
+        let (height, width) = video_raster(aspect_ratio.unwrap_or(ResolutionName::Landscape16x9))
+            .ok_or_else(|| {
+            crate::openai::serve_error_to_api(ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source: crate::serving::TokenizeError::Invalid(
+                    "aspect_ratio must be \"16:9\" or \"9:16\"".to_string(),
+                ),
+            })
+        })?;
         Ok((
             seconds,
             uniserve_core::DiffusionSamplingParams {
@@ -607,6 +624,8 @@ impl InputProcessor {
                 video_units,
                 num_inference_steps: *num_inference_steps,
                 seed,
+                height,
+                width,
             },
         ))
     }
@@ -1012,6 +1031,19 @@ pub fn video_frame_count(seconds: f64, max_video_seconds: f64) -> std::result::R
     // The range bounds the product to [96, 360], so the conversion is exact.
     let requested = (seconds * f64::from(VIDEO_FPS)).round_ties_even() as u32;
     Ok(requested + (22 - requested % 17) % 17)
+}
+
+/// Returns the MiniMax H3 output frame raster, as `(height, width)` in pixels, for an aspect
+/// ratio the checkpoint serves.
+///
+/// `16:9` is 1344x768 and `9:16` is 768x1344; both pack 1008 latent token rows per frame.
+/// Returns `None` for every other aspect ratio.
+fn video_raster(aspect_ratio: ResolutionName) -> Option<(u32, u32)> {
+    match aspect_ratio {
+        ResolutionName::Landscape16x9 => Some((768, 1344)),
+        ResolutionName::Portrait9x16 => Some((1344, 768)),
+        _ => None,
+    }
 }
 
 /// Returns the multimodal resources required by the active profile.

@@ -156,15 +156,20 @@ impl Scheduler {
     /// on each call's first placement candidate. The text encoder's
     /// `DimBound::Device` dimensions become `num_prompt_tokens`, and the
     /// leading dimension of the video decoder and encoder outputs becomes
-    /// `sampling.video_units`. Returns one `(component, output index, dtype,
-    /// shape bound)` entry per declared output.
+    /// `sampling.video_units`. The decoder declares its media units at its
+    /// largest raster; their height and width become the request's
+    /// `sampling.height` and `sampling.width`. Returns one `(component,
+    /// output index, dtype, shape bound)` entry per declared output.
     ///
     /// Returns `None` when one of those calls has no reported component or no
     /// candidate, the candidate declares no binding for the component it
     /// serves, a component declares an unexpected number of outputs, a text
     /// encoder output has no device dimension, a video output's leading
-    /// dimension is missing or not a device bound, or the prompt length or
-    /// unit count is zero or exceeds the declared maximum. `enqueue_media`
+    /// dimension is missing or not a device bound, the decoded units are not
+    /// `(units, frames, height, width, channels)` rows with a static raster,
+    /// the prompt length or unit count is zero or exceeds the declared
+    /// maximum, or the request's raster has more pixels than the declared
+    /// one. `enqueue_media`
     /// rejects such a request, and `admit_media` calls this again to size the
     /// reservation.
     fn media_outputs(
@@ -221,6 +226,19 @@ impl Scheduler {
                         return None;
                     }
                     shape.dims[0] = DimBound::Static(sampling.video_units);
+                    if role == MediaCall::VideoDecoding {
+                        let [_, _, DimBound::Static(height), DimBound::Static(width), _] =
+                            shape.dims[..]
+                        else {
+                            return None;
+                        };
+                        let pixels = u64::from(sampling.height) * u64::from(sampling.width);
+                        if pixels == 0 || pixels > u64::from(height) * u64::from(width) {
+                            return None;
+                        }
+                        shape.dims[2] = DimBound::Static(sampling.height);
+                        shape.dims[3] = DimBound::Static(sampling.width);
+                    }
                 }
                 outputs.push((name.clone(), index as u32, output.dtype, shape));
             }

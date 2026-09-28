@@ -159,7 +159,8 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
 class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     """A standalone denoiser that generates a video timeline from text features.
 
-    A request is sized by its output frame count and prompt length. The network
+    A request is sized by its output frame count, frame raster and prompt
+    length. The network
     fixes its step count, rounds a requested duration to its native windows,
     and describes the request state and outputs that the caller's storage
     holds; the caller advances the fixed schedule and supplies each step's
@@ -180,8 +181,15 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         """Round a requested frame count up to one the network generates."""
         raise NotImplementedError
 
-    def make_size(self, num_frames: int, num_text_tokens: int) -> VideoSizeT:
-        """Build the size descriptor of one request."""
+    def make_size(
+        self, num_frames: int, frame: image.Config, num_text_tokens: int
+    ) -> VideoSizeT:
+        """Build the size descriptor of one request.
+
+        Raises:
+            ValueError: The network does not generate the frame count or
+                raster, or the prompt is empty.
+        """
         raise NotImplementedError
 
     def state_buffers(self, size: VideoSizeT) -> Mapping[str, BufferConfig]:

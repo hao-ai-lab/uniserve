@@ -7,10 +7,11 @@ use super::common::Normalizable;
 
 /// MiniMax H3 text-to-video-and-audio request for the `/v1/videos` routes.
 ///
-/// The request carries no canvas, frame-rate, or step controls.
-/// `InputProcessor::video_sampling` resolves `seconds` into an aligned frame
-/// count at 24 fps, takes the step count from the model configuration, and
-/// rejects durations the model cannot serve.
+/// The request carries no frame-rate or step controls. `InputProcessor::video_sampling`
+/// resolves `seconds` into an aligned frame count at 24 fps, resolves
+/// `aspect_ratio` into the output frame raster, takes the step count from the
+/// model configuration, and rejects durations and aspect ratios the model
+/// cannot serve.
 ///
 /// The HTTP `VideoBody` extractor deserializes it from a JSON body or from
 /// multipart fields, and `deny_unknown_fields` rejects any other field; the
@@ -29,6 +30,10 @@ pub struct VideoGenerationRequest {
     /// lesser of 5 seconds and the model's configured maximum.
     #[serde(default)]
     pub seconds: Option<f64>,
+    /// Output aspect ratio: `16:9` (1344x768, the default when omitted) or
+    /// `9:16` (768x1344). `video_sampling` rejects every other name.
+    #[serde(default)]
+    pub aspect_ratio: Option<crate::profile::omni::resolution::ResolutionName>,
 }
 
 impl Normalizable for VideoGenerationRequest {}

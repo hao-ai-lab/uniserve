@@ -364,6 +364,7 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
                 prompt: prompt.to_string(),
                 seconds: Some(seconds),
                 seed: 17,
+                aspect_ratio: None,
             },
         )
     };
@@ -407,6 +408,7 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
                     prompt: prompt.to_string(),
                     seconds: Some(seconds),
                     seed: 17,
+                    aspect_ratio: None,
                 },
             )
             .unwrap_err()
@@ -471,9 +473,55 @@ fn video_duration_capacity_is_a_deployment_limit() {
     assert_eq!(capabilities["model_max_seconds"], 15.0);
     assert_eq!(capabilities["fps"], 24);
     let id = ServeRequestId::new("capacity");
-    let (seconds, sampling) = model.video_sampling(&id, Some(10.0), 3).unwrap();
+    let (seconds, sampling) = model.video_sampling(&id, Some(10.0), 3, None).unwrap();
     assert_eq!((seconds, sampling.num_frames), (10.0, 243));
-    assert!(model.video_sampling(&id, Some(10.5), 3).is_err());
+    assert!(model.video_sampling(&id, Some(10.5), 3, None).is_err());
+}
+
+/// A video request picks its output raster by aspect ratio: 16:9 by default
+/// is 1344x768 and 9:16 is 768x1344, and the capabilities advertise both.
+/// Other aspect ratios are rejected before admission.
+#[test]
+fn video_aspect_ratio_selects_the_output_raster() {
+    use uniserve_server::profile::omni::resolution::ResolutionName;
+
+    let (_directory, _tokenizer, model) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
+    let request = |aspect_ratio| {
+        model.preprocess_video_request(
+            &ServeRequestId::new("video"),
+            uniserve_server::openai::VideoGenerationRequest {
+                model: "minimax_h3".to_string(),
+                prompt: "a lighthouse at dusk".to_string(),
+                seconds: Some(5.0),
+                seed: 17,
+                aspect_ratio,
+            },
+        )
+    };
+    let raster = |aspect_ratio| {
+        let sampling = request(aspect_ratio).unwrap().sampling;
+        (sampling.width, sampling.height)
+    };
+
+    assert_eq!(raster(None), (1344, 768));
+    assert_eq!(raster(Some(ResolutionName::Landscape16x9)), (1344, 768));
+    assert_eq!(raster(Some(ResolutionName::Portrait9x16)), (768, 1344));
+    // Both orientations keep the requested duration.
+    assert_eq!(
+        request(Some(ResolutionName::Portrait9x16))
+            .unwrap()
+            .sampling
+            .num_frames,
+        124
+    );
+    assert!(request(Some(ResolutionName::Square)).is_err());
+
+    let capabilities = model.video_capabilities();
+    assert_eq!(capabilities["default_aspect_ratio"], "16:9");
+    assert_eq!(capabilities["aspect_ratios"]["16:9"]["width"], 1344);
+    assert_eq!(capabilities["aspect_ratios"]["16:9"]["height"], 768);
+    assert_eq!(capabilities["aspect_ratios"]["9:16"]["width"], 768);
+    assert_eq!(capabilities["aspect_ratios"]["9:16"]["height"], 1344);
 }
 
 /// `InputProcessor::new` replaces the checkpoint's context length with the

@@ -7,29 +7,37 @@ from dataclasses import dataclass
 import torch
 
 from uniserve.distributed import Communicator
+from uniserve.media import image
 from uniserve.model import DenoiserInput as BaseDenoiserInput
 from uniserve.nn.attention import vsa
 
-from .packing import Packing, video_latent_frames
+from .packing import FRAME_SIZES, Packing, video_latent_frames
 
 
 @dataclass(frozen=True, slots=True)
 class DenoiserSize:
-    """Describe one sample's output timeline and conditioning length.
+    """Describe one sample's output timeline, raster and conditioning length.
 
     ``num_frames`` counts output video frames at 24 fps and must have the form
     ``17 * n + 5`` with ``n`` positive; ``video_latent_frames`` raises
-    otherwise. ``num_text_tokens`` is either a request's exact prompt length
+    otherwise. ``frame`` is the output raster, one of ``FRAME_SIZES``.
+    ``num_text_tokens`` is either a request's exact prompt length
     or, for a layout (see ``Denoiser.layout_size``), that length rounded up to
     whole 64-row tiles.
     """
 
     num_frames: int
+    frame: image.Config
     num_text_tokens: int
 
     def __post_init__(self):
         # Raises ValueError for a frame count H3 does not generate.
         video_latent_frames(self.num_frames)
+        if (
+            not isinstance(self.frame, image.Config)
+            or (self.frame.height, self.frame.width) not in FRAME_SIZES
+        ):
+            raise ValueError("H3 generates 1344x768 or 768x1344 video")
         if type(self.num_text_tokens) is not int or self.num_text_tokens < 1:
             raise ValueError(
                 "H3 conditioning must contain a positive number of text tokens"

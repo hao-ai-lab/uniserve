@@ -154,12 +154,12 @@ pub(crate) async fn videos_sync(
 ///
 /// Both content types deserialize into the same `VideoGenerationRequest`, whose
 /// `deny_unknown_fields` rejects unknown JSON fields. The multipart path admits
-/// only the text fields `model`, `prompt`, `seconds`, and `seed`, rejects file
+/// only the text fields `model`, `prompt`, `seconds`, `seed`, and `aspect_ratio`, rejects file
 /// parts and repeated fields, and parses `seconds` as a finite number and
 /// `seed` as an unsigned integer before deserializing. Every rejection is
 /// `400 Bad Request` except an unsupported content type, which is
 /// `415 Unsupported Media Type`. Semantic checks (served model, prompt,
-/// duration) happen later, in `InputProcessor::video_sampling` and
+/// duration, aspect ratio) happen later, in `InputProcessor::video_sampling` and
 /// `InputProcessor::preprocess_video_request`.
 pub(crate) struct VideoBody(pub VideoGenerationRequest);
 
@@ -189,7 +189,7 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
                 ApiError::invalid_request(error.to_string(), None).into_response()
             })? {
                 let name = field.name().unwrap_or("").to_owned();
-                if !["model", "prompt", "seconds", "seed"].contains(&name.as_str())
+                if !["model", "prompt", "seconds", "seed", "aspect_ratio"].contains(&name.as_str())
                     || field.file_name().is_some()
                 {
                     return Err(ApiError::invalid_request(
@@ -276,15 +276,15 @@ pub(crate) async fn videos_create(
     use crate::video_jobs::{VideoFailure, VideoJob, timestamp};
 
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
-    let (requested_seconds, sampling) =
-        match state
-            .runtime()
-            .model()
-            .video_sampling(&request_id, body.seconds, body.seed)
-        {
-            Ok(options) => options,
-            Err(error) => return error.into_response(),
-        };
+    let (requested_seconds, sampling) = match state.runtime().model().video_sampling(
+        &request_id,
+        body.seconds,
+        body.seed,
+        body.aspect_ratio,
+    ) {
+        Ok(options) => options,
+        Err(error) => return error.into_response(),
+    };
 
     // Job capacity is claimed before submission, so a request refused for it
     // never reaches the engine. The slot is released if this handler is
@@ -660,6 +660,64 @@ mod tests {
         assert_eq!(left, right);
         assert_eq!(left.seconds, Some(5.5));
         assert_eq!(left.seed, 42);
+    }
+
+    /// `aspect_ratio` names the output orientation in both formats and is
+    /// absent unless given; a value that names no aspect ratio is a bad
+    /// request.
+    #[tokio::test]
+    async fn aspect_ratio_is_read_from_both_formats() {
+        use crate::profile::omni::resolution::ResolutionName;
+
+        let json = |body: &str| {
+            axum::extract::Request::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let multipart = |aspect_ratio: &str| {
+            axum::extract::Request::builder()
+                .header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
+                .body(Body::from(format!(
+                    "--clip\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nFastH3\r\n\
+                     --clip\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nA river\r\n\
+                     --clip\r\nContent-Disposition: form-data; name=\"aspect_ratio\"\r\n\r\n{aspect_ratio}\r\n\
+                     --clip--\r\n"
+                )))
+                .unwrap()
+        };
+
+        let absent = VideoBody::from_request(json(r#"{"model":"FastH3","prompt":"A river"}"#), &())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(absent.aspect_ratio, None);
+
+        let portrait = VideoBody::from_request(
+            json(r#"{"model":"FastH3","prompt":"A river","aspect_ratio":"9:16"}"#),
+            &(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(portrait.aspect_ratio, Some(ResolutionName::Portrait9x16));
+        assert_eq!(
+            VideoBody::from_request(multipart("9:16"), &())
+                .await
+                .unwrap()
+                .0,
+            portrait
+        );
+
+        for request in [
+            json(r#"{"model":"FastH3","prompt":"A river","aspect_ratio":"portrait"}"#),
+            multipart("9x16"),
+        ] {
+            match VideoBody::from_request(request, &()).await {
+                Ok(VideoBody(body)) => panic!("accepted {body:?}"),
+                Err(response) => assert_eq!(response.status(), StatusCode::BAD_REQUEST),
+            }
+        }
     }
 
     /// A duration Rust parses as a float but JSON cannot carry (infinite, NaN,

@@ -16,6 +16,7 @@ from functools import cached_property
 import torch
 
 from uniserve.diffusion import Schedule, normal_noise
+from uniserve.media import image
 from uniserve.model import LatentInput, VideoDenoiser
 from uniserve.tensors import BufferConfig
 
@@ -63,6 +64,37 @@ def _aligned(elements: int) -> int:
     return -(-int(elements) // SAMPLE_ALIGNMENT) * SAMPLE_ALIGNMENT
 
 
+def bound(first: BufferConfig, second: BufferConfig) -> BufferConfig:
+    """Return the field whose extents hold both, dimension by dimension.
+
+    Raises:
+        ValueError: The fields differ in rank, dtype or placement.
+    """
+    if (
+        len(first.shape) != len(second.shape)
+        or first.dtype != second.dtype
+        or first.host != second.host
+    ):
+        raise ValueError("bounded fields must share rank, dtype and placement")
+
+    def largest(a, b):
+        return tuple(max(x, y) for x, y in zip(a, b, strict=True))
+
+    capacity = (
+        None
+        if first.capacity_shape is None and second.capacity_shape is None
+        else largest(
+            first.capacity_shape or first.shape,
+            second.capacity_shape or second.shape,
+        )
+    )
+    return replace(
+        first,
+        shape=largest(first.shape, second.shape),
+        capacity_shape=capacity,
+    )
+
+
 class MediaBuilder:
     """Own input bounds while borrowing the denoiser's numerical capability.
 
@@ -72,7 +104,8 @@ class MediaBuilder:
     size descriptor.
 
     Serving evaluates a bounded set of capacity layouts (``layouts``): every
-    frame count the worker admits, each with every text capacity. A request
+    frame count the worker admits at every served frame raster, each with
+    every text capacity. A request
     evaluates in the smallest capacity layout that holds it (``layout``), so
     every request of one layout binds the same shapes and replays the same
     captured ladder, and no admitted size needs a layout of its own. What
@@ -88,6 +121,7 @@ class MediaBuilder:
         self,
         denoiser: VideoDenoiser,
         *,
+        frame_sizes: tuple[image.Config, ...],
         max_frames: int,
         max_text_tokens: int,
         min_frames: int = 1,
@@ -96,19 +130,31 @@ class MediaBuilder:
         """Bound admitted sizes and fix the capacity layouts.
 
         Admitted frame counts are the legal counts from ``min_frames`` up to
-        ``max_frames`` rounded up to complete native windows. Text
+        ``max_frames`` rounded up to complete native windows, each at every
+        raster of ``frame_sizes``. Text
         capacities are prompt token counts; the largest must hold
         ``max_text_tokens``, and without any they are ``TEXT_CAPACITY_FIRST``
         and then steps of ``TEXT_CAPACITY_STEP`` up to it.
 
         Raises:
-            ValueError: No frame count is admitted, or a text capacity is
-                not positive or none holds ``max_text_tokens``.
+            ValueError: No frame count or raster is admitted, the denoiser does
+                not generate a raster, or a text capacity is not positive or
+                none holds ``max_text_tokens``.
         """
+        if not frame_sizes or len(set(frame_sizes)) != len(frame_sizes):
+            raise ValueError("media input requires distinct frame rasters")
         # Admission advertises complete native windows, including the final
         # overlap. Cover the configured duration with the next legal input.
         frames = denoiser.legal_frame_count(max_frames)
-        self.maximum = denoiser.make_size(frames, max_text_tokens)
+        self.frame_sizes = tuple(frame_sizes)
+        self.max_frames = frames
+        self.max_text_tokens = max_text_tokens
+        # The largest admitted size at each raster; together they bound every
+        # admitted size's shapes dimension by dimension.
+        self.maxima = tuple(
+            denoiser.make_size(frames, frame, max_text_tokens)
+            for frame in self.frame_sizes
+        )
         self.denoiser = denoiser
         self.num_steps = denoiser.num_steps
 
@@ -130,14 +176,16 @@ class MediaBuilder:
             )
         # Each capacity is the text region of the layout that holds it,
         # capped at the one that holds the prompt capacity.
-        largest = denoiser.layout_size(self.maximum).num_text_tokens
+        largest = denoiser.layout_size(self.maxima[0]).num_text_tokens
         self.text_capacities = tuple(
             sorted(
                 {
                     min(
                         largest,
                         denoiser.layout_size(
-                            denoiser.make_size(frames, value)
+                            denoiser.make_size(
+                                frames, self.frame_sizes[0], value
+                            )
                         ).num_text_tokens,
                     )
                     for value in requested
@@ -149,53 +197,62 @@ class MediaBuilder:
         # ``layouts`` lists.
         self._states: dict[object, Mapping[str, BufferConfig]] = {}
 
-    def size(self, num_frames: int, num_text_tokens: int):
+    def size(self, num_frames: int, frame: image.Config, num_text_tokens: int):
         """Return the denoiser's exact size for an admitted request.
 
         Raises:
-            ValueError: The frame count is not one the worker admits, or the
-                prompt exceeds its conditioning capacity.
+            ValueError: The frame count or raster is not one the worker
+                admits, or the prompt exceeds its conditioning capacity.
         """
-        size = self.denoiser.make_size(num_frames, num_text_tokens)
+        size = self.denoiser.make_size(num_frames, frame, num_text_tokens)
         if (
             size.num_frames not in self.frame_counts
-            or size.num_text_tokens > self.maximum.num_text_tokens
+            or frame not in self.frame_sizes
+            or size.num_text_tokens > self.max_text_tokens
         ):
             raise ValueError(
-                "media input exceeds the worker frame or conditioning capacity"
+                "media input exceeds the worker frame, raster or conditioning "
+                "capacity"
             )
         return size
 
     def layout(self, size):
         """Return the capacity layout a request of ``size`` evaluates in.
 
-        It is the smallest text capacity at the request's frame count that
-        holds the request (``Denoiser.holds``). Requests of one layout share
-        its prepared constants and captured graphs.
+        It is the smallest text capacity at the request's frame count and raster
+        that holds the request (``Denoiser.holds``). Requests of one layout
+        share its prepared constants and captured graphs.
 
         Raises:
-            ValueError: ``size`` is not an admitted frame count, or no
-                capacity holds it.
+            ValueError: ``size`` is not an admitted frame count and raster,
+                or no capacity holds it.
         """
-        if size.num_frames not in self.frame_counts:
+        if (
+            size.num_frames not in self.frame_counts
+            or size.frame not in self.frame_sizes
+        ):
             raise ValueError("media input has no admitted capacity layout")
         for capacity in self.text_capacities:
             layout = self.denoiser.layout_size(
-                self.denoiser.make_size(size.num_frames, capacity)
+                self.denoiser.make_size(size.num_frames, size.frame, capacity)
             )
             if self.denoiser.holds(layout, size):
                 return layout
         raise ValueError("media input has no admitted capacity layout")
 
     def layouts(self) -> tuple:
-        """List every capacity layout, the largest first.
+        """List every capacity layout, the longest and largest first.
 
-        The first holds every admitted size and bounds every other layout's
-        shapes dimension by dimension.
+        The leading layout of each raster holds every admitted size at that
+        raster and bounds the shapes of that raster's other layouts dimension
+        by dimension.
         """
         return tuple(
-            self.denoiser.layout_size(self.denoiser.make_size(frames, capacity))
+            self.denoiser.layout_size(
+                self.denoiser.make_size(frames, frame, capacity)
+            )
             for frames in reversed(self.frame_counts)
+            for frame in self.frame_sizes
             for capacity in reversed(self.text_capacities)
         )
 
@@ -208,19 +265,26 @@ class MediaBuilder:
 
     @cached_property
     def sample_pages(self) -> SamplePages:
-        """Size one request's pages from the admitted maximum.
+        """Size one request's pages from the admitted maxima.
 
-        Each modality's global extent at the maximum bounds its local shard
-        on every rank for every admitted size, as in ``capacity_buffers``.
+        Each modality's global extent at a raster's maximum bounds its local
+        shard on every rank for every admitted size at that raster, as in
+        ``capacity_buffers``.
         """
-        state = self._state(self.maximum)
         names = self.denoiser.modalities
-        dtypes = {state[name].dtype for name in names}
+        dtypes = {
+            self._state(maximum)[name].dtype
+            for maximum in self.maxima
+            for name in names
+        }
         if len(dtypes) != 1:
             raise ValueError("pooled sample modalities must share one dtype")
-        capacity = sum(
-            _aligned(math.prod(self.denoiser.latent_shape(name, self.maximum)))
-            for name in names
+        capacity = max(
+            sum(
+                _aligned(math.prod(self.denoiser.latent_shape(name, maximum)))
+                for name in names
+            )
+            for maximum in self.maxima
         )
         # Round the per-page share up to the alignment, then count the pages
         # that share actually needs (at most ``REQUEST_PAGES``).
@@ -304,17 +368,29 @@ class MediaBuilder:
         return result
 
     def capacity_buffers(self) -> Mapping[str, BufferConfig]:
-        """Cover every shard produced by an admitted duration and prompt length.
+        """Cover every shard produced by an admitted size.
 
         A shorter prompt can move additional media tokens onto a particular
         sequence rank. Global modality extents provide a conservative bound
         without assuming that the maximum-size request has the largest shard.
+        Each field's extents are the largest any raster's maximum needs,
+        dimension by dimension.
+
+        Raises:
+            ValueError: The rasters' fields disagree in rank, dtype or
+                placement.
         """
-        result = dict(self.buffers(self.maximum))
-        for name in self.denoiser.modalities:
-            capacity = self.denoiser.latent_shape(name, self.maximum)
-            key = f"{name}_source"
-            result[key] = replace(result[key], capacity_shape=capacity)
+        result: dict[str, BufferConfig] = {}
+        for maximum in self.maxima:
+            fields = dict(self.buffers(maximum))
+            for name in self.denoiser.modalities:
+                capacity = self.denoiser.latent_shape(name, maximum)
+                key = f"{name}_source"
+                fields[key] = replace(fields[key], capacity_shape=capacity)
+            for name, field in fields.items():
+                result[name] = (
+                    field if name not in result else bound(result[name], field)
+                )
         return result
 
     @torch.inference_mode()

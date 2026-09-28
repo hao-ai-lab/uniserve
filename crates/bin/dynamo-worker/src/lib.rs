@@ -42,14 +42,21 @@ use uniserve_engine::{
 use uniserve_server::{
     AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
     openai::{VideoGenerationRequest, serve_error_to_api},
+    profile::omni::resolution::ResolutionName,
     serving::{
         FinishStatus, RequestOutput, ServeRequestId, VIDEO_FPS, default_video_seconds,
         validate_video_capacity, video_frame_count,
     },
 };
 
-// The fixed FastH3 request and output dimensions mirror the capabilities
-// reported by MiniMax H3. The loaded checkpoint determines the step count.
+// The fixed FastH3 request and output dimensions. The sizes duplicate the
+// MiniMax H3 rasters the server reports from
+// `InputProcessor::video_capabilities`, landscape first as the default. The
+// loaded checkpoint determines the step count.
+const H3_SIZES: [(&str, ResolutionName); 2] = [
+    ("1344x768", ResolutionName::Landscape16x9),
+    ("768x1344", ResolutionName::Portrait9x16),
+];
 const H3_WIDTH: u32 = 1344;
 const H3_HEIGHT: u32 = 768;
 const H3_AUDIO_SAMPLE_RATE: i32 = 32_000;
@@ -499,7 +506,8 @@ struct PreparedRequest {
 
 /// Maps a Dynamo video request onto UniServe's `VideoGenerationRequest`.
 ///
-/// Omitted fields default to seed 0, a `url` response, and the duration
+/// `size` selects the landscape `1344x768` or portrait `768x1344` raster and
+/// defaults to landscape. Omitted fields default to seed 0, a `url` response, and the duration
 /// UniServe's HTTP video route resolves (`default_video_seconds`: 5 seconds,
 /// capped at `max_video_seconds`).
 /// `nvext.num_frames` is only checked against the aligned frame count of
@@ -528,14 +536,20 @@ fn prepare_request(
     if request.stream == Some(true) {
         return Err(invalid_argument("stream=true is not supported"));
     }
-    let expected_size = format!("{H3_WIDTH}x{H3_HEIGHT}");
-    if request
-        .size
-        .as_deref()
-        .is_some_and(|size| size != expected_size)
-    {
-        return Err(invalid_argument(format!("size must be {expected_size}")));
-    }
+    let aspect_ratio = match request.size.as_deref() {
+        None => None,
+        Some(size) => Some(
+            H3_SIZES
+                .iter()
+                .find_map(|&(name, aspect_ratio)| (name == size).then_some(aspect_ratio))
+                .ok_or_else(|| {
+                    invalid_argument(format!(
+                        "size must be {} or {}",
+                        H3_SIZES[0].0, H3_SIZES[1].0
+                    ))
+                })?,
+        ),
+    };
     if request
         .output_format
         .as_deref()
@@ -591,6 +605,7 @@ fn prepare_request(
             prompt: request.prompt,
             seed,
             seconds: Some(seconds),
+            aspect_ratio,
         },
         response_format: request.response_format.unwrap_or_default(),
     })
@@ -649,6 +664,7 @@ fn runtime_data(max_video_seconds: f64) -> HashMap<String, Value> {
         ("fps".to_string(), json!(VIDEO_FPS)),
         ("width".to_string(), json!(H3_WIDTH)),
         ("height".to_string(), json!(H3_HEIGHT)),
+        ("sizes".to_string(), json!(H3_SIZES.map(|(name, _)| name))),
         ("max_video_seconds".to_string(), json!(max_video_seconds)),
     ])
     .into_iter()
@@ -703,7 +719,23 @@ mod tests {
         };
         assert_eq!(prepared.request.seconds, Some(5.0));
         assert_eq!(prepared.request.seed, 1000);
+        assert_eq!(prepared.request.aspect_ratio, None);
         assert!(matches!(prepared.response_format, ResponseFormat::B64Json));
+    }
+
+    #[test]
+    fn size_selects_the_video_orientation() {
+        for (size, expected) in [
+            ("1344x768", ResolutionName::Landscape16x9),
+            ("768x1344", ResolutionName::Portrait9x16),
+        ] {
+            let request = json!({"model": "FastH3", "prompt": "x", "size": size});
+            let prepared = match prepare_request(request, "FastH3", 15.0, 4) {
+                Ok(prepared) => prepared,
+                Err(error) => panic!("size {size} was rejected: {error}"),
+            };
+            assert_eq!(prepared.request.aspect_ratio, Some(expected));
+        }
     }
 
     /// An omitted duration resolves as it does on UniServe's HTTP video route:

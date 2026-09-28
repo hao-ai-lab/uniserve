@@ -19,6 +19,7 @@ import torch
 __all__ = [
     "AUDIO_CHANNELS",
     "AUDIO_TAG",
+    "FRAME_SIZES",
     "Packing",
     "TEXT_TAG",
     "VIDEO_TAG",
@@ -43,6 +44,9 @@ ROPE_FRAME_RESCALE = 5.0 / 3.0
 # clip: 1 + 4 * 4 = 17.
 ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
 _ROPE_SPATIAL_SCALE = 32.0
+# Output (height, width) rasters the packing serves: 16:9 landscape and 9:16
+# portrait. Both pack 1008 video rows per latent frame.
+FRAME_SIZES = ((768, 1344), (1344, 768))
 
 
 def video_latent_frames(num_frames: int) -> int:
@@ -159,8 +163,8 @@ def build_packing(
     *,
     num_text_tokens: int,
     num_frames: int = 124,
-    height: int = 768,
-    width: int = 1344,
+    height: int,
+    width: int,
     patch_size: tuple[int, int, int] = (1, 2, 2),
     token_multiple: int = 256,
     audio_frames: int | None = None,
@@ -175,8 +179,9 @@ def build_packing(
         num_text_tokens: Prompt tokens, the valid leading rows of the text
             region.
         num_frames: Output video frames, of the form ``17 * n + 5``.
-        height: Output raster height; only 768 is supported.
-        width: Output raster width; only 1344 is supported.
+        height: Output raster height; with ``width``, one of
+            ``FRAME_SIZES``.
+        width: Output raster width.
         patch_size: Transformer (time, height, width) patch on the latents.
         token_multiple: Row alignment, a multiple of 64. ``padded_tokens``
             rounds up to a multiple of ``max(token_multiple, 128)``, plus one
@@ -197,10 +202,12 @@ def build_packing(
             not whole tiles holding the prompt, or a patch that does not
             divide the latents.
     """
-    if num_text_tokens < 1 or height != 768 or width != 1344:
+    if (height, width) not in FRAME_SIZES:
         raise ValueError(
-            "the FastH3 profile requires 1344x768 output and nonempty text"
+            "the FastH3 profile requires 1344x768 or 768x1344 output"
         )
+    if num_text_tokens < 1:
+        raise ValueError("the FastH3 profile requires nonempty text")
     if token_multiple < 1 or token_multiple % 64:
         raise ValueError(
             "packing alignment must contain complete 64-token tiles"
