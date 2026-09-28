@@ -566,6 +566,7 @@ def vision_state_row(
     width: int,
     conditioning_position: int,
     *,
+    seq_len: int,
     state: BatchState,
     close_image: bool,
     logits: bool,
@@ -575,13 +576,25 @@ def vision_state_row(
     """Build the prefill row that writes one image's vision features into KV.
 
     ``features`` are ``[tokens, hidden]`` (or with a leading singleton batch
-    axis). The row is non-causal, writes KV at the request's cache
-    coordinates, and selects last logits when ``logits`` is set (hidden
-    states otherwise). A framed layout adds start and end marker tokens;
+    axis). The row is non-causal: its features attend to each other in both
+    directions and to the ``seq_len`` KV tokens before it in the request's
+    slot, which are the request's visible KV and, in a context prefill, the
+    rows of its call before this one. It writes its KV after them and
+    selects last logits when ``logits`` is set (only the K/V cache
+    otherwise). A framed layout adds start and end marker tokens;
     ``close_image`` adds the end marker in any layout.
+
+    Raises:
+        WorkerError: When the model declares no feature injection, the
+            features are not ``[tokens, hidden]``, or ``seq_len`` exceeds
+            the request's allocated KV (``calls.cache_coordinates``).
     """
     request = state.pending_output(call.request_key.request_id)
     cache = calls.cache_coordinates(request, tables=request_tables)
+    if seq_len < cache[1] or seq_len > cache[2]:
+        raise invalid_descriptor(
+            "vision row prefix lies outside the request's KV extent"
+        )
     injection = model_runner.image_processor().feature_injection
     if injection is None:
         raise invalid_descriptor(
@@ -641,12 +654,12 @@ def vision_state_row(
         token_embedding_mask=embedding_mask,
         positions=positions,
         # A row that samples no token only writes the K/V cache; its
-        # outcome reads no output (``token._finish_visual``).
+        # outcome reads no output.
         selection=TokenSelection.LAST_LOGITS
         if logits
         else TokenSelection.CACHE,
         request_pool_idx=cache[0],
-        seq_len=cache[1],
+        seq_len=seq_len,
         write_kv=True,
         causal=False,
     )
