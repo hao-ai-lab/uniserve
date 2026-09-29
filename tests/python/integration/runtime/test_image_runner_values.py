@@ -248,7 +248,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 timesteps=(time,) * len(branches),
                 positions=positions,
                 attention=attention,
-                step_index=index,
+                step=schedule.step(index).to("cuda:0"),
             )
             with oracle.activate():
                 oracle.bind_attention(attention)

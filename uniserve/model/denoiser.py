@@ -197,10 +197,14 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         *,
         latents: Mapping[str, tuple[LatentInput, ...]],
         sizes: tuple[VideoSizeT, ...],
-        step_index: int,
+        step: torch.Tensor,
         text_features: tuple[torch.Tensor, ...],
     ) -> InputT:
-        """Assemble one denoising step's typed input from borrowed tensors."""
+        """Assemble one denoising step's typed input from borrowed tensors.
+
+        ``step`` is the evaluation's [1] int64 device index
+        (``Schedule.step``); see ``DenoiserInput``.
+        """
         raise NotImplementedError
 
 
@@ -234,7 +238,7 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
         *,
         latents: Mapping[str, tuple[LatentInput, ...]],
         sizes: tuple[image.Config, ...],
-        step_index: int,
+        step: torch.Tensor,
         positions: torch.Tensor,
         sequence_lengths: tuple[int, ...],
         attention: Any,

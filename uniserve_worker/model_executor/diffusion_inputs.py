@@ -56,10 +56,11 @@ class ImageBuilder:
         """Patch tokens of an image of ``size`` plus its framing tokens."""
         return self.denoiser.latent_shape("image", size)[0] + self.framing
 
-    def bind(
-        self, *, samples, sizes, timesteps, positions, attention, step_index
-    ):
-        """Delegate typed input construction to the network that owns it."""
+    def bind(self, *, samples, sizes, timesteps, positions, attention, step):
+        """Delegate typed input construction to the network that owns it.
+
+        ``step`` is the [1] int64 device index ``DenoiserInput`` carries.
+        """
         return self.denoiser.bind_inputs(
             latents={
                 "image": tuple(
@@ -68,7 +69,7 @@ class ImageBuilder:
                 )
             },
             sizes=sizes,
-            step_index=step_index,
+            step=step,
             positions=positions,
             sequence_lengths=tuple(
                 self.sequence_length(size) for size in sizes

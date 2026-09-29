@@ -34,7 +34,8 @@ use uniserve_core::{
     RuntimeFamily, SamplingParams,
 };
 use uniserve_engine::{
-    EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup, WorkerProcessArgs,
+    CallReaders, EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup,
+    WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
     ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CachePageAllocation, Call, CallId,
@@ -200,6 +201,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
                 })
                 .collect(),
         ),
+        &CallReaders::new(),
     )?;
     let report = worker
         .poll_batch(Duration::from_secs(5))?
@@ -470,6 +472,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
                         latent: batch.latent_params.into_iter().next(),
                         decode: batch.decode_ranges.into_iter().next(),
                         buffers: batch.buffer_allocations,
+                        readers: Default::default(),
                     },
                 )],
                 batch.commands,
@@ -709,6 +712,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
             latent: None,
             decode: None,
             buffers: batch.buffer_allocations,
+            readers: Default::default(),
         };
         executor.submit(ExecutionBatch::new(
             batch_id,
@@ -811,6 +815,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
                     buffers: batch.buffer_allocations,
+                    readers: Default::default(),
                 },
             )],
             batch.commands,
@@ -1058,6 +1063,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
                     buffers: batch.buffer_allocations,
+                    readers: Default::default(),
                 },
             )],
             batch.commands,
@@ -1248,7 +1254,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             BlockId(1),
             0,
         );
-        worker.submit_batch(batch)?;
+        worker.submit_batch(batch, &CallReaders::new())?;
 
         // A correlation or rank-ownership failure may fail the poll and must
         // deliver no result. A short extent still delivers the call's result,
@@ -1508,7 +1514,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
 
     // `WorkerGroup::submit_batch` refuses a batch id that does not exceed the
     // last one submitted, whether the batch repeats it or conflicts with it.
-    assert!(executor.submit_batch(initial).is_err());
+    assert!(executor.submit_batch(initial, &CallReaders::new()).is_err());
 
     let conflicting = token_batch(
         1,
@@ -1521,7 +1527,11 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         BlockId(1),
         0,
     );
-    assert!(executor.submit_batch(conflicting).is_err());
+    assert!(
+        executor
+            .submit_batch(conflicting, &CallReaders::new())
+            .is_err()
+    );
 
     // A Finish for another epoch of the same request id leaves the resident
     // epoch in place: the continuation below still runs.
@@ -1581,7 +1591,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         0,
     );
     close_batch.commands.push(close.clone());
-    executor.submit_batch(close_batch.clone())?;
+    executor.submit_batch(close_batch.clone(), &CallReaders::new())?;
     // A batch returns one result: the call's completion and the retirement
     // it carries arrive together.
     let result = executor
@@ -1591,7 +1601,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert_eq!(result.results[0].output.status, CallStatus::Ok);
     assert!(executor.poll_batch(Duration::from_millis(50))?.is_none());
     assert!(matches!(
-        executor.submit_batch(close_batch),
+        executor.submit_batch(close_batch, &CallReaders::new()),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     let descendant = token_batch(
@@ -1618,13 +1628,16 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert!(!executor.is_ready());
     assert!(executor.poll_batch(Duration::ZERO)?.is_none());
     assert!(matches!(
-        executor.submit_batch(command_batch(
-            100,
-            BatchCommand::Finish {
-                request_key: admission.request_key,
-                retained_buffers: Vec::new(),
-            }
-        )),
+        executor.submit_batch(
+            command_batch(
+                100,
+                BatchCommand::Finish {
+                    request_key: admission.request_key,
+                    retained_buffers: Vec::new(),
+                }
+            ),
+            &CallReaders::new()
+        ),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     executor.close()?;
@@ -1797,17 +1810,20 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     let lost_admission = text_admission(22, 1, 2)?;
     // Keep this rank from completing the batch before the test terminates it.
     let paused = PausedProcess::new(victim.try_into()?)?;
-    executor.submit_batch(token_batch(
-        3,
-        3,
-        lost_admission.request_key,
-        Some(lost_admission),
-        CallId::new(3, 0),
-        CallKind::Forward(ForwardMode::Prefill),
-        &[4],
-        BlockId(2),
-        0,
-    ))?;
+    executor.submit_batch(
+        token_batch(
+            3,
+            3,
+            lost_admission.request_key,
+            Some(lost_admission),
+            CallId::new(3, 0),
+            CallKind::Forward(ForwardMode::Prefill),
+            &[4],
+            BlockId(2),
+            0,
+        ),
+        &CallReaders::new(),
+    )?;
     paused.terminate()?;
     let loss = executor
         .poll_batch(Duration::from_secs(30))
@@ -1967,12 +1983,12 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
 
     // Resubmitting batch 1 is refused because batch ids must increase; the
     // original submission stays in flight.
-    executor.submit_batch(slow.clone())?;
+    executor.submit_batch(slow.clone(), &CallReaders::new())?;
     assert!(matches!(
-        executor.submit_batch(slow),
+        executor.submit_batch(slow, &CallReaders::new()),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
-    executor.submit_batch(fast)?;
+    executor.submit_batch(fast, &CallReaders::new())?;
     // This worker's component spans both ranks, so its ranks stay inside the
     // same collective and hold one batch in flight. The blocked batch is at the
     // head of the channel, so nothing behind it runs until its dependency is
@@ -2059,7 +2075,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         product: input,
         value: publication.descriptor()?,
     });
-    executor.submit_batch(batch)?;
+    executor.submit_batch(batch, &CallReaders::new())?;
     let transferred = executor
         .poll_batch(Duration::from_secs(30))?
         .context("tensor input did not reach its component")?;
@@ -2154,6 +2170,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
                     buffers: batch.buffer_allocations,
+                    readers: Default::default(),
                 },
             )],
             batch.commands,
@@ -2887,7 +2904,7 @@ fn execute(
     executor: &mut WorkerGroup,
     batch: Batch,
 ) -> anyhow::Result<uniserve_engine::WorkerResult> {
-    executor.submit_batch(batch)?;
+    executor.submit_batch(batch, &CallReaders::new())?;
     executor
         .poll_batch(Duration::from_secs(30))?
         .ok_or_else(|| anyhow::anyhow!("submission did not complete"))

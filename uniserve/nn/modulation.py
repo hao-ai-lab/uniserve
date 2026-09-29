@@ -134,24 +134,26 @@ class Modulation(nn.Module):
             None if final_projection is None else project(*final_projection),
         )
 
-    def forward(self, step_index: int, layer_index: int) -> torch.Tensor:
-        """Borrow one layer's modulation products at a prepared solver step."""
-        if (
-            not 0 <= step_index < self.products.shape[0]
-            or not 0 <= layer_index < self.products.shape[1]
-        ):
-            raise ValueError(
-                "modulation indices must lie within the prepared step/layer "
-                "domain"
-            )
-        return self.products[step_index, layer_index]
+    def forward(self, step: torch.Tensor) -> torch.Tensor:
+        """Gather every layer's modulation products at one solver step.
 
-    def output(self, step_index: int) -> torch.Tensor:
-        """Borrow final-normalization products for one prepared solver step."""
+        ``step`` is a [1] int64 device index into the prepared ladder
+        (``Schedule.step``). The gather reads it on the device, so a captured
+        computation serves every step. Returns [layer, row, output] products;
+        indices outside the ladder are not checked on the host.
+        """
+        if step.dtype != torch.int64 or tuple(step.shape) != (1,):
+            raise ValueError("modulation step must be a [1] int64 index")
+        return self.products.index_select(0, step)[0]
+
+    def output(self, step: torch.Tensor) -> torch.Tensor:
+        """Gather final-normalization products at one solver step.
+
+        ``step`` is a [1] int64 device index, as for ``forward``. Returns
+        [row, output] products.
+        """
         if self.output_products is None:
             raise ValueError("this modulation has no output projection")
-        if not 0 <= step_index < self.output_products.shape[0]:
-            raise ValueError(
-                "modulation step must lie within the prepared ladder"
-            )
-        return self.output_products[step_index]
+        if step.dtype != torch.int64 or tuple(step.shape) != (1,):
+            raise ValueError("modulation step must be a [1] int64 index")
+        return self.output_products.index_select(0, step)[0]

@@ -1,7 +1,7 @@
 """Analytical diffusion coordinates and their FP32 numerical endpoints."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
@@ -13,11 +13,15 @@ class Schedule:
 
     All three hold ``num_steps + 1`` aligned entries. ``coordinates`` retains
     the unrounded analytical values that guidance interval comparisons use.
+    ``steps`` holds the entry indices ``0..num_steps`` as int64 on the
+    endpoints' device, so a step is named by device data (``step``) rather
+    than by a host integer baked into a computation.
     """
 
     timesteps: torch.Tensor
     sigmas: torch.Tensor
     coordinates: tuple[float, ...]
+    steps: torch.Tensor = field(init=False)
 
     def __post_init__(self):
         if (
@@ -35,10 +39,33 @@ class Schedule:
                 "schedules require aligned FP32 endpoints and analytical "
                 "coordinates"
             )
+        object.__setattr__(
+            self,
+            "steps",
+            torch.arange(
+                self.timesteps.numel(),
+                dtype=torch.int64,
+                device=self.timesteps.device,
+            ),
+        )
 
     @property
     def num_steps(self) -> int:
         return len(self.coordinates) - 1
+
+    def step(self, index: int) -> torch.Tensor:
+        """Name evaluation ``index`` as a [1] int64 device view of ``steps``.
+
+        The view's value, not its address, identifies the step, so a
+        computation captured with one step's view evaluates any step once the
+        value is copied into its input.
+
+        Raises:
+            ValueError: ``index`` is not an evaluation of this schedule.
+        """
+        if type(index) is not int or not 0 <= index < self.num_steps:
+            raise ValueError("schedule step must be one of its evaluations")
+        return self.steps[index : index + 1]
 
 
 def make_schedule(

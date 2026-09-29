@@ -1306,6 +1306,7 @@ mod tests {
                     latent: None,
                     decode: None,
                     buffers: Vec::new(),
+                    readers: Default::default(),
                 },
             )],
             vec![uniserve_worker_ipc::BatchCommand::Start {

@@ -22,7 +22,7 @@ mod process;
 mod registration;
 
 pub use executor::WorkerExecutor;
-pub use instance::WorkerGroup;
+pub use instance::{CallReaders, WorkerGroup};
 pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
 use process::{PendingRank, RankProcess};
 

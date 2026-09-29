@@ -283,16 +283,20 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
     )
     with TensorBuffers.allocate(requirements, device="cuda") as owner:
         workspace = owner.view(requirements)
+        # The solver step is device data, so one captured evaluation serves
+        # every step once the index holds it.
+        step = torch.zeros(1, dtype=torch.int64, device="cuda")
         with ExecutionContext(model, vsa="cute") as context:
             context.prepare(None)
-            for step in range(4):
+            for index in range(4):
+                step.fill_(index)
                 expected = _reference(
-                    hidden, source, config, step, tags, cosine, sine, valid
+                    hidden, source, config, index, tags, cosine, sine, valid
                 )
                 actual = model(
                     hidden,
                     inputs,
-                    step_index=step,
+                    step=step,
                     tables=tables,
                     workspace=workspace,
                 )
@@ -301,21 +305,24 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
                         result, reference, rtol=2e-2, atol=2e-2
                     )
             with CUDAGraph(context=context) as graph:
+                step.fill_(3)
                 graph.capture(
                     lambda: model(
                         hidden,
                         inputs,
-                        step_index=3,
+                        step=step,
                         tables=tables,
                         workspace=workspace,
                     )
                 )
-                hidden.mul_(0.5)
-                actual = graph.replay()
-                expected = _reference(
-                    hidden, source, config, 3, tags, cosine, sine, valid
-                )
-                for result, reference in zip(actual, expected, strict=True):
-                    torch.testing.assert_close(
-                        result, reference, rtol=2e-2, atol=2e-2
+                for index in (1, 3):
+                    step.fill_(index)
+                    hidden.mul_(0.5)
+                    actual = graph.replay()
+                    expected = _reference(
+                        hidden, source, config, index, tags, cosine, sine, valid
                     )
+                    for result, reference in zip(actual, expected, strict=True):
+                        torch.testing.assert_close(
+                            result, reference, rtol=2e-2, atol=2e-2
+                        )
