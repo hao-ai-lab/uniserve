@@ -102,7 +102,7 @@ def _inputs(schedules, sample, size, steps):
                 )
             },
             (size,),
-            step,
+            schedules["image"].step(step),
         )
         for step in range(steps)
     )
@@ -184,8 +184,7 @@ def test_denoising_steps_read_the_committed_bank_and_write_the_other(
                 runner.warmup(ladder)
                 torch.testing.assert_close(sample, reference, rtol=0, atol=0)
                 if graphs:
-                    for step in (0, 1):
-                        runner.capture(ladder, step)
+                    runner.capture(ladder)
                 bank = 1
                 for step in (0, 1):
                     committed = _committed(pool, bank, slot, size).clone()
@@ -267,8 +266,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
         _committed(pool, 1, 1, size).fill_(7.0)
         bound = _bind(runner, schedules, size, steps, 1)
         runner.warmup(bound)
-        for step in range(steps):
-            runner.capture(bound, step)
+        runner.capture(bound)
         # Capture must leave the slot's committed samples where it found them.
         torch.testing.assert_close(
             _committed(pool, 1, 1, size),
@@ -291,11 +289,12 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
 
 
 @torch.inference_mode()
-def test_a_capturing_runner_serves_only_startup_captured_steps():
+def test_a_capturing_runner_serves_only_startup_captured_layouts():
     """Serving never evaluates a capturing runner's steps eagerly.
 
-    A step whose graph startup did not capture is refused rather than run
-    without graphs, so every served step replays a captured graph.
+    A step of a layout whose graph startup did not capture is refused rather
+    than run without graphs; once the layout's graph is captured, every
+    solver step replays it.
     """
     device = torch.device("cuda:0")
     model = LinearDenoiser().to(device)
@@ -316,14 +315,14 @@ def test_a_capturing_runner_serves_only_startup_captured_steps():
     try:
         bound = _bind(runner, schedules, size, steps, 1)
         _committed(pool, 1, 1, size).fill_(7.0)
-        with pytest.raises(RuntimeError, match="no graph"):
-            runner.step(bound, 0, 1)
+        for step in range(steps):
+            with pytest.raises(RuntimeError, match="no graph"):
+                runner.step(bound, step, 1)
 
         runner.warmup(bound)
-        runner.capture(bound, 0)
+        runner.capture(bound)
         assert runner.step(bound, 0, 1)[1] == "graph_replay"
-        with pytest.raises(RuntimeError, match="no graph"):
-            runner.step(bound, 1, 0)
+        assert runner.step(bound, 1, 0)[1] == "graph_replay"
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()

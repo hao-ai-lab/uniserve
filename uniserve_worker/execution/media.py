@@ -316,11 +316,12 @@ def prepare_denoising(
     the first allocates the storage every other layout shares. A placeholder
     request filling the layout's text capacity on slot one runs one eager
     step, which prepares the layout's kernels, plans and scratch; once every
-    layout is warm, a capturing runner captures every step of every
-    layout's ladder. The graphs
-    serve every request slot, since they reach a slot's storage and pages
-    through device indices, and every prompt length the layout holds, since
-    the lengths differ only in the state a graph gathers from the slot.
+    layout is warm, a capturing runner captures one graph per layout. A
+    graph serves every solver step, since the step index, timesteps and
+    schedules are inputs a replay copies in; every request slot, since it
+    reaches a slot's storage and pages through device indices; and every
+    prompt length the layout holds, since the lengths differ only in the
+    state a graph gathers from the slot.
     Collective across the component's ranks, which hold each other in
     lockstep here; serving never prepares a layout or captures.
 
@@ -382,10 +383,9 @@ def prepare_denoising(
             diffusion.warmup(ladder(layout, staged=True))
         warmed = time.perf_counter()
         if diffusion.captures:
+            # One graph per layout evaluates every solver step.
             for layout in layouts:
-                bound = ladder(layout, staged=False)
-                for index in range(builder.num_steps):
-                    diffusion.capture(bound, index)
+                diffusion.capture(ladder(layout, staged=False))
         runner.graph_storage.check()
         resident = sum(runner.graph_storage.resident_bytes().values())
         finished = time.perf_counter()
@@ -396,7 +396,7 @@ def prepare_denoising(
             len(layouts),
             len(builder.frame_counts),
             len(builder.text_capacities),
-            len(layouts) * builder.num_steps if diffusion.captures else 0,
+            len(layouts) if diffusion.captures else 0,
             finished - started,
             prepared - started,
             warmed - prepared,

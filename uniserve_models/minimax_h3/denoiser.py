@@ -137,14 +137,14 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         *,
         latents: Mapping[str, tuple[LatentInput, ...]],
         sizes: tuple[DenoiserSize, ...],
-        step_index: int,
+        step: torch.Tensor,
         text_features: tuple[torch.Tensor, ...],
     ) -> DenoiserInput:
         """Assemble one denoising step's typed input from resident tensors."""
         return DenoiserInput(
             latents=latents,
             sizes=sizes,
-            step_index=step_index,
+            step=step,
             text_features=text_features,
         )
 
@@ -556,12 +556,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         ``TensorOutput`` of this rank's rows; every other stage maps each
         modality to ``(None,)``.
         """
-        if inputs.batch_size != 1 or not 0 <= inputs.step_index < len(
-            self.diffusion.ladder
-        ):
-            raise ValueError(
-                "H3 denoising requires one sample on its checkpoint ladder"
-            )
+        # The step is device data; the schedule that named it checked that it
+        # lies on the checkpoint ladder.
+        if inputs.batch_size != 1:
+            raise ValueError("H3 denoising requires one sample")
         size = inputs.sizes[0]
         if size != self.layout_size(size):
             raise ValueError(
@@ -653,7 +651,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         predictions = self.transformer(
             hidden,
             attention,
-            step_index=inputs.step_index,
+            step=inputs.step,
             tables={
                 "modulation_indices": constants["modulation_indices"],
                 "cos": state["cos"],

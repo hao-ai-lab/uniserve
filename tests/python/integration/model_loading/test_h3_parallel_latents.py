@@ -247,7 +247,7 @@ def _generate(
                             for name, value in state.items()
                         },
                         (layout,),
-                        step_index,
+                        schedules["video"].step(step_index),
                         (conditioning,),
                     )
                     step = DenoisingStep(
