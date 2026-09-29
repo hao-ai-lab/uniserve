@@ -38,7 +38,7 @@ In one terminal, start the frontend:
 artifacts/dynamo/frontend-env/bin/python -m dynamo.frontend \
   --http-host 127.0.0.1 --http-port 18090 \
   --namespace uniserve-fasth3 \
-  --discovery-backend file --request-plane tcp
+  --discovery-backend file
 ```
 
 In another terminal, from the same repository and on the same host, start the worker:
@@ -46,7 +46,6 @@ In another terminal, from the same repository and on the same host, start the wo
 ```bash
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 export DYN_DISCOVERY_BACKEND=file
-export DYN_REQUEST_PLANE=tcp
 
 target/release/uniserve-dynamo-worker \
   --namespace uniserve-fasth3 \
@@ -59,7 +58,7 @@ target/release/uniserve-dynamo-worker \
 
 The placement uses four-way Ulysses denoising and TP4 text encoding, distributes temporal decoder units across the GPUs, and starts four host video encoders plus a host muxer. Weights remain resident; the quality configuration retains BF16 text encoding and denoising with the configured FP16 VAE projections.
 
-This single-host setup uses file discovery and TCP. Both processes must share the discovery directory, `/tmp/dynamo_store_kv` by default, and the same namespace.
+This single-host setup uses file discovery; requests travel over Dynamo's default TCP request plane. Both processes must share the discovery directory, `/tmp/dynamo_store_kv` by default, and the same namespace.
 
 Model loading and CUDA graph preparation run before the worker registers. Check the frontend's model list:
 
