@@ -150,12 +150,18 @@ class TokenBufferConfig(AttentionBufferConfig):
 
 @dataclass(frozen=True, slots=True)
 class DiffusionBufferConfig(AttentionBufferConfig):
-    """Attention columns and one solver time per image sequence."""
+    """Attention columns, one solver time per image sequence and a step.
+
+    ``step`` is the batch input's [1] int64 step index. Batched image rows
+    carry their own timesteps and are integrated per request, so the batched
+    denoisers never read it; it stays zero.
+    """
 
     def buffers(self):
         return {
             **AttentionBufferConfig.buffers(self),
             "timesteps": BufferConfig((self.max_rows,), torch.float32),
+            "step": BufferConfig((1,), torch.int64),
         }
 
 
@@ -670,10 +676,12 @@ class DiffusionBuffers(AttentionBuffers):
     row_type = DiffusionRow
 
     timesteps: torch.Tensor
+    step: torch.Tensor
 
     def __init__(self, *, image_builder: ImageBuilder, **options):
         super().__init__(**options)
         self.image_builder = image_builder
+        self.step.zero_()
 
     def _prepare_inputs(
         self, rows, *, attention=None, cache=None, tables=None, states=None
@@ -690,8 +698,8 @@ class DiffusionBuffers(AttentionBuffers):
 
         Positions and timesteps are copied into the fixed columns; each
         row's latent is borrowed and must already be on this device. The
-        image builder binds them into the denoiser's typed input at step
-        index zero.
+        image builder binds them into the denoiser's typed input at the
+        zero step index.
         """
         if self.image_builder is None:
             raise ValueError("image denoising requires its bound input builder")
@@ -727,7 +735,7 @@ class DiffusionBuffers(AttentionBuffers):
             ),
             positions=tuple(positions),
             attention=attention,
-            step_index=0,
+            step=self.step,
         )
 
 

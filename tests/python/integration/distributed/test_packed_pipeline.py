@@ -179,7 +179,7 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
             timesteps=(torch.tensor(0.5),),
             positions=(positions,),
             attention=attention,
-            step_index=0,
+            step=torch.zeros(1, dtype=torch.int64, device=sample.device),
         )
         outputs = []
         before = sample.clone()

@@ -252,7 +252,7 @@ def test_images_and_velocity_follow_independent_equations(
     inputs = u1.DenoiserInput(
         {"image": (LatentInput(sample, timestep),)},
         (image.Config(8, 8),),
-        0,
+        torch.zeros(1, dtype=torch.int64),
         (u1.ImageConditioning(pixels, grid, scale),),
         (torch.tensor([[9, 9, 9, 9], [0, 0, 1, 1], [0, 1, 0, 1]]),),
         (4,),
@@ -265,7 +265,7 @@ def test_images_and_velocity_follow_independent_equations(
             timesteps=(timestep,),
             positions=(factory.positions(size, 9, device="cpu"),),
             attention=VarlenInput(lengths, lengths, (False,)),
-            step_index=0,
+            step=torch.zeros(1, dtype=torch.int64),
         )
     with torch.no_grad():
         prediction = model.denoiser(

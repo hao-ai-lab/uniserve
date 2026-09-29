@@ -28,38 +28,43 @@ def advance_(
     latents: Mapping[str, tuple[LatentInput, ...]],
     predictions: Mapping[str, tuple[TensorOutput | torch.Tensor | None, ...]],
     schedules: Mapping[str, Schedule],
-    index: int,
+    step: torch.Tensor,
 ) -> Mapping[str, tuple[torch.Tensor, ...]]:
     """Apply one solver update to every sample from its prediction.
 
     ``latents`` holds each modality's samples at their current timesteps and
-    ``predictions`` the aligned predictions for evaluation ``index``: a
-    ``TensorOutput`` whose layout locates a sample shard, a tensor covering
+    ``predictions`` the aligned predictions for the evaluation ``step`` names:
+    a ``TensorOutput`` whose layout locates a sample shard, a tensor covering
     the whole sample, or ``None`` where this rank holds no prediction (a
-    pipeline stage before the last). Samples are updated in place toward
-    ``schedule.timesteps[index + 1]``, and prediction storage may be consumed
-    by the solver. Returns the updated sample tensors.
+    pipeline stage before the last). ``step`` is the evaluation's [1] int64
+    device index (``Schedule.step``); samples are updated in place toward
+    ``schedule.timesteps[step + 1]``, gathered on the device, so the same
+    computation serves every step. Prediction storage may be consumed by the
+    solver. Returns the updated sample tensors.
     """
     names = denoiser.modalities
     if set(latents) != set(names) or set(schedules) != set(names):
         raise ValueError(
             "denoising inputs and schedules must cover the declared modalities"
         )
-    if any(
-        not 0 <= index < schedule.num_steps for schedule in schedules.values()
-    ):
-        raise ValueError(
-            "denoising requires an evaluation index within every schedule"
-        )
     if set(predictions) != set(names):
         raise ValueError(
             "denoising predictions must cover the declared modalities"
         )
+    if step.dtype != torch.int64 or tuple(step.shape) != (1,):
+        raise ValueError("denoising requires a [1] int64 step index")
 
     samples = {}
     for name in names:
         schedule = schedules[name]
         values = latents[name]
+        # Endpoints of this evaluation, gathered by the device step as 0-d
+        # FP32 values: the same shapes and dtypes the host-indexed entries
+        # had, so the solver's type promotion and arithmetic are unchanged.
+        # ``timesteps[1:]`` offsets the gather by one to reach step + 1.
+        next_timestep = schedule.timesteps[1:].index_select(0, step)[0]
+        sigma = schedule.sigmas.index_select(0, step)[0]
+        next_sigma = schedule.sigmas[1:].index_select(0, step)[0]
         if len(predictions[name]) != len(values):
             raise ValueError(
                 "denoising predictions must align with the input samples"
@@ -85,9 +90,9 @@ def advance_(
                 prediction,
                 sample,
                 latent.timestep,
-                schedule.timesteps[index + 1],
-                sigma=schedule.sigmas[index],
-                next_sigma=schedule.sigmas[index + 1],
+                next_timestep,
+                sigma=sigma,
+                next_sigma=next_sigma,
             )
     return samples
 
@@ -113,14 +118,8 @@ class DenoisingStep(Generic[InputT, SizeT]):
 
     @torch.inference_mode()
     def __call__(self) -> Mapping[str, tuple[torch.Tensor, ...]]:
-        index = self.inputs.step_index
-        if any(
-            not 0 <= index < schedule.num_steps
-            for schedule in self.schedules.values()
-        ):
-            raise ValueError(
-                "denoising requires an evaluation index within every schedule"
-            )
+        # The step is device data; ``Schedule.step`` validated it on the host
+        # when the caller named the evaluation.
         predictions = self.denoiser(
             self.inputs,
             state=self.state,
@@ -132,7 +131,7 @@ class DenoisingStep(Generic[InputT, SizeT]):
             self.inputs.latents,
             predictions,
             self.schedules,
-            index,
+            self.inputs.step,
         )
 
         # With pipeline parallelism the last stage holds the updated samples;

@@ -141,16 +141,26 @@ class LatentInput:
 
 @dataclass(frozen=True)
 class DenoiserInput(Generic[SizeT]):
-    """Per-modality latents aligned with sample sizes at one solver step."""
+    """Per-modality latents aligned with sample sizes at one solver step.
+
+    ``step`` names the solver step as device data: a [1] int64 tensor holding
+    the evaluation index (``Schedule.step``). Per-step tables (schedule
+    endpoints, step-indexed model products) are gathered through it, so one
+    captured computation evaluates every step once the value is copied in.
+    """
 
     latents: Mapping[str, tuple[LatentInput, ...]]
     sizes: tuple[SizeT, ...]
-    step_index: int
+    step: torch.Tensor
 
     def __post_init__(self):
-        if type(self.step_index) is not int or self.step_index < 0:
+        if (
+            not isinstance(self.step, torch.Tensor)
+            or self.step.dtype != torch.int64
+            or tuple(self.step.shape) != (1,)
+        ):
             raise ValueError(
-                "denoiser step index must be a nonnegative integer"
+                "denoiser step must be a [1] int64 tensor of its evaluation"
             )
         if any(
             not name or len(values) != len(self.sizes)
