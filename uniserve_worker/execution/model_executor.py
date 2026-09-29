@@ -65,7 +65,7 @@ from uniserve.runtime import (
 from uniserve.runtime.backends.attention import resolve as attention_backend
 from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
 from uniserve.runtime.cuda_graph import CUDAGraphError
-from uniserve.runtime.device import canonical_device
+from uniserve.runtime.device import canonical_device, process_device_bytes
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout
 from uniserve_worker.bootstrap.components import (
@@ -1394,22 +1394,26 @@ class ModelExecutor:
         Afterwards no runner captures: the staged entries capture no
         further batch graphs, module entries, including ones prepared later,
         evaluate signatures without a resident graph eagerly, and the
-        denoiser runner refuses capture (see ``ModelRunner``). Raises
-        ``CUDAGraphError`` when graph residency exceeds its budget, and
-        ``CUDAError`` when a lane stream has lost its SM partition.
+        denoiser runner refuses capture (see ``ModelRunner``), so the graph
+        storage is sealed (``GraphStorage.seal``). Raises ``CUDAGraphError``
+        when graph residency exceeds its budget, and ``CUDAError`` when a
+        lane stream has lost its SM partition.
         """
         self.graph_storage.check()
         # Resident storage by device and, for graph pools, by runner kind,
-        # for sizing. Transient scratch and prepared contexts of module
-        # entries live outside the pools, so the process total is reported
-        # alongside them.
+        # for sizing. Scratch and eager warm calls allocate outside the pools,
+        # and graph executables, communicators and loaded modules outside the
+        # caching allocator, so the process's whole device footprint is
+        # reported alongside the allocator's reservation and the pools.
         for device, pooled in sorted(
-            self.graph_storage.resident_bytes().items(), key=str
+            self.graph_storage.pool_bytes().items(), key=str
         ):
             logger.info(
-                "device storage on %s: %.2f GiB reserved by this process at "
-                "startup, %.2f GiB of it in graph pools",
+                "device storage on %s: %.2f GiB held by this process at "
+                "startup, %.2f GiB of it reserved by the caching allocator "
+                "and %.2f GiB of that in graph pools",
                 device,
+                process_device_bytes(device) / 2**30,
                 torch.cuda.memory_reserved(device) / 2**30,
                 pooled / 2**30,
             )
@@ -1432,6 +1436,7 @@ class ModelExecutor:
 
         for _, stream in self._lane_streams:
             stream.verify()
+        self.graph_storage.seal()
         self._startup_complete = True
         for entry in (
             *self.entries.values(),

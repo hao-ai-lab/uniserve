@@ -5,7 +5,9 @@
 CUDA device and allocates its graph captures, prepared workspace and fixed
 graph inputs from it; the storage sums those pools per device against one
 budget. ``Worker`` rebinds each budget with ``set_budget`` from its
-remaining device-storage grant before startup warmup and capture.
+remaining device-storage grant before startup warmup and capture, and from
+then until ``seal`` the storage charges everything the process's device
+footprint gains, inside the pools or not.
 """
 
 from contextlib import ExitStack, contextmanager
@@ -13,7 +15,7 @@ from contextlib import ExitStack, contextmanager
 import torch
 
 from uniserve.runtime.cuda_graph import CUDAGraphError
-from uniserve.runtime.device import canonical_device
+from uniserve.runtime.device import canonical_device, process_device_bytes
 from uniserve_worker.config.execution import graph_storage_budget_bytes
 
 
@@ -33,6 +35,10 @@ class GraphStorage:
         }
         if any(amount < 0 for amount in self._budgets.values()):
             raise ValueError("graph storage budgets must be nonnegative")
+        # Per bound device, the bytes the process held outside the pools when
+        # ``set_budget`` bound it. Residency on a bound device is the
+        # process's footprint less these bytes.
+        self._outside = {}
 
     def reserve(self, owner, devices, *, share=None):
         """Create ``owner``'s private pools and return them by device.
@@ -89,7 +95,7 @@ class GraphStorage:
         """Reject residency above the byte bound after preparation/capture.
 
         Raises:
-            CUDAGraphError: If any device's pooled bytes exceed its budget.
+            CUDAGraphError: If any device's residency exceeds its budget.
         """
         if not self._budgets:
             return
@@ -101,13 +107,54 @@ class GraphStorage:
                 )
 
     def set_budget(self, device, amount):
-        """Bind the graph share of an owner's remaining device-storage grant."""
+        """Bind the graph share of an owner's remaining device-storage grant.
+
+        From binding until ``seal``, the device's residency is its pool bytes
+        at binding plus everything the process's device footprint
+        (``process_device_bytes``) gains afterwards. Preparation leaves
+        storage outside the pools as well: instantiated graph executables,
+        communicator resources, loaded modules and work areas created by a
+        first eager call. The grant must hold it too, or the device runs out
+        of storage while the pools still fit their budget.
+
+        Raises:
+            ValueError: ``amount`` is negative.
+            CUDAGraphError: The residency already exceeds ``amount``.
+        """
         if amount < 0:
             raise ValueError("graph storage budgets must be nonnegative")
-        self._budgets[canonical_device(device)] = int(amount)
+        device = canonical_device(device)
+        pooled = self.pool_bytes().get(device, 0)
+        self._outside[device] = process_device_bytes(device) - pooled
+        self._budgets[device] = int(amount)
         self.check()
 
+    def seal(self):
+        """Charge only the pools once startup preparation is complete.
+
+        Nothing captures after startup, so the pools stop growing, while the
+        footprint grows with serving: products becoming resident and eager
+        work. Those belong to the owner's storage grant, not to graph
+        residency.
+        """
+        self._outside.clear()
+
     def resident_bytes(self):
+        """Return the bytes each budgeted device charges against its budget.
+
+        A device bound by ``set_budget`` and not yet sealed charges its pool
+        bytes at binding plus the process's footprint growth since; any
+        other device charges its pools (``pool_bytes``).
+        """
+        unbound = self._budgets.keys() - self._outside.keys()
+        sizes = (
+            self.pool_bytes() if unbound else dict.fromkeys(self._budgets, 0)
+        )
+        for device, outside in self._outside.items():
+            sizes[device] = process_device_bytes(device) - outside
+        return sizes
+
+    def pool_bytes(self):
         """Return reserved pool bytes, including reusable capture workspace.
 
         Sums the allocator segments of every owner's pools, by device, from
@@ -153,3 +200,4 @@ class GraphStorage:
 
     def close(self):
         self._pools.clear()
+        self._outside.clear()
