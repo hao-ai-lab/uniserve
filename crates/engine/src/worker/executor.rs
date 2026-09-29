@@ -1050,7 +1050,15 @@ impl WorkerExecutor {
             });
         }
 
-        match self.workers[worker_index].1.submit_batch(wire) {
+        // Routing stays on the head: the group names each call's reading
+        // ranks from the workers its request was routed to.
+        let readers = batch
+            .requests
+            .iter()
+            .filter(|(_, placement)| !placement.readers.is_empty())
+            .map(|(call, placement)| ((call.request_key, call.call_id), placement.readers.clone()))
+            .collect();
+        match self.workers[worker_index].1.submit_batch(wire, &readers) {
             Ok(()) => {}
             Err(BatchSubmitError::WouldBlock(_)) => return Ok(Dispatch::Deferred),
             Err(BatchSubmitError::Failed(error)) => {
@@ -1935,6 +1943,7 @@ mod placement_tests {
         let slots = media_consumer_slots(
             &[MediaCall::VideoEncoding],
             &routing(),
+            &BTreeMap::new(),
             "model",
             &model_components,
             &peers,
@@ -1968,6 +1977,7 @@ mod placement_tests {
         let slots = media_consumer_slots(
             &[MediaCall::AudioEncoding],
             &routing,
+            &BTreeMap::new(),
             "model",
             &model_components,
             &peers,
@@ -1980,11 +1990,12 @@ mod placement_tests {
     }
 
     #[test]
-    fn a_shared_producer_names_every_possible_replica_reader() {
+    fn a_shared_producer_names_only_the_replica_its_request_was_routed_to() {
         // A text encoder on its own worker feeds latent preparation on two
-        // denoiser replicas. Both replicas serve the consuming component, so
-        // the producer names the reading rank of each; only the replica a
-        // request selects claims its slot.
+        // denoiser replicas. A request routed to flow-1 is read there alone,
+        // so its product names flow-1's reading rank and not flow-0's. A
+        // component with no route yet (a call placed only when it runs) is
+        // read by whichever replica serves it, so each one is named.
         use crate::executor::TransferConfig;
         use crate::worker::instance::media_consumer_slots;
 
@@ -2008,26 +2019,70 @@ mod placement_tests {
         for worker in ["text", "flow-0", "flow-1"] {
             transfer.worker_ranks.insert(worker.to_owned(), 1);
         }
+        let slots = |routed: &BTreeMap<String, WorkerId>| {
+            media_consumer_slots(
+                &[MediaCall::LatentPreparation],
+                &routing,
+                routed,
+                "text",
+                &text,
+                &peers,
+                &transfer,
+                &[0],
+                0,
+                text.get("text_encoder"),
+            )
+        };
 
-        let slots = media_consumer_slots(
-            &[MediaCall::LatentPreparation],
-            &routing,
-            "text",
-            &text,
-            &peers,
-            &transfer,
-            &[0],
-            0,
-            text.get("text_encoder"),
-        );
+        let routed = BTreeMap::from([("denoiser".to_owned(), WorkerId("flow-1".to_owned()))]);
+        assert_eq!(slots(&routed), [transfer.acknowledgment_slot("flow-1", 0)]);
 
         assert_eq!(
-            slots,
+            slots(&BTreeMap::new()),
             [
                 transfer.acknowledgment_slot("flow-0", 0),
                 transfer.acknowledgment_slot("flow-1", 0),
             ]
         );
+    }
+
+    #[test]
+    fn a_decoded_unit_names_only_the_encoder_on_its_route() {
+        // Two hosts each hold a video encoder worker. A request decoded on
+        // host 0's model worker is routed to host 0's encoder, so the unit
+        // names that encoder's reading rank; host 1's encoder rank at the
+        // same position never reads it.
+        use crate::executor::TransferConfig;
+        use crate::worker::instance::media_consumer_slots;
+
+        let model = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1], 1))]);
+        let encoder = || BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 1))]);
+        let peers = BTreeMap::from([
+            ("encoder-0".to_owned(), encoder()),
+            ("encoder-1".to_owned(), encoder()),
+            ("model-0".to_owned(), model.clone()),
+        ]);
+        let mut transfer = TransferConfig::default();
+        for worker in ["encoder-0", "encoder-1", "model-0"] {
+            transfer.worker_ranks.insert(worker.to_owned(), 2);
+        }
+        let routed =
+            BTreeMap::from([("video_encoder".to_owned(), WorkerId("encoder-0".to_owned()))]);
+
+        let slots = media_consumer_slots(
+            &[MediaCall::VideoEncoding],
+            &routing(),
+            &routed,
+            "model-0",
+            &model,
+            &peers,
+            &transfer,
+            &[0, 1],
+            1,
+            model.get("video_decoder"),
+        );
+
+        assert_eq!(slots, [transfer.acknowledgment_slot("encoder-0", 1)]);
     }
 
     fn pairing(

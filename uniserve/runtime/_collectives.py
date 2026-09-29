@@ -4,10 +4,17 @@ Each computation stream owns the communicators that enqueue its collectives,
 so captured graphs replay without host dispatch. The stream's
 :class:`StreamCommunication` also owns every window registered on those
 communicators and the storage behind it; execution contexts borrow them.
+
+Peers address a rank's storage directly only through those windows. Every
+other buffer a collective receives is borrowed, typically caching-allocator
+storage, and NCCL moves it through its own buffers. NCCL would otherwise
+register such a buffer for direct peer access when a collective is captured
+in a CUDA graph; see :func:`_forbid_implicit_registration`.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Hashable, Iterable, Mapping
 from contextlib import contextmanager
 from ctypes import addressof, c_void_p
@@ -24,6 +31,29 @@ from uniserve.runtime.cuda import (
     driver,
 )
 from uniserve.runtime.resources import close_resources
+
+
+def _forbid_implicit_registration() -> None:
+    """Keep NCCL from registering borrowed buffers of captured collectives.
+
+    By default NCCL registers the send and receive buffers of a collective
+    captured in a CUDA graph and maps the physical allocations behind them
+    into its peers, which then write to them directly on every replay, and
+    it reuses a registration for later captures by address. Borrowed buffers
+    are caching-allocator storage: with expandable segments a tensor spans
+    several 20 MiB physical chunks that the allocator maps, unmaps and hands
+    to other tensors, so no registration of it stays valid for the graphs
+    that replay it. Where NCCL can import those chunks (fabric handles across
+    GB200 hosts, POSIX handles on PCIe hosts), captured collectives on such
+    registrations write outside mapped memory. Only ``register_buffers``
+    windows, whose storage the stream owns, are addressed by peers.
+
+    NCCL reads the setting when it first enqueues a captured collective, so
+    setting it before any capture governs the whole process. The setting is
+    process-wide and overrides the environment: no UniServe collective may
+    run with it enabled.
+    """
+    os.environ["NCCL_GRAPH_REGISTER"] = "0"
 
 
 class _CollectiveWork:
@@ -56,6 +86,8 @@ class NcclCommunicator:
     def __init__(self, group, stream: torch.cuda.Stream) -> None:
         import nccl.bindings.nccl as nccl
 
+        # Before this communicator can take part in any captured collective.
+        _forbid_implicit_registration()
         self._nccl = nccl
         self._stream = stream
         # The owned publication stream exists from construction until close.

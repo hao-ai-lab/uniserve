@@ -41,16 +41,15 @@ def test_streamed_modulation_preserves_projection_batch_and_step_outputs(
     final = F.linear(
         inputs.flatten(0, 1).to(dtype), final_weight, final_bias
     ).view(4, 2, 32)
+    # Steps are device indices, so one gather serves any evaluation order.
     for step in (3, 0, 2, 1, 0):
-        for layer in range(3):
-            torch.testing.assert_close(
-                plan(step, layer), expected[step, layer], atol=0, rtol=0
-            )
+        index = torch.tensor([step])
+        torch.testing.assert_close(plan(index), expected[step], atol=0, rtol=0)
         torch.testing.assert_close(
-            plan.output(step), final[step], atol=0, rtol=0
+            plan.output(index), final[step], atol=0, rtol=0
         )
-    with pytest.raises(ValueError, match="step/layer domain"):
-        plan(4, 0)
+    with pytest.raises(ValueError, match="int64 index"):
+        plan(torch.tensor([1], dtype=torch.int32))
 
 
 @pytest.mark.parametrize("count", [1, 3])
@@ -76,10 +75,10 @@ def test_pipeline_layer_products_omit_final_projection():
     )
     for step in range(4):
         torch.testing.assert_close(
-            plan(step, 0),
+            plan(torch.tensor([step]))[0],
             F.linear(inputs.flatten(0, 1), weight).view(4, 2, 12)[step],
             rtol=0,
             atol=0,
         )
     with pytest.raises(ValueError, match="no output projection"):
-        plan.output(0)
+        plan.output(torch.tensor([0]))

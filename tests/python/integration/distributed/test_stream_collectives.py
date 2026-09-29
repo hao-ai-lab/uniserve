@@ -18,6 +18,7 @@ from uniserve.nn import ColumnParallelLinear
 from uniserve.nn.attention import AttentionParallelConfig, Ulysses
 from uniserve.runtime import CUDAGraph, ExecutionContext, partition_streams
 from uniserve.runtime.process_groups import initialize_process_groups
+from uniserve.runtime.stream import CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -258,6 +259,101 @@ def _run_shared_stream(rank: int, rendezvous: str):
 
         with pytest.raises(RuntimeError, match="stream communication"):
             ExecutionContext(module, stream=green).prepare(TextSize(4, 1))
+
+
+class _Exchange(nn.Module):
+    """Exchange rows of caching-allocator storage, as serving borrows it."""
+
+    def __init__(self, mesh):
+        super().__init__()
+        self.group = mesh.get_group("tokens")
+        self.communication_groups = (self.group,)
+        self.register_buffer(
+            "reference", torch.empty(0, device=self.group.device)
+        )
+
+    def forward(self, value):
+        half = value.shape[0] // 2
+        return self.group.all_to_all(
+            value, input_splits=(half, half), output_splits=(half, half)
+        )
+
+
+@torch.inference_mode()
+def _run_captured_exchange(rank: int, rendezvous: str):
+    device = torch.device("cuda", rank)
+    with initialize_process_groups(
+        rank=rank,
+        local_rank=rank,
+        world_size=2,
+        device=device,
+        backend="nccl",
+        init_method=rendezvous,
+    ) as environment:
+        mesh = environment.bind(
+            DeviceMesh(ranks=(0, 1), shape=(2,), axes=("tokens",), rank=rank),
+            device=device,
+        )
+        module = _Exchange(mesh)
+        # A full-device stream: its communicators may use copy engines.
+        stream = CUDAStream.external(torch.cuda.Stream(device=device))
+        try:
+            with ExecutionContext(module, stream=stream) as context:
+                context.prepare(TextSize(1024, 1))
+                value = torch.full(
+                    (1024, 1024), float(rank), device=device
+                ).view(1024, 1024)
+                with context.activate():
+                    module(value)
+                with CUDAGraph(context=context) as graph:
+                    graph.capture(lambda: module(value))
+                    replayed = graph.replay()
+                    stream.stream.synchronize()
+                    # Each rank keeps its own first half and receives the
+                    # peer's first half, in rank order.
+                    expected = torch.cat(
+                        (
+                            torch.full((512, 1024), 0.0, device=device),
+                            torch.full((512, 1024), 1.0, device=device),
+                        )
+                    )
+                    torch.testing.assert_close(
+                        replayed, expected, rtol=0, atol=0
+                    )
+        finally:
+            stream.close()
+
+
+def test_captured_collectives_leave_borrowed_storage_unregistered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Peers never map a rank's borrowed storage for a captured collective.
+
+    Borrowed buffers are caching-allocator storage whose physical backing the
+    allocator remaps, so a captured collective must move them through NCCL's
+    own buffers. NCCL reports every registration of a user buffer, including
+    attempts that a single host's handle type then refuses, in its REG debug
+    subsystem; a captured exchange must report none.
+    """
+    logs = tmp_path / "nccl"
+    logs.mkdir()
+    # The children read these when NCCL initializes in them.
+    monkeypatch.setenv("NCCL_DEBUG", "INFO")
+    monkeypatch.setenv("NCCL_DEBUG_SUBSYS", "REG")
+    monkeypatch.setenv("NCCL_DEBUG_FILE", str(logs / "nccl.%p.log"))
+    mp.spawn(
+        _run_captured_exchange,
+        ((tmp_path / "exchange").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
+    registrations = [
+        line
+        for path in logs.iterdir()
+        for line in path.read_text().splitlines()
+        if "register" in line.lower()
+    ]
+    assert not registrations, registrations[:4]
 
 
 def test_contexts_share_the_communicators_their_stream_retires(
