@@ -18,7 +18,7 @@ use uniserve_core::{
 };
 use uniserve_engine::{
     BatchEvent, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch, Scheduler,
-    SimEngine, SimExecutor, SpecialTokenIds,
+    SimEngine, SimExecutor, SpecialTokenIds, WorkerId,
 };
 use uniserve_worker_ipc::{
     CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, ShapeBound,
@@ -224,6 +224,9 @@ impl Submission {
 struct Served {
     /// Media submissions in the order the executor accepted them.
     submissions: Vec<Submission>,
+    /// Each submitted media call with the worker its placement names for
+    /// every component reading its products, in submission order.
+    readers: Vec<(RequestId, MediaCall, BTreeMap<String, WorkerId>)>,
     /// Every event each request's stream delivered.
     outcomes: HashMap<RequestId, Vec<EngineCoreOutput>>,
 }
@@ -339,6 +342,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
 
     Served {
         submissions: Vec::new(),
+        readers: Vec::new(),
         outcomes: HashMap::from([(RequestId(90), events)]),
     }
     .assert_completed(RequestId(90));
@@ -428,9 +432,20 @@ fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option
     // media calls are left out of the record.
     let mut in_flight: Vec<(u64, Vec<ObservedCall>)> = Vec::new();
     let mut submissions = Vec::new();
+    let mut readers = Vec::new();
     for event in boundary.iter() {
         match event {
             BatchEvent::Submitted(batch) => {
+                readers.extend(batch.requests.iter().filter_map(|(call, placement)| {
+                    let CallKind::Media(media_call) = call.code else {
+                        return None;
+                    };
+                    Some((
+                        call.request_key.request_id,
+                        media_call,
+                        placement.readers.clone(),
+                    ))
+                }));
                 let calls = media_calls(&batch);
                 if calls.is_empty() {
                     continue;
@@ -450,7 +465,41 @@ fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option
 
     Served {
         submissions,
+        readers,
         outcomes,
+    }
+}
+
+/// Admission routes every component of a video request, so each call names
+/// the worker the request was routed to for every component that reads its
+/// products, and nothing for a call whose products no component reads.
+#[test]
+fn each_media_call_names_the_workers_routed_to_read_its_products() {
+    let request = RequestId(7);
+    let served = serve(video_worker(2, 2), vec![video_request(7, 4)]);
+    served.assert_completed(request);
+
+    let routed = |components: &[&str]| {
+        components
+            .iter()
+            .map(|component| ((*component).to_owned(), WorkerId("sim".to_owned())))
+            .collect::<BTreeMap<_, _>>()
+    };
+    // The video graph: text conditioning feeds latent preparation on the
+    // denoiser, whose latents feed the next step and both decoders; decoded
+    // video units feed the video encoder, decoded audio and encoded video
+    // feed the muxer, and the muxer's products leave the graph.
+    let expected = |call: MediaCall| match call {
+        MediaCall::TextEncoding | MediaCall::LatentPreparation => routed(&["denoiser"]),
+        MediaCall::Denoising => routed(&["denoiser", "video_decoder", "audio_decoder"]),
+        MediaCall::VideoDecoding => routed(&["video_encoder"]),
+        MediaCall::VideoEncoding | MediaCall::AudioDecoding => routed(&["muxer"]),
+        _ => BTreeMap::new(),
+    };
+    assert!(!served.readers.is_empty());
+    for (owner, call, readers) in &served.readers {
+        assert_eq!(*owner, request);
+        assert_eq!(*readers, expected(*call), "readers of {call:?}");
     }
 }
 

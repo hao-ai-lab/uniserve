@@ -21,7 +21,7 @@
 //! waits for its ranks' endpoint reports and startup capabilities.
 
 use crate::executor::{CallResult, WorkerResult};
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -253,6 +253,11 @@ pub struct WorkerGroup {
 /// A call's identity across request epochs: engine identifier, request
 /// identifier, request epoch, and call identifier, in that order.
 type CallIdentity = (u64, u64, u64, uniserve_worker_ipc::CallId);
+
+/// The worker routed to each component reading a call's products, keyed by
+/// the call's request and call identifiers (`RequestPlacement::readers`).
+pub type CallReaders =
+    HashMap<(RequestKey, uniserve_worker_ipc::CallId), BTreeMap<String, crate::WorkerId>>;
 
 /// A physical batch and its participating ranks share one retirement lifetime.
 struct PendingBatch {
@@ -1075,11 +1080,20 @@ impl WorkerGroup {
 ///
 /// The consuming component may belong to another worker, whose ranks all
 /// read the product; on the producing worker the ranks producing their own
-/// copy read that copy instead of another rank's.
+/// copy read that copy instead of another rank's. `routed` names the worker
+/// the request was routed to for a consuming component; only that replica
+/// reads the product. A component absent from `routed` is read by whichever
+/// replica serves it when its call is placed, so every worker holding it is
+/// named.
+///
+/// Naming a replica the request was not routed to is not only wasted: a
+/// producer publishes over every mechanism that reaches a named reader, so a
+/// replica on another host would make each product cross hosts unread.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn media_consumer_slots(
     consuming: &[uniserve_worker_ipc::MediaCall],
     routing: &BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    routed: &BTreeMap<String, crate::WorkerId>,
     worker: &str,
     components: &BTreeMap<String, crate::ComponentConfig>,
     peers: &BTreeMap<String, BTreeMap<String, crate::ComponentConfig>>,
@@ -1102,11 +1116,13 @@ pub(crate) fn media_consumer_slots(
         {
             owners.push((worker, config));
         }
+        if let Some(reader) = routed.get(name) {
+            owners.retain(|(id, _)| *id == reader.0);
+        }
         for (owner, component) in owners {
             // A round deals its media units to each distributed component's
             // ranks in order, `units_per_rank` each, so a distributed consumer
-            // reads only the positions this producer rank wrote. Naming every
-            // replica is safe: only the selected consumer claims its slot.
+            // reads only the positions this producer rank wrote.
             let dealt = producer
                 .filter(|producer| {
                     producer.distribution.is_some() && component.distribution.is_some()
@@ -1144,11 +1160,14 @@ impl WorkerGroup {
     ///
     /// A video call's readers are the ranks of the components serving the
     /// calls that consume it, less the ranks that produce their own copy: a
-    /// consumer reads the copy it holds before any other. Work outside the
-    /// video graph is read by the destinations of the rank's transfer edges.
+    /// consumer reads the copy it holds before any other. `routed` names the
+    /// worker each consuming component was routed to for the call's request.
+    /// Work outside the video graph is read by the destinations of the rank's
+    /// transfer edges.
     fn consumer_slots(
         &self,
         call: &uniserve_worker_ipc::Call,
+        routed: Option<&BTreeMap<String, crate::WorkerId>>,
         members: &[usize],
         rank: usize,
     ) -> Vec<u32> {
@@ -1166,6 +1185,7 @@ impl WorkerGroup {
         media_consumer_slots(
             consuming,
             &self.media_routing,
+            routed.unwrap_or(&BTreeMap::new()),
             worker,
             &self.process_args.components,
             &self.process_args.peers,
@@ -1692,7 +1712,15 @@ impl WorkerGroup {
     /// binding carries the first refusing rank's `UnroutableInputs`. A rank
     /// submission that fails after the batch is recorded replaces the rank
     /// group and returns `Failed` with the recovery's `WorkerFailure`.
-    pub fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
+    ///
+    /// `readers` names, for the batch's routed media calls, the worker each
+    /// consuming component was routed to; each call's products then name
+    /// only those workers' reading ranks (see `media_consumer_slots`).
+    pub fn submit_batch(
+        &mut self,
+        batch: Batch,
+        readers: &CallReaders,
+    ) -> Result<(), BatchSubmitError> {
         if self.closed {
             return Err(BatchSubmitError::Failed(anyhow::anyhow!(
                 "WorkerGroup is closed"
@@ -1717,7 +1745,10 @@ impl WorkerGroup {
             &batch,
             &self.process_args.components,
             self.workers.len(),
-            |call, members, rank| self.consumer_slots(call, members, rank),
+            |call, members, rank| {
+                let routed = readers.get(&(call.request_key, call.call_id));
+                self.consumer_slots(call, routed, members, rank)
+            },
         )
         .and_then(|batches| {
             batches
