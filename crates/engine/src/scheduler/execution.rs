@@ -1145,6 +1145,23 @@ impl Scheduler {
             None => None,
         };
 
+        // Admission routed every component of the request, so the replicas
+        // reading this call's products are known here: the producer names
+        // their ranks alone, not every replica that could serve the
+        // component in some other request.
+        let readers = consuming_calls(media_call)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|consumer| {
+                let component = self.info.media_components.get(consumer)?;
+                let routed = self
+                    .placement
+                    .affinity
+                    .get(&(request_key, component.clone()))?;
+                Some((component.clone(), routed.clone()))
+            })
+            .collect();
+
         let placement = RequestPlacement {
             worker,
             request_pool_idx: Some(request_pool_idx),
@@ -1154,6 +1171,7 @@ impl Scheduler {
             latent,
             decode,
             buffers,
+            readers,
         };
         self.register_inflight(
             call.clone(),
