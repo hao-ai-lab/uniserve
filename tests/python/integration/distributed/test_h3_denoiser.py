@@ -244,7 +244,7 @@ def _run(rank, rendezvous, directory, source):
                         for name, value in state.items()
                     },
                     sizes=(layout,),
-                    step_index=1,
+                    step=schedules["video"].step(1),
                     text_features=(features,),
                 )
                 initial = {name: value.clone() for name, value in state.items()}
@@ -566,8 +566,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                     # Startup captures the first request's ladder; the second
                     # request, with its own schedules, replays it.
                     if seed == 31:
-                        for index in range(4):
-                            runner.capture(ladder, index)
+                        runner.capture(ladder)
                     bank = 1
                     for index in range(4):
                         state = _committed(factory, latents, size, 1, bank)
@@ -741,8 +740,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                     factory, runner, placeholder, views, schedules, 1
                 )
                 runner.warmup(ladder)
-                for index in range(4):
-                    runner.capture(ladder, index)
+                runner.capture(ladder)
 
                 actual, paths = denoise(runner, pool, context)
                 assert paths == ["graph_replay"] * 8
@@ -899,8 +897,7 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                     padded, runner, placeholder, views, schedules, 1
                 )
                 runner.warmup(ladder)
-                for index in range(padded.num_steps):
-                    runner.capture(ladder, index)
+                runner.capture(ladder)
                 actual, paths = denoise(padded, runner, pool)
                 assert set(paths) == {"graph_replay"}
             finally:
@@ -1041,7 +1038,7 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
                             for modality, value in state.items()
                         },
                         (layout,),
-                        0,
+                        schedules["video"].step(0),
                         (conditioning,),
                     ),
                     state=request,

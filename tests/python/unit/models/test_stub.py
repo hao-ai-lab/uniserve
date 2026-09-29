@@ -101,7 +101,7 @@ def test_zero_velocity_preserves_each_raster_through_solver_and_decoder():
                 )
             },
             sizes,
-            index,
+            schedule.step(index),
             batch,
         )
         predictions = model.denoiser(

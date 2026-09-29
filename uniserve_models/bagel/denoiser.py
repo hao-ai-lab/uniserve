@@ -86,7 +86,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         *,
         latents,
         sizes,
-        step_index,
+        step,
         positions,
         sequence_lengths,
         attention,
@@ -95,7 +95,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         return DenoiserInput(
             latents=latents,
             sizes=sizes,
-            step_index=step_index,
+            step=step,
             positions=positions,
             sequence_lengths=sequence_lengths,
             attention=attention,

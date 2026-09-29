@@ -48,7 +48,7 @@ pub use crate::scheduler::{
 #[cfg(feature = "testing")]
 pub use crate::sim::{BatchEvent, SimEngine, SimExecutor};
 pub use crate::worker::{
-    BatchSubmitError, FlashInferBackend, FlashInferBackendParseError, LaneConfig, WorkerExecutor,
-    WorkerGroup, WorkerProcessArgs,
+    BatchSubmitError, CallReaders, FlashInferBackend, FlashInferBackendParseError, LaneConfig,
+    WorkerExecutor, WorkerGroup, WorkerProcessArgs,
 };
 pub use uniserve_worker_ipc::{AttentionBackend, DEFAULT_COMPONENT};

@@ -281,14 +281,16 @@ class Transformer(nn.Module):
         hidden: torch.Tensor,
         inputs: AttentionInput,
         *,
-        step_index: int,
+        step: torch.Tensor,
         tables: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
     ) -> tuple[torch.Tensor, ...]:
         """Evaluate the layers over one token shard.
 
-        ``tables`` holds the per-row modulation indices and the rotary
-        ``cos``/``sin`` of every packed row.
+        ``step`` is the solver step's [1] int64 device index; the step's
+        modulation products are gathered through it, so one captured
+        evaluation serves every step. ``tables`` holds the per-row modulation
+        indices and the rotary ``cos``/``sin`` of every packed row.
 
         A stage after the first receives its input into ``hidden`` from the
         preceding stage. A stage before the last sends its output onward and
@@ -306,6 +308,8 @@ class Transformer(nn.Module):
             "sin": tables["sin"],
         }
         chunks = ((inputs.token_slice, hidden),)
+        # [resident layer, timestep, 18 * hidden] products of this step.
+        modulation = self.modulation(step)
         for index, layer in enumerate(self.layers.values()):
             layer = cast(TransformerLayer, layer)
             # Adjacent layers alternate between the two attention scratch sets
@@ -323,7 +327,7 @@ class Transformer(nn.Module):
             }
             chunks = layer.forward_chunks(
                 chunks,
-                self.modulation(step_index, index),
+                modulation[index],
                 inputs,
                 workspace=layer_buffers,
             )
@@ -335,7 +339,7 @@ class Transformer(nn.Module):
             return ()
 
         # The final pipeline stage projects each modality with its own head.
-        modulation = self.modulation.output(step_index)
+        modulation = self.modulation.output(step)
         results = []
         for index, (indices, projection) in enumerate(
             (

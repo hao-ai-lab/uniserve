@@ -49,33 +49,35 @@ def _bind(denoiser):
     length = rows + denoiser.framing_tokens
     lengths = SequenceLengths.from_lengths((length,), device="cpu")
 
+    step = torch.zeros(1, dtype=torch.int64)
     bound = denoiser.bind_inputs(
         latents={"image": (LatentInput(sample, torch.zeros(())),)},
         sizes=(size,),
-        step_index=0,
+        step=step,
         positions=(torch.zeros((3, length), dtype=torch.int64),),
         sequence_lengths=(length,),
         attention=VarlenInput(lengths, lengths, (False,)),
     )
-    return bound, sample, size
+    return bound, sample, size, step
 
 
 @pytest.mark.parametrize(
     "build", [_sensenova_denoiser, _stub_denoiser], ids=["sensenova_u1", "stub"]
 )
 def test_image_denoisers_bind_borrowed_latents(build, tmp_path):
-    bound, sample, size = _bind(build(tmp_path))
+    bound, sample, size, step = _bind(build(tmp_path))
 
-    # Solver updates write the resident latent in place, so the bound input
-    # must borrow it rather than hold a copy.
+    # Solver updates write the resident latent in place, and a captured step
+    # reads the step index as device data, so the bound input must borrow
+    # both rather than hold copies.
     assert bound.latents["image"][0].tensor is sample
     assert bound.sizes == (size,)
-    assert bound.step_index == 0
+    assert bound.step is step
 
 
 def test_bound_input_drives_one_prediction_per_latent(tmp_path):
     denoiser = _stub_denoiser(tmp_path)
-    bound, sample, _ = _bind(denoiser)
+    bound, sample, _, _ = _bind(denoiser)
 
     prediction = denoiser(bound, state={}, constants={}, workspace={})
 

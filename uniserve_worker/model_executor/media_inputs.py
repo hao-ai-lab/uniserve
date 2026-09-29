@@ -406,6 +406,9 @@ class MediaBuilder:
         if not 0 <= index < self.num_steps:
             raise ValueError("denoising index is outside the fixed schedule")
 
+        # Every modality's schedule enumerates the same evaluations; the
+        # first names the step as device data (``Schedule.step``).
+        names = self.denoiser.modalities
         return self.denoiser.bind_inputs(
             latents={
                 name: (
@@ -413,9 +416,9 @@ class MediaBuilder:
                         samples[name], schedules[name].timesteps[index]
                     ),
                 )
-                for name in self.denoiser.modalities
+                for name in names
             },
             sizes=(self.layout(size),),
-            step_index=index,
+            step=schedules[names[0]].step(index),
             text_features=(tensors["text_condition"],),
         )
