@@ -48,13 +48,10 @@ use uniserve_server::{
     },
 };
 
-// The fixed FastH3 request and output contract. The size duplicates the
-// MiniMax H3 values the server reports from
-// `InputProcessor::video_capabilities`; `build_state` checks the step count
-// against the started engine.
+// The fixed FastH3 request and output dimensions mirror the capabilities
+// reported by MiniMax H3. The loaded checkpoint determines the step count.
 const H3_WIDTH: u32 = 1344;
 const H3_HEIGHT: u32 = 768;
-const H3_DENOISE_STEPS: i32 = 4;
 const H3_AUDIO_SAMPLE_RATE: i32 = 32_000;
 
 #[derive(Clone, Parser)]
@@ -201,9 +198,8 @@ impl DynamoFastH3Engine {
     /// Fails with an invalid argument when the checkpoint's pipeline index
     /// cannot be resolved or does not name MiniMax H3, when the configuration
     /// does not validate, or when the started model reports no video
-    /// capabilities or a denoising step count other than `H3_DENOISE_STEPS`;
-    /// it fails with an engine error when UniServe cannot start. The two
-    /// refusals after startup shut the engine down before returning.
+    /// capabilities. It fails with an engine error when UniServe cannot
+    /// start. A refusal after startup shuts the engine down before returning.
     async fn build_state(&self) -> Result<Arc<AppState>, DynamoError> {
         // A MiniMax H3 checkpoint names its pipeline class in a root index in
         // place of config.json; refuse anything else before a rank starts.
@@ -260,22 +256,11 @@ impl DynamoFastH3Engine {
             .await
             .map_err(|error| engine_error(format!("failed to start UniServe: {error:#}")))?;
 
-        // The server identifies the model from its checkpoint. This worker's
-        // request contract is four-step MiniMax H3, so a different family or
-        // step count is refused after its ranks stop.
-        let refusal = if state.runtime().model().video_capabilities().is_null() {
-            Some("checkpoint is not MiniMax H3".to_string())
-        } else if state.engine().denoise_steps() != H3_DENOISE_STEPS as u32 {
-            Some(format!(
-                "checkpoint runs {} denoising steps; this worker requires {H3_DENOISE_STEPS}",
-                state.engine().denoise_steps()
-            ))
-        } else {
-            None
-        };
-        if let Some(message) = refusal {
+        // Use the same checkpoint-derived schedule as the HTTP serving path.
+        // A request may confirm that schedule, but cannot override it.
+        if state.runtime().model().video_capabilities().is_null() {
             let _ = state.engine().shutdown().await;
-            return Err(invalid_argument(message));
+            return Err(invalid_argument("checkpoint is not MiniMax H3"));
         }
         Ok(state)
     }
@@ -316,6 +301,7 @@ impl RawEngine for DynamoFastH3Engine {
             request,
             &self.args.served_model_name,
             self.args.max_video_seconds,
+            state.engine().denoise_steps(),
         )?;
         // The Dynamo context id is the UniServe request id, so `abort` can name
         // the same request from its own context.
@@ -524,6 +510,7 @@ fn prepare_request(
     value: Value,
     served_model_name: &str,
     max_video_seconds: f64,
+    denoise_steps: u32,
 ) -> Result<PreparedRequest, DynamoError> {
     let request: DynamoVideoRequest = serde_json::from_value(value)
         .map_err(|error| invalid_argument(format!("invalid video request: {error}")))?;
@@ -586,10 +573,10 @@ fn prepare_request(
     }
     if nvext
         .num_inference_steps
-        .is_some_and(|steps| steps != H3_DENOISE_STEPS)
+        .is_some_and(|steps| i64::from(steps) != i64::from(denoise_steps))
     {
         return Err(invalid_argument(format!(
-            "nvext.num_inference_steps must be {H3_DENOISE_STEPS}"
+            "nvext.num_inference_steps must be {denoise_steps}"
         )));
     }
     // Dynamo's seed is signed and UniServe's unsigned.
@@ -710,7 +697,7 @@ mod tests {
 
     #[test]
     fn request_maps_to_uniserve_contract() {
-        let prepared = match prepare_request(request(), "FastH3", 15.0) {
+        let prepared = match prepare_request(request(), "FastH3", 15.0, 4) {
             Ok(prepared) => prepared,
             Err(error) => panic!("supported request was rejected: {error}"),
         };
@@ -725,7 +712,7 @@ mod tests {
     fn an_omitted_duration_defaults_as_the_http_route_does() {
         for (max_video_seconds, expected) in [(15.0, 5.0), (4.5, 4.5)] {
             let request = json!({"model": "FastH3", "prompt": "A stream in a forest"});
-            let prepared = match prepare_request(request, "FastH3", max_video_seconds) {
+            let prepared = match prepare_request(request, "FastH3", max_video_seconds, 8) {
                 Ok(prepared) => prepared,
                 Err(error) => panic!("max {max_video_seconds}s refused the default: {error}"),
             };
@@ -747,7 +734,22 @@ mod tests {
             json!({"model":"FastH3", "prompt":"x", "seconds":16}),
             json!({"model":"FastH3", "prompt":"x", "extra_args":{"media_passthrough":{"foo":1}}}),
         ] {
-            assert!(prepare_request(request, "FastH3", 15.0).is_err());
+            assert!(prepare_request(request, "FastH3", 15.0, 8).is_err());
+        }
+    }
+
+    /// Explicit steps confirm the loaded schedule; they never change it.
+    #[test]
+    fn inference_steps_must_match_the_checkpoint() {
+        for checkpoint_steps in [4, 8] {
+            for requested_steps in [4, 8, 0, -1] {
+                let mut value = request();
+                value["nvext"]["num_inference_steps"] = json!(requested_steps);
+                assert_eq!(
+                    prepare_request(value, "FastH3", 15.0, checkpoint_steps).is_ok(),
+                    i64::from(requested_steps) == i64::from(checkpoint_steps),
+                );
+            }
         }
     }
 
