@@ -72,7 +72,7 @@ def test_denoising_runner_advances_prepared_samples() -> None:
                 DenoiserInput(
                     {"image": (LatentInput(state["image"], timestep),)},
                     (size,),
-                    step,
+                    schedules["image"].step(step),
                 ),
                 schedules,
                 state=state,

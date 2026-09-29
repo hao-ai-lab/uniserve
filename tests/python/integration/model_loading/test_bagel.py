@@ -73,7 +73,7 @@ def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
         timesteps=(timestep,),
         positions=(factory.positions(size, 9, device="cpu"),),
         attention=VarlenInput(lengths, lengths, (False,)),
-        step_index=0,
+        step=torch.zeros(1, dtype=torch.int64),
     )
     before = sample.clone()
     # GLIDE time features and the checkpoint's zero-update flow residual give

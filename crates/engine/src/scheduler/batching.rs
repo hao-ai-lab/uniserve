@@ -1054,6 +1054,7 @@ impl Scheduler {
                 latent,
                 decode: None,
                 buffers: call_buffers,
+                readers: Default::default(),
             },
         ));
         // The resolved token product serves only the first call after its

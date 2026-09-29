@@ -224,13 +224,16 @@ def test_public_image_step_uses_borrowed_sample_and_input_time():
     torch.testing.assert_close(
         sample, torch.full_like(sample, 2), rtol=0, atol=0
     )
+    schedules = network.make_schedules(1, shift=None, device="cpu")
     inputs = DenoiserInput(
-        {"image": (LatentInput(sample[0], torch.tensor(0.5)),)}, (size,), 0
+        {"image": (LatentInput(sample[0], torch.tensor(0.5)),)},
+        (size,),
+        schedules["image"].step(0),
     )
     step = DenoisingStep(
         network,
         inputs,
-        network.make_schedules(1, shift=None, device="cpu"),
+        schedules,
         {"image": sample},
         {},
         {},

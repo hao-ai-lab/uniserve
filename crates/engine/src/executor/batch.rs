@@ -8,6 +8,7 @@
 //! wire `Batch`.
 
 use super::WorkerId;
+use std::collections::BTreeMap;
 use uniserve_worker_ipc::{
     Batch, BatchCommand, BlockTable, BufferAllocation, CachePageAllocation, Call, DecodeRange,
     ForwardBatch, LatentParams, NewRequest, RequestKey, TensorPublication,
@@ -37,6 +38,12 @@ pub struct RequestPlacement {
     /// Worker-local persistent spans for the call's buffer inputs and outputs.
     /// Request retirement retains every physical reader and writer allocation.
     pub buffers: Vec<BufferAllocation>,
+    /// Worker routed to each component that reads a media call's products,
+    /// keyed by component name. Admission fixes a media request's route, so
+    /// a product is published only toward the replicas that read it. Empty
+    /// for calls outside the video graph, whose readers are the destinations
+    /// of their transfer edges.
+    pub readers: BTreeMap<String, WorkerId>,
 }
 
 /// One logical executor submission. Its rank projections are derived only inside an executor.

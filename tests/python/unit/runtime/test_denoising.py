@@ -36,7 +36,7 @@ def test_named_denoising_updates_each_sequence_with_its_modality_schedule(
                 for name, rows in samples.items()
             },
             (Size(2),) * 2,
-            step,
+            schedules["video"].step(step),
         )
         output = DenoisingStep(model, batch, schedules, {}, constants, {})()
         for name, rows in reference.items():
