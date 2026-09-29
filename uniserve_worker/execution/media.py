@@ -378,16 +378,21 @@ def prepare_denoising(
         # layout's persistent plans and scratch from the runner's pool, and
         # the captured steps of every layout share that pool's free blocks
         # as their intermediates; a persistent allocation made after a
-        # capture could land in a block an earlier graph rewrites.
+        # capture could land in a block an earlier graph rewrites. Each
+        # layout's warm step and captures also leave storage outside the
+        # pool (loaded modules, graph executables), so the budget is checked
+        # per layout: an overrun is refused at the layout that causes it,
+        # before the device itself runs out.
         for layout in layouts:
             diffusion.warmup(ladder(layout, staged=True))
+            runner.graph_storage.check()
         warmed = time.perf_counter()
         if diffusion.captures:
             # One graph per layout evaluates every solver step.
             for layout in layouts:
                 diffusion.capture(ladder(layout, staged=False))
-        runner.graph_storage.check()
-        resident = sum(runner.graph_storage.resident_bytes().values())
+                runner.graph_storage.check()
+        resident = sum(runner.graph_storage.pool_bytes().values())
         finished = time.perf_counter()
         logger.info(
             "prepared %d denoiser layouts (%d frame counts x %d text "
@@ -442,54 +447,67 @@ def warmup_decoders(runner: ModelExecutor) -> None:
     duration warms every unit this rank decodes at that duration. Every
     duration's context is prepared before the first capture into the
     decoder's shared graph pool (``ModelExecutor.prepare_module``).
+
+    Raises:
+        RuntimeError: The decoders' prepared contexts and graphs do not fit
+            the device, with the settings that bound them.
     """
     builder = runner.media_builder
     frames = tuple(reversed(builder.frame_counts))
-    for (name, _, method), (binding, call) in runner._module_calls.items():
-        if method != "decode":
-            continue
-        module = call.module
-        for num_frames in frames:
-            if isinstance(module, VideoDecoder):
-                runner.prepare_module(name, num_frames, method="decode")
-            elif isinstance(module, AudioDecoder):
-                runner.prepare_module(
-                    name,
-                    module.latent_frames(audio_samples(runner, num_frames)),
-                    method="decode",
-                )
-        for num_frames in frames:
-            size = builder.size(num_frames, builder.maximum.num_text_tokens)
-            if isinstance(module, VideoDecoder):
-                shape = builder.denoiser.latent_shape("video", size)
-                latent = torch.zeros(
-                    shape, dtype=torch.float32, device=binding.device
-                )
-                windows = module.frame_slices(num_frames)
-                for unit in decoded_units(runner, name, len(windows)):
-                    runner.run_module(
+    try:
+        for (name, _, method), (binding, call) in runner._module_calls.items():
+            if method != "decode":
+                continue
+            module = call.module
+            for num_frames in frames:
+                if isinstance(module, VideoDecoder):
+                    runner.prepare_module(name, num_frames, method="decode")
+                elif isinstance(module, AudioDecoder):
+                    runner.prepare_module(
                         name,
-                        (latent,),
+                        module.latent_frames(audio_samples(runner, num_frames)),
                         method="decode",
-                        size=num_frames,
-                        frames=(windows[unit],),
-                        num_frames=(num_frames,),
                     )
-            elif isinstance(module, AudioDecoder):
-                shape = builder.denoiser.latent_shape("audio", size)
-                latent = torch.zeros(
-                    shape, dtype=torch.float32, device=binding.device
-                )
-                # The engine hands a request's audio units to the decoder in
-                # one round, which serving decodes through the same call.
-                decode_audio(
-                    runner,
-                    name,
-                    latent,
-                    audio_samples(runner, num_frames),
-                    cursor=0,
-                    count=audio_unit_count(runner, name),
-                )
+            for num_frames in frames:
+                size = builder.size(num_frames, builder.maximum.num_text_tokens)
+                if isinstance(module, VideoDecoder):
+                    shape = builder.denoiser.latent_shape("video", size)
+                    latent = torch.zeros(
+                        shape, dtype=torch.float32, device=binding.device
+                    )
+                    windows = module.frame_slices(num_frames)
+                    for unit in decoded_units(runner, name, len(windows)):
+                        runner.run_module(
+                            name,
+                            (latent,),
+                            method="decode",
+                            size=num_frames,
+                            frames=(windows[unit],),
+                            num_frames=(num_frames,),
+                        )
+                elif isinstance(module, AudioDecoder):
+                    shape = builder.denoiser.latent_shape("audio", size)
+                    latent = torch.zeros(
+                        shape, dtype=torch.float32, device=binding.device
+                    )
+                    # The engine hands a request's audio units to the decoder
+                    # in one round, which serving decodes through the same
+                    # call.
+                    decode_audio(
+                        runner,
+                        name,
+                        latent,
+                        audio_samples(runner, num_frames),
+                        cursor=0,
+                        count=audio_unit_count(runner, name),
+                    )
+    except (CUDAGraphError, torch.OutOfMemoryError) as error:
+        raise RuntimeError(
+            f"the decoders at {len(frames)} admitted durations do not fit "
+            "this device: lower --max-video-seconds, raise "
+            "--mem-fraction-static, or serve with --graph-policy off "
+            f"({error})"
+        ) from error
 
 
 @torch.inference_mode()
