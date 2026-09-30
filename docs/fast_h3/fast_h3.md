@@ -4,7 +4,7 @@ UniServe serves the FastH3 text-to-video-and-audio checkpoints. The output is an
 
 ## Requirements
 
-- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA SM100 GPUs such as B200 or GB200. GB200 has end-to-end validation; other hardware requires its own validation before performance claims.
+- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. H200, GB200, and RTX PRO 6000 Blackwell Server Edition have end-to-end validation.
 - One of the complete FastH3 VSA checkpoints listed below. Base partitions and adapter-only checkpoints are unsupported.
 - Enough GPU storage for weights, two resident requests, and CUDA graphs. Four local GPUs are the standard setup.
 - Shared storage and pinned-storage access for worker IPC. The container command below provisions 4 GiB of shared storage and unlimited locked storage.
@@ -40,7 +40,7 @@ The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashIn
 | [`skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | ModelOpt NVFP4 | 4 | 0.9 | 123 GB |
 | [`skx618/FastVideo-FastH3-8-Step-V2-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-8-Step-V2-NVFP4) | ModelOpt NVFP4 | 8 | 0.8 | 123 GB |
 
-The two `skx618` repositories are ModelOpt PTQ checkpoints in ModelOpt's unified Hugging Face layout, which UniServe loads with no precision flags: see [Precision and graphs](#precision-and-graphs).
+The two `skx618` repositories are ModelOpt PTQ checkpoints in ModelOpt's unified Hugging Face layout, which UniServe loads with no precision flags and which require Blackwell; the BF16 checkpoints run on Hopper and Blackwell. See [Precision and graphs](#precision-and-graphs).
 
 Each checkpoint's `fastvideo_inference.json` supplies its sampling schedule: the trained DMD rungs in `dmd_denoising_steps`, one transformer forward per rung, and the VSA sparsity. The video and audio shifts come from `scheduler/` and `audio_scheduler/`, and a manifest that restates them must agree. The loader refuses a manifest that is not a `fasth3-inference-contract-v1` text-to-video-and-audio contract without guidance. The table lists the checkpoints UniServe has validated end to end.
 
@@ -49,9 +49,9 @@ Each checkpoint's `fastvideo_inference.json` supplies its sampling schedule: the
 ## Download the model
 
 ```bash
-export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4
+export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 
-hf download skx618/FastVideo-FastH3-8-Step-V2-NVFP4 --local-dir "$H3_MODEL"
+hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 ```
 
 Pass the model root containing `modular_model_index.json`, `fastvideo_inference.json`, `transformer/`, `text_encoder/`, `vae/`, `audio_vae/`, `scheduler/`, `audio_scheduler/`, and `tokenizer/`. In an NVFP4 root in ModelOpt's unified layout, `transformer/config.json` and `vae/config.json` also declare a `quantization_config` with `quant_method: modelopt`. The server identifies the model from the pipeline class that `modular_model_index.json` declares and reads the tokenizer from the component folder the index names; the loader then validates the inference contract in `fastvideo_inference.json`.
@@ -89,11 +89,13 @@ One launcher serves every worker of the deployment that places a rank on its hos
 
 `configs/minimax-h3-eight-devices-single-node.json` places the same components on eight devices of one host, so it needs no launcher and starts exactly like the four-device file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with eight encoder ranks, one per media unit of a round, and a muxer rank.
 
+`configs/minimax-h3-eight-devices-gather.json` uses the same single-host placement with eight-way all-gather sequence parallelism in place of Ulysses: each rank attends its own query rows to the complete gathered keys and values, and every rank holds the complete denoiser weights.
+
 ## Data parallel serving
 
 The single-node DP8 deployment uses eight independent one-GPU flow workers instead of one eight-rank Ulysses worker. Each flow worker owns a complete denoiser, video decoder, and audio decoder, so eight requests can denoise and decode concurrently without a collective between GPUs. The scheduler selects one flow replica when it admits a request, keeps that request on the same replica through latent preparation, denoising, and device decoding, and accounts its request rows, product buffers, queue, and execution lane in that worker's address space. Replica capacities add; a shared component remains an independently bounded stage of the route.
 
-The NVFP4 checkpoints are the intended DP8 weights. Dense BF16 denoiser replication is not expected to fit on 96 GB devices. Start with the shared-TP8 conditioning layout:
+The NVFP4 checkpoints are the intended DP8 weights on 96 GB devices, where dense BF16 denoiser replication is not expected to fit. On H200 the dense checkpoint also serves the five-second, 1000-token DP8 workload; see [H200 measurements](#h200-measurements). Start with the shared-TP8 conditioning layout:
 
 ```bash
 uniserve serve "$H3_MODEL" \
@@ -139,7 +141,7 @@ Resolve the commands and paths before starting the serial artifact-producing run
 
 The `fast_h3_pareto_ulysses4`, `fast_h3_pareto_dp4`, `fast_h3_pareto_ulysses8`, and `fast_h3_pareto_dp8` suites sweep concurrency 1/2/4 and, for eight GPUs, 8. They use two excluded warmups and 16 measured five-second/1000-token requests per point. Run the points serially against their matching placement; the suite fixes request data and metrics, while the deployment command fixes whether the point is Ulysses or data parallel.
 
-The eight-device Ulysses file also does not shard denoiser weights, so every rank holds the whole denoiser, and a rank's residency can exceed the default `--mem-fraction-static` on a 96 GB device at the default `--max-video-seconds 15` and `--max-model-len 16384`. Raise the fraction, or shard the denoiser with `"tensor_parallel_size"`, if that deployment refuses to start with a static storage grant error. For DP8, adjust the text and flow workers' explicit `memory_fraction` values together instead of raising the global default.
+Ulysses shards the merged query, key, value and gate weights by attention head while retaining the other denoiser weights on every rank. A rank's residency can exceed the default `--mem-fraction-static` on a 96 GB device at the default `--max-video-seconds 15` and `--max-model-len 16384`. Raise the fraction, or shard the denoiser further with `"tensor_parallel_size"`, if that deployment refuses to start with a static storage grant error. For DP8, adjust the text and flow workers' explicit `memory_fraction` values together instead of raising the global default.
 
 Cross-rank products move over the mechanism named for that edge. CUDA VMM reads inspect the visible CUDA peer topology: a consumer with direct access maps the allocation on its destination GPU, while a consumer outside the producer's peer set maps it on the source GPU and uses CUDA's host-staged cross-device copy. The choice depends on the runtime topology rather than the accelerator model. `--transfer model->model=shm` remains available when an operator wants to force host staging for every model-worker product.
 
@@ -224,12 +226,12 @@ A dense BF16 checkpoint selects its precision at startup with `--quantization-co
 
 | Mode | Denoiser attention | Denoiser MLP | Text encoder | Video VAE |
 | --- | --- | --- | --- | --- |
-| `quality` | BF16 | BF16 | BF16 | FP16 |
-| `balanced` (default) | BF16 | BF16 | BF16 | NVFP4 |
+| `quality` (default) | BF16 | BF16 | BF16 | FP16 |
+| `balanced` | BF16 | BF16 | BF16 | NVFP4 |
 | `performance` | BF16 | FP8 | BF16 | NVFP4 |
 | `maximum` | BF16 | NVFP4 | FP8 | NVFP4 |
 
-Omitting `--quantization-config` selects `balanced`.
+Omitting `--quantization-config` selects `quality`, the checkpoint's own BF16 and FP16 representations. The other tiers use NVFP4, which needs Blackwell; see [Hopper](#hopper).
 
 ```bash
 --quantization-config '{"mode":"maximum"}'
@@ -255,14 +257,54 @@ uniserve serve skx618/FastVideo-FastH3-8-Step-V2-NVFP4 \
   --served-model-name FastH3
 ```
 
+## Hopper
+
+The BF16 checkpoints run on Hopper in the default `quality` precision. Hopper computes BF16, FP16, and FP8; NVFP4 and MXFP8 need Blackwell tensor cores, so the `balanced`, `performance`, and `maximum` tiers and the packed `skx618` checkpoints do not run there. FP8 denoiser MLPs are available as a component override:
+
+```bash
+--quantization-config '{"components":{"mlp":"fp8"}}'
+```
+
+Four H200s serving the dense checkpoint with 15-second capacity, text capacities 1024 and 16384, and two request slots need `--mem-fraction-static 0.92`: the default 0.80 grant does not hold the BF16 weights and full-duration decoder graphs.
+
+### H200 measurements
+
+These points use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, the repository's `minimax-h3` dataset with seed 1000, full graphs, and `--mem-fraction-static 0.92`. Latency is the mean ± SD of three complete MP4 requests at concurrency one after one warmup. The DP8 points use eight warmups and 16 measured requests at concurrency eight, with the 0.18 text and 0.81 flow grants of `configs/minimax-h3-dp8-text-tp8.json`.
+
+Eight-H200 Ulysses in `quality` precision:
+
+| Video duration | 1000-token prompt | 10000-token prompt |
+| --- | ---: | ---: |
+| 5 s | 8.194 ± 0.818 s | 14.218 ± 0.880 s |
+| 10 s | 18.539 ± 1.071 s | 26.578 ± 0.600 s |
+| 15 s | 31.069 ± 0.045 s | 44.228 ± 0.878 s |
+
+| Deployment | Precision | Workload | Result |
+| --- | --- | --- | --- |
+| Four-H200 Ulysses | `quality` | 5 s, 1000 tokens | 13.864 ± 0.013 s |
+| Gather8 | `quality` | 5 s, 10000 tokens | 20.170 ± 0.698 s |
+| Eight-H200 Ulysses | FP8 MLPs | 5 s, 1000 tokens | 7.448 ± 0.734 s |
+| Eight-H200 Ulysses | FP8 MLPs | 15 s, 10000 tokens | 42.380 ± 0.807 s |
+| DP8 + text TP8 | `quality` | 5 s, 1000 tokens, concurrency 8 | 0.1519 videos/s, 52.231 ± 0.358 s, 90,329 MiB peak per GPU |
+| DP8 + text TP8 | FP8 MLPs | 5 s, 1000 tokens, concurrency 8 | 0.1676 videos/s, 47.314 ± 0.386 s, 81,531 MiB peak per GPU |
+
+`uniserve_eval/hopper.toml` fixes each protocol. Run the points serially; the `hopper-ulysses8` suite reproduces the first table, and the `hopper` and `hopper-fp8` suites and the `hopper-gather8-5s-10k` and `hopper-dp8-5s-1k` points reproduce the second. Results land under `artifacts/hopper/measurements/`:
+
+```bash
+export UNISERVE_MINIMAX_H3_MODEL="$H3_MODEL"
+.venv/bin/uniserve-eval --config uniserve_eval/hopper.toml plan hopper-ulysses8
+.venv/bin/uniserve-eval --config uniserve_eval/hopper.toml run hopper-ulysses8 --reuse-deployment
+```
+
 ## Troubleshooting
 
 | Error | Action |
 | --- | --- |
 | `_uniserve_ipc` import or protocol error | Run `uv sync --locked --python /usr/bin/python3.12 --extra gpu` again and use the resulting `uniserve` executable. |
-| CUDA or sparse-attention compile error | Check CUDA 13 `nvcc`, `CUDA_HOME`, SM100 hardware, C++ build tools, and a writable `TORCH_EXTENSIONS_DIR` whose file system supports `flock`. |
+| CUDA or sparse-attention compile error | Check CUDA 13 `nvcc`, `CUDA_HOME`, supported Hopper or Blackwell hardware, C++ build tools, and a writable `TORCH_EXTENSIONS_DIR` whose file system supports `flock`. |
 | Missing audio VAE or codec | Restore the locked environment with `uv sync`; do not mix in older Diffusers or PyAV packages. |
 | `unsupported FastH3 checkpoint` | Use a complete checkpoint from the table above; the message names the model ID and revision it expects. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config`: a packed NVFP4 checkpoint carries its own precision contract. |
-| GPU out of memory | Reduce resident capacity, or write a deployment configuration that shards the denoiser; sequence parallelism alone replicates denoiser weights. |
+| `nvfp4 conversion requires an SM100-class CUDA device` | NVFP4 and MXFP8 need Blackwell. On Hopper, keep the default `quality` precision or use FP8 component overrides. |
+| GPU out of memory | Reduce resident capacity, or shard the denoiser with tensor or pipeline parallelism; Ulysses retains most denoiser weights on each rank. |
 | MP4 contains an error body | Use `--fail-with-body`, inspect the HTTP status, and confirm the model name and `/v1/capabilities` limits. |

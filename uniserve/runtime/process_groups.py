@@ -291,9 +291,29 @@ def _rendezvous_store(
     )
 
 
+def _connect_during_initialization() -> None:
+    """Have NCCL connect peers when a communicator initializes.
+
+    By default NCCL defers each transport connection, with its device
+    buffers and peer handshake, to the first collective that needs it. A
+    collective path first taken while serving would then grow the process's
+    device footprint after startup has sealed its storage grant, and would
+    run the handshake while peers are executing numerical work. Connecting
+    at initialization keeps both within startup.
+
+    NCCL reads the setting when it initializes the process's first
+    communicator. Every UniServe process group, and each stream-bound
+    communicator created over one, initializes after this call. A caller
+    that initializes NCCL itself beforehand sets the variable first. An
+    explicit ``NCCL_RUNTIME_CONNECT`` in the environment takes precedence.
+    """
+    os.environ.setdefault("NCCL_RUNTIME_CONNECT", "0")
+
+
 def _group_options(backend: str):
     if backend != "nccl":
         return None
+    _connect_during_initialization()
     options = dist.ProcessGroupNCCL.Options()
     options.use_pg_for_symm_mem_rendezvous = True
     # NCCL checks topology, driver, symmetric windows and collective kind for

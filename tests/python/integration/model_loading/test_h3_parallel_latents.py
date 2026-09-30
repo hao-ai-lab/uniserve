@@ -29,7 +29,11 @@ from uniserve.runtime import (
 from uniserve_eval.config import load_config
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
 from uniserve_models import loading as models
-from uniserve_models.minimax_h3 import DenoiserInput, DenoiserSize
+from uniserve_models.minimax_h3 import (
+    DenoiserInput,
+    DenoiserSize,
+    weight_config,
+)
 from uniserve_models.minimax_h3.packing import (
     audio_latent_frames,
     build_packing,
@@ -96,6 +100,20 @@ _LAYOUTS = {
     "pp4": ((3, 1, 2, 0), (4,), ("pp",), AttentionParallelConfig()),
 }
 
+# Serving tiers, and component overrides for representations no tier selects
+# as a whole: FP8 attention, MXFP8 MLPs and an all-NVFP4 transformer.
+_PRECISIONS = {
+    "quality": {"preset": "quality"},
+    "maximum": {"preset": "maximum"},
+    "fp8": {"preset": "quality", "attention": "fp8", "mlp": "fp8"},
+    "mxfp8": {"preset": "quality", "mlp": "mxfp8"},
+    "nvfp4": {
+        "preset": "maximum",
+        "attention": "nvfp4",
+        "text_encoder": "nvfp4",
+    },
+}
+
 
 @torch.inference_mode()
 def _generate(
@@ -152,7 +170,7 @@ def _generate(
     model = models.load_model(
         config,
         device=device,
-        precision=precision,
+        weights=weight_config(**_PRECISIONS[precision]),
         meshes=meshes,
         attention=attention,
     ).model
@@ -350,8 +368,12 @@ def _collect(checkpoint, requests, kind, directory, *, encoder_tp, precision):
     return results
 
 
-@pytest.fixture(scope="module")
-def generation_requests():
+@pytest.fixture(
+    scope="module",
+    params=[(5, 124, 1000), (15, 362, 16384)],
+    ids=["5s-1k", "15s-16k"],
+)
+def generation_requests(request):
     checkpoint = os.environ.get("UNISERVE_H3_MODEL", "")
     if not checkpoint or not Path(checkpoint).is_dir():
         pytest.fail(
@@ -360,35 +382,33 @@ def generation_requests():
         )
     tokenizer = AutoTokenizer.from_pretrained(Path(checkpoint) / "tokenizer")
     point = load_config().benchmarks["minimax-h3-5s-1k"]
-    requests = []
-    for seconds, frames, tokens in ((5, 124, 1000), (15, 362, 16384)):
-        case = replace(
-            point,
-            load=replace(point.load, num_prompts=1),
-            video=replace(point.video, seconds=seconds, prompt_tokens=tokens),
+    seconds, frames, tokens = request.param
+    case = replace(
+        point,
+        load=replace(point.load, num_prompts=1),
+        video=replace(point.video, seconds=seconds, prompt_tokens=tokens),
+    )
+    example = MiniMaxH3Dataset(case).load(tokenizer)[0]
+    requests = [
+        (
+            frames,
+            tuple(tokenizer.encode(example.prompt, add_special_tokens=False)),
         )
-        example = MiniMaxH3Dataset(case).load(tokenizer)[0]
-        requests.append(
-            (
-                frames,
-                tuple(
-                    tokenizer.encode(example.prompt, add_special_tokens=False)
-                ),
-            )
-        )
+    ]
     tokens = requests[0][1]
     # Exact tile boundaries and a different prompt with the same signature
     # expose stale conditioning, while the minimum frame count exercises
     # decoder geometry.
-    requests.extend((22, tokens[:length]) for length in (63, 64, 65))
-    requests.append((22, tokens[1:65]))
+    if seconds == 5:
+        requests.extend((22, tokens[:length]) for length in (63, 64, 65))
+        requests.append((22, tokens[1:65]))
     return checkpoint, requests
 
 
 @pytest.mark.parametrize(
     "precision,kind,encoder_tp",
-    [("bf16", kind, 1) for kind in _LAYOUTS]
-    + [("bf16", "ulysses4", 2), ("bf16", "ulysses4", 4)]
+    [("quality", kind, 1) for kind in _LAYOUTS]
+    + [("quality", "ulysses4", 2), ("quality", "ulysses4", 4)]
     + [
         (precision, "tp4", 1)
         for precision in ("fp8", "mxfp8", "nvfp4", "maximum")
@@ -426,7 +446,11 @@ def test_parallel_layout_generates_usable_decoder_latents(
             assert energy.isfinite() and energy > 0, (
                 f"{modality}: invalid denoised signal energy"
             )
-            if modality == "video" and precision in ("bf16", "fp8", "mxfp8"):
+            if modality == "video" and precision in (
+                "quality",
+                "fp8",
+                "mxfp8",
+            ):
                 assert latent.to(torch.float16).isfinite().all(), (
                     "video: FP16 decoder overflow"
                 )
