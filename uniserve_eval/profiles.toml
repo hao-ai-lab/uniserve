@@ -9,7 +9,7 @@ artifact_root = "artifacts/benchmark"
 [servers.qwen]
 host = "127.0.0.1"
 port = 18081
-command = ["target/release/uniserve", "serve", "${UNISERVE_QWEN3_MODEL}", "--served-model-name", "Qwen3-32B", "--host", "127.0.0.1", "--port", "18081", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_QWEN_WORKER_RANKS:-1}", "--max-total-tokens", "131072", "--max-running-requests", "128", "--max-num-batched-tokens", "16384", "--chunked-prefill-size", "16384", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--flashinfer-workspace-size", "${UNISERVE_QWEN_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--queue-depth", "3", "--reasoning-parser", "none"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MODEL}", "--served-model-name", "Qwen3-32B", "--host", "127.0.0.1", "--port", "18081", "--worker-python", ".venv/bin/python", "--worker-ranks", "${UNISERVE_QWEN_WORKER_RANKS:-1}", "--max-total-tokens", "131072", "--max-running-requests", "128", "--max-num-batched-tokens", "16384", "--chunked-prefill-size", "16384", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--flashinfer-workspace-size", "${UNISERVE_QWEN_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--queue-depth", "3", "--reasoning-parser", "none"]
 
 [servers.qwen.environment]
 CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN_CUDA_VISIBLE_DEVICES:-0}"
@@ -17,7 +17,7 @@ CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN_CUDA_VISIBLE_DEVICES:-0}"
 [servers.sensenova]
 host = "127.0.0.1"
 port = 18082
-command = ["target/release/uniserve", "serve", "${UNISERVE_SENSENOVA_MODEL}", "--served-model-name", "SenseNova-U1", "--host", "127.0.0.1", "--port", "18082", "--worker-python", ".venv/bin/python", "--max-running-requests", "32", "--max-num-batched-tokens", "8192", "--page-size", "64", "--mem-fraction-static", "${UNISERVE_SENSENOVA_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--flashinfer-workspace-size", "${UNISERVE_SENSENOVA_FLASHINFER_WORKSPACE_SIZE:-536870912}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_SENSENOVA_MODEL}", "--served-model-name", "SenseNova-U1", "--host", "127.0.0.1", "--port", "18082", "--worker-python", ".venv/bin/python", "--max-running-requests", "32", "--max-num-batched-tokens", "8192", "--page-size", "64", "--mem-fraction-static", "${UNISERVE_SENSENOVA_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--flashinfer-workspace-size", "${UNISERVE_SENSENOVA_FLASHINFER_WORKSPACE_SIZE:-536870912}"]
 
 [servers.sensenova.environment]
 CUDA_VISIBLE_DEVICES = "0"
@@ -25,7 +25,7 @@ CUDA_VISIBLE_DEVICES = "0"
 [servers.bagel]
 host = "127.0.0.1"
 port = 18084
-command = ["target/release/uniserve", "serve", "${UNISERVE_BAGEL_MODEL}", "--served-model-name", "BAGEL", "--host", "127.0.0.1", "--port", "18084", "--worker-python", ".venv/bin/python", "--max-running-requests", "32", "--max-num-batched-tokens", "8192", "--page-size", "64", "--mem-fraction-static", "${UNISERVE_BAGEL_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--flashinfer-workspace-size", "${UNISERVE_BAGEL_FLASHINFER_WORKSPACE_SIZE:-536870912}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_BAGEL_MODEL}", "--served-model-name", "BAGEL", "--host", "127.0.0.1", "--port", "18084", "--worker-python", ".venv/bin/python", "--max-running-requests", "32", "--max-num-batched-tokens", "8192", "--page-size", "64", "--mem-fraction-static", "${UNISERVE_BAGEL_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--flashinfer-workspace-size", "${UNISERVE_BAGEL_FLASHINFER_WORKSPACE_SIZE:-536870912}"]
 
 [servers.bagel.environment]
 CUDA_VISIBLE_DEVICES = "0"

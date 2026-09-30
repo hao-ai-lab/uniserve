@@ -27,7 +27,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` binary, the native worker IPC extension and the `gpu` extra's kernels: FlashInfer, FlashAttention-4, and UniServe's sparse-attention and peer-storage kernels. Building them needs a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja; the [FastH3 guide](docs/fast_h3/fast_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` server and `uniserve-host` launcher binaries, the native worker IPC extension and the `gpu` extra's kernels: FlashInfer, FlashAttention-4, and UniServe's sparse-attention and peer-storage kernels. Building them needs a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja; the [FastH3 guide](docs/fast_h3/fast_h3.md#install) lists the system packages and a container build.
 
 ## Quickstart
 

@@ -29,7 +29,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source "$UV_PROJECT_ENVIRONMENT/bin/activate"
 ```
 
-The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashInfer, FlashAttention-4, the peer-storage and sparse-attention kernels, and the CuTe and CUTLASS DSLs. These are shared runtime capabilities rather than model-specific packages, so there is no FastH3-specific dependency group. The sync also builds the `_uniserve_ipc` extension and the `uniserve` binary from this checkout. FastVideo itself is not a runtime dependency.
+The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashInfer, FlashAttention-4, the peer-storage and sparse-attention kernels, and the CuTe and CUTLASS DSLs. These are shared runtime capabilities rather than model-specific packages, so there is no FastH3-specific dependency group. The sync also builds the `_uniserve_ipc` extension and the `uniserve` and `uniserve-host` binaries from this checkout. FastVideo itself is not a runtime dependency.
 
 ## Supported checkpoints
 
@@ -111,10 +111,10 @@ NCCL_NVLS_ENABLE=0 uniserve serve "$H3_MODEL" \
   --graph-policy off
 ```
 
-The head logs `awaiting a launcher for each host this instance does not run on address=...`; on the other host, start the launcher with that address and the host identity the file names:
+The head logs `awaiting a launcher for each host this instance does not run on address="0.0.0.0:<port>"`: it listens on every interface at that port. On the other host, start the launcher with an address of `rank-0` it can reach, that port, and the host identity the file names:
 
 ```bash
-NCCL_NVLS_ENABLE=0 uniserve-host --head <address the head logs> --host-identity rank-1
+NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity rank-1
 ```
 
 One launcher serves every worker of the deployment that places a rank on its host: in `ulysses8-two-node.json`, ranks 4 to 7 of the model worker and encoder ranks 4 to 7 of the host worker, which encode that host's four media units per round, while the muxer rank stays on `rank-0`. The launcher starts each rank with the Python interpreter and launch descriptor the head resolved, so the other host needs the same Python environment and the checkpoint at the same path. The launcher and the head speak one launch protocol, so run a `uniserve-host` built from the same source as the head's `uniserve`.
@@ -270,7 +270,7 @@ export UNISERVE_FAST_H3_NVFP4_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
 ```
 
-The `gb200-8` suites start the head on `rank-0`; start `uniserve-host` on `rank-1` with the address the head logs, as in [Two hosts](#two-hosts), once for each server the suite starts.
+The `gb200-8` suites start the head on `rank-0`; start `uniserve-host` on `rank-1` with `rank-0`'s address and the port the head logs, as in [Two hosts](#two-hosts), once for each server the suite starts.
 
 ### H200
 
