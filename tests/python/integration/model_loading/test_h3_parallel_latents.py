@@ -4,7 +4,6 @@ The decoder inputs are produced across partitions.
 """
 
 import os
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -26,8 +25,13 @@ from uniserve.runtime import (
     TensorBuffers,
     initialize_process_groups,
 )
-from uniserve_eval.config import load_config
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
+from uniserve_eval.types import (
+    BenchmarkPoint,
+    LoadConfig,
+    TaskName,
+    VideoConfig,
+)
 from uniserve_models import loading as models
 from uniserve_models.minimax_h3 import (
     DenoiserInput,
@@ -381,12 +385,18 @@ def generation_requests(request):
             "checkpoint directory"
         )
     tokenizer = AutoTokenizer.from_pretrained(Path(checkpoint) / "tokenizer")
-    point = load_config().benchmarks["minimax-h3-5s-1k"]
     seconds, frames, tokens = request.param
-    case = replace(
-        point,
-        load=replace(point.load, num_prompts=1),
-        video=replace(point.video, seconds=seconds, prompt_tokens=tokens),
+    # The evaluator's FastH3 prompt synthesis yields exactly `tokens` prompt
+    # tokens, the text capacity each case exercises.
+    case = BenchmarkPoint(
+        name="fast-h3-prompt",
+        server="uniserve",
+        task=TaskName.VIDEO,
+        model="FastH3",
+        dataset="minimax-h3",
+        metrics=(),
+        load=LoadConfig(num_prompts=1),
+        video=VideoConfig(seconds=seconds, prompt_tokens=tokens),
     )
     example = MiniMaxH3Dataset(case).load(tokenizer)[0]
     requests = [

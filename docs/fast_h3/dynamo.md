@@ -51,7 +51,7 @@ target/release/uniserve-dynamo-worker \
   --namespace uniserve-fasth3 \
   --model-path "$H3_MODEL" --served-model-name FastH3 \
   --worker-python "$PWD/.venv/bin/python" \
-  --workers configs/minimax-h3-four-devices.json \
+  --workers configs/fast_h3/ulysses4.json \
   --max-model-len 16384 --max-video-seconds 15 \
   --max-running-requests 2 --quantization-config '{"mode":"quality"}'
 ```
