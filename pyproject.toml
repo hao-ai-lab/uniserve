@@ -72,16 +72,26 @@ uniserve-worker = "uniserve_worker.main:main"
 # ship a console script whose dependencies it never declares.
 include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*"]
 
-# Native worker IPC extension (PyO3).
+# Native worker IPC extension (PyO3). Serving runs these native targets, so
+# they build with Cargo's release profile even for an editable install,
+# where setuptools-rust would otherwise choose a debug build.
 [[tool.setuptools-rust.ext-modules]]
 target = "uniserve_worker._uniserve_ipc"
 path = "crates/worker-ipc-py/Cargo.toml"
 binding = "PyO3"
+debug = false
 
 # Server/scheduler binary, installed onto PATH as `uniserve`.
 [[tool.setuptools-rust.bins]]
 target = "uniserve"
 path = "crates/bin/uniserve/Cargo.toml"
+debug = false
+
+# Per-host launcher for multi-host deployments, installed as `uniserve-host`.
+[[tool.setuptools-rust.bins]]
+target = "uniserve-host"
+path = "crates/bin/uniserve-host/Cargo.toml"
+debug = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
