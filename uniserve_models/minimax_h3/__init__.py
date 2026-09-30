@@ -25,12 +25,7 @@ from .model import Model, entry_points
 from .modulation import OutputNorm, TimestepEmbedding
 from .output import VideoPostprocessor
 from .packing import Packing
-from .precision import (
-    checkpoint_precision,
-    default_precision,
-    precisions,
-    weight_config,
-)
+from .precision import checkpoint_precision, precisions, weight_config
 from .transformer import Transformer, TransformerLayer
 from .weights import checkpoint_mappings, checkpoint_sources
 
@@ -71,7 +66,6 @@ __all__ = [
     "checkpoint_mappings",
     "entry_points",
     "precisions",
-    "default_precision",
     "checkpoint_precision",
     "weight_config",
 ]

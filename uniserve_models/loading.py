@@ -101,9 +101,6 @@ class Config(Generic[ConfigT, ModelT]):
             ``checkpoint_identity``. Every rank of one instance must load the
             same checkpoint, and the launching side derives the same value
             for a local checkpoint directory.
-        default_precision: Optional loading policy that selects a named
-            precision for the destination device. Explicit numerical choices
-            and checkpoint-owned representations take precedence.
     """  # noqa: D205
 
     model: ConfigT
@@ -120,7 +117,6 @@ class Config(Generic[ConfigT, ModelT]):
     flow_prompt: FlowPrompt | None
     modules: frozenset[str] | None
     checkpoint_identity: str
-    default_precision: Callable[[torch.device], str] | None = None
 
     def __post_init__(self):
         # Freeze the caller's containers; ``ComponentEntry`` values are
@@ -1209,11 +1205,6 @@ def read_config(
         package.flow_prompt,
         modules,
         identity,
-        (
-            getattr(package, "default_precision", None)
-            if checkpoint_format is None and quantization is None
-            else None
-        ),
     )
 
 
@@ -1231,9 +1222,8 @@ def load_model(
     """Materialize the selected capability modules through the common loader.
 
     ``precision`` names one of ``config.precisions`` and ``weights`` supplies
-    a weight configuration directly; with neither, the package's device
-    default applies, or ``config.weights`` when it has no device policy.
-    ``modules`` may narrow ``config.modules`` but not widen it.
+    a weight configuration directly; with neither, ``config.weights``
+    applies. ``modules`` may narrow ``config.modules`` but not widen it.
     The remaining arguments pass through to ``uniserve.loading.load_model``.
 
     Raises:
@@ -1244,12 +1234,6 @@ def load_model(
         raise ValueError(
             "precision and weights are mutually exclusive numerical choices"
         )
-    if (
-        weights is None
-        and precision in (None, "default")
-        and config.default_precision is not None
-    ):
-        precision = config.default_precision(torch.device(device))
     if precision is not None:
         if precision not in config.precisions:
             raise ValueError(

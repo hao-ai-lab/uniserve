@@ -1,4 +1,20 @@
-"""FlashInfer provider for mutable head-wise block-64 video sparse attention."""
+"""FlashInfer provider for mutable head-wise block-64 video sparse attention.
+
+On Hopper, sparse rows use FlashInfer's FA3 prefill with the checkpoint's
+live per-head block selection. Each selected 64-row block expands into
+single-token KV pages holding only its valid keys, so partial and empty
+blocks need no score mask. Dense-prefix query rows attend their complete
+valid key domain through FlashAttention-4's SM90 kernel, whose device
+predicate excludes each tile's padding. Query packing preserves owner and
+interval order, including a final short interval. FA3's scheduler narrows
+KV offsets to signed 32 bits, so a large query domain splits into
+independent windows, each retaining its queries' complete selected keys.
+
+Startup graphs capture the CSR updates together with attention. Serialized
+calls borrow the execution context's mutable CSR backing, and layers with
+the same numerical signature share their shape-specific plans, which bounds
+graph residency across transformer depth and captured layouts.
+"""
 
 from __future__ import annotations
 

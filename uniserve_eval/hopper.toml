@@ -1,15 +1,15 @@
-# FastH3 qualification on Hopper GPUs. The device default uses BF16 with
-# FP16 video projections; the checkpoint owns the eight-step schedule.
+# FastH3 qualification on Hopper GPUs. BF16 servers select the quality tier
+# (BF16 transformer and text, FP16 video projections); FP8 servers override
+# only the denoiser MLPs. The checkpoint owns the eight-step schedule.
 root = ".."
 artifact_root = "artifacts/hopper/measurements"
 
 [servers.hopper-ulysses4]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-four-devices.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92"]
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-four-devices.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
 
 [servers.hopper-ulysses4.environment]
-CUDA_MODULE_LOADING = "EAGER"
 CUDA_VISIBLE_DEVICES = "0,1,2,3"
 OMP_NUM_THREADS = "1"
 MAX_JOBS = "8"
@@ -43,10 +43,9 @@ points = ["hopper-ulysses4-5s-1k"]
 [servers.hopper-ulysses8]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-eight-devices-single-node.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024,10240", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92"]
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-eight-devices-single-node.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024,10240", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
 
 [servers.hopper-ulysses8.environment]
-CUDA_MODULE_LOADING = "EAGER"
 CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
 OMP_NUM_THREADS = "1"
 MAX_JOBS = "8"
@@ -190,10 +189,9 @@ points = ["hopper-ulysses8-5s-1k", "hopper-ulysses8-5s-10k", "hopper-ulysses8-10
 [servers.hopper-gather8]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-eight-devices-gather.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024,10240", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92"]
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-eight-devices-gather.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024,10240", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
 
 [servers.hopper-gather8.environment]
-CUDA_MODULE_LOADING = "EAGER"
 CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
 OMP_NUM_THREADS = "1"
 MAX_JOBS = "8"
@@ -224,10 +222,9 @@ videos_per_second = "higher"
 [servers.hopper-fp8-ulysses8]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-eight-devices-single-node.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024,10240", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"performance","components":{"video_vae":"fp16"}}']
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-eight-devices-single-node.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024,10240", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"components":{"mlp":"fp8"}}']
 
 [servers.hopper-fp8-ulysses8.environment]
-CUDA_MODULE_LOADING = "EAGER"
 CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
 OMP_NUM_THREADS = "1"
 MAX_JOBS = "8"
@@ -236,10 +233,9 @@ NCCL_CUMEM_HOST_ENABLE = "1"
 [servers.hopper-fp8-dp8]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-dp8-text-tp8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "8", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"performance","components":{"video_vae":"fp16"}}']
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-dp8-text-tp8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "8", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"components":{"mlp":"fp8"}}']
 
 [servers.hopper-fp8-dp8.environment]
-CUDA_MODULE_LOADING = "EAGER"
 CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
 OMP_NUM_THREADS = "1"
 MAX_JOBS = "8"
@@ -317,10 +313,9 @@ points = ["hopper-fp8-ulysses8-5s-1k", "hopper-fp8-ulysses8-15s-10k", "hopper-fp
 [servers.hopper-dp8]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-dp8-text-tp8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "8", "--graph-policy", "full", "--mem-fraction-static", "0.92"]
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/minimax-h3-dp8-text-tp8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "8", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
 
 [servers.hopper-dp8.environment]
-CUDA_MODULE_LOADING = "EAGER"
 CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
 OMP_NUM_THREADS = "1"
 MAX_JOBS = "8"

@@ -174,30 +174,6 @@ def _indexed(root, format):
     return path
 
 
-@pytest.mark.parametrize("choice", (None, "default", "explicit", "weights"))
-def test_loading_device_default_preserves_explicit_numerical_choices(
-    tmp_path, choice
-):
-    qwen_checkpoint(tmp_path)
-    config = models.read_config(tmp_path)
-    config = replace(
-        config,
-        precisions={
-            "host": weights.Config(dtype=torch.float32),
-            "explicit": weights.Config(dtype=torch.bfloat16),
-        },
-        default_precision=lambda device: "host",
-    )
-    options = (
-        {"weights": weights.Config(dtype=torch.bfloat16)}
-        if choice == "weights"
-        else {"precision": choice}
-    )
-    model = models.load_model(config, device="cpu", **options).model
-    expected = torch.float32 if choice in (None, "default") else torch.bfloat16
-    assert all(parameter.dtype == expected for parameter in model.parameters())
-
-
 @pytest.mark.parametrize("mode", ("eager", "layered"))
 @pytest.mark.parametrize("format", ("safetensors", "pt"))
 @torch.inference_mode()

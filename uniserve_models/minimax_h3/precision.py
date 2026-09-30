@@ -19,21 +19,18 @@ from uniserve.quantization import QuantizationConfig, Quantizer
 from .config import TransformerConfig
 from .video_vae import Config as VideoConfig
 
-# This table is the single definition of each named numerical choice. Both
+# This table is the single definition of each named numerical tier. Both
 # complete presets and component overrides expand through weight_config.
 # Each row names (attention, mlp, text_encoder, video_vae) representations, in
-# weight_config's keyword order. "default" and "balanced" select the same
-# representations, as do "quality" and "bf16".
+# weight_config's keyword order. "default" selects "quality": the dense
+# checkpoint's own BF16 transformer and FP16 video decoder, which every
+# supported GPU computes. Quantized tiers are explicit choices.
 _formats = {
-    "default": ("bf16", "bf16", "bf16", "nvfp4"),
+    "default": ("bf16", "bf16", "bf16", "fp16"),
     "quality": ("bf16", "bf16", "bf16", "fp16"),
-    "bf16": ("bf16", "bf16", "bf16", "fp16"),
     "balanced": ("bf16", "bf16", "bf16", "nvfp4"),
     "performance": ("bf16", "fp8", "bf16", "nvfp4"),
     "maximum": ("bf16", "nvfp4", "fp8", "nvfp4"),
-    "fp8": ("fp8", "fp8", "bf16", "fp16"),
-    "mxfp8": ("bf16", "mxfp8", "bf16", "fp16"),
-    "nvfp4": ("nvfp4", "nvfp4", "nvfp4", "nvfp4"),
 }
 
 
@@ -162,22 +159,6 @@ def weight_config(
 precisions = MappingProxyType(
     {name: weight_config(preset=name) for name in _formats}
 )
-
-
-def default_precision(device: torch.device) -> str:
-    """Select the dense checkpoint's default for the loading destination.
-
-    NVFP4 requires Blackwell tensor cores. Hopper retains the checkpoint's
-    BF16 transformer and FP16 decoder projections; explicit presets keep
-    their declared representations on every device.
-    """
-    if device.type == "cuda" and torch.cuda.get_device_capability(device) >= (
-        10,
-        0,
-    ):
-        return "balanced"
-    return "quality"
-
 
 # Dense modules of a calibrated checkpoint keep BF16, the video VAE
 # projections included, so the VAE runs under BF16 autocast as with the NVFP4

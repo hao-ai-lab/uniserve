@@ -95,7 +95,7 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     max_running_requests: usize,
 
-    #[arg(long, default_value = r#"{"mode":"balanced"}"#, value_parser = parse_json_object)]
+    #[arg(long, default_value = r#"{}"#, value_parser = parse_json_object)]
     quantization_config: Value,
 
     #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]

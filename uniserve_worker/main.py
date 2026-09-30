@@ -35,11 +35,14 @@ def main() -> None:
     _install_fault_dump_handlers()
     process_args = parse_worker_args()
     if str(process_args.execution.device).startswith("cuda"):
-        # First-use module loading can synchronize a CUDA context while a
-        # peer waits in an asynchronous collective. Preload both code and
-        # data before importing the execution stack and initializing CUDA.
-        os.environ["CUDA_MODULE_LOADING"] = "EAGER"
-        os.environ["CUDA_MODULE_DATA_LOADING"] = "EAGER"
+        # Lazy loading defers a module's load, which can synchronize the CUDA
+        # context, to its first kernel launch. A launch concurrent with a
+        # collective that waits on peers can then deadlock; NVIDIA's lazy
+        # loading guide names eager loading as a remedy. Module data
+        # loading inherits this mode. The driver reads it at initialization,
+        # so it precedes the execution stack's imports. An explicit
+        # ``CUDA_MODULE_LOADING`` takes precedence.
+        os.environ.setdefault("CUDA_MODULE_LOADING", "EAGER")
 
     from uniserve_worker.bootstrap.launch import run_worker
 
