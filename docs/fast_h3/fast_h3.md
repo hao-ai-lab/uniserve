@@ -22,12 +22,13 @@ curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolcha
 
 export CUDA_HOME=/usr/local/cuda
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$CUDA_HOME/bin:$PATH"
-export UV_PROJECT_ENVIRONMENT=/opt/uniserve-venv
 export MAX_JOBS=2
 
 uv sync --locked --python /usr/bin/python3.12 --extra gpu
-source "$UV_PROJECT_ENVIRONMENT/bin/activate"
+source .venv/bin/activate
 ```
+
+The environment lives in the checkout's `.venv`, where the evaluation profiles below find `uniserve` and the worker interpreter. `CUDA_HOME` names the toolkit that compiles UniServe's GPU kernels, and `MAX_JOBS` bounds their parallel compilation.
 
 The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashInfer, FlashAttention-4, the peer-storage and sparse-attention kernels, and the CuTe and CUTLASS DSLs. These are shared runtime capabilities rather than model-specific packages, so there is no FastH3-specific dependency group. The sync also builds the `_uniserve_ipc` extension and the `uniserve` and `uniserve-host` binaries from this checkout. FastVideo itself is not a runtime dependency.
 
