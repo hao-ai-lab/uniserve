@@ -37,10 +37,10 @@ The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashIn
 | --- | --- | --- | --- | --- |
 | [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree) | BF16 | 4 | 0.9 | 148 GB |
 | [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2) | BF16 | 8 | 0.8 | 148 GB |
-| [`skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | ModelOpt NVFP4 | 4 | 0.9 | 123 GB |
-| [`skx618/FastVideo-FastH3-8-Step-V2-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-8-Step-V2-NVFP4) | ModelOpt NVFP4 | 8 | 0.8 | 123 GB |
+| [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | ModelOpt NVFP4 | 4 | 0.9 | 123 GB |
+| [`FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4) | ModelOpt NVFP4 | 8 | 0.8 | 123 GB |
 
-The two `skx618` repositories are ModelOpt PTQ checkpoints in ModelOpt's unified Hugging Face layout, which UniServe loads with no precision flags and which require Blackwell; the BF16 checkpoints run on Hopper and Blackwell. See [Precision and graphs](#precision-and-graphs).
+The two NVFP4 repositories are ModelOpt PTQ checkpoints in ModelOpt's unified Hugging Face layout, which UniServe loads with no precision flags and which require Blackwell; the BF16 checkpoints run on Hopper and Blackwell. See [Precision and graphs](#precision-and-graphs).
 
 Each checkpoint's `fastvideo_inference.json` supplies its sampling schedule: the trained DMD rungs in `dmd_denoising_steps`, one transformer forward per rung, and the VSA sparsity. The video and audio shifts come from `scheduler/` and `audio_scheduler/`, and a manifest that restates them must agree. The loader refuses a manifest that is not a `fasth3-inference-contract-v1` text-to-video-and-audio contract without guidance. The table lists the checkpoints UniServe has validated end to end.
 
@@ -60,94 +60,84 @@ Pass the model root containing `modular_model_index.json`, `fastvideo_inference.
 
 ```bash
 uniserve serve "$H3_MODEL" \
-  --workers configs/minimax-h3-four-devices.json \
+  --workers configs/fast_h3/ulysses4.json \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2
 ```
 
-`configs/minimax-h3-four-devices.json` is a deployment file: it lists the participating devices and, under `components`, the placement and parallel configuration of each of FastH3's five components. It places the numerical components on four devices of one host, as the `model` worker: four-way Ulysses denoising, TP4 text encoding, one video and one audio media unit per rank. A second worker, `host`, has five ranks on the host with `"device": "cpu"` and holds the two host components every video deployment needs: `video_encoder` on ranks 0 to 3, one media unit of each decode round per rank, and `muxer` on rank 4, which encodes the audio track and assembles the MP4. Each host rank is one codec slot: it runs one encode or assembly step at a time in its own process. The muxer must be on the head's host, and every worker that decodes video needs an encoder that keeps each media unit on the host that decoded it; the server refuses a placement that violates either at startup and routes each request to such an encoder. Under Ulysses each rank keeps only its own heads' share of the denoiser's merged query, key, value and gate projections, a quarter of those weights on four devices; the other denoiser weights are replicated on every rank. Serving a different width, or sharding the denoiser by tensor or pipeline, is a different deployment file.
+`configs/fast_h3/ulysses4.json` is a deployment file: it lists the participating devices and, under `components`, the placement and parallel configuration of each of FastH3's five components. It places the numerical components on four devices of one host, as the `model` worker: four-way Ulysses denoising, TP4 text encoding, one video and one audio media unit per rank. A second worker, `host`, has five ranks on the host with `"device": "cpu"` and holds the two host components every video deployment needs: `video_encoder` on ranks 0 to 3, one media unit of each decode round per rank, and `muxer` on rank 4, which encodes the audio track and assembles the MP4. Each host rank is one codec slot: it runs one encode or assembly step at a time in its own process. The muxer must be on the head's host, and every worker that decodes video needs an encoder that keeps each media unit on the host that decoded it; the server refuses a placement that violates either at startup and routes each request to such an encoder. Under Ulysses each rank keeps only its own heads' share of the denoiser's merged query, key, value and gate projections, a quarter of those weights on four devices; the other denoiser weights are replicated on every rank. Serving a different width, or sharding the denoiser by tensor or pipeline, is a different deployment file.
 
-`configs/minimax-h3-eight-devices.json` is the same placement over eight devices on two hosts, named `rank-0` and `rank-1` in the file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with four encoder ranks on each host, which encode that host's four media units per round, and a muxer rank on `rank-0`. The head runs on the host named `rank-0`, which holds ranks 0 to 3 of the model worker, and a launcher on the other host runs ranks 4 to 7 of the model worker and encoder ranks 4 to 7 of the host worker. Start the head first:
+### Deployments
+
+`configs/fast_h3/` holds the deployments UniServe publishes measurements for:
+
+| File | GPUs | Denoiser | Text encoder |
+| --- | --- | --- | --- |
+| `ulysses4.json` | Four on one host | Ulysses4 | TP4 |
+| `ulysses8.json` | Eight on one host | Ulysses8 | TP8 |
+| `ulysses8-two-node.json` | Four on each of two hosts | Ulysses8 | TP8 |
+| `ulysses4x2.json` | Eight on one host | Two Ulysses4 replicas | One TP4 replica per denoiser replica |
+| `ulysses4x2-two-node.json` | Four on each of two hosts | One Ulysses4 replica per host | One TP4 replica per host |
+| `dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas | One TP8 worker shared by all replicas |
+| `gather8.json` | Eight on one host | Eight-way all-gather sequence parallelism | TP8 |
+
+A single request is fastest when every GPU works on it, so the one-replica files serve latency; replicas serve more requests at once. These commands serve the 8-Step V2 checkpoints at the default 15-second and 16384-token capacities unless the row states a limit:
+
+| Hardware | Goal | Deployment | Additional options |
+| --- | --- | --- | --- |
+| 4 x GB200 | Latency and throughput | `ulysses4.json` | `--max-running-requests 2` |
+| 8 x GB200, two hosts | Latency | `ulysses8-two-node.json` | `--max-running-requests 2 --graph-policy off`, `NCCL_NVLS_ENABLE=0` |
+| 8 x GB200, two hosts | Throughput | `ulysses4x2-two-node.json` | `--max-running-requests 4`, `NCCL_NVLS_ENABLE=0` |
+| 8 x RTX PRO 6000 | Latency | `ulysses8.json` | `--max-running-requests 2 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240,16384` |
+| 8 x RTX PRO 6000 | Throughput | `ulysses4x2.json` | `--max-running-requests 4 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240,16384` |
+| 4 x H200 | Latency and throughput | `ulysses4.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --video-text-capacities 1024,16384` |
+| 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --video-text-capacities 1024,10240` |
+| 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `dp8-text-tp8.json` | `--max-running-requests 8 --max-video-seconds 5 --max-model-len 1024` |
+
+The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) assembles the same commands from a hardware, goal and checkpoint selection. `gather8.json` attends each rank's own query rows to the complete gathered keys and values and holds the complete denoiser weights on every rank; it is an alternative to Ulysses where head sharding does not apply.
+
+### Two hosts
+
+The two-host files name their hosts `rank-0` and `rank-1`. The head runs on the host named `rank-0`, and a launcher on the other host runs the ranks the file places there. Start the head first:
 
 ```bash
-uniserve serve "$H3_MODEL" \
-  --workers configs/minimax-h3-eight-devices.json \
+NCCL_NVLS_ENABLE=0 uniserve serve "$H3_MODEL" \
+  --workers configs/fast_h3/ulysses8-two-node.json \
   --host-identity rank-0 \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
-  --max-running-requests 2
+  --max-running-requests 2 \
+  --graph-policy off
 ```
 
 The head logs `awaiting a launcher for each host this instance does not run on address=...`; on the other host, start the launcher with that address and the host identity the file names:
 
 ```bash
-uniserve-host --head <address the head logs> --host-identity rank-1
+NCCL_NVLS_ENABLE=0 uniserve-host --head <address the head logs> --host-identity rank-1
 ```
 
-One launcher serves every worker of the deployment that places a rank on its host, here ranks 4 to 7 of the model worker and ranks 4 to 7 of the host worker. The launcher starts each rank with the Python interpreter and launch descriptor the head resolved, so the other host needs the same Python environment and the checkpoint at the same path. The launcher and the head speak one launch protocol, so run a `uniserve-host` built from the same source as the head's `uniserve`.
+One launcher serves every worker of the deployment that places a rank on its host: in `ulysses8-two-node.json`, ranks 4 to 7 of the model worker and encoder ranks 4 to 7 of the host worker, which encode that host's four media units per round, while the muxer rank stays on `rank-0`. The launcher starts each rank with the Python interpreter and launch descriptor the head resolved, so the other host needs the same Python environment and the checkpoint at the same path. The launcher and the head speak one launch protocol, so run a `uniserve-host` built from the same source as the head's `uniserve`.
 
-`configs/minimax-h3-eight-devices-single-node.json` places the same components on eight devices of one host, so it needs no launcher and starts exactly like the four-device file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with eight encoder ranks, one per media unit of a round, and a muxer rank.
+### Replicas
 
-`configs/minimax-h3-eight-devices-gather.json` uses the same single-host placement with eight-way all-gather sequence parallelism in place of Ulysses: each rank attends its own query rows to the complete gathered keys and values, and every rank holds the complete denoiser weights.
+A replica is a complete denoiser, video decoder and audio decoder that serves one request at a time. `ulysses4x2.json` and `ulysses4x2-two-node.json` run two four-GPU Ulysses replicas, each with its own TP4 text encoder; `dp8-text-tp8.json` runs eight one-GPU replicas that share one TP8 text encoder. The scheduler selects one flow replica when it admits a request, keeps that request on the same replica through latent preparation, denoising, and device decoding, and accounts its request rows, product buffers, queue, and execution lane in that worker's address space. Replica capacities add; a shared component remains an independently bounded stage of the route.
 
-## Data parallel serving
+Each GPU decoder has one native media unit per rank, so a one-GPU flow replica reconstructs an eight-unit request in eight bounded decode rounds, and its units reach the encoder one at a time. Each request is therefore bound to one single-rank encoder worker, chosen at admission, and the eight encoder workers encode eight requests' units concurrently. Audio encoding and MP4 assembly run on the one muxer worker, serialized per request because they are short relative to denoising and need one ordered artifact owner.
 
-The single-node DP8 deployment uses eight independent one-GPU flow workers instead of one eight-rank Ulysses worker. Each flow worker owns a complete denoiser, video decoder, and audio decoder, so eight requests can denoise and decode concurrently without a collective between GPUs. The scheduler selects one flow replica when it admits a request, keeps that request on the same replica through latent preparation, denoising, and device decoding, and accounts its request rows, product buffers, queue, and execution lane in that worker's address space. Replica capacities add; a shared component remains an independently bounded stage of the route.
+The queue depths are capacity values. A resident media request slot occupies three positions of its worker's batch queue, one reserved pipeline position and two unresolved outputs, and every flow worker must expose at least two resident slots, so each flow worker uses depth 6. In `dp8-text-tp8.json` the shared TP8 text worker and the muxer worker use depth 24 for eight slots, and each encoder worker uses depth 6 for two, so the narrowest aggregate component capacity is eight complete routes.
 
-The NVFP4 checkpoints are the intended DP8 weights on 96 GB devices, where dense BF16 denoiser replication is not expected to fit. On H200 the dense checkpoint also serves the five-second, 1000-token DP8 workload; see [H200 measurements](#h200-measurements). Start with the shared-TP8 conditioning layout:
+The `memory_fraction` on each GPU worker is its per-process static storage ceiling. It bounds everything the process holds on the device as NVML reports it per process: the caching allocator's segments and graph pools, product arenas, communicator buffers, captured graph executables, loaded kernels and the CUDA context. NVML must therefore list the worker's process ID, which requires the host's process ID namespace. Text and flow workers share every GPU, so neither inherits the global `--mem-fraction-static` default: the replica files grant 0.26 to each text rank and 0.73 to each flow rank, and `dp8-text-tp8.json` grants 0.18 and 0.81. The physical free-storage check still caps their combined allocations. The DP8 split holds a five-second duration and 1024-token prompt capacity; revalidate it when checkpoint precision, maximum duration, prompt bound, graph shapes, or hardware change, and adjust the text and flow fractions together.
 
-```bash
-uniserve serve "$H3_MODEL" \
-  --workers configs/minimax-h3-dp8-text-tp8.json \
-  --served-model-name FastH3 \
-  --host 0.0.0.0 \
-  --max-running-requests 8
-```
+DP improves throughput only when the offered concurrency keeps multiple replicas occupied. At concurrency one, Ulysses retains lower latency because all GPUs cooperate on one denoising call; at higher concurrency, replicas remove that per-step collective and keep queueing behind one request from dominating service time.
 
-The two supplied placements isolate the main topology choices:
-
-| Deployment | Text encoder | Denoiser and device decode | CPU post-processing | Intended use |
-| --- | --- | --- | --- | --- |
-| `minimax-h3-dp8-text-tp8.json` | One TP8 worker shared by all requests | Eight complete one-GPU replicas | Eight one-rank encoder workers and one muxer worker | Lower text-weight storage per GPU and the conservative starting point; conditioning is one shared stage and its TP collective spans all devices. |
-| `minimax-h3-dp8-text-tp4x2.json` | Two TP4 replicas, one on devices 0–3 and one on devices 4–7 | Eight complete one-GPU replicas | The same encoder and muxer workers | Two conditioning requests can run concurrently and each collective stays within a four-GPU island, at the cost of a larger text shard on every GPU. |
-
-`configs/minimax-h3-dp8-text-tp8-two-node.json` extends the shared-TP8 layout across two four-GPU hosts. The text collective spans both hosts, each host owns four one-GPU flow replicas, and each host holds the four one-rank encoder workers that serve its flow replicas, with the muxer worker on `rank-0`. A request is routed to an encoder on its flow replica's host, so every decoded unit is borrowed in place from shared storage; only the encoded unit rows, a fraction of a raw unit, cross to the muxer. Start it with the same head-plus-`uniserve-host` procedure as the two-host Ulysses placement above.
-
-Each GPU decoder has one native media unit per rank, so a one-GPU flow replica reconstructs an eight-unit request in eight bounded decode rounds, and its units reach the encoder one at a time. Each request is therefore bound to one single-rank encoder worker on its replica's host, chosen at admission, and the eight encoder workers encode eight requests' units concurrently. Audio encoding and MP4 assembly run on the one muxer worker, serialized per request because they are short relative to denoising and need one ordered artifact owner.
-
-The queue depths are intentional capacity values. A resident media request slot occupies three positions of its worker's batch queue, one reserved pipeline position and two unresolved outputs, and every flow worker must expose at least two resident slots, so each one-GPU flow uses depth 6. The shared TP8 text worker uses depth 24 for eight slots; each of the two TP4 text workers uses depth 12 for four slots. The muxer worker also uses depth 24 so its shared request-row bank exposes eight slots, and each encoder worker uses depth 6 for two. The narrowest aggregate component capacity is therefore eight complete routes in either deployment.
-
-The `memory_fraction` on each GPU worker is its per-process static storage ceiling. It bounds everything the process holds on the device as NVML reports it per process: the caching allocator's segments and graph pools, product arenas, communicator buffers, captured graph executables, loaded kernels and the CUDA context. NVML must therefore list the worker's process ID, which requires the host's process ID namespace. A text worker and a flow worker intentionally share every GPU, so neither inherits the global `--mem-fraction-static` default. Both supplied layouts grant 0.18 to each text rank and 0.81 to each flow replica; the physical free-storage check still caps their combined allocations. On 96 GB RTX PRO 6000 devices, the TP8 layout retained 5.5 GiB or more at the measured concurrency-eight peak. TP4×2 reached 97,244 MiB on the two GPUs holding text rank 0, leaving only 100 MiB; it is a measured maximum-throughput option, not the production default. Treat the supplied split as part of the five-second, 1000-token deployment contract and revalidate it when checkpoint precision, maximum duration, prompt bound, graph shapes, or hardware change.
-
-DP improves throughput only when the offered concurrency keeps multiple replicas occupied. At concurrency one, Ulysses can retain lower latency because all GPUs cooperate on one denoising call; at concurrency eight, DP removes that per-step collective and keeps queueing behind one request from dominating service time. Compare the layouts with the same checkpoint, prompts, duration, graph warmup, and concurrency rather than comparing an uncaptured first request with steady state.
-
-The `fast_h3_dp8` evaluation suite fixes that comparison protocol for the packed four-step checkpoint. It first runs the existing eight-way Ulysses placement with its two latency-oriented resident slots, then the shared-TP8 and replicated-TP4 DP8 placements. All three points use the same checkpoint and eight GPUs, 16 measured requests at concurrency eight after eight warmup requests, five-second outputs, 1000-token prompts, and the same seeds. The Ulysses worker keeps a 0.93 static ceiling; the DP workers use the explicit per-process ceilings validated above because independent text and flow processes share each device.
-
-The reference RTX PRO 6000 Blackwell Server Edition run completed all 16 measured requests in every point and validated every output as 1344×768 H.264 video with stereo 32-kHz AAC audio. The shared-TP8 DP8 layout is the recommended deployment because it more than doubles throughput over Ulysses while retaining useful GPU memory headroom. TP4×2 is 17.1% faster than TP8 in this workload, but its 100 MiB minimum headroom is too small for a general production recommendation.
-
-| Deployment | Videos/s | Video latency p50 | Video latency p95 | Peak single-GPU memory | Change from Ulysses |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Ulysses8 | 0.1235 | 64.221 s | 64.661 s | 45,799 MiB | Control |
-| DP8 + text TP8 | 0.2602 | 28.236 s | 31.552 s | 91,726 MiB | 2.108× throughput; 56.0% lower p50 |
-| DP8 + text TP4×2 | 0.3048 | 26.007 s | 26.346 s | 97,244 MiB | 2.469× throughput; 59.5% lower p50 |
-
-Resolve the commands and paths before starting the serial artifact-producing run:
-
-```bash
-.venv/bin/uniserve-eval --config uniserve_eval/profiles.toml plan fast_h3_dp8
-.venv/bin/uniserve-eval --config uniserve_eval/profiles.toml run fast_h3_dp8
-```
-
-The `fast_h3_pareto_ulysses4`, `fast_h3_pareto_dp4`, `fast_h3_pareto_ulysses8`, and `fast_h3_pareto_dp8` suites sweep concurrency 1/2/4 and, for eight GPUs, 8. They use two excluded warmups and 16 measured five-second/1000-token requests per point. Run the points serially against their matching placement; the suite fixes request data and metrics, while the deployment command fixes whether the point is Ulysses or data parallel.
-
-Ulysses shards the merged query, key, value and gate weights by attention head while retaining the other denoiser weights on every rank. A rank's residency can exceed the default `--mem-fraction-static` on a 96 GB device at the default `--max-video-seconds 15` and `--max-model-len 16384`. Raise the fraction, or shard the denoiser further with `"tensor_parallel_size"`, if that deployment refuses to start with a static storage grant error. For DP8, adjust the text and flow workers' explicit `memory_fraction` values together instead of raising the global default.
+Ulysses shards the merged query, key, value and gate weights by attention head while retaining the other denoiser weights on every rank. A rank's residency can exceed the default `--mem-fraction-static` of 0.70 on a 96 GB or 141 GB device at the default `--max-video-seconds 15` and `--max-model-len 16384`. Raise the fraction, or shard the denoiser further with `"tensor_parallel_size"`, if a deployment refuses to start with a static storage grant error.
 
 Cross-rank products move over the mechanism named for that edge. CUDA VMM reads inspect the visible CUDA peer topology: a consumer with direct access maps the allocation on its destination GPU, while a consumer outside the producer's peer set maps it on the source GPU and uses CUDA's host-staged cross-device copy. The choice depends on the runtime topology rather than the accelerator model. `--transfer model->model=shm` remains available when an operator wants to force host staging for every model-worker product.
 
 A FastH3 deployment defaults to `--max-video-seconds 15` and `--max-model-len 16384`; set them only to change those limits. `--max-running-requests` caps concurrently resident requests, and the engine clamps that cap to the worker's advertised request-slot capacity; lowering it trades throughput for per-request latency and storage headroom.
 
-Startup prepares every computation an admitted request reaches. The denoiser is prepared for each of the 16 output frame counts up to `--max-video-seconds`, at every text capacity: `--video-text-capacities` lists those capacities in prompt tokens (default: 1024, then steps of 2048 up to `--max-model-len`), and a request evaluates in the smallest capacity that holds its prompt. The text encoder and the text refiner are prepared at every text capacity, and the video and audio decoders at every admitted duration. With graphs enabled (`--graph-policy auto`, the default, or `full`), startup captures one denoising graph per layout and every text-encoding and decoding call before the server reports ready, and accepted requests replay them: serving never captures and never falls back to eager execution. A layout's graph evaluates any of the eight solver steps, because the step index, the timesteps and the schedule are inputs each replay copies in. The video post-processor, which converts decoded frames for encoding, runs eagerly by design. The denoiser's layouts share one workspace and one graph pool, so its resident memory follows the largest layout rather than their count, while startup time grows with the count; fewer capacities start faster, and finer ones pad shorter prompts less. Decoder graphs keep one output per duration, so decoder memory grows with `--max-video-seconds`. With the default settings on four GB200 devices (`configs/minimax-h3-four-devices.json`), startup captures 144 denoising graphs, one per layout, and the server becomes ready in about 11 minutes; about 6 of them prepare the denoiser, almost all running one warm step per layout and about one minute capturing. Each device then reserves about 87 GiB, about 32 GiB of it in graph storage. A deployment whose startup storage does not fit its devices fails before it reports ready; the startup log lists the bytes each process holds on each device, the caching allocator's share of them, and the graph storage of each component. `--graph-policy off` serves the same layouts without graphs.
+Startup prepares every computation an admitted request reaches. The denoiser is prepared for each of the 16 output frame counts up to `--max-video-seconds`, at every text capacity: `--video-text-capacities` lists those capacities in prompt tokens (default: 1024, then steps of 2048 up to `--max-model-len`), and a request evaluates in the smallest capacity that holds its prompt. The text encoder and the text refiner are prepared at every text capacity, and the video and audio decoders at every admitted duration. With graphs enabled (`--graph-policy auto`, the default, or `full`), startup captures one denoising graph per layout and every text-encoding and decoding call before the server reports ready, and accepted requests replay them: serving never captures and never falls back to eager execution. A layout's graph evaluates any of the eight solver steps, because the step index, the timesteps and the schedule are inputs each replay copies in. The video post-processor, which converts decoded frames for encoding, runs eagerly by design. The denoiser's layouts share one workspace and one graph pool, so its resident memory follows the largest layout rather than their count, while startup time grows with the count; fewer capacities start faster, and finer ones pad shorter prompts less. Decoder graphs keep one output per duration, so decoder memory grows with `--max-video-seconds`. With the default settings on four GB200 devices (`configs/fast_h3/ulysses4.json`), startup captures 144 denoising graphs, one per layout, and the server becomes ready in about 11 minutes; about 6 of them prepare the denoiser, almost all running one warm step per layout and about one minute capturing. Each device then reserves about 87 GiB, about 32 GiB of it in graph storage. A deployment whose startup storage does not fit its devices fails before it reports ready; the startup log lists the bytes each process holds on each device, the caching allocator's share of them, and the graph storage of each component. `--graph-policy off` serves the same layouts without graphs.
 
 Check the live limits and served model name after startup:
 
@@ -173,7 +163,7 @@ docker run --rm \
   -p 8000:8000 \
   -v "$H3_MODEL:/models/fast_h3:ro" \
   uniserve-h3 serve /models/fast_h3 \
-    --workers configs/minimax-h3-four-devices.json \
+    --workers configs/fast_h3/ulysses4.json \
     --served-model-name FastH3 \
     --host 0.0.0.0 \
     --max-running-requests 2
@@ -249,27 +239,42 @@ The four tiers above are runtime dynamic-quantization presets for dense checkpoi
 
 Both published packed checkpoints quantize their calibrated denoiser MLP projections and Video VAE Transformer projections to NVFP4 and retain the BF16 text encoder. The stored tensors are the contract: exactly the Linears whose weights are packed run in NVFP4, every other module runs in BF16 with FP32 decoders and latent heads, and loading refuses a ModelOpt recipe other than static NVFP4 weights and activations with 16-element blocks.
 
-On four GB200 devices, the packed 8-Step V2 checkpoint serves every measured duration and prompt length faster than any runtime tier applied to the dense 8-Step V2 checkpoint, and at lower peak device memory. Measurements outside that hardware and workload require their own run.
-
 ```bash
-uniserve serve skx618/FastVideo-FastH3-8-Step-V2-NVFP4 \
-  --workers configs/minimax-h3-four-devices.json \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4 \
+  --workers configs/fast_h3/ulysses4.json \
   --served-model-name FastH3
 ```
 
 ## Hopper
 
-The BF16 checkpoints run on Hopper in the default `quality` precision. Hopper computes BF16, FP16, and FP8; NVFP4 and MXFP8 need Blackwell tensor cores, so the `balanced`, `performance`, and `maximum` tiers and the packed `skx618` checkpoints do not run there. FP8 denoiser MLPs are available as a component override:
+The BF16 checkpoints run on Hopper in the default `quality` precision. Hopper computes BF16, FP16, and FP8; NVFP4 and MXFP8 need Blackwell tensor cores, so the `balanced`, `performance`, and `maximum` tiers and the NVFP4 checkpoints do not run there. FP8 denoiser MLPs are available as a component override:
 
 ```bash
 --quantization-config '{"components":{"mlp":"fp8"}}'
 ```
 
-Four H200s serving the dense checkpoint with 15-second capacity, text capacities 1024 and 16384, and two request slots need `--mem-fraction-static 0.92`: the default 0.80 grant does not hold the BF16 weights and full-duration decoder graphs.
+H200 deployments at 15-second capacity use `--mem-fraction-static 0.92`: the default 0.70 grant does not hold the BF16 weights and full-duration decoder graphs.
 
-### H200 measurements
+## Reproduce the measurements
 
-These points use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, the repository's `minimax-h3` dataset with seed 1000, full graphs, and `--mem-fraction-static 0.92`. Latency is the mean ± SD of three complete MP4 requests at concurrency one after one warmup. The DP8 points use eight warmups and 16 measured requests at concurrency eight, with the 0.18 text and 0.81 flow grants of `configs/minimax-h3-dp8-text-tp8.json`.
+The evaluator runs the published workloads against the deployments above and validates every MP4. Run points serially, one server at a time, from the repository root. Each run writes its resolved commands, request data, per-request latencies, media validation and GPU memory observations under `artifacts/fast_h3/`.
+
+### UniServe FastH3 post
+
+`uniserve_eval/fast_h3.toml` holds the post's deployments and workload: 72 latency requests one at a time, 12 for each combination of a 5, 10 or 15 second clip and a 1000- or 10000-token prompt, and 32 throughput requests at each concurrency after a priming phase, all preceded by six unmeasured warmup requests. The request manifests are in `uniserve_eval/workloads/fast_h3/`. One suite covers each hardware configuration and checkpoint: `gb200-4-bf16`, `gb200-4-nvfp4`, `gb200-8-bf16`, `gb200-8-nvfp4`, `rtx-pro-6000-8-bf16`, and `rtx-pro-6000-8-nvfp4`.
+
+```bash
+export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
+export UNISERVE_FAST_H3_NVFP4_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4
+.venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml plan gb200-4-bf16
+.venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
+```
+
+The `gb200-8` suites start the head on `rank-0`; start `uniserve-host` on `rank-1` with the address the head logs, as in [Two hosts](#two-hosts), once for each server the suite starts.
+
+### H200
+
+`uniserve_eval/fast_h3_h200.toml` holds the H200 measurements below. They use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, the evaluator's synthesized `minimax-h3` prompts with seed 1000, full graphs, and `--mem-fraction-static 0.92`. Latency is the mean ± SD of three complete MP4 requests at concurrency one after one warmup. The DP8 points use eight warmups and 16 measured requests at concurrency eight.
 
 Eight-H200 Ulysses in `quality` precision:
 
@@ -288,12 +293,12 @@ Eight-H200 Ulysses in `quality` precision:
 | DP8 + text TP8 | `quality` | 5 s, 1000 tokens, concurrency 8 | 0.1519 videos/s, 52.231 ± 0.358 s, 90,329 MiB peak per GPU |
 | DP8 + text TP8 | FP8 MLPs | 5 s, 1000 tokens, concurrency 8 | 0.1676 videos/s, 47.314 ± 0.386 s, 81,531 MiB peak per GPU |
 
-`uniserve_eval/hopper.toml` fixes each protocol. Run the points serially; the `hopper-ulysses8` suite reproduces the first table, and the `hopper` and `hopper-fp8` suites and the `hopper-gather8-5s-10k` and `hopper-dp8-5s-1k` points reproduce the second. Results land under `artifacts/hopper/measurements/`:
+The `h200-ulysses8` suite reproduces the first table; the `h200-ulysses4` and `h200-fp8` suites and the `h200-gather8-5s-10k` and `h200-dp8-5s-1k` points reproduce the second:
 
 ```bash
-export UNISERVE_MINIMAX_H3_MODEL="$H3_MODEL"
-.venv/bin/uniserve-eval --config uniserve_eval/hopper.toml plan hopper-ulysses8
-.venv/bin/uniserve-eval --config uniserve_eval/hopper.toml run hopper-ulysses8 --reuse-deployment
+export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
+.venv/bin/uniserve-eval --config uniserve_eval/fast_h3_h200.toml plan h200-ulysses8
+.venv/bin/uniserve-eval --config uniserve_eval/fast_h3_h200.toml run h200-ulysses8 --reuse-deployment
 ```
 
 ## Troubleshooting

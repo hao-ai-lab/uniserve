@@ -6,7 +6,6 @@ import io
 import json
 import os
 import sys
-from dataclasses import replace
 from itertools import zip_longest
 from pathlib import Path
 
@@ -23,9 +22,14 @@ from tests.python.e2e.http_helpers import (
     server_process,
     written_deployment,
 )
-from uniserve_eval.config import load_config
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
 from uniserve_eval.transport.video import inspect_video_bytes
+from uniserve_eval.types import (
+    BenchmarkPoint,
+    LoadConfig,
+    TaskName,
+    VideoConfig,
+)
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
 
@@ -421,13 +425,19 @@ def test_component_bindings_release_cancelled_requests(
         json.dumps({"mode": precision}),
     ]
     tokenizer = AutoTokenizer.from_pretrained(Path(model_value) / "tokenizer")
-    point = load_config().benchmarks["minimax-h3-5s-1k"]
     payloads = []
     for seconds, tokens, _frames in shapes:
-        case = replace(
-            point,
-            load=replace(point.load, num_prompts=1),
-            video=replace(point.video, seconds=seconds, prompt_tokens=tokens),
+        # The evaluator's FastH3 prompt synthesis yields exactly `tokens`
+        # prompt tokens, so each request lands in its intended text capacity.
+        case = BenchmarkPoint(
+            name="fast-h3-prompt",
+            server="uniserve",
+            task=TaskName.VIDEO,
+            model="FastH3",
+            dataset="minimax-h3",
+            metrics=(),
+            load=LoadConfig(num_prompts=1),
+            video=VideoConfig(seconds=seconds, prompt_tokens=tokens),
         )
         prompt = MiniMaxH3Dataset(case).load(tokenizer)[0].prompt
         payloads.append(
@@ -518,7 +528,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     deployment = (
         Path(__file__).resolve().parents[3]
         / "configs"
-        / "minimax-h3-four-devices.json"
+        / "fast_h3"
+        / "ulysses4.json"
     )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"

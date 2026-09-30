@@ -7,69 +7,51 @@ from pathlib import Path
 
 import pytest
 
+import uniserve_eval
 from uniserve_eval.config import load_config
 
 pytestmark = pytest.mark.unit
 
 
-def test_fast_h3_serves_the_deployment_configuration_it_is_given(
-    monkeypatch,
+# Profiles shipped beside the evaluator; each runs from the repository root.
+_SHIPPED = sorted(
+    path
+    for path in Path(uniserve_eval.__file__).parent.glob("*.toml")
+    if path.name != "pyproject.toml"
+)
+
+
+@pytest.mark.parametrize("profile", _SHIPPED, ids=lambda path: path.name)
+def test_shipped_profiles_name_deployments_and_workloads_that_exist(
+    profile: Path,
 ) -> None:
-    """A width is a deployment, so serving another one names another file."""
-    monkeypatch.setenv(
-        "UNISERVE_H3_DEPLOYMENT", "configs/minimax-h3-two-devices.json"
-    )
-    monkeypatch.setenv("UNISERVE_H3_CUDA_VISIBLE_DEVICES", "0,1")
-    monkeypatch.setenv("UNISERVE_H3_MEM_FRACTION", "0.99")
-    monkeypatch.setenv("UNISERVE_H3_QUANT_MODE", "performance")
+    """Every deployment and request manifest a shipped point uses exists."""
+    config = load_config(profile)
 
-    server = load_config().servers["minimax-h3"]
-    deployment = server.command.index("--workers") + 1
-    fraction_value = server.command.index("--mem-fraction-static") + 1
-    precision_value = server.command.index("--quantization-config") + 1
+    for name, server in config.servers.items():
+        if "--workers" not in server.command:
+            continue
+        deployment = (
+            config.root / server.command[server.command.index("--workers") + 1]
+        )
+        assert deployment.is_file(), f"{name} names {deployment}"
+        workers = json.loads(deployment.read_text())
+        assert workers and all(worker["components"] for worker in workers)
 
-    assert server.command[deployment] == "configs/minimax-h3-two-devices.json"
-    assert server.command[fraction_value] == "0.99"
-    assert json.loads(server.command[precision_value]) == {
-        "mode": "performance"
-    }
-    assert server.environment["CUDA_VISIBLE_DEVICES"] == "0,1"
-
-
-def test_fast_h3_defaults_to_the_four_device_deployment(monkeypatch) -> None:
-    monkeypatch.delenv("UNISERVE_H3_DEPLOYMENT", raising=False)
-
-    config = load_config()
-    server = config.servers["minimax-h3"]
-    deployment = server.command.index("--workers") + 1
-
-    named = config.root / server.command[deployment]
-    assert named.is_file(), f"{named} is the default deployment and must exist"
-    # The numerical components run on the model worker's devices; the host
-    # components encode and mux on a host rank.
-    workers = {
-        worker["id"]: sorted(worker["components"])
-        for worker in json.loads(named.read_text())
-    }
-    assert workers == {
-        "model": ["audio_decoder", "denoiser", "text_encoder", "video_decoder"],
-        "host": ["muxer", "video_encoder"],
-    }
-    host = next(
-        worker
-        for worker in json.loads(named.read_text())
-        if worker["id"] == "host"
-    )
-    assert all(rank["device"] == "cpu" for rank in host["ranks"])
-
-
-def test_fast_h3_server_defaults_to_balanced_precision(monkeypatch) -> None:
-    monkeypatch.delenv("UNISERVE_H3_QUANT_MODE", raising=False)
-
-    server = load_config().servers["minimax-h3"]
-    precision_value = server.command.index("--quantization-config") + 1
-
-    assert json.loads(server.command[precision_value]) == {"mode": "balanced"}
+    for name, point in config.benchmarks.items():
+        manifests = (
+            point.dataset_path,
+            point.load.warmup_manifest,
+            point.load.priming_manifest,
+        )
+        for manifest in filter(None, manifests):
+            assert (config.root / manifest).is_file(), (
+                f"{name} names {manifest}"
+            )
+        if point.dataset == "jsonl":
+            rows = (config.root / point.dataset_path).read_text().splitlines()
+            measured = sum(1 for row in rows if row.strip())
+            assert measured >= point.load.num_prompts, name
 
 
 def test_toml_rejects_an_unknown_benchmark_field(tmp_path: Path) -> None:
