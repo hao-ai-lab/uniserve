@@ -14,9 +14,10 @@ from ._rows import _Rows
 
 
 class Operator:
-    """One call site's plans, borrowed scratch and per-scale row producers.
+    """One numerical signature's plans, scratch and per-scale row producers.
 
-    Block IDs remain live inputs. A concrete operator supplies ``kernel``, the
+    Serialized call sites may share an operator; block IDs remain live inputs.
+    A concrete operator supplies ``kernel``, the
     block-64 numerical call ``kernel(q, k, v, out, indices, counts,
     valid_sizes, scale=...)`` that evaluates complete calls, and may supply a
     different ``row_kernel`` for row production.

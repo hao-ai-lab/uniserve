@@ -205,6 +205,9 @@ class ExecutionContext(Generic[SizeT]):
         self._merged: dict[int | _binding.MergedKey, MatmulBinding] = {}
         self._attention: dict[int, AttentionBinding] = {}
         self._vsa: dict[int, VsaBinding] = {}
+        # VSA plans depend on numerical shapes, not on layer weights. Keep
+        # one operator per signature across this context's serialized layers.
+        self._vsa_operators = {}
         self._vsa_output: dict[ParallelAttention, OutputBuffers] = {}
         self._vsa_context: dict[ParallelAttention, AttentionBuffers] = {}
         self._context_backing: dict[tuple[object, ...], AttentionBuffers] = {}
@@ -527,6 +530,7 @@ class ExecutionContext(Generic[SizeT]):
                         self._attention_workspace,
                         partial(self._vsa_buffers, vsa_slot % 2),
                         self._vsa_exchange,
+                        self._vsa_operators,
                     )
                     vsa_slot += 1
 
@@ -692,6 +696,7 @@ class ExecutionContext(Generic[SizeT]):
             close_resources(
                 *(binding.close for binding in self._attention.values()),
                 *(binding.close for binding in self._vsa.values()),
+                *(operator.close for operator in self._vsa_operators.values()),
                 *(
                     allocation.close
                     for allocation in reversed(self._allocations)
@@ -709,6 +714,7 @@ class ExecutionContext(Generic[SizeT]):
                 self._merged,
                 self._attention,
                 self._vsa,
+                self._vsa_operators,
                 self._vsa_output,
                 self._vsa_context,
                 self._context_backing,

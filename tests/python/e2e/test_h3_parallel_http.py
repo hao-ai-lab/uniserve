@@ -511,6 +511,10 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
             "directory; docs/fast_h3/fast_h3.md lists them"
         )
+    inference = json.loads(
+        (Path(model) / "fastvideo_inference.json").read_text()
+    )
+    expected_steps = len(inference["dmd_denoising_steps"])
     deployment = (
         Path(__file__).resolve().parents[3]
         / "configs"
@@ -534,6 +538,10 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         # duration.
         "--video-text-capacities",
         "1024,16384",
+        # Full-duration decoder graphs need a larger static grant on H200
+        # alongside BF16 weights and two resident request slots.
+        "--mem-fraction-static",
+        "0.92",
         "--graph-policy",
         "full",
     ]
@@ -590,7 +598,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         job = completed(client, job_id)
         assert job["seconds"] == 5 and job["num_frames"] == 124
         assert job["actual_seconds"] == 124 / 24
-        assert job["completed_steps"] == job["total_steps"] == 4
+        assert job["completed_steps"] == job["total_steps"] == expected_steps
         assert job["expires_at"] > job["completed_at"]
         assert job_id in {
             item["id"] for item in client.get("/v1/videos").json()["data"]

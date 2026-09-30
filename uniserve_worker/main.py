@@ -5,9 +5,9 @@ The Rust launchers (the engine's worker process launcher and the
 ``python -m uniserve_worker.main`` with the arguments
 `uniserve_worker.bootstrap.cli.parse_worker_args` reads; the
 ``uniserve-worker`` console script runs the same ``main``. This module owns
-only process-level concerns: logging setup, signal-triggered traceback dumps,
-and the exit status; `uniserve_worker.bootstrap.launch.run_worker` builds and
-serves the rank.
+only process-level concerns: CUDA loading policy, logging setup,
+signal-triggered traceback dumps, and the exit status;
+`uniserve_worker.bootstrap.launch.run_worker` builds and serves the rank.
 """
 
 from __future__ import annotations
@@ -19,13 +19,12 @@ import signal
 import sys
 
 from uniserve_worker.bootstrap.cli import parse_worker_args
-from uniserve_worker.bootstrap.launch import run_worker
 
 logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    """Configure diagnostics and run the worker.
+    """Configure CUDA loading and diagnostics, then run the worker.
 
     The worker runs until shutdown or interruption.
     """
@@ -35,6 +34,17 @@ def main() -> None:
     )
     _install_fault_dump_handlers()
     process_args = parse_worker_args()
+    if str(process_args.execution.device).startswith("cuda"):
+        # Lazy loading defers a module's load, which can synchronize the CUDA
+        # context, to its first kernel launch. A launch concurrent with a
+        # collective that waits on peers can then deadlock; NVIDIA's lazy
+        # loading guide names eager loading as a remedy. Module data
+        # loading inherits this mode. The driver reads it at initialization,
+        # so it precedes the execution stack's imports. An explicit
+        # ``CUDA_MODULE_LOADING`` takes precedence.
+        os.environ.setdefault("CUDA_MODULE_LOADING", "EAGER")
+
+    from uniserve_worker.bootstrap.launch import run_worker
 
     # Both exception paths end the process with ``os._exit``, which skips
     # interpreter shutdown and the ``finally`` clause below; that clause logs

@@ -26,8 +26,9 @@ slices the output of its whole-domain attention launch in the same order. In
 head-major storage each segment is itself head-major. With one owner and a
 single segment the Q order equals the row order.
 
-Extents, offsets and strides are ``tl.constexpr`` kernel arguments, so every
-distinct combination compiles and caches its own kernel specialization.
+Shapes and strides specialize the kernels. Input preparation receives the
+interval's row offset at runtime, so intervals of the same numerical shape
+reuse a compiled kernel while each graph node retains its actual offset.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ _TILE = 64
 
 if triton is not None:
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["row_start"])
     def _pack_masked_qkv_kernel(
         query,
         key,
@@ -61,7 +62,7 @@ if triton is not None:
         value_stride_head: tl.constexpr,
         rows: tl.constexpr,
         input_rows: tl.constexpr,
-        row_start: tl.constexpr,
+        row_start,
         heads: tl.constexpr,
         width: tl.constexpr,
         tile_rows: tl.constexpr,
@@ -174,7 +175,7 @@ if triton is not None:
             mask=row_mask,
         )
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["row_start"])
     def _prepare_masked_qkv_kernel(
         query,
         key,
@@ -202,8 +203,7 @@ if triton is not None:
         pooled_stride_tile: tl.constexpr,
         pooled_stride_head: tl.constexpr,
         rows: tl.constexpr,
-        row_start: tl.constexpr,
-        tile_offset: tl.constexpr,
+        row_start,
         heads: tl.constexpr,
         width: tl.constexpr,
         half_rotary: tl.constexpr,
@@ -215,8 +215,8 @@ if triton is not None:
     ):
         """Normalize, rotate, pool and pack one 64-row tile of one head.
 
-        Grid: one program per (interval tile, head). ``tile_offset`` is the
-        packed tile of the interval's first row; ``tile_offset + tile``
+        Grid: one program per (interval tile, head). The first packed tile
+        comes from ``row_start // tile_rows``; adding the interval tile
         indexes ``valid_sizes`` and the pooled outputs.
 
         Q and K are RMS-normalized in fp32 over the full head and their even
@@ -238,6 +238,10 @@ if triton is not None:
         """
         tile = tl.program_id(0)
         head = tl.program_id(1)
+        # Public preparation accepts whole tiles. Keep that alignment while
+        # sharing code across offsets instead of compiling each interval.
+        row_start = tl.multiple_of(row_start, tile_rows)
+        tile_offset = row_start // tile_rows
         half_width: tl.constexpr = width // 2
         rotary_dim: tl.constexpr = 2 * half_rotary
         tail_half: tl.constexpr = half_width - half_rotary
@@ -781,7 +785,6 @@ def prepare_sparse_input_rows(
         int(pooled_query.stride(1)),
         rows,
         row_start,
-        row_start // _TILE,
         heads,
         width,
         half_rotary,

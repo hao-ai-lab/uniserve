@@ -1,4 +1,4 @@
-"""VSA operators and projected input backing for one layer call site."""
+"""Shared VSA numerical plans and projected backing for a layer call site."""
 
 from __future__ import annotations
 
@@ -8,19 +8,22 @@ from . import capturing
 
 
 class VsaBinding:
-    """Own one VSA call site's plans and packed input backing.
+    """Borrow the context's VSA plans and retain call-site input backing.
 
-    Own one VSA call site's plans, mutable query maps, and packed input
-    backing.
+    Every operator is bound only to numerical dimensions and a block-count
+    pattern. Serialized layers with the same signature can share its plans;
+    the live block maps and projected rows remain inputs of each invocation.
     """
 
-    def __init__(self, backend, transient, scratch, shared_buffers, exchange):
+    def __init__(
+        self, backend, transient, scratch, shared_buffers, exchange, operators
+    ):
         # ``transient(role, requirements, device)`` lends the context's
         # shared per-call work areas (``ExecutionContext.scratch``);
         # ``scratch`` allocates the operators' own workspace.
         self.backend, self.transient, self.scratch = backend, transient, scratch
         self._shared_buffers, self.exchange = shared_buffers, exchange
-        self.operators, self._buffers = {}, {}
+        self.operators, self._buffers = operators, {}
 
     def prepare(self, pattern, q):
         key = (q.device, q.dtype, q.shape[1], q.shape[2], pattern)
@@ -65,7 +68,6 @@ class VsaBinding:
         return self._buffers[key]
 
     def close(self):
-        for operator in self.operators.values():
-            operator.close()
-        self.operators.clear()
+        # The execution context retires shared operators once every call site
+        # and graph has finished borrowing them.
         self._buffers.clear()

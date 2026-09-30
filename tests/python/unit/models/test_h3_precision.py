@@ -50,8 +50,8 @@ def test_serving_tiers_expand_to_the_public_precision_contract(
     assert _format(config, f"{decoder}.decoder.layers.0.qkv") == video_vae
 
 
-def test_default_precision_is_balanced():
-    assert weight_config() == weight_config(preset="balanced")
+def test_default_precision_is_quality():
+    assert weight_config() == weight_config(preset="quality")
 
 
 @pytest.mark.parametrize(
