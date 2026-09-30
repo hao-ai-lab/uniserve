@@ -41,7 +41,14 @@ async def receive_video(
             guidance_scale=1.0,
             flow_shift=10.0,
             extra_params=json.dumps(
-                {"task": "t2va", "duration": seconds, "audio_flow_shift": 3.0}
+                {
+                    "task": "t2va",
+                    "duration": seconds,
+                    "audio_flow_shift": 3.0,
+                    # Configured serving options, such as preencode_mp4;
+                    # the configuration cannot restate the fields above.
+                    **request.video_extra_params,
+                }
             ),
         )
         # vLLM-Omni's native video endpoint consumes multipart form fields.
@@ -72,6 +79,9 @@ async def receive_video(
                 num_inference_steps=9,
                 flow_shift=10.0,
                 audio_flow_shift=3.0,
+                # Configured serving options, such as x264_preset; the
+                # configuration cannot restate the fields above.
+                **request.video_extra_params,
             )
         kwargs = {"json": payload}
     url = base_url.rstrip("/") + request.endpoint

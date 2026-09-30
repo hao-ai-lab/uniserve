@@ -248,6 +248,119 @@ def test_native_transport_waits_for_media_and_enforces_logical_deadline(
     asyncio.run(exercise())
 
 
+def test_vllm_omni_request_carries_configured_extra_params():
+    async def exercise():
+        sent = {}
+
+        async def handler(request):
+            message = BytesParser(policy=default).parsebytes(
+                b"Content-Type: "
+                + request.headers["content-type"].encode()
+                + b"\r\n\r\n"
+                + request.content
+            )
+            for part in message.iter_parts():
+                if part.get_param("name", header="content-disposition") == (
+                    "extra_params"
+                ):
+                    sent.update(json.loads(part.get_payload(decode=True)))
+            return httpx.Response(
+                200,
+                content=b"original bytes",
+                headers={"content-type": "video/mp4"},
+            )
+
+        config = point(
+            video=VideoConfig(
+                backend="vllm-omni", extra_params={"preencode_mp4": True}
+            )
+        )
+        request = VideoTask(config).build_request(
+            Example("row", "precise prompt", seconds=10, seed=11)
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            record = await send_request(
+                client, "http://backend", request, "row", task="video"
+            )
+        assert record.success
+        # The configured option joins the fields that fix the work.
+        assert sent == {
+            "task": "t2va",
+            "duration": 10.0,
+            "audio_flow_shift": 3.0,
+            "preencode_mp4": True,
+        }
+
+    asyncio.run(exercise())
+
+
+def test_sglang_request_carries_configured_extra_params():
+    async def exercise():
+        sent = {}
+
+        async def handler(request):
+            if request.method == "POST":
+                sent.update(json.loads(request.content))
+                return httpx.Response(
+                    200, json={"id": "job", "status": "completed"}
+                )
+            return httpx.Response(
+                200,
+                content=b"original bytes",
+                headers={"content-type": "video/mp4"},
+            )
+
+        config = replace(
+            point(
+                video=VideoConfig(
+                    backend="sglang",
+                    extra_params={
+                        "x264_preset": "ultrafast",
+                        "output_compression": 53,
+                    },
+                )
+            ),
+            endpoint="/v1/videos",
+        )
+        request = VideoTask(config).build_request(
+            Example("row", "precise prompt", seconds=10, seed=11)
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            record = await send_request(
+                client, "http://backend", request, "row", task="video"
+            )
+        assert record.success
+        # The configured options join the native fields that fix the work.
+        assert sent["x264_preset"] == "ultrafast"
+        assert sent["output_compression"] == 53
+        assert sent["task"] == "t2va"
+        assert sent["target"]["duration_seconds"] == 10
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "backend,extra_params,message",
+    [
+        ("fastvideo", {"preencode_mp4": True}, "only to sglang and vllm-omni"),
+        ("uniserve", {"preencode_mp4": True}, "only to sglang and vllm-omni"),
+        ("vllm-omni", {"duration": 5}, "duration"),
+        ("vllm-omni", {"task": "t2v"}, "task"),
+        ("sglang", {"target": {}}, "target"),
+        ("sglang", {"num_inference_steps": 4}, "num_inference_steps"),
+    ],
+)
+def test_video_extra_params_cannot_change_the_work_or_go_unsent(
+    backend, extra_params, message
+):
+    with pytest.raises(ValueError, match=message):
+        VideoConfig(backend=backend, extra_params=extra_params)
+
+
 @pytest.mark.parametrize("failed", [False, True])
 def test_async_job_failure_or_published_media_url_is_terminal(failed):
     async def exercise():
