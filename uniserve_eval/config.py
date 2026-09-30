@@ -589,6 +589,9 @@ def _video_config(raw: Any, context: str) -> VideoConfig:
         return VideoConfig()
     value = _mapping(raw, context)
     _reject_unknown(value, _VIDEO_FIELDS, context)
+    extra = value.get("extra_params", {})
+    if not isinstance(extra, dict):
+        raise ValueError(f"{context}.extra_params must be a table")
     return _build_settings(VideoConfig, value, context)
 
 

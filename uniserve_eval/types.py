@@ -162,13 +162,41 @@ class ImageConfig:
             raise ValueError("image_count must be positive")
 
 
+# Request fields that define the generated work, per backend accepting
+# configured serving options; the video task sets them from each request, so
+# configured options cannot.
+VIDEO_WORK_FIELDS = {
+    # Fields of vLLM-Omni's `extra_params` form field.
+    "vllm-omni": frozenset({"task", "duration", "audio_flow_shift"}),
+    # Top-level fields of SGLang's native JSON request.
+    "sglang": frozenset(
+        {
+            "model",
+            "prompt",
+            "seed",
+            "task",
+            "conditions",
+            "target",
+            "num_inference_steps",
+            "flow_shift",
+            "audio_flow_shift",
+        }
+    ),
+}
+
+
 @dataclass(frozen=True)
 class VideoConfig:
     """Configures generated duration and synthesized prompt length.
 
     ``seconds`` is the requested duration of rows without a per-row override.
     ``prompt_tokens`` is the tokenizer length of the prompts that
-    the MiniMax H3 dataset synthesizes.
+    the MiniMax H3 dataset synthesizes. ``extra_params`` adds serving options
+    to every request of a backend that accepts them: vLLM-Omni receives them
+    in its ``extra_params`` form field (for example ``{"preencode_mp4":
+    true}``), SGLang as additional JSON fields (for example ``{"x264_preset":
+    "ultrafast"}``). They may not restate the fields that fix the generated
+    work, and other backends refuse them rather than ignoring them.
     """
 
     seconds: float = 5.0
@@ -176,6 +204,7 @@ class VideoConfig:
     backend: str = "uniserve"
     poll_interval_s: float = 0.1
     media_dir: str | None = None
+    extra_params: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate finite duration and positive prompt length."""
@@ -187,6 +216,16 @@ class VideoConfig:
             raise ValueError("unknown video backend")
         if not math.isfinite(self.poll_interval_s) or self.poll_interval_s <= 0:
             raise ValueError("poll_interval_s must be finite and positive")
+        if self.extra_params and self.backend not in VIDEO_WORK_FIELDS:
+            raise ValueError(
+                "video extra_params apply only to "
+                f"{' and '.join(sorted(VIDEO_WORK_FIELDS))}"
+            )
+        fixed = VIDEO_WORK_FIELDS.get(self.backend, frozenset()) & set(
+            self.extra_params
+        )
+        if fixed:
+            raise ValueError(f"video extra_params may not set {sorted(fixed)}")
 
 
 @dataclass(frozen=True)
@@ -234,6 +273,7 @@ class TaskRequest:
     stream: bool
     video_backend: str | None = None
     poll_interval_s: float = 0.1
+    video_extra_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

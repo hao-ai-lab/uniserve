@@ -54,6 +54,7 @@ class VideoTask(BenchmarkTask):
             stream=False,
             video_backend=self.point.video.backend,
             poll_interval_s=self.point.video.poll_interval_s,
+            video_extra_params=dict(self.point.video.extra_params),
         )
 
     def inspect_output(self, record: RequestRecord) -> None:
