@@ -1,0 +1,347 @@
+# FastH3 on NVIDIA H200 GPUs: the deployments and workload of the H200
+# measurements in docs/fast_h3/fast_h3.md. UNISERVE_FAST_H3_MODEL names a
+# local copy of FastVideo/FastVideo-FastH3-8-Step-V2. BF16 servers select the
+# quality tier (BF16 transformer and text, FP16 video projections); FP8
+# servers override only the denoiser MLPs. Run points serially, one server at
+# a time.
+root = ".."
+artifact_root = "artifacts/fast_h3/h200"
+
+[servers.h200-ulysses4]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/fast_h3/ulysses4.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
+
+[servers.h200-ulysses4.environment]
+CUDA_VISIBLE_DEVICES = "0,1,2,3"
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "8"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.h200-ulysses4-5s-1k]
+server = "h200-ulysses4"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-ulysses4-5s-1k.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.h200-ulysses4-5s-1k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-ulysses4-5s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[suites.h200-ulysses4]
+points = ["h200-ulysses4-5s-1k"]
+
+[servers.h200-ulysses8]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/fast_h3/ulysses8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024,10240", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
+
+[servers.h200-ulysses8.environment]
+CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "8"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.h200-ulysses8-5s-1k]
+server = "h200-ulysses8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-ulysses8-5s-1k.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.h200-ulysses8-5s-1k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-ulysses8-5s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[benchmarks.h200-ulysses8-5s-10k]
+server = "h200-ulysses8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-ulysses8-5s-10k.video]
+seconds = 5.0
+prompt_tokens = 10000
+
+[benchmarks.h200-ulysses8-5s-10k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-ulysses8-5s-10k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[benchmarks.h200-ulysses8-10s-1k]
+server = "h200-ulysses8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-ulysses8-10s-1k.video]
+seconds = 10.0
+prompt_tokens = 1000
+
+[benchmarks.h200-ulysses8-10s-1k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-ulysses8-10s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[benchmarks.h200-ulysses8-10s-10k]
+server = "h200-ulysses8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-ulysses8-10s-10k.video]
+seconds = 10.0
+prompt_tokens = 10000
+
+[benchmarks.h200-ulysses8-10s-10k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-ulysses8-10s-10k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[benchmarks.h200-ulysses8-15s-1k]
+server = "h200-ulysses8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-ulysses8-15s-1k.video]
+seconds = 15.0
+prompt_tokens = 1000
+
+[benchmarks.h200-ulysses8-15s-1k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-ulysses8-15s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[benchmarks.h200-ulysses8-15s-10k]
+server = "h200-ulysses8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-ulysses8-15s-10k.video]
+seconds = 15.0
+prompt_tokens = 10000
+
+[benchmarks.h200-ulysses8-15s-10k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-ulysses8-15s-10k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[suites.h200-ulysses8]
+points = ["h200-ulysses8-5s-1k", "h200-ulysses8-5s-10k", "h200-ulysses8-10s-1k", "h200-ulysses8-10s-10k", "h200-ulysses8-15s-1k", "h200-ulysses8-15s-10k"]
+
+[servers.h200-gather8]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/fast_h3/gather8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024,10240", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
+
+[servers.h200-gather8.environment]
+CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "8"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.h200-gather8-5s-10k]
+server = "h200-gather8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-gather8-5s-10k.video]
+seconds = 5.0
+prompt_tokens = 10000
+
+[benchmarks.h200-gather8-5s-10k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-gather8-5s-10k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[servers.h200-fp8-ulysses8]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/fast_h3/ulysses8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "10240", "--video-text-capacities", "1024,10240", "--max-video-seconds", "15", "--max-running-requests", "2", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"components":{"mlp":"fp8"}}']
+
+[servers.h200-fp8-ulysses8.environment]
+CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "8"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[servers.h200-fp8-dp8]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/fast_h3/dp8-text-tp8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "8", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"components":{"mlp":"fp8"}}']
+
+[servers.h200-fp8-dp8.environment]
+CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "8"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.h200-fp8-ulysses8-5s-1k]
+server = "h200-fp8-ulysses8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-fp8-ulysses8-5s-1k.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.h200-fp8-ulysses8-5s-1k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-fp8-ulysses8-5s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[benchmarks.h200-fp8-ulysses8-15s-10k]
+server = "h200-fp8-ulysses8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-fp8-ulysses8-15s-10k.video]
+seconds = 15.0
+prompt_tokens = 10000
+
+[benchmarks.h200-fp8-ulysses8-15s-10k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.h200-fp8-ulysses8-15s-10k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[benchmarks.h200-fp8-dp8-5s-1k]
+server = "h200-fp8-dp8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-fp8-dp8-5s-1k.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.h200-fp8-dp8-5s-1k.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 8
+seed = 1000
+
+[benchmarks.h200-fp8-dp8-5s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[suites.h200-fp8]
+points = ["h200-fp8-ulysses8-5s-1k", "h200-fp8-ulysses8-15s-10k", "h200-fp8-dp8-5s-1k"]
+
+[servers.h200-dp8]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--workers", "configs/fast_h3/dp8-text-tp8.json", "--worker-python", ".venv/bin/python", "--port", "18083", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "5", "--max-running-requests", "8", "--graph-policy", "full", "--mem-fraction-static", "0.92", "--quantization-config", '{"mode":"quality"}']
+
+[servers.h200-dp8.environment]
+CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "8"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.h200-dp8-5s-1k]
+server = "h200-dp8"
+task = "video"
+model = "FastH3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_FAST_H3_MODEL}/tokenizer"
+
+[benchmarks.h200-dp8-5s-1k.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.h200-dp8-5s-1k.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 8
+seed = 1000
+
+[benchmarks.h200-dp8-5s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"

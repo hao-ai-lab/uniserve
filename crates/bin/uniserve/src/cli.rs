@@ -742,6 +742,38 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_every_published_deployment_configuration() {
+        // The repository's `configs/` tree holds the deployments the
+        // documentation tells operators to pass to `--workers`.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../configs");
+        let mut published = Vec::new();
+        for model in std::fs::read_dir(&root).expect("configs directory") {
+            for entry in std::fs::read_dir(model.expect("model directory").path())
+                .expect("model configurations")
+            {
+                published.push(entry.expect("configuration entry").path());
+            }
+        }
+        assert!(!published.is_empty(), "configs/ publishes deployments");
+
+        for path in published {
+            let parsed = <Cli as clap::Parser>::try_parse_from([
+                "uniserve",
+                "serve",
+                "model",
+                "--workers",
+                path.to_str().expect("configuration path"),
+            ]);
+            assert!(
+                parsed.is_ok(),
+                "{} must be a valid deployment: {:?}",
+                path.display(),
+                parsed.err()
+            );
+        }
+    }
+
+    #[test]
     fn serve_accepts_component_quantization_config() {
         let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",

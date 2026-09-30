@@ -31,4 +31,9 @@ where = [".."]
 include = ["uniserve_eval*"]
 
 [tool.setuptools.package-data]
-uniserve_eval = ["profiles.toml"]
+uniserve_eval = [
+    "profiles.toml",
+    "fast_h3.toml",
+    "fast_h3_h200.toml",
+    "workloads/fast_h3/*.jsonl",
+]

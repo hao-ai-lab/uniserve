@@ -1,55 +1,76 @@
 # UniServe
 
-UniServe provides a Python computation library and an OpenAI-compatible inference server for text and omni models. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the concrete models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, tokenization, scheduling, generation state, cache accounting and response assembly.
+UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 guide](docs/fast_h3/fast_h3.md) covers every deployment, precision and option.
 
-The configured model descriptions are `qwen3`, `sensenova`, `bagel`, and `minimax-h3`. A server process loads exactly one description and exposes one served-model identity.
+UniServe is a Python computation library and a Rust server. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, scheduling, request state and response assembly.
 
 ## Requirements
 
 | Component | Requirement |
 | --- | --- |
 | OS / architecture | Linux on x86-64 or aarch64 |
-| GPU | NVIDIA GPU with a CUDA-compatible driver for production model execution |
-| Python | Python 3.11+ with a compatible PyTorch installation |
+| GPU | NVIDIA Hopper or Blackwell GPUs; H200, GB200 and RTX PRO 6000 Blackwell Server Edition have end-to-end validation |
+| CUDA | CUDA 13 toolkit and a matching driver |
+| Python | Python 3.12 |
 | Rust | Stable Rust toolchain with edition 2024 support |
-
-The NVIDIA NGC PyTorch container is the recommended environment because it supplies an accelerator-matched PyTorch and CUDA toolchain.
 
 ## Installation
 
+Run from the repository root:
+
 ```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-. "$HOME/.cargo/env"
-uv venv --system-site-packages .venv
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
-uv pip install -e .
 ```
 
-The installation builds the `uniserve` binary and the native worker IPC extension.
+The sync builds the `uniserve` binary, the native worker IPC extension and the `gpu` extra's kernels: FlashInfer, FlashAttention-4, and UniServe's sparse-attention and peer-storage kernels. Building them needs a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja; the [FastH3 guide](docs/fast_h3/fast_h3.md#install) lists the system packages and a container build.
 
-The three Python packages (`uniserve`, `uniserve_models` and `uniserve_worker`) are installed together with their `uniserve-kernels` dependency, which holds UniServe's own device kernels.
+## Quickstart
 
-The `gpu` extra adds FlashAttention-4 and the native `uniserve-kernels` extensions for sparse video attention, CUDA IPC and peer-storage mappings. Install the source workspace with `uv sync --extra gpu`; building these extensions requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
-
-## Start a server
-
-Every server invocation supplies the model path or Hugging Face repository. The checkpoint's own configuration selects the serving profile:
+Download the checkpoint and serve it on four GPUs:
 
 ```bash
-uniserve serve Qwen/Qwen3-32B \
-  --served-model-name Qwen3-32B
+export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
+hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
+
+uniserve serve "$H3_MODEL" \
+  --workers configs/fast_h3/ulysses4.json \
+  --served-model-name FastH3 \
+  --host 0.0.0.0 \
+  --max-running-requests 2
 ```
 
-Local model directories use the same command shape:
+Startup prepares and captures every admitted request shape before `/health` reports ready; on four GB200 GPUs this takes about 11 minutes. Then generate a video:
 
 ```bash
-uniserve serve /models/SenseNova-U1 \
-  --served-model-name SenseNova-U1
+curl --fail-with-body --max-time 600 \
+  http://127.0.0.1:8000/v1/videos/sync \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","seconds":5,"seed":1000}' \
+  --output forest.mp4
 ```
 
-Run `uniserve serve --help` for the complete option set.
+## Deployments
 
-## Public HTTP API
+A deployment file passed to `--workers` places FastH3's components on devices and hosts. `configs/fast_h3/` holds the deployments with published measurements:
+
+| File | GPUs | Layout |
+| --- | --- | --- |
+| `ulysses4.json` | Four on one host | Ulysses4 denoiser, TP4 text encoder |
+| `ulysses8.json` | Eight on one host | Ulysses8 denoiser, TP8 text encoder |
+| `ulysses8-two-node.json` | Four on each of two hosts | Ulysses8 denoiser, TP8 text encoder |
+| `ulysses4x2.json` | Eight on one host | Two Ulysses4 replicas |
+| `ulysses4x2-two-node.json` | Four on each of two hosts | One Ulysses4 replica per host |
+| `dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas, shared TP8 text encoder |
+| `gather8.json` | Eight on one host | All-gather sequence-parallel denoiser, TP8 text encoder |
+
+One replica spanning every GPU gives the lowest latency; replicas serve more requests at once. The [FastH3 guide](docs/fast_h3/fast_h3.md#deployments) lists the recommended deployment and options for each GPU type and goal, and describes two-host startup.
+
+## HTTP API
 
 | Method and path | Purpose |
 | --- | --- |
@@ -57,93 +78,51 @@ Run `uniserve serve --help` for the complete option set.
 | `GET /metrics` | Runtime metrics |
 | `GET /version` | Build information |
 | `GET /v1/models` | Configured served model |
-| `POST /v1/chat/completions` | Streaming and non-streaming text, image-input, image-output, and interleaved generation |
-| `POST /v1/images/generations` | Single-image generation adapter for configured omni descriptions |
+| `GET /v1/capabilities` | Accepted request fields, frame geometry, duration limits and job retention |
+| `POST /v1/videos/sync` | Generate one video and return the MP4 |
+| `POST /v1/videos` | Create an asynchronous video job |
+| `GET /v1/videos`, `GET /v1/videos/{id}` | List jobs, or read one job's state and progress |
+| `GET /v1/videos/{id}/content` | Download a completed job's MP4 |
+| `DELETE /v1/videos/{id}` | Cancel or delete a job |
 
-List the configured model:
+A video request accepts `model`, `prompt`, `seconds` (4 to 15, default 5) and `seed`. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
 
-```bash
-curl -s http://127.0.0.1:8000/v1/models
-```
+The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requests`, labeled by served-model name, profile, description, and state. `active` is the instantaneous in-flight count; `accepted`, `scheduled`, `finished`, `rejected`, `cancelled`, `aborted`, and `failed` are cumulative for the running serving runtime. Scheduler, worker, request-latency, and HTTP metrics share the same OpenMetrics response.
 
-Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields. `id` is the configured served-model name.
-
-The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requests`, labeled by served-model name, profile, description, and state. `active` is the instantaneous in-flight count; `accepted`, `scheduled`, `finished`, `rejected`, `cancelled`, `aborted`, and `failed` are cumulative for the running serving runtime. Scheduler, worker, cache, request-latency, and HTTP metrics share the same OpenMetrics response.
-
-Submit a chat completion:
-
-```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "Qwen3-32B",
-    "messages": [{"role": "user", "content": "Give one concise fact about matrix multiplication."}],
-    "max_completion_tokens": 128
-  }'
-```
-
-Stream a chat completion:
-
-```bash
-curl -N http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "Qwen3-32B",
-    "messages": [{"role": "user", "content": "Count to five."}],
-    "stream": true,
-    "stream_options": {"include_usage": true}
-  }'
-```
-
-Generate one image from a SenseNova server:
-
-```bash
-curl -s http://127.0.0.1:8000/v1/images/generations \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "SenseNova-U1",
-    "prompt": "A red bicycle against a brick wall in golden-hour light",
-    "n": 1,
-    "size": "2048x1152",
-    "steps": 50,
-    "seed": 42
-  }'
-```
-
-Each image response entry carries `b64_json`, pixel `height` and `width`, and the encoded PNG byte count `bytes`; `revised_prompt` is included when available. Request timing starts before preprocessing and includes queueing and generation.
-
-
-## Serving configuration
+## Serving options
 
 | Option | Default | Purpose |
 | --- | --- | --- |
 | Positional `MODEL` | Required | Local model directory or Hugging Face repository |
+| `--workers` | One model worker over every rank | Deployment file: worker instances, node/device ranks, and the components placed on them |
 | `--served-model-name` | Resolved model ID | Single public model ID |
 | `--host`, `--port` | `127.0.0.1`, `8000` | TCP listener |
 | `--uds` | Unset | Unix-domain listener instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
-| `--device` | `cuda` | Worker device |
-| `--worker-ranks` | `1` | Ranks in the default Worker instance when `--workers` is omitted |
-| `--workers` | One `model` entry over every rank | Path to a JSON deployment configuration: Worker instances, node/device ranks, and the components placed on them |
-| `--max-model-len` | Model configuration | Context-length ceiling |
-| `--max-total-tokens` | Runtime sizing | KV token-capacity override |
-| `--max-running-requests` | `128` | Scheduler active-request bound |
-| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
-| `--chunked-prefill-size` | `8192` | Per-request prefill bound |
-| `--attention-backend` | `auto` | Worker attention provider selection |
+| `--host-identity` | `localhost` | This host's name in a multi-host deployment file |
+| `--max-video-seconds` | `15` | Longest admitted clip, from 4 to 15 seconds |
+| `--max-model-len` | `16384` | Longest admitted prompt, in tokens |
+| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities that startup prepares |
+| `--max-running-requests` | `128`, clamped to the deployment's request slots | Concurrently resident requests |
+| `--mem-fraction-static` | `0.70` | Each worker rank's share of its device's storage |
+| `--graph-policy` | `auto` | CUDA graph capture: `auto`, `full`, or `off` |
+| `--quantization-config` | `{}`, the `quality` preset | Precision preset or per-component overrides |
 | `--api-key` | Unset | Bearer token for public routes |
-| `--request-timeout` | Unset | Seconds until a response head is sent; streamed bodies (chat SSE and video downloads) are not bounded |
-| `--max-concurrent-requests` | Unset | In-flight bound for chat completion and image generation requests (503 above it); video requests share the video job slots instead |
+| `--request-timeout` | Unset | Seconds until a response head is sent; streamed bodies, such as video downloads, are not bounded |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
 
-For tensor-parallel execution, select one rank per participating GPU:
+Run `uniserve serve --help` for the complete option set.
+
+## Reproduce the measurements
+
+The serving evaluator runs HTTP workloads against a server, validates every response, and writes reproducible result bundles. `uniserve_eval/fast_h3.toml` holds the deployments and workload of the UniServe FastH3 post, and `uniserve_eval/fast_h3_h200.toml` the H200 measurements in the FastH3 guide:
 
 ```bash
-uniserve serve /models/Qwen3-32B \
-  --served-model-name Qwen3-32B \
-  --worker-ranks 4
+export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
+.venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml plan gb200-4-bf16
+.venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
 ```
 
-For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).
+The [FastH3 guide](docs/fast_h3/fast_h3.md#reproduce-the-measurements) lists every suite and the two-host procedure.
 
 ## Development and verification
 
@@ -158,19 +137,14 @@ just test-python-cuda
 just test-python-e2e
 ```
 
-The fast and integration suites run without a CUDA device; tests that need one carry the `gpu` marker, which `test-python-cuda` selects at the unit and integration layers.
-
-Real-device end-to-end validation uses the configured model environment variables:
+The fast and integration suites run without a CUDA device; tests that need one carry the `gpu` marker, which `test-python-cuda` selects at the unit and integration layers. The FastH3 GPU tests load a complete checkpoint on four GPUs:
 
 ```bash
-UNISERVE_QWEN3_MODEL=/models/Qwen3-32B \
-UNISERVE_SENSENOVA_MODEL=/models/SenseNova-U1 \
-UNISERVE_BAGEL_MODEL=/models/BAGEL-7B-MoT \
-UNISERVE_RUN_GPU_E2E=1 \
-just test-python-gpu
+UNISERVE_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2 \
+  .venv/bin/python -m pytest \
+  tests/python/integration/model_loading/test_h3_parallel_latents.py \
+  tests/python/e2e/test_h3_parallel_http.py
 ```
-
-The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
 ## Repository layout
 
@@ -180,9 +154,11 @@ crates/foundation/observability/         Runtime metrics and process registry
 crates/foundation/observability-derive/  Metrics proc-macro
 crates/worker-ipc/                       Worker messages, serialization, and iceoryx endpoints
 crates/worker-ipc-py/                    Python worker IPC extension
-crates/engine/                           Scheduler, KV pool, executors, and engine process
-crates/server/                           Model profiles, serving funnel, OpenAI API, HTTP, and engine clients
+crates/engine/                           Scheduler, executors, and engine process
+crates/server/                           Model profiles, serving funnel, HTTP API, and engine clients
 crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
+crates/bin/uniserve-host/                Per-host launcher for multi-host deployments
+crates/bin/dynamo-worker/                NVIDIA Dynamo worker backend
 uniserve/                                 Numerical layers, loading, and resource binding
 uniserve_models/                          Concrete models, typed configs, and checkpoint catalog
 uniserve_worker/                          Worker lifecycle and rank-local execution
@@ -192,9 +168,9 @@ uniserve_worker/                          Worker lifecycle and rank-local execut
   sampling/                              Sampling metadata, execution, and numerical results
   storage/                               KV, latent, tensor, request-slot, and output backing
   transport/                             Local, SHM, CUDA VMM, and channel transfers
-uniserve_eval/                            Serving evaluator
-specs/                                    Builder-facing implementation notes
-docs/fast_h3/                             FastH3 deployment cheat sheet and container files
+uniserve_eval/                            Serving evaluator, profiles, and request workloads
+configs/fast_h3/                          FastH3 deployment files
+docs/fast_h3/                             FastH3 guide, Dynamo guide, and container files
 ```
 
 ## License
