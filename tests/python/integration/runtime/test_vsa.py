@@ -3,16 +3,36 @@
 They also preserve mutable graph inputs.
 """
 
+import gc
 from importlib import import_module
 
 import pytest
 import torch
+from uniserve_kernels.attention.vsa_rows import pack_sparse_input_rows
 
 from tests.python.fixtures.vsa import reference_attention
 from uniserve.nn.attention import vsa
-from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
+from uniserve.runtime import (
+    CUDAGraph,
+    CUDAStream,
+    ExecutionContext,
+    TensorBuffers,
+)
+from uniserve.runtime.backends.attention import vsa as providers
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+
+@pytest.fixture
+def provider(request):
+    from uniserve.runtime.backends.attention import vsa as providers
+
+    name = request.param
+    if not import_module(f"{providers.__name__}.{name}").available(
+        torch.device("cuda")
+    ):
+        pytest.skip(f"VSA provider {name} is unavailable on this device")
+    return name
 
 
 @pytest.fixture
@@ -20,6 +40,14 @@ def stream():
     owner = CUDAStream.external(torch.cuda.Stream())
     yield owner
     owner.close()
+
+
+@pytest.fixture
+def cuda_cache():
+    """Retire large cached allocations before another GPU consumer starts."""
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def _input(valid):
@@ -57,7 +85,68 @@ def _workspace(q):
     )
 
 
-@pytest.mark.parametrize("provider", ["cute", "flashinfer", "triton"])
+@pytest.mark.slow
+@pytest.mark.usefixtures("cuda_cache")
+@torch.inference_mode()
+def test_large_hopper_key_domain_preserves_head_values_on_graph_replay(stream):
+    """Whole-domain sparse attention supports more than 2**31 KV references.
+
+    Constant per-head binary vectors make the exact attention result known
+    without materializing a dense score matrix. Every query tile reaches the
+    same selected keys; sampling one row per tile covers all CSR row offsets.
+    """
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("this large-domain fixture qualifies Hopper attention")
+    if torch.cuda.mem_get_info()[0] < 48 * 1024**3:
+        pytest.skip("large-domain graph replay requires 48 GiB of free memory")
+
+    tiles, heads, selected, width = 1600, 56, 384, 128
+    rows = tiles * 64
+    q = torch.zeros(rows, heads, width, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    codes = (
+        torch.arange(heads, device="cuda")[:, None]
+        >> (torch.arange(width, device="cuda")[None, :] % 6)
+    ) & 1
+    codes = codes.to(q.dtype)
+    value = codes.expand(rows, -1, -1).contiguous()
+    out = torch.empty_like(q)
+    valid = torch.full((tiles,), 64, device="cuda", dtype=torch.int32)
+    batch = vsa.BlockInput(
+        vsa.Pattern(((selected,) * tiles,), 0, 0),
+        torch.arange(selected, device="cuda", dtype=torch.int32)
+        .expand(heads, tiles, -1)
+        .contiguous(),
+        torch.full((heads, tiles), selected, device="cuda", dtype=torch.int32),
+        valid,
+        0,
+    )
+    module = vsa.BlockAttention(128**-0.5)
+
+    def invoke():
+        return module(q, k, value, batch, out=out)
+
+    stream.wait(torch.cuda.current_stream())
+    with ExecutionContext(module, stream=stream, vsa="flashinfer") as context:
+        context.prepare(None)
+        invoke()
+        torch.testing.assert_close(
+            out[::64], codes.expand(tiles, -1, -1), rtol=2e-2, atol=2e-2
+        )
+        with CUDAGraph(context=context) as graph:
+            graph.capture(invoke)
+            valid.fill_(32)
+            codes = 1 - codes
+            value.copy_(codes.expand(rows, -1, -1))
+            graph.replay()
+            torch.testing.assert_close(
+                out[::64], codes.expand(tiles, -1, -1), rtol=2e-2, atol=2e-2
+            )
+
+
+@pytest.mark.parametrize(
+    "provider", ["cute", "flashinfer", "triton"], indirect=True
+)
 @torch.inference_mode()
 def test_selection_compression_and_projected_chunks(provider, stream):
     torch.manual_seed(518)
@@ -111,16 +200,11 @@ def test_selection_compression_and_projected_chunks(provider, stream):
             )
 
 
-@pytest.mark.parametrize("provider", ["sm100", "cute", "flashinfer", "triton"])
+@pytest.mark.parametrize(
+    "provider", ["sm100", "cute", "flashinfer", "triton"], indirect=True
+)
 @torch.inference_mode()
 def test_projected_chunks_apply_the_layer_softmax_scale(provider, stream):
-    from uniserve.runtime.backends.attention import vsa as providers
-
-    if not import_module(f"{providers.__name__}.{provider}").available(
-        torch.device("cuda")
-    ):
-        pytest.skip(f"VSA provider {provider} is unavailable on this device")
-
     torch.manual_seed(733)
     q, k, v, gate = torch.randn(
         256, 3, 4, 128, device="cuda", dtype=torch.bfloat16
@@ -189,8 +273,8 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
                 tuple(value[start:stop] for value in (query, key, v, gate)),
             )
 
-    def attend(query, key, norm_rope):
-        result = torch.empty_like(q)
+    def attend(query, key, norm_rope, result=None):
+        result = torch.empty_like(q) if result is None else result
         for interval, output in module.forward_chunks(
             chunks(query, key),
             inputs,
@@ -202,7 +286,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
         return result
 
     stream.wait(torch.cuda.current_stream())
-    with ExecutionContext(module, stream=stream, vsa="cute") as context:
+    with ExecutionContext(module, stream=stream) as context:
         context.prepare(None)
         expected = attend(normalized_q, normalized_k, None).clone()
         actual = attend(
@@ -216,16 +300,43 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
         torch.testing.assert_close(
             actual[live], expected[live], rtol=2**-7, atol=2**-7
         )
+        replayed = torch.empty_like(q)
+        norm_rope = vsa.NormRope(query_weight, key_weight, 1e-6, cos, sin)
+        with CUDAGraph(context=context) as graph:
+            graph.capture(lambda: attend(q, k, norm_rope, replayed))
+            q.add_(0.3)
+            k.mul_(-0.9)
+            graph.replay()
+            normalized_q, normalized_k = qk_norm_rope(
+                q,
+                k,
+                (query_weight,),
+                (key_weight,),
+                (cos,),
+                (sin,),
+                eps=1e-6,
+                axis_dims=(128,),
+            )
+            expected = attend(normalized_q, normalized_k, None)
+            torch.testing.assert_close(
+                replayed[live], expected[live], rtol=2**-7, atol=2**-7
+            )
         torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("provider", ["cute", "flashinfer", "triton"])
+@pytest.mark.parametrize(
+    "provider", ["cute", "flashinfer", "triton"], indirect=True
+)
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("owners", [1, 2])
+@pytest.mark.parametrize("chunk_tokens", [64, 192])
 @torch.inference_mode()
-def test_row_production_over_many_intervals_matches_one_call(provider, stream):
+def test_row_production_over_many_intervals_matches_one_call(
+    provider, prepared, owners, chunk_tokens, stream
+):
     """Rows produced interval by interval equal the single-call result.
 
-    Small exchange intervals give several packed segments; the fine
-    attention is launched once for the whole domain and every interval
+    Small exchange intervals give several packed segments and every interval
     composes its own rows. The first interval is the dense prefix tile,
     whose rows attend the complete valid key domain.
     """
@@ -248,31 +359,68 @@ def test_row_production_over_many_intervals_matches_one_call(provider, stream):
         expected = module(q, k, v, gate, batch, workspace=workspace).clone()
 
         produced = torch.zeros_like(q)
-        with module.attention._operator(q, batch) as operator:
-            producer = operator.rows(
-                q,
-                k,
-                v,
-                batch,
-                gate=gate,
-                compressed=workspace.compressed_tiles,
-                out=workspace.attention_output,
-                owners=1,
-                chunk_tokens=64,
-                packed=None,
-                scale=module.attention.scale,
+        backend = providers.resolve(provider, device=q.device)
+        options = {
+            "num_heads": q.shape[1],
+            "head_dim": q.shape[2],
+            "dtype": q.dtype,
+        }
+        requirements = backend.workspace_buffers(batch.pattern, **options)
+        with TensorBuffers.allocate(requirements, device=q.device) as buffers:
+            operator = backend.prepare(
+                batch.pattern, **options, workspace=buffers.view(requirements)
             )
-            for start in range(0, 256, 64):
-                producer(
-                    slice(start, start + 64), (produced[start : start + 64],)
+            try:
+                producer = operator.rows(
+                    q,
+                    k,
+                    v,
+                    batch,
+                    gate=gate,
+                    compressed=workspace.compressed_tiles,
+                    out=workspace.attention_output,
+                    owners=owners,
+                    chunk_tokens=chunk_tokens,
+                    packed=(
+                        pack_sparse_input_rows(
+                            q,
+                            k,
+                            v,
+                            valid,
+                            owners=owners,
+                            chunk_rows=chunk_tokens,
+                            row_major=True,
+                        )
+                        if prepared
+                        else None
+                    ),
+                    scale=128**-0.5,
                 )
+                owner_rows = q.shape[0] // owners
+                for start in range(0, owner_rows, chunk_tokens):
+                    stop = min(start + chunk_tokens, owner_rows)
+                    producer(
+                        slice(start, stop),
+                        tuple(
+                            produced[
+                                owner * owner_rows + start : owner * owner_rows
+                                + stop
+                            ]
+                            for owner in range(owners)
+                        ),
+                    )
+            finally:
+                torch.cuda.synchronize()
+                operator.close()
         torch.cuda.synchronize()
         torch.testing.assert_close(
             produced[live], expected[live], rtol=2e-2, atol=2e-2
         )
 
 
-@pytest.mark.parametrize("provider", ["sm100", "cute", "flashinfer", "triton"])
+@pytest.mark.parametrize(
+    "provider", ["sm100", "cute", "flashinfer", "triton"], indirect=True
+)
 @torch.inference_mode()
 def test_empty_prefix_tiles_leave_live_rows_unchanged(provider, stream):
     """A prefix tile without valid rows changes no live row's attention.
@@ -282,13 +430,6 @@ def test_empty_prefix_tiles_leave_live_rows_unchanged(provider, stream):
     values, and the live prefix lists name only the text and audio tiles.
     Every live row must attend exactly as in the domain without that tile.
     """
-    from uniserve.runtime.backends.attention import vsa as providers
-
-    if not import_module(f"{providers.__name__}.{provider}").available(
-        torch.device("cuda")
-    ):
-        pytest.skip(f"VSA provider {provider} is unavailable on this device")
-
     torch.manual_seed(4211)
     device = torch.device("cuda")
     heads = 3

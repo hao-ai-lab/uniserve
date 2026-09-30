@@ -4,7 +4,7 @@ UniServe serves the FastH3 text-to-video-and-audio checkpoints. The output is an
 
 ## Requirements
 
-- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA SM100 GPUs such as B200 or GB200. GB200 has end-to-end validation; other hardware requires its own validation before performance claims.
+- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. H200, GB200, and RTX PRO 6000 Blackwell Server Edition have end-to-end validation; measurements apply to their stated checkpoint, precision, deployment, and workload.
 - One of the complete FastH3 VSA checkpoints listed below. Base partitions and adapter-only checkpoints are unsupported.
 - Enough GPU storage for weights, two resident requests, and CUDA graphs. Four local GPUs are the standard setup.
 - Shared storage and pinned-storage access for worker IPC. The container command below provisions 4 GiB of shared storage and unlimited locked storage.
@@ -49,10 +49,12 @@ Each checkpoint's `fastvideo_inference.json` supplies its sampling schedule: the
 ## Download the model
 
 ```bash
-export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4
+export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 
-hf download skx618/FastVideo-FastH3-8-Step-V2-NVFP4 --local-dir "$H3_MODEL"
+hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 ```
+
+The dense checkpoint runs on Hopper and Blackwell. Packed NVFP4 checkpoints require Blackwell; select one of the `skx618` repositories above when using that representation.
 
 Pass the model root containing `modular_model_index.json`, `fastvideo_inference.json`, `transformer/`, `text_encoder/`, `vae/`, `audio_vae/`, `scheduler/`, `audio_scheduler/`, and `tokenizer/`. In an NVFP4 root in ModelOpt's unified layout, `transformer/config.json` and `vae/config.json` also declare a `quantization_config` with `quant_method: modelopt`. The server identifies the model from the pipeline class that `modular_model_index.json` declares and reads the tokenizer from the component folder the index names; the loader then validates the inference contract in `fastvideo_inference.json`.
 
@@ -89,11 +91,17 @@ One launcher serves every worker of the deployment that places a rank on its hos
 
 `configs/minimax-h3-eight-devices-single-node.json` places the same components on eight devices of one host, so it needs no launcher and starts exactly like the four-device file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with eight encoder ranks, one per media unit of a round, and a muxer rank.
 
+`configs/minimax-h3-eight-devices-gather.json` uses the same single-host component placement with eight-way all-gather sequence parallelism in the denoiser. Each rank computes its local query rows against the complete gathered key and value domain. The denoiser weights are replicated, so its memory requirement differs from head-sharded Ulysses. The `hopper-gather8-5s-10k` evaluation profile fixes a BF16 latency point for this deployment.
+
+For four H200s with the dense eight-step checkpoint, 15-second capacity, text capacities 1024 and 16384, and two request slots, use `--mem-fraction-static 0.92`. The BF16 weights and full-duration decoder graphs exceed the default 0.80 static grant during startup. This setting grants more of the available storage to the same computations and graph layouts.
+
+H200 serving qualification covers Gather8, TP8, TP2×Ulysses4, TP4×Ulysses2, PP2×Ulysses4, PP4×Ulysses2, Ulysses4×Gather2 and Ulysses2×Gather4 at BF16/FP16 precision. Every layout prepares 32 denoiser graphs, generates both 5s/1k and 15s/16k complete media, and handles three cancellation/reuse cycles. The four-device deployment additionally preserves each concurrent request's decoded result against isolated execution and matches graph/eager decoded media within the established BF16 comparison budget. These checks describe correctness and capacity for the tested configurations; latency measurements use the distinct profiles below.
+
 ## Data parallel serving
 
 The single-node DP8 deployment uses eight independent one-GPU flow workers instead of one eight-rank Ulysses worker. Each flow worker owns a complete denoiser, video decoder, and audio decoder, so eight requests can denoise and decode concurrently without a collective between GPUs. The scheduler selects one flow replica when it admits a request, keeps that request on the same replica through latent preparation, denoising, and device decoding, and accounts its request rows, product buffers, queue, and execution lane in that worker's address space. Replica capacities add; a shared component remains an independently bounded stage of the route.
 
-The NVFP4 checkpoints are the intended DP8 weights. Dense BF16 denoiser replication is not expected to fit on 96 GB devices. Start with the shared-TP8 conditioning layout:
+The NVFP4 checkpoints are the intended DP8 weights on 96 GB devices, where dense BF16 denoiser replication is not expected to fit. On H200, the dense BF16 eight-step checkpoint and its FP8 MLP configuration both support the five-second/1000-token DP8 workload; their capacities and measurements are listed below. Start with the shared-TP8 conditioning layout:
 
 ```bash
 uniserve serve "$H3_MODEL" \
@@ -139,7 +147,57 @@ Resolve the commands and paths before starting the serial artifact-producing run
 
 The `fast_h3_pareto_ulysses4`, `fast_h3_pareto_dp4`, `fast_h3_pareto_ulysses8`, and `fast_h3_pareto_dp8` suites sweep concurrency 1/2/4 and, for eight GPUs, 8. They use two excluded warmups and 16 measured five-second/1000-token requests per point. Run the points serially against their matching placement; the suite fixes request data and metrics, while the deployment command fixes whether the point is Ulysses or data parallel.
 
-The eight-device Ulysses file also does not shard denoiser weights, so every rank holds the whole denoiser, and a rank's residency can exceed the default `--mem-fraction-static` on a 96 GB device at the default `--max-video-seconds 15` and `--max-model-len 16384`. Raise the fraction, or shard the denoiser with `"tensor_parallel_size"`, if that deployment refuses to start with a static storage grant error. For DP8, adjust the text and flow workers' explicit `memory_fraction` values together instead of raising the global default.
+Ulysses shards the merged query, key, value and gate weights by attention head while retaining the other denoiser weights on every rank. A rank's residency can exceed the default `--mem-fraction-static` on a 96 GB device at the default `--max-video-seconds 15` and `--max-model-len 16384`. Raise the fraction, or shard the denoiser further with `"tensor_parallel_size"`, if that deployment refuses to start with a static storage grant error. For DP8, adjust the text and flow workers' explicit `memory_fraction` values together instead of raising the global default.
+
+### H200 measurements
+
+The eight-H200 Ulysses deployment uses `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, BF16 attention, MLPs and text encoding, and FP16 video decoding. The checkpoint supplies all eight denoising steps and its 0.8 VSA sparsity. Each point measures three complete synchronous MP4 requests at concurrency one after one excluded warmup, with the repository's `minimax-h3` dataset, seed 1000, 1344×768 video, and stereo 32-kHz audio. The server captures all 16 admitted frame counts at text capacities 1024 and 10240, uses `--graph-policy full`, two request slots and a 0.92 static memory fraction. The profile preloads CUDA kernels with `CUDA_MODULE_LOADING=EAGER`; measurements used driver 595.91.07 and the locked CUDA 13 GPU environment. All 18 measured outputs passed decoding, geometry, frame count, audio and completion checks, with peak single-GPU memory 96,292 MiB across the six points.
+
+| Video duration | 1000-token prompt, mean ± SD | 10000-token prompt, mean ± SD |
+| --- | ---: | ---: |
+| 5 s | 8.194 ± 0.818 s | 14.218 ± 0.880 s |
+| 10 s | 18.539 ± 1.071 s | 26.578 ± 0.600 s |
+| 15 s | 31.069 ± 0.045 s | 44.228 ± 0.878 s |
+
+These are small-sample latency measurements. The [FastH3 blog](https://github.com/hao-ai-lab/hao-ai-lab.github.io/pull/97) uses varied scene prompts; its GB200 and RTX PRO 6000 numbers provide hardware context, while this table applies to the declared repository workload.
+
+The four-H200 Ulysses BF16 5s/1k point averages 13.864 ± 0.013 s, with three valid measured MP4s and peak single-GPU memory 80,185 MiB. Its deployment admits five-second videos and 1024-token prompts, captures both frame counts with full graphs, and retains two request slots at a 0.92 static fraction. The `hopper` suite reproduces this point.
+
+The Gather8 deployment's BF16 5s/10k point uses the same request and graph-capacity protocol as Ulysses8 and averages 20.170 ± 0.698 s, with three valid measured MP4s and peak single-GPU memory 112,244 MiB. Its Hopper dense-prefix optimization reduced latency by 16.4% against the fixed 24.139 ± 0.809 s control. Run `hopper-gather8-5s-10k` with the same evaluation configuration to reproduce this workload.
+
+Resolve and run the serial suite with a local checkpoint directory:
+
+```bash
+export UNISERVE_MINIMAX_H3_MODEL="$H3_MODEL"
+.venv/bin/uniserve-eval --config uniserve_eval/hopper.toml plan hopper-ulysses8
+.venv/bin/uniserve-eval --config uniserve_eval/hopper.toml run hopper-ulysses8 --reuse-deployment
+```
+
+Results are written under `artifacts/hopper/measurements/`, including resolved commands, request data, individual latencies, media validation and GPU memory observations. The `hopper` suite measures four-GPU Ulysses. The `hopper-fp8` suite selects FP8 MLPs with FP16 video decoding and contains eight-GPU Ulysses latency points and a DP8 throughput point.
+
+The FP8 MLP profile retains BF16 attention and text encoding and FP16 video decoding. Its Ulysses8 points use the same latency protocol as the BF16 table: 5s/1k averages 7.448 ± 0.734 s and 15s/10k averages 42.380 ± 0.807 s, with all six measured MP4s valid.
+
+The DP8 profiles use `configs/minimax-h3-dp8-text-tp8.json`, eight excluded warmups and 16 measured 5s/1k requests at concurrency eight, seed 1000, full graphs, a five-second duration bound and a 1024-token prompt capacity. The placement grants 0.18 of each device to the shared text rank and 0.81 to its independent flow replica. Both precision configurations retain BF16 attention/text and FP16 video decoding and completed all 16 outputs with every declared media check passing. Run `hopper-dp8-5s-1k` for the dense checkpoint's BF16 default, or the `hopper-fp8` suite for FP8 MLPs. Their concurrency differs from the latency table above.
+
+| Denoiser MLP | Videos/s | Video latency, mean ± SD | Peak single-GPU memory |
+| --- | ---: | ---: | ---: |
+| BF16 | 0.1519 | 52.231 ± 0.358 s | 90,329 MiB |
+| FP8 | 0.1676 | 47.314 ± 0.386 s | 81,531 MiB |
+
+To inspect eight denoising batches, collect Torch CPU ranges alongside an Nsight Systems CUDA timeline. Nsight owns the GPU tracing session, and `--cuda-graph-trace=node` exposes the kernels within each replay. Profiling artifacts use a separate output directory because trace collection and export affect request latency:
+
+```bash
+UNISERVE_TORCH_PROFILER_DIR=artifacts/hopper/profiling/torch \
+UNISERVE_PROFILE_ACTIVITIES=CPU \
+UNISERVE_PROFILE_START_STEP=3 UNISERVE_PROFILE_STEPS=8 \
+UNISERVE_CUDA_PROFILER=1 UNISERVE_NVTX=1 \
+nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  --cuda-graph-trace=node --wait=all \
+  --output=artifacts/hopper/profiling/timeline \
+  .venv/bin/uniserve-eval --config uniserve_eval/hopper.toml \
+  run hopper-ulysses8-5s-10k --output-root artifacts/hopper/profiling/results
+```
 
 Cross-rank products move over the mechanism named for that edge. CUDA VMM reads inspect the visible CUDA peer topology: a consumer with direct access maps the allocation on its destination GPU, while a consumer outside the producer's peer set maps it on the source GPU and uses CUDA's host-staged cross-device copy. The choice depends on the runtime topology rather than the accelerator model. `--transfer model->model=shm` remains available when an operator wants to force host staging for every model-worker product.
 
@@ -225,11 +283,11 @@ A dense BF16 checkpoint selects its precision at startup with `--quantization-co
 | Mode | Denoiser attention | Denoiser MLP | Text encoder | Video VAE |
 | --- | --- | --- | --- | --- |
 | `quality` | BF16 | BF16 | BF16 | FP16 |
-| `balanced` (default) | BF16 | BF16 | BF16 | NVFP4 |
+| `balanced` | BF16 | BF16 | BF16 | NVFP4 |
 | `performance` | BF16 | FP8 | BF16 | NVFP4 |
 | `maximum` | BF16 | NVFP4 | FP8 | NVFP4 |
 
-Omitting `--quantization-config` selects `balanced`.
+Omitting `--quantization-config`, or selecting `mode: default`, resolves the dense checkpoint's precision for each loading destination: `quality` on Hopper and `balanced` on Blackwell. The public Python model loader uses the same policy. Explicit presets, component overrides, and checkpoint-owned representations retain their declared numerical choices.
 
 ```bash
 --quantization-config '{"mode":"maximum"}'
@@ -240,6 +298,20 @@ Omitting `--quantization-config` selects `balanced`.
 ```bash
 --quantization-config '{"mode":"performance","components":{"video_vae":"bf16"}}'
 ```
+
+Hopper supports BF16, FP16, and FP8 computation. NVFP4 and MXFP8 require Blackwell tensor cores, including when their weights come from a packed checkpoint. To use FP8 denoiser MLPs on Hopper while retaining BF16 attention and text encoding and FP16 video decoding, select:
+
+```bash
+--quantization-config '{"mode":"performance","components":{"video_vae":"fp16"}}'
+```
+
+The `fp8` preset additionally quantizes denoiser attention projections to FP8 and keeps the text encoder in BF16 and the video decoder in FP16. FP8 representations change the numerical contract; select and evaluate them explicitly for the required quality.
+
+Hopper VSA uses FlashInfer's FA3 sparse prefill with the checkpoint's live per-head block selection. Selected 64-row blocks expand into single-token KV pages containing only their valid keys; this preserves partial and empty blocks without requiring a score mask. Dense prefix queries use FlashAttention-4 SM90 over their full valid key domain, with a device predicate excluding each tile's padding. Query packing preserves owner and interval order, including the final short interval. Large query domains partition into independent windows that retain each query's complete selected keys and keep FA3's scheduler offsets within signed 32-bit capacity. CUDA graphs capture the CSR updates and attention during startup. Serialized calls borrow the execution context's mutable CSR backing, and layers with the same numerical signature share their shape-specific plans, keeping graph residency bounded across transformer depth and captured layouts.
+
+GPU workers select `CUDA_MODULE_LOADING=EAGER` and `CUDA_MODULE_DATA_LOADING=EAGER` before importing the execution stack and initializing CUDA. CUDA loading can require context synchronization while a peer is already waiting in an asynchronous collective. These settings make loaded module code and data available eagerly; runtime communication also prepares peer connections before numerical work. When using the public Python model-loading and execution APIs directly, launch Python with both settings before creating CUDA contexts. NVIDIA documents these settings in its [CUDA programming guide](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-programming-guide/05-appendices/environment-variables.html#cuda-module-data-loading).
+
+Runtime process groups and stream-bound NCCL communicators establish their peer connections during initialization with `NCCL_RUNTIME_CONNECT=0`. This completes transport setup before numerical work starts, including work on intersecting head and context groups. Copy-engine collectives, registered windows and asynchronous publication retain their ordinary execution paths. If an application creates its own NCCL world before binding UniServe resources, set this environment variable before creating that world; NCCL caches it at initialization. The [NCCL environment reference](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-runtime-connect) defines the connection timing.
 
 CUDA graphs are captured during startup, as described above, so requests never capture; a capture failure stops startup rather than silently degrading to eager execution. Precision, placement, duration capacity, and prompt capacity are startup settings; restart the server after changing them.
 
@@ -260,9 +332,9 @@ uniserve serve skx618/FastVideo-FastH3-8-Step-V2-NVFP4 \
 | Error | Action |
 | --- | --- |
 | `_uniserve_ipc` import or protocol error | Run `uv sync --locked --python /usr/bin/python3.12 --extra gpu` again and use the resulting `uniserve` executable. |
-| CUDA or sparse-attention compile error | Check CUDA 13 `nvcc`, `CUDA_HOME`, SM100 hardware, C++ build tools, and a writable `TORCH_EXTENSIONS_DIR` whose file system supports `flock`. |
+| CUDA or sparse-attention compile error | Check CUDA 13 `nvcc`, `CUDA_HOME`, supported Hopper or Blackwell hardware, C++ build tools, and a writable `TORCH_EXTENSIONS_DIR` whose file system supports `flock`. |
 | Missing audio VAE or codec | Restore the locked environment with `uv sync`; do not mix in older Diffusers or PyAV packages. |
 | `unsupported FastH3 checkpoint` | Use a complete checkpoint from the table above; the message names the model ID and revision it expects. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config`: a packed NVFP4 checkpoint carries its own precision contract. |
-| GPU out of memory | Reduce resident capacity, or write a deployment configuration that shards the denoiser; sequence parallelism alone replicates denoiser weights. |
+| GPU out of memory | Reduce resident capacity, or shard the denoiser with tensor or pipeline parallelism; Ulysses retains most denoiser weights on each rank. |
 | MP4 contains an error body | Use `--fail-with-body`, inspect the HTTP status, and confirm the model name and `/v1/capabilities` limits. |

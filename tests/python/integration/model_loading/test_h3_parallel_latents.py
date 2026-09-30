@@ -350,8 +350,12 @@ def _collect(checkpoint, requests, kind, directory, *, encoder_tp, precision):
     return results
 
 
-@pytest.fixture(scope="module")
-def generation_requests():
+@pytest.fixture(
+    scope="module",
+    params=[(5, 124, 1000), (15, 362, 16384)],
+    ids=["5s-1k", "15s-16k"],
+)
+def generation_requests(request):
     checkpoint = os.environ.get("UNISERVE_H3_MODEL", "")
     if not checkpoint or not Path(checkpoint).is_dir():
         pytest.fail(
@@ -360,28 +364,26 @@ def generation_requests():
         )
     tokenizer = AutoTokenizer.from_pretrained(Path(checkpoint) / "tokenizer")
     point = load_config().benchmarks["minimax-h3-5s-1k"]
-    requests = []
-    for seconds, frames, tokens in ((5, 124, 1000), (15, 362, 16384)):
-        case = replace(
-            point,
-            load=replace(point.load, num_prompts=1),
-            video=replace(point.video, seconds=seconds, prompt_tokens=tokens),
+    seconds, frames, tokens = request.param
+    case = replace(
+        point,
+        load=replace(point.load, num_prompts=1),
+        video=replace(point.video, seconds=seconds, prompt_tokens=tokens),
+    )
+    example = MiniMaxH3Dataset(case).load(tokenizer)[0]
+    requests = [
+        (
+            frames,
+            tuple(tokenizer.encode(example.prompt, add_special_tokens=False)),
         )
-        example = MiniMaxH3Dataset(case).load(tokenizer)[0]
-        requests.append(
-            (
-                frames,
-                tuple(
-                    tokenizer.encode(example.prompt, add_special_tokens=False)
-                ),
-            )
-        )
+    ]
     tokens = requests[0][1]
     # Exact tile boundaries and a different prompt with the same signature
     # expose stale conditioning, while the minimum frame count exercises
     # decoder geometry.
-    requests.extend((22, tokens[:length]) for length in (63, 64, 65))
-    requests.append((22, tokens[1:65]))
+    if seconds == 5:
+        requests.extend((22, tokens[:length]) for length in (63, 64, 65))
+        requests.append((22, tokens[1:65]))
     return checkpoint, requests
 
 

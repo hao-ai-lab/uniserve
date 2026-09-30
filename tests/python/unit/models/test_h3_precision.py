@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from uniserve_models.minimax_h3 import weight_config
+from uniserve_models.minimax_h3 import (
+    default_precision,
+    precisions,
+    weight_config,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -52,6 +56,30 @@ def test_serving_tiers_expand_to_the_public_precision_contract(
 
 def test_default_precision_is_balanced():
     assert weight_config() == weight_config(preset="balanced")
+
+
+@pytest.mark.parametrize(
+    ("device", "capability", "video_vae"),
+    [
+        ("cpu", (0, 0), "fp16"),
+        ("cuda:0", (9, 0), "fp16"),
+        ("cuda:0", (10, 0), "nvfp4"),
+        ("cuda:0", (12, 0), "nvfp4"),
+    ],
+)
+def test_loading_default_uses_device_supported_representations(
+    monkeypatch, device, capability, video_vae
+):
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device: capability
+    )
+    config = precisions[default_precision(torch.device(device))]
+    layer = "denoiser.transformer.layers.0"
+    decoder = "video_decoder.decoder.decoder"
+    assert _format(config, f"{layer}.attention.projection") == "bf16"
+    assert _format(config, f"{layer}.mlp") == "bf16"
+    assert _format(config, "text_encoder") == "bf16"
+    assert _format(config, f"{decoder}.decoder.layers.0.qkv") == video_vae
 
 
 @pytest.mark.parametrize(

@@ -194,11 +194,12 @@ def _weight_config(source, options, execution) -> weights.Config:
     ``options`` is the launch's ``quantization_config``. Exactly one source
     selects the base weight configuration: ``components`` selectors passed to
     the model package's ``weight_config`` factory (with ``mode`` or
-    ``quant_method`` as its preset, ``default`` without one); a named
-    precision in ``source.precisions``; a ``quant_method`` among the generic
-    formats, applied to every module; or, with no selector, the checkpoint's
-    own weights. ``ignored_layers`` then maps each listed module path to no
-    quantization, and the dtype comes from ``execution.model_dtype``.
+    ``quant_method`` as its preset, the destination's default without one);
+    a named precision in ``source.precisions``; a ``quant_method`` among the
+    generic formats, applied to every module; or the checkpoint's own weights
+    when its package has no device policy. ``ignored_layers`` then maps each
+    listed module path to no quantization, and the dtype comes from
+    ``execution.model_dtype``.
     ``kv_cache_dtype`` is accepted here but applied by ``load_worker_model``.
 
     Raises:
@@ -239,6 +240,8 @@ def _weight_config(source, options, execution) -> weights.Config:
         )
 
     selected = options.get("mode", options.get("quant_method"))
+    if selected in (None, "default") and source.default_precision is not None:
+        selected = source.default_precision(torch.device(execution.device))
     components = options.get("components", {})
     if not isinstance(components, Mapping):
         raise TypeError("precision components must be an object")
@@ -407,6 +410,8 @@ def load_worker_model(
     loaded = models.load_model(
         source,
         device=config.execution.device,
+        # Launch precision, dtype and exclusions are already resolved above.
+        weights=source.weights,
         meshes=meshes,
         attention=attention,
         devices=_devices(description, config.execution.generation_device),

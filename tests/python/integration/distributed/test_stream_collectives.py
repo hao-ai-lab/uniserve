@@ -117,7 +117,14 @@ def _run_collectives(rank: int, rendezvous: str):
             device=device,
         ).get_group("tokens")
         module = _Collectives(mesh, independent)
-        greens = partition_streams(device, (64, 88))
+        # Exercise two independent partitions within this device's SM grant.
+        # H200 exposes 132 SMs, so the 64 + 88 split of larger devices does
+        # not fit. Eight-SM multiples satisfy Hopper's partition granularity.
+        total_sms = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+        second_sms = min(88, (total_sms - 64) // 8 * 8)
+        greens = partition_streams(device, (64, second_sms))
         try:
             for green in greens:
                 with ExecutionContext(module, stream=green) as context:

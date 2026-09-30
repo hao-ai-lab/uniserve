@@ -42,6 +42,7 @@ _TILE = 64
 _HEAD_DIM = 128
 _FLOAT_WORKSPACE_BYTES = 128 * 1024 * 1024
 _INDEX_BLOCK = 256
+_MAX_TOKEN_REFERENCES = torch.iinfo(torch.int32).max
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,40 @@ class _NativeSparsePlan:
     counts: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class _TokenPlan:
+    """FlashInfer FA3 CSR over the valid tokens of selected tile-64 blocks.
+
+    Single-token pages express partial and empty tiles without a custom
+    score mask. The plan schedules each row's declared capacity; device CSR
+    pointers and indices carry its live key domain on every graph replay.
+    """
+
+    wrapper: Any
+    indices: torch.Tensor
+    indptr: torch.Tensor
+    counts: torch.Tensor
+    work_batches: torch.Tensor
+    work_starts: torch.Tensor
+    work_counts: torch.Tensor
+    query_tiles: int
+    key_tiles: int
+    owner_tiles: int
+    interval_tiles: int
+    start_tile: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Queries:
+    """Independent query windows over the same complete key domain."""
+
+    plans: tuple[_TokenPlan, ...]
+    heads: int
+    owners: int
+    rows: int
+    start_tile: int
+
+
 @dataclass
 class SparseExecutionState:
     """Own mutable plans and scratch.
@@ -79,7 +114,9 @@ class SparseExecutionState:
     domain.
     """
 
-    plans: dict[tuple[Any, ...], _SparsePlan] = field(default_factory=dict)
+    plans: dict[tuple[Any, ...], _SparsePlan | _TokenPlan | _Queries] = field(
+        default_factory=dict
+    )
     native_plans: dict[tuple[Any, ...], _NativeSparsePlan] = field(
         default_factory=dict
     )
@@ -99,6 +136,113 @@ def uses_row_major_inputs(device: torch.device) -> bool:
 
 
 if triton is not None:
+
+    @triton.jit
+    def _refresh_sparse_work_kernel(
+        batches,
+        indptr,
+        counts,
+        starts,
+        lengths,
+        work_count: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        work = tl.program_id(0) * block + tl.arange(0, block)
+        active = work < work_count
+        batch = tl.load(batches + work, mask=active, other=0)
+        start = tl.load(indptr + batch, mask=active, other=0)
+        count = tl.load(counts + batch, mask=active, other=0)
+        tl.store(starts + work, start, mask=active)
+        tl.store(lengths + work, count, mask=active)
+
+    @triton.jit
+    def _count_sparse_tokens_kernel(
+        source_indices,
+        source_counts,
+        valid_sizes,
+        counts,
+        index_stride_head: tl.constexpr,
+        index_stride_tile: tl.constexpr,
+        count_stride_head: tl.constexpr,
+        query_tiles: tl.constexpr,
+        owner_tiles: tl.constexpr,
+        interval_tiles: tl.constexpr,
+        start_tile: tl.constexpr,
+        source_width: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        head = row // query_tiles
+        local_tile = row % query_tiles
+        tile = (
+            local_tile // interval_tiles * owner_tiles
+            + start_tile
+            + local_tile % interval_tiles
+        )
+        live_count = tl.load(source_counts + head * count_stride_head + tile)
+        selected = tl.arange(0, block)
+        active = (selected < source_width) & (selected < live_count)
+        keys = tl.load(
+            source_indices
+            + head * index_stride_head
+            + tile * index_stride_tile
+            + selected,
+            mask=active,
+            other=0,
+        )
+        sizes = tl.load(valid_sizes + keys, mask=active, other=0)
+        tl.store(counts + row, tl.sum(sizes, 0))
+
+    @triton.jit
+    def _fill_sparse_tokens_kernel(
+        source_indices,
+        source_counts,
+        valid_sizes,
+        indptr,
+        indices,
+        index_stride_head: tl.constexpr,
+        index_stride_tile: tl.constexpr,
+        count_stride_head: tl.constexpr,
+        query_tiles: tl.constexpr,
+        key_tiles: tl.constexpr,
+        owner_tiles: tl.constexpr,
+        interval_tiles: tl.constexpr,
+        start_tile: tl.constexpr,
+        source_width: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        head = row // query_tiles
+        local_tile = row % query_tiles
+        tile = (
+            local_tile // interval_tiles * owner_tiles
+            + start_tile
+            + local_tile % interval_tiles
+        )
+        live_count = tl.load(source_counts + head * count_stride_head + tile)
+        destination = tl.load(indptr + row)
+        columns = tl.arange(0, 16)
+        tokens = tl.arange(0, 64)
+        # Expand a bounded group at a time rather than materializing a
+        # source_width x 64 register tile for each query block.
+        for begin in range(tl.cdiv(source_width, 16)):
+            selected = begin * 16 + columns
+            active = (selected < source_width) & (selected < live_count)
+            keys = tl.load(
+                source_indices
+                + head * index_stride_head
+                + tile * index_stride_tile
+                + selected,
+                mask=active,
+                other=0,
+            )
+            sizes = tl.load(valid_sizes + keys, mask=active, other=0)
+            offsets = tl.cumsum(sizes, 0) - sizes
+            tl.store(
+                indices + destination + offsets[:, None] + tokens[None, :],
+                (head * key_tiles + keys[:, None]) * 64 + tokens[None, :],
+                mask=active[:, None] & (tokens[None, :] < sizes[:, None]),
+            )
+            destination += tl.sum(sizes, 0)
 
     @triton.jit
     def _fill_flattened_bsr_kernel(
@@ -251,7 +395,7 @@ def _plan_for(
     owners: int = 1,
     row_start: int = 0,
     row_count: int | None = None,
-) -> _SparsePlan:
+) -> _SparsePlan | _TokenPlan | _Queries:
     """Plan head-flattened BSR from the caller's declared row cardinalities."""
     rows, heads, width = (int(size) for size in query.shape)
     owner_rows = rows // owners
@@ -304,13 +448,89 @@ def _plan_for(
         ),
     )
     counts = counts.index_select(1, selected).reshape(-1)
+    hopper = torch.cuda.get_device_capability(query.device)[0] == 9
+    if (
+        hopper
+        and int(counts.sum(dtype=torch.int64)) * _TILE > _MAX_TOKEN_REFERENCES
+    ):
+        # FA3's WorkTileInfo narrows KV offsets to signed int even when the
+        # public CSR uses int64. Independent query windows preserve every
+        # selected key while bounding each launch's scheduler offsets.
+        costs = (
+            counts.view(heads, owners, interval_tiles).sum(
+                dim=(0, 1), dtype=torch.int64
+            )
+            * _TILE
+        )
+        windows = []
+        begin, capacity = 0, 0
+        for tile, cost in enumerate(costs.tolist()):
+            if cost > _MAX_TOKEN_REFERENCES:
+                raise ValueError("one VSA query tile exceeds FA3's KV capacity")
+            if capacity + cost > _MAX_TOKEN_REFERENCES:
+                windows.append((begin, tile))
+                begin, capacity = tile, 0
+            capacity += cost
+        windows.append((begin, interval_tiles))
+        plans = tuple(
+            _plan_for(
+                state,
+                query,
+                key,
+                pattern=pattern,
+                index_width=index_width,
+                scale=scale,
+                owners=owners,
+                row_start=row_start + begin * _TILE,
+                row_count=(end - begin) * _TILE,
+            )
+            for begin, end in windows
+        )
+        plan = _Queries(plans, heads, owners, row_count, row_start // _TILE)
+        state.plans[cache_key] = plan
+        return plan
+
     indptr_host = torch.empty(counts.numel() + 1, dtype=torch.int32)
     indptr_host[0] = 0
     torch.cumsum(counts, dim=0, out=indptr_host[1:])
+    if hopper:
+        plan = _token_plan(
+            state,
+            query,
+            indptr_host,
+            rows=rows,
+            key_rows=key_rows,
+            owner_rows=owner_rows,
+            row_start=row_start,
+            row_count=row_count,
+            scale=scale,
+        )
+        state.plans[cache_key] = plan
+        return plan
     indptr = indptr_host.to(query.device)
-    indices = torch.zeros(
-        int(indptr_host[-1]), dtype=torch.int32, device=query.device
+    index_count = int(indptr_host[-1])
+    requirements = {
+        "indices": BufferConfig((index_count,), torch.int32),
+        "mask": BufferConfig(
+            (index_count * _TILE * (_TILE // 8),), torch.uint8
+        ),
+    }
+    # Every launch rewrites its complete index list and key-validity mask.
+    # Serialized layers and layouts can borrow the same mutable backing;
+    # retaining a mask per layer would multiply quadratic storage by depth.
+    maps = (
+        {
+            name: torch.empty(
+                config.shape, dtype=config.dtype, device=query.device
+            )
+            for name, config in requirements.items()
+        }
+        if state.transient is None
+        else state.transient("vsa_bsr_rows", requirements, query.device)
     )
+    indices = maps["indices"]
+    indices.zero_()
+    packed_mask = maps["mask"]
 
     workspace_key = query.device
     float_workspace = state.workspaces.get(workspace_key)
@@ -321,12 +541,6 @@ def _plan_for(
             device=query.device,
         )
         state.workspaces[workspace_key] = float_workspace
-
-    packed_mask = torch.empty(
-        indices.numel() * _TILE * (_TILE // 8),
-        dtype=torch.uint8,
-        device=query.device,
-    )
 
     wrapper = _BlockSparseAttentionWrapper(float_workspace, backend="auto")
     wrapper.plan(
@@ -374,6 +588,107 @@ def _plan_for(
     )
     state.plans[cache_key] = plan
     return plan
+
+
+def _token_plan(
+    state: SparseExecutionState,
+    query: torch.Tensor,
+    indptr_host: torch.Tensor,
+    *,
+    rows: int,
+    key_rows: int,
+    owner_rows: int,
+    row_start: int,
+    row_count: int,
+    scale: float,
+) -> _TokenPlan:
+    """Plan the declared sparse capacity with graph-stable token CSR views.
+
+    This is the single-token page representation used by FlashInfer's
+    variable-block sparse attention. Keeping the row capacities on the host
+    and generating their live CSR on the device permits dynamic block
+    selection and exact padding exclusion without replanning during serving.
+    """
+    device = query.device
+    batch_size = indptr_host.numel() - 1
+    index_dtype = torch.int32
+    token_indptr = indptr_host * _TILE
+    requirements = {
+        "indices": BufferConfig((int(token_indptr[-1]),), index_dtype),
+        "indptr": BufferConfig((batch_size + 1,), index_dtype),
+        "counts": BufferConfig((batch_size,), torch.int32),
+    }
+    maps = (
+        {
+            name: torch.empty(config.shape, dtype=config.dtype, device=device)
+            for name, config in requirements.items()
+        }
+        if state.transient is None
+        else state.transient("vsa_sparse_tokens", requirements, device)
+    )
+    indices = maps["indices"]
+    indices.zero_()
+    qo_indptr = torch.arange(batch_size + 1, dtype=index_dtype) * _TILE
+    last_page_len = torch.ones(batch_size, dtype=index_dtype)
+    workspace = state.workspaces.get(device)
+    if workspace is None:
+        workspace = torch.empty(
+            _FLOAT_WORKSPACE_BYTES, dtype=torch.uint8, device=device
+        )
+        state.workspaces[device] = workspace
+
+    wrapper = _flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace,
+        kv_layout="NHD",
+        use_cuda_graph=True,
+        qo_indptr_buf=qo_indptr.to(device),
+        paged_kv_indptr_buf=maps["indptr"],
+        paged_kv_indices_buf=indices,
+        paged_kv_last_page_len_buf=last_page_len.to(device),
+        backend="fa3",
+    )
+    wrapper.plan(
+        qo_indptr,
+        token_indptr,
+        indices,
+        last_page_len,
+        1,
+        1,
+        query.shape[-1],
+        1,
+        q_data_type=query.dtype,
+        kv_data_type=query.dtype,
+        o_data_type=query.dtype,
+        sm_scale=scale,
+    )
+    # FA3's persistent scheduler caches key offsets and lengths inside its
+    # integer workspace, rather than reading the supplied CSR on run. Its
+    # PrefillPlanSM90Info serializes nine byte offsets/flags. Each of our
+    # 64-row, one-head requests schedules exactly one 128-row query tile;
+    # keep that immutable work order and refresh only its live key domain.
+    info = wrapper._plan_info
+    if len(info) != 9:
+        raise RuntimeError("FlashInfer returned an unsupported FA3 plan layout")
+
+    def work_field(index: int) -> torch.Tensor:
+        return wrapper._int_workspace_buffer.narrow(
+            0, info[index], batch_size * index_dtype.itemsize
+        ).view(index_dtype)
+
+    return _TokenPlan(
+        wrapper,
+        indices,
+        maps["indptr"],
+        maps["counts"],
+        work_field(7),
+        work_field(2),
+        work_field(4),
+        rows // _TILE,
+        key_rows // _TILE,
+        owner_rows // _TILE,
+        row_count // _TILE,
+        row_start // _TILE,
+    )
 
 
 def _native_plan_for(
@@ -442,7 +757,7 @@ def _native_plan_for(
 
 
 def _fill_flattened_bsr(
-    plan: _SparsePlan,
+    plan: _SparsePlan | _TokenPlan,
     source_indices: torch.Tensor,
     source_counts: torch.Tensor,
     valid_sizes: torch.Tensor,
@@ -454,6 +769,55 @@ def _fill_flattened_bsr(
     """
     assert triton is not None
     heads = int(source_indices.shape[0])
+    if isinstance(plan, _TokenPlan):
+        arguments = (
+            int(source_indices.stride(0)),
+            int(source_indices.stride(1)),
+            int(source_counts.stride(0)),
+            plan.query_tiles,
+        )
+        mapping = (
+            plan.owner_tiles,
+            plan.interval_tiles,
+            plan.start_tile,
+            int(source_indices.shape[2]),
+        )
+        _count_sparse_tokens_kernel[(heads * plan.query_tiles,)](
+            source_indices,
+            source_counts,
+            valid_sizes,
+            plan.counts,
+            *arguments,
+            *mapping,
+            triton.next_power_of_2(source_indices.shape[2]),
+            num_warps=4,
+        )
+        plan.indptr[:1].zero_()
+        torch.cumsum(
+            plan.counts, 0, dtype=plan.indptr.dtype, out=plan.indptr[1:]
+        )
+        _fill_sparse_tokens_kernel[(heads * plan.query_tiles,)](
+            source_indices,
+            source_counts,
+            valid_sizes,
+            plan.indptr,
+            plan.indices,
+            *arguments,
+            plan.key_tiles,
+            *mapping,
+            num_warps=4,
+        )
+        _refresh_sparse_work_kernel[(triton.cdiv(plan.counts.numel(), 256),)](
+            plan.work_batches,
+            plan.indptr,
+            plan.counts,
+            plan.work_starts,
+            plan.work_counts,
+            plan.counts.numel(),
+            256,
+            num_warps=4,
+        )
+        return
     wrapper_indptr = getattr(plan.wrapper, "_paged_kv_indptr_buf", None)
     if wrapper_indptr is None:
         raise RuntimeError(
@@ -480,6 +844,90 @@ def _fill_flattened_bsr(
         num_warps=4,
         num_stages=1,
     )
+
+
+def run_sparse(
+    plan: _SparsePlan | _TokenPlan | _Queries,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    block_indices: torch.Tensor,
+    block_counts: torch.Tensor,
+    valid_sizes: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Evaluate a prepared sparse plan with its live device key domain."""
+    if isinstance(plan, _Queries):
+        output = torch.empty_like(query) if out is None else out
+        width = query.shape[-1]
+        queries = query.view(plan.heads, plan.owners, plan.rows, width)
+        outputs = output.view(plan.heads, plan.owners, plan.rows, width)
+        for window in plan.plans:
+            begin = (window.start_tile - plan.start_tile) * _TILE
+            count = window.interval_tiles * _TILE
+            packed = queries[:, :, begin : begin + count].contiguous()
+            # Plans borrow the same mutable CSR. Populate and consume each
+            # window on the serialized stream before the next rewrites it.
+            result = run_sparse(
+                window,
+                packed.view(-1, 1, width),
+                key,
+                value,
+                block_indices=block_indices,
+                block_counts=block_counts,
+                valid_sizes=valid_sizes,
+            )
+            outputs[:, :, begin : begin + count].copy_(
+                result.view(plan.heads, plan.owners, count, width)
+            )
+        return output
+
+    _fill_flattened_bsr(plan, block_indices, block_counts, valid_sizes)
+    if isinstance(plan, _TokenPlan):
+        return plan.wrapper.run(
+            query,
+            (
+                key.view(-1, 1, 1, key.shape[-1]),
+                value.view(-1, 1, 1, value.shape[-1]),
+            ),
+            out=out,
+        )
+    return plan.wrapper.run(query, key, value, out=out)
+
+
+def dense_prefix(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    valid_sizes: torch.Tensor,
+    *,
+    scale: float,
+) -> torch.Tensor:
+    """Attend Hopper prefix rows to every valid key, returning row-major rows.
+
+    Inputs have head-first layouts [heads, rows, width]. Each key tile has
+    64 rows; its borrowed int32 validity count remains live on graph replay.
+    The score predicate preserves partial and empty tiles while allowing
+    FlashAttention-4's SM90 TMA/WGMMA implementation.
+    """
+    from uniserve_kernels.attention.block_validity import block_validity
+
+    from ..flash_attn_4 import _flash_attn_forward
+
+    # Preserve the vector's inner stride and alignment when CuTe converts
+    # the auxiliary tensor. This changes metadata, not the borrowed counts.
+    valid_sizes.__leading_dim__ = 0
+    valid_sizes.__assumed_align__ = 4
+    return _flash_attn_forward()(
+        query.transpose(0, 1).unsqueeze(0),
+        key.transpose(0, 1).unsqueeze(0),
+        value.transpose(0, 1).unsqueeze(0),
+        softmax_scale=scale,
+        causal=False,
+        mask_mod=block_validity,
+        aux_tensors=[valid_sizes],
+    )[0][0]
 
 
 def prepare_rows(
@@ -565,9 +1013,12 @@ def prepare_rows(
     prefix_rows = pattern.dense_prefix_tiles * _TILE
     valid_tiles = pattern.dense_key_tiles
     key_mask = None
-    if valid_tiles and not native_rows:
+    hopper = torch.cuda.get_device_capability(query.device)[0] == 9
+    if valid_tiles and not native_rows and not hopper:
         key_mask = torch.empty(
-            valid_tiles * (_TILE // 8), dtype=torch.uint8, device=query.device
+            valid_tiles * (_TILE // 8),
+            dtype=torch.uint8,
+            device=query.device,
         )
         _pack_key_validity_kernel[(triton.cdiv(key_mask.numel(), 256),)](
             valid_sizes, key_mask, key_mask.numel()
@@ -640,17 +1091,17 @@ def prepare_rows(
             row_start=start,
             row_count=count,
         )
-        _fill_flattened_bsr(
-            plan, mask_block_indices, mask_block_count, valid_sizes
-        )
-
         output = attention_output.view(-1)[:elements].view(
             heads * members * count, 1, width
         )
-        plan.wrapper.run(
+        run_sparse(
+            plan,
             packed_query.reshape(heads * members * count, 1, width),
             packed_key.view(heads * rows, 1, width),
             packed_value.view(heads * rows, 1, width),
+            block_indices=mask_block_indices,
+            block_counts=mask_block_count,
+            valid_sizes=valid_sizes,
             out=output,
         )
         compose_attention(
@@ -714,16 +1165,25 @@ def prepare_rows(
             owner_query = packed_query[:, owner * count : (owner + 1) * count]
 
             if dense_rows:
-                assert key_mask is not None
-                attended = _flashinfer.single_prefill_with_kv_cache(
-                    owner_query[:, :dense_rows].transpose(0, 1),
-                    packed_key[:, : valid_tiles * _TILE],
-                    packed_value[:, : valid_tiles * _TILE],
-                    kv_layout="HND",
-                    backend="fa2",
-                    sm_scale=scale,
-                    packed_custom_mask=key_mask.repeat(dense_rows),
-                )
+                if hopper:
+                    attended = dense_prefix(
+                        owner_query[:, :dense_rows],
+                        packed_key[:, : valid_tiles * _TILE],
+                        packed_value[:, : valid_tiles * _TILE],
+                        valid_sizes,
+                        scale=scale,
+                    )
+                else:
+                    assert key_mask is not None
+                    attended = _flashinfer.single_prefill_with_kv_cache(
+                        owner_query[:, :dense_rows].transpose(0, 1),
+                        packed_key[:, : valid_tiles * _TILE],
+                        packed_value[:, : valid_tiles * _TILE],
+                        kv_layout="HND",
+                        backend="fa2",
+                        sm_scale=scale,
+                        packed_custom_mask=key_mask.repeat(dense_rows),
+                    )
                 compose_attention(
                     attended.transpose(0, 1).unsqueeze(0),
                     gate,

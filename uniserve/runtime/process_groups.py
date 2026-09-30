@@ -294,6 +294,11 @@ def _rendezvous_store(
 def _group_options(backend: str):
     if backend != "nccl":
         return None
+    from ._collectives import _connect_during_initialization
+
+    # NCCL caches process policy at the first communicator initialization.
+    # Apply it to the physical world as well as stream-bound communicators.
+    _connect_during_initialization()
     options = dist.ProcessGroupNCCL.Options()
     options.use_pg_for_symm_mem_rendezvous = True
     # NCCL checks topology, driver, symmetric windows and collective kind for

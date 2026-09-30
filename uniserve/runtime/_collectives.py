@@ -56,6 +56,18 @@ def _forbid_implicit_registration() -> None:
     os.environ["NCCL_GRAPH_REGISTER"] = "0"
 
 
+def _connect_during_initialization() -> None:
+    """Establish peer connections before numerical work starts.
+
+    Runtime connection setup can block a collective's host launch while a
+    peer is still loading a cuBLAS kernel. CUDA library loading may need
+    synchronization with peer work, so neither launch can then advance.
+    Connecting during resource binding completes that collective setup
+    before numerical calls, including calls on intersecting groups.
+    """
+    os.environ["NCCL_RUNTIME_CONNECT"] = "0"
+
+
 class _CollectiveWork:
     """A published transfer with a consumer-supplied dependency.
 
@@ -88,6 +100,7 @@ class NcclCommunicator:
 
         # Before this communicator can take part in any captured collective.
         _forbid_implicit_registration()
+        _connect_during_initialization()
         self._nccl = nccl
         self._stream = stream
         # The owned publication stream exists from construction until close.

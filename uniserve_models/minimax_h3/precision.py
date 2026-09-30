@@ -163,6 +163,22 @@ precisions = MappingProxyType(
     {name: weight_config(preset=name) for name in _formats}
 )
 
+
+def default_precision(device: torch.device) -> str:
+    """Select the dense checkpoint's default for the loading destination.
+
+    NVFP4 requires Blackwell tensor cores. Hopper retains the checkpoint's
+    BF16 transformer and FP16 decoder projections; explicit presets keep
+    their declared representations on every device.
+    """
+    if device.type == "cuda" and torch.cuda.get_device_capability(device) >= (
+        10,
+        0,
+    ):
+        return "balanced"
+    return "quality"
+
+
 # Dense modules of a calibrated checkpoint keep BF16, the video VAE
 # projections included, so the VAE runs under BF16 autocast as with the NVFP4
 # video_vae choice. The audio decoder, the latent heads, and the untargeted
