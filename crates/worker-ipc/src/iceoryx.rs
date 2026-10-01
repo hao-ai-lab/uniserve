@@ -9,6 +9,17 @@
 //!
 //! The module also owns the transport vocabulary shared by both transports:
 //! [`IpcError`], [`Frame`], [`IPC_VERSION`] and header validation.
+//!
+//! # Node ownership
+//!
+//! Each endpoint owns the iceoryx2 node its ports were created from and drops
+//! it after them. iceoryx2 removes a node's resources when the last handle to
+//! the node drops, and a port releases its handle before it removes the tag
+//! it keeps in the node's directory. A port that outlives the node therefore
+//! runs that removal while its own tag still occupies the directory: the
+//! removal fails with a warning and leaves the directory behind. A
+//! `WakeSender` holds a port too, so whoever holds a clone of one drops it
+//! before the endpoint it came from.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -264,8 +275,6 @@ pub fn service_name(id: &str) -> String {
 
 /// Host-side endpoint for sending requests and receiving worker responses.
 pub struct ClientEndpoint {
-    /// Node owner that keeps all client ports alive.
-    _node: Node<IxService>,
     /// Request-response port used to loan and send request frames.
     client: IxClient,
     /// Largest payload in bytes accepted in either direction.
@@ -274,6 +283,9 @@ pub struct ClientEndpoint {
     connect_timeout: Duration,
     /// Directional wake ports paired with the request-response service.
     events: ClientEvents,
+    /// Node owner that keeps all client ports alive. Declared last so it is
+    /// dropped after them (see the module's node ownership section).
+    _node: Node<IxService>,
 }
 
 impl ClientEndpoint {
@@ -471,8 +483,6 @@ impl ClientEndpoint {
 
 /// Worker-side endpoint for receiving requests and publishing responses.
 pub struct ServerEndpoint {
-    /// Node owner that keeps all server ports alive.
-    _node: Node<IxService>,
     /// Request-response port used to receive and answer request frames.
     server: IxServer,
     /// Largest payload in bytes accepted in either direction.
@@ -481,6 +491,9 @@ pub struct ServerEndpoint {
     active: VecDeque<(u64, IxActive)>,
     /// Directional wake ports paired with the request-response service.
     events: ServerEvents,
+    /// Node owner that keeps all server ports alive. Declared last so it is
+    /// dropped after them (see the module's node ownership section).
+    _node: Node<IxService>,
 }
 
 impl ServerEndpoint {
