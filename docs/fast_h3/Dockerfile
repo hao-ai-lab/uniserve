@@ -18,4 +18,4 @@ RUN uv sync --locked --python /usr/bin/python3.12 --extra gpu
 
 EXPOSE 8000
 ENTRYPOINT ["uniserve"]
-CMD ["serve", "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree", "--workers", "configs/fast_h3/ulysses4.json", "--host", "0.0.0.0"]
+CMD ["serve", "FastVideo/FastVideo-FastH3-8-Step-V2", "--workers", "configs/fast_h3/ulysses4.json", "--served-model-name", "FastH3", "--host", "0.0.0.0", "--max-running-requests", "2"]

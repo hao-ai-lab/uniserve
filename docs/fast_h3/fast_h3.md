@@ -22,14 +22,13 @@ curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolcha
 
 export CUDA_HOME=/usr/local/cuda
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$CUDA_HOME/bin:$PATH"
-export UV_PROJECT_ENVIRONMENT=/opt/uniserve-venv
 export MAX_JOBS=2
 
 uv sync --locked --python /usr/bin/python3.12 --extra gpu
-source "$UV_PROJECT_ENVIRONMENT/bin/activate"
+source .venv/bin/activate
 ```
 
-The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashInfer, FlashAttention-4, the peer-storage and sparse-attention kernels, and the CuTe and CUTLASS DSLs. These are shared runtime capabilities rather than model-specific packages, so there is no FastH3-specific dependency group. The sync also builds the `_uniserve_ipc` extension and the `uniserve` and `uniserve-host` binaries from this checkout. FastVideo itself is not a runtime dependency.
+The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashInfer, FlashAttention-4, the peer-storage and sparse-attention kernels, and the CuTe and CUTLASS DSLs. These are shared runtime capabilities rather than model-specific packages, so there is no FastH3-specific dependency group. The sync also builds the `_uniserve_ipc` extension and the `uniserve` and `uniserve-host` binaries from this checkout. FastVideo itself is not a runtime dependency. The environment is the repository's `.venv`, which the evaluation profiles and the [Dynamo guide](dynamo.md) run from. UniServe's native kernels compile on the first startup, as described in [Build and run with Docker](#build-and-run-with-docker); `MAX_JOBS` bounds that compilation's parallelism.
 
 ## Supported checkpoints
 
@@ -86,7 +85,7 @@ A single request is fastest when every GPU works on it, so the one-replica files
 
 | Hardware | Goal | Deployment | Additional options |
 | --- | --- | --- | --- |
-| 4 x GB200 | Latency and throughput | `ulysses4.json` | `--max-running-requests 2` |
+| 4 x GB200 | Latency and throughput | `ulysses4.json` | `--max-running-requests 2`, `NCCL_NVLS_ENABLE=0` |
 | 8 x GB200, two hosts | Latency | `ulysses8-two-node.json` | `--max-running-requests 2 --graph-policy off`, `NCCL_NVLS_ENABLE=0` |
 | 8 x GB200, two hosts | Throughput | `ulysses4x2-two-node.json` | `--max-running-requests 4`, `NCCL_NVLS_ENABLE=0` |
 | 8 x RTX PRO 6000 | Latency | `ulysses8.json` | `--max-running-requests 2 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240,16384` |
@@ -95,7 +94,7 @@ A single request is fastest when every GPU works on it, so the one-replica files
 | 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --video-text-capacities 1024,10240` |
 | 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `dp8-text-tp8.json` | `--max-running-requests 8 --max-video-seconds 5 --max-model-len 1024` |
 
-The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) assembles the same commands from a hardware, goal and checkpoint selection. `gather8.json` attends each rank's own query rows to the complete gathered keys and values and holds the complete denoiser weights on every rank; it is an alternative to Ulysses where head sharding does not apply.
+Every GB200 measurement ran with `NCCL_NVLS_ENABLE=0`, which disables NCCL's NVLink SHARP multicast; a four-GPU GB200 host also serves without it. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) assembles the same commands from a hardware, goal and checkpoint selection. `gather8.json` attends each rank's own query rows to the complete gathered keys and values and holds the complete denoiser weights on every rank; it is an alternative to Ulysses where head sharding does not apply.
 
 ### Two hosts
 
@@ -127,7 +126,7 @@ Each GPU decoder has one native media unit per rank, so a one-GPU flow replica r
 
 The queue depths are capacity values. A resident media request slot occupies three positions of its worker's batch queue, one reserved pipeline position and two unresolved outputs, and every flow worker must expose at least two resident slots, so each flow worker uses depth 6. In `dp8-text-tp8.json` the shared TP8 text worker and the muxer worker use depth 24 for eight slots, and each encoder worker uses depth 6 for two, so the narrowest aggregate component capacity is eight complete routes.
 
-The `memory_fraction` on each GPU worker is its per-process static storage ceiling. It bounds everything the process holds on the device as NVML reports it per process: the caching allocator's segments and graph pools, product arenas, communicator buffers, captured graph executables, loaded kernels and the CUDA context. NVML must therefore list the worker's process ID, which requires the host's process ID namespace. Text and flow workers share every GPU, so neither inherits the global `--mem-fraction-static` default: the replica files grant 0.26 to each text rank and 0.73 to each flow rank, and `dp8-text-tp8.json` grants 0.18 and 0.81. The physical free-storage check still caps their combined allocations. The DP8 split holds a five-second duration and 1024-token prompt capacity; revalidate it when checkpoint precision, maximum duration, prompt bound, graph shapes, or hardware change, and adjust the text and flow fractions together.
+The `memory_fraction` on each GPU worker is its per-process static storage ceiling. It bounds everything the process holds on the device as NVML reports it per process: the caching allocator's segments and graph pools, product arenas, communicator buffers, captured graph executables, loaded kernels and the CUDA context. NVML must therefore report that usage under the process ID the worker sees. A container whose NVML reports host process IDs fails startup with `NVML reports no device storage for process`; run such a container in the host's process ID namespace (`--pid=host`). Text and flow workers share every GPU, so neither inherits the global `--mem-fraction-static` default: the replica files grant 0.26 to each text rank and 0.73 to each flow rank, and `dp8-text-tp8.json` grants 0.18 and 0.81. The physical free-storage check still caps their combined allocations. The DP8 split holds a five-second duration and 1024-token prompt capacity; revalidate it when checkpoint precision, maximum duration, prompt bound, graph shapes, or hardware change, and adjust the text and flow fractions together.
 
 DP improves throughput only when the offered concurrency keeps multiple replicas occupied. At concurrency one, Ulysses retains lower latency because all GPUs cooperate on one denoising call; at higher concurrency, replicas remove that per-step collective and keep queueing behind one request from dominating service time.
 
@@ -137,7 +136,7 @@ Cross-rank products move over the mechanism named for that edge. CUDA VMM reads 
 
 A FastH3 deployment defaults to `--max-video-seconds 15` and `--max-model-len 16384`; set them only to change those limits. `--max-running-requests` caps concurrently resident requests, and the engine clamps that cap to the worker's advertised request-slot capacity; lowering it trades throughput for per-request latency and storage headroom.
 
-Startup prepares every computation an admitted request reaches. The denoiser is prepared for each of the 16 output frame counts up to `--max-video-seconds`, at every text capacity: `--video-text-capacities` lists those capacities in prompt tokens (default: 1024, then steps of 2048 up to `--max-model-len`), and a request evaluates in the smallest capacity that holds its prompt. The text encoder and the text refiner are prepared at every text capacity, and the video and audio decoders at every admitted duration. With graphs enabled (`--graph-policy auto`, the default, or `full`), startup captures one denoising graph per layout and every text-encoding and decoding call before the server reports ready, and accepted requests replay them: serving never captures and never falls back to eager execution. A layout's graph evaluates any of the eight solver steps, because the step index, the timesteps and the schedule are inputs each replay copies in. The video post-processor, which converts decoded frames for encoding, runs eagerly by design. The denoiser's layouts share one workspace and one graph pool, so its resident memory follows the largest layout rather than their count, while startup time grows with the count; fewer capacities start faster, and finer ones pad shorter prompts less. Decoder graphs keep one output per duration, so decoder memory grows with `--max-video-seconds`. With the default settings on four GB200 devices (`configs/fast_h3/ulysses4.json`), startup captures 144 denoising graphs, one per layout, and the server becomes ready in about 11 minutes; about 6 of them prepare the denoiser, almost all running one warm step per layout and about one minute capturing. Each device then reserves about 87 GiB, about 32 GiB of it in graph storage. A deployment whose startup storage does not fit its devices fails before it reports ready; the startup log lists the bytes each process holds on each device, the caching allocator's share of them, and the graph storage of each component. `--graph-policy off` serves the same layouts without graphs.
+Startup prepares every computation an admitted request reaches. The denoiser is prepared for each of the 16 output frame counts up to `--max-video-seconds`, at every text capacity: `--video-text-capacities` lists those capacities in prompt tokens (default: 1024, then steps of 2048 up to `--max-model-len`), and a request evaluates in the smallest capacity that holds its prompt. The text encoder and the text refiner are prepared at every text capacity, and the video and audio decoders at every admitted duration. With graphs enabled (`--graph-policy auto`, the default, or `full`), startup captures one denoising graph per layout and every text-encoding and decoding call before the server reports ready, and accepted requests replay them: serving never captures and never falls back to eager execution. A layout's graph evaluates any of the eight solver steps, because the step index, the timesteps and the schedule are inputs each replay copies in. The video post-processor, which converts decoded frames for encoding, runs eagerly by design. The denoiser's layouts share one workspace and one graph pool, so its resident memory follows the largest layout rather than their count, while startup time grows with the count; fewer capacities start faster, and finer ones pad shorter prompts less. Decoder graphs keep one output per duration, so decoder memory grows with `--max-video-seconds`. With the default settings on four GB200 devices (`configs/fast_h3/ulysses4.json`), startup captures 144 denoising graphs, one per layout, and the server becomes ready in about 11 minutes; about 6 of them prepare the denoiser, almost all running one warm step per layout and about one minute capturing. The first startup on a machine also compiles the kernels those steps run and takes about 19 minutes; later startups load them from the caches described in [Build and run with Docker](#build-and-run-with-docker). Until preparation finishes, the log reports `worker still busy during Worker startup` with the elapsed seconds. Each model worker process then holds about 110 GiB on its device as NVML reports it, the figure its storage grant charges; the caching allocator reserves about 87 GiB of that, about 32 GiB of it in graph pools. A deployment whose startup storage does not fit its devices fails before it reports ready; the startup log lists the bytes each process holds on each device, the caching allocator's share of them, and the graph storage of each component. `--graph-policy off` serves the same layouts without graphs.
 
 Check the live limits and served model name after startup:
 
@@ -169,7 +168,7 @@ docker run --rm \
     --max-running-requests 2
 ```
 
-The first startup compiles the native GPU providers; later startups import the finished builds without compiling. Those artifacts land in `~/.cache/torch_extensions/uniserve_kernels`; mount that path, or point `TORCH_EXTENSIONS_DIR` at a mounted directory, if container restarts must reuse them. The directory's file system must support `flock` locks, which serialize concurrent builds and are released when a stopped or killed startup exits.
+The first startup compiles UniServe's native kernels and the Triton and FlashInfer kernels FastH3 runs; later startups load the cached builds without compiling. They land in `~/.cache/torch_extensions/uniserve_kernels`, `~/.triton/cache`, and `~/.cache/flashinfer`. If container restarts must reuse them, mount `/root/.cache` and `/root/.triton`, or point `TORCH_EXTENSIONS_DIR`, `TRITON_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE` at mounted directories. The native kernels' directory must be on a file system that supports `flock` locks, which serialize concurrent builds and are released when a stopped or killed startup exits.
 
 ## Generate a video
 
@@ -259,6 +258,14 @@ H200 deployments at 15-second capacity use `--mem-fraction-static 0.92`: the def
 
 The evaluator runs the published workloads against the deployments above and validates every MP4. Run points serially, one server at a time, from the repository root. Each run writes its resolved commands, request data, per-request latencies, media validation and GPU memory observations under `artifacts/fast_h3/`.
 
+The `bench` extra installs the evaluator. `uv sync` keeps exactly the extras it names, so name `gpu` beside it:
+
+```bash
+uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
+```
+
+The profiles start `.venv/bin/uniserve` with `.venv/bin/python` as the worker interpreter, so run them from the checkout whose `.venv` holds this environment.
+
 ### UniServe FastH3 post
 
 `uniserve_eval/fast_h3.toml` holds the post's deployments and workload: 72 latency requests one at a time, 12 for each combination of a 5, 10 or 15 second clip and a 1000- or 10000-token prompt, and 32 throughput requests at each concurrency after a priming phase, all preceded by six unmeasured warmup requests. The request manifests are in `uniserve_eval/workloads/fast_h3/`. One suite covers each hardware configuration and checkpoint: `gb200-4-bf16`, `gb200-4-nvfp4`, `gb200-8-bf16`, `gb200-8-nvfp4`, `rtx-pro-6000-8-bf16`, and `rtx-pro-6000-8-nvfp4`.
@@ -274,7 +281,7 @@ The `gb200-8` suites start the head on `rank-0`; start `uniserve-host` on `rank-
 
 ### H200
 
-`uniserve_eval/fast_h3_h200.toml` holds the H200 measurements below. They use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, the evaluator's synthesized `minimax-h3` prompts with seed 1000, full graphs, and `--mem-fraction-static 0.92`. Latency is the mean ± SD of three complete MP4 requests at concurrency one after one warmup. The DP8 points use eight warmups and 16 measured requests at concurrency eight.
+`uniserve_eval/fast_h3_h200.toml` holds the H200 measurements below. They use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, the evaluator's synthesized `minimax-h3` prompts with seed 1000, full graphs, `--mem-fraction-static 0.92`, and `NCCL_CUMEM_HOST_ENABLE=1`. Latency is the mean ± SD of three complete MP4 requests at concurrency one after one warmup. The DP8 points use eight warmups and 16 measured requests at concurrency eight.
 
 Eight-H200 Ulysses in `quality` precision:
 
@@ -311,5 +318,6 @@ export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 | `unsupported FastH3 checkpoint` | Use a complete checkpoint from the table above; the message names the model ID and revision it expects. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config`: a packed NVFP4 checkpoint carries its own precision contract. |
 | `nvfp4 conversion requires an SM100-class CUDA device` | NVFP4 and MXFP8 need Blackwell. On Hopper, keep the default `quality` precision or use FP8 component overrides. |
+| `NVML reports no device storage for process` | NVML attributes no device usage to the worker's process ID, as when it reports host process IDs inside a container; run the container in the host's process ID namespace (`--pid=host`). |
 | GPU out of memory | Reduce resident capacity, or shard the denoiser with tensor or pipeline parallelism; Ulysses retains most denoiser weights on each rank. |
 | MP4 contains an error body | Use `--fail-with-body`, inspect the HTTP status, and confirm the model name and `/v1/capabilities` limits. |

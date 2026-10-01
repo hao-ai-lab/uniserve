@@ -6,6 +6,8 @@
 !uv.lock
 !.python-version
 !README.md
+!configs
+!configs/**
 !crates
 !crates/**
 !uniserve
