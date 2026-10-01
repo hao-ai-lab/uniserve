@@ -2163,18 +2163,14 @@ mod placement_tests {
 
     #[test]
     fn every_shipped_deployment_encodes_its_units_on_their_host() {
-        // Every `minimax-h3-*.json` deployment file in `configs/` must pass
-        // the placement checks the engine applies at startup, including the
-        // pairing of every decoding worker with an encoder on its host.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        // Every FastH3 deployment file shipped in `configs/fast_h3/` must
+        // pass the placement checks the engine applies at startup, including
+        // the pairing of every decoding worker with an encoder on its host.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/fast_h3");
         let mut checked = 0;
-        for entry in std::fs::read_dir(&root).expect("the deployment directory exists") {
+        for entry in std::fs::read_dir(&root).expect("the FastH3 deployment directory exists") {
             let path = entry.expect("readable entry").path();
-            let is_media = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("minimax-h3-") && name.ends_with(".json"));
-            if !is_media {
+            if path.extension().is_none_or(|extension| extension != "json") {
                 continue;
             }
             let workers: Vec<crate::WorkerConfig> =
