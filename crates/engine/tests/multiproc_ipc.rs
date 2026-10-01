@@ -1387,6 +1387,51 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
 }
 
 #[test]
+fn closing_a_group_lets_every_rank_finish_a_collective_teardown() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The `collective_teardown_worker` fixture ranks serve the stub worker
+    // and, once closed, wait at a barrier over their process world before
+    // they record `<rank>.closed`. Like the release of the communicators a
+    // group's ranks share, that teardown completes on any rank only once
+    // every rank has been asked to close.
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("worker");
+    let python = serde_json::to_string(&worker_python())?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture =
+        serde_json::to_string(&root.join("tests/python/fixtures/collective_teardown_worker.py"))?;
+    // The fixture is run by path, so its own directory leads the import
+    // path; the package it shares with the rest of the suite is named here.
+    let import_root = serde_json::to_string(&root.canonicalize()?)?;
+    let records = serde_json::to_string(&directory.path())?;
+    // `WorkerGroup` runs `<python> -m uniserve_worker.main <args>`, so the
+    // wrapper drops its first two arguments and runs the fixture with the
+    // rest.
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, PYTHONPATH={import_root}, UNISERVE_TEST_TEARDOWN_DIR={records})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let mut args = rank_group_args(1 << 20, 8 << 20);
+    args.python = wrapper;
+    let mut worker = WorkerGroup::spawn(args)?;
+
+    // Close returns once every local rank process has exited, so each rank
+    // has either finished its teardown or been stopped short of it.
+    worker.close()?;
+    for rank in 0..WORLD_SIZE {
+        assert!(
+            directory.path().join(format!("{rank}.closed")).exists(),
+            "rank {rank} exited without finishing its teardown"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::ERROR)
