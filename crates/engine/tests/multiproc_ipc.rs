@@ -418,6 +418,98 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
 }
 
 #[test]
+fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Result<()> {
+    use uniserve_worker_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let descriptor_directory = tempfile::tempdir()?;
+    let descriptor_path = descriptor_directory.path().join("launch.json");
+    std::fs::write(
+        &descriptor_path,
+        serde_json::to_vec(&stub_launch_descriptor(&listener.local_addr()?.to_string()))?,
+    )?;
+    let mut child = std::process::Command::new(worker_python())
+        .args(["-m", "uniserve_worker.main"])
+        .arg("--launch-descriptor")
+        .arg(&descriptor_path)
+        .spawn()?;
+    let result = (|| -> anyhow::Result<()> {
+        let client = ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 1 << 20, 8)?;
+        let request = |mut request: WorkerRequest, message_id| {
+            request.set_call_id(Some(message_id));
+            request
+        };
+        let serve = |batch_id: u64, request_id: u64, slot: u32, message_id| -> anyhow::Result<()> {
+            let admission = text_admission(request_id, 1, slot)?;
+            let batch = token_batch(
+                batch_id,
+                batch_id,
+                admission.request_key,
+                Some(admission),
+                CallId::new(batch_id, 0),
+                CallKind::Forward(ForwardMode::Prefill),
+                &[7, 8],
+                BlockId(slot),
+                0,
+            );
+            let pending =
+                client.send_request(&request(WorkerRequest::submit(batch), message_id))?;
+            let response = client
+                .recv_response_timeout(&pending, Duration::from_secs(30))?
+                .context("submission did not complete")?
+                .decode_response()?;
+            anyhow::ensure!(
+                matches!(response, WorkerResponse::Result { .. }),
+                "submission failed: {response:?}"
+            );
+            Ok(())
+        };
+
+        // A result means the rank serves: warmup has ended.
+        serve(1, 61, 1, 1)?;
+
+        // A terminal's Ctrl-C and a service manager's stop reach every process
+        // of the job; the rank keeps serving until its head closes it.
+        let pid = libc::pid_t::try_from(child.id())?;
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            anyhow::ensure!(unsafe { libc::kill(pid, signal) } == 0);
+        }
+        serve(2, 62, 2, 2)?;
+
+        let close = client.send_request(&request(WorkerRequest::close(), 3))?;
+        let closed = client
+            .recv_response_timeout(&close, Duration::from_secs(30))?
+            .context("Close was not acknowledged")?
+            .decode_response()?;
+        anyhow::ensure!(
+            closed
+                == WorkerResponse::Ok {
+                    message_id: Some(3)
+                },
+            "Close failed: {closed:?}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::ensure!(status.success(), "worker shutdown failed: {status}");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "worker did not exit after Close"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    })();
+    // Clean up the external process even when an assertion or transport call fails.
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+#[test]
 fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
     use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
 

@@ -20,7 +20,12 @@ from typing import IO, Self
 from .config import ServerLaunch, ServerProfile
 
 # Seconds a stopped server group has to exit after SIGTERM before SIGKILL.
-_STOP_GRACE_S = 10.0
+# A serving rank leaves SIGTERM to the server, which drains its worker groups
+# and closes each group's ranks together so they release the communicators
+# they share; FastH3 on four GPUs takes about 12 seconds. SIGKILL during that
+# teardown abandons the communicators' shared-memory segments, so the grace
+# covers it with margin and only bounds a server that has stopped responding.
+_STOP_GRACE_S = 60.0
 
 
 class ManagedServer:
