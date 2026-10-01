@@ -27,7 +27,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` server and `uniserve-host` launcher binaries, the native worker IPC extension and the `gpu` extra's kernels: FlashInfer, FlashAttention-4, and UniServe's sparse-attention and peer-storage kernels. Building them needs a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja; the [FastH3 guide](docs/fast_h3/fast_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` server and `uniserve-host` launcher binaries and the native worker IPC extension, and installs the `gpu` extra's providers: FlashInfer, FlashAttention-4, and UniServe's sparse-attention and peer-storage kernels. The first `uniserve serve` compiles UniServe's native kernels, which needs a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja; the [FastH3 guide](docs/fast_h3/fast_h3.md#install) lists the system packages and a container build.
 
 ## Quickstart
 
@@ -44,7 +44,7 @@ uniserve serve "$H3_MODEL" \
   --max-running-requests 2
 ```
 
-Startup prepares and captures every admitted request shape before `/health` reports ready; on four GB200 GPUs this takes about 11 minutes. Then generate a video:
+Startup prepares and captures every admitted request shape before `/health` reports ready; on four GB200 GPUs this takes about 11 minutes. The first startup on a machine also compiles and caches the kernels FastH3 runs and takes about 19 minutes. Until preparation finishes, the log reports `worker still busy during Worker startup` with the elapsed seconds. Then generate a video:
 
 ```bash
 curl --fail-with-body --max-time 600 \
@@ -114,9 +114,10 @@ Run `uniserve serve --help` for the complete option set.
 
 ## Reproduce the measurements
 
-The serving evaluator runs HTTP workloads against a server, validates every response, and writes reproducible result bundles. `uniserve_eval/fast_h3.toml` holds the deployments and workload of the UniServe FastH3 post, and `uniserve_eval/fast_h3_h200.toml` the H200 measurements in the FastH3 guide:
+The serving evaluator runs HTTP workloads against a server, validates every response, and writes reproducible result bundles. `uniserve_eval/fast_h3.toml` holds the deployments and workload of the UniServe FastH3 post, and `uniserve_eval/fast_h3_h200.toml` the H200 measurements in the FastH3 guide. The `bench` extra installs the evaluator; `uv sync` keeps exactly the extras it names, so name `gpu` beside it:
 
 ```bash
+uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
 export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml plan gb200-4-bf16
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
