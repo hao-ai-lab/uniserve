@@ -1345,16 +1345,25 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
         serde_json::json!({"max_batch_tokens": 128}),
     ] {
         let directory = tempfile::tempdir()?;
-        // The wrapper is the interpreter `WorkerGroup` runs: the fixture's
-        // `run` strips the `-m uniserve_worker.main` arguments and serves a
-        // `Worker` whose `info` reads `replacement.json`.
         let wrapper = directory.path().join("python");
+        let python = serde_json::to_string(&worker_python())?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixture =
+            serde_json::to_string(&root.join("tests/python/fixtures/replacement_worker.py"))?;
+        // The fixture is run by path, so its own directory leads the import
+        // path; the repository root named here resolves the worker packages
+        // from this checkout.
+        let import_root = serde_json::to_string(&root.canonicalize()?)?;
+        let state = serde_json::to_string(&directory.path())?;
+        // `WorkerGroup` runs `<python> -m uniserve_worker.main <args>`, so the
+        // wrapper drops its first two arguments and runs the fixture with the
+        // rest. The fixture serves a `Worker` whose `info` reads
+        // `replacement.json` from `directory`, where each rank also writes
+        // its pid.
         std::fs::write(
             &wrapper,
             format!(
-                "#!{}\nfrom pathlib import Path\nfrom tests.python.fixtures.replacement_worker import run\nrun(Path({}))\n",
-                worker_python().display(),
-                serde_json::to_string(&directory.path())?,
+                "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, PYTHONPATH={import_root}, UNISERVE_TEST_REPLACEMENT_DIR={state})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;

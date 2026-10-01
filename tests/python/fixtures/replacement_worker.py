@@ -1,8 +1,13 @@
-"""An external rank whose replacement advertises a different capability."""
+"""An external rank whose replacement advertises a different capability.
+
+Run by path with the worker CLI arguments. ``UNISERVE_TEST_REPLACEMENT_DIR``
+names a directory shared with the test: each rank writes its process id to
+``<rank>.pid`` there, and once ``replacement.json`` exists there, the rank's
+worker info carries the fields that file holds in place of its own.
+"""
 
 import json
 import os
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,11 +20,11 @@ from uniserve_worker.bootstrap.launch import (
 from uniserve_worker.worker import Worker
 
 
-def run(directory: Path) -> None:
-    # WorkerGroup invokes its Python executable with -m and the worker module.
-    sys.argv = [sys.argv[0], *sys.argv[3:]]
+def main() -> None:
+    directory = Path(os.environ["UNISERVE_TEST_REPLACEMENT_DIR"])
     config = parse_worker_args()
     (directory / f"{config.execution.rank}.pid").write_text(str(os.getpid()))
+
     name = endpoint_name(config)
     with WorkerIpcEndpoint(
         name,
@@ -43,3 +48,7 @@ def run(directory: Path) -> None:
         with Rank.from_config(config) as worker:
             worker.bind(endpoint)
             worker.run()
+
+
+if __name__ == "__main__":
+    main()
