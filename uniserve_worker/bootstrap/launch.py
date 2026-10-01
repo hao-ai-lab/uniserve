@@ -6,6 +6,9 @@ one-shot TCP connection to the registration address, and only then builds the
 blocking serve loop. The endpoint mechanism is the one the launch descriptor's
 ``channel_transport`` names: shared storage for a rank on the head's host, a
 TCP socket for a rank elsewhere.
+
+Once the rank is ready to serve, its head owns its shutdown, and the rank no
+longer acts on SIGINT or SIGTERM (`_leave_shutdown_to_head`).
 """
 
 from __future__ import annotations
@@ -14,7 +17,9 @@ import json
 import logging
 import os
 import secrets
+import signal
 import socket
+from types import FrameType
 
 from uniserve_worker.config.deployment import WorkerProcessArgs
 
@@ -121,7 +126,43 @@ def run_worker(config: WorkerProcessArgs) -> None:
                     ),
                 },
             )
+            # The rank serves, and its head can close it, once warmup ends;
+            # `run` then starts the service without warming up again.
+            worker.warmup()
+            _leave_shutdown_to_head()
             worker.run()
+
+
+def _leave_shutdown_to_head() -> None:
+    """Stop SIGINT and SIGTERM from ending this serving rank on their own.
+
+    The head closes every rank of a worker group together (``WorkerGroup``'s
+    close in the engine): each rank's teardown retires the communicators and
+    process groups it shares with the others, and that retirement completes
+    only once every rank takes part. SIGINT and SIGTERM usually address the
+    whole job rather than one rank: a terminal's Ctrl-C reaches every process
+    in its foreground process group, and a service manager or harness may
+    signal every process it started, the head among them. A rank acting on
+    such a signal would leave its group without that teardown, abandoning
+    the communicators' shared-memory segments, so the rank only logs it and
+    keeps serving until the head closes it. SIGKILL still ends the rank.
+
+    The head can close the rank only once it serves, so this is called after
+    warmup; until then, either signal ends the rank as usual, which the head
+    reports as a failed startup. A process this rank later executes starts
+    with the default dispositions, since an exec resets a handled signal.
+    Must be called from the main thread.
+    """
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, _log_shutdown_signal)
+
+
+def _log_shutdown_signal(signum: int, _frame: FrameType | None) -> None:
+    """Record a SIGINT or SIGTERM the serving rank leaves to its head."""
+    logger.info(
+        "ignoring %s; the head shuts this rank down with its worker group",
+        signal.Signals(signum).name,
+    )
 
 
 __all__ = ["WorkerIpcEndpoint", "run_worker"]

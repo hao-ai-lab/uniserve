@@ -87,7 +87,7 @@ mod imp {
                 // Peers can be alive but waiting for this member during group
                 // initialization. Cancel that incomplete startup as one instance.
                 // The release store pairs with the acquire loads in
-                // `RankProcess::check_worker` and `RankProcess::close`. Once the
+                // `RankProcess::check_worker` and `RankProcess::request_close`. Once the
                 // group is ready its ranks stop consulting the flag, so a later
                 // exit only wakes.
                 startup_abort.store(true, Ordering::Release);
