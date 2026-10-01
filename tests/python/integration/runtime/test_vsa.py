@@ -4,6 +4,7 @@ They also preserve mutable graph inputs.
 """
 
 import gc
+from contextlib import ExitStack
 from importlib import import_module
 
 import pytest
@@ -141,6 +142,127 @@ def test_large_hopper_key_domain_preserves_head_values_on_graph_replay(stream):
             graph.replay()
             torch.testing.assert_close(
                 out[::64], codes.expand(tiles, -1, -1), rtol=2e-2, atol=2e-2
+            )
+
+
+@pytest.mark.slow
+@pytest.mark.usefixtures("cuda_cache")
+@torch.inference_mode()
+def test_rows_past_32_bit_mask_offsets_match_cute_on_graph_replay(stream):
+    """Row intervals whose key-validity mask exceeds 2**31 bytes stay exact.
+
+    FA2 block-sparse prefill addresses 512 packed mask bytes per declared
+    BSR entry. The single produced interval here declares 2 heads x 2 owners
+    x 1024 query tiles x 1152 key tiles = 4,718,592 entries, beyond the
+    2**31 / 512 entries one launch can address. Each query tile attends a
+    few random live key tiles, all of them partial, so every row depends on
+    its own selection and validity. Replay changes the live selection,
+    validity and values; CuTe row production supplies the reference.
+    """
+    device = torch.device("cuda")
+    for name in ("flashinfer", "cute"):
+        if not import_module(f"{providers.__name__}.{name}").available(device):
+            pytest.skip(f"VSA provider {name} is unavailable on this device")
+    if torch.cuda.mem_get_info()[0] < 16 * 1024**3:
+        pytest.skip("past-limit row production requires 16 GiB free memory")
+
+    torch.manual_seed(3301)
+    heads, owners, owner_tiles, declared = 2, 2, 1024, 1152
+    tiles, owner_rows = owners * owner_tiles, owner_tiles * 64
+    options = {"num_heads": heads, "head_dim": 128, "dtype": torch.bfloat16}
+    pattern = vsa.Pattern(((declared,) * tiles,), 0, 0)
+    projections = torch.randn(
+        tiles * 64, heads, 4, 128, device=device, dtype=torch.bfloat16
+    )
+    q, k, v, gate = projections.unbind(2)
+    # Without compression each output row is its fine attention alone.
+    compressed = torch.zeros(heads, tiles, 128, device=device)
+    valid = torch.empty(tiles, device=device, dtype=torch.int32)
+    indices = torch.empty(
+        heads, tiles, declared, device=device, dtype=torch.int32
+    )
+    counts = torch.empty(heads, tiles, device=device, dtype=torch.int32)
+    batch = vsa.BlockInput(pattern, indices, counts, valid, 0)
+
+    def rows():
+        return torch.empty(q.shape, dtype=q.dtype, device=device)
+
+    expected, actual = rows(), rows()
+
+    def select():
+        valid.copy_(torch.randint(1, 64, (tiles,), device=device))
+        indices.copy_(
+            torch.rand(heads, tiles, tiles, device=device).argsort(-1)[
+                ..., :declared
+            ]
+        )
+        counts.copy_(torch.randint(1, 9, (heads, tiles), device=device))
+
+    def live():
+        offsets = torch.arange(64, device=device).expand(tiles, -1)
+        return (offsets < valid[:, None]).reshape(-1)
+
+    def prepare(name, context, scope):
+        backend = providers.resolve(name, device=device)
+        requirements = backend.workspace_buffers(pattern, **options)
+        buffers = scope.enter_context(
+            TensorBuffers.allocate(requirements, device=device)
+        )
+        operator = backend.prepare(
+            pattern,
+            **options,
+            workspace=buffers.view(requirements),
+            transient=context.scratch,
+        )
+        scope.callback(operator.close)
+        return operator, rows()
+
+    def produce(prepared, result):
+        operator, attended = prepared
+        producer = operator.rows(
+            q,
+            k,
+            v,
+            batch,
+            gate=gate,
+            compressed=compressed,
+            out=attended,
+            owners=owners,
+            chunk_tokens=owner_rows,
+            packed=None,
+            scale=128**-0.5,
+        )
+        producer(
+            slice(0, owner_rows),
+            result.view(owners, owner_rows, heads, 128).unbind(0),
+        )
+
+    module = vsa.BlockAttention(128**-0.5)
+    stream.wait(torch.cuda.current_stream())
+    with (
+        ExecutionContext(module, stream=stream, vsa="flashinfer") as context,
+        ExitStack() as scope,
+    ):
+        context.prepare(None)
+        flashinfer = prepare("flashinfer", context, scope)
+        cute = prepare("cute", context, scope)
+        scope.callback(torch.cuda.synchronize)
+
+        select()
+        produce(cute, expected)
+        produce(flashinfer, actual)
+        torch.testing.assert_close(
+            actual[live()], expected[live()], rtol=2e-2, atol=2e-2
+        )
+
+        with CUDAGraph(context=context) as graph:
+            graph.capture(lambda: produce(flashinfer, actual))
+            select()
+            projections.normal_()
+            graph.replay()
+            produce(cute, expected)
+            torch.testing.assert_close(
+                actual[live()], expected[live()], rtol=2e-2, atol=2e-2
             )
 
 
