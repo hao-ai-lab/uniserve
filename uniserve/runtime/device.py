@@ -43,7 +43,7 @@ def process_device_bytes(device: torch.device | str) -> int:
     Raises:
         ValueError: ``device`` is not a CUDA device.
         RuntimeError: NVML attributes no usage on the device to this process.
-            NVML reports host process IDs, so a process in another process
+            Where NVML reports host process IDs, a process in another process
             ID namespace, as in a container without the host's, is not
             found; a device without per-process accounting reports none.
     """
