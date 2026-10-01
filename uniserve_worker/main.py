@@ -52,6 +52,8 @@ def main() -> None:
     try:
         run_worker(process_args)
     except KeyboardInterrupt:
+        # Only a rank that is not serving yet acts on SIGINT; a serving rank
+        # leaves its shutdown to the head (`uniserve_worker.bootstrap.launch`).
         logger.info("worker interrupted; shutting down")
         # 130 is the shell convention for termination by SIGINT (128 + 2).
         os._exit(130)

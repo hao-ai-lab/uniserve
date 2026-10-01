@@ -7,8 +7,8 @@
 //! `PendingRank::adopt` binds a `RankChannel` to it and yields a
 //! `RankProcess`, which `WorkerGroup` (in `instance`) drives:
 //! `finish_startup` validates the rank's startup report, `submit_batch` and
-//! `poll_batch` exchange batches and results, and `close` or `terminate`
-//! retires the rank.
+//! `poll_batch` exchange batches and results, and `close_ranks` or
+//! `terminate` retires the rank.
 //!
 //! The host exchanges FlatBuffers descriptors and bounded result values while
 //! tensors, KV pages, and latent storage remain worker-resident.
@@ -18,7 +18,7 @@
 //! descriptor built from it.
 
 use crate::executor::WorkerResult;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -47,17 +47,26 @@ use crate::worker::death_watch::DeathWatcher;
 /// warmed up, and that wait has no deadline here (see
 /// `RankProcess::wait_pending_response`).
 const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
-/// Deadline for sending the shutdown request in `close`.
+/// Deadline for sending the shutdown request in `request_close`.
 ///
 /// The channel was connected at startup, so a missing server connection at
 /// this point means the rank has dropped off, and shutdown fails fast rather
 /// than waiting for the startup deadline.
 const WORKER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
-/// Maximum time `close` spends draining in-flight responses from a
-/// still-alive worker before it sends the shutdown request and falls back to
-/// killing the process. A hung (alive but unresponsive) worker must not be
-/// able to block shutdown forever.
+/// Maximum time `request_close` spends draining in-flight responses from a
+/// still-alive worker before it sends the shutdown request. A hung (alive but
+/// unresponsive) worker must not be able to block shutdown forever.
 const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the ranks closed together by `close_ranks` have, from the last
+/// shutdown request, to acknowledge it, finish their teardown and exit. A
+/// local process still running afterwards is killed, which abandons whatever
+/// its teardown had not yet released.
+const WORKER_EXIT_GRACE: Duration = Duration::from_secs(30);
+/// Longest wait between checks for the exit of a rank `close_ranks` is
+/// closing. A local process exit raises no wake once the rank's death watcher
+/// has stopped, and a launcher reports a remote exit within its own
+/// 100-millisecond read timeout.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Interval between progress logs while a rank prepares during startup.
 const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Longest wait between liveness checks (`RankProcess::check_worker`) while
@@ -498,7 +507,7 @@ impl WorkerProcessArgs {
 /// One adopted rank: its channel, its process when this engine started it,
 /// and the requests outstanding on it.
 ///
-/// Dropping it runs `close`.
+/// Dropping it closes the rank alone through `close_ranks`.
 pub(super) struct RankProcess {
     client: RankChannel,
     /// The rank's validated startup report; the default value until
@@ -532,15 +541,27 @@ pub(super) struct RankProcess {
     /// Next message identity to assign. Identities start at 1 and are never
     /// zero; `route` treats a zero header identity as absent.
     next_message_id: u64,
-    /// Set once `close` or `terminate` has begun retiring the rank, so a
-    /// later `close` sends no second shutdown request.
-    shutdown_sent: bool,
+    /// How far the rank's retirement has progressed.
+    retirement: Retirement,
     /// Edge-triggered worker-death watcher: fires the channel's death wake
     /// and sets the startup cancellation flag when the child exits. `None`
     /// for a rank started on another host, off Linux, when
-    /// `DeathWatcher::spawn` failed, and once `close` or `terminate` has
-    /// stopped it; a local rank's exit is then noticed by `check_worker`.
+    /// `DeathWatcher::spawn` failed, and once `request_close` or `terminate`
+    /// has stopped it; a local rank's exit is then noticed by `check_worker`.
     death_watcher: Option<DeathWatcher>,
+}
+
+/// How far a rank's retirement has progressed.
+enum Retirement {
+    /// Neither `request_close` nor `terminate` has run.
+    Serving,
+    /// `request_close` has asked the rank to shut down, and `await_close`
+    /// has not yet waited for it. `acknowledgment` is the shutdown request
+    /// while its answer is outstanding; it is `None` when the rank had
+    /// already exited or the request could not be sent.
+    Closing { acknowledgment: Option<Outstanding> },
+    /// The rank was closed or terminated; nothing remains to do.
+    Retired,
 }
 
 /// One launched rank between its start and its endpoint report.
@@ -833,7 +854,7 @@ impl PendingRank {
             pending: HashMap::new(),
             ready: VecDeque::new(),
             next_message_id: 1,
-            shutdown_sent: false,
+            retirement: Retirement::Serving,
             death_watcher,
         })
     }
@@ -942,7 +963,7 @@ impl RankProcess {
     ///
     /// Sends no shutdown request and discards outstanding and routed results.
     pub(crate) fn terminate(&mut self) {
-        self.shutdown_sent = true;
+        self.retirement = Retirement::Retired;
         // The watcher stops before the kill, so the intended exit raises no
         // death wake and no startup cancellation.
         self.death_watcher.take();
@@ -1248,15 +1269,15 @@ impl RankProcess {
         }
     }
 
-    /// Drains outstanding calls, requests graceful shutdown, and bounds forced termination.
+    /// Drains outstanding calls and asks the rank to shut down.
     ///
     /// A startup that was cancelled goes straight to `terminate`. Otherwise
     /// only a first call acts, and none after `terminate`. A live rank gets up
     /// to `WORKER_DRAIN_TIMEOUT` to answer outstanding batches and is then
-    /// sent a close request, and a local process that has not exited within
-    /// the following grace period is killed. Every failure along the way is
-    /// absorbed, so this always returns `Ok`.
-    pub(super) fn close(&mut self) -> anyhow::Result<()> {
+    /// sent a shutdown request, without waiting for its answer; `await_close`
+    /// completes the retirement. A failure to reach the rank is absorbed, and
+    /// `await_close` then bounds the rank by its deadline alone.
+    fn request_close(&mut self) {
         // A rank of this launch exited before the group became ready, so this
         // rank is terminated without draining or a shutdown request.
         if self
@@ -1265,16 +1286,16 @@ impl RankProcess {
             .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire))
         {
             self.terminate();
-            return Ok(());
+            return;
         }
-        if self.shutdown_sent {
-            return Ok(());
+        if !matches!(self.retirement, Retirement::Serving) {
+            return;
         }
-        self.shutdown_sent = true;
 
         // Stop the death watcher before the intended teardown, so the exit
         // does not fire a spurious death wake during shutdown.
         let _ = self.death_watcher.take();
+        let mut acknowledgment = None;
         // A rank started elsewhere is never observed to have exited here, so
         // shutdown drains its channel as it would a live local rank.
         let exited = matches!(self.child.as_mut().map(Child::try_wait), Some(Ok(Some(_))));
@@ -1308,38 +1329,163 @@ impl RankProcess {
                 let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
                 req.set_call_id(Some(message_id));
-                if let Ok(pending) = self.send_request_checked(&req, "shutdown") {
-                    let _ = self
-                        .client
-                        .recv_response_timeout(&pending, Duration::from_secs(5));
-                }
+                acknowledgment = self.send_request_checked(&req, "shutdown").ok();
+            }
+        }
+        self.retirement = Retirement::Closing { acknowledgment };
+    }
+
+    /// Waits until `deadline` for a rank `request_close` asked to shut down,
+    /// then kills its local process if it is still running.
+    ///
+    /// The shutdown request stays outstanding until the rank answers it, so
+    /// the answer, which the rank sends before its teardown begins, always
+    /// has a receiver. A local rank is retired once its process exits,
+    /// answered or not. The process of a rank elsewhere belongs to its
+    /// launcher, so that rank is retired once it answers or its channel
+    /// fails; `close_ranks` then follows it to its exit. Acts only on a rank
+    /// that is closing.
+    fn await_close(&mut self, deadline: Instant) {
+        let Retirement::Closing { mut acknowledgment } =
+            std::mem::replace(&mut self.retirement, Retirement::Retired)
+        else {
+            return;
+        };
+
+        loop {
+            // A failed receive means the rank's end of the channel is gone,
+            // which answers the request as finally as a response does.
+            if let Some(pending) = acknowledgment.as_ref()
+                && !matches!(self.client.try_recv_response(pending), Ok(None))
+            {
+                acknowledgment = None;
+            }
+            let retired = match self.child.as_mut() {
+                Some(child) => !matches!(child.try_wait(), Ok(None)),
+                None => acknowledgment.is_none(),
+            };
+            if retired {
+                return;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // A response raises a wake; a process exit does not, so the wait
+            // is also bounded by the exit poll interval. A channel that cannot
+            // wait any more still gets the interval, so the loop never spins.
+            let interval = remaining.min(EXIT_POLL_INTERVAL);
+            if self.client.wait_wake(interval).is_err() {
+                std::thread::sleep(interval);
             }
         }
 
-        // Only a local process is waited for and, past the grace period,
-        // killed; the process of a rank elsewhere belongs to its launcher.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while let Some(child) = self.child.as_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-            }
+        if let Some(child) = self.child.as_mut() {
+            tracing::warn!(
+                rank = self.rank,
+                "worker did not exit before the shutdown deadline; killing it"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        Ok(())
+    }
+}
+
+/// Retires the ranks of one worker group together, absorbing every failure.
+///
+/// A rank's orderly teardown retires the communicators and process groups it
+/// shares with the group's other ranks (`Worker.close` on the Python side),
+/// and that retirement completes on any rank only once every rank has
+/// reached it. Every rank is therefore asked to shut down, after draining its
+/// outstanding calls, before any is waited for, and all of them then share
+/// one `WORKER_EXIT_GRACE` deadline, after which a local process still
+/// running is killed. Asking one rank at a time would leave the first one
+/// waiting on peers that have not been asked, until it is killed with its
+/// communicators unreleased.
+///
+/// `launchers` names the registry that started the group's ranks on other
+/// hosts, and the group's worker id. A rank answers its shutdown request
+/// before its teardown begins, and a launcher kills the ranks it still runs
+/// once the head lets go of the registry, so the ranks elsewhere are held
+/// until their launchers report their exits, against the same deadline.
+pub(super) fn close_ranks(
+    ranks: &mut [RankProcess],
+    launchers: Option<(&super::launcher::Launchers, &str)>,
+) {
+    for rank in ranks.iter_mut() {
+        rank.request_close();
+    }
+
+    // The ranks elsewhere that were asked to shut down. A rank whose request
+    // could not be sent is unreachable, and nothing it could still release
+    // waits on this process.
+    let remote: BTreeSet<u32> = ranks
+        .iter()
+        .filter(|rank| {
+            rank.child.is_none()
+                && matches!(
+                    rank.retirement,
+                    Retirement::Closing {
+                        acknowledgment: Some(_)
+                    }
+                )
+        })
+        .map(|rank| rank.rank)
+        .collect();
+
+    let deadline = Instant::now() + WORKER_EXIT_GRACE;
+    for rank in ranks.iter_mut() {
+        rank.await_close(deadline);
+    }
+    if let Some((registry, worker_id)) = launchers {
+        await_remote_exits(registry, worker_id, remote, deadline);
+    }
+}
+
+/// Waits until `deadline` for the launchers to report the exit of each rank
+/// in `remote`, all ranks of `worker_id` on other hosts.
+///
+/// Gives up when the registry cannot be locked. A rank still running at the
+/// deadline is left to its launcher, which kills it once the head releases
+/// the registry.
+fn await_remote_exits(
+    registry: &super::launcher::Launchers,
+    worker_id: &str,
+    mut remote: BTreeSet<u32>,
+    deadline: Instant,
+) {
+    while !remote.is_empty() {
+        let Ok(mut hosts) = super::launcher::lock(registry) else {
+            return;
+        };
+        for (_, exit) in hosts.drain_exits(worker_id) {
+            remote.remove(&exit.rank);
+        }
+        drop(hosts);
+        if remote.is_empty() {
+            return;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!(
+                worker = worker_id,
+                ranks = ?remote,
+                "ranks on other hosts did not exit before the shutdown deadline"
+            );
+            return;
+        }
+        std::thread::sleep(remaining.min(EXIT_POLL_INTERVAL));
     }
 }
 
 impl Drop for RankProcess {
-    /// Closes the rank as `close` does, ignoring its result.
+    /// Closes the rank as `close_ranks` would close it alone. A rank on
+    /// another host is not followed to its exit, since no launcher registry
+    /// is at hand.
     fn drop(&mut self) {
-        let _ = self.close();
+        close_ranks(std::slice::from_mut(self), None);
     }
 }
 

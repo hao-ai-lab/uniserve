@@ -1901,22 +1901,31 @@ impl WorkerGroup {
     }
 
     /// Closes every rank in the physical worker group.
+    ///
+    /// The ranks are closed together (`close_ranks`): each is asked to shut
+    /// down before any is waited for, since a rank's teardown retires the
+    /// communicators it shares with the others and completes only once all
+    /// of them take part. Ranks on other hosts are followed until their
+    /// launchers report their exits. Failures to reach or stop a rank are
+    /// absorbed, so this returns `Ok`.
     pub fn close(&mut self) -> anyhow::Result<()> {
         self.closed = true;
-        let mut first_error = None;
-        for worker in self.workers.iter_mut() {
-            if let Err(error) = worker.close()
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
+        super::process::close_ranks(
+            &mut self.workers,
+            self.launchers
+                .as_ref()
+                .map(|launchers| (launchers, self.process_args.worker_id.as_str())),
+        );
         self.release_closed_resources();
-        if let Some(error) = first_error {
-            Err(error)
-        } else {
-            Ok(())
-        }
+        Ok(())
+    }
+}
+
+impl Drop for WorkerGroup {
+    /// Closes the group's ranks together, as `close` does; a closed group
+    /// has no ranks left.
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 

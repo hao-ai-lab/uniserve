@@ -53,9 +53,12 @@ struct PyServer {
 /// idle, only `completion_wake` while a GIL-free call holds the endpoint, and
 /// neither after close. `completion_wake` is therefore the closed flag.
 struct ServerState {
-    endpoint: Option<RankServer>,
     /// Wake source used by CPU, transfer, and device completion callbacks.
+    /// Declared first, and taken first by `close`: on a shared-storage
+    /// channel it holds a port of the endpoint's node, which must be released
+    /// before the endpoint releases the node.
     completion_wake: Option<Wake>,
+    endpoint: Option<RankServer>,
 }
 
 /// Shared eventfd state retained until the last scheduled callback completes.
@@ -357,8 +360,8 @@ impl PyServer {
         if state.endpoint.is_none() {
             return Err(py_runtime("IPC server endpoint is already in use"));
         }
-        state.endpoint.take();
         state.completion_wake.take();
+        state.endpoint.take();
         Ok(())
     }
 
