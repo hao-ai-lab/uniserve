@@ -1309,6 +1309,8 @@ pub(super) mod tests {
     use serde_json::{Value, json};
 
     use super::super::RequestField;
+    use super::super::presentation::present;
+    use super::super::presentation::tests::character_tokenizer;
     use super::super::probe::{AudioFacts, FrameRate, ImageFacts, MediaFacts, VideoFacts};
     use super::{
         AudioClip, Canvas, ConditionPlan, ConditionRole, ConditionSpec, ConditionType, PlanLimits,
@@ -1685,26 +1687,41 @@ pub(super) mod tests {
             for (key, value) in rows {
                 assert_eq!(u64::from(value), expected[key], "{name} {key}");
             }
+            // Together with the presentation's rows, the planned rows fill
+            // the reference's packed sequence exactly.
+            let planned = rows.iter().map(|&(_, value)| u64::from(value)).sum::<u64>();
+            assert_eq!(
+                planned + expected["text_rows"].as_u64().unwrap(),
+                expected["sequence_rows"],
+                "{name}"
+            );
             let conditions: Vec<Value> = plan.conditions.iter().map(condition_json).collect();
             assert_eq!(Value::from(conditions), expected["conditions"], "{name}");
         }
     }
 
-    /// Each rejected request names the field the serving contract blames.
+    /// Each rejected request names the field the serving contract blames,
+    /// whether planning or the presentation rejects it.
     #[test]
     fn rejected_requests_name_the_field() {
         let fixture = fixture();
         let vision = vision(&fixture);
+        let tokenizer = character_tokenizer();
         for case in fixture["requests"].as_array().unwrap() {
             let Some(error) = case.get("error") else {
                 continue;
             };
-            let field = Request::parse(case)
-                .plan(&vision)
-                .unwrap_err()
-                .field()
-                .unwrap();
-            assert_eq!(field.to_string(), error["field"], "{}", case["name"]);
+            let rejection = match Request::parse(case).plan(&vision) {
+                Ok(plan) => present(&tokenizer, &plan, case["prompt"].as_str().unwrap())
+                    .expect_err("the request was accepted"),
+                Err(rejection) => rejection,
+            };
+            assert_eq!(
+                rejection.field().unwrap().to_string(),
+                error["field"],
+                "{}",
+                case["name"]
+            );
         }
     }
 
