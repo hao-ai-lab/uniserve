@@ -663,3 +663,67 @@ def test_full_head_rotation_preserves_strided_heads_and_value_rows(
         assert torch.equal(value, original[:, query_heads + key_heads :])
     else:
         assert torch.equal(packed, original)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+def test_interleaved_sections_match_qwen3_vl_multimodal_rotary(device):
+    from transformers import Qwen3VLTextConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLTextRotaryEmbedding,
+    )
+
+    # Qwen3-VL-32B's language rotary: 64 compact frequencies interleaved
+    # over (temporal, height, width) coordinates.
+    config = Qwen3VLTextConfig(
+        head_dim=128,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 5_000_000.0,
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+        },
+    )
+    reference = Qwen3VLTextRotaryEmbedding(config).to(device)
+    rotary = RotaryEmbedding(128, theta=5_000_000.0, sections=(24, 20, 20)).to(
+        device
+    )
+    generator = torch.Generator().manual_seed(911)
+    positions = torch.randint(0, 40_000, (3, 97), generator=generator).to(
+        device
+    )
+
+    # The reference repeats the compact factors over both head halves.
+    expected = reference(
+        torch.empty((), dtype=torch.float32, device=device),
+        positions[:, None],
+    )
+    actual = rotary(positions, dtype=torch.float32, sequence_length=97)
+    for value, wanted in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, wanted[0, :, :64])
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+def test_sections_with_shared_coordinates_reproduce_one_axis_factors(device):
+    # Text advances every axis together; its multimodal factors must equal
+    # the one-dimensional recipe exactly, not merely closely.
+    plain = RotaryEmbedding(128, theta=5_000_000.0).to(device)
+    sectioned = RotaryEmbedding(
+        128, theta=5_000_000.0, sections=(24, 20, 20)
+    ).to(device)
+    positions = torch.arange(1000, 1313, device=device)
+    expected = plain(positions, dtype=torch.float32, sequence_length=313)
+    actual = sectioned(
+        positions.expand(3, -1), dtype=torch.float32, sequence_length=313
+    )
+    for value, wanted in zip(actual, expected, strict=True):
+        assert torch.equal(value, wanted)
+
+
+@pytest.mark.parametrize("sections", [(24, 20), (24, 20, 21), (8, 28, 28)])
+def test_sections_must_partition_the_interleaved_frequencies(sections):
+    with pytest.raises(ValueError, match="M-RoPE sections"):
+        RotaryEmbedding(128, sections=sections)
