@@ -239,6 +239,46 @@ pub struct ArtifactEvent {
     pub media: Arc<SharedMedia>,
 }
 
+/// A video raster in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Canvas {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+/// A video-and-audio generation task, by its request name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoTask {
+    /// Text to video and audio.
+    T2va,
+    /// First and/or last keyframe to video and audio.
+    Fl2va,
+    /// Image, video and audio references to video and audio.
+    Ref2va,
+}
+
+impl VideoTask {
+    /// Every task, in canonical order.
+    pub const ALL: [Self; 3] = [Self::T2va, Self::Fl2va, Self::Ref2va];
+
+    /// The task's request name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::T2va => "t2va",
+            Self::Fl2va => "fl2va",
+            Self::Ref2va => "ref2va",
+        }
+    }
+
+    /// The task a request name denotes, if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|task| task.as_str() == name)
+    }
+}
+
 /// Effective diffusion controls, resolved once by model preprocessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionSamplingParams {
@@ -250,6 +290,10 @@ pub struct DiffusionSamplingParams {
     pub num_inference_steps: u32,
     /// Deterministic request-level noise seed.
     pub seed: u64,
+    /// Output raster width in pixels: the request's canvas.
+    pub width: u32,
+    /// Output raster height in pixels: the request's canvas.
+    pub height: u32,
 }
 
 /// Media request. Final media bytes are returned through shared storage.
@@ -267,7 +311,8 @@ pub struct DiffusionRequest {
 
 impl DiffusionRequest {
     /// Checks that the prompt is nonempty, that the frame, media-unit, and
-    /// step counts are positive, and that the prompt token count fits in `u32`.
+    /// step counts and the canvas are positive, and that the prompt token
+    /// count fits in `u32`.
     ///
     /// The engine's media admission rejects a failing request with
     /// `RejectionKind::Invalid`.
@@ -279,6 +324,8 @@ impl DiffusionRequest {
         if self.sampling.num_frames == 0
             || self.sampling.video_units == 0
             || self.sampling.num_inference_steps == 0
+            || self.sampling.width == 0
+            || self.sampling.height == 0
             || self.prompt_token_ids.len() > u32::MAX as usize
         {
             return Err(DiffusionRequestError::InvalidSampling);
@@ -294,8 +341,8 @@ pub enum DiffusionRequestError {
     /// The tokenized prompt contains no tokens.
     #[error("media prompt tokens must not be empty")]
     EmptyPromptTokens,
-    /// A frame, media-unit, or step count is zero, or the prompt token count
-    /// exceeds `u32::MAX`.
+    /// A frame, media-unit, or step count or a canvas side is zero, or the
+    /// prompt token count exceeds `u32::MAX`.
     #[error("diffusion parameters are invalid")]
     InvalidSampling,
 }

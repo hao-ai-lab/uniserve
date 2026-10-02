@@ -1,4 +1,4 @@
-"""H3 output raster, sampling clocks and RGB reconstruction.
+"""H3 sampling clocks and RGB reconstruction.
 
 A video of ``17 * n + 5`` frames is decoded as ``n`` media units. Each unit
 decodes to 25 frames: a 17-frame body, three VAE padding frames, and a
@@ -12,16 +12,18 @@ from dataclasses import dataclass
 
 import torch
 
-from uniserve.media import image
+from uniserve.media import video
 from uniserve.model import VideoPostprocessor as BaseVideoPostprocessor
 from uniserve.tensors import BufferConfig, OutputLayout
 
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Output raster and the video frame and audio sample clocks in Hz."""
+    """The video frame and audio sample clocks in Hz.
 
-    frame_size: image.Config = image.Config(768, 1344)
+    The raster is a request's canvas, not a property of the model.
+    """
+
     frame_rate: int = 24
     sample_rate: int = 32000
 
@@ -50,11 +52,11 @@ def frame_slices(num_frames: int) -> tuple[slice, ...]:
 class VideoPostprocessor(BaseVideoPostprocessor):
     """Remove H3's three-frame decoder padding and cross-fade five-frame overlaps."""  # noqa: E501
 
-    def __init__(self, *, frame_size: image.Config, frame_rate: int):
+    def __init__(self, *, frame_rate: int):
         # Weight of the current unit across the five overlap frames: 0, 0.2,
         # ..., 0.8, so the first blended frame is entirely the predecessor's.
         weights = torch.arange(5, device="cpu", dtype=torch.float16) / 5
-        super().__init__(weights, frame_size=frame_size, frame_rate=frame_rate)
+        super().__init__(weights, frame_rate=frame_rate)
 
     def reconstruction_slices(
         self, frames: slice, num_frames: int
@@ -68,9 +70,10 @@ class VideoPostprocessor(BaseVideoPostprocessor):
         # next unit.
         return slice(0, 17), slice(20, 25)
 
-    def output_layout(self, num_frames: int) -> Mapping[str, OutputLayout]:
+    def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
+        num_frames = size.num_frames
         frame_slices(num_frames)
-        height, width = self.frame_size.height, self.frame_size.width
+        height, width = size.frame.height, size.frame.width
         return {
             "video": OutputLayout(
                 (num_frames, height, width, 3),
@@ -86,43 +89,46 @@ class VideoPostprocessor(BaseVideoPostprocessor):
             )
         }
 
-    def state_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
-        frame_slices(num_frames)
+    def state_buffers(self, size: video.Config) -> Mapping[str, BufferConfig]:
+        frame_slices(size.num_frames)
         return {
             "video_overlap": BufferConfig(
-                (1, 3, 5, self.frame_size.height, self.frame_size.width),
-                torch.float16,
+                (1, 3, 5, size.frame.height, size.frame.width), torch.float16
             )
         }
 
-    def workspace_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
-        layout = self.output_layout(num_frames)["video"]
+    def workspace_buffers(
+        self, size: video.Config
+    ) -> Mapping[str, BufferConfig]:
+        layout = self.output_layout(size)["video"]
         # One call reconstructs one media unit, so the RGB workspace holds the
         # longest unit rather than the whole timeline; the last unit is the
         # longest because it keeps its own overlap tail.
         unit = max(
-            window.stop - window.start for window in frame_slices(num_frames)
+            window.stop - window.start
+            for window in frame_slices(size.num_frames)
         )
         return {
             "rgb_frames": BufferConfig((unit, *layout.shape[1:]), layout.dtype),
             # Receives the predecessor media unit's overlap from the ring.
             "overlap_exchange": BufferConfig(
-                (1, 3, 5, self.frame_size.height, self.frame_size.width),
-                torch.float16,
+                (1, 3, 5, size.frame.height, size.frame.width), torch.float16
             ),
         }
 
-    def constant_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
-        frame_slices(num_frames)
+    def constant_buffers(
+        self, size: video.Config
+    ) -> Mapping[str, BufferConfig]:
+        frame_slices(size.num_frames)
         return {
             name: BufferConfig((1, 3, 1, 1, 1), torch.float32)
             for name in ("pixel_mean", "pixel_std")
         }
 
     def prepare_constants(
-        self, num_frames: int, *, out: Mapping[str, torch.Tensor]
+        self, size: video.Config, *, out: Mapping[str, torch.Tensor]
     ) -> None:
-        buffers = self.constant_buffers(num_frames)
+        buffers = self.constant_buffers(size)
         if out.keys() != buffers.keys():
             raise ValueError(
                 "RGB constants must contain mean and standard deviation"

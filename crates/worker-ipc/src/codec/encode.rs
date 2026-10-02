@@ -256,6 +256,8 @@ fn diffusion<'a>(
             video_units: v.video_units,
             num_inference_steps: v.num_inference_steps,
             seed: v.seed,
+            width: v.width,
+            height: v.height,
         },
     )
 }
@@ -1304,6 +1306,31 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
         Some(b.create_vector(&values))
     };
     let checkpoint_identity = Some(b.create_string(&v.checkpoint_identity));
+    let video_denoiser = v.video_denoiser.as_ref().map(|value| {
+        let tasks = value
+            .tasks
+            .iter()
+            .map(|task| b.create_string(task))
+            .collect::<Vec<_>>();
+        let tasks = Some(b.create_vector(&tasks));
+        let canvases = value
+            .canvases
+            .iter()
+            .map(|canvas| fbs::Canvas::new(canvas.width, canvas.height))
+            .collect::<Vec<_>>();
+        let canvases = Some(b.create_vector(&canvases));
+        fbs::VideoDenoiserInfo::create(
+            b,
+            &fbs::VideoDenoiserInfoArgs {
+                tasks,
+                schedule_points: value.schedule_points,
+                video_shift: value.video_shift,
+                audio_shift: value.audio_shift,
+                canvases,
+                max_sequence_rows: value.max_sequence_rows,
+            },
+        )
+    });
     fbs::WorkerInfo::create(
         b,
         &fbs::WorkerInfoArgs {
@@ -1334,6 +1361,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             num_inference_steps: v.num_inference_steps,
             host_lane_capacity: v.host_lane_capacity,
             checkpoint_identity,
+            video_denoiser,
         },
     )
 }

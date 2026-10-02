@@ -33,9 +33,9 @@ pub mod philox;
 pub mod sampling;
 pub use codec::stats::ForwardStats;
 pub use events::{
-    ArtifactEvent, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
+    ArtifactEvent, Canvas, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
     EngineCoreOutput, FinishReason, MediaKind, PositionLogprobs, RejectionKind, Request,
-    RuntimeFamily, StopReason, TokenLogprob,
+    RuntimeFamily, StopReason, TokenLogprob, VideoTask,
 };
 pub use generation::{
     CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,

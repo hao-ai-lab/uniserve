@@ -650,7 +650,7 @@ def artifact_import_regions(
     time, and the muxer reads every round. Each round holds one media unit per
     participating rank and the muxer produced one of them itself.
     """
-    components = media_components(model)
+    components = media_components(model, worker_config.deployment_components)
     encoder = components.get(MediaCall.VIDEO_ENCODING)
     binding = None if encoder is None else bindings.get(encoder)
     decoder = capability(model, VideoDecoder)
@@ -721,7 +721,9 @@ def model_arena_capacity(
             product_bytes_per_request=local_product_storage_bytes(
                 resolve_outputs(model, worker_config),
                 bindings=bindings or {},
-                media_components=media_components(model),
+                media_components=media_components(
+                    model, worker_config.deployment_components
+                ),
             ),
             concurrent_imports=artifact_import_regions(
                 model, worker_config, bindings=bindings or {}
@@ -1015,7 +1017,9 @@ def resolve_request_capacity(
                 product_bytes = local_product_storage_bytes(
                     resolve_outputs(model, worker_config),
                     bindings=bindings or {},
-                    media_components=media_components(model),
+                    media_components=media_components(
+                        model, worker_config.deployment_components
+                    ),
                 )
                 arena = request_tensor_arena_capacity(
                     capacity_config,

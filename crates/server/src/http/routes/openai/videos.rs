@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use crate::openai::VideoGenerationRequest;
 use crate::openai::serve_error_to_api;
+use crate::serving::video::service::REQUEST_FIELDS;
 use crate::serving::{FinishStatus, RequestOutput};
 use axum::Extension;
 use axum::body::Body;
@@ -69,8 +70,8 @@ pub(crate) async fn videos_sync(
         Err(message) => return job_capacity_exceeded(message),
     };
 
-    let mut stream = match state.runtime().generate_video(request_id, body).await {
-        Ok(stream) => stream,
+    let (_, mut stream) = match state.runtime().generate_video(request_id, body).await {
+        Ok(generation) => generation,
         Err(error) => return error.into_response(),
     };
 
@@ -153,15 +154,71 @@ pub(crate) async fn videos_sync(
 /// `multipart/form-data`.
 ///
 /// Both content types deserialize into the same `VideoGenerationRequest`, whose
-/// `deny_unknown_fields` rejects unknown JSON fields. The multipart path admits
-/// only the text fields `model`, `prompt`, `seconds`, and `seed`, rejects file
-/// parts and repeated fields, and parses `seconds` as a finite number and
-/// `seed` as an unsigned integer before deserializing. Every rejection is
+/// `deny_unknown_fields` rejects unknown fields at every level. A multipart
+/// body carries every field as a text part of the same name: `conditions` and
+/// `target` as JSON text, the counts and seed as unsigned integers, and the
+/// durations and shifts as finite numbers. File parts, repeated fields and
+/// fields outside the schema are rejected. Every rejection is
 /// `400 Bad Request` except an unsupported content type, which is
-/// `415 Unsupported Media Type`. Semantic checks (served model, prompt,
-/// duration) happen later, in `InputProcessor::video_sampling` and
+/// `415 Unsupported Media Type`. Semantic checks (served model, task,
+/// conditions, target and the restated fields) happen in
 /// `InputProcessor::preprocess_video_request`.
 pub(crate) struct VideoBody(pub VideoGenerationRequest);
+
+/// How a multipart text part of the video request becomes a JSON value.
+#[derive(Clone, Copy)]
+enum PartKind {
+    /// The text itself.
+    Text,
+    /// JSON text: an array or object field.
+    Json,
+    /// An unsigned integer.
+    Unsigned,
+    /// A finite number.
+    Number,
+}
+
+/// The multipart part of each request field.
+fn part_kind(name: &str) -> Option<PartKind> {
+    Some(match name {
+        "model" | "prompt" | "task" | "quality" | "size" => PartKind::Text,
+        "conditions" | "target" => PartKind::Json,
+        "seed" | "num_inference_steps" | "num_outputs_per_prompt" | "n" | "width" | "height" => {
+            PartKind::Unsigned
+        }
+        "seconds" | "flow_shift" | "audio_flow_shift" => PartKind::Number,
+        _ => return None,
+    })
+}
+
+/// Converts one multipart text part into the JSON value its field takes.
+fn part_value(
+    name: &'static str,
+    kind: PartKind,
+    text: String,
+) -> Result<serde_json::Value, ApiError> {
+    let invalid =
+        |message: &str| ApiError::invalid_request(format!("{name} {message}"), Some(name));
+    match kind {
+        PartKind::Text => Ok(serde_json::Value::String(text)),
+        PartKind::Json => {
+            serde_json::from_str(&text).map_err(|error| invalid(&format!("must be JSON: {error}")))
+        }
+        PartKind::Unsigned => text
+            .parse::<u64>()
+            .map(serde_json::Value::from)
+            .map_err(|_| invalid("must be an unsigned integer")),
+        // `f64` parsing also accepts `inf`, `NaN`, and overflowing literals,
+        // which a JSON number cannot represent. They are refused here, as the
+        // JSON body parser refuses them.
+        PartKind::Number => text
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| invalid("must be a finite number")),
+    }
+}
 
 impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
     type Rejection = Response;
@@ -181,55 +238,43 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
                 .map_err(|error| {
                     ApiError::invalid_request(error.to_string(), None).into_response()
                 })?;
-            // Multipart values are all text, so the accepted fields are
-            // assembled into a JSON object with numeric `seconds` and `seed`
-            // and deserialized exactly like a JSON body.
+            // Multipart values are all text, so each field is converted to the
+            // JSON value its schema takes and the object is deserialized
+            // exactly like a JSON body.
             let mut fields = serde_json::Map::new();
             while let Some(field) = multipart.next_field().await.map_err(|error| {
                 ApiError::invalid_request(error.to_string(), None).into_response()
             })? {
                 let name = field.name().unwrap_or("").to_owned();
-                if !["model", "prompt", "seconds", "seed"].contains(&name.as_str())
-                    || field.file_name().is_some()
-                {
+                let schema = REQUEST_FIELDS.iter().copied().find(|known| *known == name);
+                let (Some(name), Some(kind)) = (schema, part_kind(&name)) else {
                     return Err(ApiError::invalid_request(
-                        format!("unsupported video field {name:?}; this checkpoint accepts text-to-video-and-audio only"),
-                        None,
-                    ).into_response());
-                }
-                if fields.contains_key(&name) {
-                    return Err(ApiError::invalid_request(
-                        format!("duplicate video field {name:?}"),
+                        format!("unknown video field {name:?}"),
                         None,
                     )
                     .into_response());
+                };
+                if field.file_name().is_some() {
+                    return Err(ApiError::invalid_request(
+                        format!("video field {name:?} must be text, not a file"),
+                        Some(name),
+                    )
+                    .into_response());
                 }
-                let value = field.text().await.map_err(|error| {
+                if fields.contains_key(name) {
+                    return Err(ApiError::invalid_request(
+                        format!("duplicate video field {name:?}"),
+                        Some(name),
+                    )
+                    .into_response());
+                }
+                let text = field.text().await.map_err(|error| {
                     ApiError::invalid_request(error.to_string(), None).into_response()
                 })?;
-                let value = match name.as_str() {
-                    // `f64` parsing also accepts `inf`, `NaN`, and overflowing
-                    // literals, which a JSON number cannot represent. They are
-                    // refused here, as the JSON body parser refuses them.
-                    "seconds" => value
-                        .parse::<f64>()
-                        .ok()
-                        .and_then(serde_json::Number::from_f64)
-                        .map(serde_json::Value::Number)
-                        .ok_or_else(|| {
-                            ApiError::invalid_request(
-                                "seconds must be a finite number",
-                                Some("seconds"),
-                            )
-                            .into_response()
-                        })?,
-                    "seed" => serde_json::Value::from(value.parse::<u64>().map_err(|_| {
-                        ApiError::invalid_request("seed must be an unsigned integer", Some("seed"))
-                            .into_response()
-                    })?),
-                    _ => serde_json::Value::String(value),
-                };
-                fields.insert(name, value);
+                fields.insert(
+                    name.to_owned(),
+                    part_value(name, kind, text).map_err(IntoResponse::into_response)?,
+                );
             }
             serde_json::from_value(serde_json::Value::Object(fields))
                 .map(Self)
@@ -261,10 +306,9 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
 
 /// Creates an asynchronous video job and returns its `queued` record.
 ///
-/// Duration and sampling are resolved before submission and fill the record's
-/// `seconds`, `actual_seconds`, `num_frames`, and `total_steps`. A full job store answers
-/// `429 Too Many Requests`; resolution and submission errors map through
-/// `ApiError`. Once the record is inserted, a detached task consumes
+/// The prepared request fills the record's `seconds`, `actual_seconds`, `num_frames`,
+/// `size`, and `total_steps`. A full job store answers `429 Too Many Requests`;
+/// preparation and submission errors map through `ApiError`. Once the record is inserted, a detached task consumes
 /// the runtime stream and publishes progress and the final result through
 /// `VideoJobs`, so the job continues after the HTTP response is sent or
 /// dropped.
@@ -276,15 +320,6 @@ pub(crate) async fn videos_create(
     use crate::video_jobs::{VideoFailure, VideoJob, timestamp};
 
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
-    let (requested_seconds, sampling) =
-        match state
-            .runtime()
-            .model()
-            .video_sampling(&request_id, body.seconds, body.seed)
-        {
-            Ok(options) => options,
-            Err(error) => return error.into_response(),
-        };
 
     // Job capacity is claimed before submission, so a request refused for it
     // never reaches the engine. The slot is released if this handler is
@@ -294,14 +329,19 @@ pub(crate) async fn videos_create(
         Err(message) => return job_capacity_exceeded(message),
     };
 
-    let mut stream = match state
+    let (prepared, mut stream) = match state
         .runtime()
         .generate_video(request_id.clone(), body)
         .await
     {
-        Ok(stream) => stream,
+        Ok(generation) => generation,
         Err(error) => return error.into_response(),
     };
+    let Some(prepared) = prepared else {
+        return ApiError::server_error("the video request ended before it was prepared")
+            .into_response();
+    };
+    let sampling = prepared.request.sampling;
 
     // Public IDs are server-generated; caller request-ID headers cannot collide with retained jobs.
     let id = format!("video_{}", uuid::Uuid::new_v4().simple());
@@ -312,9 +352,10 @@ pub(crate) async fn videos_create(
         created_at: timestamp(),
         completed_at: None,
         expires_at: None,
-        seconds: requested_seconds,
+        seconds: prepared.duration_seconds,
         actual_seconds: f64::from(sampling.num_frames) / f64::from(crate::serving::VIDEO_FPS),
         num_frames: sampling.num_frames,
+        size: format!("{}x{}", prepared.canvas.width, prepared.canvas.height),
         status: "queued",
         phase: "queued".to_owned(),
         completed_steps: 0,
@@ -570,12 +611,39 @@ mod tests {
     fn video_state() -> AppState {
         sim_state(ModelParameters::MiniMaxH3 {
             max_video_seconds: 15.0,
-            num_inference_steps: 4,
         })
     }
 
     fn video_request() -> serde_json::Value {
-        serde_json::json!({"model": SERVED_MODEL, "prompt": "A river", "seconds": 5})
+        serde_json::json!({
+            "model": SERVED_MODEL,
+            "prompt": "A river",
+            "task": "t2va",
+            "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5},
+        })
+    }
+
+    /// A `multipart/form-data` request of text parts.
+    fn multipart(parts: &[(&str, &str)]) -> axum::extract::Request {
+        let mut body = String::new();
+        for (name, value) in parts {
+            body.push_str(&format!(
+                "--clip\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str("--clip--\r\n");
+        axum::extract::Request::builder()
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// A JSON request carrying `body`.
+    fn json_request(body: &serde_json::Value) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
     }
 
     /// Both video submission routes draw on the same job slots: with every
@@ -645,65 +713,141 @@ mod tests {
 
     #[tokio::test]
     async fn json_and_multipart_normalize_to_the_same_request() {
-        let json = axum::extract::Request::builder()
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"model":"FastH3","prompt":"A river","seconds":5.5,"seed":42}"#,
-            ))
-            .unwrap();
-        let multipart = axum::extract::Request::builder().header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
-            .body(Body::from("--clip\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nFastH3\r\n--clip\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nA river\r\n--clip\r\nContent-Disposition: form-data; name=\"seconds\"\r\n\r\n5.5\r\n--clip\r\nContent-Disposition: form-data; name=\"seed\"\r\n\r\n42\r\n--clip--\r\n")).unwrap();
+        let conditions = r#"[{"type": "image", "uri": "data:image/png;base64,AA==", "role": "keyframe", "frame_index": 0}]"#;
+        let target = r#"{"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 5.5}"#;
+        let json = json_request(&serde_json::json!({
+            "model": "FastH3",
+            "prompt": "A river",
+            "task": "fl2va",
+            "conditions": serde_json::from_str::<serde_json::Value>(conditions).unwrap(),
+            "target": serde_json::from_str::<serde_json::Value>(target).unwrap(),
+            "seed": 7,
+            "num_inference_steps": 50,
+            "flow_shift": 12.0,
+            "n": 1,
+            "quality": "lossless",
+            "seconds": 5.5,
+            "size": "1344x768",
+        }));
+        let multipart = multipart(&[
+            ("model", "FastH3"),
+            ("prompt", "A river"),
+            ("task", "fl2va"),
+            ("conditions", conditions),
+            ("target", target),
+            ("seed", "7"),
+            ("num_inference_steps", "50"),
+            ("flow_shift", "12"),
+            ("n", "1"),
+            ("quality", "lossless"),
+            ("seconds", "5.5"),
+            ("size", "1344x768"),
+        ]);
 
         let left = VideoBody::from_request(json, &()).await.unwrap().0;
         let right = VideoBody::from_request(multipart, &()).await.unwrap().0;
 
         assert_eq!(left, right);
-        assert_eq!(left.seconds, Some(5.5));
-        assert_eq!(left.seed, 42);
+        assert_eq!(left.task, uniserve_core::VideoTask::Fl2va);
+        assert_eq!(left.conditions[0].frame_index, Some(0));
+        assert_eq!(left.target.duration_seconds, Some(5.5));
+        assert_eq!(left.seed, 7);
+
+        // An omitted seed is the reference's 42.
+        let defaulted = VideoBody::from_request(json_request(&video_request()), &())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(defaulted.seed, crate::openai::DEFAULT_VIDEO_SEED);
     }
 
-    /// A duration Rust parses as a float but JSON cannot carry (infinite, NaN,
-    /// or overflowing) is a bad request, as it is for a JSON body, rather than
-    /// a request for the default duration.
+    /// A number Rust parses as a float but JSON cannot carry (infinite, NaN,
+    /// or overflowing) is a bad request, as it is for a JSON body.
     #[tokio::test]
-    async fn a_non_finite_multipart_duration_is_rejected() {
+    async fn a_non_finite_multipart_number_is_rejected() {
         for seconds in ["inf", "-infinity", "NaN", "1e400"] {
-            let multipart = axum::extract::Request::builder()
-                .header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
-                .body(Body::from(format!(
-                    "--clip\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nFastH3\r\n\
-                     --clip\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nA river\r\n\
-                     --clip\r\nContent-Disposition: form-data; name=\"seconds\"\r\n\r\n{seconds}\r\n\
-                     --clip--\r\n"
-                )))
-                .unwrap();
-
-            match VideoBody::from_request(multipart, &()).await {
+            let request = multipart(&[
+                ("model", "FastH3"),
+                ("prompt", "A river"),
+                ("task", "t2va"),
+                (
+                    "target",
+                    r#"{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5}"#,
+                ),
+                ("seconds", seconds),
+            ]);
+            match VideoBody::from_request(request, &()).await {
                 Ok(VideoBody(body)) => panic!("seconds={seconds} was accepted as {body:?}"),
                 Err(response) => assert_eq!(response.status(), StatusCode::BAD_REQUEST),
             }
         }
     }
 
+    /// Fields outside the schema, file parts and the former duration-only
+    /// body are refused in both formats; the former body names the missing
+    /// `task`.
     #[tokio::test]
-    async fn unsupported_conditioning_is_rejected_in_both_formats() {
-        // The JSON body is refused by the request schema's unknown-field check,
-        // the multipart body by the field allowlist and file-part check.
-        let json = axum::extract::Request::builder()
-            .header(header::CONTENT_TYPE, "application/json")
+    async fn fields_outside_the_schema_are_rejected_in_both_formats() {
+        let mut extra = video_request();
+        extra["guidance_scale"] = serde_json::json!(5.0);
+        let mut nested = video_request();
+        nested["target"]["fps"] = serde_json::json!(24);
+        let file = axum::extract::Request::builder()
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
             .body(Body::from(
-                r#"{"model":"FastH3","prompt":"A river","input_reference":"image.png"}"#,
+                "--clip\r\nContent-Disposition: form-data; name=\"conditions\"; filename=\"image.png\"\r\n\r\nimage\r\n--clip--\r\n",
             ))
             .unwrap();
-        let multipart = axum::extract::Request::builder().header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
-            .body(Body::from("--clip\r\nContent-Disposition: form-data; name=\"input_reference\"; filename=\"image.png\"\r\n\r\nimage\r\n--clip--\r\n")).unwrap();
+        let requests = [
+            json_request(&extra),
+            json_request(&nested),
+            multipart(&[("model", "FastH3"), ("input_reference", "image.png")]),
+            file,
+        ];
+        for request in requests {
+            match VideoBody::from_request(request, &()).await {
+                Ok(VideoBody(body)) => panic!("{body:?} was accepted"),
+                Err(response) => assert_eq!(response.status(), StatusCode::BAD_REQUEST),
+            }
+        }
 
-        for request in [json, multipart] {
+        for request in [
+            json_request(
+                &serde_json::json!({"model": "FastH3", "prompt": "A river", "seconds": 5}),
+            ),
+            multipart(&[("model", "FastH3"), ("prompt", "A river"), ("seconds", "5")]),
+        ] {
             let response = match VideoBody::from_request(request, &()).await {
-                Ok(_) => panic!("conditioning was accepted"),
+                Ok(VideoBody(body)) => panic!("{body:?} was accepted"),
                 Err(response) => response,
             };
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains("task"), "{message}");
         }
+    }
+
+    /// The capabilities report what the placed denoiser serves.
+    #[tokio::test]
+    async fn capabilities_follow_the_denoiser_handshake() {
+        let router = crate::http::build_router(Arc::new(video_state()));
+        let request = axum::extract::Request::builder()
+            .uri("/v1/capabilities")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = send(&router, request).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["video"]["tasks"], serde_json::json!(["t2va"]));
+        assert_eq!(body["video"]["schedule"]["num_inference_steps"], 5);
+        assert_eq!(body["video"]["canvas"]["canvases"], serde_json::Value::Null);
+        assert_eq!(
+            body["video"]["canvas"]["aspect_ratios"],
+            serde_json::json!(["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"])
+        );
     }
 }

@@ -473,6 +473,32 @@ fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRe
     })
 }
 
+/// Decodes a video denoiser's declaration; `WorkerInfo::validate` checks it.
+fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoDenoiserInfo {
+    crate::VideoDenoiserInfo {
+        tasks: table
+            .tasks()
+            .map(|tasks| tasks.iter().map(str::to_owned).collect())
+            .unwrap_or_default(),
+        schedule_points: table.schedule_points(),
+        video_shift: table.video_shift(),
+        audio_shift: table.audio_shift(),
+        canvases: table
+            .canvases()
+            .map(|canvases| {
+                canvases
+                    .iter()
+                    .map(|canvas| uniserve_core::Canvas {
+                        width: canvas.width(),
+                        height: canvas.height(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        max_sequence_rows: table.max_sequence_rows(),
+    }
+}
+
 /// Decodes diffusion admission parameters; `NewRequest::validate` checks the
 /// frame, unit, and step counts.
 fn diffusion_params_from_table(
@@ -483,6 +509,8 @@ fn diffusion_params_from_table(
         video_units: admission.video_units(),
         num_inference_steps: admission.num_inference_steps(),
         seed: admission.seed(),
+        width: admission.width(),
+        height: admission.height(),
     })
 }
 
@@ -1056,6 +1084,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             components
         },
         num_inference_steps: info.num_inference_steps(),
+        video_denoiser: info.video_denoiser().map(video_denoiser_from_table),
     };
     info.validate()?;
     Ok(info)

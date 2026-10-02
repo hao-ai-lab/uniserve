@@ -1,11 +1,19 @@
-"""Fixed-profile H3 audio/video packing and RoPE coordinates.
+"""H3 packed sequences, their rotary coordinates and latent row orders.
 
-One sample's tokens form a single packed sequence of 64-row tiles:
-``[text | stereo audio | tiled video | padding]``. Text and audio form the
-dense prefix that every text, audio and video query attends; video rows are
-grouped into 4x4x4 spatiotemporal tiles for sparse attention. Every packed
-row carries a token tag and a (time, height, width) rotary coordinate. All
-tables are CPU tensors built on the host.
+Every H3 denoiser evaluates one packed sequence per sample whose rows carry
+a token tag and a (time, height, width) rotary coordinate. Two packings
+exist, one per attention kind:
+
+* ``TilePacking`` (sparse attention): 64-row tiles ``[text | stereo audio |
+  tiled video | padding]``. Text and audio form the dense prefix that every
+  query attends; video rows are grouped into 4x4x4 spatiotemporal tiles.
+* ``DensePacking`` (dense attention): ``[target video | target audio | text
+  and conditions | padding]``. Attention is permutation-equivariant given
+  the rotary coordinates, so the generated rows lead at fixed offsets and the
+  request-dependent text and condition rows follow them, contiguous, with
+  padding only at the end.
+
+All tables are CPU tensors built on the host.
 """
 
 from __future__ import annotations
@@ -16,18 +24,26 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from uniserve.media import image
+
 __all__ = [
     "AUDIO_CHANNELS",
     "AUDIO_TAG",
-    "Packing",
+    "CANVAS_MULTIPLE",
+    "DensePacking",
     "TEXT_TAG",
+    "TilePacking",
     "VIDEO_TAG",
     "audio_latent_frames",
-    "build_packing",
+    "dense_packing",
+    "dense_tables",
+    "latent_raster",
     "patchify_video",
+    "tile_packing",
     "unpatchify_video",
     "unpatchify_video_into",
     "video_latent_frames",
+    "video_order",
 ]
 
 # Token tags. A tag is also the token's group among each timestep's three
@@ -43,6 +59,35 @@ ROPE_FRAME_RESCALE = 5.0 / 3.0
 # clip: 1 + 4 * 4 = 17.
 ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
 _ROPE_SPATIAL_SCALE = 32.0
+# A canvas side survives the VAE's 16x spatial compression and remains a
+# whole number of 2x2 transformer patches.
+CANVAS_MULTIPLE = 32
+# Timestep groups a packed row reads its modulation under: the generated
+# video timestep (text and padding rows too), the generated audio timestep,
+# the visual-condition timestep and the audio-reference timestep.
+VIDEO_GROUP, AUDIO_GROUP, VISUAL_CONDITION_GROUP, AUDIO_CONDITION_GROUP = (
+    0,
+    1,
+    2,
+    3,
+)
+
+
+def latent_raster(canvas: image.Config) -> tuple[int, int]:
+    """Return the (height, width) latent raster of ``canvas``.
+
+    Raises:
+        ValueError: A canvas side is not a positive multiple of 32.
+    """
+    if (
+        not isinstance(canvas, image.Config)
+        or canvas.height % CANVAS_MULTIPLE
+        or canvas.width % CANVAS_MULTIPLE
+    ):
+        raise ValueError(
+            f"H3 canvas sides must be multiples of {CANVAS_MULTIPLE} pixels"
+        )
+    return canvas.height // 16, canvas.width // 16
 
 
 def video_latent_frames(num_frames: int) -> int:
@@ -72,9 +117,9 @@ def audio_latent_frames(num_frames: int) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class Packing:
+class TilePacking:
     """CPU indices for the mathematical text, stereo audio and tiled video
-    order.
+    order of sparse attention.
 
     num_tokens counts valid tokens. padded_tokens also includes tile-boundary
     and partition alignment, whose validity is represented separately.
@@ -155,17 +200,16 @@ def _temporal_grid(count: int, origin: float) -> torch.Tensor:
     )
 
 
-def build_packing(
+def tile_packing(
     *,
     num_text_tokens: int,
-    num_frames: int = 124,
-    height: int = 768,
-    width: int = 1344,
+    num_frames: int,
+    canvas: image.Config,
     patch_size: tuple[int, int, int] = (1, 2, 2),
     token_multiple: int = 256,
     audio_frames: int | None = None,
     text_rows: int | None = None,
-) -> Packing:
+) -> TilePacking:
     """Build CPU coordinates for `[text | audio | tiled video | padding]` rows.
 
     These host metadata values remain concrete during deferred parameter
@@ -175,8 +219,7 @@ def build_packing(
         num_text_tokens: Prompt tokens, the valid leading rows of the text
             region.
         num_frames: Output video frames, of the form ``17 * n + 5``.
-        height: Output raster height; only 768 is supported.
-        width: Output raster width; only 1344 is supported.
+        canvas: Output raster, sides multiples of 32.
         patch_size: Transformer (time, height, width) patch on the latents.
         token_multiple: Row alignment, a multiple of 64. ``padded_tokens``
             rounds up to a multiple of ``max(token_multiple, 128)``, plus one
@@ -191,16 +234,14 @@ def build_packing(
             tags or validity of any prompt, audio or video token.
 
     Raises:
-        ValueError: An unsupported raster, empty text, a frame count H3 does
-            not generate, a nonpositive audio length, an alignment that is
-            not a positive multiple of the 64-row tile, a text region that is
-            not whole tiles holding the prompt, or a patch that does not
-            divide the latents.
+        ValueError: A canvas off the 32-pixel grid, empty text, a frame
+            count H3 does not generate, a nonpositive audio length, an
+            alignment that is not a positive multiple of the 64-row tile, a
+            text region that is not whole tiles holding the prompt, or a
+            patch that does not divide the latents.
     """
-    if num_text_tokens < 1 or height != 768 or width != 1344:
-        raise ValueError(
-            "the FastH3 profile requires 1344x768 output and nonempty text"
-        )
+    if num_text_tokens < 1:
+        raise ValueError("H3 packing requires nonempty text")
     if token_multiple < 1 or token_multiple % 64:
         raise ValueError(
             "packing alignment must contain complete 64-token tiles"
@@ -213,7 +254,7 @@ def build_packing(
         )
     patch_t, patch_h, patch_w = patch_size
     # Latents are 16x spatially compressed relative to the output raster.
-    latent_height, latent_width = height // 16, width // 16
+    latent_height, latent_width = latent_raster(canvas)
     video_frames = video_latent_frames(num_frames)
     audio_frames = (
         audio_latent_frames(num_frames)
@@ -376,7 +417,7 @@ def build_packing(
     tile_valid_sizes[video_tile_start : video_tile_start + video_tiles] = (
         video_valid_sizes
     )
-    return Packing(
+    return TilePacking(
         num_tokens=num_tokens,
         padded_tokens=padded_tokens,
         position_ids=positions,
@@ -394,6 +435,223 @@ def build_packing(
         latent_width=latent_width,
         audio_frames=audio_frames,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class DensePacking:
+    """Row extents of one dense layout: ``[video | audio | prefix | padding]``.
+
+    The generated video rows (raster order: latent frame, then patch row,
+    then patch column) start at row 0 and the generated stereo audio rows
+    (channel-major) follow them, so a sequence shard's generated rows depend
+    on the layout alone. The prefix region holds a request's text rows and
+    then its condition rows, contiguous; the rest of the region and the
+    alignment rows are padding, which attention excludes.
+
+    Attributes:
+        video_rows: Generated video rows.
+        audio_rows: Generated audio rows, both stereo channels.
+        text_rows: Text capacity of the prefix region.
+        condition_rows: Condition capacity of the prefix region.
+        padded_tokens: All rows, a multiple of the layout's alignment.
+    """
+
+    video_rows: int
+    audio_rows: int
+    text_rows: int
+    condition_rows: int
+    padded_tokens: int
+
+    @property
+    def prefix_start(self) -> int:
+        """First row of the prefix region."""
+        return self.video_rows + self.audio_rows
+
+    @property
+    def zero_row(self) -> int:
+        """Row of the prefix source that holds zeros (see ``dense_tables``)."""
+        return self.text_rows + self.condition_rows
+
+
+def dense_packing(
+    *,
+    num_frames: int,
+    canvas: image.Config,
+    text_rows: int,
+    condition_rows: int,
+    token_multiple: int,
+    patch_size: tuple[int, int, int] = (1, 2, 2),
+) -> DensePacking:
+    """Size the dense layout of one frame count, canvas and prefix capacity.
+
+    ``token_multiple`` aligns the padded row count so that every sequence
+    rank holds an equal shard.
+
+    Raises:
+        ValueError: A frame count H3 does not generate, a canvas off the
+            32-pixel grid, nonpositive text or negative condition capacity,
+            or a nonpositive alignment.
+    """
+    if (
+        type(text_rows) is not int
+        or text_rows < 1
+        or type(condition_rows) is not int
+        or condition_rows < 0
+        or type(token_multiple) is not int
+        or token_multiple < 1
+    ):
+        raise ValueError(
+            "a dense layout needs text rows, a condition capacity and a "
+            "positive alignment"
+        )
+    patch_t, patch_h, patch_w = patch_size
+    latent_height, latent_width = latent_raster(canvas)
+    video_rows = (
+        video_latent_frames(num_frames)
+        // patch_t
+        * (latent_height // patch_h)
+        * (latent_width // patch_w)
+    )
+    audio_rows = AUDIO_CHANNELS * audio_latent_frames(num_frames)
+    rows = video_rows + audio_rows + text_rows + condition_rows
+    return DensePacking(
+        video_rows=video_rows,
+        audio_rows=audio_rows,
+        text_rows=text_rows,
+        condition_rows=condition_rows,
+        padded_tokens=math.ceil(rows / token_multiple) * token_multiple,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DenseTables:
+    """One request's row tables in a dense layout.
+
+    Attributes:
+        position_ids: [padded_tokens, 3] FP64 rotary coordinates; padding
+            rows hold zeros.
+        token_tags: [padded_tokens] int64 modulation tags; padding rows carry
+            ``VIDEO_TAG``.
+        groups: [padded_tokens] int64 timestep groups (``VIDEO_GROUP`` ...).
+        prefix_index: [padded_tokens] int64 row of the prefix source each
+            packed row takes: text rows first, then condition rows, and the
+            source's zero row for generated and padding rows.
+        used: Rows attention attends: generated rows, text and conditions.
+    """
+
+    position_ids: torch.Tensor
+    token_tags: torch.Tensor
+    groups: torch.Tensor
+    prefix_index: torch.Tensor
+    used: int
+
+
+def dense_tables(
+    packing: DensePacking,
+    *,
+    num_frames: int,
+    canvas: image.Config,
+    num_text_tokens: int,
+    patch_size: tuple[int, int, int] = (1, 2, 2),
+) -> DenseTables:
+    """Build a text-only request's tables in its dense layout.
+
+    The coordinates are the released contract: text row ``i`` sits at
+    ``(i, 0, 0)``; the media clock starts at the prompt length, the audio
+    rows advancing one unit per latent with the stereo channels at the two
+    ends of the width grid, and the video frames at
+    ``(5 / 3) * (1, 4, 4, 4, 4)[k mod 5]`` spacing over the aspect-normalized
+    spatial grid.
+
+    Raises:
+        ValueError: The prompt does not fit the layout's text rows.
+    """
+    if not 1 <= num_text_tokens <= packing.text_rows:
+        raise ValueError("the prompt must fit its layout's text rows")
+    _, patch_h, patch_w = patch_size
+    latent_height, latent_width = latent_raster(canvas)
+    rows = packing.padded_tokens
+    frames = video_latent_frames(num_frames)
+    audio_frames = audio_latent_frames(num_frames)
+    origin = float(num_text_tokens)
+
+    positions = torch.zeros((rows, 3), dtype=torch.float64, device="cpu")
+    sqrt_area = math.sqrt(latent_height * latent_width)
+    height_grid = _spatial_grid(latent_height, patch_h, sqrt_area)
+    width_grid = _spatial_grid(latent_width, patch_w, sqrt_area)
+    spatial = torch.stack(
+        [
+            grid.reshape(-1)
+            for grid in torch.meshgrid(height_grid, width_grid, indexing="ij")
+        ],
+        dim=-1,
+    )
+    video = torch.empty(
+        (frames, spatial.shape[0], 3), dtype=torch.float64, device="cpu"
+    )
+    video[:, :, 0] = _temporal_grid(frames, origin)[:, None]
+    video[:, :, 1:] = spatial[None]
+    positions[: packing.video_rows] = video.reshape(-1, 3)
+
+    audio = slice(packing.video_rows, packing.prefix_start)
+    positions[audio, 0] = (
+        origin + torch.arange(audio_frames, dtype=torch.float64, device="cpu")
+    ).repeat(AUDIO_CHANNELS)
+    positions[audio, 2] = torch.cat(
+        (
+            torch.full(
+                (audio_frames,), float(width_grid[0]), dtype=torch.float64
+            ),
+            torch.full(
+                (audio_frames,), float(width_grid[-1]), dtype=torch.float64
+            ),
+        )
+    )
+    text = slice(packing.prefix_start, packing.prefix_start + num_text_tokens)
+    positions[text, 0] = torch.arange(
+        num_text_tokens, dtype=torch.float64, device="cpu"
+    )
+
+    tags = torch.full((rows,), VIDEO_TAG, dtype=torch.int64, device="cpu")
+    tags[audio] = AUDIO_TAG
+    tags[text] = TEXT_TAG
+    groups = torch.full((rows,), VIDEO_GROUP, dtype=torch.int64, device="cpu")
+    groups[audio] = AUDIO_GROUP
+
+    prefix_index = torch.full(
+        (rows,), packing.zero_row, dtype=torch.int64, device="cpu"
+    )
+    prefix_index[text] = torch.arange(num_text_tokens, dtype=torch.int64)
+    return DenseTables(
+        position_ids=positions,
+        token_tags=tags,
+        groups=groups,
+        prefix_index=prefix_index,
+        used=packing.prefix_start + num_text_tokens,
+    )
+
+
+def video_order(
+    attention, *, num_frames: int, canvas: image.Config
+) -> torch.Tensor:
+    """Return the raster row of each generated video row in packed order.
+
+    ``attention`` is a denoiser's attention configuration
+    (``config.DenseAttention`` or ``config.SparseAttention``): dense packing
+    keeps the raster order; tile packing orders rows tile-major, which does
+    not depend on the prompt.
+    """
+    from .config import DenseAttention
+
+    if isinstance(attention, DenseAttention):
+        height, width = latent_raster(canvas)
+        return torch.arange(
+            video_latent_frames(num_frames) * (height // 2) * (width // 2),
+            dtype=torch.int64,
+        )
+    return tile_packing(
+        num_text_tokens=64, num_frames=num_frames, canvas=canvas
+    ).video_raster_indices
 
 
 def patchify_video(

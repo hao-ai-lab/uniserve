@@ -389,6 +389,16 @@ impl WorkerProcessArgs {
         fields.insert("local_rank".into(), json!(self.host_slot(rank)?.0));
         fields.insert("world_size".into(), json!(self.world_size()));
         fields.insert("components".into(), serde_json::to_value(&self.components)?);
+        // Every component any group of the deployment places, so each rank
+        // resolves the capabilities the deployment as a whole selects, such
+        // as which of a checkpoint's denoisers it serves.
+        let deployment = self
+            .peers
+            .values()
+            .flat_map(|components| components.keys())
+            .chain(self.components.keys())
+            .collect::<std::collections::BTreeSet<_>>();
+        fields.insert("deployment_components".into(), json!(deployment));
         // Null lets the worker serve every capability group it implements.
         fields.insert(
             "supported_calls".into(),

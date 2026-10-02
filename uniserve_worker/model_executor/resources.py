@@ -13,6 +13,7 @@ from collections.abc import Mapping
 
 import torch
 
+from uniserve.media import image, video
 from uniserve.model import (
     AudioDecoder,
     Denoiser,
@@ -27,7 +28,41 @@ from uniserve_worker.model_executor.component_binding import (
     Call,
     ComponentBinding,
 )
-from uniserve_worker.model_executor.media_inputs import MediaBuilder
+from uniserve_worker.model_executor.media_inputs import MediaBuilder, envelope
+
+
+def bounding_layout(layouts: tuple[OutputLayout, ...]) -> OutputLayout:
+    """Combine one product's layouts at several sizes into a bound.
+
+    Equal layouts bound themselves. Otherwise the result takes each
+    dimension's largest extent and covers it whole; its variable axes are
+    the layouts' own, and a request's exact extents come from its admission.
+
+    Raises:
+        ValueError: The layouts disagree on rank, dtype, variable axes or
+            value range.
+    """
+    first = layouts[0]
+    if all(layout == first for layout in layouts):
+        return first
+    if any(
+        len(layout.shape) != len(first.shape)
+        or layout.dtype != first.dtype
+        or layout.variable_axes != first.variable_axes
+        or layout.value_range != first.value_range
+        for layout in layouts
+    ):
+        raise ValueError("bounded layouts must describe one product")
+    shape = tuple(
+        max(extents) for extents in zip(*(layout.shape for layout in layouts))
+    )
+    return OutputLayout(
+        shape,
+        first.dtype,
+        tuple(slice(0, extent) for extent in shape),
+        variable_axes=first.variable_axes,
+        value_range=first.value_range,
+    )
 
 
 def media_state_buffers(
@@ -56,7 +91,13 @@ def media_state_buffers(
             ):
                 fields = builder.capacity_buffers()
             elif isinstance(call.module, VideoPostprocessor):
-                fields = call.module.state_buffers(builder.maximum.num_frames)
+                # The overlap of the longest video at every admitted canvas.
+                fields = envelope(
+                    tuple(
+                        call.module.state_buffers(size)
+                        for size in builder.video_sizes()
+                    )
+                )
             else:
                 continue
 
@@ -83,7 +124,7 @@ def holds_samples(
 
 
 def decoded_units_layout(
-    decoder: VideoDecoder, num_frames: int
+    decoder: VideoDecoder, size: video.Config
 ) -> OutputLayout:
     """Describe a video decoding round's product: RGB media units.
 
@@ -92,15 +133,9 @@ def decoded_units_layout(
     division names how many. The rows are host products a host rank's
     encoder reads in place.
     """
-    windows = decoder.frame_slices(num_frames)
+    windows = decoder.frame_slices(size.num_frames)
     frames = max(window.stop - window.start for window in windows)
-    shape = (
-        len(windows),
-        frames,
-        decoder.frame_size.height,
-        decoder.frame_size.width,
-        3,
-    )
+    shape = (len(windows), frames, size.frame.height, size.frame.width, 3)
     return OutputLayout(
         shape,
         torch.uint8,
@@ -111,7 +146,7 @@ def decoded_units_layout(
 
 
 def encoded_units_layout(
-    decoder: VideoDecoder, num_frames: int
+    decoder: VideoDecoder, size: video.Config
 ) -> OutputLayout:
     """Describe a video encoding round's product: framed encoded unit rows.
 
@@ -120,11 +155,11 @@ def encoded_units_layout(
     """
     from uniserve_worker.media.mux import encoded_unit_bytes
 
-    windows = decoder.frame_slices(num_frames)
+    windows = decoder.frame_slices(size.num_frames)
     row = encoded_unit_bytes(
         max(window.stop - window.start for window in windows),
-        decoder.frame_size.height,
-        decoder.frame_size.width,
+        size.frame.height,
+        size.frame.width,
     )
     return OutputLayout(
         (len(windows), row),
@@ -141,15 +176,19 @@ def output_layouts(
     builder: MediaBuilder | None = None,
     clock: VideoPostprocessor | None = None,
     frames: int | None = None,
+    canvas: image.Config | None = None,
     prompt_tokens: int | None = None,
 ) -> Mapping[str, OutputLayout]:
     """Describe the products one call publishes, keyed by product name.
 
-    ``frames`` and ``prompt_tokens`` size the layout for one request and
-    default to the admitted maxima. ``clock`` is the video post-processor
-    whose frame rate relates audio samples to video frames; with a clock, a
-    video decoder's product is its RGB media units (``decoded_units_layout``)
-    rather than its own declared layout.
+    ``frames``, ``canvas`` and ``prompt_tokens`` size the layout for one
+    request; without ``frames`` and ``canvas`` the layout bounds every
+    admitted size (``bounding_layout`` over the longest video at each
+    admitted canvas), and the prompt defaults to the admitted maximum.
+    ``clock`` is the video post-processor whose frame rate relates audio
+    samples to video frames; with a clock, a video decoder's product is its
+    RGB media units (``decoded_units_layout``) rather than its own declared
+    layout.
 
     The mapping is empty for a video post-processor, for a call that is
     neither a text encoder's ``encode`` nor a denoiser, video decoder or
@@ -181,18 +220,35 @@ def output_layouts(
 
     if not isinstance(component, (Denoiser, VideoDecoder, AudioDecoder)):
         return {}
+    if (frames is None) != (canvas is None):
+        raise ValueError("a request's layout names its frames and canvas")
+    if frames is None:
+        if builder is None:
+            # Standalone decoders have no serving timeline bound, and image
+            # execution returns its features and decoded raster through the
+            # token/image protocol rather than persistent products.
+            return {}
+        bounds = tuple(
+            output_layouts(
+                config,
+                call,
+                builder=builder,
+                clock=clock,
+                frames=size.num_frames,
+                canvas=size.frame,
+                prompt_tokens=prompt_tokens,
+            )
+            for size in builder.video_sizes()
+        )
+        return {
+            name: bounding_layout(tuple(layouts[name] for layouts in bounds))
+            for name in bounds[0]
+        }
     if isinstance(component, VideoDecoder):
-        if frames is None:
-            if builder is None:
-                # Standalone decoders have no serving timeline bound. Their
-                # caller supplies the exact frame range with the invocation.
-                return {}
-            count = builder.maximum.num_frames
-        else:
-            count = frames
+        output = video.Config(frames, canvas)
         if clock is None:
-            return component.output_layout(count)
-        return {"video": decoded_units_layout(component, count)}
+            return component.output_layout(output)
+        return {"video": decoded_units_layout(component, output)}
 
     if builder is None:
         # Image execution returns its features and decoded raster through the
@@ -200,8 +256,9 @@ def output_layouts(
         return {}
 
     size = builder.size(
-        builder.maximum.num_frames if frames is None else frames,
+        frames,
         config.max_sequence_tokens if prompt_tokens is None else prompt_tokens,
+        canvas,
     )
     if isinstance(component, Denoiser):
         # Only a video denoiser shares the media timeline the builder sizes.

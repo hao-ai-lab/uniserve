@@ -39,6 +39,7 @@ REQUIRED_FIELDS = (
     "local_rank",
     "world_size",
     "components",
+    "deployment_components",
     "supported_calls",
     "transfer_backends",
     "publish_backends",

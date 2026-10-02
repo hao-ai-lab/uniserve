@@ -2162,12 +2162,21 @@ mod placement_tests {
 
     #[test]
     fn every_shipped_deployment_encodes_its_units_on_their_host() {
-        // Every FastH3 deployment file shipped in `configs/fast_h3/` must
-        // pass the placement checks the engine applies at startup, including
-        // the pairing of every decoding worker with an encoder on its host.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/fast_h3");
+        // Every video deployment file shipped in `configs/fast_h3/` and
+        // `configs/minimax_h3/` must pass the placement checks the engine
+        // applies at startup, including the pairing of every decoding worker
+        // with an encoder on its host.
+        for family in ["fast_h3", "minimax_h3"] {
+            check_shipped_deployments(family);
+        }
+    }
+
+    fn check_shipped_deployments(family: &str) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../configs")
+            .join(family);
         let mut checked = 0;
-        for entry in std::fs::read_dir(&root).expect("the FastH3 deployment directory exists") {
+        for entry in std::fs::read_dir(&root).expect("the deployment directory exists") {
             let path = entry.expect("readable entry").path();
             if path.extension().is_none_or(|extension| extension != "json") {
                 continue;
@@ -2195,7 +2204,7 @@ mod placement_tests {
             assert_eq!(pairings.len(), decoders, "{}", path.display());
             checked += 1;
         }
-        assert!(checked > 0, "no FastH3 deployment was checked");
+        assert!(checked > 0, "no {family} deployment was checked");
     }
 
     #[test]

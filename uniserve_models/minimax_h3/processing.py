@@ -950,11 +950,11 @@ def present(
     without a chat template, and the pieces are concatenated.
 
     Raises:
-        PlanError: The prompt is empty or contains a vision placeholder,
+        PlanError: The prompt is blank or contains a vision placeholder,
             which would misalign the conditioner's vision inputs.
     """
-    if not prompt:
-        raise PlanError("prompt", "must not be empty")
+    if not prompt.strip():
+        raise PlanError("prompt", "must not be blank")
     start = tokenizer.convert_tokens_to_ids(VISION_START)
     end = tokenizer.convert_tokens_to_ids(VISION_END)
     placeholders = {

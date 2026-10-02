@@ -9,7 +9,7 @@ mod version;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -130,6 +130,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let enable_request_id_headers = state.enable_request_id_headers();
     let request_timeout = state.request_timeout();
     let api_key = state.api_key().map(|key| Arc::new(key.to_string()));
+    let video_body_limit = state.video_body_limit();
 
     let mut router = Router::new()
         .route("/health", get(health::health))
@@ -138,11 +139,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(openai::list_models))
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/images/generations", post(openai::images_generations))
-        .route("/v1/videos/sync", post(openai::videos_sync))
+        // The video submission routes take condition media inline, so their
+        // body limit follows the configured media total.
+        .route(
+            "/v1/videos/sync",
+            post(openai::videos_sync).layer(DefaultBodyLimit::max(video_body_limit)),
+        )
         .route("/v1/capabilities", get(openai::capabilities))
         .route(
             "/v1/videos",
-            get(openai::videos_list).post(openai::videos_create),
+            get(openai::videos_list).post(openai::videos_create).layer(
+                // Applies to the listing too, which reads no body.
+                DefaultBodyLimit::max(video_body_limit),
+            ),
         )
         .route(
             "/v1/videos/{id}",
@@ -165,7 +174,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(TraceLayer::new_for_http())
         // Sets the limit that axum's body extractors (`Json`, `Multipart`)
         // apply; it does not cap bodies read by other means.
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(crate::http::BODY_LIMIT))
         .layer(from_fn(move |request: Request, next: Next| {
             middleware::resolve_request_id(enable_request_id_headers, request, next)
         }));

@@ -93,7 +93,8 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
 
 
 def test_h3_worker_advertises_bounded_media_products():
-    from uniserve_models.minimax_h3 import Config, Model
+    from tests.python.fixtures.h3 import fasth3_config
+    from uniserve_models.minimax_h3 import Model
     from uniserve_worker.bootstrap.components import (
         media_components,
         supported_calls,
@@ -107,7 +108,7 @@ def test_h3_worker_advertises_bounded_media_products():
     )
 
     with torch.device("meta"):
-        model = Model(Config())
+        model = Model(fasth3_config())
     config = WorkerConfig(
         device="cpu",
         max_sequence_tokens=65,
@@ -289,13 +290,14 @@ def test_h3_audio_product_holds_the_decoded_track(seconds, frames):
     duration is a fractional number of latent frames: longer at 124 frames,
     equal at 243 and shorter at 362.
     """
-    from uniserve_models.minimax_h3 import Config, Model
+    from tests.python.fixtures.h3 import fasth3_config
+    from uniserve_models.minimax_h3 import Model
     from uniserve_models.minimax_h3.packing import audio_latent_frames
     from uniserve_worker.bootstrap.outputs import resolve_outputs
     from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
-        model = Model(Config())
+        model = Model(fasth3_config())
     config = WorkerConfig(
         device="cpu",
         max_sequence_tokens=65,
@@ -320,13 +322,14 @@ def test_h3_video_capacity_rounds_half_frames_to_even():
     even, to 124 frames, which is already a complete temporal window;
     rounding away from zero would reach 125 and extend to 141 frames.
     """
-    from uniserve_models.minimax_h3 import Config, Model
+    from tests.python.fixtures.h3 import fasth3_config
+    from uniserve_models.minimax_h3 import Model
     from uniserve_models.minimax_h3.packing import video_latent_frames
     from uniserve_worker.bootstrap.outputs import resolve_outputs
     from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
-        model = Model(Config())
+        model = Model(fasth3_config())
     config = WorkerConfig(
         device="cpu",
         max_sequence_tokens=65,

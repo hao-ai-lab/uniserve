@@ -59,10 +59,11 @@ pub use input::{
     OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions, SamplingConfig, StopConfig,
     TextPromptRequest,
 };
+pub(crate) use model::LoadedModel;
 pub use model::{
     InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ModelSupport, ServedEndpoint,
     ServedFeature, ServedModality, ServedSamplingControl, VIDEO_FPS, WorkerCapabilities,
-    default_video_seconds, validate_video_capacity, video_frame_count,
+    validate_video_capacity, video_frame_count,
 };
 
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Qwen3ChatOutputProcessor};
@@ -423,11 +424,14 @@ impl ServingRuntime {
             self.served_model_name(),
         )?;
         let input_id = request_id.clone();
-        self.generate_with(request_id, move |model| {
-            model
-                .preprocess_chat_request(input_id, request)
-                .map(Prepared::from)
-        })
+        self.generate_with(
+            request_id.clone(),
+            blocking(request_id, move |model| {
+                model
+                    .preprocess_chat_request(input_id, request)
+                    .map(Prepared::from)
+            }),
+        )
         .await
     }
 
@@ -438,11 +442,14 @@ impl ServingRuntime {
         request: crate::openai::ImageGenerationRequest,
     ) -> crate::openai::Result<RequestOutputStream> {
         let input_id = request_id.clone();
-        self.generate_with(request_id, move |model| {
-            model
-                .preprocess_image_request(input_id, request)
-                .map(Prepared::from)
-        })
+        self.generate_with(
+            request_id.clone(),
+            blocking(request_id, move |model| {
+                model
+                    .preprocess_image_request(input_id, request)
+                    .map(Prepared::from)
+            }),
+        )
         .await
     }
 
@@ -451,28 +458,45 @@ impl ServingRuntime {
         &self,
         request: TextPromptRequest,
     ) -> crate::openai::Result<RequestOutputStream> {
-        self.generate_with(request.request_id.clone(), move |model| {
-            model
-                .preprocess_text_request(request)
-                .map(Prepared::from)
-                .map_err(crate::openai::serve_error_to_api)
-        })
+        let request_id = request.request_id.clone();
+        self.generate_with(
+            request_id.clone(),
+            blocking(request_id, move |model| {
+                model
+                    .preprocess_text_request(request)
+                    .map(Prepared::from)
+                    .map_err(crate::openai::serve_error_to_api)
+            }),
+        )
         .await
     }
 
-    /// Tokenizes video prompts on the same blocking pool and lifecycle as text.
+    /// Prepares a video request (media ingestion included) within its request lifecycle and
+    /// streams its output.
+    ///
+    /// Also returns the prepared request, whose duration, canvas and sampling describe the
+    /// generation; it is `None` when a control command ended the request before preparation
+    /// completed, in which case the stream carries that terminal outcome.
     pub async fn generate_video(
         &self,
         request_id: ServeRequestId,
         request: crate::openai::VideoGenerationRequest,
-    ) -> crate::openai::Result<RequestOutputStream> {
+    ) -> crate::openai::Result<(
+        Option<crate::serving::video::PreparedVideo>,
+        RequestOutputStream,
+    )> {
+        let (prepared, outline) = tokio::sync::oneshot::channel();
         let input_id = request_id.clone();
-        self.generate_with(request_id, move |model| {
-            model
-                .preprocess_video_request(&input_id, request)
-                .map(Prepared::Diffusion)
-        })
-        .await
+        let stream = self
+            .generate_with(request_id, move |model| async move {
+                let video = model.preprocess_video_request(&input_id, &request).await?;
+                // The caller reads the outline only after this future completed or was
+                // dropped, so a closed receiver cannot occur here.
+                let _ = prepared.send(video.clone());
+                Ok(Prepared::Diffusion(video.request))
+            })
+            .await?;
+        Ok((outline.await.ok(), stream))
     }
 
     /// Owns the request across blocking preprocessing, submission, and public output.
@@ -481,11 +505,14 @@ impl ServingRuntime {
     /// tokenization work and a cancel or abort can target a request that is still compiling.
     /// Every path after registration either returns a stream that carries the lifecycle guard
     /// or records a terminal outcome through it.
-    async fn generate_with(
+    async fn generate_with<Preprocess>(
         &self,
         request_id: ServeRequestId,
-        preprocess: impl FnOnce(&InputProcessor) -> crate::openai::Result<Prepared> + Send + 'static,
-    ) -> crate::openai::Result<RequestOutputStream> {
+        preprocess: impl FnOnce(Arc<InputProcessor>) -> Preprocess,
+    ) -> crate::openai::Result<RequestOutputStream>
+    where
+        Preprocess: std::future::Future<Output = crate::openai::Result<Prepared>> + Send,
+    {
         // `compile_us` and the lifecycle's elapsed times are measured from this instant, so
         // time spent queued for the blocking pool counts toward compilation.
         let compile_started = Instant::now();
@@ -515,21 +542,15 @@ impl ServingRuntime {
             compile_started,
         );
 
-        // A control command that arrives during preprocessing ends the request immediately.
-        // Dropping the `spawn_blocking` handle detaches the task rather than cancelling it, so
-        // the preprocessing still runs to completion and its result is discarded.
-        let model = Arc::clone(&self.model);
-        let tokenize_request_id = request_id.clone();
+        // A control command that arrives during preprocessing ends the request immediately and
+        // drops the preprocessing future. Work on the blocking pool (`blocking`) still runs to
+        // completion and its result is discarded; asynchronous work such as media fetches
+        // stops at its next await.
         let tokenize_result = tokio::select! {
             terminal = self.engine.requests.wait_for_control(&request_id) => {
                 return Ok(self.control_event_stream(request_id, terminal, lifecycle));
             }
-            tokenized = tokio::task::spawn_blocking(move || preprocess(&model)) => {
-                tokenized.unwrap_or_else(|error| Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
-                    request_id: tokenize_request_id,
-                    source: TokenizeError::Task(error),
-                })))
-            }
+            tokenized = preprocess(Arc::clone(&self.model)) => tokenized,
         };
         let mut tokenized = match tokenize_result {
             Ok(tokenized) => tokenized,
@@ -954,6 +975,29 @@ impl RuntimeMetricsSnapshot {
             ("aborted", self.aborted),
             ("failed", self.failed),
         ]
+    }
+}
+
+/// Runs synchronous preprocessing (tokenization, chat rendering) on the blocking pool.
+///
+/// A panicked or cancelled task becomes a tokenization error of `request_id`.
+fn blocking(
+    request_id: ServeRequestId,
+    preprocess: impl FnOnce(&InputProcessor) -> crate::openai::Result<Prepared> + Send + 'static,
+) -> impl FnOnce(
+    Arc<InputProcessor>,
+) -> futures::future::BoxFuture<'static, crate::openai::Result<Prepared>> {
+    move |model| {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || preprocess(&model))
+                .await
+                .unwrap_or_else(|error| {
+                    Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
+                        request_id,
+                        source: TokenizeError::Task(error),
+                    }))
+                })
+        })
     }
 }
 

@@ -325,6 +325,10 @@ class WorkerConfig:
     # Text capacities, in prompt tokens, of the denoiser's layouts; empty
     # selects ``MediaBuilder``'s default spacing.
     video_text_capacities: tuple[int, ...] = ()
+    # Names of every component any worker group of the deployment places;
+    # it selects which of a checkpoint's video denoisers the deployment
+    # serves.
+    deployment_components: tuple[str, ...] = ()
     max_request_pool_size: int = 128
     encoder_cache_entries: int = 256
     generation_device: str | None = None
@@ -444,6 +448,9 @@ def worker_config_from_namespace(
         ),
         video_text_capacities=_parse_positive_int_csv(
             getattr(namespace, "video_text_capacities", None), default=()
+        ),
+        deployment_components=tuple(
+            str(name) for name in namespace.deployment_components
         ),
         kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
         attention_backend=str(namespace.attention_backend),

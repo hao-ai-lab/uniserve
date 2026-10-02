@@ -24,6 +24,7 @@ use uniserve_engine::{
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, SchedulingPolicy,
+    VideoMediaSettings,
 };
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
@@ -137,6 +138,20 @@ pub(crate) struct SharedRuntimeArgs {
     /// advertised as `max_seconds`.
     #[arg(long = "max-video-seconds", default_value_t = 15.0)]
     pub max_video_seconds: f64,
+    /// Directory that `file://` condition media of video requests resolves
+    /// under. Without it, `file://` media is refused.
+    #[arg(long = "media-directory", value_name = "DIR")]
+    pub media_directory: Option<std::path::PathBuf>,
+    /// Whether the server fetches `http(s)://` condition media of video
+    /// requests.
+    #[arg(long = "remote-media", default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub remote_media: bool,
+    /// Bytes of condition media one video request may carry in total.
+    #[arg(long = "max-request-bytes", default_value_t = VideoMediaSettings::DEFAULT_MAX_REQUEST_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_request_bytes: u64,
+    /// `ffprobe` executable that probes video and audio condition media.
+    #[arg(long, default_value = "ffprobe", value_name = "PATH")]
+    pub ffprobe: std::path::PathBuf,
     /// Optional explicit KV token capacity override for the worker.
     #[arg(long = "max-total-tokens")]
     pub kv_token_capacity: Option<u64>,
@@ -381,6 +396,12 @@ impl SharedRuntimeArgs {
             max_concurrent_requests: self.max_concurrent_requests,
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout),
             reasoning_parsing: self.reasoning_parser != "none",
+            video_media: VideoMediaSettings {
+                media_directory: self.media_directory,
+                remote_media: self.remote_media,
+                max_request_bytes: self.max_request_bytes,
+                ffprobe: self.ffprobe,
+            },
         }
     }
 }

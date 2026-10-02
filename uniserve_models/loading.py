@@ -1095,10 +1095,10 @@ def read_config(
     # The package's "default" preset, else its "bf16" preset, else the
     # ``weights.Config`` defaults; the quantization metadata below refines
     # this base or, for a ModelOpt export, replaces it.
-    precision = package.precisions.get(
-        "default", package.precisions.get("bf16", weight_options.Config())
+    precisions = package.precisions(model_config)
+    precision = precisions.get(
+        "default", precisions.get("bf16", weight_options.Config())
     )
-    precisions = package.precisions
     checkpoint_format = None
     quantization = metadata.get("quantization_config")
     if quantization is not None and not isinstance(quantization, dict):
@@ -1140,7 +1140,7 @@ def read_config(
         # Packed weights and their calibrated scales form one immutable
         # checkpoint contract. Runtime precision presets apply only to dense
         # checkpoints and must not be offered for this source.
-        base = package.checkpoint_precision
+        base = package.checkpoint_precision(model_config)
         precision = replace(
             base,
             quantization={

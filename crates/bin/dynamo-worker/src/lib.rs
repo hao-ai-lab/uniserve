@@ -9,11 +9,13 @@
 //!
 //! The Dynamo frontend forwards each `/v1/videos` request to
 //! `RawEngine::generate`, nesting unknown client fields under `extra_args`.
-//! `prepare_request` checks it against the fixed FastH3 contract and refuses
-//! any control FastH3 does not implement rather than ignoring it. The request
-//! then enters `ServingRuntime::generate_video`, the lifecycle the HTTP
-//! `/v1/videos` route uses, and a successful request yields one terminal
-//! response object carrying the single MP4 artifact.
+//! The worker serves FastH3 text-to-video-and-audio at its single 1344x768
+//! canvas: `prepare_request` maps the Dynamo request onto a `t2va` request
+//! of UniServe's video API and refuses any control FastH3 does not implement
+//! rather than ignoring it. The request then enters
+//! `ServingRuntime::generate_video`, the lifecycle the HTTP `/v1/videos`
+//! route uses, and a successful request yields one terminal response object
+//! carrying the single MP4 artifact.
 //! UniServe's own HTTP listener is never started.
 
 use std::collections::{BTreeMap, HashMap};
@@ -34,25 +36,30 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
-use uniserve_core::MediaKind;
+use uniserve_core::{MediaKind, VideoTask};
 use uniserve_engine::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     SchedulingPolicy, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::{
     AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
-    openai::{VideoGenerationRequest, serve_error_to_api},
+    openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     serving::{
-        FinishStatus, RequestOutput, ServeRequestId, VIDEO_FPS, default_video_seconds,
-        validate_video_capacity, video_frame_count,
+        FinishStatus, RequestOutput, ServeRequestId, VIDEO_FPS, validate_video_capacity,
+        video_frame_count,
     },
 };
 
-// The fixed FastH3 request and output dimensions mirror the capabilities
-// reported by MiniMax H3. The loaded checkpoint determines the step count.
+// FastH3 DMD exports generate the 16:9 canvas of a 768-pixel short edge,
+// 1344x768, alone. The loaded checkpoint determines the step count.
+const H3_SHORT_EDGE: u32 = 768;
+const H3_ASPECT_RATIO: &str = "16:9";
 const H3_WIDTH: u32 = 1344;
 const H3_HEIGHT: u32 = 768;
 const H3_AUDIO_SAMPLE_RATE: i32 = 32_000;
+/// The duration of a Dynamo request that omits `seconds`, at most the
+/// deployment's capacity.
+const DEFAULT_SECONDS: f64 = 5.0;
 
 #[derive(Clone, Parser)]
 #[command(
@@ -301,7 +308,11 @@ impl RawEngine for DynamoFastH3Engine {
             request,
             &self.args.served_model_name,
             self.args.max_video_seconds,
-            state.engine().denoise_steps(),
+            state
+                .runtime()
+                .model()
+                .video_service()
+                .map_or(0, |video| video.num_inference_steps()),
         )?;
         // The Dynamo context id is the UniServe request id, so `abort` can name
         // the same request from its own context.
@@ -310,7 +321,7 @@ impl RawEngine for DynamoFastH3Engine {
         // The serving runtime owns the request lifecycle the HTTP video route
         // uses: identity registration, prompt preprocessing, submission and
         // terminal accounting.
-        let mut events = state
+        let (_, mut events) = state
             .runtime()
             .generate_video(request_id.clone(), prepared.request)
             .await
@@ -497,15 +508,15 @@ struct PreparedRequest {
     response_format: ResponseFormat,
 }
 
-/// Maps a Dynamo video request onto UniServe's `VideoGenerationRequest`.
+/// Maps a Dynamo video request onto a `t2va` `VideoGenerationRequest` whose
+/// target is the 1344x768 canvas and the request's duration.
 ///
-/// Omitted fields default to seed 0, a `url` response, and the duration
-/// UniServe's HTTP video route resolves (`default_video_seconds`: 5 seconds,
-/// capped at `max_video_seconds`).
-/// `nvext.num_frames` is only checked against the aligned frame count of
-/// `seconds`; UniServe derives the frame count from `seconds` again in
-/// `InputProcessor::video_sampling`. Every refusal is an invalid-argument
-/// error.
+/// Omitted fields default to seed 0, a `url` response, and 5 seconds, capped
+/// at `max_video_seconds`. `nvext.num_frames` is only checked against the
+/// aligned frame count of `seconds`; UniServe derives the frame count from
+/// the target duration again when it prepares the request.
+/// `nvext.num_inference_steps` counts denoiser evaluations, `denoise_steps`.
+/// Every refusal is an invalid-argument error.
 fn prepare_request(
     value: Value,
     served_model_name: &str,
@@ -555,7 +566,7 @@ fn prepare_request(
     // bounds it and derives the frame count `nvext.num_frames` must match.
     let seconds = request
         .seconds
-        .map_or_else(|| default_video_seconds(max_video_seconds), f64::from);
+        .map_or_else(|| DEFAULT_SECONDS.min(max_video_seconds), f64::from);
     let frames = video_frame_count(seconds, max_video_seconds).map_err(invalid_argument)?;
     let nvext = request.nvext.unwrap_or_default();
     reject_present("nvext.annotations", nvext.annotations.as_ref())?;
@@ -589,8 +600,24 @@ fn prepare_request(
         request: VideoGenerationRequest {
             model: request.model,
             prompt: request.prompt,
+            task: VideoTask::T2va,
+            conditions: Vec::new(),
+            target: VideoTarget {
+                short_edge: H3_SHORT_EDGE,
+                aspect_ratio: H3_ASPECT_RATIO.to_owned(),
+                duration_seconds: Some(seconds),
+            },
             seed,
-            seconds: Some(seconds),
+            num_inference_steps: None,
+            flow_shift: None,
+            audio_flow_shift: None,
+            num_outputs_per_prompt: None,
+            n: None,
+            quality: None,
+            seconds: None,
+            size: None,
+            width: None,
+            height: None,
         },
         response_format: request.response_format.unwrap_or_default(),
     })
@@ -701,22 +728,24 @@ mod tests {
             Ok(prepared) => prepared,
             Err(error) => panic!("supported request was rejected: {error}"),
         };
-        assert_eq!(prepared.request.seconds, Some(5.0));
+        assert_eq!(prepared.request.task, VideoTask::T2va);
+        assert_eq!(prepared.request.target.aspect_ratio, "16:9");
+        assert_eq!(prepared.request.target.duration_seconds, Some(5.0));
         assert_eq!(prepared.request.seed, 1000);
         assert!(matches!(prepared.response_format, ResponseFormat::B64Json));
     }
 
-    /// An omitted duration resolves as it does on UniServe's HTTP video route:
-    /// 5 seconds, or the deployment's maximum when that is shorter.
+    /// An omitted duration is 5 seconds, or the deployment's maximum when
+    /// that is shorter.
     #[test]
-    fn an_omitted_duration_defaults_as_the_http_route_does() {
+    fn an_omitted_duration_defaults_to_five_seconds() {
         for (max_video_seconds, expected) in [(15.0, 5.0), (4.5, 4.5)] {
             let request = json!({"model": "FastH3", "prompt": "A stream in a forest"});
             let prepared = match prepare_request(request, "FastH3", max_video_seconds, 8) {
                 Ok(prepared) => prepared,
                 Err(error) => panic!("max {max_video_seconds}s refused the default: {error}"),
             };
-            assert_eq!(prepared.request.seconds, Some(expected));
+            assert_eq!(prepared.request.target.duration_seconds, Some(expected));
         }
     }
 

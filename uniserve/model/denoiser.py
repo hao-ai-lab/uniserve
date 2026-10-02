@@ -21,13 +21,19 @@ SizeT = TypeVar("SizeT")
 
 
 class VideoSize(Protocol):
-    """A video request's output timeline and conditioning length."""
+    """A video request's output timeline, raster and conditioning lengths."""
 
     @property
     def num_frames(self) -> int: ...
 
     @property
+    def canvas(self) -> image.Config: ...
+
+    @property
     def num_text_tokens(self) -> int: ...
+
+    @property
+    def condition_rows(self) -> int: ...
 
 
 VideoSizeT = TypeVar("VideoSizeT", bound=VideoSize)
@@ -157,14 +163,51 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
 
 
 class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
-    """A standalone denoiser that generates a video timeline from text features.
+    """A standalone denoiser that generates a video timeline from conditions.
 
-    A request is sized by its output frame count and prompt length. The network
-    fixes its step count, rounds a requested duration to its native windows,
-    and describes the request state and outputs that the caller's storage
-    holds; the caller advances the fixed schedule and supplies each step's
-    borrowed tensors to ``bind_inputs``.
+    A request is sized by its output frame count, canvas, prompt length and
+    condition rows. The network fixes its step count, rounds a requested
+    duration to its native windows, and describes the request state and
+    outputs that the caller's storage holds; the caller advances the fixed
+    schedule and supplies each step's borrowed tensors to ``bind_inputs``.
     """
+
+    @property
+    def canvases(self) -> tuple[image.Config, ...]:
+        """Canvases whose layouts a deployment prepares before serving."""
+        raise NotImplementedError
+
+    @property
+    def tasks(self) -> tuple[str, ...]:
+        """Task names this network serves, in canonical order."""
+        raise NotImplementedError
+
+    @property
+    def schedule_shifts(self) -> Mapping[str, float]:
+        """Each modality's fixed schedule shift."""
+        raise NotImplementedError
+
+    @property
+    def fixed_canvases(self) -> tuple[image.Config, ...] | None:
+        """The only canvases the network generates, or None for any canvas.
+
+        ``None`` admits every canvas of the model's canvas rule; prepared
+        ``canvases`` evaluate in captured layouts and others unprepared.
+        """
+        raise NotImplementedError
+
+    @property
+    def max_sequence_rows(self) -> int | None:
+        """The checkpoint's packed sequence capacity, or None without one."""
+        raise NotImplementedError
+
+    def text_condition_rows(self, layout: VideoSizeT) -> int:
+        """Rows of a request's retained conditioning in ``layout``.
+
+        The caller retains the refined prompt in the leading rows, zero past
+        the prompt; a network may reserve further rows it fills itself.
+        """
+        return layout.num_text_tokens
 
     @property
     def num_steps(self) -> int:
@@ -180,7 +223,14 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         """Round a requested frame count up to one the network generates."""
         raise NotImplementedError
 
-    def make_size(self, num_frames: int, num_text_tokens: int) -> VideoSizeT:
+    def make_size(
+        self,
+        num_frames: int,
+        num_text_tokens: int,
+        *,
+        canvas: image.Config,
+        condition_rows: int,
+    ) -> VideoSizeT:
         """Build the size descriptor of one request."""
         raise NotImplementedError
 

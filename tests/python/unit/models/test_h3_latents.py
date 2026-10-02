@@ -1,22 +1,62 @@
 """Native CPU random draws map to the same H3 samples.
 
-The mapping holds under sequence sharding.
+The mapping holds under sequence sharding, for both packings and for every
+canvas a denoiser generates.
 """
 
 import pytest
 import torch
 
+from tests.python.fixtures.h3 import WIDE, base_denoiser, dmd_denoiser
 from uniserve.diffusion import normal_noise
 from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.media import image
 from uniserve.nn.attention import AttentionParallelConfig, Ulysses
 from uniserve.runtime import TensorBuffers
-from uniserve_models.minimax_h3.config import DiffusionConfig, TransformerConfig
 from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.inputs import DenoiserSize
 
 pytestmark = pytest.mark.unit
 
+TALL = image.Config(1344, 768)
 
+
+def _tile_order(video: torch.Tensor) -> torch.Tensor:
+    """Canonical tile rows of a 16:9 draw.
+
+    Rows visit 4x4x4 tiles and valid positions within each tile in temporal,
+    height, width order. Patch channels retain native channel, patch-height,
+    patch-width order.
+    """
+    patches = video.reshape(24, video.shape[1], 24, 2, 42, 2).permute(
+        1, 2, 4, 0, 3, 5
+    )
+    return torch.cat(
+        [
+            patches[t : t + 4, h : h + 4, w : w + 4].reshape(-1, 96)
+            for t in range(0, video.shape[1], 4)
+            for h in range(0, 24, 4)
+            for w in range(0, 42, 4)
+        ]
+    )
+
+
+def _raster_order(video: torch.Tensor) -> torch.Tensor:
+    """Canonical raster rows: latent frame, patch row, patch column."""
+    _, frames, height, width = video.shape
+    patches = video.reshape(24, frames, height // 2, 2, width // 2, 2)
+    return patches.permute(1, 2, 4, 0, 3, 5).reshape(-1, 96)
+
+
+@pytest.mark.parametrize(
+    "config,canvas,order",
+    [
+        (dmd_denoiser(), WIDE, _tile_order),
+        (base_denoiser(), WIDE, _raster_order),
+        (base_denoiser(), TALL, _raster_order),
+    ],
+    ids=("tile", "dense-wide", "dense-tall"),
+)
 @pytest.mark.parametrize(
     "frames,seed,tokens",
     [
@@ -28,14 +68,16 @@ pytestmark = pytest.mark.unit
         (362, 23, 1000),
     ],
 )
-def test_native_draws_and_canonical_shards(frames, seed, tokens):
-    size = DenoiserSize(frames, tokens)
+def test_native_draws_and_canonical_shards(
+    config, canvas, order, frames, seed, tokens
+):
+    size = DenoiserSize(frames, canvas, tokens, 0)
     ranks = (7, 3, 5, 1, 6, 2, 4, 0)
     outputs = {"video": [], "audio": []}
     noise = None
     for rank in ranks:
         with torch.device("meta"):
-            model = Denoiser(TransformerConfig(), DiffusionConfig())
+            model = Denoiser(config)
         mesh = DeviceMesh(ranks=ranks, shape=(8,), axes=("tokens",), rank=rank)
         parallelize_(
             model.transformer,
@@ -67,20 +109,7 @@ def test_native_draws_and_canonical_shards(frames, seed, tokens):
                 torch.testing.assert_close(
                     noise["audio"][0], audio, rtol=0, atol=0
                 )
-                # Canonical rows visit 4x4x4 tiles and valid positions within
-                # each tile in temporal, height, width order. Patch channels
-                # retain native channel, patch-height, patch-width order.
-                patches = video.reshape(
-                    24, video.shape[2], 24, 2, 42, 2
-                ).permute(1, 2, 4, 0, 3, 5)
-                expected_video = torch.cat(
-                    [
-                        patches[t : t + 4, h : h + 4, w : w + 4].reshape(-1, 96)
-                        for t in range(0, video.shape[2], 4)
-                        for h in range(0, 24, 4)
-                        for w in range(0, 42, 4)
-                    ]
-                )
+                expected_video = order(video[0])
             buffers = model.state_buffers(size)
             with TensorBuffers.allocate(buffers, device="cpu") as state_owner:
                 state = {
@@ -111,5 +140,11 @@ def test_native_draws_and_canonical_shards(frames, seed, tokens):
     torch.testing.assert_close(
         torch.cat(outputs["audio"]), audio, rtol=0, atol=0
     )
-    torch.testing.assert_close(noise["video"][0], video, rtol=0, atol=0)
-    torch.testing.assert_close(noise["audio"][0], audio, rtol=0, atol=0)
+
+
+def test_dmd_export_generates_only_its_canvas():
+    with torch.device("meta"):
+        model = Denoiser(dmd_denoiser())
+    model.make_size(124, 64, canvas=WIDE, condition_rows=0)
+    with pytest.raises(ValueError, match="generates only"):
+        model.make_size(124, 64, canvas=TALL, condition_rows=0)

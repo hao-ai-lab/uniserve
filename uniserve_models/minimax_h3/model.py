@@ -17,23 +17,54 @@ from .output import VideoPostprocessor
 
 
 class Model(nn.Module):
-    """Compose shared numerical capabilities without retaining execution owners."""  # noqa: E501
+    """Compose shared numerical capabilities without retaining execution owners.
+
+    Each DiT partition the checkpoint holds is its own denoising component:
+    ``denoiser`` (the ``transformer`` partition) and ``reference_denoiser``
+    (``transformer_ref``); a deployment places one of them. The video
+    decoder reconstructs the latent order those denoisers publish, so a
+    checkpoint's denoisers must share one attention kind.
+    """
+
+    denoiser: Denoiser | None
+    reference_denoiser: Denoiser | None
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
         self.text_encoder = TextEncoder(config.text_encoder)
-        self.denoiser = Denoiser(config.denoiser, config.diffusion)
-        self.video_decoder = VideoDecoder(
-            config.video_decoder, frame_size=config.output.frame_size
-        )
+        for name in ("denoiser", "reference_denoiser"):
+            denoiser = config.denoisers.get(name)
+            setattr(
+                self, name, None if denoiser is None else Denoiser(denoiser)
+            )
+        kinds = {
+            type(denoiser.attention) for denoiser in config.denoisers.values()
+        }
+        if len(kinds) != 1:
+            raise ValueError(
+                "an H3 checkpoint's denoisers must share one attention kind"
+            )
+        attention = next(iter(config.denoisers.values())).attention
+        self.video_decoder = VideoDecoder(config.video_vae, attention=attention)
         self.audio_decoder = AudioDecoder(
-            config.audio_decoder, sample_rate=config.output.sample_rate
+            config.audio_vae, sample_rate=config.output.sample_rate
         )
         self.video_postprocessor = VideoPostprocessor(
-            frame_size=config.output.frame_size,
-            frame_rate=config.output.frame_rate,
+            frame_rate=config.output.frame_rate
         )
+
+
+def _denoiser_entry(name: str) -> ComponentEntry:
+    # The conditioner runs on the first pipeline stage only, the stage whose
+    # ``Denoiser.forward`` writes refined text into the packed token rows.
+    return ComponentEntry(
+        name,
+        (
+            EntryPoint("conditioner.encode", stage="first", groups=("tp",)),
+            EntryPoint("forward", groups=("tp", "sp", "pp", "cp", "ulysses")),
+        ),
+    )
 
 
 # IPC component names select methods on independently placeable numerical
@@ -45,20 +76,7 @@ def entry_points(config: Config) -> Mapping[str, ComponentEntry]:
             "text_encoder": ComponentEntry(
                 "text_encoder", (EntryPoint("encode", groups=("tp",)),)
             ),
-            # The conditioner runs on the first pipeline stage only, the stage
-            # whose ``Denoiser.forward`` scatters refined text into the packed
-            # token rows.
-            "denoiser": ComponentEntry(
-                "denoiser",
-                (
-                    EntryPoint(
-                        "conditioner.encode", stage="first", groups=("tp",)
-                    ),
-                    EntryPoint(
-                        "forward", groups=("tp", "sp", "pp", "cp", "ulysses")
-                    ),
-                ),
-            ),
+            **{name: _denoiser_entry(name) for name in config.denoisers},
             # The rank that reconstructs a media unit also converts it to RGB,
             # so the decoder and its post-processor are one component. The
             # entry owns two sibling modules, which the empty component path

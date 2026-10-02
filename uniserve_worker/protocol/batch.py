@@ -27,6 +27,7 @@ from enum import StrEnum
 from typing import TypeAlias
 
 from uniserve import sampling
+from uniserve.media import image
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import call, identity, tensor, transfer
 from uniserve_worker.protocol.validation import (
@@ -272,13 +273,27 @@ class DiffusionParams:
     num_inference_steps: int
     # Deterministic noise seed; nonnegative.
     seed: int
+    # Output raster in pixels: the request's canvas.
+    width: int
+    height: int
 
     def __post_init__(self) -> None:
         """Require positive work bounds and a nonnegative deterministic seed."""
-        for name in ("num_frames", "video_units", "num_inference_steps"):
+        for name in (
+            "num_frames",
+            "video_units",
+            "num_inference_steps",
+            "width",
+            "height",
+        ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"diffusion {name} must be positive")
         _nonnegative(self.seed, "diffusion seed")
+
+    @property
+    def canvas(self) -> image.Config:
+        """The request's output raster."""
+        return image.Config(self.height, self.width)
 
     @classmethod
     def from_mapping(
@@ -293,6 +308,8 @@ class DiffusionParams:
                 data.get("num_inference_steps"), f"{where}.num_inference_steps"
             ),
             seed=_uint(data.get("seed"), f"{where}.seed"),
+            width=_uint(data.get("width"), f"{where}.width"),
+            height=_uint(data.get("height"), f"{where}.height"),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -302,6 +319,8 @@ class DiffusionParams:
             "video_units": self.video_units,
             "num_inference_steps": self.num_inference_steps,
             "seed": self.seed,
+            "width": self.width,
+            "height": self.height,
         }
 
 

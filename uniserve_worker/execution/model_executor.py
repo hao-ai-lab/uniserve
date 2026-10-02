@@ -41,6 +41,7 @@ import torch
 from torch import nn
 
 from uniserve.distributed import Communicator, DeviceMesh
+from uniserve.media import video
 from uniserve.model import (
     AudioDecoder,
     CausalLM,
@@ -973,6 +974,7 @@ class ModelExecutor:
             return None
 
         frames = None if media is None else media.num_frames
+        canvas = None if media is None else media.canvas
         results: tuple[tuple[nn.Module | None, str, OutputLayout], ...] = tuple(
             (call.module, name, layout)
             for call in self._declarations[entry]
@@ -982,6 +984,7 @@ class ModelExecutor:
                 builder=self.media_builder,
                 clock=self.video_postprocessor,
                 frames=frames,
+                canvas=canvas,
                 prompt_tokens=num_prompt_tokens,
             ).items()
         )
@@ -989,19 +992,25 @@ class ModelExecutor:
             # The video codec owns no numerical method; its product is the
             # encoded rows of the media units it is handed.
             from uniserve_worker.model_executor.resources import (
+                bounding_layout,
                 encoded_units_layout,
             )
 
-            count = (
-                self.media_builder.maximum.num_frames
-                if frames is None
-                else frames
+            sizes = (
+                self.media_builder.video_sizes()
+                if media is None
+                else (video.Config(media.num_frames, media.canvas),)
             )
             results = (
                 (
                     None,
                     "encoded_units",
-                    encoded_units_layout(self.video_decoder, count),
+                    bounding_layout(
+                        tuple(
+                            encoded_units_layout(self.video_decoder, size)
+                            for size in sizes
+                        )
+                    ),
                 ),
             )
         module, name, layout = results[output_index]

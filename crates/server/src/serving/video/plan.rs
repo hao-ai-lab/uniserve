@@ -32,6 +32,7 @@ use std::path::Path;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
+use uniserve_core::{Canvas, VideoTask};
 
 use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
 use super::{RequestField, VideoInputError};
@@ -85,29 +86,6 @@ pub const MAX_AUDIO_REFERENCES: usize = 3;
 /// References of all types one request may carry; keyframes not counted.
 pub const MAX_REFERENCES: usize = 12;
 
-/// A MiniMax-H3 task, by its request name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VideoTask {
-    /// Text to video and audio.
-    T2va,
-    /// First and/or last keyframe to video and audio.
-    Fl2va,
-    /// Image, video and audio references to video and audio.
-    Ref2va,
-}
-
-impl VideoTask {
-    /// The task's request name.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::T2va => "t2va",
-            Self::Fl2va => "fl2va",
-            Self::Ref2va => "ref2va",
-        }
-    }
-}
-
 /// The media type of a condition, by its request name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,20 +120,9 @@ pub enum FramePosition {
     Last,
 }
 
-/// A frame size in pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub struct Canvas {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-}
-
-impl Canvas {
-    /// Denoiser rows of one latent frame: one per 32x32 pixel block.
-    pub const fn rows_per_frame(self) -> u32 {
-        (self.width / CANVAS_MULTIPLE) * (self.height / CANVAS_MULTIPLE)
-    }
+/// Denoiser rows of one latent frame of `canvas`: one per 32x32 pixel block.
+pub const fn rows_per_frame(canvas: Canvas) -> u32 {
+    (canvas.width / CANVAS_MULTIPLE) * (canvas.height / CANVAS_MULTIPLE)
 }
 
 /// Resolves a display aspect into a canvas with the adapt_shape_v1 rule.
@@ -260,8 +227,8 @@ pub struct VisionGrid {
 ///
 /// Read from the checkpoint's `processor/preprocessor_config.json` and
 /// `processor/video_preprocessor_config.json` with
-/// [`VisionConfig::from_processor_dir`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// [`VisionConfig::read`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisionConfig {
     /// Pixels per patch side.
     pub patch_size: u32,
@@ -294,22 +261,22 @@ struct ProcessorSize {
 }
 
 impl VisionConfig {
-    /// Reads the image and video processor configs of a checkpoint's
-    /// `processor` directory.
+    /// Reads a checkpoint's image processor config
+    /// (`processor/preprocessor_config.json`) and video processor config
+    /// (`processor/video_preprocessor_config.json`).
     ///
     /// # Errors
     ///
     /// Fails when a file cannot be read or parsed, or when the two configs
     /// disagree on the patch geometry.
-    pub fn from_processor_dir(directory: &Path) -> anyhow::Result<Self> {
-        let read = |name: &str| -> anyhow::Result<ProcessorFile> {
-            let path = directory.join(name);
-            let text = std::fs::read_to_string(&path)
+    pub fn read(image: &Path, video: &Path) -> anyhow::Result<Self> {
+        let read = |path: &Path| -> anyhow::Result<ProcessorFile> {
+            let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
         };
-        let image = read("preprocessor_config.json")?;
-        let video = read("video_preprocessor_config.json")?;
+        let image = read(image)?;
+        let video = read(video)?;
         anyhow::ensure!(
             (
                 image.patch_size,
@@ -580,6 +547,9 @@ pub struct RequestPlan {
     pub task: VideoTask,
     /// The generated canvas.
     pub canvas: Canvas,
+    /// The requested duration in seconds: `target.duration_seconds`, or the
+    /// soundtrack's length after its start offset when that sets it.
+    pub duration_seconds: f64,
     /// Generated frames, of the form `17n + 5`.
     pub num_frames: u32,
     /// Generated video latent frames.
@@ -593,7 +563,7 @@ pub struct RequestPlan {
 impl RequestPlan {
     /// Denoiser rows of the generated video.
     pub fn target_video_rows(&self) -> u32 {
-        self.latent_frames * self.canvas.rows_per_frame()
+        self.latent_frames * rows_per_frame(self.canvas)
     }
 
     /// Denoiser rows of the generated stereo audio.
@@ -1112,9 +1082,10 @@ fn resolve_frames(
     target: &Target<'_>,
     soundtracks: &[(usize, &AudioFacts, f64)],
     limits: &PlanLimits,
-) -> Result<u32, VideoInputError> {
+) -> Result<(f64, u32), VideoInputError> {
     if let Some(seconds) = target.duration_seconds {
         return video_frame_count(seconds, limits.max_video_seconds)
+            .map(|frames| (seconds, frames))
             .map_err(|error| VideoInputError::invalid(RequestField::TargetDuration, error));
     }
     let [(index, track, start_seconds)] = soundtracks else {
@@ -1135,12 +1106,14 @@ fn resolve_frames(
         ));
     }
     let seconds = (track.samples - start_sample) as f64 / rate;
-    video_frame_count(seconds, limits.max_video_seconds).map_err(|error| {
-        VideoInputError::condition(
-            *index,
-            format!("the audio track sets the duration, but {error}"),
-        )
-    })
+    video_frame_count(seconds, limits.max_video_seconds)
+        .map(|frames| (seconds, frames))
+        .map_err(|error| {
+            VideoInputError::condition(
+                *index,
+                format!("the audio track sets the duration, but {error}"),
+            )
+        })
 }
 
 /// The generated canvas: from the ratio, or from the first keyframe.
@@ -1204,7 +1177,7 @@ fn plan_keyframe(
             cover_crop: crop,
         }),
         vision: seen,
-        video_rows: size.rows_per_frame(),
+        video_rows: rows_per_frame(size),
         audio_rows: 0,
     })
 }
@@ -1237,7 +1210,7 @@ fn plan_reference(
             Ok(plan(
                 Prepared::Image(size),
                 Some(seen),
-                size.rows_per_frame(),
+                rows_per_frame(size),
                 0,
             ))
         }
@@ -1249,7 +1222,7 @@ fn plan_reference(
             let start = condition.start_seconds.unwrap_or(0.0);
             let (clip, seen) = video_reference(video, start, frames, vision).map_err(reject)?;
             let audio_rows = clip.soundtrack.map_or(0, |track| track.rows());
-            let video_rows = clip.latent_frames * clip.canvas.rows_per_frame();
+            let video_rows = clip.latent_frames * rows_per_frame(clip.canvas);
             Ok(plan(
                 Prepared::Video(clip),
                 Some(Vision::Video(seen)),
@@ -1294,7 +1267,7 @@ pub fn plan_request(
             soundtracks.push((index, track, condition.start_seconds.unwrap_or(0.0)));
         }
     }
-    let frames = resolve_frames(target, &soundtracks, limits)?;
+    let (duration_seconds, frames) = resolve_frames(target, &soundtracks, limits)?;
 
     let size = target_canvas(task, target, media)?;
     check_served(size, limits)?;
@@ -1322,6 +1295,7 @@ pub fn plan_request(
     Ok(RequestPlan {
         task,
         canvas: size,
+        duration_seconds,
         num_frames: frames,
         latent_frames: latent_frames(frames),
         audio_latents: audio_latents(frames),
@@ -1339,7 +1313,7 @@ pub(super) mod tests {
     use super::{
         AudioClip, Canvas, ConditionPlan, ConditionRole, ConditionSpec, ConditionType, PlanLimits,
         Prepared, RequestPlan, Target, VideoTask, Vision, VisionConfig, audio_clip, canvas,
-        cover_crop, plan_request, reference_image_size, video_reference,
+        cover_crop, plan_request, reference_image_size, rows_per_frame, video_reference,
     };
 
     /// The shared planning vectors, generated from the diffusers reference.
@@ -1605,7 +1579,7 @@ pub(super) mod tests {
                 case["vision_tokens"],
                 "{case}"
             );
-            assert_eq!(u64::from(resized.rows_per_frame()), case["rows"], "{case}");
+            assert_eq!(u64::from(rows_per_frame(resized)), case["rows"], "{case}");
         }
     }
 
@@ -1657,7 +1631,7 @@ pub(super) mod tests {
                 case["vision_grid"]
             );
             assert_eq!(u64::from(seen.block_tokens), case["block_tokens"], "{case}");
-            let rows = clip.latent_frames * clip.canvas.rows_per_frame();
+            let rows = clip.latent_frames * rows_per_frame(clip.canvas);
             assert_eq!(u64::from(rows), case["rows"], "{case}");
         }
     }

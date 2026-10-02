@@ -195,6 +195,22 @@ table ComponentInfo {
   outputs:[OutputInfo];
 }
 
+/// A video raster in pixels.
+struct Canvas { width:uint; height:uint; }
+
+/// What a deployment's video denoiser serves: its tasks, its fixed schedule
+/// (sigma points including the clean endpoint, and the per-modality shifts)
+/// and the canvases and packed rows it accepts. An empty canvas list is the
+/// model's canvas rule; an absent capacity is unbounded by the checkpoint.
+table VideoDenoiserInfo {
+  tasks:[string];
+  schedule_points:uint;
+  video_shift:double;
+  audio_shift:double;
+  canvases:[Canvas];
+  max_sequence_rows:uint = null;
+}
+
 /// Binds a media call to the component that runs it; the decoder rejects a
 /// call bound twice.
 table MediaComponent { call:MediaCall; component:string; }
@@ -236,6 +252,7 @@ table WorkerInfo {
   /// stub model; the engine refuses ranks or pools that report different
   /// values.
   checkpoint_identity:string;
+  video_denoiser:VideoDenoiserInfo;
 }
 
 // Request identities and call records.
@@ -482,6 +499,9 @@ table DiffusionSamplingParams {
   video_units:uint;
   num_inference_steps:uint;
   seed:ulong;
+  /// Output raster in pixels: the request's canvas.
+  width:uint;
+  height:uint;
 }
 
 table NewRequest {

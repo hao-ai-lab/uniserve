@@ -166,6 +166,9 @@ fn video_request(id: u64, video_units: u32) -> Request {
             video_units,
             num_inference_steps: STEPS,
             seed: id,
+            // The fixture decoder's raster (`video_worker`).
+            width: 24,
+            height: 16,
         },
     })
 }
@@ -295,6 +298,8 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
                 video_units: 32,
                 num_inference_steps: STEPS,
                 seed: 1,
+                width: 24,
+                height: 16,
             },
         }))
         .unwrap();

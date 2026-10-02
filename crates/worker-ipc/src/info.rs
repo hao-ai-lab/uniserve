@@ -183,6 +183,59 @@ impl WorkerEndpoint {
 /// no checkpoint identity because it loads no checkpoint.
 const STUB_MODEL_PREFIX: &str = "uniserve_models.stub";
 
+/// What the video denoiser a deployment places serves.
+///
+/// The denoiser fixes its schedule, so requests may only restate it; the
+/// tasks, canvases and sequence capacity bound what admission accepts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoDenoiserInfo {
+    /// Task names the denoiser serves, in canonical order.
+    pub tasks: Vec<String>,
+    /// Sigma points of the fixed schedule, the clean endpoint included: one
+    /// more than the network evaluations (`WorkerInfo::num_inference_steps`).
+    pub schedule_points: u32,
+    /// Shift of the video schedule.
+    pub video_shift: f64,
+    /// Shift of the audio schedule.
+    pub audio_shift: f64,
+    /// The only canvases the denoiser generates; empty when it generates
+    /// every canvas of the model's canvas rule.
+    #[serde(default)]
+    pub canvases: Vec<uniserve_core::Canvas>,
+    /// The checkpoint's packed sequence capacity in rows, when it has one.
+    #[serde(default)]
+    pub max_sequence_rows: Option<u32>,
+}
+
+impl VideoDenoiserInfo {
+    /// Checks that tasks are named once each, the schedule has an endpoint
+    /// and positive finite shifts, and every canvas and the capacity are
+    /// positive.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            !self.tasks.is_empty()
+                && self.tasks.iter().all(|task| !task.is_empty())
+                && self.tasks.iter().collect::<HashSet<_>>().len() == self.tasks.len(),
+            "a video denoiser names each of its tasks once"
+        );
+        ensure_valid!(
+            self.schedule_points >= 2
+                && [self.video_shift, self.audio_shift]
+                    .iter()
+                    .all(|shift| shift.is_finite() && *shift > 0.0),
+            "a video denoiser schedule needs points and positive shifts"
+        );
+        ensure_valid!(
+            self.canvases
+                .iter()
+                .all(|canvas| canvas.width > 0 && canvas.height > 0)
+                && self.max_sequence_rows != Some(0),
+            "a video denoiser declares an empty canvas or sequence capacity"
+        );
+        Ok(())
+    }
+}
+
 /// Post-load worker geometry, limits, supported work, and model identity.
 ///
 /// [`WorkerInfo::validate`] checks only internal consistency. The engine's
@@ -198,6 +251,9 @@ pub struct WorkerInfo {
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
     /// Effective number of diffusion predictions advertised by the loaded model.
     pub num_inference_steps: u32,
+    /// What the deployment's video denoiser serves, when the model has one.
+    #[serde(default)]
+    pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
     /// Rank-local primary compute device used to bind physical transfer edges.
@@ -392,6 +448,13 @@ impl WorkerInfo {
             }),
             "a media call names no component this worker serves"
         );
+        if let Some(video) = &self.video_denoiser {
+            video.validate()?;
+            ensure_valid!(
+                video.schedule_points == self.num_inference_steps + 1,
+                "a video denoiser's schedule points disagree with its evaluations"
+            );
+        }
         ensure_valid!(
             self.max_batch_calls > 0
                 && self.max_batch_tokens > 0
@@ -454,6 +517,7 @@ impl Default for WorkerInfo {
             model_name: "model".to_owned(),
             media_components: Default::default(),
             num_inference_steps: 0,
+            video_denoiser: None,
             fabric_handles: false,
             endpoint: WorkerEndpoint {
                 worker_id: "worker".into(),

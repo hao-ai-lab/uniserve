@@ -34,17 +34,21 @@
 pub mod plan;
 pub mod presentation;
 pub mod probe;
+pub mod service;
 pub mod sources;
+
+pub use service::{PreparedVideo, VideoService};
 
 use std::fmt;
 
 use crate::openai::ApiError;
 use crate::profile::tokenizer::DynTokenizer;
 
-use plan::{ConditionSpec, PlanLimits, RequestPlan, Target, VideoTask, VisionConfig};
+use plan::{ConditionSpec, PlanLimits, RequestPlan, Target, VisionConfig};
 use presentation::Presentation;
 use probe::MediaProber;
 use sources::{FetchedMedia, MediaFetcher};
+use uniserve_core::VideoTask;
 
 /// The request field a rejection names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,13 +283,14 @@ mod tests {
     use image::ImageEncoder as _;
 
     use super::plan::tests::{fixture, limits, vision};
-    use super::plan::{ConditionRole, ConditionSpec, ConditionType, Prepared, Target, VideoTask};
+    use super::plan::{ConditionRole, ConditionSpec, ConditionType, Prepared, Target};
     use super::presentation::tests::character_tokenizer;
     use super::presentation::{TEXT_TAG, VIDEO_TAG};
     use super::probe::{MediaProber, ProbeConfig};
     use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
     use super::{ConditionInput, RequestField, VideoIngest, VideoInputError, VideoRequestInput};
     use crate::openai::ApiError;
+    use uniserve_core::VideoTask;
 
     fn ingest(scratch: &std::path::Path) -> VideoIngest {
         let fetcher = MediaFetcher::new(MediaPolicy {

@@ -1,12 +1,19 @@
-"""H3's learned Q/K normalization, partial RoPE and sparse tile compression.
+"""H3's learned Q/K normalization, partial RoPE and attention kinds.
 
-``Attention`` owns the per-layer head projections and output projection and
-delegates the attention itself to ``uniserve.nn.attention.vsa``: text and
-audio query tiles attend every valid key tile, video query tiles attend the
-dense text/audio prefix plus a selected subset of video key tiles, and VSA
-adds a gated attention over mean-pooled tiles to that fine result. All token
-counts here are rows of the complete packing built by
-``packing.build_packing``.
+Every H3 layer projects its normalized rows to 56 heads of 128 channels,
+normalizes each query and key head with a learned RMSNorm, rotates the
+leading 96 channels of each head with neox RoPE over the (time, height,
+width) coordinates (16 frequencies per axis; the trailing 32 channels stay
+unrotated), attends, and projects back. The attention itself is one of:
+
+* ``Dense``: full bidirectional attention over the packed sequence
+  (``packing.DensePacking``); under Ulysses each rank exchanges its token
+  shard for a head shard of the whole sequence.
+* ``Sparse``: video sparse attention (``uniserve.nn.attention.vsa``) over
+  the tile packing (``packing.TilePacking``): text and audio query tiles
+  attend every valid key tile, video query tiles attend the dense prefix
+  plus a selected subset of video key tiles, and a gated attention over
+  mean-pooled tiles is added to that fine result.
 """
 
 from __future__ import annotations
@@ -24,26 +31,111 @@ from uniserve.nn import (
     MergedColumnParallelLinear,
     RMSNorm,
     RowParallelLinear,
+    functional,
 )
-from uniserve.nn.attention import vsa
+from uniserve.nn.attention import Attention, vsa
 from uniserve.tensors import BufferConfig
 
 from .config import TransformerConfig
-from .inputs import AttentionInput
+from .inputs import AttentionInput, SequenceInput
 
 
-class Attention(nn.Module):
-    """Compose head projections and VSA over the complete visible key domain.
+class Dense(nn.Module):
+    """Project heads, normalize and rotate Q/K, and attend every used row.
 
-    The merged projection produces four branches: query, key, value, and
-    ``gate``, which weights VSA's compressed-tile attention elementwise before
-    it is added to the selected fine attention.
+    The Q/K/V projections keep every head for this rank's token rows; the
+    attention layer's Ulysses exchange trades the token shard for a head
+    shard of the whole sequence and back.
     """
 
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.head_dim = config.head_dim
-        self.sparsity = config.vsa_sparsity
+        # Rotated channels of each head: two halves of three axes' frequencies.
+        self.rotary_width = 6 * config.rope_frequency_dim
+        inner = config.num_attention_heads * config.head_dim
+        self.projection = MergedColumnParallelLinear(
+            config.hidden_size,
+            dict.fromkeys(("q", "k", "v"), inner),
+            bias=False,
+        )
+        self.output = RowParallelLinear(inner, config.hidden_size, bias=False)
+        self.query_norm = RMSNorm(config.head_dim, config.qk_norm_eps)
+        self.key_norm = RMSNorm(config.head_dim, config.qk_norm_eps)
+        self.attention = Attention(
+            config.num_attention_heads,
+            config.num_attention_heads,
+            config.head_dim,
+        )
+
+    def workspace_buffers(
+        self, num_tokens: int, num_query_tokens: int, *, dtype: torch.dtype
+    ) -> Mapping[str, BufferConfig]:
+        """Dense attention borrows no scratch beyond its layer outputs."""
+        return {}
+
+    @torch.inference_mode()
+    def forward_chunks(
+        self,
+        hidden: torch.Tensor | Iterator[tuple[slice, torch.Tensor]],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        inputs: SequenceInput,
+        *,
+        workspace: Mapping[str, torch.Tensor],
+    ) -> Iterator[tuple[slice, torch.Tensor]]:
+        """Attend this rank's token shard and yield its projected output.
+
+        ``hidden`` is the normalized shard, whole or as ``(global row slice,
+        rows)`` chunks in row order. ``cos`` and ``sin`` hold the compact
+        rotary factors ``[shard rows, rotary_width / 2]`` of the shard's
+        rows. Yields one chunk covering the shard.
+        """
+        if not isinstance(hidden, torch.Tensor):
+            chunks = tuple(value for _, value in hidden)
+            hidden = chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+        values = self.projection(hidden)
+        q, k, v = (
+            values[name].view(
+                -1, values[name].shape[-1] // self.head_dim, self.head_dim
+            )
+            for name in ("q", "k", "v")
+        )
+        # One RMS domain spans each whole head; the leading axis rotates its
+        # 96 channels split-half and the trailing 32 channels pass through.
+        unrotated = cos[..., :0]
+        q, k = functional.qk_norm_rope(
+            q,
+            k,
+            (self.query_norm.weight,),
+            (self.key_norm.weight,),
+            (cos, unrotated),
+            (sin, unrotated),
+            eps=self.query_norm.eps,
+            axis_dims=(self.rotary_width, self.head_dim - self.rotary_width),
+        )
+        attended = self.attention(q, k, v.contiguous(), inputs.visible)
+        yield inputs.token_slice, self.output(attended.flatten(1))
+
+    def forward(self, hidden, cos, sin, inputs, *, workspace):
+        return next(
+            self.forward_chunks(hidden, cos, sin, inputs, workspace=workspace)
+        )[1]
+
+
+class Sparse(nn.Module):
+    """Compose head projections and VSA over the complete visible key domain.
+
+    The merged projection produces four branches: query, key, value, and
+    ``gate``, which weights VSA's compressed-tile attention elementwise before
+    it is added to the selected fine attention. ``sparsity`` is the fraction
+    of video key tiles each video query tile drops.
+    """
+
+    def __init__(self, config: TransformerConfig, *, sparsity: float):
+        super().__init__()
+        self.head_dim = config.head_dim
+        self.sparsity = sparsity
         inner = config.num_attention_heads * config.head_dim
         self.projection = MergedColumnParallelLinear(
             config.hidden_size,

@@ -1,10 +1,11 @@
 """H3 latent unpacking for the video and audio decoders.
 
 The denoiser publishes each modality's final latent in its packed order:
-video rows tile-major, as ``packing.build_packing`` lays them out, and audio
-rows channel-major, all frames of the first stereo channel before the
-second. The decoders here convert a window of that latent into the native
-VAE input layout.
+video rows in raster order under dense attention and tile-major under sparse
+attention (``packing.video_order``), and audio rows channel-major, all frames
+of the first stereo channel before the second. The decoders here convert a
+window of that latent into the native VAE input layout at the request's
+canvas.
 """
 
 from __future__ import annotations
@@ -14,39 +15,43 @@ from collections.abc import Mapping
 
 import torch
 
-from uniserve.media import image
+from uniserve.media import video
 from uniserve.model import AudioDecoder as BaseAudioDecoder
 from uniserve.model import VideoDecoder as BaseVideoDecoder
 from uniserve.tensors import BufferConfig, OutputLayout
 
 from . import audio_vae, video_vae
+from .config import Attention
 from .output import frame_slices
 from .packing import (
     FPS,
     audio_latent_frames,
-    build_packing,
+    latent_raster,
     unpatchify_video_into,
     video_latent_frames,
+    video_order,
 )
 
 
 class VideoDecoder(BaseVideoDecoder):
-    """Unpack tile-major H3 video latents into each native seven-frame VAE window."""  # noqa: E501
+    """Unpack packed H3 video latents into each native seven-frame VAE window.
 
-    def __init__(self, config: video_vae.Config, *, frame_size: image.Config):
-        super().__init__(
-            video_vae.Model(config, frame_size=frame_size),
-            frame_size=frame_size,
-        )
+    ``attention`` is the attention kind of the denoisers whose latents this
+    decoder reconstructs; it fixes their packed video row order.
+    """
+
+    def __init__(self, config: video_vae.Config, *, attention: Attention):
+        super().__init__(video_vae.Model(config))
         self.config = config
+        self.attention = attention
 
     def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
         return frame_slices(num_frames)
 
-    def output_layout(self, num_frames: int) -> Mapping[str, OutputLayout]:
-        units = len(self.frame_slices(num_frames))
+    def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
+        units = len(self.frame_slices(size.num_frames))
         # Each unit decodes one native 25-frame RGB window at the output raster.
-        shape = (units, 1, 3, 25, self.frame_size.height, self.frame_size.width)
+        shape = (units, 1, 3, 25, size.frame.height, size.frame.width)
         return {
             "video": OutputLayout(
                 shape,
@@ -56,10 +61,11 @@ class VideoDecoder(BaseVideoDecoder):
             )
         }
 
-    def workspace_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
-        self.frame_slices(num_frames)
-        height = self.frame_size.height // self.config.spatial_compression
-        width = self.frame_size.width // self.config.spatial_compression
+    def workspace_buffers(
+        self, size: video.Config
+    ) -> Mapping[str, BufferConfig]:
+        self.frame_slices(size.num_frames)
+        height, width = latent_raster(size.frame)
         channels = self.config.latent_channels
         # One seven-latent-frame window: the NCTHW decoder input and the
         # raster patch rows gathered for it.
@@ -72,14 +78,15 @@ class VideoDecoder(BaseVideoDecoder):
             ),
         }
 
-    def constant_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
-        self.frame_slices(num_frames)
-        height = self.frame_size.height // self.config.spatial_compression
-        width = self.frame_size.width // self.config.spatial_compression
+    def constant_buffers(
+        self, size: video.Config
+    ) -> Mapping[str, BufferConfig]:
+        self.frame_slices(size.num_frames)
+        height, width = latent_raster(size.frame)
         return {
             "video_raster_order": BufferConfig(
                 (
-                    video_latent_frames(num_frames)
+                    video_latent_frames(size.num_frames)
                     * (height // 2)
                     * (width // 2),
                 ),
@@ -89,9 +96,9 @@ class VideoDecoder(BaseVideoDecoder):
 
     @torch.inference_mode()
     def prepare_constants(
-        self, num_frames: int, *, out: Mapping[str, torch.Tensor]
+        self, size: video.Config, *, out: Mapping[str, torch.Tensor]
     ) -> None:
-        configs = self.constant_buffers(num_frames)
+        configs = self.constant_buffers(size)
         if out.keys() != configs.keys():
             raise ValueError("video decoding requires its raster-order indices")
         target, config = (
@@ -102,20 +109,19 @@ class VideoDecoder(BaseVideoDecoder):
             raise ValueError(
                 "video raster-order indices have incompatible shape or dtype"
             )
-        # The video tile order does not depend on the prompt, so any text
-        # length yields the same permutation. The argsort maps each raster
-        # row to its position among the packed video rows.
-        packed = build_packing(
-            num_text_tokens=64,
-            num_frames=num_frames,
-            height=self.frame_size.height,
-            width=self.frame_size.width,
+        # The argsort maps each raster row to its position among the packed
+        # video rows.
+        target.copy_(
+            torch.argsort(
+                video_order(
+                    self.attention,
+                    num_frames=size.num_frames,
+                    canvas=size.frame,
+                )
+            )
         )
-        target.copy_(torch.argsort(packed.video_raster_indices))
 
-    def unpack_latents(
-        self, latent, frames, num_frames, *, constants, workspace
-    ):
+    def unpack_latents(self, latent, frames, size, *, constants, workspace):
         target, tokens = (
             workspace["video_input"],
             workspace["reconstruction_tokens"],
@@ -123,7 +129,7 @@ class VideoDecoder(BaseVideoDecoder):
         height, width = target.shape[-2:]
         tokens_per_frame = (height // 2) * (width // 2)
         shape = (
-            video_latent_frames(num_frames) * tokens_per_frame,
+            video_latent_frames(size.num_frames) * tokens_per_frame,
             self.config.latent_channels * 4,
         )
         if latent.shape != shape:

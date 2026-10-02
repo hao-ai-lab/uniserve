@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from uniserve.media import video
 from uniserve.model import AudioDecoder, VideoDecoder, VideoPostprocessor
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.tensors import TensorOutput, concatenate_views
@@ -85,7 +86,7 @@ def video_shape(runner: ModelExecutor, media: DiffusionParams, tokens: int):
         )
 
     try:
-        size = builder.size(media.num_frames, tokens)
+        size = builder.size(media.num_frames, tokens, media.canvas)
         windows = decoder.frame_slices(size.num_frames)
     except ValueError as error:
         raise invalid_descriptor(str(error)) from error
@@ -260,17 +261,18 @@ def prepare_call(
         # A decode round also converts its media unit to RGB, cross-faded with
         # the neighbouring unit's tail held in the request's overlap state.
         postprocessor = runner.video_postprocessor
+        output = video.Config(size.num_frames, size.canvas)
         if "video_overlap" not in slot.tensors:
             if storage is None:
                 raise RuntimeError(
                     "video reconstruction requires reserved overlap storage"
                 )
             slot.tensors["video_overlap"] = storage.view(
-                postprocessor.state_buffers(size.num_frames)
+                postprocessor.state_buffers(output)
             )
-        runner.prepare_module(call.component, size.num_frames, method="forward")
+        runner.prepare_module(call.component, output, method="forward")
         return slot.tensors["video_overlap"], runner.prepare_module(
-            call.component, size.num_frames, method="decode"
+            call.component, output, method="decode"
         ).context
 
     if kind is MediaCall.AUDIO_DECODING:
@@ -354,7 +356,8 @@ def prepare_denoising(
             # placeholder's inputs staged.
             size = builder.size(
                 layout.num_frames,
-                min(layout.num_text_tokens, builder.maximum.num_text_tokens),
+                min(layout.num_text_tokens, builder.max_text_tokens),
+                layout.canvas,
             )
             views = storage[0].view(builder.buffers(size))
             samples = builder.sample_views(size, diffusion.samples)
@@ -395,10 +398,11 @@ def prepare_denoising(
         resident = sum(runner.graph_storage.pool_bytes().values())
         finished = time.perf_counter()
         logger.info(
-            "prepared %d denoiser layouts (%d frame counts x %d text "
-            "capacities, %d step graphs) in %.1f s (contexts %.1f s, warm "
-            "steps %.1f s, capture %.1f s); graph storage %.2f GiB",
+            "prepared %d denoiser layouts (%d canvases x %d frame counts x "
+            "%d text capacities, %d step graphs) in %.1f s (contexts %.1f s, "
+            "warm steps %.1f s, capture %.1f s); graph storage %.2f GiB",
             len(layouts),
+            len(builder.canvases),
             len(builder.frame_counts),
             len(builder.text_capacities),
             len(layouts) if diffusion.captures else 0,
@@ -411,7 +415,8 @@ def prepare_denoising(
     except (CUDAGraphError, torch.OutOfMemoryError) as error:
         raise RuntimeError(
             f"the denoiser's {len(builder.layouts())} capacity layouts "
-            f"({len(builder.frame_counts)} frame counts x "
+            f"({len(builder.canvases)} canvases x "
+            f"{len(builder.frame_counts)} frame counts x "
             f"{len(builder.text_capacities)} text capacities) do not fit "
             "this device: lower --max-video-seconds or --max-model-len, use "
             "fewer --video-text-capacities, raise --mem-fraction-static, or "
@@ -440,13 +445,13 @@ def decoded_units(runner: ModelExecutor, name: str, count: int) -> tuple:
 
 @torch.inference_mode()
 def warmup_decoders(runner: ModelExecutor) -> None:
-    """Prepare and capture reconstruction at every admitted duration.
+    """Prepare and capture reconstruction at every admitted size.
 
     A decoder's prepared context and captured graph follow its frame count
-    and, for video, the media unit it reconstructs, so each admitted
-    duration warms every unit this rank decodes at that duration. Every
-    duration's context is prepared before the first capture into the
-    decoder's shared graph pool (``ModelExecutor.prepare_module``).
+    (and, for video, its canvas) and the media unit it reconstructs, so each
+    admitted size warms every unit this rank decodes at that size. Every
+    size's context is prepared before the first capture into the decoder's
+    shared graph pool (``ModelExecutor.prepare_module``).
 
     Raises:
         RuntimeError: The decoders' prepared contexts and graphs do not fit
@@ -459,31 +464,49 @@ def warmup_decoders(runner: ModelExecutor) -> None:
             if method != "decode":
                 continue
             module = call.module
-            for num_frames in frames:
-                if isinstance(module, VideoDecoder):
-                    runner.prepare_module(name, num_frames, method="decode")
-                elif isinstance(module, AudioDecoder):
-                    runner.prepare_module(
-                        name,
-                        module.latent_frames(audio_samples(runner, num_frames)),
-                        method="decode",
-                    )
-            for num_frames in frames:
-                size = builder.size(num_frames, builder.maximum.num_text_tokens)
+            # The audio track does not depend on the canvas.
+            canvases = (
+                builder.canvases
+                if isinstance(module, VideoDecoder)
+                else (builder.maximum.canvas,)
+            )
+            for canvas in canvases:
+                for num_frames in frames:
+                    if isinstance(module, VideoDecoder):
+                        runner.prepare_module(
+                            name,
+                            video.Config(num_frames, canvas),
+                            method="decode",
+                        )
+                    elif isinstance(module, AudioDecoder):
+                        runner.prepare_module(
+                            name,
+                            module.latent_frames(
+                                audio_samples(runner, num_frames)
+                            ),
+                            method="decode",
+                        )
+            for canvas, num_frames in (
+                (canvas, num_frames)
+                for canvas in canvases
+                for num_frames in frames
+            ):
+                size = builder.size(num_frames, builder.max_text_tokens, canvas)
                 if isinstance(module, VideoDecoder):
                     shape = builder.denoiser.latent_shape("video", size)
                     latent = torch.zeros(
                         shape, dtype=torch.float32, device=binding.device
                     )
                     windows = module.frame_slices(num_frames)
+                    output = video.Config(num_frames, canvas)
                     for unit in decoded_units(runner, name, len(windows)):
                         runner.run_module(
                             name,
                             (latent,),
                             method="decode",
-                            size=num_frames,
+                            size=output,
                             frames=(windows[unit],),
-                            num_frames=(num_frames,),
+                            sizes=(output,),
                         )
                 elif isinstance(module, AudioDecoder):
                     shape = builder.denoiser.latent_shape("audio", size)
@@ -503,7 +526,8 @@ def warmup_decoders(runner: ModelExecutor) -> None:
                     )
     except (CUDAGraphError, torch.OutOfMemoryError) as error:
         raise RuntimeError(
-            f"the decoders at {len(frames)} admitted durations do not fit "
+            f"the decoders at {len(builder.canvases)} canvases x "
+            f"{len(frames)} admitted durations do not fit "
             "this device: lower --max-video-seconds, raise "
             "--mem-fraction-static, or serve with --graph-policy off "
             f"({error})"
@@ -516,11 +540,11 @@ def warmup_postprocess(
 ) -> None:
     """Exercise real output windows through the public numerical interface.
 
-    One post-processing call converts the media unit this rank reconstructed, so
-    its prepared context follows the frame count, and every admitted duration
-    is prepared. Every rank of the ring prepares each duration even where it
-    holds no unit in a round, because preparing a context binds the ring's
-    communication resources and that binding spans the whole ring.
+    One post-processing call converts the media unit this rank reconstructed,
+    so its prepared context follows the frame count and canvas, and every
+    admitted size is prepared. Every rank of the ring prepares each size even
+    where it holds no unit in a round, because preparing a context binds the
+    ring's communication resources and that binding spans the whole ring.
     """
     entries = [
         (name, call)
@@ -538,11 +562,17 @@ def warmup_postprocess(
     device = binding.device
     position = binding.config.ranks.index(binding.process_group.global_rank)
     units_per_round = len(binding.config.ranks)
-    for frames in reversed(builder.frame_counts):
-        runner.prepare_module(name, frames, method="forward")
+    sizes = (
+        video.Config(frames, canvas)
+        for canvas in builder.canvases
+        for frames in reversed(builder.frame_counts)
+    )
+    for output in sizes:
+        frames = output.num_frames
+        runner.prepare_module(name, output, method="forward")
         windows = decoder.frame_slices(frames)
-        layout = decoder.output_layout(frames)["video"]
-        state = storage[0].view(call.module.state_buffers(frames))
+        layout = decoder.output_layout(output)["video"]
+        state = storage[0].view(call.module.state_buffers(output))
         cursor = 0
         while cursor < len(windows):
             count = min(units_per_round, len(windows) - cursor)
@@ -568,9 +598,9 @@ def warmup_postprocess(
                     name,
                     unit_outputs,
                     method="forward",
-                    size=frames,
+                    size=output,
                     frames=(windows[unit],),
-                    num_frames=(frames,),
+                    sizes=(output,),
                     state=state,
                     unit_count=count,
                 )
@@ -582,8 +612,8 @@ def mux_config(runner: ModelExecutor, media) -> AvMuxConfig:
     decoder = runner.video_decoder
     windows = decoder.frame_slices(media.num_frames)
     return AvMuxConfig(
-        width=decoder.frame_size.width,
-        height=decoder.frame_size.height,
+        width=media.width,
+        height=media.height,
         frame_count=media.num_frames,
         frame_rate=runner.video_postprocessor.frame_rate,
         audio_rate=runner.audio_decoder.sample_rate,
@@ -975,13 +1005,14 @@ def execute(
                 model_runner, call.component, cursor, count, len(windows)
             ).start
             window = windows[unit]
+            output = video.Config(media.num_frames, media.canvas)
             decoded = model_runner.run_module(
                 call.component,
                 (read.tensor,),
                 method="decode",
-                size=media.num_frames,
+                size=output,
                 frames=(window,),
-                num_frames=(media.num_frames,),
+                sizes=(output,),
             )
             if decoded.stats is None:
                 raise RuntimeError("module output has no execution statistics")
@@ -995,7 +1026,7 @@ def execute(
             # cross-faded with the neighbouring unit's tail, and that unit
             # is the product a host rank encodes.
             decoder = model_runner.video_decoder
-            layout = decoder.output_layout(media.num_frames)["video"]
+            layout = decoder.output_layout(output)["video"]
             unit_outputs = (
                 TensorOutput(
                     decoded.values[0],
@@ -1012,9 +1043,9 @@ def execute(
                 call.component,
                 unit_outputs,
                 method="forward",
-                size=media.num_frames,
+                size=output,
                 frames=(window,),
-                num_frames=(media.num_frames,),
+                sizes=(output,),
                 state=slot,
                 unit_count=count,
             )
@@ -1024,11 +1055,7 @@ def execute(
             # the longest fills its row's leading frames.
             frames = window.stop - window.start
             value = concatenate_views(processed.values).view(
-                1,
-                frames,
-                decoder.frame_size.height,
-                decoder.frame_size.width,
-                3,
+                1, frames, media.height, media.width, 3
             )
             longest = max(
                 span.stop - span.start

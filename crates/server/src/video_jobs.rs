@@ -52,8 +52,8 @@ pub(crate) struct VideoJob {
     pub completed_at: Option<u64>,
     /// Set with `completed_at`, to `VIDEO_RETENTION` after it.
     pub expires_at: Option<u64>,
-    /// Requested duration in seconds, or the model default when the request
-    /// omits it.
+    /// Requested duration in seconds: the target's, or the length of the
+    /// reference soundtrack that sets it.
     pub seconds: f64,
     /// Duration in seconds of the frames the model generates, `num_frames`
     /// at the model's frame rate. It may exceed `seconds`, since the model
@@ -61,6 +61,8 @@ pub(crate) struct VideoJob {
     pub actual_seconds: f64,
     /// Frames the model generates for the requested duration.
     pub num_frames: u32,
+    /// The generated canvas, `WxH` in pixels.
+    pub size: String,
     pub status: &'static str,
     /// `queued`, then the phases the generation task reports from runtime
     /// events, then `completed` or `failed`.
@@ -357,6 +359,7 @@ mod tests {
             seconds: 5.0,
             actual_seconds: 124.0 / 24.0,
             num_frames: 124,
+            size: "1344x768".to_owned(),
             status: "queued",
             phase: "queued".to_owned(),
             completed_steps: 0,

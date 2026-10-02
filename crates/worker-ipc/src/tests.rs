@@ -191,6 +191,8 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
             video_units: 3,
             num_inference_steps: 4,
             seed: 17,
+            width: 1024,
+            height: 768,
         },
     )
     .unwrap()

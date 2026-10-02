@@ -122,31 +122,35 @@ pub struct Presentation {
 ///
 /// # Errors
 ///
-/// Returns [`VideoInputError::Invalid`] for `prompt` when the prompt is empty
+/// Returns [`VideoInputError::Invalid`] for `prompt` when the prompt is blank
 /// or contains a vision placeholder or marker, which would misalign the
 /// conditioner's vision inputs, and [`VideoInputError::Internal`] when the
-/// tokenizer lacks the vision tokens or fails.
+/// tokenizer fails or lacks the vision tokens a vision block needs.
 pub fn present(
     tokenizer: &HuggingFaceTokenizer,
     plan: &RequestPlan,
     prompt: &str,
 ) -> Result<Presentation, VideoInputError> {
-    if prompt.is_empty() {
+    if prompt.trim().is_empty() {
         return Err(VideoInputError::invalid(
             RequestField::Prompt,
-            "must not be empty",
+            "must not be blank",
         ));
     }
-    let token = |name: &str| {
-        tokenizer
-            .token_to_id(name)
-            .ok_or_else(|| VideoInputError::internal(format!("the tokenizer has no {name} token")))
+    // A vision block needs the vision vocabulary; a prompt can only produce
+    // the vision tokens the tokenizer has, which it must not contain.
+    let token = |name: &'static str| (name, tokenizer.token_to_id(name));
+    let required = |(name, id): (&str, Option<u32>)| {
+        id.ok_or_else(|| VideoInputError::internal(format!("the tokenizer has no {name} token")))
     };
-    let start = token(VISION_START)?;
-    let end = token(VISION_END)?;
-    let image_pad = token(VisionPad::Image.token())?;
-    let video_pad = token(VisionPad::Video.token())?;
-    let placeholders = [start, end, image_pad, video_pad];
+    let start = token(VISION_START);
+    let end = token(VISION_END);
+    let image_pad = token(VisionPad::Image.token());
+    let video_pad = token(VisionPad::Video.token());
+    let placeholders: Vec<u32> = [start, end, image_pad, video_pad]
+        .iter()
+        .filter_map(|(_, id)| *id)
+        .collect();
 
     let segments = segments(plan, prompt);
     let last = segments.len() - 1;
@@ -155,14 +159,14 @@ pub fn present(
     for (position, segment) in segments.iter().enumerate() {
         match segment {
             Segment::Vision { pad, tokens } => {
-                let pad = match pad {
+                let pad = required(match pad {
                     VisionPad::Image => image_pad,
                     VisionPad::Video => video_pad,
-                };
+                })?;
                 let block = *tokens as usize + 2;
-                token_ids.push(start);
+                token_ids.push(required(start)?);
                 token_ids.extend(std::iter::repeat_n(pad, *tokens as usize));
-                token_ids.push(end);
+                token_ids.push(required(end)?);
                 tags.extend(std::iter::repeat_n(VIDEO_TAG, block));
             }
             Segment::Text(text) => {

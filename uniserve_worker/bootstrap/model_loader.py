@@ -252,7 +252,9 @@ def _weight_config(source, options, execution) -> weights.Config:
                 "without component selectors"
             )
         result = factory(
-            preset="default" if selected is None else selected, **components
+            source.model,
+            preset="default" if selected is None else selected,
+            **components,
         )
     elif selected is None:
         result = source.weights

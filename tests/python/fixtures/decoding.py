@@ -6,7 +6,6 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
-from uniserve.media import image
 from uniserve.model import ComponentEntry, EntryPoint, VideoDecoder
 from uniserve.nn.vae import LatentDecoder
 from uniserve.tensors import OutputLayout
@@ -41,7 +40,6 @@ class Decoder(VideoDecoder):
                 mean=torch.tensor([0.1, 0.2, 0.3]).view(1, 3, 1, 1, 1),
                 std=torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1, 1, 1),
             ),
-            frame_size=image.Config(config.height, config.width),
         )
         self.window = config.window
 
@@ -55,14 +53,14 @@ class Decoder(VideoDecoder):
             for start in range(0, num_frames, self.window)
         )
 
-    def output_layout(self, num_frames):
+    def output_layout(self, size):
         shape = (
-            len(self.frame_slices(num_frames)),
+            len(self.frame_slices(size.num_frames)),
             1,
             3,
             self.window,
-            self.frame_size.height,
-            self.frame_size.width,
+            size.frame.height,
+            size.frame.width,
         )
         return {
             "video": OutputLayout(
@@ -70,11 +68,9 @@ class Decoder(VideoDecoder):
             )
         }
 
-    def unpack_latents(
-        self, latent, frames, num_frames, *, constants, workspace
-    ):
+    def unpack_latents(self, latent, frames, size, *, constants, workspace):
         return latent.T.reshape(
-            1, 3, num_frames, self.frame_size.height, self.frame_size.width
+            1, 3, size.num_frames, size.frame.height, size.frame.width
         )[:, :, frames]
 
 

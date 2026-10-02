@@ -218,8 +218,11 @@ impl ExecutorInfo {
         let seed_index = kv_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
         merged.media_components = self.media_routing()?;
-        merged.num_inference_steps = routed(CallKind::Media(MediaCall::Denoising))
-            .map_or(0, |info| info.num_inference_steps);
+        let denoising = routed(CallKind::Media(MediaCall::Denoising));
+        merged.num_inference_steps = denoising.map_or(0, |info| info.num_inference_steps);
+        // Every worker describes the deployment's placed denoiser alike; the
+        // denoising worker's description is the deployment's.
+        merged.video_denoiser = denoising.and_then(|info| info.video_denoiser.clone());
         // A deployment that assembles video denoises over a fixed ladder,
         // which the denoising worker reports.
         anyhow::ensure!(
@@ -235,6 +238,13 @@ impl ExecutorInfo {
                     || info.num_inference_steps == merged.num_inference_steps
             }),
             "workers disagree on diffusion steps"
+        );
+        anyhow::ensure!(
+            self.workers
+                .iter()
+                .all(|(_, info)| info.video_denoiser.is_none()
+                    || info.video_denoiser == merged.video_denoiser),
+            "workers disagree on the deployment's video denoiser"
         );
         // Every KV stage must agree on layout. Capacity is the narrowest pool
         // because a request may traverse all routed KV stages, and the

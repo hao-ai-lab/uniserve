@@ -11,6 +11,7 @@ import torch
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
+from tests.python.fixtures.h3 import WIDE
 from uniserve.diffusion import DenoisingStep, normal_noise
 from uniserve.distributed import DeviceMesh, communication_axes
 from uniserve.model import LatentInput, TextSize
@@ -29,18 +30,18 @@ from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
 from uniserve_eval.types import (
     BenchmarkPoint,
     LoadConfig,
+    MetricDefinition,
     TaskName,
     VideoConfig,
 )
 from uniserve_models import loading as models
 from uniserve_models.minimax_h3 import (
     DenoiserInput,
-    DenoiserSize,
     weight_config,
 )
 from uniserve_models.minimax_h3.packing import (
     audio_latent_frames,
-    build_packing,
+    tile_packing,
     unpatchify_video,
     video_latent_frames,
 )
@@ -174,7 +175,7 @@ def _generate(
     model = models.load_model(
         config,
         device=device,
-        weights=weight_config(**_PRECISIONS[precision]),
+        weights=weight_config(config.model, **_PRECISIONS[precision]),
         meshes=meshes,
         attention=attention,
     ).model
@@ -199,13 +200,15 @@ def _generate(
             mesh = meshes["denoiser"]
             pipeline = mesh.get_group("pp" if "pp" in axes else ())
             tensor = mesh.get_group("tp" if "tp" in axes else ())
-            size = DenoiserSize(frames, len(token_ids))
+            size = denoiser.make_size(
+                frames, len(token_ids), canvas=WIDE, condition_rows=0
+            )
             # Calls evaluate the prompt's layout: its conditioning fills the
             # leading text rows, and its own tables are request state.
             layout = denoiser.layout_size(size)
             conditioning = torch.zeros(
-                layout.num_text_tokens,
-                denoiser.config.hidden_size,
+                denoiser.text_condition_rows(layout),
+                denoiser.text_condition_width,
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -354,8 +357,8 @@ def _collect(checkpoint, requests, kind, directory, *, encoder_tp, precision):
             )
             for name in ("video", "audio")
         }
-        packing = build_packing(
-            num_text_tokens=len(token_ids), num_frames=frames
+        packing = tile_packing(
+            num_text_tokens=len(token_ids), num_frames=frames, canvas=WIDE
         )
         raster = torch.empty_like(joined["video"])
         raster[packing.video_raster_indices] = joined["video"]
@@ -394,7 +397,8 @@ def generation_requests(request):
         task=TaskName.VIDEO,
         model="FastH3",
         dataset="minimax-h3",
-        metrics=(),
+        # The point only synthesizes the prompt; its metric is never read.
+        metrics=(MetricDefinition(("videos_per_second",), "higher"),),
         load=LoadConfig(num_prompts=1),
         video=VideoConfig(seconds=seconds, prompt_tokens=tokens),
     )

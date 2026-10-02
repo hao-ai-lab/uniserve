@@ -93,7 +93,10 @@ def resolve_outputs(
         describe_components,
     )
     from uniserve_worker.bootstrap.inputs import capability, media_builder
-    from uniserve_worker.model_executor.resources import encoded_units_layout
+    from uniserve_worker.model_executor.resources import (
+        bounding_layout,
+        encoded_units_layout,
+    )
 
     builder = media_builder(model, config)
     decoder = capability(model, VideoDecoder)
@@ -119,7 +122,12 @@ def resolve_outputs(
                 (
                     None,
                     "encoded_units",
-                    encoded_units_layout(decoder, builder.maximum.num_frames),
+                    bounding_layout(
+                        tuple(
+                            encoded_units_layout(decoder, size)
+                            for size in builder.video_sizes()
+                        )
+                    ),
                 )
             )
         for module, name, layout in layouts:
