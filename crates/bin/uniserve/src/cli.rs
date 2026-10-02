@@ -425,6 +425,12 @@ pub(crate) struct WorkerProcessOptions {
     /// Hugging Face cache root for repository model paths.
     #[arg(long)]
     pub download_dir: Option<std::path::PathBuf>,
+    /// Local copy of the base checkpoint that a component export (such as
+    /// FastH3 OmniRef) pins for its other components. Workers verify its
+    /// revision from its Hugging Face download records; without it they
+    /// read the pinned revision from the Hugging Face cache.
+    #[arg(long, value_name = "PATH")]
+    pub base_model: Option<std::path::PathBuf>,
     /// Concurrent checkpoint file readers.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub load_threads: Option<u32>,
@@ -510,6 +516,7 @@ impl WorkerProcessOptions {
         WorkerProcessArgs {
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.clone(),
+            base_model: self.base_model.clone(),
             load_threads: self.load_threads,
             checksum_manifest: self.checksum_manifest.clone(),
             model_dtype: self.model_dtype,
@@ -825,6 +832,24 @@ mod tests {
         assert_eq!(
             worker.quantization_config["components"]["transformer.mlp"],
             "nvfp4"
+        );
+    }
+
+    #[test]
+    fn serve_forwards_a_local_base_checkpoint() {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "/models/FastH3-OmniRef",
+            "--base-model",
+            "/models/MiniMax-H3",
+        ])
+        .expect("component export with a local base");
+        let Command::Serve(args) = parsed.command;
+        let worker = args.runtime.worker_process.to_args();
+        assert_eq!(
+            worker.base_model,
+            Some(std::path::PathBuf::from("/models/MiniMax-H3"))
         );
     }
 

@@ -244,10 +244,12 @@ def resolve(backend, *, device, tile):
     """
     if isinstance(backend, Backend):
         return backend
+    # Every provider runs CUDA kernels; other devices have none to probe.
+    cuda = torch.device(device).type == "cuda"
     if backend == "auto":
         for name in ("sm100", "flashinfer", "triton"):
             candidate = import_module(f"{__name__}.{name}")
-            if tile in candidate.TILES and candidate.available(device):
+            if cuda and tile in candidate.TILES and candidate.available(device):
                 return candidate.Backend()
         raise RuntimeError(
             f"no installed VSA backend serves {tile}-row tiles on {device}"
@@ -262,7 +264,7 @@ def resolve(backend, *, device, tile):
     if backend not in {"sm100", "cute", "flashinfer", "triton"}:
         raise ValueError(f"unknown VSA backend {backend!r}")
     module = import_module(f"{__name__}.{backend}")
-    if tile not in module.TILES or not module.available(device):
+    if not cuda or tile not in module.TILES or not module.available(device):
         raise RuntimeError(
             f"VSA backend {backend!r} does not serve {tile}-row tiles on "
             f"{device}"

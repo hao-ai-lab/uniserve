@@ -30,6 +30,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from uniserve_models.loading import Base
+
 # Inference contract schema every FastVideo MiniMax-H3 export publishes.
 INFERENCE_SCHEMA = "fasth3-inference-contract-v1"
 
@@ -41,6 +43,12 @@ DENOISER_DIRECTORIES: Mapping[str, str] = MappingProxyType(
 # Tasks each denoising component serves; the DiT partition fixes them.
 DENOISER_TASKS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {"denoiser": ("t2va", "fl2va"), "reference_denoiser": ("ref2va",)}
+)
+
+# Components a component export draws from its pinned base: everything but
+# its own DiT partition and schedulers.
+BASE_DIRECTORIES = frozenset(
+    {"text_encoder", "tokenizer", "processor", "vae", "audio_vae"}
 )
 
 
@@ -183,3 +191,20 @@ def detect(root: Path) -> Layout:
             "neither transformer nor transformer_ref"
         )
     return Layout(Kind.DIFFUSERS_ROOT, MappingProxyType(denoisers), None, None)
+
+
+def base_checkpoint(root: Path) -> Base | None:
+    """Name the base checkpoint a component export draws components from.
+
+    A component export pins its base with ``base_model_revision``; the base
+    supplies ``BASE_DIRECTORIES``. Returns ``None`` for the layouts that
+    hold every component.
+
+    Raises:
+        FileNotFoundError: As ``detect``.
+        ValueError: As ``detect``.
+    """
+    layout = detect(root)
+    if layout.base is None:
+        return None
+    return Base(layout.base.repository, layout.base.revision, BASE_DIRECTORIES)

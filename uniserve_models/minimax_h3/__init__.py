@@ -6,11 +6,13 @@ independently placeable components (see ``entry_points``): the Qwen text
 encoder, one denoiser per DiT partition the checkpoint holds (each with its
 token refiner), the video decoder with its RGB post-processor, and the audio
 decoder. ``read_config`` recognizes the checkpoint layout and normalizes its
-JSON sidecars, and ``checkpoint_mappings`` maps its tensors onto the
-modules.
+JSON sidecars, ``base_checkpoint`` names the pinned base a component export
+draws its other components from, and ``checkpoint_mappings`` maps its
+tensors onto the modules.
 """
 
 from .attention import Dense, RegionSparse, Sparse
+from .checkpoint import base_checkpoint
 from .conditioning import Conditioner, RefinerBlock, TokenRefiner
 from .config import (
     Config,
@@ -50,6 +52,7 @@ image_processor = None
 flow_prompt = None
 
 __all__ = [
+    "base_checkpoint",
     "config_sources",
     "image_processor",
     "flow_prompt",
