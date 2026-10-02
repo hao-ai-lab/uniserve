@@ -87,7 +87,7 @@ fn media_units(name: &str, units: u32) -> OutputInfo {
 }
 
 /// A video worker whose text encoder, denoiser, audio decoder and muxer live on
-/// rank 0 and whose video decoder and video encoder are distributed over
+/// rank 0 and whose video decoder and video codec are distributed over
 /// `decoder_ranks` ranks, each reconstructing and encoding one media unit per
 /// round.
 ///
@@ -133,7 +133,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
             vec![media_units("units", 32)],
         ),
         component(
-            "video_encoder",
+            "video_codec",
             (0..decoder_ranks).collect(),
             true,
             vec![output("encoded", Some(32))],
@@ -146,7 +146,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         (MediaCall::LatentPreparation, "denoiser".to_owned()),
         (MediaCall::Denoising, "denoiser".to_owned()),
         (MediaCall::VideoDecoding, "video_decoder".to_owned()),
-        (MediaCall::VideoEncoding, "video_encoder".to_owned()),
+        (MediaCall::VideoEncoding, "video_codec".to_owned()),
         (MediaCall::AudioDecoding, "audio_decoder".to_owned()),
         (MediaCall::AudioEncoding, "muxer".to_owned()),
         (MediaCall::Muxing, "muxer".to_owned()),
@@ -487,12 +487,12 @@ fn each_media_call_names_the_workers_routed_to_read_its_products() {
     };
     // The video graph: text conditioning feeds latent preparation on the
     // denoiser, whose latents feed the next step and both decoders; decoded
-    // video units feed the video encoder, decoded audio and encoded video
+    // video units feed the video codec, decoded audio and encoded video
     // feed the muxer, and the muxer's products leave the graph.
     let expected = |call: MediaCall| match call {
         MediaCall::TextEncoding | MediaCall::LatentPreparation => routed(&["denoiser"]),
         MediaCall::Denoising => routed(&["denoiser", "video_decoder", "audio_decoder"]),
-        MediaCall::VideoDecoding => routed(&["video_encoder"]),
+        MediaCall::VideoDecoding => routed(&["video_codec"]),
         MediaCall::VideoEncoding | MediaCall::AudioDecoding => routed(&["muxer"]),
         _ => BTreeMap::new(),
     };

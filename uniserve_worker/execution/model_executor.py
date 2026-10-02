@@ -69,7 +69,7 @@ from uniserve.runtime.device import canonical_device, process_device_bytes
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout
 from uniserve_worker.bootstrap.components import (
-    VIDEO_ENCODER_COMPONENT,
+    VIDEO_CODEC_COMPONENT,
     bind_components,
     call_kinds,
     describe_components,
@@ -985,8 +985,8 @@ class ModelExecutor:
                 prompt_tokens=num_prompt_tokens,
             ).items()
         )
-        if entry == VIDEO_ENCODER_COMPONENT:
-            # The video encoder owns no numerical method; its product is the
+        if entry == VIDEO_CODEC_COMPONENT:
+            # The video codec owns no numerical method; its product is the
             # encoded rows of the media units it is handed.
             from uniserve_worker.model_executor.resources import (
                 encoded_units_layout,

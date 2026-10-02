@@ -126,9 +126,9 @@ def test_h3_worker_advertises_bounded_media_products():
         MediaCall.DENOISING: "denoiser",
         MediaCall.VIDEO_DECODING: "video_decoder",
         MediaCall.AUDIO_DECODING: "audio_decoder",
-        # The host components own no numerical method: the video encoder
+        # The host components own no numerical method: the video codec
         # encodes the decoded media units and the muxer assembles them.
-        MediaCall.VIDEO_ENCODING: "video_encoder",
+        MediaCall.VIDEO_ENCODING: "video_codec",
         MediaCall.AUDIO_ENCODING: "muxer",
         MediaCall.MUXING: "muxer",
     }

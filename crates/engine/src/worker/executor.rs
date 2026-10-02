@@ -217,7 +217,7 @@ pub struct WorkerExecutor {
 ///
 /// Returns an empty map when the routing lacks a video decoding or a video
 /// encoding component.
-pub(crate) fn video_unit_encoders(
+pub(crate) fn video_unit_codecs(
     routing: &std::collections::BTreeMap<uniserve_worker_ipc::MediaCall, String>,
     placements: &[(
         &WorkerId,
@@ -286,7 +286,7 @@ pub(crate) fn video_unit_encoders(
         }
         anyhow::ensure!(
             !admissible.is_empty(),
-            "no video encoder keeps the media units of worker {decoder_worker} on their host, \
+            "no video codec keeps the media units of worker {decoder_worker} on their host, \
              where their encoder reads them through shared storage: {}",
             refusals.join("; ")
         );
@@ -303,7 +303,7 @@ impl WorkerExecutor {
     /// was initialized with transfer bindings other than `transfer`, a worker
     /// reports invalid capabilities, the workers loaded different models or
     /// checkpoints or expose different outputs for a replicated component, the
-    /// media routing or video encoder pairing is refused, a transfer edge names
+    /// media routing or video codec pairing is refused, a transfer edge names
     /// an unbound worker or rank, repeats a physical rank pair, or uses a
     /// mechanism an endpoint did not initialize or that cannot serve the edge's
     /// endpoints, or no runtime capacity view can be derived from the workers.
@@ -353,7 +353,7 @@ impl WorkerExecutor {
                 (id, ranks, components)
             })
             .collect::<Vec<_>>();
-        executor_info.video_encoders = video_unit_encoders(&media_routing, &placements)?;
+        executor_info.video_codecs = video_unit_codecs(&media_routing, &placements)?;
         for (_, worker) in &mut workers {
             worker.set_media_routing(media_routing.clone());
         }
@@ -1890,7 +1890,7 @@ impl Executor for WorkerExecutor {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::video_unit_encoders;
+    use super::video_unit_codecs;
     use crate::WorkerRank;
     use crate::executor::{ComponentConfig, WorkerId};
     use std::collections::BTreeMap;
@@ -1915,13 +1915,13 @@ mod placement_tests {
     fn routing() -> BTreeMap<MediaCall, String> {
         BTreeMap::from([
             (MediaCall::VideoDecoding, "video_decoder".to_owned()),
-            (MediaCall::VideoEncoding, "video_encoder".to_owned()),
+            (MediaCall::VideoEncoding, "video_codec".to_owned()),
         ])
     }
 
     #[test]
     fn a_decoded_unit_names_the_host_worker_ranks_that_read_it() {
-        // The decoder's product is read by the video encoder on the host
+        // The decoder's product is read by the video codec on the host
         // worker: the encoder rank dealt this decoder rank's position is
         // named, none of the decoder's own ranks, and the host worker's
         // slots follow the model worker's run. A consumer that is not
@@ -1932,7 +1932,7 @@ mod placement_tests {
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
         let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 2))]);
+            BTreeMap::from([("video_codec".to_owned(), distributed(vec![0, 1], 2))]);
         let peers = BTreeMap::from([
             ("host".to_owned(), host_components),
             ("model".to_owned(), model_components.clone()),
@@ -2048,7 +2048,7 @@ mod placement_tests {
 
     #[test]
     fn a_decoded_unit_names_only_the_encoder_on_its_route() {
-        // Two hosts each hold a video encoder worker. A request decoded on
+        // Two hosts each hold a video codec worker. A request decoded on
         // host 0's model worker is routed to host 0's encoder, so the unit
         // names that encoder's reading rank; host 1's encoder rank at the
         // same position never reads it.
@@ -2056,7 +2056,7 @@ mod placement_tests {
         use crate::worker::instance::media_consumer_slots;
 
         let model = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1], 1))]);
-        let encoder = || BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 1))]);
+        let encoder = || BTreeMap::from([("video_codec".to_owned(), distributed(vec![0, 1], 1))]);
         let peers = BTreeMap::from([
             ("encoder-0".to_owned(), encoder()),
             ("encoder-1".to_owned(), encoder()),
@@ -2066,8 +2066,7 @@ mod placement_tests {
         for worker in ["encoder-0", "encoder-1", "model-0"] {
             transfer.worker_ranks.insert(worker.to_owned(), 2);
         }
-        let routed =
-            BTreeMap::from([("video_encoder".to_owned(), WorkerId("encoder-0".to_owned()))]);
+        let routed = BTreeMap::from([("video_codec".to_owned(), WorkerId("encoder-0".to_owned()))]);
 
         let slots = media_consumer_slots(
             &[MediaCall::VideoEncoding],
@@ -2088,7 +2087,7 @@ mod placement_tests {
     fn pairing(
         placements: &[(&WorkerId, &[WorkerRank], &BTreeMap<String, ComponentConfig>)],
     ) -> anyhow::Result<BTreeMap<WorkerId, std::collections::BTreeSet<WorkerId>>> {
-        video_unit_encoders(&routing(), placements)
+        video_unit_codecs(&routing(), placements)
     }
 
     #[test]
@@ -2110,7 +2109,7 @@ mod placement_tests {
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
         let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
+            BTreeMap::from([("video_codec".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
         let pairings = pairing(&[
             (&model, &model_ranks, &model_components),
             (&host, &host_ranks, &host_components),
@@ -2140,7 +2139,7 @@ mod placement_tests {
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 2))]);
         let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed((0..8).collect(), 1))]);
+            BTreeMap::from([("video_codec".to_owned(), distributed((0..8).collect(), 1))]);
         pairing(&[
             (&model, &model_ranks, &model_components),
             (&host, &host_ranks, &host_components),
@@ -2213,7 +2212,7 @@ mod placement_tests {
             (WorkerId("encoder-b".to_owned()), vec![rank("b", "cpu")]),
         ];
         let decoder = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0], 1))]);
-        let encoder = BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0], 1))]);
+        let encoder = BTreeMap::from([("video_codec".to_owned(), distributed(vec![0], 1))]);
         let placements = flows
             .iter()
             .map(|(id, ranks)| (id, ranks.as_slice(), &decoder))

@@ -47,7 +47,7 @@ pub struct ExecutorInfo {
     /// `WorkerExecutor::try_new` fills this from the placement; `single` and
     /// `from_workers` leave it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
-    pub video_encoders: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
+    pub video_codecs: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
 }
 
 impl ExecutorInfo {
@@ -55,7 +55,7 @@ impl ExecutorInfo {
     pub fn single(id: WorkerId, info: WorkerInfo) -> Self {
         Self {
             workers: vec![(id, info)],
-            video_encoders: BTreeMap::new(),
+            video_codecs: BTreeMap::new(),
         }
     }
 
@@ -95,7 +95,7 @@ impl ExecutorInfo {
         }
         Ok(Self {
             workers: pools,
-            video_encoders: BTreeMap::new(),
+            video_codecs: BTreeMap::new(),
         })
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
                 (MediaCall::LatentPreparation, "denoiser"),
                 (MediaCall::Denoising, "denoiser"),
                 (MediaCall::VideoDecoding, "video_decoder"),
-                (MediaCall::VideoEncoding, "video_encoder"),
+                (MediaCall::VideoEncoding, "video_codec"),
                 (MediaCall::AudioDecoding, "audio_decoder"),
                 (MediaCall::AudioEncoding, "muxer"),
                 (MediaCall::Muxing, "muxer"),
@@ -1355,7 +1355,7 @@ mod tests {
             media_pool(
                 "host",
                 &[
-                    (MediaCall::VideoEncoding, "video_encoder"),
+                    (MediaCall::VideoEncoding, "video_codec"),
                     (MediaCall::AudioEncoding, "muxer"),
                     (MediaCall::Muxing, "muxer"),
                 ],
@@ -1386,7 +1386,7 @@ mod tests {
         );
         let host = media_info(
             &[
-                (MediaCall::VideoEncoding, "video_encoder"),
+                (MediaCall::VideoEncoding, "video_codec"),
                 (MediaCall::AudioEncoding, "muxer"),
                 (MediaCall::Muxing, "muxer"),
             ],
@@ -1397,11 +1397,11 @@ mod tests {
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("host".to_owned()), host),
             ],
-            video_encoders: BTreeMap::new(),
+            video_codecs: BTreeMap::new(),
         };
         let routing = info.media_routing().expect("the union is complete");
         assert_eq!(routing.len(), MediaCall::VIDEO.len());
-        assert_eq!(routing[&MediaCall::VideoEncoding], "video_encoder");
+        assert_eq!(routing[&MediaCall::VideoEncoding], "video_codec");
         assert_eq!(routing[&MediaCall::VideoDecoding], "video_decoder");
     }
 
@@ -1414,7 +1414,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model.clone()),
                 (WorkerId("host".to_owned()), host),
             ],
-            video_encoders: BTreeMap::new(),
+            video_codecs: BTreeMap::new(),
         };
         let message = info
             .media_routing()
@@ -1428,7 +1428,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("other".to_owned()), other),
             ],
-            video_encoders: BTreeMap::new(),
+            video_codecs: BTreeMap::new(),
         };
         let message = info
             .media_routing()

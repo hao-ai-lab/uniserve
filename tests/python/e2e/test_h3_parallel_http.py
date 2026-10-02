@@ -345,7 +345,7 @@ def test_component_bindings_release_cancelled_requests(
             "ranks": [{"node": "localhost", "device": "cpu"}]
             * (decoder_units + 1),
             "components": {
-                "video_encoder": {
+                "video_codec": {
                     "ranks": list(range(decoder_units)),
                     "distribution": "temporal_units",
                     "units_per_rank": 1,
@@ -355,15 +355,15 @@ def test_component_bindings_release_cancelled_requests(
             "queue_depth": 6,
         }
     )
-    owners.update({"video_encoder": "host", "muxer": "host"})
+    owners.update({"video_codec": "host", "muxer": "host"})
     edges = {
         (owners[source], owners[destination])
         for source, destination in (
             ("text_encoder", "denoiser"),
             ("denoiser", "video_decoder"),
             ("denoiser", "audio_decoder"),
-            ("video_decoder", "video_encoder"),
-            ("video_encoder", "muxer"),
+            ("video_decoder", "video_codec"),
+            ("video_codec", "muxer"),
             ("audio_decoder", "muxer"),
         )
     }

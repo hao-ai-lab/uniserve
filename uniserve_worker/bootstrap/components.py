@@ -52,12 +52,12 @@ from uniserve_worker.protocol.call import (
 
 # Host components run on a host worker's ranks and own no numerical method, so
 # the worker declares them rather than the model, which declares numerical
-# components only. The video encoder encodes the media units the video decoder
+# components only. The video codec encodes the media units the video decoder
 # reconstructs; the muxer encodes the audio track and assembles the artifact.
-VIDEO_ENCODER_COMPONENT = "video_encoder"
+VIDEO_CODEC_COMPONENT = "video_codec"
 MUXER_COMPONENT = "muxer"
 HOST_COMPONENTS: Mapping[str, frozenset[MediaCall]] = {
-    VIDEO_ENCODER_COMPONENT: frozenset({MediaCall.VIDEO_ENCODING}),
+    VIDEO_CODEC_COMPONENT: frozenset({MediaCall.VIDEO_ENCODING}),
     MUXER_COMPONENT: frozenset({MediaCall.AUDIO_ENCODING, MediaCall.MUXING}),
 }
 #: The muxer's calls, which ``bind_components`` records as its call kinds.
@@ -363,7 +363,7 @@ def validate_components(
             refuses the model, the placement names an undeclared component, a
             non-host component has no calls, or a component's
             ``distribution`` does not fit its calls. The muxer is never
-            distributed; the video encoder and a component with a
+            distributed; the video codec and a component with a
             ``VideoDecoder`` call require ``temporal_units`` with one unit per
             rank; a component with an ``AudioDecoder`` call and no
             ``VideoDecoder`` call accepts no distribution or
@@ -389,7 +389,7 @@ def validate_components(
                 raise unsupported_setup(
                     "the muxer assembles one artifact and is not distributed"
                 )
-            if name == VIDEO_ENCODER_COMPONENT and (
+            if name == VIDEO_CODEC_COMPONENT and (
                 component.distribution != "temporal_units"
                 or component.units_per_rank != 1
             ):

@@ -179,7 +179,7 @@ impl Scheduler {
             (MediaCall::TextEncoding, 1),
             (MediaCall::Denoising, 2),
             // The video decoder declares its decoded media units and the
-            // video encoder the rows encoded from them; both are indexed by
+            // video codec the rows encoded from them; both are indexed by
             // media unit.
             (MediaCall::VideoDecoding, 1),
             (MediaCall::VideoEncoding, 1),
@@ -240,7 +240,7 @@ impl Scheduler {
     /// Returns a map from component name to worker, or `None` when some
     /// component has no ready candidate that is already on the route or has
     /// a free request row. When the executor reports admissible video
-    /// encoders for the video decoder's chosen worker, the video encoder's
+    /// codecs for the video decoder's chosen worker, the video codec's
     /// candidates are further limited to those.
     fn media_routes(&self) -> Option<HashMap<String, crate::WorkerId>> {
         use uniserve_worker_ipc::MediaCall;
@@ -252,7 +252,7 @@ impl Scheduler {
             .map(|(call, component)| (*call, component.clone()))
             .collect::<Vec<_>>();
         // Routing order: the denoiser first, then the calls that feed it, then
-        // decoders before encoders, since the video encoder's admissible
+        // decoders before encoders, since the video codec's admissible
         // workers depend on the route chosen for the video decoder.
         required.sort_by_key(|(call, _)| match call {
             MediaCall::Denoising => 0,
@@ -275,7 +275,7 @@ impl Scheduler {
                 .then(|| {
                     let decoder = self.info.media_components.get(&MediaCall::VideoDecoding)?;
                     let worker = routes.get(decoder)?;
-                    self.executor.info().video_encoders.get(worker)
+                    self.executor.info().video_codecs.get(worker)
                 })
                 .flatten();
             let candidates = self

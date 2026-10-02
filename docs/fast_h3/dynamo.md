@@ -56,7 +56,7 @@ target/release/uniserve-dynamo-worker \
   --max-running-requests 2 --quantization-config '{"mode":"quality"}'
 ```
 
-The placement uses four-way Ulysses denoising and TP4 text encoding, distributes temporal decoder units across the GPUs, and starts four host video encoders plus a host muxer. Weights remain resident; the quality configuration retains BF16 text encoding and denoising with the configured FP16 VAE projections.
+The placement uses four-way Ulysses denoising and TP4 text encoding, distributes temporal decoder units across the GPUs, and starts four host video codec ranks plus a host muxer. Weights remain resident; the quality configuration retains BF16 text encoding and denoising with the configured FP16 VAE projections.
 
 This single-host setup uses file discovery; requests travel over Dynamo's default TCP request plane. Both processes must share the discovery directory, `/tmp/dynamo_store_kv` by default, and the same namespace.
 

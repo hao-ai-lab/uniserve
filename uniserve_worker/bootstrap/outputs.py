@@ -5,7 +5,7 @@ this rank's slice, variable axes). The worker reports products to the engine
 as ``OutputInfo`` values in ``ComponentInfo.outputs``, with a protocol
 ``DType`` and a ``ShapeBound``. This module owns that translation, the
 protocol names of media products, and the ``encoded_units`` product the host
-video encoder publishes. ``uniserve_worker.bootstrap.capacity`` and
+video codec publishes. ``uniserve_worker.bootstrap.capacity`` and
 ``uniserve_worker.bootstrap.report`` also size product storage from the result.
 """
 
@@ -83,13 +83,13 @@ def resolve_outputs(
 
     Raises:
         ValueError: An output's dtype has no protocol ``DType``, an output
-            has more than one variable axis, or the video encoder component is
+            has more than one variable axis, or the video codec component is
             present but the model has no ``MediaBuilder`` or no
             ``VideoDecoder``. Errors from ``media_builder``, the capability
             lookups, ``describe_components`` and ``output_layouts`` propagate.
     """
     from uniserve_worker.bootstrap.components import (
-        VIDEO_ENCODER_COMPONENT,
+        VIDEO_CODEC_COMPONENT,
         describe_components,
     )
     from uniserve_worker.bootstrap.inputs import capability, media_builder
@@ -112,7 +112,7 @@ def resolve_outputs(
                 clock=clock,
             ).items()
         ]
-        if component == VIDEO_ENCODER_COMPONENT:
+        if component == VIDEO_CODEC_COMPONENT:
             if builder is None or decoder is None:
                 raise ValueError("video encoding requires a decoder timeline")
             layouts.append(
