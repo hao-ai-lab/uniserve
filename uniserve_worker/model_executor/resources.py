@@ -126,15 +126,21 @@ def holds_samples(
     )
 
 
+#: The ``(height, width)`` axes of ``decoded_units_layout``, which hold the
+#: request's canvas.
+DECODED_UNITS_RASTER_AXES = (2, 3)
+
+
 def decoded_units_layout(
     decoder: VideoDecoder, size: video.Config
 ) -> OutputLayout:
     """Describe a video decoding round's product: RGB media units.
 
-    Each row holds one media unit's frames at the output raster; a unit
-    shorter than the longest fills its row's leading frames, and the unit
-    division names how many. The rows are host products a host rank's
-    encoder reads in place.
+    The product is ``[units, frames, height, width, 3]`` uint8. Each row
+    holds one media unit's frames at the output raster
+    (``DECODED_UNITS_RASTER_AXES``); a unit shorter than the longest fills
+    its row's leading frames, and the unit division names how many. The rows
+    are host products a host rank's encoder reads in place.
     """
     windows = decoder.frame_slices(size.num_frames)
     frames = max(window.stop - window.start for window in windows)
@@ -154,7 +160,7 @@ def encoded_units_layout(
     """Describe a video encoding round's product: framed encoded unit rows.
 
     An encoded unit's length is not known when its row is reserved, so a row
-    is bounded by the largest unit and carries its own length.
+    is bounded by the largest unit of ``size`` and carries its own length.
     """
     from uniserve_worker.media.mux import encoded_unit_bytes
 

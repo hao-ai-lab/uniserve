@@ -909,6 +909,21 @@ fn shape_bound_from_parts(
     })
 }
 
+/// Decodes a result's raster axes: both indices set, or both -1 for a result
+/// without a raster. Their range is left to `OutputInfo::validate`.
+fn raster_axes_from_fb(height: i32, width: i32) -> CodecResult<Option<crate::RasterAxes>> {
+    match (u32::try_from(height), u32::try_from(width)) {
+        (Ok(height), Ok(width)) => Ok(Some(crate::RasterAxes { height, width })),
+        _ => {
+            codec_ensure!(
+                height == -1 && width == -1,
+                "a tensor result names one raster axis without the other"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Decodes a role-independent tensor identity and its bounded capacity.
 fn tensor_ref_from_table(reference: fbs::TensorRef<'_>) -> CodecResult<TensorRef> {
     let id = buffer_id_from_table(reference.id())?;
@@ -1147,6 +1162,10 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                                         shape_bound: shape_bound_from_parts(
                                             output.extents(),
                                             output.dynamic_axis(),
+                                        )?,
+                                        raster_axes: raster_axes_from_fb(
+                                            output.height_axis(),
+                                            output.width_axis(),
                                         )?,
                                     })
                                 })

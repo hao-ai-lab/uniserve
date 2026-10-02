@@ -90,7 +90,10 @@ def resolve_outputs(
     Every component ``describe_components`` reports for ``model`` is
     resolved, not only the components this rank holds. Condition products
     are declared only where the deployment's video denoiser executes a
-    conditioned task and ``config`` grants condition capacity.
+    conditioned task and ``config`` grants condition capacity. The video
+    decoder's RGB media units name their raster axes, which each request
+    binds to its canvas; the video codec's encoded rows are bounded by the
+    largest unit of every admitted canvas, the row every request uses.
 
     Returns:
         A read-only mapping from component name to its products. Components
@@ -117,6 +120,7 @@ def resolve_outputs(
         video_denoiser,
     )
     from uniserve_worker.model_executor.resources import (
+        DECODED_UNITS_RASTER_AXES,
         bounding_layout,
         condition_media_layouts,
         encoded_units_layout,
@@ -210,6 +214,15 @@ def resolve_outputs(
             # A variable axis becomes a device-sized bound; every other
             # extent is a static protocol dimension. ``ShapeBound`` admits at
             # most one ``DeviceDim``, which the check above reports by name.
+            # Decoded media units hold each request's own raster, at most the
+            # largest admitted one.
+            raster = (
+                DECODED_UNITS_RASTER_AXES
+                if isinstance(module, VideoDecoder)
+                and name == "video"
+                and clock is not None
+                else None
+            )
             outputs.append(
                 OutputInfo(
                     name if module is None else product_name(module, name),
@@ -222,6 +235,7 @@ def resolve_outputs(
                             for axis, extent in enumerate(layout.shape)
                         )
                     ),
+                    raster_axes=raster,
                 )
             )
         if outputs:

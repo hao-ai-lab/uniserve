@@ -41,7 +41,6 @@ import torch
 from torch import nn
 
 from uniserve.distributed import Communicator, DeviceMesh
-from uniserve.media import video
 from uniserve.model import (
     AudioDecoder,
     AudioEncoder,
@@ -1084,17 +1083,15 @@ class ModelExecutor:
         )
         if entry == VIDEO_CODEC_COMPONENT:
             # The video codec owns no numerical method; its product is the
-            # encoded rows of the media units it is handed.
+            # encoded rows of the media units it is handed. A row carries its
+            # own length, so every request uses the row that bounds the
+            # largest unit at every admitted canvas, as declared.
             from uniserve_worker.model_executor.resources import (
                 bounding_layout,
                 encoded_units_layout,
             )
 
-            sizes = (
-                self.media_builder.video_sizes()
-                if media is None
-                else (video.Config(media.num_frames, media.canvas),)
-            )
+            sizes = self.media_builder.video_sizes()
             results = (
                 (
                     None,

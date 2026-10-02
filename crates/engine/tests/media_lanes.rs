@@ -25,7 +25,7 @@ use uniserve_engine::{
     WorkerId,
 };
 use uniserve_worker_ipc::{
-    Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, ShapeBound,
+    Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes, ShapeBound,
 };
 
 /// Denoising steps the simulated model advertises and every request follows.
@@ -69,6 +69,7 @@ fn output(name: &str, units: Option<u32>) -> OutputInfo {
         name: name.to_owned(),
         dtype: DType::BF16,
         shape_bound: ShapeBound { dims },
+        raster_axes: None,
     }
 }
 
@@ -80,6 +81,7 @@ fn rows(name: &str, max: u32, width: u32, dtype: DType) -> OutputInfo {
         shape_bound: ShapeBound {
             dims: vec![DimBound::Device { max }, DimBound::Static(width)],
         },
+        raster_axes: None,
     }
 }
 
@@ -88,8 +90,15 @@ const MAX_CONDITION_ROWS: u32 = 4_096;
 const MAX_CONDITION_PIXELS: u32 = 1 << 20;
 const MAX_VISION_PATCHES: u32 = 4_096;
 
+/// The largest raster the fixture's video decoder admits.
+const MAX_RASTER: Canvas = Canvas {
+    width: 32,
+    height: 32,
+};
+
 /// A decoded media unit result as a video decoder declares it: units along a
-/// device-actual leading axis, then frames, height, width and RGB channels.
+/// device-actual leading axis, then frames, the raster's height and width at
+/// their largest admitted extents, and RGB channels.
 fn media_units(name: &str, units: u32) -> OutputInfo {
     OutputInfo {
         name: name.to_owned(),
@@ -98,11 +107,15 @@ fn media_units(name: &str, units: u32) -> OutputInfo {
             dims: vec![
                 DimBound::Device { max: units },
                 DimBound::Static(4),
-                DimBound::Static(16),
-                DimBound::Static(24),
+                DimBound::Static(MAX_RASTER.height),
+                DimBound::Static(MAX_RASTER.width),
                 DimBound::Static(3),
             ],
         },
+        raster_axes: Some(RasterAxes {
+            height: 2,
+            width: 3,
+        }),
     }
 }
 
@@ -1063,4 +1076,83 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
             && message.contains(&(3 * MAX_CONDITION_ROWS + 2).to_string()),
         "{message}"
     );
+}
+
+/// A `t2va` request of two media units at `canvas`.
+fn canvas_request(id: u64, canvas: Canvas) -> Request {
+    let Request::Diffusion(mut request) = video_request(id, 2) else {
+        unreachable!("the fixture is a video request");
+    };
+    request.sampling.width = canvas.width;
+    request.sampling.height = canvas.height;
+    Request::Diffusion(request)
+}
+
+/// Each video request's decoded media units are reserved at its own canvas:
+/// the raster axes, which the decoder declares at its largest admitted
+/// raster, take the request's height and width, so a round's product is the
+/// round's units of exactly the request's frames. A canvas beyond the
+/// declared raster is refused, naming the product and both extents.
+#[test]
+fn decoded_media_units_are_reserved_at_each_request_canvas() {
+    let wide = Canvas {
+        width: 24,
+        height: 16,
+    };
+    let tall = Canvas {
+        width: 16,
+        height: 32,
+    };
+    let oversized = Canvas {
+        width: 48,
+        height: 16,
+    };
+    let served = serve(
+        video_worker(2, 2),
+        vec![
+            canvas_request(1, wide),
+            canvas_request(2, tall),
+            canvas_request(3, oversized),
+        ],
+    );
+
+    for (id, canvas) in [(1, wide), (2, tall)] {
+        let request = RequestId(id);
+        served.assert_completed(request);
+        let rounds = call_indices(&served, request, MediaCall::VideoDecoding);
+        assert!(!rounds.is_empty());
+        for index in rounds {
+            let (call, _) = &served.calls[index];
+            let product = &call.outputs[0];
+            assert_eq!(
+                product.shape_bound.dims[1..],
+                [
+                    DimBound::Static(4),
+                    DimBound::Static(canvas.height),
+                    DimBound::Static(canvas.width),
+                    DimBound::Static(3),
+                ],
+                "{request:?}"
+            );
+            assert_eq!(
+                product.max_bytes(),
+                u64::from(leading(product)) * 4 * u64::from(canvas.height * canvas.width) * 3
+            );
+        }
+    }
+
+    match served.outcomes[&RequestId(3)].as_slice() {
+        [
+            EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
+                message,
+            },
+        ] => assert!(
+            message.contains("video_units")
+                && message.contains(&MAX_RASTER.width.to_string())
+                && message.contains(&oversized.width.to_string()),
+            "{message}"
+        ),
+        events => panic!("the oversized canvas was not refused: {events:?}"),
+    }
 }

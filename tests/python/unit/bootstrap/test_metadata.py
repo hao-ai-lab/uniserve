@@ -342,6 +342,90 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     )
 
 
+def test_h3_media_units_follow_each_request_canvas():
+    """Decoded media units are laid out at each request's own canvas.
+
+    A worker serving several canvases declares the decoded units at its
+    largest height (9:16) and width (21:9) and names those raster axes,
+    which the engine binds to each request's canvas; the worker lays out
+    each request's units at that canvas. Encoded unit rows carry their own
+    length, so every request uses the declared row.
+    """
+    from tests.python.fixtures.h3 import base_config
+    from uniserve.distributed import Communicator, DeviceMesh
+    from uniserve_models.minimax_h3 import Model
+    from uniserve_worker.bootstrap.outputs import resolve_outputs
+    from uniserve_worker.config.deployment import (
+        ComponentConfig,
+        ParallelConfig,
+    )
+    from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.model_executor.component_binding import (
+        ComponentBinding,
+    )
+    from uniserve_worker.protocol.batch import DecodeRange, DiffusionParams
+    from uniserve_worker.protocol.identity import CallId, RequestKey
+    from uniserve_worker.protocol.tensor import StaticDim
+
+    with torch.device("meta"):
+        model = Model(base_config())
+    config = WorkerConfig(
+        device="cpu",
+        max_sequence_tokens=65,
+        max_video_seconds=5.0,
+        deployment_components=("denoiser", "video_decoder", "video_codec"),
+    )
+    products = {
+        value.name: value
+        for values in resolve_outputs(model, config).values()
+        for value in values
+    }
+    units = products["video_units"]
+    assert units.raster_axes == (2, 3)
+    assert units.shape_bound.dims[1:] == (
+        StaticDim(22),
+        StaticDim(1344),
+        StaticDim(1536),
+        StaticDim(3),
+    )
+    (row,) = products["encoded_units"].shape_bound.dims[1:]
+
+    # One rank decodes and encodes every unit of a round.
+    dimensions = ParallelConfig().dimensions
+    group = Communicator((0,), 0)
+    bindings = {
+        name: ComponentBinding(
+            name,
+            ComponentConfig((0,), distribution="temporal_units"),
+            group,
+            DeviceMesh(
+                ranks=(0,),
+                rank=0,
+                shape=tuple(size for _, size in dimensions),
+                axes=tuple(axis for axis, _ in dimensions),
+            ),
+            group.device,
+        )
+        for name in ("video_decoder", "video_codec")
+    }
+    runner = ModelExecutor(model, config, bindings=bindings)
+    try:
+        round_ = DecodeRange(
+            RequestKey(1, 0, 0), CallId(1, 0), cursor=0, max_units=1
+        )
+        for width, height in ((1536, 672), (1344, 768), (768, 1344)):
+            media = DiffusionParams(124, 7, 50, 1, width=width, height=height)
+            assert runner.output_layout(
+                "video_decoder", 0, media, round_, 10
+            ).shape == (1, 22, height, width, 3)
+            assert runner.output_layout(
+                "video_codec", 0, media, round_, 10
+            ).shape == (1, row.extent)
+    finally:
+        runner.close()
+
+
 @pytest.mark.parametrize(
     "seconds,frames", [(5.0, 124), (10.0, 243), (15.0, 362)]
 )

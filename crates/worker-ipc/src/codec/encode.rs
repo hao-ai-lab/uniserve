@@ -1287,6 +1287,9 @@ fn output_info<'a>(
     let name = Some(b.create_string(&v.name));
     let dtype = dtype_to_fb(v.dtype);
     let extents = Some(b.create_vector(&extents));
+    let (height_axis, width_axis) = v.raster_axes.map_or((-1, -1), |raster| {
+        (raster.height as i32, raster.width as i32)
+    });
     fbs::OutputInfo::create(
         b,
         &fbs::OutputInfoArgs {
@@ -1294,6 +1297,8 @@ fn output_info<'a>(
             dtype,
             extents,
             dynamic_axis,
+            height_axis,
+            width_axis,
         },
     )
 }

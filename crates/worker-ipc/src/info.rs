@@ -138,13 +138,43 @@ pub struct OutputInfo {
     /// Upper bound on the result's shape, used to size storage before the
     /// actual shape is known.
     pub shape_bound: ShapeBound,
+    /// The axes holding a video request's raster, for a result laid out at
+    /// the request's canvas. Their extents in `shape_bound` are the largest
+    /// height and width the worker admits; a request binds them to its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raster_axes: Option<RasterAxes>,
+}
+
+/// The two axes of a result that hold a video request's raster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RasterAxes {
+    /// Axis holding the canvas height in pixels.
+    pub height: u32,
+    /// Axis holding the canvas width in pixels.
+    pub width: u32,
 }
 
 impl OutputInfo {
     /// Validate the logical representation advertised to allocation and routing.
+    ///
+    /// Raster axes must be two distinct static axes of the bound.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(!self.name.is_empty(), "tensor result must have a name");
         self.shape_bound.validate()?;
+        if let Some(raster) = self.raster_axes {
+            let is_static = |axis: u32| {
+                matches!(
+                    self.shape_bound.dims.get(axis as usize),
+                    Some(DimBound::Static(_))
+                )
+            };
+            ensure_valid!(
+                raster.height != raster.width
+                    && is_static(raster.height)
+                    && is_static(raster.width),
+                "a tensor result's raster axes must be two distinct static axes"
+            );
+        }
         Ok(())
     }
 }

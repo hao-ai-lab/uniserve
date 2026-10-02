@@ -184,6 +184,11 @@ table OutputInfo {
   /// Index of the one axis whose extent is known only on the device, or -1
   /// when every axis is static.
   dynamic_axis:int = -1;
+  /// Static axes holding a video request's canvas height and width, whose
+  /// extents are the largest admitted; -1 for a result without a raster.
+  /// Either both are set or neither.
+  height_axis:int = -1;
+  width_axis:int = -1;
 }
 
 table ComponentInfo {

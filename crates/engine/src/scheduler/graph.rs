@@ -13,9 +13,11 @@
 //!
 //! Products are named as the loaded components declare them, so admission
 //! finds each product's output on the component serving its call by name.
-//! The graph holds sizes only: it never inspects media.
+//! A product laid out at the request's raster declares its raster axes, which
+//! admission binds to the graph's canvas. The graph holds sizes only: it never
+//! inspects media.
 
-use uniserve_core::{DiffusionRequest, VideoTask};
+use uniserve_core::{Canvas, DiffusionRequest, VideoTask};
 use uniserve_worker_ipc::MediaCall;
 
 /// Product names, as the worker's components declare their outputs.
@@ -66,6 +68,8 @@ pub(crate) struct GraphProduct {
 pub(crate) struct VideoGraph {
     calls: Vec<MediaCall>,
     products: Vec<GraphProduct>,
+    /// The generated video's raster.
+    canvas: Canvas,
     /// Denoiser rows of each temporal unit the visual latent encoding
     /// covers, condition by condition in request order.
     condition_units: Vec<u32>,
@@ -242,6 +246,10 @@ impl VideoGraph {
         Ok(Self {
             calls,
             products,
+            canvas: Canvas {
+                width: request.sampling.width,
+                height: request.sampling.height,
+            },
             condition_units: conditions
                 .iter()
                 .flat_map(|condition| condition.latent_units.iter().copied())
@@ -282,6 +290,11 @@ impl VideoGraph {
     /// Every product the request reserves at admission.
     pub(crate) fn products(&self) -> &[GraphProduct] {
         &self.products
+    }
+
+    /// The generated video's raster, which binds every raster axis.
+    pub(crate) fn canvas(&self) -> Canvas {
+        self.canvas
     }
 
     /// The product a call publishes under `name`.

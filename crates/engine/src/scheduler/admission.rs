@@ -165,7 +165,9 @@ impl Scheduler {
     /// outputs of the component serving its call, as bound on that call's
     /// first placement candidate. A product with a request extent takes it
     /// as the extent of its output's device-sized axis, which must not exceed
-    /// the declared maximum; a product without one keeps its declared shape.
+    /// the declared maximum; a product without one keeps its declared
+    /// extent there. An output declaring raster axes takes the request's
+    /// canvas height and width in them, each at most the declared extent.
     /// Returns one entry per product: its name, component, output index,
     /// dtype and shape bound.
     ///
@@ -173,9 +175,10 @@ impl Scheduler {
     ///
     /// Returns a message naming the product when no component serves its
     /// call, the component declares no output of that name, the output has
-    /// no device-sized axis for a request extent, or the request's extent is
-    /// zero or exceeds the declared maximum. `enqueue_media` rejects such a
-    /// request, and `admit_media` calls this again to size the reservation.
+    /// no device-sized axis for a request extent, or the request's extent or
+    /// canvas is zero or exceeds the declared maximum. `enqueue_media`
+    /// rejects such a request, and `admit_media` calls this again to size the
+    /// reservation.
     fn media_outputs(&self, graph: &VideoGraph) -> Result<Vec<MediaOutput>, String> {
         let mut outputs = Vec::new();
         for product in graph.products() {
@@ -201,6 +204,31 @@ impl Scheduler {
                 .find(|(_, output)| output.name == product.name)
                 .ok_or_else(|| format!("component {name} declares no {} output", product.name))?;
             let mut shape = output.shape_bound.clone();
+            // A product laid out at the request's raster holds the canvas in
+            // its raster axes, whose declared extents are the largest the
+            // worker admits.
+            if let Some(raster) = output.raster_axes {
+                let canvas = graph.canvas();
+                for (axis, extent, side) in [
+                    (raster.height, canvas.height, "height"),
+                    (raster.width, canvas.width, "width"),
+                ] {
+                    let Some(DimBound::Static(max)) = shape.dims.get(axis as usize).copied() else {
+                        return Err(format!(
+                            "{} of component {name} has no static {side} axis",
+                            product.name
+                        ));
+                    };
+                    if extent == 0 || extent > max {
+                        return Err(format!(
+                            "{} of component {name} holds a {side} of at most {max} pixels, the \
+                             request's canvas has {extent}",
+                            product.name
+                        ));
+                    }
+                    shape.dims[axis as usize] = DimBound::Static(extent);
+                }
+            }
             if let Some(extent) = product.extent {
                 let dim = shape
                     .dims

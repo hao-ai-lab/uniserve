@@ -1369,17 +1369,38 @@ fn worker_info_round_trips() {
             components: vec![ComponentInfo {
                 name: "denoiser".into(),
                 config: ComponentConfig::parallel((0..count).rev().collect(), config),
-                outputs: vec![OutputInfo {
-                    name: "conditioning".into(),
-                    dtype: DType::BF16,
-                    shape_bound: ShapeBound {
-                        dims: vec![
-                            DimBound::Static(1),
-                            DimBound::Device { max: 16384 },
-                            DimBound::Static(2560),
-                        ],
+                outputs: vec![
+                    OutputInfo {
+                        name: "conditioning".into(),
+                        dtype: DType::BF16,
+                        shape_bound: ShapeBound {
+                            dims: vec![
+                                DimBound::Static(1),
+                                DimBound::Device { max: 16384 },
+                                DimBound::Static(2560),
+                            ],
+                        },
+                        raster_axes: None,
                     },
-                }],
+                    // A product laid out at the request's raster names it.
+                    OutputInfo {
+                        name: "video_units".into(),
+                        dtype: DType::U8,
+                        shape_bound: ShapeBound {
+                            dims: vec![
+                                DimBound::Device { max: 8 },
+                                DimBound::Static(22),
+                                DimBound::Static(1344),
+                                DimBound::Static(1536),
+                                DimBound::Static(3),
+                            ],
+                        },
+                        raster_axes: Some(RasterAxes {
+                            height: 2,
+                            width: 3,
+                        }),
+                    },
+                ],
             }],
             ..Default::default()
         };
