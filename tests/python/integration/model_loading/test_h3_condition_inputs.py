@@ -125,7 +125,12 @@ def _runner(checkpoint: Path, modules, placed) -> ModelExecutor:
         )
         for name, distribution in placed
     }
-    return ModelExecutor(model, config, bindings=bindings)
+    runner = ModelExecutor(model, config, bindings=bindings)
+    # A worker seals startup before it admits requests, so request calls
+    # without a graph captured at startup, as condition encodings are, run
+    # eagerly.
+    runner.complete_startup()
+    return runner
 
 
 def _request(root: Path, case: str, ffmpeg: str):
