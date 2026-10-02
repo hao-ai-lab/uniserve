@@ -902,11 +902,14 @@ impl WorkerExecutor {
             .find(|entry| entry.name == producer.component);
         let destination = entries.iter().find(|entry| entry.name == consumer_entry);
         if producer.component == consumer_entry {
-            // A consumer call on the component that produced the product is aligned
-            // with the round that produced it: the same media units in the same
-            // order on the same ranks, so each rank consumes the shard it wrote
-            // and no rank needs another's.
-            return true;
+            // A consumer call on the component that produced the product runs on
+            // the same ranks. Each rank reads the copy it wrote when every rank
+            // writes one: a distributed component's round deals the same media
+            // units in the same order to the same ranks, and a sequence-parallel
+            // rank writes its own shard. A tensor-parallel or pipelined component
+            // publishes from its output ranks alone, so its other ranks read the
+            // product's publication.
+            return source.is_some_and(|source| source.config.publishes_on_every_rank());
         }
         source
             .zip(destination)
