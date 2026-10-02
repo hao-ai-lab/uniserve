@@ -37,7 +37,7 @@ class DenoiserSize:
             not isinstance(self.frame, image.Config)
             or (self.frame.height, self.frame.width) not in FRAME_SIZES
         ):
-            raise ValueError("H3 generates 1344x768 or 768x1344 video")
+            raise ValueError("H3 generates only its training-bucket rasters")
         if type(self.num_text_tokens) is not int or self.num_text_tokens < 1:
             raise ValueError(
                 "H3 conditioning must contain a positive number of text tokens"

@@ -64,6 +64,18 @@ def _aligned(elements: int) -> int:
     return -(-int(elements) // SAMPLE_ALIGNMENT) * SAMPLE_ALIGNMENT
 
 
+def _layout_elements(denoiser: VideoDenoiser, layout) -> int:
+    """Count the elements of a layout's workspace and state buffers."""
+    fields = dict(denoiser.state_buffers(layout))
+    query = getattr(denoiser, "workspace_buffers", None)
+    if query is not None:
+        workspace = query(layout)
+        fields.update(
+            {f"workspace.{name}": field for name, field in workspace.items()}
+        )
+    return sum(math.prod(field.shape) for field in fields.values())
+
+
 def bound(first: BufferConfig, second: BufferConfig) -> BufferConfig:
     """Return the field whose extents hold both, dimension by dimension.
 
@@ -146,7 +158,22 @@ class MediaBuilder:
         # Admission advertises complete native windows, including the final
         # overlap. Cover the configured duration with the next legal input.
         frames = denoiser.legal_frame_count(max_frames)
-        self.frame_sizes = tuple(frame_sizes)
+        # The leading layout bounds every other layout's workspace and state
+        # (``DiffusionRunner.for_layouts``), so the raster whose largest
+        # layout needs the most storage leads; ties keep the given order.
+        self.frame_sizes = tuple(
+            sorted(
+                frame_sizes,
+                key=lambda frame: (
+                    -_layout_elements(
+                        denoiser,
+                        denoiser.layout_size(
+                            denoiser.make_size(frames, frame, max_text_tokens)
+                        ),
+                    )
+                ),
+            )
+        )
         self.max_frames = frames
         self.max_text_tokens = max_text_tokens
         # The largest admitted size at each raster; together they bound every
@@ -245,7 +272,8 @@ class MediaBuilder:
 
         The leading layout of each raster holds every admitted size at that
         raster and bounds the shapes of that raster's other layouts dimension
-        by dimension.
+        by dimension. The first raster is the one whose leading layout needs
+        the most storage, so ``layouts()[0]`` bounds every layout.
         """
         return tuple(
             self.denoiser.layout_size(

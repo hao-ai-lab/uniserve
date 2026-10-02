@@ -135,15 +135,14 @@ def decoded_units_layout(
 
 
 def encoded_units_layout(
-    decoder: VideoDecoder,
-    num_frames: int,
-    frame: image.Config | None = None,
+    decoder: VideoDecoder, num_frames: int
 ) -> OutputLayout:
     """Describe a video encoding round's product: framed encoded unit rows.
 
     An encoded unit's length is not known when its row is reserved, so a row
-    is bounded by the largest unit and carries its own length. Without
-    ``frame`` the row bounds a unit at any of the decoder's rasters.
+    is bounded by the largest unit at any of the decoder's rasters and
+    carries its own length. The row's extent is static, so every request
+    reserves the same row whatever raster it selects.
     """
     from uniserve_worker.media.mux import encoded_unit_bytes
 
@@ -151,7 +150,7 @@ def encoded_units_layout(
     frames = max(window.stop - window.start for window in windows)
     row = max(
         encoded_unit_bytes(frames, size.height, size.width)
-        for size in (decoder.frame_sizes if frame is None else (frame,))
+        for size in decoder.frame_sizes
     )
     return OutputLayout(
         (len(windows), row),

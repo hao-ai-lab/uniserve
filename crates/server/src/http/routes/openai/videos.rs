@@ -154,12 +154,13 @@ pub(crate) async fn videos_sync(
 ///
 /// Both content types deserialize into the same `VideoGenerationRequest`, whose
 /// `deny_unknown_fields` rejects unknown JSON fields. The multipart path admits
-/// only the text fields `model`, `prompt`, `seconds`, `seed`, and `aspect_ratio`, rejects file
+/// only the text fields `model`, `prompt`, `seconds`, `seed`, `resolution`, and `aspect_ratio`,
+/// rejects file
 /// parts and repeated fields, and parses `seconds` as a finite number and
 /// `seed` as an unsigned integer before deserializing. Every rejection is
 /// `400 Bad Request` except an unsupported content type, which is
 /// `415 Unsupported Media Type`. Semantic checks (served model, prompt,
-/// duration, aspect ratio) happen later, in `InputProcessor::video_sampling` and
+/// duration, raster) happen later, in `InputProcessor::video_sampling` and
 /// `InputProcessor::preprocess_video_request`.
 pub(crate) struct VideoBody(pub VideoGenerationRequest);
 
@@ -189,7 +190,15 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
                 ApiError::invalid_request(error.to_string(), None).into_response()
             })? {
                 let name = field.name().unwrap_or("").to_owned();
-                if !["model", "prompt", "seconds", "seed", "aspect_ratio"].contains(&name.as_str())
+                if ![
+                    "model",
+                    "prompt",
+                    "seconds",
+                    "seed",
+                    "resolution",
+                    "aspect_ratio",
+                ]
+                .contains(&name.as_str())
                     || field.file_name().is_some()
                 {
                     return Err(ApiError::invalid_request(
@@ -280,6 +289,7 @@ pub(crate) async fn videos_create(
         &request_id,
         body.seconds,
         body.seed,
+        body.resolution,
         body.aspect_ratio,
     ) {
         Ok(options) => options,
@@ -570,6 +580,7 @@ mod tests {
     fn video_state() -> AppState {
         sim_state(ModelParameters::MiniMaxH3 {
             max_video_seconds: 15.0,
+            video_rasters: crate::profile::video::VideoRasters::default(),
             num_inference_steps: 4,
         })
     }
@@ -662,12 +673,13 @@ mod tests {
         assert_eq!(left.seed, 42);
     }
 
-    /// `aspect_ratio` names the output orientation in both formats and is
-    /// absent unless given; a value that names no aspect ratio is a bad
-    /// request.
+    /// `resolution` and `aspect_ratio` name the output raster in both formats
+    /// and are absent unless given; a value that names no resolution or
+    /// aspect ratio is a bad request.
     #[tokio::test]
-    async fn aspect_ratio_is_read_from_both_formats() {
+    async fn raster_fields_are_read_from_both_formats() {
         use crate::profile::omni::resolution::ResolutionName;
+        use crate::profile::video::VideoResolution;
 
         let json = |body: &str| {
             axum::extract::Request::builder()
@@ -675,12 +687,13 @@ mod tests {
                 .body(Body::from(body.to_owned()))
                 .unwrap()
         };
-        let multipart = |aspect_ratio: &str| {
+        let multipart = |resolution: &str, aspect_ratio: &str| {
             axum::extract::Request::builder()
                 .header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
                 .body(Body::from(format!(
                     "--clip\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nFastH3\r\n\
                      --clip\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nA river\r\n\
+                     --clip\r\nContent-Disposition: form-data; name=\"resolution\"\r\n\r\n{resolution}\r\n\
                      --clip\r\nContent-Disposition: form-data; name=\"aspect_ratio\"\r\n\r\n{aspect_ratio}\r\n\
                      --clip--\r\n"
                 )))
@@ -691,18 +704,22 @@ mod tests {
             .await
             .unwrap()
             .0;
+        assert_eq!(absent.resolution, None);
         assert_eq!(absent.aspect_ratio, None);
 
         let portrait = VideoBody::from_request(
-            json(r#"{"model":"FastH3","prompt":"A river","aspect_ratio":"9:16"}"#),
+            json(
+                r#"{"model":"FastH3","prompt":"A river","resolution":"480p","aspect_ratio":"21:9"}"#,
+            ),
             &(),
         )
         .await
         .unwrap()
         .0;
-        assert_eq!(portrait.aspect_ratio, Some(ResolutionName::Portrait9x16));
+        assert_eq!(portrait.resolution, Some(VideoResolution::P480));
+        assert_eq!(portrait.aspect_ratio, Some(ResolutionName::Landscape21x9));
         assert_eq!(
-            VideoBody::from_request(multipart("9:16"), &())
+            VideoBody::from_request(multipart("480p", "21:9"), &())
                 .await
                 .unwrap()
                 .0,
@@ -711,7 +728,9 @@ mod tests {
 
         for request in [
             json(r#"{"model":"FastH3","prompt":"A river","aspect_ratio":"portrait"}"#),
-            multipart("9x16"),
+            json(r#"{"model":"FastH3","prompt":"A river","resolution":"720p"}"#),
+            multipart("768p", "9x16"),
+            multipart("768", "9:16"),
         ] {
             match VideoBody::from_request(request, &()).await {
                 Ok(VideoBody(body)) => panic!("accepted {body:?}"),

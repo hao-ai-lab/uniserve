@@ -44,9 +44,24 @@ ROPE_FRAME_RESCALE = 5.0 / 3.0
 # clip: 1 + 4 * 4 = 17.
 ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
 _ROPE_SPATIAL_SCALE = 32.0
-# Output (height, width) rasters the packing serves: 16:9 landscape and 9:16
-# portrait. Both pack 1008 video rows per latent frame.
-FRAME_SIZES = ((768, 1344), (1344, 768))
+# Output (height, width) rasters of the checkpoint's training buckets: the
+# 21:9, 16:9, 4:3, 1:1, 3:4 and 9:16 aspect ratios at the 768p and 480p
+# resolutions. Every side is a whole number of 32-pixel latent tokens; a
+# deployment serves a subset (``output.Config.frame_sizes``).
+FRAME_SIZES = (
+    (672, 1536),
+    (768, 1344),
+    (768, 1024),
+    (768, 768),
+    (1024, 768),
+    (1344, 768),
+    (416, 992),
+    (480, 832),
+    (480, 640),
+    (480, 480),
+    (640, 480),
+    (832, 480),
+)
 
 
 def video_latent_frames(num_frames: int) -> int:
@@ -204,7 +219,7 @@ def build_packing(
     """
     if (height, width) not in FRAME_SIZES:
         raise ValueError(
-            "the FastH3 profile requires 1344x768 or 768x1344 output"
+            f"the FastH3 profile has no {width}x{height} training bucket"
         )
     if num_text_tokens < 1:
         raise ValueError("the FastH3 profile requires nonempty text")

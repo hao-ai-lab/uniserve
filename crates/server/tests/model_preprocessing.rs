@@ -144,9 +144,14 @@ fn try_resolved_model(
     // is built by `ModelConfig::from_pipeline`, here with the server's default
     // 15-second maximum video duration.
     let config = match description {
-        ModelDescription::MiniMaxH3 => {
-            ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096)).unwrap()
-        }
+        ModelDescription::MiniMaxH3 => ModelConfig::from_pipeline(
+            description.id(),
+            description,
+            15.0,
+            uniserve_server::profile::video::VideoRasters::default(),
+            Some(4096),
+        )
+        .unwrap(),
         _ => tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
@@ -364,6 +369,7 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
                 prompt: prompt.to_string(),
                 seconds: Some(seconds),
                 seed: 17,
+                resolution: None,
                 aspect_ratio: None,
             },
         )
@@ -408,6 +414,7 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
                     prompt: prompt.to_string(),
                     seconds: Some(seconds),
                     seed: 17,
+                    resolution: None,
                     aspect_ratio: None,
                 },
             )
@@ -447,6 +454,7 @@ fn video_duration_capacity_is_a_deployment_limit() {
         let mut config = loaded.config().clone();
         config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
             max_video_seconds,
+            video_rasters: Default::default(),
             num_inference_steps: 8,
         };
         InputProcessor::new(
@@ -473,20 +481,50 @@ fn video_duration_capacity_is_a_deployment_limit() {
     assert_eq!(capabilities["model_max_seconds"], 15.0);
     assert_eq!(capabilities["fps"], 24);
     let id = ServeRequestId::new("capacity");
-    let (seconds, sampling) = model.video_sampling(&id, Some(10.0), 3, None).unwrap();
+    let (seconds, sampling) = model
+        .video_sampling(&id, Some(10.0), 3, None, None)
+        .unwrap();
     assert_eq!((seconds, sampling.num_frames), (10.0, 243));
-    assert!(model.video_sampling(&id, Some(10.5), 3, None).is_err());
+    assert!(
+        model
+            .video_sampling(&id, Some(10.5), 3, None, None)
+            .is_err()
+    );
 }
 
-/// A video request picks its output raster by aspect ratio: 16:9 by default
-/// is 1344x768 and 9:16 is 768x1344, and the capabilities advertise both.
-/// Other aspect ratios are rejected before admission.
+/// A video request picks its output raster by resolution and aspect ratio
+/// from the deployment's provisioned product. The default deployment serves
+/// 768p 16:9 (1344x768, the default) and 9:16; one provisioning every trained
+/// bucket serves each at its trained size, and the capabilities advertise
+/// the product. Unprovisioned rasters are rejected before admission.
 #[test]
-fn video_aspect_ratio_selects_the_output_raster() {
+fn video_resolution_and_aspect_ratio_select_the_output_raster() {
     use uniserve_server::profile::omni::resolution::ResolutionName;
+    use uniserve_server::profile::video::{VIDEO_ASPECT_RATIOS, VideoRasters, VideoResolution};
 
-    let (_directory, _tokenizer, model) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let request = |aspect_ratio| {
+    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
+    let processor = |video_rasters: VideoRasters| {
+        let mut config = loaded.config().clone();
+        config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
+            max_video_seconds: 15.0,
+            video_rasters,
+            num_inference_steps: 8,
+        };
+        InputProcessor::new(
+            config,
+            std::sync::Arc::clone(&tokenizer),
+            None,
+            uniserve_server::serving::WorkerCapabilities {
+                limits: runtime_limits(),
+                sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
+                max_model_tokens: 4096,
+                denoise_steps: 8,
+            },
+            true,
+        )
+        .unwrap()
+    };
+    let request = |model: &InputProcessor, resolution, aspect_ratio| {
         model.preprocess_video_request(
             &ServeRequestId::new("video"),
             uniserve_server::openai::VideoGenerationRequest {
@@ -494,34 +532,86 @@ fn video_aspect_ratio_selects_the_output_raster() {
                 prompt: "a lighthouse at dusk".to_string(),
                 seconds: Some(5.0),
                 seed: 17,
+                resolution,
                 aspect_ratio,
             },
         )
     };
-    let raster = |aspect_ratio| {
-        let sampling = request(aspect_ratio).unwrap().sampling;
+    let raster = |model: &InputProcessor, resolution, aspect_ratio| {
+        let sampling = request(model, resolution, aspect_ratio).unwrap().sampling;
+        // Every raster keeps the requested duration.
+        assert_eq!(sampling.num_frames, 124);
         (sampling.width, sampling.height)
     };
 
-    assert_eq!(raster(None), (1344, 768));
-    assert_eq!(raster(Some(ResolutionName::Landscape16x9)), (1344, 768));
-    assert_eq!(raster(Some(ResolutionName::Portrait9x16)), (768, 1344));
-    // Both orientations keep the requested duration.
+    let default = processor(VideoRasters::default());
+    assert_eq!(raster(&default, None, None), (1344, 768));
     assert_eq!(
-        request(Some(ResolutionName::Portrait9x16))
-            .unwrap()
-            .sampling
-            .num_frames,
-        124
+        raster(&default, None, Some(ResolutionName::Portrait9x16)),
+        (768, 1344)
     );
-    assert!(request(Some(ResolutionName::Square)).is_err());
-
-    let capabilities = model.video_capabilities();
+    assert!(request(&default, None, Some(ResolutionName::Square)).is_err());
+    assert!(request(&default, Some(VideoResolution::P480), None).is_err());
+    let capabilities = default.video_capabilities();
+    assert_eq!(capabilities["default_resolution"], "768p");
     assert_eq!(capabilities["default_aspect_ratio"], "16:9");
-    assert_eq!(capabilities["aspect_ratios"]["16:9"]["width"], 1344);
-    assert_eq!(capabilities["aspect_ratios"]["16:9"]["height"], 768);
-    assert_eq!(capabilities["aspect_ratios"]["9:16"]["width"], 768);
-    assert_eq!(capabilities["aspect_ratios"]["9:16"]["height"], 1344);
+    assert_eq!(
+        (
+            capabilities["width"].clone(),
+            capabilities["height"].clone()
+        ),
+        (1344.into(), 768.into())
+    );
+    assert_eq!(capabilities["resolutions"], serde_json::json!(["768p"]));
+    assert_eq!(
+        capabilities["aspect_ratios"],
+        serde_json::json!(["16:9", "9:16"])
+    );
+    assert_eq!(capabilities["sizes"]["768p"]["9:16"]["width"], 768);
+    assert_eq!(capabilities["sizes"]["768p"]["9:16"]["height"], 1344);
+
+    let every = processor(VideoRasters::new(&VideoResolution::ALL, &VIDEO_ASPECT_RATIOS).unwrap());
+    let expected = [
+        (
+            VideoResolution::P768,
+            [
+                (1536, 672),
+                (1344, 768),
+                (1024, 768),
+                (768, 768),
+                (768, 1024),
+                (768, 1344),
+            ],
+        ),
+        (
+            VideoResolution::P480,
+            [
+                (992, 416),
+                (832, 480),
+                (640, 480),
+                (480, 480),
+                (480, 640),
+                (480, 832),
+            ],
+        ),
+    ];
+    for (resolution, sizes) in expected {
+        for (aspect_ratio, size) in VIDEO_ASPECT_RATIOS.into_iter().zip(sizes) {
+            assert_eq!(raster(&every, Some(resolution), Some(aspect_ratio)), size);
+            let advertised =
+                &every.video_capabilities()["sizes"][resolution.as_str()][aspect_ratio.as_str()];
+            assert_eq!(
+                (advertised["width"].clone(), advertised["height"].clone()),
+                (size.0.into(), size.1.into())
+            );
+        }
+    }
+    // The first configured resolution and aspect ratio are the defaults.
+    assert_eq!(raster(&every, None, None), (1536, 672));
+    assert_eq!(
+        raster(&every, Some(VideoResolution::P480), None),
+        (992, 416)
+    );
 }
 
 /// `InputProcessor::new` replaces the checkpoint's context length with the
@@ -848,6 +938,7 @@ fn omitted_video_duration_uses_the_advertised_model_default() {
     let mut config = loaded.config().clone();
     config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
         max_video_seconds: 4.5,
+        video_rasters: Default::default(),
         num_inference_steps: 4,
     };
     let model = InputProcessor::new(

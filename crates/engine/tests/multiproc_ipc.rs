@@ -3025,6 +3025,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "flow_graph_shapes": null,
     "min_video_seconds": null,
     "video_text_capacities": null,
+    "video_frame_sizes": null,
     "flashinfer_workspace_size": 536870912,
     "flashinfer_use_tensor_core": null,
     "flashinfer_decode_backend": "fa2",

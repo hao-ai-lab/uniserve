@@ -209,7 +209,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         # selects this rank's rows.
         if modality == "video":
             # The latent raster is 16x compressed, and each 2x2 patch is one
-            # token: 24x42 tokens per frame for either served raster.
+            # token: 32 output pixels per token side, from 15x15 (480x480)
+            # to 21x48 (1536x672) tokens per frame.
             tokens = (size.frame.height // 32) * (size.frame.width // 32)
             return video_latent_frames(
                 size.num_frames

@@ -16,13 +16,16 @@ from uniserve.media import image, video
 from uniserve.model import VideoPostprocessor as BaseVideoPostprocessor
 from uniserve.tensors import BufferConfig, OutputLayout
 
+from .packing import FRAME_SIZES
+
 
 @dataclass(frozen=True, slots=True)
 class Config:
     """Output rasters and the video frame and audio sample clocks in Hz.
 
-    ``frame_sizes`` lists the served rasters: 16:9 landscape first, then
-    9:16 portrait.
+    ``frame_sizes`` lists the served rasters, distinct training buckets
+    from ``packing.FRAME_SIZES``. The default is 768p 16:9 landscape, then
+    9:16 portrait; a deployment's ``--video-frame-sizes`` replaces it.
     """
 
     frame_sizes: tuple[image.Config, ...] = (
@@ -37,6 +40,13 @@ class Config:
             not isinstance(frame, image.Config) for frame in self.frame_sizes
         ):
             raise ValueError("H3 output requires at least one raster")
+        if any(
+            (frame.height, frame.width) not in FRAME_SIZES
+            for frame in self.frame_sizes
+        ):
+            raise ValueError("H3 output rasters must be training buckets")
+        if len(set(self.frame_sizes)) != len(self.frame_sizes):
+            raise ValueError("H3 output rasters must be distinct")
         if any(
             type(value) is not int or value < 1
             for value in (self.frame_rate, self.sample_rate)

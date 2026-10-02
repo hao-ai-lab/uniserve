@@ -22,6 +22,8 @@ use uniserve_engine::{
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
+use uniserve_server::profile::omni::resolution::ResolutionName;
+use uniserve_server::profile::video::VideoResolution;
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, SchedulingPolicy,
 };
@@ -137,6 +139,24 @@ pub(crate) struct SharedRuntimeArgs {
     /// advertised as `max_seconds`.
     #[arg(long = "max-video-seconds", default_value_t = 15.0)]
     pub max_video_seconds: f64,
+    /// Comma-separated video resolution classes (`768p`, `480p`) a video
+    /// deployment prepares; the first is the request default. Every listed
+    /// resolution is served at every `--video-aspect-ratios` entry.
+    #[arg(
+        long = "video-resolutions",
+        value_delimiter = ',',
+        default_value = "768p"
+    )]
+    pub video_resolutions: Vec<VideoResolution>,
+    /// Comma-separated video aspect ratios, from the trained buckets `21:9`,
+    /// `16:9`, `4:3`, `1:1`, `3:4`, `9:16`, a video deployment prepares; the
+    /// first is the request default.
+    #[arg(
+        long = "video-aspect-ratios",
+        value_delimiter = ',',
+        default_value = "16:9,9:16"
+    )]
+    pub video_aspect_ratios: Vec<ResolutionName>,
     /// Optional explicit KV token capacity override for the worker.
     #[arg(long = "max-total-tokens")]
     pub kv_token_capacity: Option<u64>,
@@ -337,6 +357,8 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
+            video_resolutions: self.video_resolutions.clone(),
+            video_aspect_ratios: self.video_aspect_ratios.clone(),
             // Without a written configuration a deployment serves one
             // component over every rank. A model whose components are placed
             // differently -- on disjoint ranks, or with distinct partitions --

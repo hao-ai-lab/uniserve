@@ -9,9 +9,9 @@ use super::common::Normalizable;
 ///
 /// The request carries no frame-rate or step controls. `InputProcessor::video_sampling`
 /// resolves `seconds` into an aligned frame count at 24 fps, resolves
-/// `aspect_ratio` into the output frame raster, takes the step count from the
-/// model configuration, and rejects durations and aspect ratios the model
-/// cannot serve.
+/// `resolution` and `aspect_ratio` into the output frame raster, takes the
+/// step count from the model configuration, and rejects durations and rasters
+/// the deployment does not serve.
 ///
 /// The HTTP `VideoBody` extractor deserializes it from a JSON body or from
 /// multipart fields, and `deny_unknown_fields` rejects any other field; the
@@ -30,8 +30,14 @@ pub struct VideoGenerationRequest {
     /// lesser of 5 seconds and the model's configured maximum.
     #[serde(default)]
     pub seconds: Option<f64>,
-    /// Output aspect ratio: `16:9` (1344x768, the default when omitted) or
-    /// `9:16` (768x1344). `video_sampling` rejects every other name.
+    /// Output resolution class, `768p` or `480p`. When omitted,
+    /// `video_sampling` uses the deployment's first configured resolution.
+    #[serde(default)]
+    pub resolution: Option<crate::profile::video::VideoResolution>,
+    /// Output aspect ratio, one of the trained buckets `21:9`, `16:9`, `4:3`,
+    /// `1:1`, `3:4`, `9:16`. When omitted, `video_sampling` uses the
+    /// deployment's first configured aspect ratio; it rejects any aspect
+    /// ratio the deployment does not provision.
     #[serde(default)]
     pub aspect_ratio: Option<crate::profile::omni::resolution::ResolutionName>,
 }

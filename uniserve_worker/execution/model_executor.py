@@ -1002,7 +1002,7 @@ class ModelExecutor:
                 (
                     None,
                     "encoded_units",
-                    encoded_units_layout(self.video_decoder, count, frame),
+                    encoded_units_layout(self.video_decoder, count),
                 ),
             )
         module, name, layout = results[output_index]

@@ -160,3 +160,68 @@ def test_a_layout_holds_only_prompts_that_fit_at_its_frame_count(denoiser):
     assert not denoiser.holds(layout, make(124, 64, PORTRAIT))
     # A text region that is not whole tiles is not a layout.
     assert not denoiser.holds(make(124, 100), make(124, 64))
+
+
+def test_the_leading_layout_bounds_every_trained_bucket(denoiser):
+    """Serving every bucket, ``layouts()[0]`` holds every layout's buffers."""
+    from uniserve_models.minimax_h3.packing import FRAME_SIZES
+
+    rasters = tuple(
+        image.Config(height, width) for height, width in FRAME_SIZES
+    )
+    # Given smallest first, the builder still leads with the largest bucket.
+    builder = MediaBuilder(
+        denoiser,
+        frame_sizes=tuple(reversed(rasters)),
+        max_frames=240,
+        max_text_tokens=1024,
+        min_frames=96,
+    )
+    assert set(builder.frame_sizes) == set(rasters)
+    layouts = builder.layouts()
+    leading = layouts[0]
+
+    def fields(layout):
+        result = dict(denoiser.state_buffers(layout))
+        result.update(
+            {
+                f"workspace.{name}": field
+                for name, field in denoiser.workspace_buffers(layout).items()
+            }
+        )
+        return result
+
+    bounds = fields(leading)
+    for layout in layouts:
+        for name, field in fields(layout).items():
+            assert name in bounds
+            assert len(field.shape) == len(bounds[name].shape)
+            assert all(
+                extent <= bound
+                for extent, bound in zip(field.shape, bounds[name].shape)
+            ), (layout.frame, name)
+
+
+def test_encoded_unit_rows_do_not_depend_on_the_raster():
+    """Every request reserves the encoded row its declaration bounds."""
+    from dataclasses import replace
+
+    from uniserve_models.minimax_h3 import output
+    from uniserve_models.minimax_h3.packing import FRAME_SIZES
+    from uniserve_worker.media.mux import encoded_unit_bytes
+    from uniserve_worker.model_executor.resources import encoded_units_layout
+
+    rasters = tuple(
+        image.Config(height, width) for height, width in FRAME_SIZES
+    )
+    config = Config()
+    config = replace(config, output=output.Config(frame_sizes=rasters))
+    with torch.device("meta"):
+        decoder = Model(config).video_decoder
+    layout = encoded_units_layout(decoder, 243)
+    windows = decoder.frame_slices(243)
+    frames = max(window.stop - window.start for window in windows)
+    assert layout.shape[1] == max(
+        encoded_unit_bytes(frames, frame.height, frame.width)
+        for frame in rasters
+    )
