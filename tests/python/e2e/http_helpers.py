@@ -125,16 +125,21 @@ def post_sse(
 
 
 def t2va_request(
-    model: str, prompt: str, seconds: float, seed: int
+    model: str,
+    prompt: str,
+    seconds: float,
+    seed: int,
+    *,
+    aspect_ratio: str = "16:9",
 ) -> dict[str, Any]:
-    """A MiniMax-H3 text-to-video-and-audio request at the 16:9 canvas."""
+    """A MiniMax-H3 text-to-video-and-audio request at a named canvas."""
     return {
         "model": model,
         "prompt": prompt,
         "task": "t2va",
         "target": {
             "short_edge": 768,
-            "aspect_ratio": "16:9",
+            "aspect_ratio": aspect_ratio,
             "duration_seconds": seconds,
         },
         "seed": seed,
