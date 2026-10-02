@@ -1231,7 +1231,8 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let fixture = serde_json::to_string(&root.join("tests/python/fixtures/rank_media.py"))?;
         // The fixture is run by path, so its own directory leads the import
-        // path; the package it shares with the rest of the suite is named here.
+        // path; name the shared fixture package without dropping configured
+        // source paths for separately packaged dependencies such as kernels.
         let import_root = serde_json::to_string(&root.canonicalize()?)?;
         let name = serde_json::to_string(&name_path)?;
         // `WorkerGroup` runs `<python> -m uniserve_worker.main <args>`, so the
@@ -1241,7 +1242,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         std::fs::write(
             &wrapper,
             format!(
-                "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, PYTHONPATH={import_root}, UNISERVE_TEST_MEDIA_RESPONSE={case:?}, UNISERVE_TEST_MEDIA_NAME={name})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
+                "#!/usr/bin/env python3\nimport os, sys\npaths = [{import_root}, os.environ.get('PYTHONPATH', '')]\nenv = dict(os.environ, PYTHONPATH=os.pathsep.join(path for path in paths if path), UNISERVE_TEST_MEDIA_RESPONSE={case:?}, UNISERVE_TEST_MEDIA_NAME={name})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
