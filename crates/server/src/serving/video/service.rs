@@ -596,6 +596,22 @@ mod tests {
         );
     }
 
+    /// The checkpoint's sequence bound counts the tile-packed condition
+    /// rows: the video-plus-audio request with 1024 text rows packs 1024 +
+    /// 46,848 condition rows + 414 + 37,296 generated rows, 85,582 in all,
+    /// and is refused one row below that bound, naming both counts.
+    #[test]
+    fn the_sequence_bound_counts_tile_packed_rows() {
+        let plan = planned("ref2va_video_audio");
+        let bounded = |bound| packed_service(1 << 17, Some(bound), Some(REGION_TILES));
+        assert_eq!(bounded(85_582).check_rows(&plan, 1024), Ok(()));
+        let message = refusal(bounded(85_581).check_rows(&plan, 1024).unwrap_err());
+        assert!(
+            message.contains("85582") && message.contains("85581"),
+            "{message}"
+        );
+    }
+
     /// A keyframe has no rows in a region packing, so a tile-packing
     /// denoiser refuses it while a dense one admits it.
     #[test]
