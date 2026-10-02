@@ -1,6 +1,6 @@
 # UniServe
 
-UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 guide](docs/fast_h3/fast_h3.md) covers every deployment, precision and option.
+UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 guide](docs/fast_h3/fast_h3.md) covers every deployment, precision and option. UniServe also serves the base MiniMax-H3 checkpoint, with text-to-video, keyframe and reference requests, and FastH3 OmniRef reference requests; the [MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers them.
 
 UniServe is a Python computation library and a Rust server. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, scheduling, request state and response assembly.
 
