@@ -298,32 +298,22 @@ def _fused_qk_norm_rope(
         return False
 
     if counts == (1,) and rotated[0]:
-        # The partial kernel updates its operands in place. Both the sources
-        # and the destinations must satisfy it before the sources are copied.
-        if all(
-            kernels.can_run_triton_qk_rms_norm_rope_inplace(
-                query_value,
-                key_value,
-                q_weights[0],
-                k_weights[0],
-                cos[0],
-                sin[0],
-            )
-            for query_value, key_value in ((q, k), (query, key))
+        # The partial kernel reads the strided sources and writes the outputs,
+        # which may alias them.
+        if kernels.can_run_triton_qk_rms_norm_partial_rope(
+            q, k, q_weights[0], k_weights[0], cos[0], sin[0], query, key
         ):
-            if query is not q:
-                query.copy_(q)
-            if key is not k:
-                key.copy_(k)
-            kernels.triton_qk_rms_norm_rope_inplace(
-                query,
-                key,
+            kernels.triton_qk_rms_norm_partial_rope(
+                q,
+                k,
                 q_weights[0],
                 k_weights[0],
                 cos[0],
                 sin[0],
                 eps,
                 stepwise,
+                query,
+                key,
             )
             return True
         return False

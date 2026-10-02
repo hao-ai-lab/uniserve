@@ -221,7 +221,7 @@ if triton is not None:
 
         Q and K are RMS-normalized in fp32 over the full head and their even
         rotary prefix is rotated split-half with compact factors, the formula
-        of ``triton_qk_rms_norm_rope_inplace`` in ``uniserve_kernels.rope``.
+        of ``triton_qk_rms_norm_partial_rope`` in ``uniserve_kernels.rope``.
         The squared-row sum here adds two half-width partial sums, a
         different fp32 order, so a rounded element can differ from that
         kernel's by one ulp. Each head row is read once as two half-width

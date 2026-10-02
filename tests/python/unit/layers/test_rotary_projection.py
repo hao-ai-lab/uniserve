@@ -733,7 +733,8 @@ def test_sections_must_partition_the_interleaved_frequencies(sections):
     "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
 )
 @pytest.mark.parametrize("axes", ["one partial axis", "rotated and plain axes"])
-def test_stepwise_qk_rotation_rounds_each_eager_operation(device, axes):
+@pytest.mark.parametrize("packed", [False, True])
+def test_stepwise_qk_rotation_rounds_each_eager_operation(device, axes, packed):
     """Stepwise Q/K preparation equals eager BF16 PyTorch bit for bit.
 
     Heads of +-1 have an exact unit mean square, so each weighted
@@ -741,16 +742,17 @@ def test_stepwise_qk_rotation_rounds_each_eager_operation(device, axes):
     the rotation's BF16 products and sums are exact functions of the
     operands. 96 of the 128 channels rotate split-half, declared either as
     one axis whose factors cover a prefix or as a rotated axis followed by
-    an unrotated one.
+    an unrotated one. ``packed`` Q/K are strided row views of one fused
+    projection output, as attention layers produce them.
     """
     generator = torch.Generator().manual_seed(183)
     rows, heads, dim, rotated, eps = 37, 4, 128, 96, 1e-6
 
-    def unit_heads():
-        signs = torch.randint(0, 2, (rows, heads, dim), generator=generator)
-        return (signs * 2 - 1).to(device=device, dtype=torch.bfloat16)
-
-    q, k = unit_heads(), unit_heads()
+    signs = torch.randint(0, 2, (rows, 3, heads, dim), generator=generator)
+    projection = (signs * 2 - 1).to(device=device, dtype=torch.bfloat16)
+    q, k, _ = projection.unbind(1)
+    if not packed:
+        q, k = q.contiguous(), k.contiguous()
     q_weight, k_weight = (
         (torch.rand(dim, generator=generator) + 0.5).to(
             device=device, dtype=torch.bfloat16

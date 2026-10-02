@@ -293,13 +293,19 @@ if triton is not None:
             )
 
     @triton.jit
-    def _qk_rms_norm_partial_rope_inplace_kernel(
+    def _qk_rms_norm_rotary_prefix_kernel(
+        query_source,
+        key_source,
         query,
         key,
         query_weight,
         key_weight,
         cosine,
         sine,
+        query_source_stride_row: tl.constexpr,
+        query_source_stride_head: tl.constexpr,
+        key_source_stride_row: tl.constexpr,
+        key_source_stride_head: tl.constexpr,
         query_stride_row: tl.constexpr,
         query_stride_head: tl.constexpr,
         key_stride_row: tl.constexpr,
@@ -313,12 +319,14 @@ if triton is not None:
         rotary_dim: tl.constexpr,
         stepwise: tl.constexpr,
     ):
-        """Normalize Q/K in place and rotate an even prefix of each head.
+        """Normalize Q/K and rotate an even prefix of each head.
 
-        Compact factors hold one ``[rows, rotary_dim / 2]`` phase per rotated
-        feature pair. Each program owns a disjoint ``[block_rows, head_dim]``
-        tile of one head and loads every value it reads, including partner
-        features, before its stores, so updating in place is safe. ``rows`` is
+        Reads ``query_source``/``key_source`` and writes ``query``/``key``,
+        which may be the same tensors. Compact factors hold one
+        ``[rows, rotary_dim / 2]`` phase per rotated feature pair. Each
+        program owns a disjoint ``[block_rows, head_dim]`` tile of one head
+        and loads every value it reads, including partner features, before
+        its stores, so updating in place is safe. ``rows`` is
         a compile-time constant, so each distinct row count compiles its own
         variant. ``stepwise`` rounds the weighted normalization, the factors
         and each rotation product to the input dtype before the sum, as eager
@@ -331,24 +339,22 @@ if triton is not None:
         columns = tl.arange(0, head_dim)
         valid = row_offsets[:, None] < rows
 
-        query_offsets = (
-            row_offsets[:, None] * query_stride_row
-            + head * query_stride_head
-            + columns[None, :]
+        query_rows = (
+            row_offsets[:, None] * query_source_stride_row
+            + head * query_source_stride_head
         )
-        key_offsets = (
-            row_offsets[:, None] * key_stride_row
-            + head * key_stride_head
-            + columns[None, :]
+        key_rows = (
+            row_offsets[:, None] * key_source_stride_row
+            + head * key_source_stride_head
         )
 
         # query/key tiles: [block_rows, head_dim] for one head.
-        query_values = tl.load(query + query_offsets, mask=valid, other=0.0).to(
-            tl.float32
-        )
-        key_values = tl.load(key + key_offsets, mask=valid, other=0.0).to(
-            tl.float32
-        )
+        query_values = tl.load(
+            query_source + query_rows + columns[None, :], mask=valid, other=0.0
+        ).to(tl.float32)
+        key_values = tl.load(
+            key_source + key_rows + columns[None, :], mask=valid, other=0.0
+        ).to(tl.float32)
         # ``head_dim`` is the power-of-two tile width, so the weight loads
         # need no feature mask.
         query_weights = tl.load(query_weight + columns)[None, :].to(tl.float32)
@@ -378,18 +384,12 @@ if triton is not None:
         )
 
         partner_query = tl.load(
-            query
-            + row_offsets[:, None] * query_stride_row
-            + head * query_stride_head
-            + partner_columns[None, :],
+            query_source + query_rows + partner_columns[None, :],
             mask=valid,
             other=0.0,
         ).to(tl.float32)
         partner_key = tl.load(
-            key
-            + row_offsets[:, None] * key_stride_row
-            + head * key_stride_head
-            + partner_columns[None, :],
+            key_source + key_rows + partner_columns[None, :],
             mask=valid,
             other=0.0,
         ).to(tl.float32)
@@ -458,8 +458,22 @@ if triton is not None:
                 + sign * partner_key * sine_values,
                 normalized_key,
             )
-        tl.store(query + query_offsets, query_output, mask=valid)
-        tl.store(key + key_offsets, key_output, mask=valid)
+        tl.store(
+            query
+            + row_offsets[:, None] * query_stride_row
+            + head * query_stride_head
+            + columns[None, :],
+            query_output,
+            mask=valid,
+        )
+        tl.store(
+            key
+            + row_offsets[:, None] * key_stride_row
+            + head * key_stride_head
+            + columns[None, :],
+            key_output,
+            mask=valid,
+        )
 
     @triton.jit
     def _split_rms_norm_rope_row(
@@ -999,32 +1013,35 @@ def triton_rope(
     )
 
 
-def can_run_triton_qk_rms_norm_rope_inplace(
-    query: torch.Tensor,
-    key: torch.Tensor,
+def can_run_triton_qk_rms_norm_partial_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
     query_weight: torch.Tensor,
     key_weight: torch.Tensor,
     cosine: torch.Tensor,
     sine: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
 ) -> bool:
-    """Check ``[rows, heads, head_dim]`` Q/K for in-place partial rotation.
+    """Check ``[rows, heads, head_dim]`` Q/K sources and outputs.
 
     A program tiles the complete head with ``tl.arange(0, head_dim)`` and no
     feature mask, so ``head_dim`` must be a power of two; it is also bounded
-    by 1024 features. Compact factors hold one row per token and cover an even
-    prefix of the head.
+    by 1024 features. Sources and outputs may use any row and head strides
+    with contiguous features. Compact factors hold one row per token and
+    cover an even prefix of the head. Callers pass each output either as its
+    source or as storage disjoint from it.
     """
-    head_dim = int(query.shape[-1]) if query.ndim == 3 else 0
+    head_dim = int(q.shape[-1]) if q.ndim == 3 else 0
     return (
-        _resident(query, key, query_weight, key_weight, cosine, sine)
-        and query.ndim == 3
-        and query.shape == key.shape
-        and query.dtype == key.dtype
-        and query.numel() > 0
+        _resident(q, k, query, key, query_weight, key_weight, cosine, sine)
+        and q.ndim == 3
+        and q.shape == k.shape == query.shape == key.shape
+        and q.dtype == k.dtype == query.dtype == key.dtype
+        and q.numel() > 0
         and 0 < head_dim <= 1024
         and head_dim & (head_dim - 1) == 0
-        and int(query.stride(-1)) == 1
-        and int(key.stride(-1)) == 1
+        and all(int(tensor.stride(-1)) == 1 for tensor in (q, k, query, key))
         and query_weight.shape == (head_dim,)
         and key_weight.shape == (head_dim,)
         and query_weight.is_contiguous()
@@ -1033,48 +1050,56 @@ def can_run_triton_qk_rms_norm_rope_inplace(
         and sine.shape == cosine.shape
         and cosine.is_contiguous()
         and sine.is_contiguous()
-        and int(cosine.shape[0]) == int(query.shape[0])
+        and int(cosine.shape[0]) == int(q.shape[0])
         and 0 < int(cosine.shape[1]) * 2 <= head_dim
     )
 
 
 @torch.library.custom_op(
-    "uniserve::qk_rms_norm_partial_rope_inplace",
+    "uniserve::qk_rms_norm_partial_rope",
     mutates_args=("query", "key"),
 )
-def triton_qk_rms_norm_rope_inplace(
-    query: torch.Tensor,
-    key: torch.Tensor,
+def triton_qk_rms_norm_partial_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
     query_weight: torch.Tensor,
     key_weight: torch.Tensor,
     cosine: torch.Tensor,
     sine: torch.Tensor,
     eps: float,
-    stepwise: bool = False,
+    stepwise: bool,
+    query: torch.Tensor,
+    key: torch.Tensor,
 ) -> None:
-    """Normalize complete Q/K heads and rotate their leading prefix in place.
+    """Normalize complete Q/K heads and rotate their leading prefix.
 
-    Query and key use ``[rows, heads, head_dim]`` layout; compact factors have
-    shape ``[rows, rotary_dim / 2]``. ``stepwise`` rounds each operation of
-    the eager expression to the input dtype instead of rounding once.
-    Callers first check :func:`can_run_triton_qk_rms_norm_rope_inplace`.
+    Reads ``q``/``k`` and writes ``query``/``key``, all in
+    ``[rows, heads, head_dim]`` layout; an output may be its source, which
+    updates it in place. Compact factors have shape
+    ``[rows, rotary_dim / 2]``. ``stepwise`` rounds each operation of the
+    eager expression to the input dtype instead of rounding once. Callers
+    first check :func:`can_run_triton_qk_rms_norm_partial_rope`.
     Registration as a ``torch.library`` custom operator with ``mutates_args``
-    declares the in-place update of ``query`` and ``key`` to PyTorch.
+    declares the update of ``query`` and ``key`` to PyTorch.
     """
-    rows, heads, head_dim = (int(size) for size in query.shape)
+    rows, heads, head_dim = (int(size) for size in q.shape)
 
     # Each program covers eight rows for one head, normalizing the full head
     # before applying factors only to the declared rotary prefix.
     block_rows = 8
-    _qk_rms_norm_partial_rope_inplace_kernel[
-        (triton.cdiv(rows, block_rows), heads)
-    ](
+    _qk_rms_norm_rotary_prefix_kernel[(triton.cdiv(rows, block_rows), heads)](
+        q,
+        k,
         query,
         key,
         query_weight,
         key_weight,
         cosine,
         sine,
+        int(q.stride(0)),
+        int(q.stride(1)),
+        int(k.stride(0)),
+        int(k.stride(1)),
         int(query.stride(0)),
         int(query.stride(1)),
         int(key.stride(0)),
@@ -1094,22 +1119,25 @@ def triton_qk_rms_norm_rope_inplace(
     )
 
 
-@triton_qk_rms_norm_rope_inplace.register_fake
-def _triton_qk_rms_norm_rope_inplace_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
+@triton_qk_rms_norm_partial_rope.register_fake
+def _triton_qk_rms_norm_partial_rope_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
     query_weight: torch.Tensor,
     key_weight: torch.Tensor,
     cosine: torch.Tensor,
     sine: torch.Tensor,
     eps: float,
-    stepwise: bool = False,
+    stepwise: bool,
+    query: torch.Tensor,
+    key: torch.Tensor,
 ) -> None:
     """Fake-tensor implementation: the operator returns nothing.
 
-    The mutation of ``query`` and ``key`` is declared by ``mutates_args``.
+    The update of ``query`` and ``key`` is declared by ``mutates_args``.
     """
-    del query, key, query_weight, key_weight, cosine, sine, eps, stepwise
+    del q, k, query, key, query_weight, key_weight, cosine, sine, eps
+    del stepwise
 
 
 def _qk_rows(
