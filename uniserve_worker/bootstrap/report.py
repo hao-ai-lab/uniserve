@@ -59,6 +59,7 @@ from uniserve_worker.bootstrap.components import (
 )
 from uniserve_worker.bootstrap.inputs import (
     capability,
+    executed_video_tasks,
     image_builder,
     media_builder,
 )
@@ -608,11 +609,6 @@ def _token_worker_layout(
     )
 
 
-# Video tasks whose request calls the worker executes: generation
-# conditioned on the prompt's text encoding alone.
-EXECUTED_VIDEO_TASKS = frozenset({"t2va"})
-
-
 def video_denoiser_info(denoiser: VideoDenoiser) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
 
@@ -624,9 +620,7 @@ def video_denoiser_info(denoiser: VideoDenoiser) -> VideoDenoiserInfo:
         WorkerError: ``UnsupportedSetup`` when the worker executes none of
             the denoiser's tasks.
     """
-    tasks = tuple(
-        task for task in denoiser.tasks if task in EXECUTED_VIDEO_TASKS
-    )
+    tasks = executed_video_tasks(denoiser)
     if not tasks:
         raise unsupported_setup(
             f"the placed video denoiser serves {', '.join(denoiser.tasks)}, "

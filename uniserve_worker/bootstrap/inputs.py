@@ -97,6 +97,18 @@ def video_denoiser(model: nn.Module, config: WorkerConfig):
     return placed[0]
 
 
+# Video tasks whose request calls the worker executes: generation
+# conditioned on the prompt's text encoding alone.
+EXECUTED_VIDEO_TASKS = frozenset({"t2va"})
+
+
+def executed_video_tasks(denoiser: VideoDenoiser) -> tuple[str, ...]:
+    """The denoiser's tasks the worker executes, in the denoiser's order."""
+    return tuple(
+        task for task in denoiser.tasks if task in EXECUTED_VIDEO_TASKS
+    )
+
+
 def media_builder(model: nn.Module, config: WorkerConfig):
     """Instantiate the video input builder within the worker's frame budget.
 

@@ -246,6 +246,8 @@ impl Default for WorkerProcessArgs {
             flashinfer_disable_split_kv: false,
             max_model_len: 8192,
             max_video_seconds: 15.0,
+            max_condition_rows: 0,
+            ffmpeg: "ffmpeg".into(),
             min_video_seconds: None,
         }
     }
@@ -462,6 +464,8 @@ impl WorkerProcessArgs {
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
         fields.insert("max_model_len".into(), json!(self.max_model_len));
         fields.insert("max_video_seconds".into(), json!(self.max_video_seconds));
+        fields.insert("max_condition_rows".into(), json!(self.max_condition_rows));
+        fields.insert("ffmpeg".into(), json!(self.ffmpeg));
         fields.insert("min_video_seconds".into(), json!(self.min_video_seconds));
         fields.insert("graph_policy".into(), json!(self.graph_policy));
         fields.insert(

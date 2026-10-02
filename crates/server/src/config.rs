@@ -73,6 +73,10 @@ pub struct EngineSettings {
     /// Largest request duration, in seconds, resident media state is sized to
     /// serve. `InputProcessor::video_sampling` rejects longer video requests.
     pub max_video_seconds: f64,
+    /// Most denoiser rows a video request's conditions may take
+    /// (`--max-condition-rows`). Video workers provision their condition
+    /// products for it, and the video service rejects requests above it.
+    pub max_condition_rows: u32,
     /// Static Worker configurations with ordered ranks and named computation components.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
@@ -94,6 +98,7 @@ impl Default for EngineSettings {
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: 15.0,
+            max_condition_rows: EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
             // One local CUDA rank running `DEFAULT_COMPONENT`. The `uniserve`
             // CLI and the Dynamo worker binary both replace this with a
             // placement built from their own arguments.
@@ -284,6 +289,12 @@ impl EngineSettings {
     /// transport (64 MiB). `build_state` raises the configured capacity to the
     /// model's channel payload capacity when that is larger.
     pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
+
+    /// Default condition capacity in denoiser rows (128 Ki), the sequence
+    /// capacity of the largest checkpoint that bounds its own. It holds the
+    /// released reference workloads, two reference videos with their
+    /// soundtracks included.
+    pub const DEFAULT_MAX_CONDITION_ROWS: u32 = 1 << 17;
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`

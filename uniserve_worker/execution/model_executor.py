@@ -44,6 +44,7 @@ from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import video
 from uniserve.model import (
     AudioDecoder,
+    AudioEncoder,
     CausalLM,
     Denoiser,
     ImageDenoiser,
@@ -52,7 +53,9 @@ from uniserve.model import (
     TextEncoder,
     TextSize,
     VideoDecoder,
+    VideoEncoder,
     VideoPostprocessor,
+    VisionInput,
 )
 from uniserve.nn.vae import PatchAutoencoder
 from uniserve.processing import ImageProcessor
@@ -91,6 +94,11 @@ from uniserve_worker.errors import (
     WorkerErrorCode,
     classify,
     invalid_descriptor,
+)
+from uniserve_worker.execution.conditions import (
+    CONDITION_PRODUCTS,
+    condition_encoder,
+    condition_layout,
 )
 from uniserve_worker.model_executor.component_binding import (
     ComponentBinding,
@@ -371,22 +379,25 @@ class ModelExecutor:
             )
         return calls[0].module
 
-    def _module_call(self, name, method=None):
+    def _module_call(self, name, method=None, path=None):
         """Return the unique ``(binding, call)`` pair of component ``name``.
 
-        ``method`` selects among the component's numerical methods. Raises
-        ``RuntimeError`` once the executor is closed and ``InputError`` unless
-        exactly one call matches.
+        ``method`` and ``path`` select among the component's numerical
+        methods, ``path`` naming the module of a component that exposes one
+        method name on several modules. Raises ``RuntimeError`` once the
+        executor is closed and ``InputError`` unless exactly one call matches.
         """
         if self._closed:
             raise RuntimeError("model runner is closed")
         entries = [
             (binding, call)
-            for (entry, _, entry_method), (
+            for (entry, entry_path, entry_method), (
                 binding,
                 call,
             ) in self._module_calls.items()
-            if entry == name and (method is None or entry_method == method)
+            if entry == name
+            and (method is None or entry_method == method)
+            and (path is None or entry_path == path)
         ]
         if len(entries) != 1:
             raise InputError(
@@ -394,7 +405,7 @@ class ModelExecutor:
             )
         return entries[0]
 
-    def prepare_module(self, name, size, *, method=None):
+    def prepare_module(self, name, size, *, method=None, path=None):
         """Prepare one exact numerical size before dependent media calls.
 
         Prepared contexts are keyed by the input signature of ``size`` per
@@ -410,7 +421,7 @@ class ModelExecutor:
         in an LRU whose bound is the request pool size; reaching it retires
         the least recently used one. Returns the prepared runner.
         """
-        binding, call = self._module_call(name, method)
+        binding, call = self._module_call(name, method, path)
         key = (name, call.path, call.entry_point.method, input_signature(size))
         if key not in self._module_entries:
             resident = tuple(
@@ -421,7 +432,9 @@ class ModelExecutor:
             if len(resident) >= self.worker_config.max_request_pool_size:
                 self._retire_module(resident[0])
 
-            stream = self.module_stream(name, method=call.entry_point.method)
+            stream = self.module_stream(
+                name, method=call.entry_point.method, path=call.path
+            )
             # The worker holds a module's preparation size as an opaque value.
             context: ExecutionContext[object] = ExecutionContext(
                 call.module,
@@ -488,16 +501,17 @@ class ModelExecutor:
         self._module_entries.move_to_end(key)
         return self._module_entries[key]
 
-    def module_stream(self, name, *, method=None):
+    def module_stream(self, name, *, method=None, path=None):
         """Bind one numerical entry to a stream in its existing resource grant.
 
+        ``method`` and ``path`` select the entry as ``_module_call`` does.
         Returns ``None`` for an entry on a non-CUDA device. Each (entry, path,
         method) gets one stream on first use, kept until ``close``. Raises
         ``InputError`` when more than one lane stream on the entry's device
         covers its call kinds, or when lanes are configured and none does;
         errors of ``_module_call`` and ``_initialize_streams`` propagate.
         """
-        binding, call = self._module_call(name, method)
+        binding, call = self._module_call(name, method, path)
         if binding.device.type != "cuda":
             return None
 
@@ -597,11 +611,24 @@ class ModelExecutor:
                 for candidate in calls
                 if isinstance(candidate.module, VideoDecoder)
             )
+        elif call.kind is MediaCall.LATENT_ENCODING:
+            # A condition encoding round runs the encoder of the latents it
+            # publishes: visual rounds the video encoder, the audio round
+            # the audio encoder.
+            encoder = condition_encoder(call, self.outputs)
+            if encoder is not None:
+                calls = tuple(
+                    candidate
+                    for candidate in calls
+                    if isinstance(candidate.module, encoder)
+                )
 
         if len(calls) != 1:
             raise InputError("call requires one bound numerical capability")
         owner = self.module_stream(
-            call.component, method=calls[0].entry_point.method
+            call.component,
+            method=calls[0].entry_point.method,
+            path=calls[0].path,
         )
         return None if owner is None else owner.stream
 
@@ -686,6 +713,10 @@ class ModelExecutor:
             return "vision"
         if isinstance(module, PatchAutoencoder):
             return "latent"
+        if isinstance(module, VideoEncoder):
+            return "video_condition"
+        if isinstance(module, AudioEncoder):
+            return "audio_condition"
         return "conditioning"
 
     def run_encoder(self, kind, *values, **options):
@@ -720,7 +751,27 @@ class ModelExecutor:
             else tuple(value.shape for value in inputs)
         )
         return self.run_module(
-            name, inputs, method="encode", size=size, **options
+            name, inputs, method="encode", path=call.path, size=size, **options
+        )
+
+    def encode_vision(self, inputs: VisionInput) -> ExecutionOutput:
+        """Run this rank's vision encoder on packed patch samples.
+
+        Returns one ``[tokens, features]`` tensor per sample of ``inputs``.
+        The encoder's context does not depend on the samples' grids, so one
+        context serves every call. Raises ``InputError`` unless exactly one
+        bound vision encoder exists.
+        """
+        found = [
+            (name, call)
+            for (name, _, method), (_, call) in self._module_calls.items()
+            if method == "encode" and isinstance(call.module, PatchEncoder)
+        ]
+        if len(found) != 1:
+            raise InputError("rank does not participate in vision encoding")
+        name, call = found[0]
+        return self.run_module(
+            name, inputs, method="encode", path=call.path, size=None
         )
 
     def _text_capacity(self, num_tokens: int) -> int:
@@ -739,20 +790,40 @@ class ModelExecutor:
             if capacity >= num_tokens
         )
 
-    def encode_text(self, token_ids) -> ExecutionOutput:
+    def encode_text(
+        self,
+        token_ids,
+        *,
+        visual: torch.Tensor | None = None,
+        image_grids: tuple[tuple[int, int, int], ...] = (),
+        video_grids: tuple[tuple[int, int, int], ...] = (),
+    ) -> ExecutionOutput:
         """Encode one prompt's tokens at its text capacity.
 
         The tokens are followed by padding up to ``_text_capacity``. The text
         encoder attends causally, so the padding never reaches the prompt's
-        rows, whose features are returned.
+        rows, whose features are returned. A prompt holding vision blocks
+        passes their features as ``visual``, one row per placeholder in
+        prompt order, with the blocks' image and video grids, from which the
+        encoder derives the prompt's rotary coordinates; padding is text and
+        continues them.
         """
         count = len(token_ids)
         capacity = self._text_capacity(count)
         # Token 0 fills the padding; any vocabulary token serves.
-        tokens = self.prepare_text_tokens(
-            (*token_ids, *(0,) * (capacity - count))
-        )
-        result = self.run_encoder("text", tokens)
+        padded = (*token_ids, *(0,) * (capacity - count))
+        tokens = self.prepare_text_tokens(padded)
+        options = {}
+        if visual is not None:
+            encoder = capability(self.model, TextEncoder)
+            positions = encoder.positions(
+                padded, image_grids=image_grids, video_grids=video_grids
+            )
+            options = {
+                "positions": (positions.to(tokens.device, non_blocking=True),),
+                "visual": (visual,),
+            }
+        result = self.run_encoder("text", tokens, **options)
         return replace(
             result, values=tuple(value[:count] for value in result.values)
         )
@@ -837,10 +908,14 @@ class ModelExecutor:
                 self.encode_conditioning(features(capacity))
 
     @torch.inference_mode()
-    def run_module(self, name, *args, method=None, size=None, **kwargs):
+    def run_module(
+        self, name, *args, method=None, path=None, size=None, **kwargs
+    ):
         """Resolve a bound capability and invoke its numerical runner."""
-        binding, call = self._module_call(name, method)
-        runner = self.prepare_module(name, size, method=call.entry_point.method)
+        binding, call = self._module_call(name, method, path)
+        runner = self.prepare_module(
+            name, size, method=call.entry_point.method, path=call.path
+        )
         with profile_range(
             f"uniserve.model.module rank={self.worker_config.rank} work={name}"
         ):
@@ -894,7 +969,9 @@ class ModelExecutor:
         if self._diffusion is None:
             builder = cast("MediaBuilder", self.media_builder)
             name, binding, call = self._denoiser
-            stream = self.module_stream(name, method=call.entry_point.method)
+            stream = self.module_stream(
+                name, method=call.entry_point.method, path=call.path
+            )
             captures = (
                 self.worker_config.graph_policy != "off" and stream is not None
             )
@@ -952,15 +1029,22 @@ class ModelExecutor:
         )
 
     def output_layout(
-        self, entry, output_index, media, decode, num_prompt_tokens
+        self,
+        entry,
+        output_index,
+        media,
+        decode,
+        num_prompt_tokens,
+        conditions=None,
     ):
         """Resolve the published layout of one call output on this rank.
 
         ``media`` supplies the request's frame count (the builder's maximum
         when ``None``), ``decode`` the media units of a scheduled decode round
-        (every unit when ``None``), and ``num_prompt_tokens`` the prompt
-        length. A distributed component's layout is narrowed to the units
-        this rank publishes.
+        (every unit when ``None``), ``num_prompt_tokens`` the prompt length,
+        and ``conditions`` the request's ``VideoAdmission``, which sizes its
+        condition products. A distributed component's layout is narrowed to
+        the units this rank publishes.
 
         Returns None for outputs this rank does not publish: non-output ranks,
         degenerate denoiser slices, and empty temporal-unit shares of a
@@ -972,6 +1056,16 @@ class ModelExecutor:
             and binding.process_group.global_rank not in binding.output_ranks
         ):
             return None
+
+        declared = self.outputs.get(entry, ())
+        if output_index < len(declared) and (
+            declared[output_index].name in CONDITION_PRODUCTS
+        ):
+            if conditions is None:
+                raise InputError("a condition product needs its conditions")
+            return condition_layout(
+                declared[output_index], conditions, decode, binding
+            )
 
         frames = None if media is None else media.num_frames
         canvas = None if media is None else media.canvas

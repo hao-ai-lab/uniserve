@@ -1104,6 +1104,7 @@ def _reserve_host_tasks(
     for call in scheduled:
         if call.kind not in {
             MediaCall.IMAGE_DECODING,
+            MediaCall.MEDIA_READING,
             MediaCall.VIDEO_ENCODING,
             MediaCall.AUDIO_ENCODING,
             MediaCall.MUXING,
@@ -1294,6 +1295,7 @@ def _reserve_outputs(
                     request.request.admission.diffusion,
                     decode,
                     len(request.request.admission.prompt_token_ids),
+                    request.request.admission.video,
                 )
                 # None: this rank does not publish the output.
                 if layout is None:

@@ -32,7 +32,9 @@ use std::path::Path;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use uniserve_core::{Canvas, VideoTask};
+use uniserve_core::{
+    Canvas, ConditionMedia, ConditionVision, ImageFit, MediaLocator, VideoCondition, VideoTask,
+};
 
 use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
 use super::{RequestField, VideoInputError};
@@ -538,6 +540,127 @@ pub struct ConditionPlan {
     pub video_rows: u32,
     /// Denoiser audio condition rows.
     pub audio_rows: u32,
+}
+
+impl ConditionPlan {
+    /// Denoiser video rows of each temporal unit the video encoder encodes,
+    /// in unit order.
+    ///
+    /// A still image is one unit. A video's `17n + 5` encoded frames are
+    /// `n + 1` units of up to 17 frames: each complete one yields 5 latent
+    /// frames and the last 2, the video encoder dropping the leading 3 of
+    /// its padded final window. An audio reference has none.
+    pub fn latent_units(&self) -> Vec<u32> {
+        match &self.prepared {
+            Prepared::Keyframe(_) | Prepared::Image(_) => vec![self.video_rows],
+            Prepared::Video(clip) => {
+                let windows = (clip.vae_frames - VAE_LATENTS_PER_CHUNK) / VAE_FRAMES_PER_CHUNK;
+                let rows_per_frame = rows_per_frame(clip.canvas);
+                let mut units = vec![VAE_LATENTS_PER_CHUNK * rows_per_frame; windows as usize];
+                units.push(
+                    (latent_frames(clip.vae_frames) - windows * VAE_LATENTS_PER_CHUNK)
+                        * rows_per_frame,
+                );
+                units
+            }
+            Prepared::Audio(_) => Vec::new(),
+        }
+    }
+
+    /// Describes the condition for the engine and the workers: its role, the
+    /// published media at `source`, what the media reader decodes it into,
+    /// what the conditioner reads of it, and the denoiser rows it encodes to.
+    /// `canvas` is the generated canvas, which a keyframe is fitted to.
+    pub fn describe(&self, canvas: Canvas, source: MediaLocator) -> VideoCondition {
+        let audio = |clip: &AudioClip| uniserve_core::AudioClip {
+            sample_rate: clip.sample_rate,
+            start_sample: clip.start_sample,
+            source_samples: clip.source_samples,
+            samples: clip.samples,
+        };
+        let (role, media) = match &self.prepared {
+            Prepared::Keyframe(fit) => {
+                let role = match fit.position {
+                    FramePosition::First => uniserve_core::ConditionRole::FirstFrame,
+                    FramePosition::Last => uniserve_core::ConditionRole::LastFrame,
+                };
+                let size = canvas;
+                // A stretched keyframe is resized straight onto the canvas; a
+                // cover-cropped one past it, then centred.
+                let fit = match fit.cover_crop {
+                    None => ImageFit {
+                        resized: size,
+                        left: 0,
+                        top: 0,
+                        size,
+                    },
+                    Some(crop) => ImageFit {
+                        resized: Canvas {
+                            width: crop.width,
+                            height: crop.height,
+                        },
+                        left: crop.left,
+                        top: crop.top,
+                        size,
+                    },
+                };
+                (role, ConditionMedia::Image(fit))
+            }
+            Prepared::Image(size) => (
+                uniserve_core::ConditionRole::Reference,
+                ConditionMedia::Image(ImageFit {
+                    resized: *size,
+                    left: 0,
+                    top: 0,
+                    size: *size,
+                }),
+            ),
+            Prepared::Video(clip) => (
+                uniserve_core::ConditionRole::Reference,
+                ConditionMedia::Video {
+                    clip: uniserve_core::VideoClip {
+                        canvas: clip.canvas,
+                        start_frame: clip.start_frame,
+                        frames: clip.frames,
+                        vae_frames: clip.vae_frames,
+                    },
+                    soundtrack: clip.soundtrack.as_ref().map(audio),
+                },
+            ),
+            Prepared::Audio(clip) => (
+                uniserve_core::ConditionRole::Reference,
+                ConditionMedia::Audio(audio(clip)),
+            ),
+        };
+        let vision = self.vision.as_ref().map(|vision| match vision {
+            Vision::Image(image) => ConditionVision {
+                grid: core_grid(image.grid),
+                tokens: image.tokens,
+                frame_indices: Vec::new(),
+            },
+            Vision::Video(video) => ConditionVision {
+                grid: core_grid(video.grid),
+                tokens: video.grid.t * video.block_tokens,
+                frame_indices: video.frame_indices.clone(),
+            },
+        });
+        VideoCondition {
+            role,
+            source,
+            media,
+            vision,
+            latent_units: self.latent_units(),
+            audio_rows: self.audio_rows,
+        }
+    }
+}
+
+const fn core_grid(grid: VisionGrid) -> uniserve_core::VisionGrid {
+    uniserve_core::VisionGrid {
+        t: grid.t,
+        h: grid.h,
+        w: grid.w,
+    }
 }
 
 /// The resolved size of a request and of every condition.
@@ -1595,6 +1718,44 @@ pub(super) mod tests {
             let crop = cover_crop(width, height, size(&case["canvas"]));
             assert_eq!(json!(crop), case["cover_crop"], "{case}");
         }
+    }
+
+    /// A video's encoded frames split into the video encoder's 17-frame
+    /// windows: each complete window yields five latent frames of rows and
+    /// the padded last one two, which together are the condition's rows. A
+    /// still image is one unit.
+    #[test]
+    fn latent_units_partition_the_condition_rows() {
+        let canvas = Canvas {
+            width: 1344,
+            height: 768,
+        };
+        let video = ConditionPlan {
+            index: 0,
+            condition_type: ConditionType::Video,
+            prepared: Prepared::Video(super::VideoClip {
+                canvas,
+                start_frame: 0,
+                frames: 124,
+                vae_frames: 124,
+                latent_frames: 37,
+                soundtrack: None,
+            }),
+            vision: None,
+            video_rows: 37 * 1008,
+            audio_rows: 0,
+        };
+        let units = video.latent_units();
+        assert_eq!(units, [vec![5 * 1008; 7], vec![2 * 1008]].concat());
+        assert_eq!(units.iter().sum::<u32>(), video.video_rows);
+
+        let image = ConditionPlan {
+            prepared: Prepared::Image(canvas),
+            condition_type: ConditionType::Image,
+            video_rows: 1008,
+            ..video
+        };
+        assert_eq!(image.latent_units(), [1008]);
     }
 
     /// Reference videos resample to 24 fps, honour the start offset, keep a

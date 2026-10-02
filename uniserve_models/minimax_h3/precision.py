@@ -102,14 +102,17 @@ def weight_config(
         )
         return QuantizationConfig(quantizer, quantizer)
 
-    # The audio decoder and each transformer's latent input and output heads
-    # stay FP32 and unquantized. Under the longest-prefix rule, every video
-    # decoder parameter without a more specific entry below (norms, residual
-    # scales, register tokens) also stays FP32. Every denoising component a
+    # The audio decoder, both condition encoders and each transformer's
+    # latent input and output heads stay FP32 and unquantized, the VAEs'
+    # native precision. Under the longest-prefix rule, every video decoder
+    # parameter without a more specific entry below (norms, residual scales,
+    # register tokens) also stays FP32. Every denoising component a
     # checkpoint may hold takes the same representation.
     dtypes = {
         "audio_decoder": torch.float32,
         "video_decoder": torch.float32,
+        "video_encoder": torch.float32,
+        "audio_encoder": torch.float32,
         **{
             f"{component}.transformer.{name}": torch.float32
             for component in config.denoisers

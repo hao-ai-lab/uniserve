@@ -65,6 +65,7 @@ def _encoder(config):
         network,
         _RETAINED,
         vision,
+        pixels=qwen3_vl.PixelConfig(),
         image_token_id=IMAGE,
         video_token_id=VIDEO,
         dtype=torch.float32,

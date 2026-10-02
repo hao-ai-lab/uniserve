@@ -57,6 +57,8 @@ DEFAULTS: dict[str, Any] = {
     "max_batch_tokens": 8192,
     "max_model_len": 8192,
     "max_video_seconds": 15.0,
+    "max_condition_rows": 0,
+    "ffmpeg": "ffmpeg",
     "graph_policy": "off",
     "decode_graph_batch_sizes": None,
     "prefill_cuda_graph": False,

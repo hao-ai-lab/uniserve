@@ -50,7 +50,16 @@ checkpoint_sources = (
     checkpoint.Config(
         "audio_decoder", "audio_vae", module_path="audio_decoder"
     ),
+    checkpoint.Config("video_encoder", "vae", module_path="video_encoder"),
+    checkpoint.Config(
+        "audio_encoder", "audio_vae", module_path="audio_encoder"
+    ),
 )
+
+# The checkpoint tensors each VAE encoder loads; every other tensor of its
+# VAE belongs to the decoder or to heads the encoders never evaluate.
+_VIDEO_ENCODER_TENSORS = ("encoder.", "quant_conv.")
+_AUDIO_ENCODER_TENSORS = ("encoder.", "pre_block.", "mean_proj.")
 
 
 @cache
@@ -456,8 +465,10 @@ def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
             components.extend(_denoiser_components(name, denoiser))
     components.append(_text_component(model.text_encoder))
 
-    # Only the decoder halves of both VAEs are resident.
+    # The decoder halves of both VAEs, and their encoder halves for the
+    # condition encoders.
     video, audio = model.video_decoder.decoder, model.audio_decoder.decoder
+    video_encoder, audio_encoder = model.video_encoder, model.audio_encoder
     components.extend(
         (
             weights.ModuleMapping(
@@ -480,6 +491,32 @@ def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
                     name
                     for name in _audio_names(audio.config)
                     if not name.startswith(("decoder.", "dec_in_proj."))
+                ),
+            ),
+            weights.ModuleMapping(
+                video_encoder,
+                "video_encoder",
+                lambda reader: video_vae.encoder_assignments(
+                    video_encoder.encoder, reader
+                ),
+                frozenset(name for name, _ in video_encoder.named_parameters()),
+                nonresident=frozenset(
+                    name
+                    for name in _video_names(model.config.video_vae)
+                    if not name.startswith(_VIDEO_ENCODER_TENSORS)
+                ),
+            ),
+            weights.ModuleMapping(
+                audio_encoder,
+                "audio_encoder",
+                lambda reader: audio_vae.encoder_assignments(
+                    audio_encoder.encoder, reader
+                ),
+                frozenset(name for name, _ in audio_encoder.named_parameters()),
+                nonresident=frozenset(
+                    name
+                    for name in _audio_names(model.config.audio_vae)
+                    if not name.startswith(_AUDIO_ENCODER_TENSORS)
                 ),
             ),
         )

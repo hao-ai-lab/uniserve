@@ -12,6 +12,7 @@ video codec publishes. ``uniserve_worker.bootstrap.capacity`` and
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from types import MappingProxyType
 
 import torch
@@ -19,8 +20,11 @@ from torch import nn
 
 from uniserve.model import (
     AudioDecoder,
+    AudioEncoder,
     Denoiser,
+    PatchEncoder,
     VideoDecoder,
+    VideoEncoder,
     VideoPostprocessor,
 )
 from uniserve.tensors import OutputLayout
@@ -33,6 +37,7 @@ from uniserve_worker.protocol.tensor import (
     ShapeBound,
     StaticDim,
 )
+from uniserve_worker.protocol.video import VideoTask
 
 # Torch dtypes a product may carry on the wire. An output in any other dtype
 # is refused by ``resolve_outputs``.
@@ -51,13 +56,21 @@ def product_name(module: nn.Module, name: str) -> str:
     """Name a numerical modality by its downstream protocol use.
 
     A denoiser's ``video``/``audio`` outputs are latents, a video decoder's
-    ``video`` output is its decoded media units, and an audio decoder's
-    ``audio`` output is audio samples. Every other name passes through.
+    ``video`` output is its decoded media units, an audio decoder's
+    ``audio`` output is audio samples, a vision encoder's ``features`` are
+    vision features, and the condition encoders' outputs are condition
+    latents. Every other name passes through.
     """
     if isinstance(module, Denoiser):
         return {"video": "video_latents", "audio": "audio_latents"}.get(
             name, name
         )
+    if isinstance(module, PatchEncoder) and name == "features":
+        return "vision_features"
+    if isinstance(module, VideoEncoder) and name == "video":
+        return "condition_video_latents"
+    if isinstance(module, AudioEncoder) and name == "audio":
+        return "condition_audio_latents"
     if isinstance(module, VideoDecoder) and name == "video":
         return "video_units"
     if isinstance(module, AudioDecoder) and name == "audio":
@@ -75,7 +88,9 @@ def resolve_outputs(
     output layouts retain only their numerical representation and placement.
 
     Every component ``describe_components`` reports for ``model`` is
-    resolved, not only the components this rank holds.
+    resolved, not only the components this rank holds. Condition products
+    are declared only where the deployment's video denoiser executes a
+    conditioned task and ``config`` grants condition capacity.
 
     Returns:
         A read-only mapping from component name to its products. Components
@@ -83,20 +98,39 @@ def resolve_outputs(
 
     Raises:
         ValueError: An output's dtype has no protocol ``DType``, an output
-            has more than one variable axis, or the video codec component is
+            has more than one variable axis, the video codec component is
             present but the model has no ``MediaBuilder`` or no
-            ``VideoDecoder``. Errors from ``media_builder``, the capability
-            lookups, ``describe_components`` and ``output_layouts`` propagate.
+            ``VideoDecoder``, or the media reader serves conditions for a
+            model without both condition encoders and a vision encoder.
+            Errors from ``media_builder``, the capability lookups,
+            ``describe_components`` and ``output_layouts`` propagate.
     """
     from uniserve_worker.bootstrap.components import (
+        MEDIA_READER_COMPONENT,
         VIDEO_CODEC_COMPONENT,
         describe_components,
     )
-    from uniserve_worker.bootstrap.inputs import capability, media_builder
+    from uniserve_worker.bootstrap.inputs import (
+        capability,
+        executed_video_tasks,
+        media_builder,
+        video_denoiser,
+    )
     from uniserve_worker.model_executor.resources import (
         bounding_layout,
+        condition_media_layouts,
         encoded_units_layout,
     )
+
+    # Only a conditioned task carries conditions, so a deployment whose
+    # denoiser executes none provisions no condition product, whatever its
+    # condition capacity.
+    denoiser = video_denoiser(model, config)
+    if config.max_condition_rows and (
+        denoiser is None
+        or not set(executed_video_tasks(denoiser)) - {VideoTask.T2VA}
+    ):
+        config = replace(config, max_condition_rows=0)
 
     builder = media_builder(model, config)
     decoder = capability(model, VideoDecoder)
@@ -129,6 +163,38 @@ def resolve_outputs(
                         )
                     ),
                 )
+            )
+        # The media reader's products are the condition media it decodes,
+        # declared only where the deployment serves conditions.
+        if component == MEDIA_READER_COMPONENT and config.max_condition_rows:
+            encoders = (
+                capability(model, VideoEncoder),
+                capability(model, AudioEncoder),
+                capability(model, PatchEncoder),
+            )
+            if builder is None or any(value is None for value in encoders):
+                raise ValueError(
+                    "media reading requires the condition encoders and a "
+                    "video timeline"
+                )
+            video_encoder, audio_encoder, vision = encoders
+            # A condition encodes one frame (an image) or a reference
+            # video's leading frames, a count the denoiser generates.
+            denoiser = builder.denoiser
+            frame_counts = [1, denoiser.legal_frame_count(1)]
+            while (
+                count := denoiser.legal_frame_count(frame_counts[-1] + 1)
+            ) <= builder.maximum.num_frames:
+                frame_counts.append(count)
+            layouts.extend(
+                (None, name, layout)
+                for name, layout in condition_media_layouts(
+                    config,
+                    video_encoder=video_encoder,
+                    audio_encoder=audio_encoder,
+                    vision=vision,
+                    frame_counts=tuple(frame_counts),
+                ).items()
             )
         for module, name, layout in layouts:
             dtype = _DTYPES.get(layout.dtype)

@@ -29,6 +29,12 @@
         "parallel_config": {},
         "distribution": "temporal_units",
         "units_per_rank": 1
+      },
+      "latent_encoder": {
+        "ranks": [0, 1, 2, 3],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
       }
     },
     "queue_depth": 6
@@ -36,6 +42,7 @@
   {
     "id": "host",
     "ranks": [
+      { "node": "localhost", "device": "cpu" },
       { "node": "localhost", "device": "cpu" },
       { "node": "localhost", "device": "cpu" },
       { "node": "localhost", "device": "cpu" },
@@ -51,6 +58,10 @@
       },
       "muxer": {
         "ranks": [4],
+        "parallel_config": {}
+      },
+      "media_reader": {
+        "ranks": [5],
         "parallel_config": {}
       }
     },

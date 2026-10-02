@@ -945,6 +945,11 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             width: 1344,
             height: 768,
         },
+        uniserve_worker_ipc::VideoAdmission {
+            task: uniserve_core::VideoTask::T2va,
+            text_tags: vec![1],
+            conditions: Vec::new(),
+        },
     )?;
     let value = TensorRef {
         request_key: key,
@@ -1592,7 +1597,11 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
             let prompt_token_ids = vec![100_000 + index as u32];
             let events = engine.submit(Request::Diffusion(DiffusionRequest {
                 request_id,
+                task: uniserve_core::VideoTask::T2va,
+                text_tags: vec![1; prompt_token_ids.len()],
                 prompt_token_ids,
+                conditions: Vec::new(),
+                media: Vec::new(),
                 priority: 0,
                 sampling: DiffusionSamplingParams {
                     num_frames: 22,
@@ -3036,6 +3045,8 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "max_batch_tokens": 256,
     "max_model_len": 8192,
     "max_video_seconds": 15.0,
+    "max_condition_rows": 0,
+    "ffmpeg": "ffmpeg",
     "graph_policy": "off",
     "decode_graph_batch_sizes": null,
     "prefill_cuda_graph": false,

@@ -8,17 +8,19 @@ with ``rope_index``, and loads both towers with ``weights.assignments``.
 """
 
 from . import weights
-from .config import VisionConfig, read_vision_config
-from .encoder import TextEncoder
+from .config import PixelConfig, VisionConfig, read_vision_config
+from .encoder import TextEncoder, VisionEncoder
 from .positions import rope_index
 from .vision import Attention, PatchMerger, TransformerLayer, VisionTower
 
 __all__ = [
     "Attention",
     "PatchMerger",
+    "PixelConfig",
     "TextEncoder",
     "TransformerLayer",
     "VisionConfig",
+    "VisionEncoder",
     "VisionTower",
     "read_vision_config",
     "rope_index",

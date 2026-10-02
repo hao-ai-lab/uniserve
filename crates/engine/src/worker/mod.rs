@@ -158,6 +158,11 @@ pub struct WorkerProcessArgs {
     pub max_model_len: u32,
     /// Maximum accepted video duration in seconds.
     pub max_video_seconds: f64,
+    /// Most denoiser rows a video request's conditions may take, which bounds
+    /// the condition products a video worker provisions.
+    pub max_condition_rows: u32,
+    /// The `ffmpeg` executable a media reader decodes reference videos with.
+    pub ffmpeg: std::path::PathBuf,
     /// Shortest video duration in seconds the serving API admits, which
     /// bounds the frame counts a video worker provisions from below; `None`
     /// provisions every frame count the model generates.

@@ -22,6 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(test)]
+use uniserve_worker_ipc::VideoDenoiserInfo;
 use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 use anyhow::Context as _;
@@ -123,8 +125,8 @@ impl ExecutorInfo {
             }
         }
         if routing.contains_key(&MediaCall::Muxing) {
-            let missing = MediaCall::VIDEO
-                .iter()
+            let missing = crate::scheduler::graph::task_calls(uniserve_core::VideoTask::T2va)
+                .into_iter()
                 .filter(|call| !routing.contains_key(call))
                 .map(|call| format!("{call:?}"))
                 .collect::<Vec<_>>();
@@ -185,7 +187,9 @@ impl ExecutorInfo {
             "executor exposes no physical pools"
         );
         if self.workers.len() == 1 {
-            return Ok(self.workers[0].1.clone());
+            let info = self.workers[0].1.clone();
+            check_video_tasks(&info)?;
+            return Ok(info);
         }
 
         // Route-specific capacities contribute only when a pool implements the
@@ -392,8 +396,37 @@ impl ExecutorInfo {
             .unwrap_or(0);
 
         merged.validate()?;
+        check_video_tasks(&merged)?;
         Ok(merged)
     }
+}
+
+/// Checks that the deployment places a component for every call of every
+/// task its video denoiser serves.
+///
+/// A conditioned task reads its media on a host component and encodes its
+/// conditions before denoising, so a deployment serving one must place the
+/// media reader and both condition encoders as well as the generation calls.
+fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
+    let Some(denoiser) = info.video_denoiser.as_ref() else {
+        return Ok(());
+    };
+    for name in &denoiser.tasks {
+        let Some(task) = uniserve_core::VideoTask::from_name(name) else {
+            anyhow::bail!("the video denoiser serves unknown task {name:?}");
+        };
+        let missing = crate::scheduler::graph::task_calls(task)
+            .into_iter()
+            .filter(|call| !info.media_components.contains_key(call))
+            .map(|call| format!("{call:?}"))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            missing.is_empty(),
+            "the deployment serves {name} but places no component for {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// One call result returned from an executor-owned batch.
@@ -1410,9 +1443,59 @@ mod tests {
             video_codecs: BTreeMap::new(),
         };
         let routing = info.media_routing().expect("the union is complete");
-        assert_eq!(routing.len(), MediaCall::VIDEO.len());
+        assert_eq!(routing.len(), 8);
         assert_eq!(routing[&MediaCall::VideoEncoding], "video_codec");
         assert_eq!(routing[&MediaCall::VideoDecoding], "video_decoder");
+    }
+
+    /// A deployment whose denoiser serves a conditioned task must place the
+    /// media reader and both condition encoders; one serving `t2va` alone
+    /// needs only the generation calls.
+    #[test]
+    fn a_conditioned_task_requires_its_condition_components() {
+        let generation = [
+            (MediaCall::TextEncoding, "text_encoder"),
+            (MediaCall::LatentPreparation, "denoiser"),
+            (MediaCall::Denoising, "denoiser"),
+            (MediaCall::VideoDecoding, "video_decoder"),
+            (MediaCall::AudioDecoding, "audio_decoder"),
+            (MediaCall::VideoEncoding, "video_codec"),
+            (MediaCall::AudioEncoding, "muxer"),
+            (MediaCall::Muxing, "muxer"),
+        ];
+        let serving = |tasks: &[&str], routes: &[(MediaCall, &str)]| {
+            let mut info = media_info(routes, 4);
+            info.video_denoiser = Some(VideoDenoiserInfo {
+                tasks: tasks.iter().map(|task| (*task).to_owned()).collect(),
+                schedule_points: 5,
+                video_shift: 12.0,
+                audio_shift: 3.0,
+                canvases: Vec::new(),
+                max_sequence_rows: None,
+            });
+            ExecutorInfo {
+                workers: vec![(WorkerId("model".to_owned()), info)],
+                video_codecs: BTreeMap::new(),
+            }
+        };
+
+        assert!(serving(&["t2va"], &generation).runtime_info().is_ok());
+        let message = serving(&["t2va", "fl2va"], &generation)
+            .runtime_info()
+            .expect_err("fl2va reads and encodes conditions")
+            .to_string();
+        assert!(
+            message.contains("fl2va") && message.contains("MediaReading"),
+            "{message}"
+        );
+
+        let conditioned = [
+            (MediaCall::MediaReading, "media_reader"),
+            (MediaCall::VisionEncoding, "text_encoder"),
+            (MediaCall::LatentEncoding, "latent_encoder"),
+        ];
+        let routes = [generation.as_slice(), conditioned.as_slice()].concat();
+        assert!(serving(&["t2va", "fl2va"], &routes).runtime_info().is_ok());
     }
 
     #[test]

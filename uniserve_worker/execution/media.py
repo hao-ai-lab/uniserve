@@ -46,8 +46,8 @@ from uniserve_worker.media.mux import AvMuxConfig
 from uniserve_worker.protocol.batch import (
     Batch,
     DecodeRange,
-    DiffusionParams,
     MediaTrack,
+    NewRequest,
     TensorPublication,
 )
 from uniserve_worker.protocol.call import Call, CallStatus, MediaCall
@@ -68,25 +68,37 @@ if TYPE_CHECKING:
     from uniserve_worker.transport.interface import Transport
 
 
-def video_shape(runner: ModelExecutor, media: DiffusionParams, tokens: int):
+def video_shape(runner: ModelExecutor, admission: NewRequest):
     """Resolve a video admission into its exact numerical size.
 
-    ``tokens`` is the admitted prompt length; the size is not rounded up to
-    the layout it occupies. Raises ``invalid_descriptor`` when the rank lacks
-    a media builder or video decoder, when the builder or decoder rejects the
-    frame count or prompt length (a size beyond the worker's capacity
-    included), or when the admission's media unit count or step count
-    disagrees with the model.
+    The size holds the admitted prompt length, the request's conditions and
+    its presented vision spans; it is not rounded up to the layout it
+    occupies. Raises ``invalid_descriptor`` when the admission is not a
+    video request's, when the rank lacks a media builder or video decoder,
+    when the builder or decoder rejects the frame count, prompt length or
+    conditions (a size beyond the worker's capacity included), or when the
+    admission's media unit count or step count disagrees with the model.
     """
+    from uniserve_worker.execution.conditions import library_conditions
+
     builder = runner.media_builder
     decoder = runner.video_decoder
+    media, video = admission.diffusion, admission.video
+    if media is None or video is None:
+        raise invalid_descriptor("video call has no admitted media dimensions")
     if builder is None or decoder is None:
         raise invalid_descriptor(
             "video input requires denoising and reconstruction capabilities"
         )
 
     try:
-        size = builder.size(media.num_frames, tokens, media.canvas)
+        size = builder.size(
+            media.num_frames,
+            len(admission.prompt_token_ids),
+            media.canvas,
+            conditions=library_conditions(video),
+            vision_spans=video.vision_spans(),
+        )
         windows = decoder.frame_slices(size.num_frames)
     except ValueError as error:
         raise invalid_descriptor(str(error)) from error
@@ -718,10 +730,7 @@ def open_state(runner: ModelExecutor, size) -> DiffusionState:
 
 def video_state(runner: ModelExecutor, request: RequestState) -> DiffusionState:
     """Return the admitted video request's state, creating it on first use."""
-    media = request.admission.diffusion
-    if media is None:
-        raise invalid_descriptor("video call has no admitted media dimensions")
-    size = video_shape(runner, media, len(request.admission.prompt_token_ids))
+    size = video_shape(runner, request.admission)
     trajectory = request.diffusion
     if trajectory is None:
         trajectory = open_state(runner, size)
@@ -796,9 +805,7 @@ def execute(
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("video call has no admitted media dimensions")
-    numerical_shape = video_shape(
-        model_runner, media, len(request.request.admission.prompt_token_ids)
-    )
+    numerical_shape = video_shape(model_runner, request.request.admission)
 
     trajectory = video_state(model_runner, request.request)
 
@@ -821,21 +828,29 @@ def execute(
         # Batch preparation validated the call's pages and interval.
         params = trajectory_params(call, state=state)
         assert pool is not None
-        inputs = call.inputs
-        if len(inputs) != 1:
-            raise invalid_descriptor(
-                "video preparation requires one conditioning Tensor"
+        # The text features, then a conditioned request's condition latents:
+        # every visual round's rows, then every audio track's
+        # (``conditions.condition_latents``).
+        reads = []
+        for product in call.inputs:
+            read = tensor_store.consume(
+                product,
+                consumer_call_id=call.call_id,
+                device=model_runner.call_devices(call)[0],
             )
-        conditioning = tensor_store.consume(
-            inputs[0],
-            consumer_call_id=call.call_id,
-            device=model_runner.call_devices(call)[0],
-        )
-        request.device_reads.append(conditioning)
-        if conditioning.region is not None:
+            request.device_reads.append(read)
+            if read.region is not None:
+                raise invalid_descriptor(
+                    "video preparation requires complete input coverage"
+                )
+            reads.append(read)
+        video_inputs = request.request.admission.video
+        conditioned = video_inputs is not None and bool(video_inputs.conditions)
+        if not reads or (len(reads) > 1) != conditioned:
             raise invalid_descriptor(
-                "video preparation requires complete conditioning coverage"
+                "video preparation reads its conditioning and its conditions"
             )
+        conditioning = reads[0]
 
         # Without a staging future from ``begin_noise``, the seeded draw and
         # the request's tables are staged here on the service thread.
@@ -879,6 +894,25 @@ def execute(
                     )
                 builder.store_conditioning(
                     numerical_shape, slot, result.values[0]
+                )
+            if conditioned:
+                from uniserve_worker.execution.conditions import (
+                    condition_latents,
+                )
+
+                assert video_inputs is not None
+                if any(read.tensor is None for read in reads[1:]):
+                    raise invalid_descriptor(
+                        "condition latents have no input Tensor"
+                    )
+                # The condition rows follow the stored prompt in the
+                # retained conditioning, written on the same stream.
+                builder.encode_conditions(
+                    numerical_shape,
+                    slot,
+                    condition_latents(
+                        video_inputs, tuple(read.tensor for read in reads[1:])
+                    ),
                 )
         request.latent.update = sample_update(
             slot_index, params, step=0, previous=None

@@ -50,6 +50,7 @@ from uniserve_worker.protocol.tensor import (
     StaticDim,
     TensorRef,
 )
+from uniserve_worker.protocol.video import VideoAdmission, VideoTask
 from uniserve_worker.protocol.worker_info import WorkerInfo
 from uniserve_worker.transport.fetch import fetch_tensor
 
@@ -407,6 +408,9 @@ def test_text_encoder_call_publishes_consumable_conditioning(
                     diffusion=DiffusionParams(
                         22, 3, 4, 1000, width=1344, height=768
                     ),
+                    video=VideoAdmission(
+                        VideoTask.T2VA, text_tags=(1,) * len(prompt)
+                    ),
                     prompt_token_ids=prompt,
                 )
             ),
@@ -606,6 +610,7 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
             key,
             request_pool_idx=1,
             diffusion=DiffusionParams(22, 3, 4, 1000, width=1344, height=768),
+            video=VideoAdmission(VideoTask.T2VA, text_tags=(1, 1, 1)),
             prompt_token_ids=(3, 8, 1),
         )
         run = Batch(

@@ -334,6 +334,10 @@ def local_product_storage_bytes(
     # These are the concrete persistent Tensor consumers of the video path.
     # Denoising state is resident; encoders consume decoded output buffers.
     for source_call, destination_call in (
+        (MediaCall.MEDIA_READING, MediaCall.VISION_ENCODING),
+        (MediaCall.MEDIA_READING, MediaCall.LATENT_ENCODING),
+        (MediaCall.VISION_ENCODING, MediaCall.TEXT_ENCODING),
+        (MediaCall.LATENT_ENCODING, MediaCall.LATENT_PREPARATION),
         (MediaCall.TEXT_ENCODING, MediaCall.LATENT_PREPARATION),
         (MediaCall.DENOISING, MediaCall.VIDEO_DECODING),
         (MediaCall.DENOISING, MediaCall.AUDIO_DECODING),

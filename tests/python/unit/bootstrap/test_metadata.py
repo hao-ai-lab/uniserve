@@ -4,6 +4,7 @@ The values are supplied without model allocation.
 """
 
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -101,11 +102,7 @@ def test_h3_worker_advertises_bounded_media_products():
     )
     from uniserve_worker.bootstrap.outputs import resolve_outputs
     from uniserve_worker.config.execution import WorkerConfig
-    from uniserve_worker.protocol.call import (
-        VIDEO_CALLS,
-        MediaCall,
-        TransferMode,
-    )
+    from uniserve_worker.protocol.call import MediaCall, TransferMode
 
     with torch.device("meta"):
         model = Model(fasth3_config())
@@ -118,17 +115,33 @@ def test_h3_worker_advertises_bounded_media_products():
     )
     outputs = resolve_outputs(model, config)
     assert set(supported_calls(model)) == {
-        *VIDEO_CALLS,
+        MediaCall.MEDIA_READING,
+        MediaCall.VISION_ENCODING,
+        MediaCall.LATENT_ENCODING,
+        MediaCall.TEXT_ENCODING,
+        MediaCall.LATENT_PREPARATION,
+        MediaCall.DENOISING,
+        MediaCall.VIDEO_DECODING,
+        MediaCall.AUDIO_DECODING,
+        MediaCall.VIDEO_ENCODING,
+        MediaCall.AUDIO_ENCODING,
+        MediaCall.MUXING,
         TransferMode.TENSOR,
     }
     assert media_components(model) == {
+        # The conditioner's vision tower encodes the presentation's vision
+        # blocks; both condition encoders form one component.
+        MediaCall.VISION_ENCODING: "text_encoder",
+        MediaCall.LATENT_ENCODING: "latent_encoder",
         MediaCall.TEXT_ENCODING: "text_encoder",
         MediaCall.LATENT_PREPARATION: "denoiser",
         MediaCall.DENOISING: "denoiser",
         MediaCall.VIDEO_DECODING: "video_decoder",
         MediaCall.AUDIO_DECODING: "audio_decoder",
-        # The host components own no numerical method: the video codec
-        # encodes the decoded media units and the muxer assembles them.
+        # The host components own no numerical method: the media reader
+        # decodes condition media, the video codec encodes the decoded media
+        # units and the muxer assembles them.
+        MediaCall.MEDIA_READING: "media_reader",
         MediaCall.VIDEO_ENCODING: "video_codec",
         MediaCall.AUDIO_ENCODING: "muxer",
         MediaCall.MUXING: "muxer",
@@ -147,11 +160,61 @@ def test_h3_worker_advertises_bounded_media_products():
         "video_units": (2, 22, 768, 1344, 3),
         "audio_samples": (52_000, 2),
     }
+    # A deployment without condition capacity declares no condition product.
     assert products.keys() == expected.keys() | {"encoded_units"}
     for name, shape in expected.items():
         assert (
             products[name].shape_bound.max_elements == torch.Size(shape).numel()
         )
+
+    # Only conditioned tasks carry conditions: this deployment executes
+    # text-to-video alone and provisions no condition product, whatever its
+    # condition capacity.
+    conditioned = replace(config, max_condition_rows=1000)
+    assert {
+        value.name
+        for values in resolve_outputs(model, conditioned).values()
+        for value in values
+    } == products.keys()
+
+    # With condition capacity, every condition product is bounded by the
+    # condition rows or the presentation. A condition encodes one frame or a
+    # generated frame count (22 or 39 here); at a 32-pixel raster each latent
+    # frame is one row, and 39 frames encode to 12 latent frames, the most
+    # pixels per row: 39 * 32 * 32 / 12 = 3328. An audio row is half a
+    # stereo latent frame. Each presented token is 2x2 merged patches of
+    # 3 x 2 x 16 x 16 values and one row of the embedding and three
+    # DeepStack features.
+    from uniserve_worker.bootstrap.components import describe_components
+    from uniserve_worker.bootstrap.inputs import media_builder
+    from uniserve_worker.model_executor.resources import (
+        condition_media_layouts,
+        output_layouts,
+    )
+
+    builder = media_builder(model, conditioned)
+    layouts = dict(
+        condition_media_layouts(
+            conditioned,
+            video_encoder=model.video_encoder,
+            audio_encoder=model.audio_encoder,
+            vision=model.text_encoder.vision,
+            frame_counts=(1, 22, 39),
+        )
+    )
+    calls = describe_components(model)
+    for call in (*calls["text_encoder"], *calls["latent_encoder"]):
+        layouts.update(output_layouts(conditioned, call, builder=builder))
+    rate = model.audio_encoder.latent_rate
+    for name, shape in {
+        "condition_pixels": (1000 * 3328, 3),
+        "condition_samples": (500 * rate, 2),
+        "vision_pixels": (4 * 65, 1536),
+        "features": (65, 4 * 5120),
+        "video": (1000, 96),
+        "audio": (1000, 32),
+    }.items():
+        assert layouts[name].shape == shape, name
 
     from uniserve_worker.bootstrap.report import build_worker_layout
 

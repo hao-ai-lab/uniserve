@@ -36,8 +36,9 @@ class TextEncoderConfig:
     fills the language fields from the checkpoint's ``text_config``, while
     ``num_retained_layers`` always keeps its default. ``mrope_sections``
     (the interleaved M-RoPE widths of the temporal, height and width axes),
-    the image and video placeholder tokens and ``vision`` (the vision tower)
-    default to the H3 checkpoint's Qwen3-VL-32B values.
+    the image and video placeholder tokens, ``vision`` (the vision tower)
+    and ``pixels`` (its processor's pixel normalization) default to the H3
+    checkpoint's Qwen3-VL-32B values.
     """
 
     vocab_size: int = 151_936
@@ -55,6 +56,7 @@ class TextEncoderConfig:
     image_token_id: int = 151_655
     video_token_id: int = 151_656
     vision: qwen3_vl.VisionConfig = _VISION
+    pixels: qwen3_vl.PixelConfig = qwen3_vl.PixelConfig()
 
     def __post_init__(self) -> None:
         for name in (
@@ -151,6 +153,7 @@ class TextEncoder(qwen3_vl.TextEncoder):
             network,
             tuple(range(config.num_retained_layers)),
             config.vision,
+            pixels=config.pixels,
             image_token_id=config.image_token_id,
             video_token_id=config.video_token_id,
             dtype=torch.bfloat16,

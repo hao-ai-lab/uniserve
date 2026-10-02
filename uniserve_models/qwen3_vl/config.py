@@ -113,6 +113,33 @@ class VisionConfig:
         return (1 + len(self.deepstack_visual_indexes)) * self.out_hidden_size
 
 
+@dataclass(frozen=True, slots=True)
+class PixelConfig:
+    """How the checkpoint's processor normalizes pixels before patching.
+
+    Each RGB channel maps ``x`` in ``[0, 255]`` to ``(x / 255 - mean) / std``.
+    The defaults are the Qwen3-VL processor's.
+
+    Raises:
+        ValueError: From ``__post_init__`` for anything but three finite
+            means and three finite positive deviations.
+    """
+
+    mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+
+    def __post_init__(self) -> None:
+        if (
+            len(self.mean) != 3
+            or len(self.std) != 3
+            or not all(math.isfinite(value) for value in self.mean)
+            or not all(math.isfinite(value) and value > 0 for value in self.std)
+        ):
+            raise ValueError(
+                "Qwen3-VL pixel normalization needs three channels"
+            )
+
+
 def read_vision_config(metadata: Mapping[str, object]) -> VisionConfig:
     """Normalize a checkpoint ``vision_config`` object.
 

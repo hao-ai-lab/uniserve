@@ -40,6 +40,7 @@ from uniserve_worker.protocol.validation import (
     _uint,
     _uints,
 )
+from uniserve_worker.protocol.video import VideoAdmission
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,16 +348,30 @@ class NewRequest:
     # bound each input image by its share of a pixel budget the images
     # share (``PatchTransform.pixel_bound``).
     input_images: int = 0
+    # A video request's task, presentation tags and conditions; present
+    # exactly with ``diffusion``.
+    video: VideoAdmission | None = None
 
     def __post_init__(self) -> None:
         """Require a positive slot and at least one family parameter set.
 
-        Diffusion requests also need non-empty prompt tokens. Each family's
-        own parameters are validated by its record.
+        Diffusion requests also need non-empty prompt tokens, each with its
+        presentation tag. Each family's own parameters are validated by its
+        record.
         """
         if self.diffusion is not None and not self.prompt_token_ids:
             raise invalid_descriptor(
                 "diffusion prompt tokens must not be empty"
+            )
+        if (self.video is None) != (self.diffusion is None):
+            raise invalid_descriptor(
+                "a video admission carries both its sampling and its inputs"
+            )
+        if self.video is not None and len(self.video.text_tags) != len(
+            self.prompt_token_ids
+        ):
+            raise invalid_descriptor(
+                "every video prompt token requires one tag"
             )
         if self.request_pool_idx < 1:
             raise invalid_descriptor("request-pool index must be positive")
@@ -412,6 +427,13 @@ class NewRequest:
                     data["diffusion"], f"{where}.diffusion"
                 )
             ),
+            video=(
+                None
+                if data.get("video") is None
+                else VideoAdmission.from_mapping(
+                    data["video"], f"{where}.video"
+                )
+            ),
         )
         return admission
 
@@ -429,6 +451,7 @@ class NewRequest:
             "diffusion": None
             if self.diffusion is None
             else self.diffusion.to_mapping(),
+            "video": None if self.video is None else self.video.to_mapping(),
         }
 
 

@@ -75,6 +75,7 @@ fn video_service(
             video_max_pixels: 25_165_824,
         },
         max_video_seconds,
+        uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
         &VideoMediaSettings::default(),
         Arc::clone(tokenizer),
     )

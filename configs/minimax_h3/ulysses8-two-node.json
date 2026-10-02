@@ -33,6 +33,12 @@
         "parallel_config": {},
         "distribution": "temporal_units",
         "units_per_rank": 1
+      },
+      "latent_encoder": {
+        "ranks": [0, 1, 2, 3, 4, 5, 6, 7],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
       }
     },
     "queue_depth": 6
@@ -48,6 +54,7 @@
       { "node": "rank-1", "device": "cpu" },
       { "node": "rank-1", "device": "cpu" },
       { "node": "rank-1", "device": "cpu" },
+      { "node": "rank-0", "device": "cpu" },
       { "node": "rank-0", "device": "cpu" }
     ],
     "components": {
@@ -59,6 +66,10 @@
       },
       "muxer": {
         "ranks": [8],
+        "parallel_config": {}
+      },
+      "media_reader": {
+        "ranks": [9],
         "parallel_config": {}
       }
     },

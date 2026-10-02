@@ -243,6 +243,9 @@ impl DynamoFastH3Engine {
                 scheduler_policy: SchedulingPolicy::Fcfs,
                 max_model_len: Some(self.args.max_model_len),
                 max_video_seconds: self.args.max_video_seconds,
+                // The Dynamo request form carries no conditions, so the
+                // worker provisions no condition rows.
+                max_condition_rows: 0,
                 workers: self.args.workers.to_vec(),
                 transfer: Default::default(),
                 worker_process,

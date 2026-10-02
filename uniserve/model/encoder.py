@@ -1,7 +1,7 @@
 """Shared homogeneous feature batching with explicit numerical boundaries."""
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from math import prod
 from typing import Generic, TypeVar
 
@@ -229,6 +229,43 @@ class PatchEncoder(Encoder[VisionInput]):
                 result[index] = features
         return tuple(result[index] for index in range(inputs.batch_size))
 
+    def pack_pixels(
+        self, frames: torch.Tensor, grid: tuple[int, int, int]
+    ) -> torch.Tensor:
+        """Return one image's or video's packed patch rows for ``encode``.
+
+        ``frames`` holds ``[frames, height, width, 3]`` uint8 RGB on the
+        host, an image being one frame; ``grid`` is the ``(time, height,
+        width)`` patch grid they are resized to. The result is the sample
+        ``encode`` takes with ``grid`` as its host shape. An encoder whose
+        network reads packed patch rows defines this conversion; it reads no
+        parameter, so a host rank holding the module's description runs it.
+        """
+        raise NotImplementedError
+
+    def pixels_layout(self, num_tokens: int) -> OutputLayout:
+        """Describe the packed patch rows of ``num_tokens`` merged tokens.
+
+        These are the rows ``pack_pixels`` produces, ``downsample**2`` per
+        merged token. An encoder that defines ``pack_pixels`` defines it.
+        """
+        raise NotImplementedError
+
+    def features_layout(self, num_tokens: int) -> Mapping[str, OutputLayout]:
+        """Describe ``encode``'s features of ``num_tokens`` merged tokens.
+
+        The packed samples' rows are described under ``features``.
+        """
+        shape = (num_tokens, self._output_size)
+        return {
+            "features": OutputLayout(
+                shape,
+                self._output_dtype,
+                tuple(slice(0, n) for n in shape),
+                variable_axes=(0,),
+            )
+        }
+
     def output_layout(self, size: image.Config):
         stride = self.patch_size * self.downsample
         shape = (
@@ -445,6 +482,22 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
                 )
             )
         return additions
+
+    def positions(
+        self,
+        token_ids: Sequence[int],
+        *,
+        image_grids: Sequence[tuple[int, int, int]] = (),
+        video_grids: Sequence[tuple[int, int, int]] = (),
+    ) -> torch.Tensor:
+        """Return the rotary coordinates of a prompt holding vision blocks.
+
+        ``image_grids`` and ``video_grids`` are the patch grids of the
+        prompt's image and video blocks in prompt order. The result is the
+        CPU int64 ``positions`` sample ``encode`` takes for the prompt. An
+        encoder that splices vision tokens into prompts defines it.
+        """
+        raise NotImplementedError
 
     def output_layout(self, num_tokens: int, dtype: torch.dtype):
         """Describe the encoded conditioning this encoder emits.

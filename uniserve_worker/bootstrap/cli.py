@@ -51,6 +51,8 @@ REQUIRED_FIELDS = (
     "max_batch_tokens",
     "max_model_len",
     "max_video_seconds",
+    "max_condition_rows",
+    "ffmpeg",
     "model_dtype",
     "quantization_config",
     "kv_memory_fraction",

@@ -138,6 +138,14 @@ pub(crate) struct SharedRuntimeArgs {
     /// advertised as `max_seconds`.
     #[arg(long = "max-video-seconds", default_value_t = 15.0)]
     pub max_video_seconds: f64,
+    /// Most denoiser rows the conditions of one video request may take: a
+    /// capacity video workers provision their condition products for,
+    /// advertised as `max_condition_rows`.
+    #[arg(
+        long = "max-condition-rows",
+        default_value_t = uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS
+    )]
+    pub max_condition_rows: u32,
     /// Directory that `file://` condition media of video requests resolves
     /// under. Without it, `file://` media is refused.
     #[arg(long = "media-directory", value_name = "DIR")]
@@ -352,6 +360,7 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
+            max_condition_rows: self.max_condition_rows,
             // Without a written configuration a deployment serves one
             // component over every rank. A model whose components are placed
             // differently -- on disjoint ranks, or with distinct partitions --
@@ -474,6 +483,11 @@ pub(crate) struct WorkerProcessOptions {
     /// 1024 tokens, then steps of 2048 tokens.
     #[arg(long)]
     pub video_text_capacities: Option<String>,
+    /// `ffmpeg` executable the media reader decodes reference videos with.
+    /// The reference conditioning decodes with FFmpeg 8.1.2, whose LANCZOS
+    /// scaler a reference video's pixels depend on.
+    #[arg(long, default_value = "ffmpeg", value_name = "PATH")]
+    pub ffmpeg: std::path::PathBuf,
     #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]
     pub flashinfer_workspace_size: u64,
     #[arg(long, hide = true)]
@@ -512,6 +526,7 @@ impl WorkerProcessOptions {
             flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
             flow_graph_shapes: self.flow_graph_shapes.clone(),
             video_text_capacities: self.video_text_capacities.clone(),
+            ffmpeg: self.ffmpeg.clone(),
             flashinfer_workspace_size: self.flashinfer_workspace_size,
             flashinfer_use_tensor_core: self.flashinfer_use_tensor_core.clone(),
             flashinfer_decode_backend: self.flashinfer_decode_backend,

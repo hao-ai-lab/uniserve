@@ -24,7 +24,12 @@ mod events;
 /// Handing a bound socket to a rank process at its launch.
 pub mod launch;
 mod media;
-pub use media::SharedMedia;
+mod video;
+pub use media::{MediaSource, SharedMedia};
+pub use video::{
+    AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
+    VideoCondition, VisionGrid,
+};
 /// Multimodal generation descriptors, resource bounds, and validation.
 pub mod generation;
 /// Counter-based Philox random-number generation.

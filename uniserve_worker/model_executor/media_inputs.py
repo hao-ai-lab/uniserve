@@ -17,7 +17,7 @@ import torch
 
 from uniserve.diffusion import Schedule, normal_noise
 from uniserve.media import image, video
-from uniserve.model import LatentInput, VideoDenoiser
+from uniserve.model import Condition, LatentInput, VideoDenoiser
 from uniserve.tensors import BufferConfig
 
 #: Pages one request's samples span in the latent pool. Every denoising step
@@ -201,19 +201,49 @@ class MediaBuilder:
         # ``layouts`` lists.
         self._states: dict[object, Mapping[str, BufferConfig]] = {}
 
-    def _size(self, num_frames: int, num_text_tokens: int, canvas):
+    def _size(
+        self,
+        num_frames: int,
+        num_text_tokens: int,
+        canvas,
+        *,
+        conditions: tuple[Condition, ...] = (),
+        vision_spans: tuple[tuple[int, int], ...] = (),
+    ):
         return self.denoiser.make_size(
-            num_frames, num_text_tokens, canvas=canvas
+            num_frames,
+            num_text_tokens,
+            canvas=canvas,
+            conditions=conditions,
+            vision_spans=vision_spans,
         )
 
-    def size(self, num_frames: int, num_text_tokens: int, canvas: image.Config):
+    def size(
+        self,
+        num_frames: int,
+        num_text_tokens: int,
+        canvas: image.Config,
+        *,
+        conditions: tuple[Condition, ...] = (),
+        vision_spans: tuple[tuple[int, int], ...] = (),
+    ):
         """Return the denoiser's exact size for an admitted request.
+
+        ``conditions`` are the request's conditioning inputs in request order
+        and ``vision_spans`` the presented prompt's vision-token ranges.
 
         Raises:
             ValueError: The frame count or canvas is not one the worker
-                admits, or the prompt exceeds its conditioning capacity.
+                admits, the prompt exceeds its conditioning capacity, or the
+                denoiser refuses the conditions.
         """
-        size = self._size(num_frames, num_text_tokens, canvas)
+        size = self._size(
+            num_frames,
+            num_text_tokens,
+            canvas,
+            conditions=conditions,
+            vision_spans=vision_spans,
+        )
         if (
             size.num_frames not in self.frame_counts
             or size.canvas not in self.canvases
@@ -388,10 +418,12 @@ class MediaBuilder:
     def buffers(self, size) -> Mapping[str, BufferConfig]:
         """Describe one request's slot storage, shaped by its layout.
 
-        The denoiser's device tables, the complete CPU draws, a CPU source for
-        every state field to stage from, samples included, and the retained
-        conditioning over the layout's text rows, zero past the prompt. The
-        device samples live in the latent pool, not here.
+        The denoiser's device tables, the complete CPU draws (the
+        conditions' in one flat ``condition_noise`` field holding every
+        request of the layout), a CPU source for every state field to stage
+        from, samples included, and the retained conditioning over the
+        layout's text rows, zero past the prompt. The device samples live in
+        the latent pool, not here.
         """
         layout = self.layout(size)
         state = self._state(size)
@@ -402,6 +434,11 @@ class MediaBuilder:
                 torch.float32,
                 host=True,
             )
+        result["condition_noise"] = BufferConfig(
+            (self.denoiser.condition_noise_capacity(layout),),
+            torch.float32,
+            host=True,
+        )
         for name, config in state.items():
             result[f"{name}_source"] = replace(config, host=True)
         result["text_condition"] = BufferConfig(
@@ -441,6 +478,21 @@ class MediaBuilder:
             result[key] = replace(result[key], capacity_shape=capacity)
         return result
 
+    def condition_noise(
+        self, size, tensors: Mapping[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, ...]:
+        """View a request's condition draws in its ``condition_noise`` field.
+
+        The draws of ``VideoDenoiser.condition_noise_shapes`` occupy the
+        field's leading elements one after another.
+        """
+        flat, views, offset = tensors["condition_noise"], [], 0
+        for shape in self.denoiser.condition_noise_shapes(size):
+            count = math.prod(shape)
+            views.append(flat[offset : offset + count].view(shape))
+            offset += count
+        return tuple(views)
+
     @torch.inference_mode()
     def stage_request(
         self, size, tensors: Mapping[str, torch.Tensor], *, seed: int
@@ -449,14 +501,21 @@ class MediaBuilder:
 
         The seeded native draw and the request's own state tables depend only
         on the seed and the exact size, so they can be prepared on another
-        thread before the request's latents are.
+        thread before the request's latents are. The seed's stream draws the
+        conditions' noise first, then each generated modality's.
         """
         # The denoiser's numerical calls batch over leading size 1.
         normal_noise(
             (seed,),
-            out=tuple(
-                tensors[f"{name}_noise"].unsqueeze(0)
-                for name in self.denoiser.modalities
+            out=(
+                *(
+                    view.unsqueeze(0)
+                    for view in self.condition_noise(size, tensors)
+                ),
+                *(
+                    tensors[f"{name}_noise"].unsqueeze(0)
+                    for name in self.denoiser.modalities
+                ),
             ),
         )
         self.denoiser.prepare_state(
@@ -513,6 +572,27 @@ class MediaBuilder:
         rows = size.num_text_tokens
         target[:rows].copy_(features.reshape(rows, -1), non_blocking=True)
         target[rows:].zero_()
+
+    def encode_conditions(
+        self,
+        size,
+        tensors: Mapping[str, torch.Tensor],
+        latents: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Write a request's encoded conditions into its retained rows.
+
+        ``latents`` are the condition latents in request order as the latent
+        encoders produced them (``VideoDenoiser.encode_conditions``). The
+        rows follow the prompt, so this runs after ``store_conditioning``, on
+        the same stream.
+        """
+        self.denoiser.encode_conditions(
+            size,
+            self.layout(size),
+            latents=latents,
+            noise=self.condition_noise(size, tensors),
+            out=tensors["text_condition"],
+        )
 
     def bind(
         self,

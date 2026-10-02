@@ -16,10 +16,13 @@ import torch
 from uniserve.media import image, video
 from uniserve.model import (
     AudioDecoder,
+    AudioEncoder,
     Denoiser,
+    PatchEncoder,
     TextEncoder,
     VideoDecoder,
     VideoDenoiser,
+    VideoEncoder,
     VideoPostprocessor,
 )
 from uniserve.tensors import BufferConfig, OutputLayout
@@ -169,6 +172,65 @@ def encoded_units_layout(
     )
 
 
+def _rows(shape: tuple[int, ...], dtype: torch.dtype) -> OutputLayout:
+    """A product of rows whose count varies by request."""
+    return OutputLayout(
+        shape,
+        dtype,
+        tuple(slice(0, extent) for extent in shape),
+        variable_axes=(0,),
+    )
+
+
+def condition_media_layouts(
+    config: WorkerConfig,
+    *,
+    video_encoder: VideoEncoder,
+    audio_encoder: AudioEncoder,
+    vision: PatchEncoder,
+    frame_counts: tuple[int, ...],
+) -> dict[str, OutputLayout]:
+    """Describe the media reader's products, bounded for every request.
+
+    A request's condition rows are at most ``config.max_condition_rows`` and
+    its presentation at most ``config.max_sequence_tokens`` tokens, which
+    bound what it reads:
+
+    - ``condition_pixels``: ``[pixels, 3]`` RGB24 of every visual condition.
+      A condition's pixels are its rows times the pixels per row of its
+      frame count, one of ``frame_counts``, so the bound is the condition
+      rows times the largest such ratio, read from the video encoder's own
+      layout (it does not depend on the raster).
+    - ``condition_samples``: ``[samples, 2]`` FP32 PCM of every audio track.
+      A track's stereo rows are twice its latent frames, each frame
+      ``latent_rate`` samples.
+    - ``vision_pixels``: the vision encoder's packed patch rows of every
+      vision block, whose tokens all lie in the presentation.
+    """
+    rows = config.max_condition_rows
+    # A 32-pixel square is the smallest raster whose rows are whole latent
+    # patches, so its rows per frame count the rows of one patch.
+    patch = image.Config(32, 32)
+    pixels_per_row = max(
+        -(
+            -frames
+            * patch.height
+            * patch.width
+            // video_encoder.output_layout(video.Config(frames, patch))[
+                "video"
+            ].shape[0]
+        )
+        for frames in frame_counts
+    )
+    return {
+        "condition_pixels": _rows((rows * pixels_per_row, 3), torch.uint8),
+        "condition_samples": _rows(
+            (rows // 2 * audio_encoder.latent_rate, 2), torch.float32
+        ),
+        "vision_pixels": vision.pixels_layout(config.max_sequence_tokens),
+    }
+
+
 def output_layouts(
     config: WorkerConfig,
     call: Call,
@@ -212,6 +274,35 @@ def output_layouts(
             else prompt_tokens,
             getattr(torch, config.model_dtype),
         )
+
+    # Condition encoders publish products only on a deployment that serves
+    # conditions. A request's vision tokens lie within its presentation, and
+    # its condition rows within the condition capacity; the request's own
+    # extents come from its admission.
+    condition_encoder = isinstance(component, (VideoEncoder, AudioEncoder)) or (
+        isinstance(component, PatchEncoder) and builder is not None
+    )
+    if condition_encoder and call.entry_point.method == "encode":
+        if config.max_condition_rows == 0:
+            return {}
+        if isinstance(component, PatchEncoder):
+            return component.features_layout(config.max_sequence_tokens)
+        # One row's width, from the encoder's own layout of a small input.
+        if isinstance(component, VideoEncoder):
+            sample = component.output_layout(
+                video.Config(1, image.Config(32, 32))
+            )["video"]
+            return {
+                "video": _rows(
+                    (config.max_condition_rows, sample.shape[1]), sample.dtype
+                )
+            }
+        sample = component.output_layout(component.latent_rate)["audio"]
+        return {
+            "audio": _rows(
+                (config.max_condition_rows, sample.shape[1]), sample.dtype
+            )
+        }
 
     if isinstance(component, VideoPostprocessor):
         # The post-processor's RGB media units are the decoding call's

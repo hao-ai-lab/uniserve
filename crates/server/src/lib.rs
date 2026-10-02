@@ -130,6 +130,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_batch_tokens,
         max_model_len: effective_max_model_len,
         max_video_seconds: config.engine.max_video_seconds,
+        max_condition_rows: config.engine.max_condition_rows,
         // Video workers provision only the frame counts the API admits.
         min_video_seconds: Some(crate::serving::MIN_VIDEO_SECONDS),
         ..config.engine.worker_process.clone()
@@ -171,6 +172,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                     denoiser,
                     vision,
                     *max_video_seconds,
+                    config.engine.max_condition_rows,
                     &config.video_media,
                     Arc::clone(&tokenizer),
                 )

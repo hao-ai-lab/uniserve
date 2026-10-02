@@ -1055,8 +1055,10 @@ impl WorkerExecutor {
         let readers = batch
             .requests
             .iter()
-            .filter(|(_, placement)| !placement.readers.is_empty())
-            .map(|(call, placement)| ((call.request_key, call.call_id), placement.readers.clone()))
+            .filter_map(|(call, placement)| {
+                let readers = placement.readers.clone()?;
+                Some(((call.request_key, call.call_id), readers))
+            })
             .collect();
         match self.workers[worker_index].1.submit_batch(wire, &readers) {
             Ok(()) => {}
