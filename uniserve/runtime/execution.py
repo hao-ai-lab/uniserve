@@ -506,15 +506,14 @@ class ExecutionContext(Generic[SizeT]):
                             )
                             amount = 2 * rows * child.weight.shape[1] * 4
 
-                        # Registered transport buffers belong to the stream
-                        # whose communicator holds their windows.
+                        # Transport buffers are reused in stream order, so a
+                        # context on an owned stream borrows that stream's
+                        # pool, which every context on the stream shares.
                         if self.stream is not None:
                             pool = self.stream.communication.gather_pool(group)
                         else:
                             if group not in self._gather_pools:
-                                self._gather_pools[group] = GatherPool(
-                                    group, None
-                                )
+                                self._gather_pools[group] = GatherPool(group)
                             pool = self._gather_pools[group]
                         self._chunks[id(child)] = partial(
                             pool.borrow, capacity=amount
