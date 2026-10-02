@@ -321,8 +321,6 @@ class RegionSparse(nn.Module):
         super().__init__()
         self.head_dim = config.head_dim
         self.rounding = config.rounding
-        # Rotated channels of each head: two halves of three axes' frequencies.
-        self.rotary_width = 6 * config.rope_frequency_dim
         inner = config.num_attention_heads * config.head_dim
         self.projection = MergedColumnParallelLinear(
             config.hidden_size,
@@ -357,13 +355,11 @@ class RegionSparse(nn.Module):
 
         ``hidden`` is the normalized shard, whole or as ``(global row slice,
         rows)`` chunks. ``cos`` and ``sin`` hold the compact rotary factors
-        ``[padded rows, rotary_width / 2]`` of every packed row. Yields one
-        chunk covering the shard.
+        ``[padded rows, 3 * rope_frequency_dim]`` of every packed row: one
+        per rotated channel pair of the three axes' halves. Yields one chunk
+        covering the shard.
         """
         rows = inputs.regions.padded_tokens
-        # One RMS domain spans each whole head; the leading axis rotates its
-        # 96 channels split-half and the trailing 32 channels pass through.
-        unrotated = cos[..., :0]
         # Projected intervals of the gathered sequence arrive in any order.
         # Each normalizes and rotates in place of its rows, so the per-row
         # recipe's temporaries stay the size of one interval.
@@ -384,18 +380,18 @@ class RegionSparse(nn.Module):
                     for name, value in branches.items()
                 }
             rotated["q"][interval], rotated["k"][interval] = (
+                # One RMS domain and one rotary axis span each whole head;
+                # the compact factors rotate its leading 96 channels
+                # split-half and the trailing 32 channels pass through.
                 functional.qk_norm_rope(
                     branches["q"],
                     branches["k"],
                     (self.query_norm.weight,),
                     (self.key_norm.weight,),
-                    (cos[interval], unrotated[interval]),
-                    (sin[interval], unrotated[interval]),
+                    (cos[interval],),
+                    (sin[interval],),
                     eps=self.query_norm.eps,
-                    axis_dims=(
-                        self.rotary_width,
-                        self.head_dim - self.rotary_width,
-                    ),
+                    axis_dims=(self.head_dim,),
                     rounding=self.rounding,
                 )
             )
