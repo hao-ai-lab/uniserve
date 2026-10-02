@@ -258,9 +258,12 @@ class _ContextPlan:
                     + batch.visible_current_end[row].index_select(0, columns)
                 )
             else:
+                # A shared endpoint column applies to every local query.
                 ends = (
                     keys.values[row].expand(count)
                     if batch.fully_visible
+                    else batch.visible_end[row].expand(count)
+                    if batch.visible_end.shape[1] == 1
                     else batch.visible_end[row].index_select(0, columns)
                 )
             self.visible[row, :count].copy_(ends)
