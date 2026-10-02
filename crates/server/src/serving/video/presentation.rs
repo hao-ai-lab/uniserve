@@ -193,7 +193,6 @@ pub fn present(
 #[cfg(test)]
 pub(super) mod tests {
     use std::borrow::Cow;
-    use std::path::PathBuf;
 
     use serde_json::Value;
     use tokenizers::models::bpe::{BPE, Vocab};
@@ -202,7 +201,9 @@ pub(super) mod tests {
     use super::super::RequestField;
     use super::super::plan::tests::{Request, fixture, vision};
     use super::{Segment, TEXT_TAG, VIDEO_TAG, VisionPad, present, segments};
+    use crate::profile::assets::resolve_pipeline_index;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
+    use crate::serving::model::pipeline_tokenizer;
 
     fn expected_segments(case: &Value) -> Vec<Segment<'static>> {
         case["expected"]["segments"]
@@ -353,17 +354,17 @@ pub(super) mod tests {
         }
     }
 
-    /// With the checkpoint's own tokenizer (`UNISERVE_MINIMAX_H3_MODEL` names
-    /// the checkpoint root), the token ids equal the reference's.
-    #[test]
-    fn checkpoint_tokenizer_matches_the_reference() {
-        let Some(root) = std::env::var_os("UNISERVE_MINIMAX_H3_MODEL") else {
+    /// With the checkpoint's own tokenizer, loaded as the server loads it
+    /// (`UNISERVE_MINIMAX_H3_MODEL` names the checkpoint root), the token ids
+    /// equal the reference's.
+    #[tokio::test]
+    async fn checkpoint_tokenizer_matches_the_reference() {
+        let Ok(root) = std::env::var("UNISERVE_MINIMAX_H3_MODEL") else {
             eprintln!("UNISERVE_MINIMAX_H3_MODEL is not set; skipping the tokenizer parity test");
             return;
         };
-        let tokenizer =
-            HuggingFaceTokenizer::new(&PathBuf::from(root).join("tokenizer/tokenizer.json"))
-                .unwrap();
+        let index = resolve_pipeline_index(&root).await.unwrap().unwrap();
+        let tokenizer = pipeline_tokenizer(&root, &index).await.unwrap();
         let fixture = fixture();
         let vision = vision(&fixture);
         for case in fixture["requests"].as_array().unwrap() {

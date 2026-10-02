@@ -947,7 +947,11 @@ def present(
     """Tokenize the presentation of a request.
 
     Every text segment is tokenized on its own without special tokens and
-    without a chat template, and the pieces are concatenated.
+    without a chat template, and the pieces are concatenated. ``tokenizer``
+    is the checkpoint's tokenizer as ``transformers`` loads it, with the
+    special tokens its ``tokenizer_config.json`` declares beyond
+    ``tokenizer.json`` (such as the ``<d>`` dialogue marker), which a prompt
+    may contain.
 
     Raises:
         PlanError: The prompt is blank or contains a vision placeholder,

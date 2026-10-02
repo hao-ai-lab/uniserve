@@ -19,7 +19,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::EngineSettings;
-use crate::profile::assets::{ResolvedModelFiles, resolve_model_file, resolve_pipeline_index};
+use crate::profile::assets::{
+    PipelineIndex, ResolvedModelFiles, resolve_model_file, resolve_pipeline_index,
+};
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
@@ -241,6 +243,28 @@ pub(crate) struct LoadedModel {
     pub vision: Option<VisionConfig>,
 }
 
+/// Loads a diffusers pipeline's `tokenizer` component as the pipeline's own
+/// `transformers` tokenizer loads it: `tokenizer.json` with the special
+/// tokens its `tokenizer_config.json`, when published, declares.
+///
+/// The conditioner reads token ids, so a declared token missing here would
+/// split into text tokens the reference never presents (MiniMax-H3 declares
+/// its `<d>` dialogue marker only in the configuration).
+pub(crate) async fn pipeline_tokenizer(
+    model: &str,
+    index: &PipelineIndex,
+) -> std::result::Result<HuggingFaceTokenizer, ModelResolutionError> {
+    let path =
+        resolve_model_file(model, &index.component_file("tokenizer", "tokenizer.json")?).await?;
+    let config_file = index.component_file("tokenizer", "tokenizer_config.json")?;
+    let tokenizer = match resolve_model_file(model, &config_file).await {
+        Ok(config) => HuggingFaceTokenizer::with_config(&path, &config)?,
+        Err(crate::profile::assets::Error::MissingFile { .. }) => HuggingFaceTokenizer::new(&path)?,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(tokenizer)
+}
+
 impl ModelConfig {
     /// Loads model facts and the tokenizer/template resources needed by preprocessing.
     ///
@@ -268,12 +292,8 @@ impl ModelConfig {
                         class_name: index.class_name.clone(),
                     }
                 })?;
-            let tokenizer_path = resolve_model_file(
-                &config.model,
-                &index.component_file("tokenizer", "tokenizer.json")?,
-            )
-            .await?;
-            let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?);
+            let tokenizer: DynTokenizer =
+                Arc::new(pipeline_tokenizer(&config.model, &index).await?);
             // The conditioner's Qwen3-VL processor fixes how condition media
             // is patched; requests are planned against it.
             let mut processor = Vec::with_capacity(2);
