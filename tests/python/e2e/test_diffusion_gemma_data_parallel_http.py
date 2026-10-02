@@ -4,11 +4,12 @@
 of the N visible GPUs, each with its own scheduler and KV cache, and routes
 every request to the replica with the fewest requests in flight; with
 ``--expert-parallel`` the replicas also shard the routed experts and exchange
-tokens at every expert layer. On both topologies the tests check what a
-client observes:
+tokens at every expert layer. DWDP instead prefetches immutable weights and
+lets replicas advance independently. The tests check what a client observes:
 
 - readouts sent together are all answered correctly, and every replica
   admits some of them;
+- mixed text and image contexts preserve the requested image order;
 - a seeded chat request sent to every replica at once is answered by each,
   with the same reply wherever the replicas are independent.
 
@@ -20,6 +21,8 @@ interpreter is ``UNISERVE_WORKER_PYTHON``, else the repository's
 
 from __future__ import annotations
 
+import base64
+import io
 import os
 import re
 import time
@@ -30,6 +33,7 @@ from pathlib import Path
 import httpx
 import pytest
 import torch
+from PIL import Image
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
@@ -181,19 +185,78 @@ def test_concurrent_readouts_are_answered_by_every_replica(served):
     assert all(count > 0 for count in admitted.values()), admitted
 
 
+def test_mixed_text_and_image_readouts_complete_across_replicas(served):
+    """Concurrent contexts preserve text and image order across replicas."""
+    base_url, replicas, _ = served
+    colors = {
+        "red": (255, 0, 0),
+        "green": (0, 255, 0),
+        "blue": (0, 0, 255),
+        "yellow": (255, 255, 0),
+    }
+    images = {}
+    for name, color in colors.items():
+        buffer = io.BytesIO()
+        Image.new("RGB", (64, 64), color).save(buffer, format="PNG")
+        images[name] = (
+            "data:image/png;base64,"
+            + base64.b64encode(buffer.getvalue()).decode()
+        )
+
+    bodies, expected = [], []
+    for index in range(4 * replicas):
+        color = tuple(colors)[index % len(colors)]
+        count = (0, 1, 3)[index % 3]
+        body = {
+            "model": SERVED_MODEL,
+            "state": (
+                "The attached images are plain color swatches."
+                if count
+                else f"The secret color is {color}."
+            )
+            + " x" * (40 + index),
+            "questions": {
+                "color": {
+                    "type": "choice",
+                    "instructions": (
+                        f"Which color fills Image {count}?"
+                        if count
+                        else "What is the secret color named in the state?"
+                    ),
+                    "criteria": dict.fromkeys(colors),
+                }
+            },
+        }
+        if count:
+            # Earlier images differ from the last, so losing context order
+            # cannot accidentally preserve the expected answer.
+            other = tuple(colors)[(index + 1) % len(colors)]
+            body["x_images"] = [images[other]] * (count - 1) + [images[color]]
+        bodies.append(body)
+        expected.append(color)
+
+    with ThreadPoolExecutor(len(bodies)) as pool:
+        responses = list(
+            pool.map(
+                lambda body: _post(base_url, "/v1/systemone", body), bodies
+            )
+        )
+    for response, color in zip(responses, expected, strict=True):
+        probabilities = response["answers"]["color"]["probabilities"]
+        assert max(probabilities, key=probabilities.get) == color, response
+
+
 def test_every_replica_answers_a_seeded_request(served):
     """One seeded request sent once per replica at the same time.
 
     Each copy is routed while the others are in flight, so every replica
     serves one. Independent replicas each serve their copy alone with the
     same model, so their replies are identical. Expert-parallel replicas
-    take every expert layer in steps together, and each pads its forward to
-    the graph of the step's agreed exchange capacity, as SGLang
-    (``prepare_mlp_sync_batch_raw``) and vLLM (``coordinate_batch_across_dp``)
-    pad data-parallel ranks to their largest: a copy that starts while the
-    other replicas run larger steps runs in a larger graph, so a reply's
-    numerics follow what the other replicas run alongside it. There each
-    replica answers with a complete reply of its own.
+    take every expert layer in steps together. Their attention and dense
+    computation keeps local shapes, while the shared expert computation
+    receives the group's tokens. Different peer batches can change its
+    floating-point rounding. Each replica must still answer with a complete
+    reply of its own. DWDP keeps local numerical batches independent.
     """
     base_url, replicas, topology = served
     body = {
