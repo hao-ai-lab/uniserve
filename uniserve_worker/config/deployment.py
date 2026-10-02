@@ -60,6 +60,7 @@ SUPPORTED_CALL_GROUPS: dict[str, tuple[CallKind, ...]] = {
         MediaCall.VIDEO_DECODING,
         MediaCall.AUDIO_DECODING,
     ),
+    "media_read": (MediaCall.MEDIA_READING,),
     "media_append": (
         MediaCall.VIDEO_ENCODING,
         MediaCall.AUDIO_ENCODING,
