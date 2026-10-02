@@ -564,17 +564,18 @@ class ExecutionContext(Generic[SizeT]):
 
         # Round up to whole rank shards so transport padding has backing.
         rows = (num_tokens + group.size - 1) // group.size * group.size
+        # The head exchange moves Q, K and V in one payload of every local
+        # head slot; the output returns this rank's query heads.
+        widths = {
+            "heads_send": layer.local_heads + 2 * layer.local_kv_heads,
+            "heads_receive": layer.local_heads + 2 * layer.local_kv_heads,
+            "output_receive": layer.local_heads,
+        }
         requirements = {
-            f"{role}_{direction}": BufferConfig(
+            name: BufferConfig(
                 (rows * heads * layer.head_dim * dtype.itemsize,), torch.uint8
             )
-            for role, heads in (
-                ("query", layer.local_heads),
-                ("key", layer.local_kv_heads),
-                ("value", layer.local_kv_heads),
-                ("output", layer.local_heads),
-            )
-            for direction in ("send", "receive")
+            for name, heads in widths.items()
         }
         previous = self._exchange.get(id(layer))
         if previous is not None and all(

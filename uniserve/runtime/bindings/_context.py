@@ -278,10 +278,8 @@ class _ContextPlan:
 
     def exchange(self, k, v, *, storage):
         """Publish local K/V shards into the global context key domain."""
-        exchange = self.layer.exchange
-        key, value = (
-            exchange.heads(self.keys.pad(tensor), storage=storage, role=role)
-            for role, tensor in (("key", k), ("value", v))
+        key, value = self.layer.exchange.heads(
+            (self.keys.pad(k), self.keys.pad(v)), storage=storage
         )
         if self.keys.num_tokens == 0:
             return key[:0], value[:0]
@@ -311,9 +309,13 @@ class _ContextPlan:
 
         Gather query rows and context K/V into this rank's attention inputs.
         """
-        query = self.layer.exchange.heads(
-            self.queries.pad(q), storage=storage, role="query"
-        ).index_select(0, self.query_indices)
+        # Queries and keys partition different token domains, so they move in
+        # separate exchanges. The index_select copies the queries out of the
+        # shared receive storage before the K/V exchange reuses it.
+        (query,) = self.layer.exchange.heads(
+            (self.queries.pad(q),), storage=storage
+        )
+        query = query.index_select(0, self.query_indices)
 
         cached = (
             isinstance(batch, VisibleInput) and batch.block_table is not None
