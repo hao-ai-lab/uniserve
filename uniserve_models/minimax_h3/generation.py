@@ -19,7 +19,6 @@ from uniserve.execution import DenoisingRunner
 from uniserve.media import image, video
 from uniserve.model import LatentInput, TextSize
 from uniserve.runtime import ExecutionContext, TensorBuffers
-from uniserve.tensors import TensorOutput
 
 from .inputs import DenoiserInput, DenoiserSize
 from .model import Model
@@ -197,28 +196,29 @@ def generate(
         ExecutionContext(decoder) as decoding,
         ExecutionContext(postprocessor) as processing,
     ):
-        decoding.prepare(output)
         processing.prepare(output)
         overlap = {
             name: torch.zeros(config.shape, dtype=config.dtype, device=device)
             for name, config in postprocessor.state_buffers(output).items()
         }
+        prepared = None
         for window in decoder.frame_slices(num_frames):
+            # Each window is unpacked from the whole latent and decoded at
+            # its segment, which the context is prepared for.
+            segment = decoder.segment(output, window)
+            if segment != prepared:
+                decoding.prepare(segment)
+                prepared = segment
+            config = decoder.window_input(segment)
+            inputs = torch.empty(
+                config.shape, dtype=config.dtype, device=device
+            )
+            decoder.unpack_latents(latents["video"], window, output, out=inputs)
             with decoding.activate():
-                segment = decoder.decode(
-                    (latents["video"],),
-                    frames=(window,),
-                    sizes=(output,),
-                    constants=decoding.constants,
-                    workspace=decoding.workspace,
-                )
+                (decoded,) = decoder.decode((inputs,), segments=(segment,))
             with processing.activate():
                 rgb = postprocessor(
-                    tuple(
-                        value
-                        for value in segment
-                        if isinstance(value, TensorOutput)
-                    ),
+                    (decoder.place(decoded, window, output),),
                     frames=(window,),
                     sizes=(output,),
                     state=overlap,

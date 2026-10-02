@@ -1,6 +1,6 @@
 """Decoder numerical calls and public output layouts."""
 
-from uniserve.model import AudioDecoder, VideoDecoder, VideoPostprocessor
+from uniserve.model import AudioDecoder, VideoPostprocessor
 from uniserve.tensors import OutputLayout
 
 from .model_runner import ModelRunner
@@ -12,7 +12,9 @@ class DecoderRunner(ModelRunner):
 
     def resources(self):
         """Context views ``execute_model`` passes to direct decoder calls."""
-        if isinstance(self.model, (VideoDecoder, VideoPostprocessor)):
+        # A video decoder's windows arrive unpacked, so its calls borrow no
+        # context views.
+        if isinstance(self.model, VideoPostprocessor):
             return {
                 "constants": self.context.constants,
                 "workspace": self.context.workspace,

@@ -6,9 +6,10 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
+from uniserve.media import video
 from uniserve.model import ComponentEntry, EntryPoint, VideoDecoder
 from uniserve.nn.vae import LatentDecoder
-from uniserve.tensors import OutputLayout
+from uniserve.tensors import BufferConfig, OutputLayout
 
 
 @dataclass(frozen=True)
@@ -68,10 +69,30 @@ class Decoder(VideoDecoder):
             )
         }
 
-    def unpack_latents(self, latent, frames, size, *, constants, workspace):
-        return latent.T.reshape(
-            1, 3, size.num_frames, size.frame.height, size.frame.width
-        )[:, :, frames]
+    def segment(self, size, frames):
+        if frames not in self.frame_slices(size.num_frames):
+            raise ValueError("the temporal projection decodes whole windows")
+        return video.Config(self.window, size.frame)
+
+    def window_input(self, segment):
+        return BufferConfig(
+            (
+                1,
+                3,
+                segment.num_frames,
+                segment.frame.height,
+                segment.frame.width,
+            ),
+            torch.float32,
+        )
+
+    def unpack_latents(self, latent, frames, size, *, out):
+        self.segment(size, frames)
+        out.copy_(
+            latent.T.reshape(
+                1, 3, size.num_frames, size.frame.height, size.frame.width
+            )[:, :, frames]
+        )
 
 
 class DecodedModel(nn.Module):

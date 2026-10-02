@@ -27,6 +27,7 @@ from uniserve_models.minimax_h3.packing import (
 from uniserve_worker.bootstrap.distributed import initialize_components
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.execution.media import decode_video_unit
 from uniserve_worker.execution.model_executor import ModelExecutor
 
 pytestmark = [
@@ -127,13 +128,8 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                                 .clone()
                             )
                         for _ in range(2):
-                            result = runner.run_module(
-                                "video_decoder",
-                                (latents,),
-                                method="decode",
-                                size=size,
-                                frames=(window,),
-                                sizes=(size,),
+                            result = decode_video_unit(
+                                runner, "video_decoder", latents, window, size
                             )
                             actual = result.values[0]
                             assert actual.dtype == torch.float16
@@ -141,7 +137,10 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                             torch.testing.assert_close(
                                 actual, expected, rtol=0, atol=0
                             )
-                            assert result.layouts[0].local_slice[0] == slice(
+                            placed = model.video_decoder.place(
+                                actual, window, size
+                            )
+                            assert placed.layout.local_slice[0] == slice(
                                 index, index + 1
                             )
                         retained.append((actual, expected))
@@ -261,13 +260,8 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
             torch.cuda.synchronize()
             with torch.cuda.stream(video_stream):
                 torch.cuda._sleep(2_000_000_000)
-                video_result = runner.run_module(
-                    "video_decoder",
-                    (latents,),
-                    method="decode",
-                    size=size,
-                    frames=(windows[0],),
-                    sizes=(size,),
+                video_result = decode_video_unit(
+                    runner, "video_decoder", latents, windows[0], size
                 )
                 video_done.record(video_stream)
             with torch.cuda.stream(audio_stream):

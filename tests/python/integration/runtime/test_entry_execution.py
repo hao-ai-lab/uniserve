@@ -247,13 +247,8 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(
             return normalized.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
         def decode(runner):
-            return runner.run_module(
-                "reconstruction",
-                (source,),
-                method="decode",
-                size=PIXEL,
-                frames=(slice(0, 4),),
-                sizes=(PIXEL,),
+            return media.decode_video_unit(
+                runner, "reconstruction", source, slice(0, 4), PIXEL
             ).values[0]
 
         reference = expected(source)
@@ -292,13 +287,8 @@ def test_module_call_statistics_count_the_call_without_tokens():
         bindings=_encoder_bindings(model, components),
     )
     try:
-        output = runner.run_module(
-            "reconstruction",
-            (torch.zeros(4, 3),),
-            method="decode",
-            size=PIXEL,
-            frames=(slice(0, 4),),
-            sizes=(PIXEL,),
+        output = media.decode_video_unit(
+            runner, "reconstruction", torch.zeros(4, 3), slice(0, 4), PIXEL
         )
     finally:
         runner.close()

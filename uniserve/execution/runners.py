@@ -237,23 +237,20 @@ class AudioRunner(ModelRunner[AudioDecoder, int]):
 
 
 class VideoRunner(ModelRunner[VideoDecoder, video.Config]):
-    """Decode video latent windows using prepared constants and workspace."""
+    """Decode unpacked video windows at a prepared segment.
+
+    ``warmup`` prepares a segment (``VideoDecoder.segment``), which every
+    window decoded through the runner must have; ``VideoDecoder``'s
+    ``unpack_latents`` supplies each window from a complete packed latent.
+    """
 
     def decode(
         self,
-        latents: tuple[torch.Tensor, ...],
+        windows: tuple[torch.Tensor, ...],
         *,
-        frames: tuple[slice, ...],
-        sizes: tuple[video.Config, ...],
-    ) -> tuple[TensorOutput | None, ...]:
-        return self._run(
-            self.model.decode,
-            latents,
-            frames=frames,
-            sizes=sizes,
-            constants=self.context.constants,
-            workspace=self.context.workspace,
-        )
+        segments: tuple[video.Config, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        return self._run(self.model.decode, windows, segments=segments)
 
 
 class VideoProcessor(ModelRunner[VideoPostprocessor, video.Config]):

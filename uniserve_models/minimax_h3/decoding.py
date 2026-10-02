@@ -21,7 +21,7 @@ from uniserve.model import VideoDecoder as BaseVideoDecoder
 from uniserve.tensors import BufferConfig, OutputLayout
 
 from . import audio_vae, video_vae
-from .config import Attention
+from .config import Attention, DenseAttention
 from .output import frame_slices
 from .packing import (
     FPS,
@@ -36,8 +36,11 @@ from .packing import (
 class VideoDecoder(BaseVideoDecoder):
     """Unpack packed H3 video latents into each native seven-frame VAE window.
 
-    ``attention`` is the attention kind of the denoisers whose latents this
-    decoder reconstructs; it fixes their packed video row order.
+    Every legal output frame slice decodes one window of seven latent frames
+    into a native 25-frame segment at the output raster, so a window's decode
+    depends on the raster alone. ``attention`` is the attention kind of the
+    denoisers whose latents this decoder reconstructs; it fixes their packed
+    video row order.
     """
 
     def __init__(self, config: video_vae.Config, *, attention: Attention):
@@ -61,72 +64,28 @@ class VideoDecoder(BaseVideoDecoder):
             )
         }
 
-    def workspace_buffers(
-        self, size: video.Config
-    ) -> Mapping[str, BufferConfig]:
-        self.frame_slices(size.num_frames)
-        height, width = latent_raster(size.frame)
-        channels = self.config.latent_channels
-        # One seven-latent-frame window: the NCTHW decoder input and the
-        # raster patch rows gathered for it.
-        return {
-            "video_input": BufferConfig(
-                (1, channels, 7, height, width), torch.float32
-            ),
-            "reconstruction_tokens": BufferConfig(
-                (7 * (height // 2) * (width // 2), channels * 4), torch.float32
-            ),
-        }
-
-    def constant_buffers(
-        self, size: video.Config
-    ) -> Mapping[str, BufferConfig]:
-        self.frame_slices(size.num_frames)
-        height, width = latent_raster(size.frame)
-        return {
-            "video_raster_order": BufferConfig(
-                (
-                    video_latent_frames(size.num_frames)
-                    * (height // 2)
-                    * (width // 2),
-                ),
-                torch.int64,
-            )
-        }
-
-    @torch.inference_mode()
-    def prepare_constants(
-        self, size: video.Config, *, out: Mapping[str, torch.Tensor]
-    ) -> None:
-        configs = self.constant_buffers(size)
-        if out.keys() != configs.keys():
-            raise ValueError("video decoding requires its raster-order indices")
-        target, config = (
-            out["video_raster_order"],
-            configs["video_raster_order"],
-        )
-        if target.shape != config.shape or target.dtype != config.dtype:
+    def segment(self, size: video.Config, frames: slice) -> video.Config:
+        if frames not in self.frame_slices(size.num_frames):
             raise ValueError(
-                "video raster-order indices have incompatible shape or dtype"
+                "video frame slice must select one complete reconstruction "
+                "window"
             )
-        # The argsort maps each raster row to its position among the packed
-        # video rows.
-        target.copy_(
-            torch.argsort(
-                video_order(
-                    self.attention,
-                    num_frames=size.num_frames,
-                    canvas=size.frame,
-                )
-            )
+        return video.Config(25, size.frame)
+
+    def window_input(self, segment: video.Config) -> BufferConfig:
+        if segment.num_frames != 25:
+            raise ValueError("an H3 window decodes 25 native frames")
+        height, width = latent_raster(segment.frame)
+        # The NCTHW decoder input of seven latent frames.
+        return BufferConfig(
+            (1, self.config.latent_channels, 7, height, width), torch.float32
         )
 
-    def unpack_latents(self, latent, frames, size, *, constants, workspace):
-        target, tokens = (
-            workspace["video_input"],
-            workspace["reconstruction_tokens"],
-        )
-        height, width = target.shape[-2:]
+    def unpack_latents(self, latent, frames, size, *, out):
+        config = self.window_input(self.segment(size, frames))
+        if tuple(out.shape) != config.shape or out.dtype != config.dtype:
+            raise ValueError("video window input has an incompatible layout")
+        height, width = latent_raster(size.frame)
         tokens_per_frame = (height // 2) * (width // 2)
         shape = (
             video_latent_frames(size.num_frames) * tokens_per_frame,
@@ -137,25 +96,42 @@ class VideoDecoder(BaseVideoDecoder):
                 f"video decoder requires complete final latent tokens "
                 f"with shape {shape}"
             )
+
         # Unit k decodes latent frames [5k, 5k + 7): five frames that advance
         # the timeline and two trailing frames that the next unit's window
-        # also reads. Gathering the window's raster rows from the packed
-        # latent yields them in raster order.
+        # also reads. Their raster rows are [start, stop).
         unit = frames.start // 17
         start = unit * 5 * tokens_per_frame
-        indices = constants["video_raster_order"][
-            start : start + 7 * tokens_per_frame
-        ]
-        torch.index_select(latent, 0, indices, out=tokens)
+        stop = start + 7 * tokens_per_frame
+        if isinstance(self.attention, DenseAttention):
+            # Dense packing keeps the raster order.
+            tokens = latent[start:stop]
+        else:
+            # Tile and region packing order the rows tile-major, which
+            # depends on the frame count; the argsort maps each raster row to
+            # its position among the packed rows.
+            positions = torch.argsort(
+                video_order(
+                    self.attention,
+                    num_frames=size.num_frames,
+                    canvas=size.frame,
+                )
+            )[start:stop]
+            if latent.device.type == "cuda":
+                # A pinned source keeps the transfer asynchronous; a pageable
+                # one would wait for the work already queued on the stream.
+                positions = positions.pin_memory().to(
+                    latent.device, non_blocking=True
+                )
+            tokens = latent.index_select(0, positions)
         unpatchify_video_into(
             tokens,
-            target,
+            out,
             frames=7,
             height=height,
             width=width,
             channels=self.config.latent_channels,
         )
-        return target
 
 
 class AudioDecoder(BaseAudioDecoder):
