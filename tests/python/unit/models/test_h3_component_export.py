@@ -132,3 +132,41 @@ def test_checkpoint_without_a_pinned_base_takes_none(checkpoints):
     _, base = checkpoints
     with pytest.raises(ValueError, match="pins no base"):
         _read(base, base)
+
+
+def test_export_without_a_local_base_reads_the_pinned_hub_revision(
+    checkpoints, tmp_path, monkeypatch
+):
+    from huggingface_hub.errors import EntryNotFoundError
+
+    export, base = checkpoints
+    snapshot = tmp_path / "hub" / REVISION
+    published = sorted(
+        path.relative_to(base).as_posix()
+        for path in base.rglob("*")
+        if path.is_file() and path.relative_to(base).parts[0] != ".cache"
+    )
+
+    # The Hub is an external service: it serves the base's files at the
+    # pinned commit only.
+    def download(*, repo_id, filename, cache_dir, revision):
+        assert (repo_id, revision) == ("MiniMaxAI/MiniMax-H3", REVISION)
+        if filename not in published:
+            raise EntryNotFoundError(f"{filename} is not published")
+        target = snapshot / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(base / filename, target)
+        return str(target)
+
+    def files(self, *, repo_id, revision):
+        assert (repo_id, revision) == ("MiniMaxAI/MiniMax-H3", REVISION)
+        return published
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+    monkeypatch.setattr("huggingface_hub.HfApi.list_repo_files", files)
+    config = models.read_config(
+        export, io=IOConfig(mode="dummy"), modules=frozenset()
+    )
+
+    assert set(config.model.denoisers) == {"reference_denoiser"}
+    assert config.tokenizer == snapshot / "tokenizer"
