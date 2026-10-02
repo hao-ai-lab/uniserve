@@ -9,11 +9,17 @@ rows into the request's retained conditioning past the prompt capacity.
 import pytest
 import torch
 
-from tests.python.fixtures.h3 import WIDE, base_denoiser, dmd_denoiser
+from tests.python.fixtures.h3 import (
+    WIDE,
+    base_denoiser,
+    dmd_denoiser,
+    omniref_denoiser,
+)
 from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import TransformerConfig
 from uniserve_models.minimax_h3.denoiser import Denoiser
+from uniserve_models.minimax_h3.inputs import DenoiserSize
 from uniserve_models.minimax_h3.packing import patchify_video
 
 pytestmark = pytest.mark.unit
@@ -159,3 +165,67 @@ def test_encoded_conditions_fill_the_rows_past_the_prompt():
         model.encode_conditions(
             size, layout, latents=(clip_rows,), noise=noise, out=out
         )
+
+
+def test_reference_regions_take_whole_tiles():
+    model = _meta(omniref_denoiser())
+    voice = Condition(ConditionRole.REFERENCE, None, 32_000)
+    size = model.make_size(
+        124, 300, canvas=WIDE, conditions=(CLIP, IMAGE, voice)
+    )
+    # The clip's 120 soundtrack rows take one tile and its 7 x 24 x 24
+    # patches 2 x 6 x 3 tiles of 4 x 4 x 8; the image's 2304 rows take 18
+    # tiles and the voice's 80 rows one.
+    assert size.condition_rows == 128 * (1 + 36 + 18 + 1)
+    layout = model.layout_size(size)
+    assert (layout.num_text_tokens, layout.condition_rows) == (384, 7168)
+    assert model.holds(layout, size)
+    # The retained conditioning holds the prompt capacity, the conditions'
+    # rows and one zero row.
+    assert model.text_condition_rows(layout) == 384 + 7168 + 1
+    # Region packing holds no keyframe rows.
+    with pytest.raises(ValueError, match="keyframe"):
+        model.make_size(124, 300, canvas=WIDE, conditions=(CLIP, FIRST))
+
+
+def test_reference_region_state_follows_its_layout():
+    model = Denoiser(
+        omniref_denoiser(
+            TransformerConfig(
+                hidden_size=64,
+                num_attention_heads=4,
+                num_hidden_layers=1,
+                num_refiner_layers=1,
+                intermediate_size=128,
+                text_dim=40,
+                frequency_dim=16,
+                time_hidden_dim=64,
+                time_dim=32,
+                rope_frequency_dim=4,
+            )
+        )
+    )
+    size = model.make_size(124, 300, canvas=WIDE, conditions=(CLIP,))
+    # A layout with spare text and condition tiles holds the request.
+    layout = model.layout_size(
+        DenoiserSize(124, WIDE, 512, size.condition_rows + 256)
+    )
+    assert model.holds(layout, size)
+    buffers = model.state_buffers(layout)
+    out = {
+        name: torch.empty(config.shape, dtype=config.dtype)
+        for name, config in buffers.items()
+        if name not in model.modalities
+    }
+    model.prepare_state((size,), layouts=(layout,), out=out)
+
+    # The prompt, the clip's soundtrack and patches, and the generated 2 x
+    # 207 audio rows and 37 x 24 x 42 video patches fill the tiles.
+    prefix = 300 + 120 + 4032
+    assert int(out["valid_sizes"].sum()) == prefix + 2 * 207 + 37 * 24 * 42
+    # The clip's video forms region 0 and the generated video region 1.
+    assert set(out["tile_regions"].tolist()) == {-1, 0, 1}
+    # Only the request's prefix rows gather the prefix source; every other
+    # row takes its zero row.
+    zero = model.text_condition_rows(layout) - 1
+    assert int((out["prefix_index"] != zero).sum()) == prefix

@@ -879,6 +879,442 @@ def dense_tables(
     )
 
 
+# The (time, height, width) token grid of one video tile of each tile size of
+# region packing; dense segments fill whole tiles of the same rows.
+VIDEO_TILE_SHAPES = {64: (4, 4, 4), 128: (4, 4, 8)}
+
+
+def tile_order(
+    grid: tuple[int, int, int], shape: tuple[int, int, int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Order a ``(time, height, width)`` token grid tile-major.
+
+    Tiles of ``shape`` cover the grid time-major, then by height, then by
+    width; the grid's far edges cut boundary tiles short. Within a tile the
+    rows inside the grid follow in row-major order, packed at the tile's
+    front.
+
+    Returns:
+        The raster row (row-major over the grid) of every row in tile-major
+        order, and the int32 row count of every tile.
+    """
+    counts = [math.ceil(extent / size) for extent, size in zip(grid, shape)]
+    tile_t, tile_h, tile_w = shape
+    tiles = np.arange(counts[0] * counts[1] * counts[2], dtype=np.int64)
+    offsets = np.arange(tile_t * tile_h * tile_w, dtype=np.int64)[None, :]
+    time = tiles[:, None] // (counts[1] * counts[2]) * tile_t + offsets // (
+        tile_h * tile_w
+    )
+    height = tiles[:, None] // counts[2] % counts[1] * tile_h + (
+        offsets // tile_w % tile_h
+    )
+    width = tiles[:, None] % counts[2] * tile_w + offsets % tile_w
+    inside = (time < grid[0]) & (height < grid[1]) & (width < grid[2])
+    raster = ((time * grid[1] + height) * grid[2] + width)[inside]
+    return raster, inside.sum(axis=1, dtype=np.int32)
+
+
+def _video_grid(
+    frames: int, latent_height: int, latent_width: int
+) -> tuple[int, int, int]:
+    """Token grid of ``frames`` latent frames of a latent raster."""
+    return frames, latent_height // 2, latent_width // 2
+
+
+def region_tiles(segment: Segment, tile: int) -> int:
+    """Tiles one condition occupies in a region packing of ``tile`` rows.
+
+    Its audio rows fill whole tiles, then an image's rows fill whole tiles
+    and a video's rows fill the tiles of its token grid.
+
+    Raises:
+        ValueError: A keyframe, which region packing does not hold.
+    """
+    if segment.kind == SegmentKind.KEYFRAME:
+        raise ValueError("H3 region packing holds no keyframes")
+    tiles = math.ceil(segment.audio_rows / tile)
+    if segment.kind == SegmentKind.IMAGE:
+        tiles += math.ceil(segment.video_rows / tile)
+    elif segment.kind == SegmentKind.VIDEO:
+        grid = _video_grid(
+            segment.latent_frames, segment.latent_height, segment.latent_width
+        )
+        tiles += math.prod(
+            math.ceil(extent / size)
+            for extent, size in zip(grid, VIDEO_TILE_SHAPES[tile])
+        )
+    return tiles
+
+
+@dataclass(frozen=True, slots=True)
+class RegionPacking:
+    """Row extents of one multi-region sparse layout.
+
+    ``[text | conditions | target audio | target video | padding]``, each
+    region whole tiles of ``tile`` rows. Text and conditions are capacities
+    that a request fills from their start (``region_tables``); the generated
+    audio and video rows sit at positions the layout fixes. The generated
+    video's rows are tile-major over its token grid (``tile_order``) and the
+    stereo audio rows are channel-major.
+
+    Attributes:
+        tile: Rows of one tile, a key of ``VIDEO_TILE_SHAPES``.
+        text_rows: Text capacity, whole tiles.
+        condition_rows: Condition capacity, whole tiles.
+        audio_rows: Generated audio rows, both stereo channels.
+        video_indices: [video rows] int64 packed row of each generated video
+            row, ascending.
+        video_raster_indices: [video rows] int64 raster row of each entry of
+            ``video_indices``.
+        video_valid_sizes: [video tiles] int32 rows of each video tile.
+        padded_tokens: All rows, a multiple of the layout's alignment.
+    """
+
+    tile: int
+    text_rows: int
+    condition_rows: int
+    audio_rows: int
+    video_indices: torch.Tensor
+    video_raster_indices: torch.Tensor
+    video_valid_sizes: torch.Tensor
+    padded_tokens: int
+
+    @property
+    def audio_start(self) -> int:
+        """First row of the generated audio tiles."""
+        return self.text_rows + self.condition_rows
+
+    @property
+    def video_start(self) -> int:
+        """First row of the generated video tiles."""
+        return (
+            self.audio_start
+            + math.ceil(self.audio_rows / self.tile) * self.tile
+        )
+
+    @property
+    def audio_indices(self) -> torch.Tensor:
+        """[audio rows] int64 packed rows of the generated audio, ascending."""
+        return torch.arange(
+            self.audio_start,
+            self.audio_start + self.audio_rows,
+            dtype=torch.int64,
+        )
+
+    @property
+    def zero_row(self) -> int:
+        """Row of the prefix source that holds zeros (see ``region_tables``)."""
+        return self.text_rows + self.condition_rows
+
+
+def region_packing(
+    *,
+    num_frames: int,
+    canvas: image.Config,
+    text_rows: int,
+    condition_rows: int,
+    tile: int,
+    token_multiple: int,
+) -> RegionPacking:
+    """Size the multi-region layout of one frame count, canvas and capacity.
+
+    ``token_multiple``, a multiple of ``tile``, aligns the padded row count so
+    that every sequence rank holds an equal shard of whole tiles.
+
+    Raises:
+        ValueError: A tile size without a video tile shape, capacities that
+            are not whole tiles, a frame count H3 does not generate, a canvas
+            off the 32-pixel grid, or an alignment that is not whole tiles.
+    """
+    if (
+        tile not in VIDEO_TILE_SHAPES
+        or type(text_rows) is not int
+        or text_rows < tile
+        or text_rows % tile
+        or type(condition_rows) is not int
+        or condition_rows < 0
+        or condition_rows % tile
+        or type(token_multiple) is not int
+        or token_multiple < tile
+        or token_multiple % tile
+    ):
+        raise ValueError(
+            "a region layout needs whole-tile text and condition capacities "
+            "and a whole-tile alignment"
+        )
+    latent_height, latent_width = latent_raster(canvas)
+    grid = _video_grid(
+        video_latent_frames(num_frames), latent_height, latent_width
+    )
+    raster, sizes = tile_order(grid, VIDEO_TILE_SHAPES[tile])
+    audio_rows = AUDIO_CHANNELS * audio_latent_frames(num_frames)
+    video_start = (
+        text_rows + condition_rows + math.ceil(audio_rows / tile) * tile
+    )
+    offsets = np.arange(tile, dtype=np.int64)[None, :]
+    rows = video_start + np.arange(sizes.size, dtype=np.int64)[:, None] * tile
+    video_indices = (rows + offsets)[offsets < sizes[:, None]]
+    end = video_start + sizes.size * tile
+    return RegionPacking(
+        tile=tile,
+        text_rows=text_rows,
+        condition_rows=condition_rows,
+        audio_rows=audio_rows,
+        video_indices=torch.from_numpy(video_indices),
+        video_raster_indices=torch.from_numpy(raster),
+        video_valid_sizes=torch.from_numpy(sizes),
+        padded_tokens=math.ceil(end / token_multiple) * token_multiple,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RegionTables:
+    """One request's row and tile tables in its multi-region layout.
+
+    Attributes:
+        position_ids: [padded_tokens, 3] FP64 rotary coordinates; rows
+            outside the request hold zeros.
+        token_tags: [padded_tokens] int64 modulation tags; rows outside the
+            request carry ``VIDEO_TAG``.
+        groups: [padded_tokens] int64 timestep groups.
+        prefix_index: [padded_tokens] int64 row of the prefix source each
+            packed row takes: the text rows, then the conditions' rows in
+            packed order, and the source's zero row for every generated row
+            and every row outside the request.
+        valid_sizes: [tiles] int32 rows of each tile; zero for a tile the
+            request leaves empty.
+        tile_regions: [tiles] int32 video region of each tile, ``-1`` for a
+            dense or empty tile (``uniserve.nn.attention.vsa.Regions``).
+        region_starts: [tiles] int32 tiles below each region index.
+        region_keep: [tiles] int32 key tiles a video query keeps of each
+            region.
+    """
+
+    position_ids: torch.Tensor
+    token_tags: torch.Tensor
+    groups: torch.Tensor
+    prefix_index: torch.Tensor
+    valid_sizes: torch.Tensor
+    tile_regions: torch.Tensor
+    region_starts: torch.Tensor
+    region_keep: torch.Tensor
+
+
+def kept_tiles(sparsity: float, tiles: int) -> int:
+    """Tiles of a region of ``tiles`` that a video query keeps at ``sparsity``.
+
+    ``ceil((1 - sparsity) * tiles)``, at least one and at most every tile,
+    evaluated in the reference's double-precision arithmetic.
+    """
+    return max(1, min(math.ceil((1 - sparsity) * tiles), tiles))
+
+
+def region_tables(
+    packing: RegionPacking,
+    *,
+    num_frames: int,
+    canvas: image.Config,
+    num_text_tokens: int,
+    segments: tuple[Segment, ...],
+    vision_spans: tuple[tuple[int, int], ...],
+    sparsity: float,
+    reference_keep: float,
+) -> RegionTables:
+    """Build one request's tables in its multi-region layout.
+
+    The rows and their coordinates are the released ``ref2va`` packed
+    sequence ``[text | references | target audio | target video]`` of
+    ``dense_tables``, held in tiles (FastVideo's ``p2_multi_region`` policy).
+    The prompt fills the text tiles from the first. The references follow in
+    packed order from the first condition tile, each segment in its own
+    tiles: a reference's audio rows, then an image's rows fill whole dense
+    tiles, and a reference video forms its own region of video tiles over its
+    token grid. The generated audio fills dense tiles and the generated
+    video forms the last region. A video query keeps
+    ``kept_tiles(1 - reference_keep, n)`` tiles of a reference region of
+    ``n`` tiles and ``kept_tiles(sparsity, n)`` of the generated video.
+
+    Raises:
+        ValueError: A keyframe, conditions or a prompt that do not fit the
+            layout's capacities, or a vision span outside the prompt.
+    """
+    tile = packing.tile
+    if (
+        not 1 <= num_text_tokens <= packing.text_rows
+        or sum(region_tiles(segment, tile) for segment in segments) * tile
+        > packing.condition_rows
+    ):
+        raise ValueError(
+            "the prompt and conditions must fit their layout's capacities"
+        )
+    if any(
+        not 0 <= start < stop <= num_text_tokens for start, stop in vision_spans
+    ):
+        raise ValueError("vision spans must lie within the prompt")
+    rows, tiles = packing.padded_tokens, packing.padded_tokens // tile
+    latent_height, latent_width = latent_raster(canvas)
+    frames = video_latent_frames(num_frames)
+    spatial, width_grid = _frame_grid(latent_height, latent_width, (1, 2, 2))
+
+    positions = torch.zeros((rows, 3), dtype=torch.float64)
+    tags = torch.full((rows,), VIDEO_TAG, dtype=torch.int64)
+    groups = torch.full((rows,), VIDEO_GROUP, dtype=torch.int64)
+    prefix_index = torch.full((rows,), packing.zero_row, dtype=torch.int64)
+    valid_sizes = torch.zeros(tiles, dtype=torch.int32)
+    tile_regions = torch.full((tiles,), -1, dtype=torch.int32)
+    region_tile_counts = []
+
+    def dense_rows(first_tile: int, count: int) -> torch.Tensor:
+        # Packed rows of a dense segment of ``count`` rows filling tiles from
+        # ``first_tile``: whole tiles, the last one partially.
+        used = math.ceil(count / tile)
+        sizes = torch.full((used,), tile, dtype=torch.int32)
+        sizes[-1] = count - (used - 1) * tile
+        valid_sizes[first_tile : first_tile + used] = sizes
+        return torch.arange(first_tile * tile, first_tile * tile + count)
+
+    def region(first_tile: int, grid: tuple[int, int, int]):
+        # A video region's tiles from ``first_tile``: returns the packed row
+        # of each grid row in tile-major order with that row's raster index.
+        raster, sizes = tile_order(grid, VIDEO_TILE_SHAPES[tile])
+        offsets = np.arange(tile, dtype=np.int64)[None, :]
+        starts = (first_tile + np.arange(sizes.size, dtype=np.int64)) * tile
+        packed = (starts[:, None] + offsets)[offsets < sizes[:, None]]
+        valid_sizes[first_tile : first_tile + sizes.size] = torch.from_numpy(
+            sizes
+        )
+        tile_regions[first_tile : first_tile + sizes.size] = len(
+            region_tile_counts
+        )
+        region_tile_counts.append(int(sizes.size))
+        return torch.from_numpy(packed), torch.from_numpy(raster)
+
+    # The prompt: text row i at (i, 0, 0), vision tokens tagged video.
+    text = dense_rows(0, num_text_tokens)
+    positions[text, 0] = torch.arange(num_text_tokens, dtype=torch.float64)
+    tags[text] = TEXT_TAG
+    for start, stop in vision_spans:
+        tags[start:stop] = VIDEO_TAG
+    prefix_index[text] = torch.arange(num_text_tokens)
+
+    # References advance the media clock in packed order, as in
+    # ``dense_tables``; their prefix source rows follow the text capacity.
+    clock = float(num_text_tokens)
+    next_tile = packing.text_rows // tile
+    source = packing.text_rows
+    for segment in segments:
+        if segment.audio_rows:
+            audio = dense_rows(next_tile, segment.audio_rows)
+            next_tile += math.ceil(segment.audio_rows / tile)
+            prefix_index[audio] = torch.arange(
+                source, source + segment.audio_rows
+            )
+            source += segment.audio_rows
+            tags[audio], groups[audio] = AUDIO_TAG, AUDIO_CONDITION_GROUP
+        if segment.kind == SegmentKind.IMAGE:
+            visual = dense_rows(next_tile, segment.video_rows)
+            next_tile += math.ceil(segment.video_rows / tile)
+            prefix_index[visual] = torch.arange(
+                source, source + segment.video_rows
+            )
+            source += segment.video_rows
+            grid, _ = _frame_grid(
+                segment.latent_height, segment.latent_width, (1, 2, 2)
+            )
+            positions[visual, 0] = clock
+            positions[visual, 1:] = grid
+            tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
+            # An image takes one integer slot, not a latent frame's span.
+            clock += 1.0
+        elif segment.kind == SegmentKind.AUDIO:
+            _place_audio(
+                positions, audio, segment.audio_frames, clock, width_grid
+            )
+            clock += float(segment.audio_frames)
+        else:
+            grid, own_width = _frame_grid(
+                segment.latent_height, segment.latent_width, (1, 2, 2)
+            )
+            if segment.audio_rows:
+                _place_audio(
+                    positions, audio, segment.audio_frames, clock, own_width
+                )
+            visual, raster = region(
+                next_tile,
+                _video_grid(
+                    segment.latent_frames,
+                    segment.latent_height,
+                    segment.latent_width,
+                ),
+            )
+            next_tile += region_tile_counts[-1]
+            prefix_index[visual] = source + raster
+            block = torch.empty(
+                (segment.latent_frames, grid.shape[0], 3), dtype=torch.float64
+            )
+            block[:, :, 0] = _temporal_grid(segment.latent_frames, clock)[
+                :, None
+            ]
+            block[:, :, 1:] = grid[None]
+            positions[visual] = block.reshape(-1, 3).index_select(0, raster)
+            source += segment.video_rows
+            tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
+            clock += max(
+                float(segment.audio_frames), _video_span(segment.latent_frames)
+            )
+
+    # The generated audio and video start where the references leave the
+    # clock; their rows are the layout's.
+    audio = dense_rows(packing.audio_start // tile, packing.audio_rows)
+    _place_audio(
+        positions,
+        audio,
+        packing.audio_rows // AUDIO_CHANNELS,
+        clock,
+        width_grid,
+    )
+    tags[audio], groups[audio] = AUDIO_TAG, AUDIO_GROUP
+    video_tile = packing.video_start // tile
+    video_tiles = packing.video_valid_sizes.numel()
+    valid_sizes[video_tile : video_tile + video_tiles] = (
+        packing.video_valid_sizes
+    )
+    tile_regions[video_tile : video_tile + video_tiles] = len(
+        region_tile_counts
+    )
+    region_tile_counts.append(video_tiles)
+    block = torch.empty((frames, spatial.shape[0], 3), dtype=torch.float64)
+    block[:, :, 0] = _temporal_grid(frames, clock)[:, None]
+    block[:, :, 1:] = spatial[None]
+    positions[packing.video_indices] = block.reshape(-1, 3).index_select(
+        0, packing.video_raster_indices
+    )
+
+    # References keep their reference rate, the generated video its
+    # sparsity; a region's start counts every tile of a lower index, the
+    # dense and empty tiles (index -1) included.
+    region_keep = torch.zeros(tiles, dtype=torch.int32)
+    region_starts = torch.zeros(tiles, dtype=torch.int32)
+    below = int((tile_regions < 0).sum())
+    for index, count in enumerate(region_tile_counts):
+        last = index == len(region_tile_counts) - 1
+        region_keep[index] = kept_tiles(
+            sparsity if last else 1.0 - reference_keep, count
+        )
+        region_starts[index] = below
+        below += count
+    return RegionTables(
+        position_ids=positions,
+        token_tags=tags,
+        groups=groups,
+        prefix_index=prefix_index,
+        valid_sizes=valid_sizes,
+        tile_regions=tile_regions,
+        region_starts=region_starts,
+        region_keep=region_keep,
+    )
+
+
 def video_order(
     attention, *, num_frames: int, canvas: image.Config
 ) -> torch.Tensor:
@@ -886,8 +1322,9 @@ def video_order(
 
     ``attention`` is a denoiser's attention configuration
     (``config.DenseAttention`` or ``config.SparseAttention``): dense packing
-    keeps the raster order; tile packing orders rows tile-major, which does
-    not depend on the prompt.
+    keeps the raster order; tile packing (64-row tiles of one region) and
+    region packing (``reference_keep`` set) order the rows tile-major, which
+    depends on neither the prompt nor the conditions.
     """
     from .config import DenseAttention
 
@@ -897,6 +1334,13 @@ def video_order(
             video_latent_frames(num_frames) * (height // 2) * (width // 2),
             dtype=torch.int64,
         )
+    if attention.reference_keep is not None:
+        height, width = latent_raster(canvas)
+        raster, _ = tile_order(
+            _video_grid(video_latent_frames(num_frames), height, width),
+            VIDEO_TILE_SHAPES[attention.tile],
+        )
+        return torch.from_numpy(raster)
     return tile_packing(
         num_text_tokens=64, num_frames=num_frames, canvas=canvas
     ).video_raster_indices

@@ -14,6 +14,10 @@ unrotated), attends, and projects back. The attention itself is one of:
   attend every valid key tile, video query tiles attend the dense prefix
   plus a selected subset of video key tiles, and a gated attention over
   mean-pooled tiles is added to that fine result.
+* ``RegionSparse``: the same sparse attention over the region packing
+  (``packing.RegionPacking``), where every reference video is a region of
+  its own whose tiles each video query selects independently
+  (``uniserve.nn.attention.vsa.RegionAttention``).
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ from uniserve.nn.attention import Attention, vsa
 from uniserve.tensors import BufferConfig
 
 from .config import TransformerConfig
-from .inputs import AttentionInput, SequenceInput
+from .inputs import AttentionInput, RegionInput, SequenceInput
 
 
 class Dense(nn.Module):
@@ -300,3 +304,97 @@ class Sparse(nn.Module):
             )
         )
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
+
+class RegionSparse(nn.Module):
+    """Project heads, normalize and rotate Q/K, and attend every region.
+
+    The projection gathers the whole sequence and projects this rank's head
+    shard of it; ``vsa.RegionAttention`` selects each video query's key
+    tiles of every region, adds the gated tile compression and returns the
+    rows of this rank's token shard, which the output projection maps back.
+    The parameters are those of ``Sparse``.
+    """
+
+    def __init__(self, config: TransformerConfig, *, tile: int):
+        super().__init__()
+        self.head_dim = config.head_dim
+        # Rotated channels of each head: two halves of three axes' frequencies.
+        self.rotary_width = 6 * config.rope_frequency_dim
+        inner = config.num_attention_heads * config.head_dim
+        self.projection = MergedColumnParallelLinear(
+            config.hidden_size,
+            dict.fromkeys(("q", "k", "v", "gate"), inner),
+            branch_width=config.head_dim,
+            bias=False,
+        )
+        self.output = RowParallelLinear(inner, config.hidden_size, bias=False)
+        self.query_norm = RMSNorm(config.head_dim, config.qk_norm_eps)
+        self.key_norm = RMSNorm(config.head_dim, config.qk_norm_eps)
+        self.vsa = vsa.RegionAttention(
+            vsa.BlockAttention(config.head_dim**-0.5, tile_size=tile)
+        )
+
+    def workspace_buffers(
+        self, num_tokens: int, num_query_tokens: int, *, dtype: torch.dtype
+    ) -> Mapping[str, BufferConfig]:
+        """Region attention borrows no scratch beyond its layer outputs."""
+        return {}
+
+    @torch.inference_mode()
+    def forward_chunks(
+        self,
+        hidden: torch.Tensor | Iterator[tuple[slice, torch.Tensor]],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        inputs: RegionInput,
+        *,
+        workspace: Mapping[str, torch.Tensor],
+    ) -> Iterator[tuple[slice, torch.Tensor]]:
+        """Attend this rank's token shard and yield its projected output.
+
+        ``hidden`` is the normalized shard, whole or as ``(global row slice,
+        rows)`` chunks. ``cos`` and ``sin`` hold the compact rotary factors
+        ``[padded rows, rotary_width / 2]`` of every packed row. Yields one
+        chunk covering the shard.
+        """
+        rows = inputs.regions.padded_tokens
+        chunks = sorted(
+            self.projection.forward_chunks(
+                hidden, token_slice=inputs.token_slice, num_tokens=rows
+            ),
+            key=lambda chunk: chunk[0].start,
+        )
+        if [chunk[0].start for chunk in chunks] != [
+            0,
+            *(chunk[0].stop for chunk in chunks[:-1]),
+        ] or chunks[-1][0].stop != rows:
+            raise ValueError("H3 region projections must cover every row")
+        q, k, v, gate = (
+            (
+                chunks[0][1][name]
+                if len(chunks) == 1
+                else torch.cat([values[name] for _, values in chunks])
+            ).view(rows, -1, self.head_dim)
+            for name in ("q", "k", "v", "gate")
+        )
+        # One RMS domain spans each whole head; the leading axis rotates its
+        # 96 channels split-half and the trailing 32 channels pass through.
+        unrotated = cos[..., :0]
+        q, k = functional.qk_norm_rope(
+            q,
+            k,
+            (self.query_norm.weight,),
+            (self.key_norm.weight,),
+            (cos, unrotated),
+            (sin, unrotated),
+            eps=self.query_norm.eps,
+            axis_dims=(self.rotary_width, self.head_dim - self.rotary_width),
+        )
+        attended = self.vsa(q, k, v, gate, inputs.regions)
+        yield inputs.token_slice, self.output(attended.flatten(1))
+
+    def forward(self, hidden, cos, sin, inputs, *, workspace):
+        return next(
+            self.forward_chunks(hidden, cos, sin, inputs, workspace=workspace)
+        )[1]

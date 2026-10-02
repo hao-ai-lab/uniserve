@@ -176,3 +176,37 @@ class SequenceInput:
                 "H3 token slice must match the logical sequence rank"
             )
         _check_indices(self.local_video_indices, self.local_audio_indices)
+
+
+@dataclass(frozen=True, slots=True)
+class RegionInput:
+    """Address one token shard of a multi-region tile layout.
+
+    Attributes:
+        token_slice: Global packed rows this sequence rank holds, its equal
+            share of the padded rows.
+        group: Sequence-parallel group whose rank selects ``token_slice``.
+        regions: The tiles and region tables every layer's attention reads.
+        local_video_indices: Int64 shard rows that hold generated video
+            rows, ascending.
+        local_audio_indices: Int64 shard rows that hold generated audio
+            rows, ascending.
+    """
+
+    token_slice: slice
+    group: Communicator
+    regions: vsa.Regions
+    local_video_indices: torch.Tensor
+    local_audio_indices: torch.Tensor
+
+    def __post_init__(self):
+        tokens = self.regions.padded_tokens
+        count = tokens // self.group.size
+        if tokens % (self.group.size * self.regions.tile) or (
+            self.token_slice
+            != slice(self.group.rank * count, (self.group.rank + 1) * count)
+        ):
+            raise ValueError(
+                "H3 token slice must be the logical sequence rank's whole tiles"
+            )
+        _check_indices(self.local_video_indices, self.local_audio_indices)

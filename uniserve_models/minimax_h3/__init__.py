@@ -10,7 +10,7 @@ JSON sidecars, and ``checkpoint_mappings`` maps its tensors onto the
 modules.
 """
 
-from .attention import Dense, Sparse
+from .attention import Dense, RegionSparse, Sparse
 from .conditioning import Conditioner, RefinerBlock, TokenRefiner
 from .config import (
     Config,
@@ -28,11 +28,17 @@ from .decoding import AudioDecoder, VideoDecoder
 from .denoiser import Denoiser
 from .encoder import TextEncoder, TextEncoderConfig
 from .encoding import AudioEncoder, VideoEncoder
-from .inputs import AttentionInput, DenoiserInput, DenoiserSize, SequenceInput
+from .inputs import (
+    AttentionInput,
+    DenoiserInput,
+    DenoiserSize,
+    RegionInput,
+    SequenceInput,
+)
 from .model import Model, entry_points
 from .modulation import OutputNorm, TimestepEmbedding
 from .output import VideoPostprocessor
-from .packing import DensePacking, TilePacking
+from .packing import DensePacking, RegionPacking, TilePacking
 from .precision import checkpoint_precision, precisions, weight_config
 from .transformer import StepProjection, Transformer, TransformerLayer
 from .weights import checkpoint_mappings, checkpoint_sources
@@ -50,6 +56,7 @@ __all__ = [
     "Model",
     "Config",
     "Dense",
+    "RegionSparse",
     "Sparse",
     "Conditioner",
     "RefinerBlock",
@@ -71,11 +78,13 @@ __all__ = [
     "AttentionInput",
     "DenoiserInput",
     "DenoiserSize",
+    "RegionInput",
     "SequenceInput",
     "OutputNorm",
     "TimestepEmbedding",
     "VideoPostprocessor",
     "DensePacking",
+    "RegionPacking",
     "TilePacking",
     "StepProjection",
     "Transformer",

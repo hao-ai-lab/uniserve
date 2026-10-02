@@ -9,6 +9,7 @@ from uniserve_models.minimax_h3 import (
     DenoiserConfig,
     DenseAttention,
     DmdLadder,
+    PddGrid,
     SparseAttention,
     TransformerConfig,
     UniformGrid,
@@ -58,6 +59,26 @@ def base_denoiser(
         tasks=tasks,
         canvases=None,
         max_sequence_rows=None,
+    )
+
+
+def omniref_denoiser(
+    transformer: TransformerConfig = TransformerConfig(),
+) -> DenoiserConfig:
+    """A FastH3 OmniRef PDD student: 32 heads, multi-region tile-128 VSA."""
+    return DenoiserConfig(
+        transformer=replace(transformer, output_heads=32),
+        schedule=PddGrid(
+            intervals=32,
+            nodes=(0, 4, 8, 12, 16, 20, 24, 28, 32),
+            video_shift=12.0,
+            audio_shift=3.0,
+            max_t=0.999,
+        ),
+        attention=SparseAttention(tile=128, sparsity=0.9, reference_keep=0.1),
+        tasks=("ref2va",),
+        canvases=None,
+        max_sequence_rows=131_072,
     )
 
 

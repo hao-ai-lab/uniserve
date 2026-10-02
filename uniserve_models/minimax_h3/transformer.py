@@ -34,16 +34,20 @@ from uniserve.nn import (
 from uniserve.quantization import Quantizer
 
 from . import config as configs
-from .attention import Dense, Sparse
+from .attention import Dense, RegionSparse, Sparse
 from .config import TransformerConfig
-from .inputs import AttentionInput, SequenceInput
+from .inputs import AttentionInput, RegionInput, SequenceInput
 from .modulation import OutputNorm
 
 
 class TransformerLayer(nn.Module):
     """Apply modality-indexed attention and feed-forward residual updates."""
 
-    def __init__(self, config: TransformerConfig, attention: Dense | Sparse):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        attention: Dense | Sparse | RegionSparse,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.rounding = config.rounding
@@ -65,7 +69,7 @@ class TransformerLayer(nn.Module):
         self,
         hidden,
         modulation,
-        inputs: AttentionInput | SequenceInput,
+        inputs: AttentionInput | SequenceInput | RegionInput,
         *,
         workspace,
     ):
@@ -233,7 +237,7 @@ class TransformerLayer(nn.Module):
         self,
         hidden,
         modulation,
-        inputs: AttentionInput | SequenceInput,
+        inputs: AttentionInput | SequenceInput | RegionInput,
         *,
         workspace,
     ):
@@ -330,14 +334,19 @@ class Transformer(nn.Module):
         self.audio_input = Linear(
             config.audio_channels, config.hidden_size, dtype=torch.float32
         )
+
+        def kind() -> Dense | Sparse | RegionSparse:
+            if isinstance(attention, configs.DenseAttention):
+                return Dense(config)
+            if attention.reference_keep is None:
+                return Sparse(config, sparsity=attention.sparsity)
+            # The sparsity and reference keep rate are request tables of the
+            # region packing (``packing.region_tables``).
+            return RegionSparse(config, tile=attention.tile)
+
         self.layers = nn.ModuleDict(
             {
-                str(index): TransformerLayer(
-                    config,
-                    Dense(config)
-                    if isinstance(attention, configs.DenseAttention)
-                    else Sparse(config, sparsity=attention.sparsity),
-                )
+                str(index): TransformerLayer(config, kind())
                 for index in range(config.num_hidden_layers)
             }
         )
@@ -381,7 +390,7 @@ class Transformer(nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
-        inputs: AttentionInput | SequenceInput,
+        inputs: AttentionInput | SequenceInput | RegionInput,
         *,
         step: torch.Tensor,
         tables: Mapping[str, torch.Tensor],
