@@ -99,9 +99,7 @@ def generate(
             (torch.tensor(prompt_token_ids, device=device),)
         )[0]
 
-    size = denoiser.make_size(
-        num_frames, tokens, canvas=canvas, condition_rows=0
-    )
+    size = denoiser.make_size(num_frames, tokens, canvas=canvas)
     layout = denoiser.layout_size(size)
     conditioning = torch.zeros(
         denoiser.text_condition_rows(layout),
