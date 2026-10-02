@@ -73,7 +73,9 @@ async def send_request(
     try:
         if request.video_backend is not None or request.endpoint == VIDEOS_SYNC:
             record.prompt_len = prompt_len
-            record.requested_seconds = float(payload["seconds"])
+            record.requested_seconds = float(
+                payload["target"]["duration_seconds"]
+            )
             # One deadline covers dispatch, polling and the complete media body.
             async with asyncio.timeout(timeout_s):
                 await receive_video(client, base_url, request, record)

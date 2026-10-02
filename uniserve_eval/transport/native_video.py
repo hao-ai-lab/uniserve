@@ -1,18 +1,26 @@
 """Native video APIs, ending only when all encoded media bytes arrive.
 
-No decoding, hashing or filesystem work belongs in these logical requests.
-The caller owns the overall deadline and retains bodies for later inspection.
+A request's payload is the canonical MiniMax-H3 body (``task``,
+``conditions``, ``target``, ``seed`` and any stated schedule). UniServe and
+SGLang take it as is; vLLM-Omni and FastVideo take the same work in their own
+fields. No decoding, hashing or filesystem work belongs in these logical
+requests. The caller owns the overall deadline and retains bodies for later
+inspection.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 from urllib.parse import quote, urljoin
 
 import httpx
 
 from ..types import RequestRecord, TaskRequest
+
+# Every MiniMax-H3 output runs at 24 frames per second.
+_FPS = 24
 
 
 async def receive_video(
@@ -22,68 +30,7 @@ async def receive_video(
     record: RequestRecord,
 ) -> None:
     """Submit the native payload, poll as needed, and collect original bytes."""
-    backend = request.video_backend or "uniserve"
-    payload = dict(request.payload)
-    if backend == "fastvideo":
-        # FastVideo counts sigma points: nine points yield eight forwards.
-        payload.update(size="1344x768", fps=24, num_inference_steps=9)
-    if backend == "vllm-omni":
-        seconds = float(payload.pop("seconds"))
-        # Omni's pinned V2 ladder counts intervals (forwards), not points.
-        # Its native duration field also preserves fractional seconds without
-        # the generic OpenAI form field's integer restriction.
-        payload.update(
-            width=1344,
-            height=768,
-            aspect_ratio="16:9",
-            fps=24,
-            num_inference_steps=8,
-            guidance_scale=1.0,
-            flow_shift=10.0,
-            extra_params=json.dumps(
-                {
-                    "task": "t2va",
-                    "duration": seconds,
-                    "audio_flow_shift": 3.0,
-                    # Configured serving options, such as preencode_mp4;
-                    # the configuration cannot restate the fields above.
-                    **request.video_extra_params,
-                }
-            ),
-        )
-        # vLLM-Omni's native video endpoint consumes multipart form fields.
-        fields = {key: (None, str(value)) for key, value in payload.items()}
-        kwargs = {"files": fields}
-    else:
-        if backend == "fastvideo":
-            # FastVideo validates an already aligned causal-VAE frame count.
-            # Preserve requested seconds separately from the actual work.
-            frames = round(float(payload["seconds"]) * 24)
-            payload["num_frames"] = frames + (5 - frames) % 17
-            if not float(payload["seconds"]).is_integer():
-                # The generic seconds field accepts integers only; the
-                # aligned native frame count carries fractional durations.
-                payload.pop("seconds")
-        elif backend == "sglang":
-            # Native H3 admission rejects fps/num_frames and derives both
-            # modalities from this canonical target, not generic seconds.
-            seconds = float(payload.pop("seconds"))
-            payload.update(
-                task="t2va",
-                conditions=[],
-                target={
-                    "short_edge": 768,
-                    "aspect_ratio": "16:9",
-                    "duration_seconds": seconds,
-                },
-                num_inference_steps=9,
-                flow_shift=10.0,
-                audio_flow_shift=3.0,
-                # Configured serving options, such as x264_preset; the
-                # configuration cannot restate the fields above.
-                **request.video_extra_params,
-            )
-        kwargs = {"json": payload}
+    kwargs = _native_request(request)
     url = base_url.rstrip("/") + request.endpoint
 
     if request.endpoint.endswith("/sync"):
@@ -111,6 +58,81 @@ async def receive_video(
     # SGLang may publish a storage URL instead of a local content route.
     media_url = urljoin(base_url + "/", job.get("url") or f"{poll_url}/content")
     await _body(client, "GET", media_url, record)
+
+
+def _native_request(request: TaskRequest) -> dict[str, Any]:
+    """Return the ``httpx`` body arguments of a request on its backend.
+
+    The canonical body states the schedule in sigma points including the
+    clean endpoint; a baseline's request always states it (``VideoConfig``
+    requires the fields each baseline takes). ``request.video_shape`` carries
+    the canvas and frame count the target resolves to.
+    """
+    backend = request.video_backend or "uniserve"
+    payload = dict(request.payload)
+    if backend == "uniserve":
+        return {"json": payload}
+    if backend == "sglang":
+        # Native H3 admission takes the canonical body and counts sigma
+        # points. Configured serving options, such as x264_preset, join it;
+        # the configuration cannot restate the work fields.
+        return {"json": {**payload, **request.video_extra_params}}
+
+    shape = request.video_shape
+    if shape is None:
+        raise ValueError(f"a {backend} video request needs its video shape")
+    seconds = float(payload["target"]["duration_seconds"])
+    common = {
+        "model": payload["model"],
+        "prompt": payload["prompt"],
+        "seed": payload["seed"],
+    }
+    if backend == "vllm-omni":
+        # Omni counts schedule intervals (denoiser forwards), not points. Its
+        # native duration field also preserves fractional seconds without the
+        # generic OpenAI form field's integer restriction.
+        fields = {
+            **common,
+            "width": shape.width,
+            "height": shape.height,
+            "aspect_ratio": payload["target"]["aspect_ratio"],
+            "fps": _FPS,
+            "num_inference_steps": int(payload["num_inference_steps"]) - 1,
+            "guidance_scale": 1.0,
+            "flow_shift": float(payload["flow_shift"]),
+            "extra_params": json.dumps(
+                {
+                    "task": payload["task"],
+                    "duration": seconds,
+                    "audio_flow_shift": float(payload["audio_flow_shift"]),
+                    # Configured serving options, such as preencode_mp4; the
+                    # configuration cannot restate the fields above.
+                    **request.video_extra_params,
+                }
+            ),
+        }
+        # vLLM-Omni's native video endpoint consumes multipart form fields.
+        return {
+            "files": {key: (None, str(value)) for key, value in fields.items()}
+        }
+    if backend == "fastvideo":
+        # FastVideo counts sigma points and takes the shifts from the
+        # checkpoint. It validates an already aligned causal-VAE frame count,
+        # so the frames carry the work and the requested seconds are kept
+        # beside them.
+        body = {
+            **common,
+            "size": f"{shape.width}x{shape.height}",
+            "fps": _FPS,
+            "num_inference_steps": int(payload["num_inference_steps"]),
+            "num_frames": shape.frames,
+        }
+        if seconds.is_integer():
+            # The generic seconds field accepts integers only; the aligned
+            # frame count alone carries a fractional duration.
+            body["seconds"] = seconds
+        return {"json": body}
+    raise ValueError(f"unknown video backend {backend!r}")
 
 
 def _failed_status(response: httpx.Response, record: RequestRecord) -> bool:

@@ -484,6 +484,7 @@ def _benchmark_point(
 
     # Construct only after every referenced component has accepted the point.
     task.check_image(image, f"benchmarks.{name}")
+    task.check_video(video, f"benchmarks.{name}.video")
     return BenchmarkPoint(
         name=name,
         server=server,

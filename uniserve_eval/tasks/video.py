@@ -1,6 +1,10 @@
-"""Build native video requests and inspect complete MP4s after measurement.
+"""Build MiniMax-H3 video requests and inspect complete MP4s after measurement.
 
-Synchronous and asynchronous adapters share the MiniMax H3 media contract.
+Every request is the official MiniMax-H3 body that UniServe and SGLang
+accept: a ``task``, its ``conditions`` and a ``target`` of short edge, aspect
+ratio and duration. The canvas and frame count a target resolves to follow
+the model package's request rules (``uniserve_models.minimax_h3.processing``),
+which the server's planner shares; validation holds every MP4 to them.
 Inspection uses each request's duration and never runs inside a load slot.
 """
 
@@ -12,49 +16,142 @@ from typing import ClassVar
 
 from ..transport.video import VideoOutputError, inspect_video_bytes
 from ..types import (
+    VIDEO_SCHEDULE_FIELDS,
     VIDEOS_SYNC,
+    BenchmarkPoint,
     Example,
     RequestRecord,
     TaskName,
     TaskRequest,
     ValidationResult,
+    VideoConfig,
+    VideoShape,
 )
 from .base import BenchmarkTask
 
+# Every MiniMax-H3 output runs at 24 frames per second.
+VIDEO_FPS = 24
+# The only target short edge the canvas rule serves, in pixels.
+TARGET_SHORT_EDGE = 768
+
+
+def target_canvas(task: str, aspect_ratio: str) -> tuple[int, int]:
+    """Resolve the canvas of a target without conditions.
+
+    A t2va target names ``auto``, which is 16:9, or one of the named ratios;
+    the adapt_shape_v1 canvas rule turns the ratio into pixels.
+
+    Returns:
+        The canvas as ``(width, height)`` in pixels.
+
+    Raises:
+        ValueError: The task does not accept the aspect ratio.
+    """
+    # The model package loads torch, which only video points need, so the
+    # rules are imported on first use.
+    from uniserve_models.minimax_h3 import processing
+
+    if task != processing.Task.T2VA:
+        raise ValueError(f"{task} targets depend on condition media")
+    # The API spells a ratio in canonical decimal form, so a named ratio is
+    # accepted exactly as written here.
+    named = {
+        f"{width}:{height}": (width, height)
+        for width, height in processing.NAMED_ASPECT_RATIOS
+    }
+    if aspect_ratio == "auto":
+        ratio = processing.DEFAULT_ASPECT_RATIO
+    elif aspect_ratio in named:
+        ratio = named[aspect_ratio]
+    else:
+        raise ValueError(
+            f"aspect_ratio must be auto or one of {', '.join(named)} for "
+            f"{task}, got {aspect_ratio!r}"
+        )
+    size = processing.canvas(*ratio)
+    return size.width, size.height
+
+
+def target_frames(seconds: float) -> int:
+    """Return the frames a target duration generates.
+
+    The duration times 24 rounds half to even and aligns up to the next
+    ``17 n + 5`` frames.
+
+    Raises:
+        ValueError: The duration lies outside 4 to 15 seconds.
+    """
+    from uniserve_models.minimax_h3 import processing
+
+    return processing.frame_count(seconds)
+
 
 class VideoTask(BenchmarkTask):
-    """Builds native video requests and validates the media contract."""
+    """Builds MiniMax-H3 video requests and validates the media contract."""
 
     name: ClassVar[TaskName] = TaskName.VIDEO
     allowed_endpoints: ClassVar[tuple[str, ...]] = (VIDEOS_SYNC, "/v1/videos")
     default_endpoint: ClassVar[str] = VIDEOS_SYNC
     default_stream: ClassVar[bool] = False
 
+    def __init__(self, point: BenchmarkPoint) -> None:
+        """Bind the point and resolve the canvas every request targets."""
+        super().__init__(point)
+        self.canvas = target_canvas(point.video.task, point.video.aspect_ratio)
+
+    @classmethod
+    def check_video(cls, video: VideoConfig, context: str) -> None:
+        """Reject a target the task cannot build or the canvas rule refuses."""
+        try:
+            target_canvas(video.task, video.aspect_ratio)
+        except ValueError as error:
+            raise ValueError(f"{context}: {error}") from error
+
     def build_request(self, example: Example) -> TaskRequest:
-        """Build a deterministic duration- and seed-qualified video request."""
+        """Build one request from the row's duration and seed.
+
+        A row without its own duration or seed takes the point's video
+        duration and load seed. The stated schedule fields are sent when the
+        point sets them.
+
+        Raises:
+            ValueError: The duration lies outside 4 to 15 seconds.
+        """
+        video = self.point.video
         seconds = float(
-            example.seconds
-            if example.seconds is not None
-            else self.point.video.seconds
+            example.seconds if example.seconds is not None else video.seconds
         )
-        if not math.isfinite(seconds) or not 4 <= seconds <= 15:
-            raise ValueError("H3 seconds must be finite and in [4, 15]")
+        frames = target_frames(seconds)
+        payload = {
+            "model": self.point.model,
+            "prompt": example.prompt,
+            "task": video.task,
+            # Rows carry no condition media; t2va takes none.
+            "conditions": [],
+            "target": {
+                "short_edge": TARGET_SHORT_EDGE,
+                "aspect_ratio": video.aspect_ratio,
+                "duration_seconds": seconds,
+            },
+            "seed": int(
+                example.seed
+                if example.seed is not None
+                else self.point.load.seed
+            ),
+        }
+        for name in VIDEO_SCHEDULE_FIELDS:
+            value = getattr(video, name)
+            if value is not None:
+                payload[name] = value
+        width, height = self.canvas
         return TaskRequest(
             self.point.endpoint,
-            {
-                "model": self.point.model,
-                "prompt": example.prompt,
-                "seed": int(
-                    example.seed
-                    if example.seed is not None
-                    else self.point.load.seed
-                ),
-                "seconds": seconds,
-            },
+            payload,
             stream=False,
-            video_backend=self.point.video.backend,
-            poll_interval_s=self.point.video.poll_interval_s,
-            video_extra_params=dict(self.point.video.extra_params),
+            video_backend=video.backend,
+            poll_interval_s=video.poll_interval_s,
+            video_extra_params=dict(video.extra_params),
+            video_shape=VideoShape(width=width, height=height, frames=frames),
         )
 
     def inspect_output(self, record: RequestRecord) -> None:
@@ -78,21 +175,21 @@ class VideoTask(BenchmarkTask):
     def validate_output(
         self, records: Sequence[RequestRecord]
     ) -> ValidationResult:
-        """Validate fixed video geometry, codecs, audio, and duration alignment."""  # noqa: E501
-        # Python round uses the API's ties-to-even rule before upward alignment.
-        expected_frames = []
-        for record in records:
-            seconds = record.requested_seconds
-            raw_frames = round(
-                (seconds if seconds is not None else self.point.video.seconds)
-                * 24
+        """Validate canvas, codecs, audio, and duration alignment."""
+        expected_frames = [
+            target_frames(
+                record.requested_seconds
+                if record.requested_seconds is not None
+                else self.point.video.seconds
             )
-            expected_frames.append(raw_frames + (5 - raw_frames) % 17)
+            for record in records
+        ]
         outputs = [record.decoded_video for record in records]
         present = bool(outputs) and all(
             output is not None for output in outputs
         )
         videos = [output for output in outputs if output is not None]
+        width, height = self.canvas
 
         # Both streams are measured against the aligned media length rather
         # than each other: the video may differ from the aligned frame count
@@ -100,19 +197,21 @@ class VideoTask(BenchmarkTask):
         # one frame period. A one-frame-short video with full-length audio is
         # therefore valid, while a missing or truncated stream is not.
         frame_tolerance = 1
-        duration_tolerance_s = 1.0 / 24.0
+        duration_tolerance_s = 1.0 / VIDEO_FPS
         return ValidationResult(
             checks={
                 "decoded_video": present,
                 "h264_video": present
                 and all(video.video_codec == "h264" for video in videos),
-                "fixed_video_geometry": present
+                "target_canvas": present
                 and all(
-                    video.width == 1344
-                    and video.height == 768
-                    # The container frame rate is a rational; require exactly
-                    # 24 fps.
-                    and video.fps_numerator == 24 * video.fps_denominator
+                    (video.width, video.height) == (width, height)
+                    for video in videos
+                ),
+                # The container frame rate is a rational; require exactly 24.
+                "24fps_video": present
+                and all(
+                    video.fps_numerator == VIDEO_FPS * video.fps_denominator
                     for video in videos
                 ),
                 "aligned_frame_count": present
@@ -131,7 +230,7 @@ class VideoTask(BenchmarkTask):
                 ),
                 "aligned_audio_duration": present
                 and all(
-                    abs(video.audio_duration_s - frames / 24.0)
+                    abs(video.audio_duration_s - frames / VIDEO_FPS)
                     <= duration_tolerance_s
                     for video, frames in zip(
                         videos, expected_frames, strict=True
@@ -156,4 +255,4 @@ class VideoTask(BenchmarkTask):
         )
 
 
-__all__ = ["VideoTask"]
+__all__ = ["VideoTask", "target_canvas", "target_frames"]

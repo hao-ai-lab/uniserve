@@ -185,21 +185,63 @@ VIDEO_WORK_FIELDS = {
 }
 
 
+# Video tasks the video benchmark builds requests for. Dataset rows carry no
+# condition media, so a request's condition list is empty, which only t2va
+# accepts.
+VIDEO_TASKS = frozenset({"t2va"})
+
+# The schedule fields of the canonical request body: sigma points including
+# the clean endpoint, then the video and audio schedule shifts.
+VIDEO_SCHEDULE_FIELDS = (
+    "num_inference_steps",
+    "flow_shift",
+    "audio_flow_shift",
+)
+
+# Schedule fields a baseline backend receives. A baseline runs whatever
+# schedule it is sent, so a point measuring one must state each of these.
+# FastVideo takes the sigma point count alone; its shifts come from the
+# checkpoint's inference contract and cannot be sent.
+_BASELINE_SCHEDULE_FIELDS = {
+    "sglang": frozenset(VIDEO_SCHEDULE_FIELDS),
+    "vllm-omni": frozenset(VIDEO_SCHEDULE_FIELDS),
+    "fastvideo": frozenset({"num_inference_steps"}),
+}
+
+
 @dataclass(frozen=True)
 class VideoConfig:
-    """Configures generated duration and synthesized prompt length.
+    """Configures the generated video work and how a backend is asked for it.
 
-    ``seconds`` is the requested duration of rows without a per-row override.
-    ``prompt_tokens`` is the tokenizer length of the prompts that
-    the MiniMax H3 dataset synthesizes. ``extra_params`` adds serving options
-    to every request of a backend that accepts them: vLLM-Omni receives them
-    in its ``extra_params`` form field (for example ``{"preencode_mp4":
-    true}``), SGLang as additional JSON fields (for example ``{"x264_preset":
+    ``task`` and ``aspect_ratio`` form each request's target together with the
+    768-pixel short edge; ``seconds`` is the target duration of rows without
+    a per-row override. ``aspect_ratio`` is ``auto`` or a named ``W:H`` ratio
+    the task accepts; the video task resolves it to the generated canvas with
+    the model package's canvas rule when the profile loads.
+
+    ``num_inference_steps``, ``flow_shift`` and ``audio_flow_shift`` state the
+    sampling schedule the point measures: sigma points including the clean
+    endpoint, and the video and audio schedule shifts. UniServe receives them
+    when set and refuses a schedule other than its checkpoint's, so they are
+    optional there. A baseline runs the schedule it is sent and requires
+    them: SGLang and vLLM-Omni need all three, and FastVideo, whose shifts
+    come from its checkpoint, needs the point count and refuses the shifts.
+
+    ``prompt_tokens`` is the tokenizer length of the prompts that the
+    MiniMax H3 dataset synthesizes. ``extra_params`` adds serving options to
+    every request of a backend that accepts them: vLLM-Omni receives them in
+    its ``extra_params`` form field (for example ``{"preencode_mp4": true}``),
+    SGLang as additional JSON fields (for example ``{"x264_preset":
     "ultrafast"}``). They may not restate the fields that fix the generated
     work, and other backends refuse them rather than ignoring them.
     """
 
     seconds: float = 5.0
+    task: str = "t2va"
+    aspect_ratio: str = "16:9"
+    num_inference_steps: int | None = None
+    flow_shift: float | None = None
+    audio_flow_shift: float | None = None
     prompt_tokens: int = 1000
     backend: str = "uniserve"
     poll_interval_s: float = 0.1
@@ -207,15 +249,23 @@ class VideoConfig:
     extra_params: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate finite duration and positive prompt length."""
+        """Validate the work, the schedule a backend needs, and its options."""
         if not math.isfinite(self.seconds) or self.seconds <= 0.0:
             raise ValueError("video seconds must be finite and positive")
+        if self.task not in VIDEO_TASKS:
+            raise ValueError(
+                f"video task must be one of {sorted(VIDEO_TASKS)}; requests "
+                "carry no condition media"
+            )
+        if not isinstance(self.aspect_ratio, str):
+            raise ValueError("video aspect_ratio must be a string")
         if self.prompt_tokens < 1:
             raise ValueError("video prompt_tokens must be positive")
         if self.backend not in {"uniserve", "vllm-omni", "sglang", "fastvideo"}:
             raise ValueError("unknown video backend")
         if not math.isfinite(self.poll_interval_s) or self.poll_interval_s <= 0:
             raise ValueError("poll_interval_s must be finite and positive")
+        self._check_schedule()
         if self.extra_params and self.backend not in VIDEO_WORK_FIELDS:
             raise ValueError(
                 "video extra_params apply only to "
@@ -226,6 +276,46 @@ class VideoConfig:
         )
         if fixed:
             raise ValueError(f"video extra_params may not set {sorted(fixed)}")
+
+    def _check_schedule(self) -> None:
+        """Validate the stated schedule and the fields the backend takes."""
+        steps = self.num_inference_steps
+        # One interval between the noise and the clean endpoint is the
+        # shortest schedule.
+        if steps is not None and (
+            isinstance(steps, bool) or not isinstance(steps, int) or steps < 2
+        ):
+            raise ValueError(
+                "video num_inference_steps counts sigma points including the "
+                "clean endpoint and must be an integer of at least 2"
+            )
+        for name in ("flow_shift", "audio_flow_shift"):
+            shift = getattr(self, name)
+            if shift is not None and (
+                isinstance(shift, bool)
+                or not isinstance(shift, int | float)
+                or not math.isfinite(shift)
+                or shift <= 0
+            ):
+                raise ValueError(f"video {name} must be finite and positive")
+
+        required = _BASELINE_SCHEDULE_FIELDS.get(self.backend)
+        if required is None:
+            return
+        stated = {
+            name
+            for name in VIDEO_SCHEDULE_FIELDS
+            if getattr(self, name) is not None
+        }
+        if missing := sorted(required - stated):
+            raise ValueError(
+                f"video backend {self.backend} runs the schedule it is sent "
+                f"and requires {missing}"
+            )
+        if unsent := sorted(stated - required):
+            raise ValueError(
+                f"video backend {self.backend} cannot receive {unsent}"
+            )
 
 
 @dataclass(frozen=True)
@@ -265,8 +355,24 @@ class Example:
 
 
 @dataclass(frozen=True)
+class VideoShape:
+    """The canvas and frame count a video request's target resolves to."""
+
+    width: int
+    height: int
+    frames: int
+
+
+@dataclass(frozen=True)
 class TaskRequest:
-    """Contains an endpoint payload and its streaming mode."""
+    """Contains an endpoint payload and its streaming mode.
+
+    A video request's ``payload`` is the canonical MiniMax-H3 body (``task``,
+    ``conditions``, ``target``, ``seed`` and any stated schedule), which the
+    native video transport sends to UniServe and SGLang as is and translates
+    for the other backends; those take explicit dimensions or a frame count
+    from ``video_shape``.
+    """
 
     endpoint: str
     payload: dict[str, Any]
@@ -274,6 +380,7 @@ class TaskRequest:
     video_backend: str | None = None
     poll_interval_s: float = 0.1
     video_extra_params: dict[str, Any] = field(default_factory=dict)
+    video_shape: VideoShape | None = None
 
 
 @dataclass(frozen=True)
