@@ -301,13 +301,17 @@ def _prepare_modulation(model, config: DenoiserConfig, reader):
 def _prepare_heads(model, schedule: PddGrid, reader):
     """Fuse a PDD student's output heads once per evaluation block.
 
-    The checkpoint's ``proj_out`` and ``audio_proj_out`` stack one head per
+    Runs in the transformer mapping's post-load hook, which materializes the
+    ``StepProjection`` buffers on the device of the loaded parameters. The
+    checkpoint's ``proj_out`` and ``audio_proj_out`` stack one head per
     fine-grid interval, head-major. Block ``k`` of each modality fuses its
     heads ``[nodes[k], nodes[k + 1])`` with that modality's normalized
     integration weights in FP32. The output projections are FP32 parameters,
     as in the released DiTs and the reference inference, so the checkpoint's
     heads widen to FP32 before fusing and the fused head keeps FP32.
     """
+    device = next(model.parameters()).device
+    blocks = range(len(schedule.nodes) - 1)
     for projection, source, shift in (
         (model.video_output, "proj_out", schedule.video_shift),
         (model.audio_output, "audio_proj_out", schedule.audio_shift),
@@ -319,27 +323,25 @@ def _prepare_heads(model, schedule: PddGrid, reader):
             max_t=schedule.max_t,
             device="cpu",
         )
-        device, dtype = projection.weight.device, projection.weight.dtype
-        weight, bias = (
-            reader.get(f"{source}.{field}")
-            .read()
-            .to(device=device, dtype=dtype)
-            for field in ("weight", "bias")
-        )
-        for block in range(len(schedule.nodes) - 1):
-            mix = grid.block_weights(block)
-            for target, value in (
-                (projection.weight, weight),
-                (projection.bias, bias),
-            ):
-                target[block].copy_(
+        for field in ("weight", "bias"):
+            heads = (
+                reader.get(f"{source}.{field}")
+                .read()
+                .to(device=device, dtype=getattr(projection, field).dtype)
+            )
+            # [blocks, *head shape]: one fused head per evaluation.
+            fused = torch.stack(
+                [
                     fuse_heads(
-                        value,
-                        mix,
+                        heads,
+                        grid.block_weights(block),
                         heads=schedule.intervals,
                         start=schedule.nodes[block],
                     )
-                )
+                    for block in blocks
+                ]
+            )
+            setattr(projection, field, fused)
 
 
 def transformer_component(model, config: DenoiserConfig, source: str):
