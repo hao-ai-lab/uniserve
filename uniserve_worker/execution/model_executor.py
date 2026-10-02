@@ -871,8 +871,11 @@ class ModelExecutor:
             return
         # The conditioning encoder refines the text encoder's features.
         text = capability(self.model, TextEncoder)
+        # Each kind's component and module path: a component may expose
+        # ``encode`` on several modules, as a conditioner does on its vision
+        # tower.
         encoders = {
-            self._encoder_kind(call.module): name
+            self._encoder_kind(call.module): (name, call.path)
             for (name, _, method), (_, call) in self._module_calls.items()
             if method == "encode"
         }
@@ -884,21 +887,24 @@ class ModelExecutor:
             return torch.zeros(
                 layout.shape,
                 dtype=layout.dtype,
-                device=self.bindings[encoders["conditioning"]].device,
+                device=self.bindings[encoders["conditioning"][0]].device,
             )
 
         # Every capacity's context precedes the first capture into each
         # encoder's shared graph pool (``prepare_module``).
         for capacity in capacities:
             if "text" in kinds:
+                name, path = encoders["text"]
                 self.prepare_module(
-                    encoders["text"], TextSize(capacity, 1), method="encode"
+                    name, TextSize(capacity, 1), method="encode", path=path
                 )
             if "conditioning" in kinds and text is not None:
+                name, path = encoders["conditioning"]
                 self.prepare_module(
-                    encoders["conditioning"],
+                    name,
                     (features(capacity).shape,),
                     method="encode",
+                    path=path,
                 )
         for capacity in capacities:
             if "text" in kinds:
@@ -1675,7 +1681,7 @@ class ModelExecutor:
             raise InputError("rank has no unambiguous text encoder")
         name, call = found[0]
         runner = self.prepare_module(
-            name, TextSize(len(tokens), 1), method="encode"
+            name, TextSize(len(tokens), 1), method="encode", path=call.path
         )
         # The token buffer holds the longest prompt at its text capacity.
         return runner.prepare_tokens(
