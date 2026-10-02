@@ -33,6 +33,13 @@ from ..types import RequestRecord, TaskRequest
 # Every MiniMax-H3 output runs at 24 frames per second.
 _FPS = 24
 
+# Response headers in which a synchronous video route reports its timings.
+_TIMING_HEADERS = (
+    "x-inference-time-s",
+    "x-stage-durations",
+    "x-peak-memory-mb",
+)
+
 # vLLM-Omni and FastVideo present a request's references grouped by media
 # type in this order, whatever order they arrive in.
 _TYPE_ORDER = {"image": 0, "video": 1, "video_audio": 1, "audio": 2}
@@ -322,9 +329,10 @@ async def _body(
         record.close_now()
         if not _failed_status(response, record):
             record.mark_success()
-            # A synchronous route reports its timings in headers; a job's
-            # content download carries none, and its job fields stand.
-            if "x-inference-time-s" in response.headers:
+            # A synchronous route reports its timings in headers, any of
+            # which a server may omit; a job's content download carries
+            # none, and its job fields stand.
+            if any(name in response.headers for name in _TIMING_HEADERS):
                 _record_timings(
                     record,
                     response.headers.get("x-inference-time-s"),
