@@ -1,8 +1,9 @@
 """SM100 attention of query blocks over a paged prefix window and themselves.
 
 Each sequence ``b`` contributes a block of ``L_b`` query rows. A query row
-attends, without causal ordering, to every key of its own block (the packed
-current K/V rows) and to the keys ``[lower, P_b)`` of the sequence's paged
+attends to every key of its own block (the packed current K/V rows), or to
+its causal/windowed current keys when its device flag is set, and to the
+keys ``[lower, P_b)`` of the sequence's paged
 prefix. ``lower`` is fixed for the sequence (canvas reads) or follows the
 query position (image blocks); see :class:`PrefixBlockAttentionSm100`.
 
@@ -177,6 +178,8 @@ class PrefixBlockAttentionSm100:
             prefix lower bound further.
         has_start_page: Whether block table column ``j`` holds logical page
             ``start_page[b] + j`` rather than page ``j``.
+        has_causal: Whether a device column selects causal current keys and
+            their history window independently for each sequence.
         has_lse: Whether to store each row's log-sum-exp.
         lse_base2: Store base-2 LSE if true, natural LSE otherwise.
         pdl: Launch as a programmatic dependent of the preceding kernel
@@ -197,6 +200,7 @@ class PrefixBlockAttentionSm100:
         has_window: bool,
         has_prefix_start: bool,
         has_start_page: bool,
+        has_causal: bool,
         has_lse: bool,
         lse_base2: bool,
         pdl: bool,
@@ -218,6 +222,7 @@ class PrefixBlockAttentionSm100:
         self.has_window = has_window
         self.has_prefix_start = has_prefix_start
         self.has_start_page = has_start_page
+        self.has_causal = has_causal
         self.has_lse = has_lse
         self.lse_base2 = lse_base2
         self.pdl = pdl
@@ -326,6 +331,7 @@ class PrefixBlockAttentionSm100:
         prefix_lengths: cute.Tensor,
         start_page: cute.Tensor | None,
         prefix_start: cute.Tensor | None,
+        causal_rows: cute.Tensor | None,
         output: cute.Tensor,
         lse: cute.Tensor | None,
         scale: Float32,
@@ -584,6 +590,7 @@ class PrefixBlockAttentionSm100:
             prefix_lengths,
             start_page,
             prefix_start,
+            causal_rows,
             key_cache.shape[0],
             scale,
             scale_log2,
@@ -635,6 +642,7 @@ class PrefixBlockAttentionSm100:
             start_page,
             prefix_start,
             window,
+            causal_rows,
         ) = schedule
         m_block = tile % num_m_blocks
         rest = tile // num_m_blocks
@@ -670,6 +678,13 @@ class PrefixBlockAttentionSm100:
             prefix_span = page_end * self.page_tokens - prefix_base
             prefix_tiles = (prefix_span + self.tile_keys - 1) // self.tile_keys
         current_tiles = (query_len + self.tile_keys - 1) // self.tile_keys
+        if const_expr(self.has_causal):
+            if causal_rows[batch] != 0:
+                # No query in this work tile can see a later current tile.
+                current_tiles = cutlass.min(
+                    current_tiles,
+                    (last_query + self.tile_keys) // self.tile_keys,
+                )
         key_tiles = prefix_tiles + current_tiles
         return (
             valid,
@@ -739,6 +754,7 @@ class PrefixBlockAttentionSm100:
         prefix_lengths: cute.Tensor,
         start_page: cute.Tensor | None,
         prefix_start: cute.Tensor | None,
+        causal_rows: cute.Tensor | None,
         num_pages: Int32,
         scale: Float32,
         scale_log2: Float32,
@@ -794,6 +810,7 @@ class PrefixBlockAttentionSm100:
             start_page,
             prefix_start,
             window,
+            causal_rows,
         )
         # The load warp reads its first work tile's metadata and page lookups
         # before the barrier and tensor-memory setup, which the other warps
@@ -1620,6 +1637,7 @@ class PrefixBlockAttentionSm100:
         cluster_id, num_clusters, total_tiles = schedule[:3]
         window = schedule[9]
         prefix_start = schedule[8]
+        causal_rows = schedule[10]
         s_consumer, p_producer, stats_producer, sum_producer = pipes
         tidx = cute.arch.thread_idx()[0] % self.lane_threads
 
@@ -1702,6 +1720,23 @@ class PrefixBlockAttentionSm100:
                     first_end = Int32(self.tile_keys)
                     second_start = Int32(0)
                     second_end = Int32(0)
+                    if const_expr(self.has_causal):
+                        if causal_rows[batch] != 0 and not is_prefix:
+                            # The last loaded tile can shift backwards to
+                            # avoid reading unwritten packed rows. Express
+                            # the causal/window bounds in its local columns.
+                            current_start = self.current_row(
+                                key_tile - prefix_tiles, query_len
+                            )
+                            first_end = cutlass.min(
+                                first_end, query_pos + 1 - current_start
+                            )
+                            if const_expr(self.has_window):
+                                first_start = cutlass.max(
+                                    first_start,
+                                    query_pos - window - current_start,
+                                )
+                            need_mask = True
                     if is_prefix:
                         need_mask = (
                             tile_start < lower_last

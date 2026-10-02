@@ -400,10 +400,10 @@ def prepare_inputs(
                     )
                 if not any(
                     entry.product
-                    == (
-                        call.vision_input
+                    in (
+                        tuple(block.feature for block in call.vision_inputs)
                         if value.payload_kind == "vision_feature"
-                        else call.latent_feature_input
+                        else (call.latent_feature_input,)
                     )
                     for call in batch.calls
                 ):

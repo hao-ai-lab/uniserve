@@ -177,6 +177,8 @@ def _reference(batch, *, window, query_window, scale, causal=False):
 
     for row, prefix in enumerate(batch.prefix_lengths.tolist()):
         begin, end = offsets[row], offsets[row + 1]
+        if begin == end:
+            continue
         positions = torch.arange(end - begin, device="cuda")
         lower = torch.zeros_like(positions)
         if batch.prefix_start is not None:
@@ -200,8 +202,11 @@ def _reference(batch, *, window, query_window, scale, causal=False):
         block = torch.ones(
             (end - begin, end - begin), dtype=torch.bool, device="cuda"
         )
-        if causal:
+        row_causal = causal[row] if isinstance(causal, tuple) else causal
+        if row_causal:
             block = block.tril()
+            if window is not None:
+                block &= positions[None, :] >= positions[:, None] - window
         visible = torch.cat((tokens[None, :] >= lower[:, None], block), dim=1)
         scores = torch.einsum(
             "qhd,khd->hqk",
@@ -228,6 +233,7 @@ def _launch(
     lse_base2=False,
     max_query_len=280,
     causal=False,
+    causal_rows=None,
 ):
     workspace = None
     if causal:
@@ -247,6 +253,7 @@ def _launch(
         window=window,
         query_window=query_window,
         causal=causal,
+        causal_rows=causal_rows,
         start_page=batch.start_page,
         prefix_start=batch.prefix_start,
         scale=scale,
@@ -286,6 +293,60 @@ def _history_start_pages(prefixes, page_tokens):
     # Pages entirely before the 1023-token window are retired, so the
     # table's first column is a later logical page.
     return tuple(max(0, prefix - 1023) // page_tokens for prefix in prefixes)
+
+
+@pytest.mark.parametrize(
+    "heads,window", [(_SLIDING, 31), (_SLIDING, 1023), (_FULL, None)]
+)
+@torch.inference_mode()
+def test_paged_graph_reads_changed_row_causality(heads, window):
+    # Long chunks cross the window and tile boundaries; the image row is
+    # bidirectional even where its current keys fall outside that window.
+    lengths, prefixes = (1297, 280, 17, 0), (0, 2051, 63, 0)
+    starts = (
+        None
+        if window is None
+        else tuple(max(0, prefix - window) // 32 for prefix in prefixes)
+    )
+    batch = _batch(
+        lengths,
+        prefixes,
+        page_tokens=32,
+        heads=heads,
+        start_pages=starts,
+        seed=97,
+    )
+    flags = _int32((1, 0, 1, 0))
+    out, lse = _outputs(batch)
+    options = {
+        "window": window,
+        "query_window": True,
+        "scale": heads[2] ** -0.5,
+    }
+
+    def launch():
+        _launch(
+            batch,
+            out=out,
+            lse=lse,
+            max_query_len=max(lengths),
+            causal_rows=flags,
+            **options,
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for causal in (
+        (True, False, True, False),
+        (False, True, False, True),
+        (True,) * 4,
+    ):
+        flags.copy_(_int32(causal))
+        graph.replay()
+        _assert_matches(batch, out, lse, base2=False, causal=causal, **options)
 
 
 @pytest.mark.parametrize("page_tokens", [16, 32])

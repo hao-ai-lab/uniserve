@@ -179,6 +179,20 @@ pub struct ImageInput {
     pub encoders: Vec<ImageEncoderInput>,
 }
 
+impl ImageInput {
+    /// Whether every encoder of the image injects token-model features (a
+    /// vision encoder), so the image enters the context as attention blocks
+    /// of a context prefill. An image with a latent encoder is ingested by
+    /// calls of its own instead.
+    pub fn injects_features(&self) -> bool {
+        !self.encoders.is_empty()
+            && self
+                .encoders
+                .iter()
+                .all(|input| input.encoder == ImageIngestStep::VitEncode)
+    }
+}
+
 /// One encoder input and its physical KV contribution.
 ///
 /// `num_kv_tokens` is exact when known. Otherwise `max_kv_tokens` bounds
@@ -1058,6 +1072,17 @@ impl GenerationRequest {
                 return Err(GenerationRequestError::EmptyImagePayload);
             }
             validate_image_encoders(&image.encoders, image.num_positions)?;
+            // A feature-injected image is a block of a context prefill whose
+            // later tokens follow it in the same call, so its KV length must
+            // be known when the call is planned.
+            if image.injects_features()
+                && image
+                    .encoders
+                    .iter()
+                    .any(|input| input.num_kv_tokens.is_none())
+            {
+                return Err(GenerationRequestError::FeatureImageKvUnknown);
+            }
             if image.position as usize > context_tokens {
                 return Err(GenerationRequestError::ImagePositionBeyondPrompt {
                     position: image.position,
@@ -1190,6 +1215,12 @@ pub enum GenerationRequestError {
     /// An exact image contribution must fit its declared capacity.
     #[error("image KV length {tokens} exceeds capacity {max_tokens}")]
     ImageKvExceedsCapacity { tokens: u32, max_tokens: u32 },
+    /// A feature-injected input image does not declare the exact KV length
+    /// of every encoder.
+    #[error(
+        "an input image whose encoders inject features must declare each encoder's exact KV length"
+    )]
+    FeatureImageKvUnknown,
     /// A suffix or round-close trigger contains no tokens.
     #[error("generation trigger patterns must not be empty")]
     EmptyTriggerPattern,
@@ -1589,6 +1620,29 @@ mod tests {
         exact_capacity.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
         assert_eq!(exact_capacity.validate(), Ok(()));
 
+        // An image whose encoders all inject features joins a context
+        // prefill, so each encoder must declare its exact KV length; a
+        // latent encoder's image may leave it to the worker.
+        let mut injected = complete_request();
+        injected.multimodal_inputs.images[0].encoders.truncate(1);
+        injected.multimodal_inputs.images[0].encoders[0] = ImageEncoderInput {
+            encoder: ImageIngestStep::VitEncode,
+            num_kv_tokens: None,
+            max_kv_tokens: Some(64),
+        };
+        assert_eq!(
+            injected.validate(),
+            Err(GenerationRequestError::FeatureImageKvUnknown)
+        );
+        injected.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
+        assert_eq!(injected.validate(), Ok(()));
+        assert!(
+            complete_request().multimodal_inputs.images[0].encoders[0]
+                .num_kv_tokens
+                .is_none()
+        );
+        assert_eq!(complete_request().validate(), Ok(()));
+
         let mut invalid_sampling = complete_request();
         invalid_sampling.sampling.top_p = 0.0;
         assert!(matches!(
@@ -1643,6 +1697,7 @@ mod tests {
         request.image_generation = ImageGenerationConfig::default();
         request.multimodal_inputs.images[0].encoders.truncate(1);
         request.multimodal_inputs.images[0].encoders[0].encoder = ImageIngestStep::VitEncode;
+        request.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
         request.readout = vec![
             ReadoutRow {
                 token_ids: vec![11, 4, 12, 4, 13],

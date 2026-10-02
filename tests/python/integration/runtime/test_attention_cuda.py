@@ -135,6 +135,71 @@ def test_native_attention_matches_declared_visibility(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize(
+    "provider", ["auto", "flash_attn_4", "flashinfer", "torch"]
+)
+def test_paged_replay_reads_changed_causal_flags(provider):
+    device = torch.device("cuda", 0)
+    generator = torch.Generator(device=device).manual_seed(271)
+    q = torch.randn(
+        5, 4, 64, dtype=torch.bfloat16, device=device, generator=generator
+    )
+    k, v = (
+        torch.randn(5, 2, 64, dtype=q.dtype, device=device, generator=generator)
+        for _ in range(2)
+    )
+    with PrefixCache(
+        Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
+        num_units=4,
+        block_size=16,
+        device=device,
+    ) as cache:
+        state = cache.state("attention")
+        state.write((0,), start=0, key=k[:2], value=v[:2])
+        state.write((1,), start=0, key=k[:1], value=v[:1])
+        batch = PagedInput.from_blocks(
+            blocks=((0,), (1,)),
+            query_lengths=(2, 3),
+            prefix_lengths=(2, 1),
+            block_size=16,
+            causal=(True, False),
+            device=device,
+        )
+        flags = torch.tensor((1, 0), dtype=torch.int32, device=device)
+        batch = replace(batch, causal_values=flags)
+        with (
+            _prepare(resolve(provider, device=device), state) as native,
+            _prepare(TorchBackend(), state) as reference,
+        ):
+            native.bind(batch)
+            actual, expected = torch.empty_like(q), torch.empty_like(q)
+            native(q, k, v, batch, scale=0.125, out=actual)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                native(q, k, v, batch, scale=0.125, out=actual)
+            for causal in ((True, False), (False, True), (True, True)):
+                flags.copy_(torch.tensor(causal, dtype=torch.int32))
+                graph.replay()
+                reference(
+                    q,
+                    k,
+                    v,
+                    replace(
+                        batch,
+                        write_indices=None,
+                        causal=causal,
+                        causal_values=None,
+                    ),
+                    scale=0.125,
+                    out=expected,
+                )
+                torch.testing.assert_close(
+                    actual, expected, rtol=2e-2, atol=2e-2
+                )
+
+
+@torch.inference_mode()
 def test_segmented_graph_keeps_nonfinite_values_within_their_sequence():
     device = torch.device("cuda:0")
     generator = torch.Generator(device=device).manual_seed(93)

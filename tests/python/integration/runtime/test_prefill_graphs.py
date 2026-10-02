@@ -221,7 +221,7 @@ def _rows(
             request_pool_idx=index + 1,
             seq_len=prefix,
             write_kv=True,
-            causal=causal,
+            causal=causal[index] if isinstance(causal, tuple) else causal,
         )
         for index, (value, selection) in enumerate(
             zip(tokens, selections, strict=True)
@@ -254,11 +254,11 @@ def _scenario(kind):
     if kind == "causal":
         lengths, selections = (40, 7, 90), (last, every, hidden)
         measured = {"selections": selections}
-    elif kind == "image_block":
+    elif kind in {"image_block", "mixed_context"}:
         lengths, selections = (70, 12), (hidden, last)
         measured = {
             "selections": selections,
-            "causal": False,
+            "causal": (True, False) if kind == "mixed_context" else False,
             "embeddings": tuple(
                 torch.randn((length, 32), generator=generator).to(
                     torch.bfloat16
@@ -292,7 +292,9 @@ def _cache_values(manager):
 
 @SM100
 @torch.inference_mode()
-@pytest.mark.parametrize("kind", ["causal", "image_block", "commit"])
+@pytest.mark.parametrize(
+    "kind", ["causal", "image_block", "mixed_context", "commit"]
+)
 def test_prefill_graph_replay_matches_eager_execution(tmp_path, kind):
     """A replayed prefill equals the eager call and copies nothing to host.
 
@@ -344,7 +346,9 @@ def test_prefill_graph_replay_matches_eager_execution(tmp_path, kind):
 
 @SM100
 @torch.inference_mode()
-@pytest.mark.parametrize("kind", ["causal", "image_block", "commit"])
+@pytest.mark.parametrize(
+    "kind", ["causal", "image_block", "mixed_context", "commit"]
+)
 def test_cache_only_prefill_writes_the_cache_of_the_complete_pass(
     tmp_path, kind
 ):

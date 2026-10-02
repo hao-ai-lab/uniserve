@@ -2018,9 +2018,9 @@ class ModelExecutor:
         # Rows sharing an entry, forward mode, device, row type, media shape
         # and attention causality form one homogeneous numerical call: a
         # canvas readout and a canvas step of one pass are separate calls.
-        # The engine plans at most one call per request in a batch, so rows
-        # of different causality belong to independent sequences, and each
-        # causality's graph serves its own call.
+        # A context call's interdependent text and vision segments stay in
+        # one prefill: attention writes all their K/V before reading it.
+        # Independent uniform calls retain their causal/non-causal graphs.
         grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
         bindings: dict[int, ModelRunner] = {}
         for index, (task, call) in enumerate(tasks):
@@ -2042,7 +2042,11 @@ class ModelExecutor:
                 shape = tuple(int(value) for value in task.encode_pixels.shape)
             elif isinstance(task, (DiffusionRow, DecodeRow)):
                 shape = (task.image_height, task.image_width)
-            causal = isinstance(task, TokenRow) and task.causal
+            causal = (
+                None
+                if call.vision_inputs and call.completion_output is None
+                else isinstance(task, TokenRow) and task.causal
+            )
             grouped[
                 (
                     entry,

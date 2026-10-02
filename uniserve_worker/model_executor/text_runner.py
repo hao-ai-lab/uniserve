@@ -392,7 +392,8 @@ class TextRunner(ModelRunner):
         or, when every row selects ``CACHE``, a cache-only bucket if the
         runner has any. Returns ``None`` for eager
         execution (graphs disabled, the batch ineligible, or prefill graphs
-        disabled for a non-decode batch), otherwise ``(key, padded_batch,
+        disabled for a non-decode batch),
+        otherwise ``(key, padded_batch,
         True)``; a decode key starts with ``"text"`` and a prefill key with
         ``"prefill"``, and both carry the ``text_shape`` tuple second. In an
         expert step, the local bucket's tokens and the shared transfer
@@ -450,13 +451,16 @@ class TextRunner(ModelRunner):
         # the force-finish column and the rows' selections stay outside it.
         padded = pad_text(batch, *shape, staging=self.input_buffers)
         inputs = padded.inputs
+        attention = next(iter(inputs.attention.entries.values()))
         key = (
             "prefill",
             shape,
             inputs.input_ids.dtype,
             inputs.positions.ndim,
             inputs.embeddings is not None,
-            next(iter(inputs.attention.entries.values())).causal[0],
+            None
+            if attention.causal_values is not None
+            else attention.causal[0],
             prefill_shapes[0].outputs,
         )
         return key, padded, True
@@ -510,10 +514,17 @@ class TextRunner(ModelRunner):
             else "non-causal"
         )
         embeddings = inputs.embeddings is not None
+        dynamic = any(
+            entry.causal_values is not None
+            for entry in inputs.attention.entries.values()
+        )
         shapes = tuple(
             shape
             for shape in self._prefill_family(batch)
-            if causality == {shape.causal} and shape.embeddings == embeddings
+            if (
+                shape.causal is None if dynamic else causality == {shape.causal}
+            )
+            and shape.embeddings == embeddings
         )
         captured = (
             "its captured prefill graphs hold up to "

@@ -78,7 +78,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::scheduler::generation::{
-    GenerationPhase as Phase, consumes_image_features, is_feedback_computation, is_prompt_extend,
+    BlockCursor, GenerationPhase as Phase, consumes_image_features, is_feedback_computation,
+    is_prompt_extend,
 };
 
 use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx};

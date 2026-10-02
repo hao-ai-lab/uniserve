@@ -303,6 +303,7 @@ class _PagePlan:
         out=None,
         lse=False,
         visible=None,
+        causal_values=None,
     ):
         self.fill(table)
 
@@ -311,7 +312,7 @@ class _PagePlan:
                 self.query_offsets,
                 self.key_offsets,
                 self.mask_offsets,
-                self.causal,
+                self.causal if causal_values is None else causal_values,
                 self.mask if visible is None else visible,
                 self.mask,
                 self.counts.numel(),
@@ -607,7 +608,10 @@ class _FlashInfer(_Operator):
                 lengths,
                 batch.block_table,
                 causal=batch.causal,
-                custom=len(set(batch.causal)) > 1,
+                # Device flags keep one custom-mask plan even when every
+                # row currently has the same causality. Replay may change it.
+                custom=batch.causal_values is not None
+                or len(set(batch.causal)) > 1,
             )
         elif isinstance(batch, VisibleInput):
             self._paged = self._page_plan(
@@ -755,6 +759,9 @@ class _FlashInfer(_Operator):
             scale=scale,
             out=out,
             visible=visible,
+            causal_values=batch.causal_values
+            if isinstance(batch, PagedInput)
+            else None,
         )
 
     def close(self):

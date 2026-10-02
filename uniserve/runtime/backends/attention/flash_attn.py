@@ -62,6 +62,11 @@ class _FlashOperator(_Operator):
             raise ValueError(
                 "this FlashAttention kernel does not implement dense masks"
             )
+        if isinstance(batch, PagedInput) and batch.causal_values is not None:
+            raise ValueError(
+                "this FlashAttention kernel does not implement device "
+                "causality flags; use FlashAttention-4 for that representation"
+            )
         self._validate(q, k, v, batch, out)
 
         if isinstance(batch, PagedInput) and batch.write_indices is not None:

@@ -12,6 +12,9 @@ sequence's paged prefix and their current block, with the visibility
   directions, such as an image block): query ``i`` at absolute position
   ``P + i`` reads prefix tokens from ``max(P + i - window, 0)`` on, or the
   whole prefix without a window;
+- a paged input with device causal flags, whose causal rows see their
+  current keys through the query position and apply their history window
+  to both prefix and current keys;
 - on a full-attention layer (head dimension 512 without a history window),
   a causal paged input (a prompt chunk or committed rows continuing their
   history): query ``i`` reads the whole prefix and the chunk's keys
@@ -21,9 +24,10 @@ sequence's paged prefix and their current block, with the visibility
 projections at the query rows and the prefix from the cache through each
 row's block table, whose first column is its start page when the table
 carries one. A paged input's write addresses are committed before the read,
-so later calls find the block in the cache. A paged batch mixing causal and
-non-causal rows is evaluated as its contiguous runs of equal causality after
-its complete write commits once. Lengths, offsets, tables and start pages
+so later calls find the block in the cache. Device causal flags allow all
+rows to share one launch after the complete cache write. A paged batch
+with only host causal flags uses contiguous runs of equal causality.
+Lengths, offsets, tables and start pages
 are device values: a launch records into a CUDA graph and replays with
 changed values in the same buffers.
 
@@ -141,8 +145,12 @@ class _PrefixBlock(_Operator):
 
     def requires_host_lengths(self, batch):
         # The kernels read every length, offset and table origin on device;
-        # only the runs of a mixed-causality batch are sliced on the host.
-        return isinstance(batch, PagedInput) and len(set(batch.causal)) > 1
+        # only mixed batches without device flags need host slicing.
+        return (
+            isinstance(batch, PagedInput)
+            and batch.causal_values is None
+            and len(set(batch.causal)) > 1
+        )
 
     def bind(self, batch):
         super().bind(batch)
@@ -157,7 +165,11 @@ class _PrefixBlock(_Operator):
                 "K/V rows"
             )
 
-        if not isinstance(batch, PagedInput) or len(set(batch.causal)) <= 1:
+        if (
+            not isinstance(batch, PagedInput)
+            or batch.causal_values is not None
+            or len(set(batch.causal)) <= 1
+        ):
             self._read(q, k, v, batch, scale, out)
             return out
 
@@ -174,10 +186,15 @@ class _PrefixBlock(_Operator):
         return out
 
     def _read(self, q, k, v, batch, scale, out):
-        """Evaluate a segmented read or paged rows of one causality."""
+        """Evaluate a segmented read or uniform/device-masked paged rows."""
         from ._paged_inputs import prepare
 
-        causal = isinstance(batch, PagedInput) and any(batch.causal)
+        flags = batch.causal_values if isinstance(batch, PagedInput) else None
+        causal = (
+            isinstance(batch, PagedInput)
+            and flags is None
+            and any(batch.causal)
+        )
         if causal:
             # One launch commits the rows' write, fused where the storage
             # allows, and zeroes the ticket counter of the causal launch.
@@ -227,6 +244,7 @@ class _PrefixBlock(_Operator):
             # position; a segmented read keeps one prefix interval.
             query_window=isinstance(batch, PagedInput),
             causal=causal,
+            causal_rows=flags,
             workspace=self._schedule if causal else None,
             start_page=None if start_page is None else start_page.contiguous(),
             scale=scale,
@@ -238,7 +256,9 @@ class _PrefixBlock(_Operator):
         if isinstance(batch, SegmentedInput) and batch.fully_visible_current:
             return
         if isinstance(batch, PagedInput) and (
-            not any(batch.causal) or self._schedule is not None
+            batch.causal_values is not None
+            or not any(batch.causal)
+            or self._schedule is not None
         ):
             return
         raise ValueError(

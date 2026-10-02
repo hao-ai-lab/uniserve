@@ -7,7 +7,8 @@ On CUDA, automatic selection chooses only native kernels:
   prefix reads whose queries see their whole current block; the
   prefix-block kernels read every paged row of full-attention layers (head
   dimension 512 without a history window) and the non-causal rows of the
-  others;
+  others; mixed paged contexts with device causal flags share one
+  prefix-block launch at both head dimensions;
 - FlashAttention-4 on SM90 and the SM100 family, for dense, variable-length,
   visible-endpoint and segmented inputs and for paged rows without a history
   window. Its SM100 head-dimension-256 kernel accepts neither per-sequence key
@@ -124,7 +125,12 @@ def _input_class(batch):
         if batch.mask is not None:
             mask += " with an explicit mask"
     elif isinstance(batch, PagedInput):
-        path, mask = "paged attention", _causality(batch.causal)
+        path = "paged attention"
+        mask = (
+            "device row causality"
+            if batch.causal_values is not None
+            else _causality(batch.causal)
+        )
     elif isinstance(batch, VarlenInput):
         path, mask = "variable-length attention", _causality(batch.causal)
     elif isinstance(batch, SegmentedInput):
@@ -215,6 +221,12 @@ def _names(batch, *, head_dim, window, architecture):
         )
         return (*block, *fa4)
     if isinstance(batch, PagedInput):
+        if batch.causal_values is not None:
+            return (
+                ("prefix_block", "flash_attn_4")
+                if window is None and fa4_indexed
+                else ("prefix_block",)
+            )
         # Non-causal blocks read their own keys and a prefix window with
         # the prefix-block kernel, and the causal prefill chunks of
         # full-attention layers (head dimension 512 without a history
@@ -300,7 +312,11 @@ class _Automatic(_Operator):
         only on causality, not on lengths, so the decision needs no host
         values. A batch whose rows all prefer one provider stays whole.
         """
-        if not isinstance(batch, PagedInput) or len(set(batch.causal)) < 2:
+        if (
+            not isinstance(batch, PagedInput)
+            or batch.causal_values is not None
+            or len(set(batch.causal)) < 2
+        ):
             return False
         rows = batch.queries.batch_size
         causal, blocks = (

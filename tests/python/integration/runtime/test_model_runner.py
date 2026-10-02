@@ -54,6 +54,7 @@ from uniserve_worker.protocol.call import (
     MediaCall,
     SamplingState,
     TransferMode,
+    VisionInput,
 )
 from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import RequestOutput
@@ -1637,7 +1638,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
             max_transfer_bytes=source.max_bytes,
             max_latent_bytes=output.max_bytes,
         ),
-        vision_input=source,
+        vision_inputs=(VisionInput(0, source),),
         encoder_output=output,
     )
     ticket = None

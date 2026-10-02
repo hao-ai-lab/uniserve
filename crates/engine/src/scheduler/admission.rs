@@ -127,13 +127,15 @@ impl Scheduler {
             latest_token: None,
             speculative_chain_invalidated: false,
             // Every request starts in prefill. A request with context images
-            // prefills the text up to each image position, then encodes that
-            // image into the marker gap before continuing.
+            // encodes each image's blocks ahead of the context prefill that
+            // writes them into their marker gap with the text around them; a
+            // latent block is written by a call of its own.
             phase: Phase::Prefill,
             num_computed_prompt_tokens: 0,
             num_ingested_images: 0,
             image_encoder_index: 0,
             input_image_features: None,
+            context_features: Vec::new(),
             round_closing: false,
             logical_position: 0,
             kv_visible_len: 0,

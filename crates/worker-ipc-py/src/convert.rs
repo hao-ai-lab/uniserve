@@ -97,6 +97,7 @@ struct RequestTypes {
     sampling_state: Py<PyAny>,
     readout: Py<PyAny>,
     canvas_step: Py<PyAny>,
+    vision_input: Py<PyAny>,
     block_table: Py<PyAny>,
     cache_unit_allocation: Py<PyAny>,
     start: Py<PyAny>,
@@ -199,6 +200,7 @@ impl RequestTypes {
             sampling_state: class(&call, "SamplingState")?,
             readout: class(&call, "Readout")?,
             canvas_step: class(&call, "CanvasStep")?,
+            vision_input: class(&call, "VisionInput")?,
             block_table: class(&batch, "BlockTable")?,
             cache_unit_allocation: class(&batch, "CacheUnitAllocation")?,
             start: class(&batch, "Start")?,
@@ -488,6 +490,17 @@ impl<'py> RequestConversion<'py> {
                 ))
             })
             .transpose()?;
+        let vision_inputs = call
+            .vision_inputs
+            .iter()
+            .map(|input| {
+                let feature = self.tensor_ref(&input.feature)?;
+                self.types
+                    .vision_input
+                    .bind(py)
+                    .call1((input.offset, feature))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         let canvas = call
             .canvas
             .as_ref()
@@ -519,11 +532,7 @@ impl<'py> RequestConversion<'py> {
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call.vision_input
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
+                pyo3::types::PyTuple::new(py, vision_inputs)?.into_any(),
                 call.latent_feature_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
@@ -2125,7 +2134,7 @@ mod tests {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
             token_output: Some(token),
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -2200,7 +2209,7 @@ mod tests {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
             token_output: None,
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -2251,7 +2260,7 @@ mod tests {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
             token_output: None,
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,

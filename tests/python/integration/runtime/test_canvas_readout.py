@@ -73,6 +73,7 @@ from uniserve_worker.protocol.call import (
     MediaCall,
     Readout,
 )
+from uniserve_worker.protocol.call import VisionInput as VisionBlock
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.tensor import (
     DeviceDim,
@@ -166,16 +167,15 @@ def _call(batch, kind, start, **fields):
     )
 
 
-def _prefill(batch, start, *, tokens=(), vision_input=None, count=None):
-    """A prefill batch writing ``count`` prompt positions after ``start``."""
-    count = len(tokens) if count is None else count
+def _prefill(batch, start, *, tokens=()):
+    """A prefill batch writing prompt tokens after ``start``."""
+    count = len(tokens)
     call = _call(
         batch,
         ForwardMode.PREFILL,
         start,
         bounds=Bounds(max_tokens=count),
         input_token_ids=tuple(tokens),
-        vision_input=vision_input,
     )
     return Batch(
         batch_id=batch,
@@ -231,12 +231,12 @@ def _completion(report):
     return record
 
 
-def _admission(input_images=0):
+def _admission(input_images=0, *, sampling=None):
     return Start(
         NewRequest(
             REQUEST,
             SLOT,
-            generation=GenerationParams(sampling=SamplingParams()),
+            generation=GenerationParams(sampling=sampling or SamplingParams()),
             input_images=input_images,
         )
     )
@@ -284,7 +284,8 @@ def _reference(root, prompt, segments, canvases, slots, features=None):
         config, num_units=tables * PAGES, block_size=PAGE, device="cpu"
     )
     context = ExecutionContext(model, cache=cache, attention="torch")
-    values = []
+    values, prompt_values = [], []
+    preceding = None
     with cache, context, torch.no_grad():
         context.prepare(TextSize(128, 1))
         for start, stop, causal in segments:
@@ -299,7 +300,7 @@ def _reference(root, prompt, segments, canvases, slots, features=None):
                 replacement = EmbeddingReplacement(
                     embeddings, torch.ones(stop - start, dtype=torch.bool)
                 )
-            model.text(
+            hidden = model.text(
                 TextInput(
                     prompt[start:stop],
                     torch.arange(start, stop),
@@ -307,6 +308,20 @@ def _reference(root, prompt, segments, canvases, slots, features=None):
                     replacement,
                 )
             )
+            logits = model.text.compute_logits(
+                hidden, token_indices=torch.arange(stop - start)
+            ).gather()
+            if causal:
+                scores = (
+                    logits[:-1]
+                    if preceding is None
+                    else torch.cat((preceding[None], logits[:-1]))
+                )
+                targets = prompt[start + int(preceding is None) : stop]
+                prompt_values.append(
+                    scores.log_softmax(-1).gather(1, targets[:, None])[:, 0]
+                )
+            preceding = logits[-1]
 
         length = prompt.numel()
         for canvas, row in zip(canvases, slots, strict=True):
@@ -336,7 +351,7 @@ def _reference(root, prompt, segments, canvases, slots, features=None):
             logprobs = torch.log_softmax(logits.float(), dim=-1)
             for position, ids in row:
                 values.append(logprobs[position, list(ids)])
-    return torch.cat(values)
+    return torch.cat(values), torch.cat(prompt_values), preceding
 
 
 def test_canvas_rows_read_candidates_over_the_cached_prompt(tmp_path):
@@ -375,7 +390,9 @@ def test_canvas_rows_read_candidates_over_the_cached_prompt(tmp_path):
         record = _completion(_run(worker, _readout(2, 13, canvases, slots)))
         _run(worker, Batch(batch_id=3, commands=(Finish(REQUEST),)))
 
-    expected = _reference(tmp_path, prompt, ((0, 13, True),), canvases, slots)
+    expected, _, _ = _reference(
+        tmp_path, prompt, ((0, 13, True),), canvases, slots
+    )
     actual = torch.tensor(record.candidate_logprobs)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
     whole = actual[2 : 2 + VOCAB]
@@ -393,12 +410,18 @@ def _png(generator):
     return base64.b64encode(buffer.getvalue()).decode()
 
 
-def test_image_soft_tokens_fill_the_prompt_between_their_markers(tmp_path):
+@pytest.mark.parametrize("score_prompt", (False, True))
+@pytest.mark.parametrize(
+    ("trailing_text", "sample"), ((True, False), (True, True), (False, True))
+)
+def test_image_context_preserves_readout_and_next_token(
+    tmp_path, score_prompt, trailing_text, sample
+):
     """An encoded image's features enter the prompt before the readout.
 
-    The prompt's text carries the image markers; the soft tokens between
-    them attend to each other in both directions and take consecutive
-    positions, so later text and the canvas sit after all of them.
+    Image features attend to each other in both directions and take
+    consecutive positions. The final text or image row predicts the next
+    token, and prompt scoring excludes the image placeholders.
     """
     diffusion_gemma_checkpoint(tmp_path)
     generator = torch.Generator().manual_seed(31)
@@ -417,7 +440,7 @@ def test_image_soft_tokens_fill_the_prompt_between_their_markers(tmp_path):
     head = [*torch.randint(7, 58, (3,), generator=generator).tolist()]
     tail = [*torch.randint(7, 58, (4,), generator=generator).tolist()]
     before = [*head, BEGIN_IMAGE]
-    after = [END_IMAGE, *tail]
+    after = [END_IMAGE, *tail] if trailing_text else []
     length = len(before) + soft + len(after)
     canvases = ([4, 11, 4, 12, 6, 0, 0, 0, 0],)
     slots = (((0, (30, 31, 32)), (2, (40, 41))),)
@@ -425,34 +448,43 @@ def test_image_soft_tokens_fill_the_prompt_between_their_markers(tmp_path):
     # The encoder's entry holds at most 70 soft tokens of 32 BF16 values.
     feature = TensorRef(
         request_key=REQUEST,
-        producer_call_id=CallId(2, 0),
+        producer_call_id=CallId(1, 0),
         output_index=0,
         generation=1,
         dtype=DType.BF16,
         shape_bound=ShapeBound((DeviceDim(70 * 32),)),
     )
+    token = TensorRef(
+        request_key=REQUEST,
+        producer_call_id=CallId(2, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.I64,
+        shape_bound=ShapeBound(),
+    )
     worker = _worker(tmp_path)
     with worker:
-        text = _prefill(1, 0, tokens=before)
-        text = replace(
-            text,
-            commands=(_admission(input_images=1),),
+        encode = Batch(
+            batch_id=1,
+            collective_seq=1,
+            commands=(
+                _admission(
+                    input_images=1,
+                    sampling=SamplingParams(
+                        return_prompt_logprobs=score_prompt
+                    ),
+                ),
+            ),
             block_tables=_tables(length),
             new_cache_units=tuple(
                 CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)
                 for table in _tables(length)
             ),
-        )
-        _completion(_run(worker, text))
-
-        encode = Batch(
-            batch_id=2,
-            collective_seq=2,
             calls=(
                 Call(
                     request_key=REQUEST,
-                    call_id=CallId(2, 0),
-                    coordinates=CallCoordinates(4, 4, 4),
+                    call_id=CallId(1, 0),
+                    coordinates=CallCoordinates(0, 0, 0),
                     kind=MediaCall.VISION_ENCODING,
                     bounds=Bounds(
                         max_tokens=soft, max_latent_bytes=feature.max_bytes
@@ -467,19 +499,48 @@ def test_image_soft_tokens_fill_the_prompt_between_their_markers(tmp_path):
         )
         _completion(_run(worker, encode))
 
-        features = _prefill(3, len(before), vision_input=feature, count=soft)
-        features = replace(features, block_tables=_tables(length))
-        written = _completion(_run(worker, features))
-        assert written.kv_visible_len == len(before) + soft
-        assert written.position == len(before) + soft
-
-        start = len(before) + soft
-        text = replace(
-            _prefill(4, start, tokens=after), block_tables=_tables(length)
+        # One context call contains all dependent text and image segments.
+        query_lengths = (len(before), soft) + (
+            (len(after),) if trailing_text else ()
         )
-        _completion(_run(worker, text))
-        record = _completion(_run(worker, _readout(5, length, canvases, slots)))
-        _run(worker, Batch(batch_id=6, commands=(Finish(REQUEST),)))
+        sequence_lengths = (len(before), len(before) + soft) + (
+            (length,) if trailing_text else ()
+        )
+        context = Batch(
+            batch_id=2,
+            collective_seq=2,
+            calls=(
+                _call(
+                    2,
+                    ForwardMode.PREFILL,
+                    0,
+                    bounds=Bounds(max_tokens=length, max_completion_bytes=4096),
+                    input_token_ids=tuple(before + after),
+                    vision_inputs=(VisionBlock(len(before), feature),),
+                    token_output=token if sample else None,
+                ),
+            ),
+            block_tables=_tables(length),
+            forward_call_indices=(0,) * len(query_lengths),
+            request_pool_indices=(SLOT,) * len(query_lengths),
+            seq_lens=sequence_lengths,
+            query_lens=query_lengths,
+            write_kv=(True,) * len(query_lengths),
+            buffer_allocations=(
+                (
+                    BufferAllocation(
+                        token.buffer_id, feature.max_bytes, token.max_bytes
+                    ),
+                )
+                if sample
+                else ()
+            ),
+        )
+        written = _completion(_run(worker, context))
+        assert written.kv_visible_len == length
+        assert written.position == length
+        record = _completion(_run(worker, _readout(3, length, canvases, slots)))
+        _run(worker, Batch(batch_id=4, commands=(Finish(REQUEST),)))
 
     model = load_diffusion_gemma(tmp_path)
     with torch.no_grad():
@@ -489,14 +550,15 @@ def test_image_soft_tokens_fill_the_prompt_between_their_markers(tmp_path):
             )
         )
     prompt = torch.tensor([*before, *[0] * soft, *after])
-    expected = _reference(
+    start = len(before) + soft
+    expected, expected_prompt, next_logits = _reference(
         tmp_path,
         prompt,
         (
             (0, len(before), True),
             (len(before), start, False),
-            (start, length, True),
-        ),
+        )
+        + (((start, length, True),) if trailing_text else ()),
         canvases,
         slots,
         features={len(before): embeddings},
@@ -507,6 +569,23 @@ def test_image_soft_tokens_fill_the_prompt_between_their_markers(tmp_path):
         rtol=1e-5,
         atol=1e-6,
     )
+    if sample:
+        assert written.committed_tokens == (int(next_logits.argmax()),)
+    if score_prompt:
+        assert tuple(
+            position[0][0] for position in written.prompt_logprobs
+        ) == (
+            *before[1:],
+            *after,
+        )
+        torch.testing.assert_close(
+            torch.tensor(
+                [position[0][1] for position in written.prompt_logprobs]
+            ),
+            expected_prompt,
+            rtol=1e-5,
+            atol=1e-6,
+        )
 
 
 def _encode(batch, image, soft):

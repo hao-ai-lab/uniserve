@@ -79,6 +79,10 @@ class _TRTLLM(_Operator):
         super().bind(batch)
         if not isinstance(batch, PagedInput):
             raise ValueError("TensorRT-LLM MHA requires paged attention input")
+        if batch.causal_values is not None:
+            raise ValueError(
+                "TensorRT-LLM MHA does not implement device causality flags"
+            )
         _require_windowed_causal(self.window, batch)
 
     def requires_host_lengths(self, batch):

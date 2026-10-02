@@ -76,7 +76,7 @@ class PrefillShape:
             ``uniserve_worker.model_executor.startup.prepare_prefill``;
             ``select_prefill_captures`` sets it to the next smaller
             configured row size, one for the smallest.
-        causal: Attention causality of every row.
+        causal: Attention causality of every row, or None for device flags.
         embeddings: Whether the call replaces token embeddings with supplied
             values, as image feature rows and every prefill of a lane with an
             image builder do.
@@ -88,7 +88,7 @@ class PrefillShape:
     token_bucket: int
     row_bucket: int
     live_rows: int
-    causal: bool = True
+    causal: bool | None = True
     embeddings: bool = False
     outputs: bool = True
 
@@ -244,7 +244,9 @@ def prefill_captures(
     embedding replacement when the lane has an ``image_builder`` (every
     prefill of such a lane replaces embeddings); a model whose image
     processor declares ``feature_injection`` also appends non-causal image
-    feature rows, which always replace embeddings. The graphs evaluate
+    feature rows and mixed text/image contexts, which replace embeddings.
+    Mixed contexts carry device causal flags through graph replay.
+    The graphs evaluate
     hidden states when the deployment's prefill calls select outputs
     (``prefill_outputs``) and only write the K/V cache otherwise. Empty when
     the graph policy is off or prefill graphs are disabled, which leaves
@@ -256,9 +258,11 @@ def prefill_captures(
 
     if config.graph_policy == "off" or not config.prefill_cuda_graph:
         return ()
-    variants: tuple[tuple[bool, bool], ...] = ((True, bool(image_builder)),)
+    variants: tuple[tuple[bool | None, bool], ...] = (
+        (True, bool(image_builder)),
+    )
     if feature_injection:
-        variants += ((False, True),)
+        variants += ((False, True), (None, True))
     return select_prefill_captures(
         config.prefill_graph_token_sizes,
         DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
@@ -306,6 +310,8 @@ def bind_attention(static, live):
             prefixes=replace(entry.prefixes, host=current.prefixes.host),
             block_table=blocks,
         )
+        if isinstance(entry, PagedInput):
+            entries[table] = replace(entries[table], causal=current.causal)
     return AttentionBatch(entries, queries)
 
 
@@ -323,8 +329,9 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
         batch's causality and embedding replacement, more rows than the
         batch and at least its token count; its rows may select any outputs.
         None when the input is not paged text over tables ``0..n-1``, rows
-        mix causality, a row has no query token, or no configured shape of
-        the batch's kind fits; a decode batch never uses a prefill shape.
+        lack device flags for mixed causality, a row has no query token, or
+        no configured shape of the batch's kind fits; a decode batch never
+        uses a prefill shape.
 
     Raises:
         ValueError: If the attention input has no host query lengths.
@@ -347,9 +354,12 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
         for table in range(len(inputs.attention.entries))
     )
     attention = entries[0]
-    causal = attention.causal[0]
-    if any(value != causal for entry in entries for value in entry.causal):
-        return None
+    causal = (
+        None if attention.causal_values is not None else attention.causal[0]
+    )
+    if causal is not None:
+        if any(value != causal for entry in entries for value in entry.causal):
+            return None
     queries = attention.queries.host
     if queries is None:
         raise ValueError("graph shape selection requires host query lengths")
@@ -450,7 +460,8 @@ def pad_text(batch, rows, tokens, widths, decode, *, staging):
     attention, live_tokens = inputs.attention, inputs.input_ids.numel()
     if rows < live_rows or tokens < live_tokens:
         raise ValueError("graph shape is smaller than its live inputs")
-    causal = next(iter(attention.entries.values())).causal[0]
+    first = next(iter(attention.entries.values()))
+    causal = first.causal[0]
 
     padding, extra = tokens - live_tokens, rows - live_rows
     if padding and not extra:
@@ -496,6 +507,10 @@ def pad_text(batch, rows, tokens, widths, decode, *, staging):
     staging.clear_padding(
         live_rows=live_rows, rows=rows, live_tokens=live_tokens, tokens=tokens
     )
+    flags = None
+    if first.causal_values is not None:
+        flags = _fixed_view(first.causal_values, (rows,))
+        flags[live_rows:].fill_(int(causal))
     padded_prefixes = {}
     entries = {}
     for number, entry in attention.entries.items():
@@ -529,7 +544,8 @@ def pad_text(batch, rows, tokens, widths, decode, *, staging):
             prefixes,
             BlockTable(table, blocks.block_size, start, start_host),
             writes,
-            (causal,) * rows,
+            entry.causal + (causal,) * extra,
+            flags,
         )
     padded = AttentionBatch(entries, shared)
 

@@ -40,7 +40,7 @@ fn ar_decode_call() -> Call {
         },
 
         token_output: Some(output_product(CallId::new(11, 0))),
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -95,7 +95,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         token_input: None,
 
         token_output: None,
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -712,7 +712,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             token_input: None,
 
             token_output: None,
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -1259,12 +1259,13 @@ fn validation_allows_shared_encoder_features_and_rejects_foreign_request_state()
     let mut feature = output_product(CallId::new(3, 0));
     feature.request_key = foreign_key;
     let mut call = ar_decode_call();
-    call.vision_input = Some(feature);
+    call.vision_inputs = vec![VisionInput { offset: 0, feature }];
     call.validate().unwrap();
 
     // Only encoder features may belong to another request; the same tensor
     // as a generic input is rejected.
-    call.inputs.push(call.vision_input.take().unwrap());
+    let shared = call.vision_inputs.pop().unwrap().feature;
+    call.inputs.push(shared);
     assert!(call.validate().is_err());
 }
 
@@ -1633,7 +1634,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             token_input: None,
 
             token_output: None,
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,

@@ -216,17 +216,38 @@ class VarlenInput:
 
 @dataclass(frozen=True, slots=True)
 class PagedInput:
+    """Packed cache-appending rows with uniform or per-row causality.
+
+    ``causal_values`` optionally borrows an int32 device mirror of ``causal``
+    (0 or 1). Callers keep the two consistent. Native mixed-block readers
+    consume the device column so graph replay can change row visibility
+    without changing the launch or synchronizing the device.
+    The auto, prefix-block, FlashAttention-4, FlashInfer and portable providers
+    implement this representation; uniform-only native kernels reject it.
+    """
+
     queries: SequenceLengths
     prefixes: SequenceLengths
     block_table: BlockTable
     write_indices: torch.Tensor | None
     causal: tuple[bool, ...]
+    causal_values: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         _paged(
             self.queries, self.prefixes, self.block_table, self.write_indices
         )
         _causal(self.causal, self.queries.batch_size)
+        flags = self.causal_values
+        if flags is not None and (
+            flags.shape != self.queries.values.shape
+            or flags.dtype != torch.int32
+            or flags.device != self.queries.values.device
+            or flags.stride(0) != 1
+        ):
+            raise ValueError(
+                "causal values require one contiguous int32 per row"
+            )
 
     @classmethod
     def from_blocks(

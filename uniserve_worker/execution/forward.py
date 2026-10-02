@@ -495,20 +495,32 @@ def prepare_forward_rows(
             )
         elif isinstance(call.kind, ForwardMode):
             build_started = time.perf_counter_ns()
-            task = token.prepare_forward(
-                call,
-                tensor_store=tensor_store,
-                request_tables=request_tables,
-                model_runner=model_runner,
-                decode_state=decode_state,
-                state=state,
+            rows = (
+                token.prepare_context(
+                    call,
+                    tensor_store=tensor_store,
+                    request_tables=request_tables,
+                    model_runner=model_runner,
+                    state=state,
+                )
+                if token.writes_context(call)
+                else (
+                    token.prepare_forward(
+                        call,
+                        tensor_store=tensor_store,
+                        request_tables=request_tables,
+                        model_runner=model_runner,
+                        decode_state=decode_state,
+                        state=state,
+                    ),
+                )
             )
             record_component(
                 state.component_us,
                 "text_build_batch",
                 build_started,
             )
-            forward.append((index, task))
+            forward.extend((index, task) for task in rows)
         elif call.kind in {
             MediaCall.VISION_ENCODING,
             MediaCall.LATENT_ENCODING,
@@ -608,6 +620,9 @@ def publish_forward_values(
 
     predictions: dict[int, list[torch.Tensor]] = defaultdict(list)
     readouts: dict[int, list[torch.Tensor]] = defaultdict(list)
+    contexts: dict[int, list[tuple[TokenRow, torch.Tensor, torch.Tensor]]] = (
+        defaultdict(list)
+    )
     # Canvas steps publish together, in row order, as one block.
     steps: list[tuple[int, torch.Tensor]] = []
     samples: list[SampleCandidate] = []
@@ -627,6 +642,11 @@ def publish_forward_values(
         elif call.kind is ForwardMode.TOKEN_DENOISING:
             # Canvas rows of one call arrive in row order.
             readouts[index].append(value)
+        elif token.writes_context(call):
+            # Commit a context once all its text and vision rows are ready.
+            # Publishing a row alone would hide the remaining segments.
+            assert isinstance(task, TokenRow)
+            contexts[index].append((task, value, sampling_index))
         elif isinstance(call.kind, ForwardMode):
             # A sequence call's row comes from token.prepare_forward.
             assert isinstance(task, (TokenRow, DiffusionRow))
@@ -683,6 +703,20 @@ def publish_forward_values(
                 tensor_store=tensor_store,
                 state=state,
             )
+
+    for index, rows in contexts.items():
+        selection = token.finish_context(
+            scheduled[index],
+            tuple(rows),
+            request_tables=request_tables,
+            decode_state=decode_state,
+            state=state,
+        )
+        if isinstance(selection, PendingOutput):
+            outcomes[index] = selection
+        else:
+            task, value, sampling = selection
+            samples.append((index, task, value, sampling, None))
 
     stepped = canvas.publish_steps(
         tuple((scheduled[index], value) for index, value in steps),

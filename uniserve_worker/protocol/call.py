@@ -699,6 +699,41 @@ class Readout:
 
 
 @dataclass(frozen=True, slots=True)
+class VisionInput:
+    """One image block of a context prefill.
+
+    The block writes the vision-encoder product ``feature`` into KV as one
+    attention block, before the call's input token ``offset``: the call's
+    context is its input tokens ``[0, offset)``, then the block, then the
+    tokens from ``offset`` on. Blocks sharing an offset follow in list
+    order.
+    """
+
+    offset: int
+    feature: tensor.TensorRef
+
+    def __post_init__(self) -> None:
+        _nonnegative(self.offset, "vision input offset")
+
+    @classmethod
+    def from_mapping(
+        cls, value: object, where: str = "vision_input"
+    ) -> VisionInput:
+        """Parse an image block's offset and feature."""
+        data = _map(value, where)
+        return cls(
+            offset=_uint(data.get("offset"), f"{where}.offset"),
+            feature=tensor.TensorRef.from_mapping(
+                data.get("feature"), f"{where}.feature"
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Serialize an image block's offset and feature."""
+        return {"offset": self.offset, "feature": self.feature.to_mapping()}
+
+
+@dataclass(frozen=True, slots=True)
 class Call:
     """One immutable computation with its identity, dataflow, and limits."""
 
@@ -719,7 +754,8 @@ class Call:
     # Sampled token and continuation bit packed into one int64 scalar (see
     # `tagged_token_values` in `uniserve_worker.sampling.sampler`).
     token_output: tensor.TensorRef | None = None
-    vision_input: tensor.TensorRef | None = None
+    # Image blocks a context prefill injects, in context order.
+    vision_inputs: tuple[VisionInput, ...] = ()
     latent_feature_input: tensor.TensorRef | None = None
     encoder_output: tensor.TensorRef | None = None
     latent_input: tensor.TensorRef | None = None
@@ -769,7 +805,7 @@ class Call:
                 value
                 for value in (
                     self.token_input,
-                    self.vision_input,
+                    *(block.feature for block in self.vision_inputs),
                     self.latent_feature_input,
                     self.latent_input,
                     self.image_input,
@@ -807,7 +843,7 @@ class Call:
             *(
                 value
                 for value in (
-                    self.vision_input,
+                    *(block.feature for block in self.vision_inputs),
                     self.latent_feature_input,
                     self.image_input,
                 )
@@ -1009,7 +1045,7 @@ class Call:
         # admitted cross-request encoder products (vision, latent features).
         for product in self.tensor_inputs():
             if product.request_key != self.request_key and product not in (
-                self.vision_input,
+                *(block.feature for block in self.vision_inputs),
                 self.latent_feature_input,
             ):
                 raise invalid_descriptor(
@@ -1101,10 +1137,13 @@ class Call:
             else tensor.TensorRef.from_mapping(
                 get("token_output"), f"{where}.token_output"
             ),
-            vision_input=None
-            if get("vision_input") is None
-            else tensor.TensorRef.from_mapping(
-                get("vision_input"), f"{where}.vision_input"
+            vision_inputs=tuple(
+                VisionInput.from_mapping(
+                    item, f"{where}.vision_inputs[{index}]"
+                )
+                for index, item in enumerate(
+                    _seq(get("vision_inputs", ()), f"{where}.vision_inputs")
+                )
             ),
             latent_feature_input=None
             if get("latent_feature_input") is None
@@ -1208,9 +1247,9 @@ class Call:
             "token_output": None
             if self.token_output is None
             else self.token_output.to_mapping(),
-            "vision_input": None
-            if self.vision_input is None
-            else self.vision_input.to_mapping(),
+            "vision_inputs": [
+                block.to_mapping() for block in self.vision_inputs
+            ],
             "latent_feature_input": None
             if self.latent_feature_input is None
             else self.latent_feature_input.to_mapping(),

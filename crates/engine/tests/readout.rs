@@ -466,6 +466,222 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
     assert_eq!(forward.seq_lens, vec![41]);
 }
 
+/// A vision input image of `tokens` KV tokens and as many positions at
+/// prompt position `position`.
+fn vision_image(hash: u64, position: u32, tokens: u32) -> ImageInput {
+    ImageInput {
+        hash,
+        b64: "aW1hZ2U=".into(),
+        position,
+        num_positions: tokens,
+        encoders: vec![ImageEncoderInput {
+            encoder: ImageIngestStep::VitEncode,
+            num_kv_tokens: Some(tokens),
+            max_kv_tokens: None,
+        }],
+    }
+}
+
+/// The context prefills of one request, with their forward rows, in
+/// submission order.
+fn context_prefills(
+    batches: &[ExecutionBatch],
+    request: u64,
+) -> Vec<(Call, uniserve_worker_ipc::ForwardBatch)> {
+    calls_of(batches, request)
+        .into_iter()
+        .filter(|(call, _)| call.code == CallKind::Forward(ForwardMode::Prefill))
+        .collect()
+}
+
+/// A prompt with an image is written into KV by one context prefill, after
+/// the image is encoded: the prefill carries the prompt tokens and the image
+/// block at its prompt position, as one forward row per segment, and the
+/// canvas then reads the whole context.
+#[test]
+fn an_image_prompt_is_written_by_one_context_prefill() {
+    let running = Running::start(readout_worker(), SchedulerConfig::default());
+    let mut request = readout_request(9, prompt(16, 1000), vec![row(16, &[(1, &[50, 51])])]);
+    request
+        .multimodal_inputs
+        .images
+        .push(vision_image(99, 10, 9));
+    let answer = events(running.submit(request.clone()));
+    let batches = running.stop();
+    assert_answered(&answer, &request);
+
+    let calls = calls_of(&batches, 9);
+    let kinds: Vec<_> = calls.iter().map(|(call, _)| call.code).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CallKind::Media(MediaCall::VisionEncoding),
+            CallKind::Forward(ForwardMode::Prefill),
+            CallKind::Forward(ForwardMode::TokenDenoising),
+        ]
+    );
+    let feature = calls[0].0.encoder_output.clone().unwrap();
+    let (prefill, forward) = &calls[1];
+    assert_eq!(prefill.input_token_ids, prompt(16, 1000));
+    assert_eq!(prefill.vision_inputs.len(), 1);
+    assert_eq!(prefill.vision_inputs[0].offset, 10);
+    assert_eq!(
+        prefill.vision_inputs[0].feature.buffer_id(),
+        feature.buffer_id()
+    );
+    assert_eq!(prefill.coordinates.kv_visible_len, 0);
+    // Text before the image, the image block, text after it.
+    assert_eq!(forward.query_lens, vec![10, 9, 6]);
+    assert_eq!(forward.seq_lens, vec![10, 19, 25]);
+    assert_eq!(forward.write_kv, vec![true, true, true]);
+    assert_eq!(calls[2].0.coordinates.kv_visible_len, 25);
+}
+
+/// Every image a context prefill reaches is encoded before it, and the
+/// prefill writes all of their blocks between its prompt tokens.
+#[test]
+fn a_context_prefill_writes_every_image_it_reaches() {
+    let running = Running::start(readout_worker(), SchedulerConfig::default());
+    let mut request = readout_request(10, prompt(20, 1000), vec![row(16, &[(1, &[50, 51])])]);
+    request
+        .multimodal_inputs
+        .images
+        .push(vision_image(101, 4, 5));
+    request
+        .multimodal_inputs
+        .images
+        .push(vision_image(102, 12, 7));
+    let answer = events(running.submit(request.clone()));
+    let batches = running.stop();
+    assert_answered(&answer, &request);
+
+    let calls = calls_of(&batches, 10);
+    let encodes: Vec<_> = calls
+        .iter()
+        .filter(|(call, _)| call.code == CallKind::Media(MediaCall::VisionEncoding))
+        .map(|(call, _)| call.encoder_output.clone().unwrap().buffer_id())
+        .collect();
+    assert_eq!(encodes.len(), 2);
+    let prefills = context_prefills(&batches, 10);
+    assert_eq!(prefills.len(), 1);
+    let (prefill, forward) = &prefills[0];
+    assert_eq!(
+        prefill
+            .vision_inputs
+            .iter()
+            .map(|input| (input.offset, input.feature.buffer_id()))
+            .collect::<Vec<_>>(),
+        vec![(4, encodes[0]), (12, encodes[1])]
+    );
+    assert_eq!(forward.query_lens, vec![4, 5, 8, 7, 8]);
+    assert_eq!(forward.seq_lens, vec![4, 9, 17, 24, 32]);
+}
+
+/// The worker's prefill graph limit bounds numerical segments, even when one
+/// request's context has more segments than the graph can hold.
+#[test]
+fn image_contexts_respect_the_workers_prefill_row_capacity() {
+    let mut sim = readout_worker();
+    sim.mut_info_for_test().max_prefill_calls = 3;
+    let running = Running::start(sim, SchedulerConfig::default());
+    let requests: Vec<_> = (0..8u64)
+        .map(|index| {
+            let mut request = readout_request(
+                100 + index,
+                prompt(20, 1000 + 100 * index as u32),
+                vec![row(16, &[(1, &[50, 51])])],
+            );
+            request.multimodal_inputs.images.extend([
+                vision_image(1000 + index * 2, 4, 5),
+                vision_image(1001 + index * 2, 12, 7),
+            ]);
+            request
+        })
+        .collect();
+    let streams: Vec<_> = requests
+        .iter()
+        .map(|request| running.submit(request.clone()))
+        .collect();
+    for (stream, request) in streams.into_iter().zip(&requests) {
+        assert_answered(&events(stream), request);
+    }
+    let batches = running.stop();
+    for batch in &batches {
+        let rows: usize = batch
+            .requests
+            .iter()
+            .filter(|(call, _)| call.code == CallKind::Forward(ForwardMode::Prefill))
+            .map(|(_, placement)| placement.forward.query_lens.len())
+            .sum();
+        assert!(rows <= 3, "prefill batch has {rows} numerical rows");
+    }
+    for request in &requests {
+        let prefills = context_prefills(&batches, request.request_id.0);
+        let tokens: Vec<_> = prefills
+            .iter()
+            .flat_map(|(call, _)| call.input_token_ids.iter().copied())
+            .collect();
+        assert_eq!(tokens, request.prompt_token_ids);
+        // Chunking preserves both complete image blocks and every text token.
+        assert_eq!(
+            prefills
+                .iter()
+                .map(|(_, forward)| forward.query_lens.iter().sum::<u32>())
+                .sum::<u32>(),
+            32
+        );
+        assert_eq!(
+            prefills
+                .iter()
+                .map(|(call, _)| call.vision_inputs.len())
+                .sum::<usize>(),
+            2
+        );
+    }
+}
+
+/// An image block is never split across context prefills: a chunk that
+/// cannot hold the whole block ends before it, and the next chunk starts
+/// with the block.
+#[test]
+fn a_context_chunk_ends_before_an_image_block_it_cannot_hold() {
+    let config = SchedulerConfig {
+        long_prefill_threshold: 16,
+        ..SchedulerConfig::default()
+    };
+    let running = Running::start(readout_worker(), config);
+    let mut request = readout_request(11, prompt(30, 1000), vec![row(16, &[(1, &[50, 51])])]);
+    request
+        .multimodal_inputs
+        .images
+        .push(vision_image(103, 12, 9));
+    let answer = events(running.submit(request.clone()));
+    let batches = running.stop();
+    assert_answered(&answer, &request);
+
+    let chunks: Vec<_> = context_prefills(&batches, 11)
+        .into_iter()
+        .map(|(call, forward)| {
+            (
+                call.input_token_ids.len(),
+                call.vision_inputs
+                    .iter()
+                    .map(|input| input.offset)
+                    .collect::<Vec<_>>(),
+                forward.query_lens,
+            )
+        })
+        .collect();
+    assert_eq!(
+        chunks,
+        vec![
+            (12, vec![], vec![12]),
+            (7, vec![0], vec![9, 7]),
+            (11, vec![], vec![11]),
+        ]
+    );
+}
+
 /// The worker prepares each inline input image as one task on its rank's
 /// host lane, so an image encode waits in the scheduler while the lane is
 /// full instead of reaching the worker: with one host task per rank, image
@@ -674,5 +890,90 @@ fn a_readout_pass_is_queued_behind_its_prompt_prefill() {
     assert!(
         pass < prefill_resolved,
         "the readout pass waited for its prefill to resolve"
+    );
+}
+
+/// A readout pass is queued behind the context prefill that writes the last
+/// image of its prompt, before that prefill resolves, as behind a text
+/// prompt's last prefill.
+#[test]
+fn a_readout_pass_is_queued_behind_its_image_context_prefill() {
+    let mut sim = readout_worker();
+    sim.set_queue_depth(2);
+    sim.set_results_on_wait(true);
+    let running = Running::start(sim, SchedulerConfig::default());
+    let mut request = readout_request(12, prompt(24, 1000), vec![row(16, &[(3, &[7, 8])])]);
+    request
+        .multimodal_inputs
+        .images
+        .push(vision_image(104, 20, 9));
+    let answer = events(running.submit(request.clone()));
+    running.handle.shutdown();
+    assert!(!running.thread.join().unwrap(), "the scheduler failed");
+    assert_answered(&answer, &request);
+
+    let history: Vec<BatchEvent> = running.batches.try_iter().collect();
+    let submitted = |code: CallKind| {
+        history
+            .iter()
+            .position(|event| match event {
+                BatchEvent::Submitted(batch) => {
+                    batch.requests.iter().any(|(call, _)| call.code == code)
+                }
+                BatchEvent::Resolved { .. } => false,
+            })
+            .unwrap()
+    };
+    let prefill = submitted(CallKind::Forward(ForwardMode::Prefill));
+    let pass = submitted(CallKind::Forward(ForwardMode::TokenDenoising));
+    let BatchEvent::Submitted(prefill_batch) = &history[prefill] else {
+        unreachable!("the position names a submission");
+    };
+    assert_eq!(prefill_batch.requests[0].0.vision_inputs.len(), 1);
+    let prefill_resolved = history
+        .iter()
+        .position(|event| {
+            matches!(event, BatchEvent::Resolved { batch_id } if *batch_id == prefill_batch.id)
+        })
+        .unwrap();
+    assert!(
+        pass < prefill_resolved,
+        "the readout pass waited for its image context prefill to resolve"
+    );
+}
+
+/// An image whose encoder product the encoder cache holds joins its context
+/// prefill without an encode, reading the cached product.
+#[test]
+fn a_cached_image_joins_its_context_prefill_without_an_encode() {
+    let running = Running::start(readout_worker(), SchedulerConfig::default());
+    let mut first = readout_request(13, prompt(16, 1000), vec![row(16, &[(1, &[50, 51])])]);
+    first.multimodal_inputs.images.push(vision_image(105, 8, 9));
+    assert_answered(&events(running.submit(first.clone())), &first);
+    let mut second = readout_request(14, prompt(12, 2000), vec![row(16, &[(1, &[50, 51])])]);
+    second
+        .multimodal_inputs
+        .images
+        .push(vision_image(105, 4, 9));
+    assert_answered(&events(running.submit(second.clone())), &second);
+    let batches = running.stop();
+
+    let encoded = calls_of(&batches, 13)
+        .into_iter()
+        .find(|(call, _)| call.code == CallKind::Media(MediaCall::VisionEncoding))
+        .and_then(|(call, _)| call.encoder_output)
+        .unwrap();
+    let calls = calls_of(&batches, 14);
+    assert!(
+        calls
+            .iter()
+            .all(|(call, _)| call.code != CallKind::Media(MediaCall::VisionEncoding))
+    );
+    let prefills = context_prefills(&batches, 14);
+    assert_eq!(prefills.len(), 1);
+    assert_eq!(prefills[0].0.vision_inputs[0].offset, 4);
+    assert_eq!(
+        prefills[0].0.vision_inputs[0].feature.buffer_id(),
+        encoded.buffer_id()
     );
 }

@@ -105,6 +105,7 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
             has_window=False,
             has_prefix_start=has_prefix_start,
             has_start_page=has_start_page,
+            has_causal=False,
             has_lse=has_lse,
             lse_base2=lse_base2,
             # The causal kernel launches in ordinary stream order.

@@ -111,6 +111,8 @@ class _FlashAttentionOperator(_Operator):
     builds_launch_plan = False
 
     def requires_host_lengths(self, batch):
+        if isinstance(batch, PagedInput) and batch.causal_values is not None:
+            return False
         return (
             isinstance(batch, (PagedInput, VarlenInput))
             and len(set(batch.causal)) > 1
@@ -200,7 +202,9 @@ class _FlashAttentionOperator(_Operator):
                 "packed attention rows must match the declared query lengths"
             )
 
-        if isinstance(batch, (PagedInput, VarlenInput)):
+        if isinstance(batch, PagedInput) and batch.causal_values is not None:
+            self._sequence(q, k, v, batch, scale, out)
+        elif isinstance(batch, (PagedInput, VarlenInput)):
             for query_slice, key_slice, run in causal_runs(batch):
                 if query_slice.stop == query_slice.start:
                     continue
@@ -318,6 +322,20 @@ class _FlashAttentionOperator(_Operator):
         }
 
         if isinstance(batch, PagedInput):
+            if batch.causal_values is not None:
+                from uniserve_kernels.attention.visible_end import (
+                    paged_causal_mask,
+                )
+
+                flags, prefixes = batch.causal_values, batch.prefixes.values
+                for column in (flags, prefixes):
+                    column.__leading_dim__ = 0
+                    column.__assumed_align__ = 4
+                common.update(
+                    causal=False,
+                    mask_mod=paged_causal_mask,
+                    aux_tensors=[flags, prefixes],
+                )
             key, value = self._cache_values(k, v)
             lengths = self.workspace["lengths"][: batch.queries.batch_size]
             torch.add(batch.prefixes.values, batch.queries.values, out=lengths)

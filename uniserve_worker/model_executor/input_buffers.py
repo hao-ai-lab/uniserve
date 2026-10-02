@@ -136,6 +136,7 @@ class AttentionBufferConfig(RowBufferConfig):
             "start_pages": BufferConfig((tables, rows), torch.int32),
             "cache_lengths": BufferConfig((rows,), torch.int32),
             "query_lengths": BufferConfig((rows,), torch.int32),
+            "causal_values": BufferConfig((rows,), torch.int32),
             "cumulative_query_lengths": BufferConfig((rows + 1,), torch.int32),
             "cumulative_prefix_lengths": BufferConfig((rows + 1,), torch.int32),
             # [table, token]: each table addresses its own units.
@@ -396,6 +397,7 @@ class AttentionBuffers(InputBuffers):
         prefixes = tuple(int(row.seq_len) for row in rows)
         write = tuple(bool(row.write_kv) for row in rows)
         causal = tuple(bool(row.causal) for row in rows)
+        flags = self.stage_causality(causal)
         if not any(write) and any(causal):
             raise ValueError(
                 "read-only prefix/current calls require noncausal current "
@@ -511,6 +513,7 @@ class AttentionBuffers(InputBuffers):
                     blocks,
                     self.write_indices[table_number, :total],
                     causal,
+                    flags,
                 )
             else:
                 entries[table_number] = SegmentedInput(
@@ -576,11 +579,29 @@ class AttentionBuffers(InputBuffers):
             ),
         )
 
+        flags = (
+            self.stage_causality(first.causal)
+            if isinstance(first, PagedInput)
+            else None
+        )
         staged = {
             number: self._stage_table(number, entry, queries, prefixes, count)
             for number, entry in entries.items()
         }
+        if flags is not None:
+            staged = {
+                number: replace(entry, causal_values=flags)
+                for number, entry in staged.items()
+            }
         return AttentionBatch(staged, queries)
+
+    def stage_causality(self, causal, *, dynamic=False):
+        """Stage one shared visibility column for a mixed numerical call."""
+        if not dynamic and len(set(causal)) < 2:
+            return None
+        values = self.causal_values[: len(causal)]
+        values.copy_(torch.tensor(causal, dtype=torch.int32), non_blocking=True)
+        return values
 
     def _stage_table(self, number, entry, queries, prefixes, count):
         """Stage one table's pages, start pages and write addresses."""

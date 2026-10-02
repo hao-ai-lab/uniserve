@@ -256,13 +256,22 @@ def _captured(q, k, v, batch, cache, scale, window):
         allowed = queries[:, None] & valid_keys[None, :]
         # Paged and variable-length queries align to the end of their keys.
         position = local_query + key_count - query_count
-        if isinstance(batch, (PagedInput, VarlenInput)) and batch.causal[row]:
-            allowed &= local_key[None, :] <= position[:, None]
+        if isinstance(batch, (PagedInput, VarlenInput)):
+            row_causal = (
+                batch.causal_values[row] != 0
+                if isinstance(batch, PagedInput)
+                and batch.causal_values is not None
+                else batch.causal[row]
+            )
+            allowed &= (local_key[None, :] <= position[:, None]) | (
+                row_causal == False  # noqa: E712 -- also a device predicate
+            )
         if isinstance(batch, (PagedInput, VarlenInput)) and window is not None:
             history = local_key[None, :] >= position[:, None] - window
-            if not batch.causal[row]:
-                # The row's own tokens stay visible to its non-causal queries.
-                history |= local_key[None, :] >= key_count - query_count
+            # The row's own tokens stay visible to its non-causal queries.
+            history |= (local_key[None, :] >= key_count - query_count) & (
+                row_causal == False  # noqa: E712 -- also a device predicate
+            )
             allowed &= history
         if isinstance(batch, SegmentedInput) and window is not None:
             # The segmented prefix keeps one fixed interval for all queries.

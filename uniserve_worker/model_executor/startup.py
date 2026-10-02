@@ -95,7 +95,7 @@ def stage_text(
     prefixes: tuple[int, ...] | None = None,
     decode: bool = False,
     selection: TokenSelection = TokenSelection.LAST_LOGITS,
-    causal: bool = True,
+    causal: bool | None = True,
     slots: tuple[int, ...] | None = None,
     embeddings: bool = False,
 ) -> InputBatch:
@@ -106,9 +106,15 @@ def stage_text(
     slots ``1..rows``; slot 0 is the inactive sentinel. Every row writes KV.
     With ``embeddings``, every token replaces its embedding with zeros, as an
     image feature row replaces its placeholders. A decode batch also carries
-    the staging's cleared force-finish column.
+    the staging's cleared force-finish column. ``causal=None`` stages device
+    flags for a mixed-context graph family, even for a one-row warmup.
     """
     rows = len(tokens)
+    flags = (
+        tuple(index % 2 == 0 for index in range(rows))
+        if causal is None
+        else (causal,) * rows
+    )
     lengths = tuple(len(value) for value in tokens)
     prefixes = (0,) * rows if prefixes is None else prefixes
     positions = tuple(
@@ -120,7 +126,7 @@ def stage_text(
         table_pages(tables, prefix_lengths=prefixes, query_lengths=lengths),
         query_lengths=lengths,
         prefix_lengths=prefixes,
-        causal=(causal,) * rows,
+        causal=flags,
         write=(True,) * rows,
     )
 
@@ -144,15 +150,33 @@ def stage_text(
                 request_pool_idx=slot,
                 seq_len=prefix,
                 write_kv=True,
-                causal=causal,
+                causal=flag,
             )
-            for value, position, slot, prefix in zip(
-                tokens, positions, slots, prefixes, strict=True
+            for value, position, slot, prefix, flag in zip(
+                tokens, positions, slots, prefixes, flags, strict=True
             )
         ),
         forward_mode=mode,
         attention=attention,
     )
+    if causal is None:
+        # Even a one-row warmup must compile the device-flag specialization;
+        # later replays can carry any mixture of text and image rows.
+        values = buffers.stage_causality(flags, dynamic=True)
+        current = batch.inputs.attention
+        batch = replace(
+            batch,
+            inputs=replace(
+                batch.inputs,
+                attention=replace(
+                    current,
+                    entries={
+                        table: replace(entry, causal_values=values)
+                        for table, entry in current.entries.items()
+                    },
+                ),
+            ),
+        )
     if decode:
         # Startup captures the same force-finish address used by live decode.
         force_finish = buffers.decode_force_finish[:rows]

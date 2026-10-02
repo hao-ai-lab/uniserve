@@ -37,8 +37,9 @@ otherwise, matching the ``base2`` flag of
 Supported configuration: CUDA compute capability 10.x, BF16 Q/K/V, caches
 and output, head dimension 256 or 512, query heads a multiple of KV heads
 with the query heads per KV head dividing 128 (head dimension 256) or 64
-(head dimension 512), and 16, 32 or 64 tokens per page. Causal ordering
-requires head dimension 512 and no history window.
+(head dimension 512), and 16, 32 or 64 tokens per page. Uniform causal
+scheduling requires head dimension 512 and no history window. Device
+``causal_rows`` flags support both head dimensions and history windows.
 :func:`unsupported_configuration` checks these dimensions before any tensor
 exists; :func:`can_run` checks a call without launching it.
 
@@ -328,6 +329,7 @@ def can_run(
     out: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
+    causal_rows: torch.Tensor | None = None,
 ) -> bool:
     """Return whether :func:`prefix_block_attention` accepts the call.
 
@@ -335,26 +337,45 @@ def can_run(
     dtype, device and layout; device values are not inspected. A missing
     ``workspace`` is not checked.
     """
-    return available(query.device) and (
-        _check(
-            query,
-            key,
-            value,
-            key_cache,
-            value_cache,
-            block_table,
-            query_offsets,
-            prefix_lengths,
-            start_page,
-            prefix_start,
-            out,
-            lse,
-            window,
-            causal,
-            workspace,
+    return (
+        _causal_rows_error(causal_rows, prefix_lengths, causal) is None
+        and available(query.device)
+        and (
+            _check(
+                query,
+                key,
+                value,
+                key_cache,
+                value_cache,
+                block_table,
+                query_offsets,
+                prefix_lengths,
+                start_page,
+                prefix_start,
+                out,
+                lse,
+                window,
+                causal,
+                workspace,
+            )
+            is None
         )
-        is None
     )
+
+
+def _causal_rows_error(rows, prefixes, causal):
+    if rows is None:
+        return None
+    if causal:
+        return "causal_rows cannot use uniform causal scheduling"
+    if (
+        rows.shape != prefixes.shape
+        or rows.dtype != torch.int32
+        or rows.device != prefixes.device
+        or rows.stride(0) != 1
+    ):
+        return "causal_rows must be a contiguous int32 flag per sequence"
+    return None
 
 
 def _dynamic_tensor(tensor: torch.Tensor, assumed_align: int = 16) -> Any:
@@ -455,6 +476,7 @@ def prefix_block_attention(
     window: int | None = None,
     query_window: bool = False,
     causal: bool = False,
+    causal_rows: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
     start_page: torch.Tensor | None = None,
     prefix_start: torch.Tensor | None = None,
@@ -483,6 +505,12 @@ def prefix_block_attention(
             whole prefix.
         query_window: Whether the window follows each query position.
         causal: Whether block row ``i`` sees only current keys ``[0, i]``.
+        causal_rows: Optional int32 ``[batch]`` device flags, 0 for a
+            bidirectional block and 1 for a causal chunk. Uses the block
+            kernel for both head dimensions and history windows. The flags
+            may change between graph replays; mutually exclusive with
+            uniform ``causal`` scheduling. Causal rows apply the history
+            window to current keys as well as prefix keys.
         workspace: The int32 workspace of a causal launch for at least
             ``batch`` sequences (:func:`new_workspace`), whose ticket counter
             a preceding launch on the stream has zeroed; not shared with a
@@ -531,6 +559,8 @@ def prefix_block_attention(
     )
     if problem is None and causal and workspace is None:
         problem = "causal launches need a workspace"
+    if problem is None:
+        problem = _causal_rows_error(causal_rows, prefix_lengths, causal)
     if problem is not None:
         raise ValueError(problem)
     if type(max_query_len) is not int or max_query_len < 0:
@@ -580,6 +610,7 @@ def prefix_block_attention(
         "has_window": window is not None,
         "has_prefix_start": prefix_start is not None,
         "has_start_page": start_page is not None,
+        "has_causal": causal_rows is not None,
         "has_lse": lse is not None,
         "lse_base2": bool(lse_base2),
         "pdl": dependent_launch(query.device),
@@ -595,6 +626,7 @@ def prefix_block_attention(
         prefix_lengths,
         start_page,
         prefix_start,
+        causal_rows,
         out,
         lse,
     )
