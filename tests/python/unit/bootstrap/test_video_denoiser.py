@@ -9,7 +9,6 @@ from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import media_builder, video_denoiser
 from uniserve_worker.bootstrap.report import video_denoiser_info
 from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.call import MediaCall
 
 pytestmark = pytest.mark.unit
@@ -51,17 +50,16 @@ def test_the_placed_denoiser_receives_the_video_calls(base, placed):
 
 def test_the_handshake_reports_the_executed_tasks_and_schedule(base):
     info = video_denoiser_info(video_denoiser(base, _config("denoiser")))
-    # The worker executes text-to-video of the t2va/fl2va DiT on the released
+    # The worker executes both tasks of the t2va/fl2va DiT on the released
     # schedule: 50 sigma points, video shift 12, audio shift 3, every canvas
     # of the canvas rule and no checkpoint sequence bound.
-    assert (info.tasks, info.schedule_points) == (("t2va",), 50)
+    assert (info.tasks, info.schedule_points) == (("t2va", "fl2va"), 50)
     assert (info.video_shift, info.audio_shift) == (12.0, 3.0)
     assert info.canvases == () and info.max_sequence_rows is None
 
-    # The reference DiT serves ref2va alone, which needs condition inputs.
+    # The reference DiT serves ref2va alone.
     reference = video_denoiser(base, _config("reference_denoiser"))
-    with pytest.raises(WorkerError, match="ref2va"):
-        video_denoiser_info(reference)
+    assert video_denoiser_info(reference).tasks == ("ref2va",)
 
 
 @pytest.mark.parametrize("placed", [(), ("denoiser", "reference_denoiser")])

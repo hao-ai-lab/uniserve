@@ -97,9 +97,9 @@ def video_denoiser(model: nn.Module, config: WorkerConfig):
     return placed[0]
 
 
-# Video tasks whose request calls the worker executes: generation
-# conditioned on the prompt's text encoding alone.
-EXECUTED_VIDEO_TASKS = frozenset({"t2va"})
+# Video tasks whose request calls the worker executes: generation from the
+# prompt alone, from keyframes, and from references.
+EXECUTED_VIDEO_TASKS = frozenset({"t2va", "fl2va", "ref2va"})
 
 
 def executed_video_tasks(denoiser: VideoDenoiser) -> tuple[str, ...]:
