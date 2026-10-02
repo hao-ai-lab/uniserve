@@ -19,9 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::EngineSettings;
-use crate::profile::assets::{
-    PipelineIndex, ResolvedModelFiles, resolve_model_file, resolve_pipeline_index,
-};
+use crate::profile::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
@@ -251,13 +249,15 @@ pub(crate) struct LoadedModel {
 /// split into text tokens the reference never presents (MiniMax-H3 declares
 /// its `<d>` dialogue marker only in the configuration).
 pub(crate) async fn pipeline_tokenizer(
-    model: &str,
-    index: &PipelineIndex,
+    pipeline: &PipelineCheckpoint,
 ) -> std::result::Result<HuggingFaceTokenizer, ModelResolutionError> {
-    let path =
-        resolve_model_file(model, &index.component_file("tokenizer", "tokenizer.json")?).await?;
-    let config_file = index.component_file("tokenizer", "tokenizer_config.json")?;
-    let tokenizer = match resolve_model_file(model, &config_file).await {
+    let path = pipeline
+        .component_file("tokenizer", "tokenizer.json")
+        .await?;
+    let tokenizer = match pipeline
+        .component_file("tokenizer", "tokenizer_config.json")
+        .await
+    {
         Ok(config) => HuggingFaceTokenizer::with_config(&path, &config)?,
         Err(crate::profile::assets::Error::MissingFile { .. }) => HuggingFaceTokenizer::new(&path)?,
         Err(error) => return Err(error.into()),
@@ -284,24 +284,22 @@ impl ModelConfig {
         // A diffusers pipeline declares its class and component folders in a
         // root index rather than a root `config.json`, so the index selects the
         // profile and locates the tokenizer component before any other asset
-        // is resolved.
-        if let Some(index) = resolve_pipeline_index(&config.model).await? {
-            let description =
-                ModelDescription::from_pipeline_class(&index.class_name).ok_or_else(|| {
-                    crate::profile::assets::Error::UnsupportedPipeline {
-                        class_name: index.class_name.clone(),
-                    }
+        // is resolved. A component export reads the components its pinned
+        // base supplies from `base_model`, or from the Hub cache at the
+        // pinned revision, as its workers do; `base_model` is refused for
+        // any other checkpoint.
+        let base_model = config.base_model.as_deref();
+        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model, base_model).await? {
+            let description = ModelDescription::from_pipeline_class(pipeline.class_name())
+                .ok_or_else(|| crate::profile::assets::Error::UnsupportedPipeline {
+                    class_name: pipeline.class_name().to_owned(),
                 })?;
-            let tokenizer: DynTokenizer =
-                Arc::new(pipeline_tokenizer(&config.model, &index).await?);
+            let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline).await?);
             // The conditioner's Qwen3-VL processor fixes how condition media
             // is patched; requests are planned against it.
             let mut processor = Vec::with_capacity(2);
             for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
-                processor.push(
-                    resolve_model_file(&config.model, &index.component_file("processor", name)?)
-                        .await?,
-                );
+                processor.push(pipeline.component_file("processor", name).await?);
             }
             let vision = VisionConfig::read(&processor[0], &processor[1])
                 .map_err(|error| ModelResolutionError::MediaContract(format!("{error:#}")))?;

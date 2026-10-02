@@ -201,7 +201,7 @@ pub(super) mod tests {
     use super::super::RequestField;
     use super::super::plan::tests::{Request, fixture, vision};
     use super::{Segment, TEXT_TAG, VIDEO_TAG, VisionPad, present, segments};
-    use crate::profile::assets::resolve_pipeline_index;
+    use crate::profile::assets::PipelineCheckpoint;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::serving::model::pipeline_tokenizer;
 
@@ -363,8 +363,11 @@ pub(super) mod tests {
             eprintln!("UNISERVE_MINIMAX_H3_MODEL is not set; skipping the tokenizer parity test");
             return;
         };
-        let index = resolve_pipeline_index(&root).await.unwrap().unwrap();
-        let tokenizer = pipeline_tokenizer(&root, &index).await.unwrap();
+        let pipeline = PipelineCheckpoint::resolve(&root, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let tokenizer = pipeline_tokenizer(&pipeline).await.unwrap();
         let fixture = fixture();
         let vision = vision(&fixture);
         for case in fixture["requests"].as_array().unwrap() {

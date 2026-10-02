@@ -129,6 +129,13 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
 
+    /// Local copy of the base checkpoint that a component export (such as
+    /// FastH3 OmniRef) pins for its other components. The server and the
+    /// workers verify its revision from its Hugging Face download records;
+    /// without it they read the pinned revision from the Hugging Face cache.
+    #[arg(long, value_name = "PATH")]
+    pub base_model: Option<std::path::PathBuf>,
+
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
     #[arg(long = "max-model-len")]
@@ -342,6 +349,7 @@ impl SharedRuntimeArgs {
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
+        worker_process.base_model = self.base_model.clone();
         let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
         worker_process.resp_slot_cap = self.resp_slot_cap;
@@ -396,6 +404,7 @@ impl SharedRuntimeArgs {
         Config {
             engine,
             model,
+            base_model: self.base_model,
             served_model_name: self.served_model_name,
             listener_mode,
             chat_template: self.chat_template,
@@ -429,12 +438,6 @@ pub(crate) struct WorkerProcessOptions {
     /// Hugging Face cache root for repository model paths.
     #[arg(long)]
     pub download_dir: Option<std::path::PathBuf>,
-    /// Local copy of the base checkpoint that a component export (such as
-    /// FastH3 OmniRef) pins for its other components. Workers verify its
-    /// revision from its Hugging Face download records; without it they
-    /// read the pinned revision from the Hugging Face cache.
-    #[arg(long, value_name = "PATH")]
-    pub base_model: Option<std::path::PathBuf>,
     /// Concurrent checkpoint file readers.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub load_threads: Option<u32>,
@@ -520,7 +523,6 @@ impl WorkerProcessOptions {
         WorkerProcessArgs {
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.clone(),
-            base_model: self.base_model.clone(),
             load_threads: self.load_threads,
             checksum_manifest: self.checksum_manifest.clone(),
             model_dtype: self.model_dtype,
@@ -850,11 +852,10 @@ mod tests {
         ])
         .expect("component export with a local base");
         let Command::Serve(args) = parsed.command;
-        let worker = args.runtime.worker_process.to_args();
-        assert_eq!(
-            worker.base_model,
-            Some(std::path::PathBuf::from("/models/MiniMax-H3"))
-        );
+        let config = args.to_uniserve_config();
+        let base = Some(std::path::PathBuf::from("/models/MiniMax-H3"));
+        assert_eq!(config.base_model, base);
+        assert_eq!(config.engine.worker_process.base_model, base);
     }
 
     #[test]

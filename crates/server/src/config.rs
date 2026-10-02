@@ -127,6 +127,12 @@ pub struct Config {
     /// repository ID or a local model directory. Empty by default; callers
     /// must set it.
     pub model: String,
+    /// Local copy of the base checkpoint that a component export (such as
+    /// FastH3 OmniRef) pins for its other components, verified against the
+    /// pinned revision by its Hugging Face download records. Without it the
+    /// server and the workers read the pinned revision from the Hugging Face
+    /// cache. Only a component export takes a base.
+    pub base_model: Option<PathBuf>,
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
@@ -223,6 +229,7 @@ impl Default for Config {
         Self {
             engine: EngineSettings::default(),
             model: String::new(),
+            base_model: None,
             served_model_name: None,
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),
