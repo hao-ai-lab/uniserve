@@ -290,11 +290,14 @@ impl EngineSettings {
     /// model's channel payload capacity when that is larger.
     pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
 
-    /// Default condition capacity in denoiser rows (128 Ki), the sequence
-    /// capacity of the largest checkpoint that bounds its own. It holds the
-    /// released reference workloads, two reference videos with their
-    /// soundtracks included.
-    pub const DEFAULT_MAX_CONDITION_ROWS: u32 = 1 << 17;
+    /// Default condition capacity in denoiser rows: two keyframes on the
+    /// largest named canvas, 1008 rows each, so every `fl2va` request fits.
+    /// The capacity sizes each request slot's retained conditioning and the
+    /// denoiser's largest layout, so a deployment that also serves `ref2va`
+    /// states the capacity its references need (a five-second reference
+    /// video with its soundtrack takes about 38,000 rows). A checkpoint's own
+    /// sequence capacity bounds requests independently.
+    pub const DEFAULT_MAX_CONDITION_ROWS: u32 = 2048;
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`

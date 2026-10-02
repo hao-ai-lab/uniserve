@@ -139,8 +139,12 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "max-video-seconds", default_value_t = 15.0)]
     pub max_video_seconds: f64,
     /// Most denoiser rows the conditions of one video request may take: a
-    /// capacity video workers provision their condition products for,
-    /// advertised as `max_condition_rows`.
+    /// capacity video workers provision their condition products, request
+    /// slots and largest denoiser layout for, advertised as
+    /// `max_condition_rows`. The default holds two keyframes on the largest
+    /// canvas, every `fl2va` request; a `ref2va` deployment raises it to the
+    /// rows its references take, about 38,000 for a five-second reference
+    /// video with its soundtrack.
     #[arg(
         long = "max-condition-rows",
         default_value_t = uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS

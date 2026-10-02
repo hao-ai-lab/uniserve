@@ -327,7 +327,8 @@ impl VideoService {
     /// # Errors
     ///
     /// Returns `invalid_request` for `conditions` naming the rows the request
-    /// needs and the capacity.
+    /// needs and the capacity, and for a deployment's condition capacity the
+    /// option that raises it.
     fn check_rows(&self, plan: &RequestPlan, text_rows: usize) -> Result<(), ApiError> {
         let condition_rows =
             u64::from(plan.condition_video_rows()) + u64::from(plan.condition_audio_rows());
@@ -335,7 +336,7 @@ impl VideoService {
             return Err(ApiError::invalid_request(
                 format!(
                     "conditions: the conditions take {condition_rows} denoiser rows, more than \
-                     the {} this deployment serves",
+                     the {} this deployment serves; serve with a larger --max-condition-rows",
                     self.max_condition_rows
                 ),
                 Some("conditions"),
@@ -703,7 +704,9 @@ mod tests {
             .unwrap_err();
         let message = refused(error);
         assert!(
-            message.contains("7296") && message.contains("7000"),
+            message.contains("7296")
+                && message.contains("7000")
+                && message.contains("--max-condition-rows"),
             "{message}"
         );
 
