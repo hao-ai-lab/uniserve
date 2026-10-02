@@ -15,13 +15,13 @@ from dataclasses import dataclass
 import torch
 
 from uniserve.diffusion import normal_noise
-from uniserve.execution import DenoisingRunner, EncoderRunner
+from uniserve.execution import DenoisingRunner
 from uniserve.media import image, video
 from uniserve.model import LatentInput, TextSize
 from uniserve.runtime import ExecutionContext, TensorBuffers
 from uniserve.tensors import TensorOutput
 
-from .inputs import DenoiserInput
+from .inputs import DenoiserInput, DenoiserSize
 from .model import Model
 
 
@@ -72,6 +72,7 @@ def generate(
     canvas: image.Config,
     seed: int,
     component: str = "denoiser",
+    layout: DenoiserSize | None = None,
 ) -> Generation:
     """Generate a text-conditioned video and audio track eagerly.
 
@@ -83,34 +84,52 @@ def generate(
         canvas: The output raster, one the denoiser generates.
         seed: The request seed of the native CPU noise draw.
         component: The denoising component to run.
+        layout: The capacity layout the request evaluates in, one that holds
+            it (``Denoiser.holds``); by default the smallest that does. The
+            prompt is encoded and refined at the layout's text capacity, as
+            a server evaluates it in its own capacity layout.
 
     Raises:
         ValueError: The denoiser rejects the size (a canvas it does not
-            generate, a frame count it does not produce).
+            generate, a frame count it does not produce), or ``layout`` does
+            not hold it.
     """
     denoiser = getattr(model, component)
     device = next(denoiser.parameters()).device
     tokens = len(prompt_token_ids)
-
-    with ExecutionContext(model.text_encoder) as context:
-        runner = EncoderRunner(model.text_encoder, context=context)
-        runner.warmup(TextSize(tokens, 1))
-        features = runner.encode(
-            (torch.tensor(prompt_token_ids, device=device),)
-        )[0]
-
     size = denoiser.make_size(num_frames, tokens, canvas=canvas)
-    layout = denoiser.layout_size(size)
+    if layout is None:
+        layout = denoiser.layout_size(size)
+    elif not denoiser.holds(layout, size):
+        raise ValueError("the capacity layout does not hold the request")
+
+    # The prompt is followed by token 0 up to the layout's text capacity;
+    # the text encoder attends causally, so the padding never reaches the
+    # prompt's rows. The conditioner then refines the prompt's features in
+    # the same capacity with the padding rows masked.
+    capacity = layout.num_text_tokens
+    padded = (*prompt_token_ids, *(0,) * (capacity - tokens))
+    with ExecutionContext(model.text_encoder) as context:
+        context.prepare(TextSize(capacity, 1))
+        with context.activate():
+            features = model.text_encoder.encode(
+                (torch.tensor(padded, device=device),)
+            )[0][:tokens]
+
     conditioning = torch.zeros(
         denoiser.text_condition_rows(layout),
         denoiser.text_condition_width,
         dtype=torch.bfloat16,
         device=device,
     )
+    rows = features.new_zeros((capacity, *features.shape[1:]))
+    rows[:tokens].copy_(features)
+    lengths = torch.full((1,), tokens, dtype=torch.int32, device=device)
     with ExecutionContext(denoiser.conditioner) as context:
-        runner = EncoderRunner(denoiser.conditioner, context=context)
-        runner.warmup(TextSize(tokens, 1))
-        conditioning[:tokens].copy_(runner.encode((features,))[0])
+        context.prepare(TextSize(capacity, 1))
+        with context.activate():
+            refined = denoiser.conditioner.encode((rows,), lengths=lengths)
+        conditioning[:tokens].copy_(refined[0][:tokens])
 
     requirements = denoiser.state_buffers(layout)
     noise = {
