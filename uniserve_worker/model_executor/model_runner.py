@@ -186,15 +186,25 @@ class ModelRunner(Execution, ABC):
             if self.pools and (graph is not None or not self._startup_complete):
                 if graph is None:
                     self.close_bucket(key)
+                    # The output is cloned below before any other graph of
+                    # this pool replays, so the pool's graphs share their
+                    # input and output backing (``SharedBacking``).
                     with self.graph_storage.allocate(self):
-                        static = clone_inputs(values)
-                    graph = CUDAGraphRunner.capture(
-                        context,
-                        static,
-                        lambda inputs: self.call.forward(
+                        static = self.backing.stage_inputs(values)
+
+                    def forward(inputs):
+                        return self.call.forward(
                             *inputs[0], **inputs[1], **resources
-                        ),
-                        pools=self.pools,
+                        )
+
+                    # The eager call warms the computation and fixes the
+                    # output shapes the shared backing views.
+                    example = forward(static)
+                    with self.graph_storage.allocate(self):
+                        call = self.backing.output_call(forward, example)
+                    del example
+                    graph = CUDAGraphRunner.capture(
+                        context, static, call, pools=self.pools, warm=False
                     )
                     # The warm call and the capture leave storage in and
                     # outside the pool; refuse an overrun at this graph.
