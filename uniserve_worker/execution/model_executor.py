@@ -98,6 +98,7 @@ from uniserve_worker.execution.conditions import (
     CONDITION_PRODUCTS,
     condition_encoder,
     condition_layout,
+    library_conditions,
 )
 from uniserve_worker.model_executor.component_binding import (
     ComponentBinding,
@@ -1082,8 +1083,9 @@ class ModelExecutor:
         when ``None``), ``decode`` the media units of a scheduled decode round
         (every unit when ``None``), ``num_prompt_tokens`` the prompt length,
         and ``conditions`` the request's ``VideoAdmission``, which sizes its
-        condition products. A distributed component's layout is narrowed to
-        the units this rank publishes.
+        condition products and places the denoiser's rows in the request's
+        own layout. A distributed component's layout is narrowed to the units
+        this rank publishes.
 
         Returns None for outputs this rank does not publish: non-output ranks,
         degenerate denoiser slices, and empty temporal-unit shares of a
@@ -1119,6 +1121,9 @@ class ModelExecutor:
                 frames=frames,
                 canvas=canvas,
                 prompt_tokens=num_prompt_tokens,
+                conditions=()
+                if conditions is None
+                else library_conditions(conditions),
             ).items()
         )
         if entry == VIDEO_CODEC_COMPONENT:

@@ -17,6 +17,7 @@ from uniserve.media import image, video
 from uniserve.model import (
     AudioDecoder,
     AudioEncoder,
+    Condition,
     Denoiser,
     PatchEncoder,
     TextEncoder,
@@ -246,13 +247,16 @@ def output_layouts(
     frames: int | None = None,
     canvas: image.Config | None = None,
     prompt_tokens: int | None = None,
+    conditions: tuple[Condition, ...] = (),
 ) -> Mapping[str, OutputLayout]:
     """Describe the products one call publishes, keyed by product name.
 
-    ``frames``, ``canvas`` and ``prompt_tokens`` size the layout for one
-    request; without ``frames`` and ``canvas`` the layout bounds every
-    admitted size (``bounding_layout`` over the longest video at each
-    admitted canvas), and the prompt defaults to the admitted maximum.
+    ``frames``, ``canvas``, ``prompt_tokens`` and ``conditions`` size the
+    layout for one request; without ``frames`` and ``canvas`` the layout
+    bounds every admitted size (``bounding_layout`` over the longest video
+    at each admitted canvas), and the prompt defaults to the admitted
+    maximum. A request's ``conditions``, in request order, place a
+    denoiser's rows in the request's own layout.
     ``clock`` is the video post-processor whose frame rate relates audio
     samples to video frames; with a clock, a video decoder's product is its
     RGB media units (``decoded_units_layout``) rather than its own declared
@@ -356,11 +360,13 @@ def output_layouts(
         frames,
         config.max_sequence_tokens if prompt_tokens is None else prompt_tokens,
         canvas,
+        conditions=conditions,
     )
     if isinstance(component, Denoiser):
         # Only a video denoiser shares the media timeline the builder sizes.
         # Its rows on this rank follow the capacity layout the request
-        # evaluates in.
+        # evaluates in, which a request's conditions widen: the generated
+        # rows a sequence-parallel rank holds move with the sequence length.
         if not isinstance(component, VideoDenoiser):
             raise ValueError("a media timeline's denoiser is a video denoiser")
         return component.output_layout(builder.layout(size))
