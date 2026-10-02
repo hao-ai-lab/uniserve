@@ -732,13 +732,16 @@ def test_sections_must_partition_the_interleaved_frequencies(sections):
 @pytest.mark.parametrize(
     "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
 )
-def test_stepwise_qk_rotation_rounds_each_eager_operation(device):
+@pytest.mark.parametrize("axes", ["one partial axis", "rotated and plain axes"])
+def test_stepwise_qk_rotation_rounds_each_eager_operation(device, axes):
     """Stepwise Q/K preparation equals eager BF16 PyTorch bit for bit.
 
     Heads of +-1 have an exact unit mean square, so each weighted
     normalization rounds to its weight in BF16 for any reduction order, and
     the rotation's BF16 products and sums are exact functions of the
-    operands. 96 of the 128 channels rotate split-half.
+    operands. 96 of the 128 channels rotate split-half, declared either as
+    one axis whose factors cover a prefix or as a rotated axis followed by
+    an unrotated one.
     """
     generator = torch.Generator().manual_seed(183)
     rows, heads, dim, rotated, eps = 37, 4, 128, 96, 1e-6
@@ -766,15 +769,19 @@ def test_stepwise_qk_rotation_rounds_each_eager_operation(device):
         turned = torch.cat((-second, first), dim=-1)
         return torch.cat((head * cosine + turned * sine, tail), dim=-1)
 
+    if axes == "one partial axis":
+        factors, axis_dims = ((cos,), (sin,)), (dim,)
+    else:
+        factors = ((cos, cos[..., :0]), (sin, sin[..., :0]))
+        axis_dims = (rotated, dim - rotated)
     query, key = qk_norm_rope(
         q,
         k,
         (q_weight,),
         (k_weight,),
-        (cos, cos[..., :0]),
-        (sin, sin[..., :0]),
+        *factors,
         eps=eps,
-        axis_dims=(rotated, dim - rotated),
+        axis_dims=axis_dims,
         rounding=Rounding.STEPWISE,
     )
 

@@ -52,8 +52,6 @@ class Dense(nn.Module):
         super().__init__()
         self.head_dim = config.head_dim
         self.rounding = config.rounding
-        # Rotated channels of each head: two halves of three axes' frequencies.
-        self.rotary_width = 6 * config.rope_frequency_dim
         inner = config.num_attention_heads * config.head_dim
         self.projection = MergedColumnParallelLinear(
             config.hidden_size,
@@ -89,8 +87,9 @@ class Dense(nn.Module):
 
         ``hidden`` is the normalized shard, whole or as ``(global row slice,
         rows)`` chunks in row order. ``cos`` and ``sin`` hold the compact
-        rotary factors ``[shard rows, rotary_width / 2]`` of the shard's
-        rows. Yields one chunk covering the shard.
+        rotary factors ``[shard rows, 3 * rope_frequency_dim]`` of the
+        shard's rows: one per rotated channel pair of the three axes' halves.
+        Yields one chunk covering the shard.
         """
         if not isinstance(hidden, torch.Tensor):
             chunks = tuple(value for _, value in hidden)
@@ -102,18 +101,18 @@ class Dense(nn.Module):
             )
             for name in ("q", "k", "v")
         )
-        # One RMS domain spans each whole head; the leading axis rotates its
-        # 96 channels split-half and the trailing 32 channels pass through.
-        unrotated = cos[..., :0]
+        # One RMS domain and one rotary axis span each whole head; the compact
+        # factors rotate its leading 96 channels split-half and the trailing
+        # 32 channels pass through.
         q, k = functional.qk_norm_rope(
             q,
             k,
             (self.query_norm.weight,),
             (self.key_norm.weight,),
-            (cos, unrotated),
-            (sin, unrotated),
+            (cos,),
+            (sin,),
             eps=self.query_norm.eps,
-            axis_dims=(self.rotary_width, self.head_dim - self.rotary_width),
+            axis_dims=(self.head_dim,),
             rounding=self.rounding,
         )
         attended = self.attention(q, k, v.contiguous(), inputs.visible)

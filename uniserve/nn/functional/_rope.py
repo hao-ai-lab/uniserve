@@ -200,23 +200,19 @@ def qk_norm_rope(
         check_output(q, query)
         check_output(k, key)
 
-    # The fused kernels implement the single-rounding recipe.
-    if (
-        rounding is Rounding.ONCE
-        and q.ndim == 3
-        and _fused_qk_norm_rope(
-            q,
-            k,
-            q_weights,
-            k_weights,
-            cos,
-            sin,
-            eps,
-            axis_dims,
-            counts,
-            query,
-            key,
-        )
+    if q.ndim == 3 and _fused_qk_norm_rope(
+        q,
+        k,
+        q_weights,
+        k_weights,
+        cos,
+        sin,
+        eps,
+        axis_dims,
+        counts,
+        query,
+        key,
+        rounding,
     ):
         return query, key
 
@@ -255,23 +251,36 @@ def qk_norm_rope(
 
 
 def _fused_qk_norm_rope(
-    q, k, q_weights, k_weights, cos, sin, eps, axis_dims, counts, query, key
+    q,
+    k,
+    q_weights,
+    k_weights,
+    cos,
+    sin,
+    eps,
+    axis_dims,
+    counts,
+    query,
+    key,
+    rounding,
 ) -> bool:
     """Launch the Triton kernel matching the call's domains and axes.
 
     Selection follows the declared layout: one domain with one axis, or a
     rotated leading domain followed by one shared tail domain that is either
-    unrotated or holds two rotated axes. Returns ``False`` when no kernel
-    accepts the tensors.
+    unrotated or holds two rotated axes. Stepwise rounding has a kernel for
+    one domain whose axis rotates a prefix of the head. Returns ``False``
+    when no kernel accepts the tensors and recipe.
     """
     from uniserve_kernels import rope as kernels
 
+    stepwise = rounding is Rounding.STEPWISE
     rotated = tuple(cosine.shape[-1] * 2 for cosine in cos)
     cos = tuple(cosine.contiguous() for cosine in cos)
     sin = tuple(sine.contiguous() for sine in sin)
 
     if counts == (1,) and rotated[0] == axis_dims[0]:
-        if kernels.can_run_triton_qk_rms_norm_rope(
+        if not stepwise and kernels.can_run_triton_qk_rms_norm_rope(
             q, k, q_weights[0], k_weights[0], cos[0], sin[0], query, key
         ):
             kernels.triton_qk_rms_norm_rope(
@@ -307,11 +316,20 @@ def _fused_qk_norm_rope(
             if key is not k:
                 key.copy_(k)
             kernels.triton_qk_rms_norm_rope_inplace(
-                query, key, q_weights[0], k_weights[0], cos[0], sin[0], eps
+                query,
+                key,
+                q_weights[0],
+                k_weights[0],
+                cos[0],
+                sin[0],
+                eps,
+                stepwise,
             )
             return True
         return False
 
+    if stepwise:
+        return False
     if (
         len(counts) != 2
         or counts[0] != 1

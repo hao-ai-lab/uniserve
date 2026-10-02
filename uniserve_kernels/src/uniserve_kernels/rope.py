@@ -311,6 +311,7 @@ if triton is not None:
         block_rows: tl.constexpr,
         head_dim: tl.constexpr,
         rotary_dim: tl.constexpr,
+        stepwise: tl.constexpr,
     ):
         """Normalize Q/K in place and rotate an even prefix of each head.
 
@@ -319,7 +320,9 @@ if triton is not None:
         tile of one head and loads every value it reads, including partner
         features, before its stores, so updating in place is safe. ``rows`` is
         a compile-time constant, so each distinct row count compiles its own
-        variant.
+        variant. ``stepwise`` rounds the weighted normalization, the factors
+        and each rotation product to the input dtype before the sum, as eager
+        PyTorch does; the launch then disables floating-point contraction.
         """
         row_offsets = (
             tl.program_id(0) * block_rows + tl.arange(0, block_rows)
@@ -419,17 +422,42 @@ if triton is not None:
         ).to(tl.float32)
 
         sign = tl.where(columns[None, :] < half_rotary, -1.0, 1.0)
-        query_output = tl.where(
-            rotary_mask,
-            normalized_query * cosine_values
-            + sign * partner_query * sine_values,
-            normalized_query,
-        )
-        key_output = tl.where(
-            rotary_mask,
-            normalized_key * cosine_values + sign * partner_key * sine_values,
-            normalized_key,
-        )
+        if stepwise:
+            # Eager order: the normalized head and the factors round to the
+            # input dtype, then each product rounds before the sum. Rounding
+            # is symmetric, so the sign may apply after the partner product.
+            dtype = query.dtype.element_ty
+            normalized_query = normalized_query.to(dtype).to(tl.float32)
+            normalized_key = normalized_key.to(dtype).to(tl.float32)
+            partner_query = partner_query.to(dtype).to(tl.float32)
+            partner_key = partner_key.to(dtype).to(tl.float32)
+            cosine_values = cosine_values.to(dtype).to(tl.float32)
+            sine_values = sine_values.to(dtype).to(tl.float32)
+            query_output = tl.where(
+                rotary_mask,
+                (normalized_query * cosine_values).to(dtype).to(tl.float32)
+                + sign * (partner_query * sine_values).to(dtype).to(tl.float32),
+                normalized_query,
+            )
+            key_output = tl.where(
+                rotary_mask,
+                (normalized_key * cosine_values).to(dtype).to(tl.float32)
+                + sign * (partner_key * sine_values).to(dtype).to(tl.float32),
+                normalized_key,
+            )
+        else:
+            query_output = tl.where(
+                rotary_mask,
+                normalized_query * cosine_values
+                + sign * partner_query * sine_values,
+                normalized_query,
+            )
+            key_output = tl.where(
+                rotary_mask,
+                normalized_key * cosine_values
+                + sign * partner_key * sine_values,
+                normalized_key,
+            )
         tl.store(query + query_offsets, query_output, mask=valid)
         tl.store(key + key_offsets, key_output, mask=valid)
 
@@ -1022,14 +1050,16 @@ def triton_qk_rms_norm_rope_inplace(
     cosine: torch.Tensor,
     sine: torch.Tensor,
     eps: float,
+    stepwise: bool = False,
 ) -> None:
     """Normalize complete Q/K heads and rotate their leading prefix in place.
 
     Query and key use ``[rows, heads, head_dim]`` layout; compact factors have
-    shape ``[rows, rotary_dim / 2]``. Callers first check
-    :func:`can_run_triton_qk_rms_norm_rope_inplace`. Registration as a
-    ``torch.library`` custom operator with ``mutates_args`` declares the
-    in-place update of ``query`` and ``key`` to PyTorch.
+    shape ``[rows, rotary_dim / 2]``. ``stepwise`` rounds each operation of
+    the eager expression to the input dtype instead of rounding once.
+    Callers first check :func:`can_run_triton_qk_rms_norm_rope_inplace`.
+    Registration as a ``torch.library`` custom operator with ``mutates_args``
+    declares the in-place update of ``query`` and ``key`` to PyTorch.
     """
     rows, heads, head_dim = (int(size) for size in query.shape)
 
@@ -1056,8 +1086,11 @@ def triton_qk_rms_norm_rope_inplace(
         block_rows,
         head_dim,
         int(cosine.shape[-1]) * 2,
+        stepwise,
         num_warps=8,
         num_stages=1,
+        # A contracted multiply-add would skip a stepwise rounding.
+        enable_fp_fusion=not stepwise,
     )
 
 
@@ -1070,12 +1103,13 @@ def _triton_qk_rms_norm_rope_inplace_fake(
     cosine: torch.Tensor,
     sine: torch.Tensor,
     eps: float,
+    stepwise: bool = False,
 ) -> None:
     """Fake-tensor implementation: the operator returns nothing.
 
     The mutation of ``query`` and ``key`` is declared by ``mutates_args``.
     """
-    del query, key, query_weight, key_weight, cosine, sine, eps
+    del query, key, query_weight, key_weight, cosine, sine, eps, stepwise
 
 
 def _qk_rows(
