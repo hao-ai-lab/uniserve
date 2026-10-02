@@ -63,6 +63,8 @@ Run `uniserve serve --help` for the complete option set.
 
 DiffusionGemma readout settings are fixed when the server starts. `--readout-canvas full` uses the checkpoint's full canvas; `compact` rounds each answer scaffold up to a multiple of 16. A numeric value, such as `--readout-canvas 64`, fixes every canvas to that length and splits larger question sets across complete canvases. Numeric lengths must be positive multiples of 16 no greater than the checkpoint's canvas length. `--readout-candidates variants` sums the supported token spellings of each answer; `primary` reads only the space-prefixed spelling (` A`, ` B`, ` yes`, ` no`, and so on). Defaults are `full` and `variants`. Canvas length and candidate selection change the returned distribution and must match between systems in a numerical or performance comparison.
 
+See the [DiffusionGemma serving guide](docs/diffusion_gemma/serving.md) for checkpoint setup, four-GPU serving, decision and chat examples, precision choices, and measurement contracts.
+
 List the configured model:
 
 ```bash
@@ -165,7 +167,8 @@ curl -s http://127.0.0.1:8000/v1/systemone \
 | `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |
 | `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |
 | `--readout-layout` | `joint` | System One question grouping: `joint` packs questions in request order into shared canvases; `independent` gives each question its own prompt and canvas |
-| `--readout-canvas` | `full` | System One canvas length: `full` is the checkpoint's canvas length; `compact` the smallest multiple of 16 tokens holding the answer scaffold |
+| `--readout-canvas` | `full` | System One canvas length: `full` is the checkpoint's canvas length; `compact` is the smallest multiple of 16 holding the scaffold; a positive multiple of 16 fixes the length, bounded by the checkpoint's canvas |
+| `--readout-candidates` | `variants` | Sum supported answer-token spellings, or use `primary` for only the space-prefixed spelling |
 | `--diffusion-generation-config` | Checkpoint `generation_config.json` | DiffusionGemma block-diffusion sampling for every reply, as a JSON object that replaces any of `max_denoising_steps`, `entropy_bound`, `t_min`, `t_max`, `confidence_threshold`, and `stability_threshold` |
 
 On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Graphs cover every step the scheduler forms. Prefill graphs hold up to `--max-num-batched-tokens` prompt tokens (plus one image's feature tokens for models that read images) and up to 31 prompts; decode graphs hold up to 128 requests. Both hold at most `--max-running-requests` and at most as many requests as the KV pool holds a page of every cache group for. The worker reports these bounds, and the scheduler never places more requests in one prefill or decode step. A prefill or decode step that no captured graph holds fails instead of running eagerly. Larger token budgets capture more graphs, so startup takes longer. Startup also runs every image encoder and decoder once, so the `uniserve-kernel-table` line it logs names the kernel of every call the server makes. `--graph-policy off` serves every call without graphs.
