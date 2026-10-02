@@ -155,6 +155,47 @@ Unknown fields are refused, at every level. `GET /v1/capabilities` reports the s
 
 The base DiTs evaluate their block epilogues (modulation, gated residuals, rotary Q/K and SwiGLU gating) the way the diffusers reference does, rounding to BF16 after each operation; OmniRef follows FastVideo's eager arithmetic, which rounds the same way. Seeded draws follow each checkpoint's reference: a request draws its condition noise, then its video and audio noise, on the CPU from its seed. The Python library computes what a server computes on the same placement: given the server's capacity layout (`minimax_h3.generation.generate(..., layout=...)`), a single-GPU library generation equals a single-GPU server's.
 
+## Reproduce the measurements
+
+`uniserve_eval/minimax_h3.toml` holds the four-GB200 measurements below for UniServe, SGLang, vLLM-Omni and FastVideo. Every request is t2va, fl2va or ref2va at the canvas and duration its workload states, uses the checkpoint's schedule (50 points, flow shift 12, audio shift 3 for the base checkpoint; the export's schedule for FastH3 and OmniRef) and is validated as a complete MP4 at the expected canvas and frame count. Each point sends one unmeasured warmup request, then its measured requests one at a time: eight (seeds 0 to 7), or four for W2. Run points serially, one server at a time, from the repository root, with the `bench` extra installed as in the [FastH3 guide](../fast_h3/fast_h3.md#reproduce-the-measurements).
+
+| Workload | Request |
+| --- | --- |
+| W1 | t2va, official prompt, 16:9, 5 s (124 frames) |
+| W2 | t2va, official prompt, 16:9, 15 s (362 frames) |
+| W3 | fl2va, the official first-frame request, `aspect_ratio` auto, 8 s (192 frames) |
+| W4 | ref2va, one reference image and one reference voice, 5 s |
+| W5 | ref2va, the official reference video with its soundtrack and a reference voice, 5 s |
+
+```bash
+export UNISERVE_MINIMAX_H3_MODEL=/workspace/models/MiniMax-H3
+export UNISERVE_MINIMAX_H3_INPUTS=/path/to/inputs   # prompts.json and media/
+export UNISERVE_MINIMAX_H3_FFMPEG=/path/to/ffmpeg/bin
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-reference
+```
+
+The suites are `gb200-4` (W1 to W3), `gb200-4-reference` (W4, W5), `gb200-4-omniref` (OmniRef W4, W5; also set `UNISERVE_MINIMAX_H3_OMNIREF` and `UNISERVE_MINIMAX_H3_OMNIREF_BASE`), `fast-h3-gb200-4` (FastH3 W1, W2) and one per baseline and task family.
+
+Median latency in seconds on one four-GB200 host, every measured request valid:
+
+| Model and workload | UniServe | SGLang | vLLM-Omni | FastVideo |
+| --- | ---: | ---: | ---: | ---: |
+| Base, W1 | 37.30 | 39.42 | 39.99 | |
+| Base, W2 | 207.59 | 213.31 | 217.38 | |
+| Base, W3 | 78.47 | 81.21 | 82.93 | |
+| Base reference DiT, W4 | 64.90 | 65.00 | 52.63 (smaller work, below) | |
+| Base reference DiT, W5 | 131.62 | 132.22 | 138.35 | |
+| FastH3 OmniRef, W4 | 13.47 | | | 17.91 |
+| FastH3 OmniRef, W5 | 19.52 | | | 35.94 |
+| FastH3 V2, W1 | 5.91 | | | |
+| FastH3 V2, W2 | 20.67 | | | |
+
+UniServe serves `ulysses4.json` (W1 to W3) and `ulysses4-reference.json` (W4, W5) with the options in the profile. The baselines run their best lossless configuration measured on this hardware: SGLang its GB200 cookbook recipe (Ulysses 4, resident, cuDNN attention, eager); vLLM-Omni its four-GPU recipe (Ulysses 4, VAE patch parallelism 4, regional compile, TRTLLM attention), with the text encoder sharded over the four GPUs for reference requests; FastVideo the OmniRef export with every component resident. None runs a lossy path. The comparison differs from identical work in these disclosed ways:
+- vLLM-Omni keeps W4's 2560×1440 reference image at that size, 3,600 condition rows, where the other systems scale it to a 2048-pixel short edge, 7,296 rows, so its W4 does less work.
+- SGLang and vLLM-Omni draw condition and audio noise from separately seeded generators, so a seed gives a different sample at the same cost.
+- The MP4 encoders differ: UniServe and FastVideo libx264 ultrafast, SGLang preset fast at CRF 25, vLLM-Omni ultrafast at CRF 18.
+
 ## Troubleshooting
 
 | Symptom | Cause and remedy |
