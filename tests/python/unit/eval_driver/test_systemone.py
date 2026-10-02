@@ -295,13 +295,25 @@ def test_unanswered_question_fails_the_readout() -> None:
     assert record.classifier == "incomplete_answers"
 
 
-def test_djev_answers_are_keyed_by_question_with_state_prompt_tokens() -> None:
+@pytest.mark.parametrize("cached", [None, 0, 128])
+def test_djev_answers_are_keyed_by_question_with_state_prompt_tokens(
+    cached,
+) -> None:
     record = _send(
         DJEV_EVALUATE,
         {
             "model": "djev",
             "states": [
-                {"id": "home:0", "answers": _ANSWERS, "prompt_tokens": 598}
+                {
+                    "id": "home:0",
+                    "answers": _ANSWERS,
+                    "prompt_tokens": 598,
+                    **(
+                        {"cached_prompt_tokens": cached}
+                        if cached is not None
+                        else {}
+                    ),
+                }
             ],
         },
     )
@@ -313,6 +325,12 @@ def test_djev_answers_are_keyed_by_question_with_state_prompt_tokens() -> None:
         "server_usage",
     )
     assert record.decision_questions == 2
+    assert record.cached_prompt_tokens == cached
+    assert record.cached_prompt_tokens_source == (
+        "djev_states_cached_prompt_tokens"
+        if cached is not None
+        else "unavailable"
+    )
 
 
 def test_readout_rates_count_answered_states_and_questions() -> None:

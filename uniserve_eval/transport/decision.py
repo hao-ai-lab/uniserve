@@ -113,12 +113,14 @@ def _djev_answers(data: Any, record: RequestRecord) -> dict[Any, Any] | None:
     """Return a DJev response's answers keyed by state id.
 
     DJev reports each state's encoded prompt length as `prompt_tokens`;
-    their sum becomes the record's authoritative prompt length.
+    their sum becomes the record's authoritative prompt length. When every
+    state reports ``cached_prompt_tokens``, their sum records prefix reuse.
     """
     if not isinstance(data, dict) or not isinstance(data.get("states"), list):
         return None
     answers: dict[Any, Any] = {}
     prompt_tokens: list[int] = []
+    cached_tokens: list[int] = []
     for state in data["states"]:
         if not isinstance(state, dict) or not isinstance(
             state.get("answers"), dict
@@ -127,9 +129,14 @@ def _djev_answers(data: Any, record: RequestRecord) -> dict[Any, Any] | None:
         answers[state.get("id")] = state["answers"]
         if _is_count(state.get("prompt_tokens")):
             prompt_tokens.append(int(state["prompt_tokens"]))
+        if _is_count(state.get("cached_prompt_tokens")):
+            cached_tokens.append(int(state["cached_prompt_tokens"]))
     if prompt_tokens and len(prompt_tokens) == len(data["states"]):
         record.prompt_len = sum(prompt_tokens)
         record.prompt_len_source = "server_usage"
+    if cached_tokens and len(cached_tokens) == len(data["states"]):
+        record.cached_prompt_tokens = sum(cached_tokens)
+        record.cached_prompt_tokens_source = "djev_states_cached_prompt_tokens"
     return answers
 
 
