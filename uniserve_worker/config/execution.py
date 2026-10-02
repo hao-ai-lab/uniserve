@@ -96,7 +96,9 @@ DEFAULT_DECODE_GRAPH_BATCH_SIZES = (
 
 # Token buckets step linearly within each range, with a step that widens as the
 # counts grow. A prefill rounded up to a bucket gains less padding than the gap
-# below that bucket.
+# below that bucket. Keep 64-token spacing through 4096: these prompt batches
+# have enough compute for padding to affect latency, while the additional
+# captured graphs still share their large execution buffers.
 DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     4,
     8,
@@ -135,19 +137,7 @@ DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     832,
     896,
     960,
-    1024,
-    1280,
-    1536,
-    1792,
-    2048,
-    2304,
-    2560,
-    2816,
-    3072,
-    3328,
-    3584,
-    3840,
-    4096,
+    *range(1024, 4097, 64),
     4608,
     5120,
     5632,
