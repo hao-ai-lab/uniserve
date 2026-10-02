@@ -313,12 +313,14 @@ class RegionSparse(nn.Module):
     shard of it; ``vsa.RegionAttention`` selects each video query's key
     tiles of every region, adds the gated tile compression and returns the
     rows of this rank's token shard, which the output projection maps back.
-    The parameters are those of ``Sparse``.
+    The parameters are those of ``Sparse``; Q/K normalization and rotation
+    follow the checkpoint's rounding recipe (``TransformerConfig.rounding``).
     """
 
     def __init__(self, config: TransformerConfig, *, tile: int):
         super().__init__()
         self.head_dim = config.head_dim
+        self.rounding = config.rounding
         # Rotated channels of each head: two halves of three axes' frequencies.
         self.rotary_width = 6 * config.rope_frequency_dim
         inner = config.num_attention_heads * config.head_dim
@@ -390,6 +392,7 @@ class RegionSparse(nn.Module):
             (sin, unrotated),
             eps=self.query_norm.eps,
             axis_dims=(self.rotary_width, self.head_dim - self.rotary_width),
+            rounding=self.rounding,
         )
         attended = self.vsa(q, k, v, gate, inputs.regions)
         yield inputs.token_slice, self.output(attended.flatten(1))
