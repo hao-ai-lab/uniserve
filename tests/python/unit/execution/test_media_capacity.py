@@ -77,7 +77,7 @@ def test_default_capacities_step_to_the_prompt_capacity(denoiser):
 
 def test_a_layout_holds_only_prompts_that_fit_at_its_frame_count(denoiser):
     def make(frames, tokens):
-        return denoiser.make_size(frames, tokens, canvas=WIDE, condition_rows=0)
+        return denoiser.make_size(frames, tokens, canvas=WIDE)
 
     layout = make(124, 2048)
     assert denoiser.holds(layout, make(124, 1))

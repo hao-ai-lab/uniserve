@@ -181,7 +181,7 @@ def _run(rank, rendezvous, directory, source):
         ).model
         # The prompt fills 63 rows of one text tile; the call evaluates the
         # tile's layout with the prompt's own tables.
-        size = model.make_size(22, 63, canvas=WIDE, condition_rows=0)
+        size = model.make_size(22, 63, canvas=WIDE)
         layout = model.layout_size(size)
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
         stream.wait(torch.cuda.current_stream(device))
@@ -968,7 +968,7 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
     )
     schedules = model.make_schedules(4, shift=None, device=device)
     for index, (frames, tokens, capacity) in enumerate(cases):
-        size = model.make_size(frames, tokens, canvas=WIDE, condition_rows=0)
+        size = model.make_size(frames, tokens, canvas=WIDE)
         generator = torch.Generator().manual_seed(60 + index)
         features = torch.randn(
             tokens, model.text_condition_width, generator=generator

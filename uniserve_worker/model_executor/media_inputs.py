@@ -203,7 +203,7 @@ class MediaBuilder:
 
     def _size(self, num_frames: int, num_text_tokens: int, canvas):
         return self.denoiser.make_size(
-            num_frames, num_text_tokens, canvas=canvas, condition_rows=0
+            num_frames, num_text_tokens, canvas=canvas
         )
 
     def size(self, num_frames: int, num_text_tokens: int, canvas: image.Config):

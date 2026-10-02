@@ -8,6 +8,7 @@ import torch
 
 from uniserve.distributed import Communicator
 from uniserve.media import image
+from uniserve.model import Condition
 from uniserve.model import DenoiserInput as BaseDenoiserInput
 from uniserve.nn.attention import VisibleInput, vsa
 
@@ -23,13 +24,18 @@ class DenoiserSize:
     multiples of 32. ``num_text_tokens`` and ``condition_rows`` are either a
     request's exact presented prompt length and condition rows or, for a
     layout (see ``Denoiser.layout_size``), the capacities of its text and
-    condition regions.
+    condition regions. A request also carries its ``conditions`` in request
+    order and the ``vision_spans`` of its presented prompt
+    (``Denoiser.make_size`` derives ``condition_rows`` from them); a layout
+    carries neither.
     """
 
     num_frames: int
     canvas: image.Config
     num_text_tokens: int
     condition_rows: int
+    conditions: tuple[Condition, ...] = ()
+    vision_spans: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self):
         # Raise ValueError for a frame count or canvas H3 does not generate.
@@ -41,6 +47,15 @@ class DenoiserSize:
             )
         if type(self.condition_rows) is not int or self.condition_rows < 0:
             raise ValueError("H3 condition rows must be a nonnegative count")
+        if not isinstance(self.conditions, tuple) or not all(
+            isinstance(condition, Condition) for condition in self.conditions
+        ):
+            raise TypeError("H3 conditions must be a tuple of Condition")
+        if not isinstance(self.vision_spans, tuple) or any(
+            not 0 <= start < stop <= self.num_text_tokens
+            for start, stop in self.vision_spans
+        ):
+            raise ValueError("H3 vision spans must lie within the prompt")
 
 
 @dataclass(frozen=True)

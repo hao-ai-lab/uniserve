@@ -145,6 +145,6 @@ def test_native_draws_and_canonical_shards(
 def test_dmd_export_generates_only_its_canvas():
     with torch.device("meta"):
         model = Denoiser(dmd_denoiser())
-    model.make_size(124, 64, canvas=WIDE, condition_rows=0)
+    model.make_size(124, 64, canvas=WIDE)
     with pytest.raises(ValueError, match="generates only"):
-        model.make_size(124, 64, canvas=TALL, condition_rows=0)
+        model.make_size(124, 64, canvas=TALL)

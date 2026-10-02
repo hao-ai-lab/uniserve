@@ -20,21 +20,26 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import StrEnum
 
 import numpy as np
 import torch
 
 from uniserve.media import image
+from uniserve.model import Condition, ConditionRole
 
 __all__ = [
     "AUDIO_CHANNELS",
     "AUDIO_TAG",
     "CANVAS_MULTIPLE",
     "DensePacking",
+    "Segment",
+    "SegmentKind",
     "TEXT_TAG",
     "TilePacking",
     "VIDEO_TAG",
     "audio_latent_frames",
+    "condition_segments",
     "dense_packing",
     "dense_tables",
     "latent_raster",
@@ -54,6 +59,8 @@ AUDIO_TAG = 2
 AUDIO_CHANNELS = 2
 FPS = 24
 AUDIO_LATENTS_PER_SECOND = 40
+# The audio VAE's 32 kHz samples per latent.
+AUDIO_HOP = 32_000 // AUDIO_LATENTS_PER_SECOND
 ROPE_FRAME_RESCALE = 5.0 / 3.0
 # Output frames covered by each of the five latent frames of one 17-frame
 # clip: 1 + 4 * 4 = 17.
@@ -71,6 +78,110 @@ VIDEO_GROUP, AUDIO_GROUP, VISUAL_CONDITION_GROUP, AUDIO_CONDITION_GROUP = (
     2,
     3,
 )
+
+
+class SegmentKind(StrEnum):
+    """What one condition contributes to the packed sequence."""
+
+    # One latent frame of the target canvas anchoring a generated frame.
+    KEYFRAME = "keyframe"
+    # One latent frame of a reference image at its own raster.
+    IMAGE = "image"
+    # A reference video's latent frames, after its soundtrack's audio rows.
+    VIDEO = "video"
+    # A reference track's stereo audio rows.
+    AUDIO = "audio"
+
+
+@dataclass(frozen=True, slots=True)
+class Segment:
+    """One condition's rows in the packed sequence.
+
+    Attributes:
+        kind: What the condition contributes.
+        condition: The condition's position in request order.
+        anchor: The generated frame a keyframe anchors; None otherwise.
+        latent_frames: Visual latent frames; 0 for audio alone.
+        latent_height: Visual latent raster height; 0 for audio alone.
+        latent_width: Visual latent raster width; 0 for audio alone.
+        audio_frames: Audio latent frames per stereo channel; 0 without
+            audio.
+    """
+
+    kind: SegmentKind
+    condition: int
+    anchor: ConditionRole | None
+    latent_frames: int
+    latent_height: int
+    latent_width: int
+    audio_frames: int
+
+    @property
+    def video_rows(self) -> int:
+        """Visual rows: one per 2x2 patch of every latent frame."""
+        return (
+            self.latent_frames
+            * (self.latent_height // 2)
+            * (self.latent_width // 2)
+        )
+
+    @property
+    def audio_rows(self) -> int:
+        """Channel-major stereo audio rows."""
+        return AUDIO_CHANNELS * self.audio_frames
+
+
+def condition_segments(
+    conditions: tuple[Condition, ...], canvas: image.Config
+) -> tuple[Segment, ...]:
+    """Order a request's conditions as the packed sequence holds them.
+
+    Keyframes come first, in request order, then the references in request
+    order: the released ``fl2va`` layout holds only keyframes, and a
+    ``ref2va`` request's keyframes lead its references as in the SGLang
+    layout, the only implementation of that combination. A one-frame
+    reference is an image; a longer one is a video, with its soundtrack
+    when it carries audio; a reference without pixels is audio.
+
+    Raises:
+        ValueError: A keyframe off the target canvas, or a raster or frame
+            count the VAE does not encode.
+    """
+    keyframes, references = [], []
+    for index, condition in enumerate(conditions):
+        pixels = condition.video
+        height = width = frames = 0
+        if pixels is not None:
+            height, width = latent_raster(pixels.frame)
+            frames = (
+                1
+                if pixels.num_frames == 1
+                else video_latent_frames(pixels.num_frames)
+            )
+        audio = math.ceil(condition.audio_samples / AUDIO_HOP)
+        if condition.role != ConditionRole.REFERENCE:
+            if pixels is None or pixels.frame != canvas:
+                raise ValueError("H3 keyframes are fitted to the target canvas")
+            kind = SegmentKind.KEYFRAME
+        elif pixels is None:
+            kind = SegmentKind.AUDIO
+        else:
+            kind = SegmentKind.IMAGE if frames == 1 else SegmentKind.VIDEO
+        if kind == SegmentKind.IMAGE and audio:
+            raise ValueError("an H3 image reference carries no audio")
+        segment = Segment(
+            kind,
+            index,
+            condition.role if kind == SegmentKind.KEYFRAME else None,
+            frames,
+            height,
+            width,
+            audio,
+        )
+        (keyframes if kind == SegmentKind.KEYFRAME else references).append(
+            segment
+        )
+    return (*keyframes, *references)
 
 
 def latent_raster(canvas: image.Config) -> tuple[int, int]:
@@ -546,36 +657,15 @@ class DenseTables:
     used: int
 
 
-def dense_tables(
-    packing: DensePacking,
-    *,
-    num_frames: int,
-    canvas: image.Config,
-    num_text_tokens: int,
-    patch_size: tuple[int, int, int] = (1, 2, 2),
-) -> DenseTables:
-    """Build a text-only request's tables in its dense layout.
+def _frame_grid(
+    latent_height: int, latent_width: int, patch: tuple[int, int, int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return one latent frame's ``(h, w)`` coordinates and its width axis.
 
-    The coordinates are the released contract: text row ``i`` sits at
-    ``(i, 0, 0)``; the media clock starts at the prompt length, the audio
-    rows advancing one unit per latent with the stereo channels at the two
-    ends of the width grid, and the video frames at
-    ``(5 / 3) * (1, 4, 4, 4, 4)[k mod 5]`` spacing over the aspect-normalized
-    spatial grid.
-
-    Raises:
-        ValueError: The prompt does not fit the layout's text rows.
+    Both axes share the scale of the raster's geometric-mean side
+    (``_spatial_grid``); rows are row-major over the 2x2 patches.
     """
-    if not 1 <= num_text_tokens <= packing.text_rows:
-        raise ValueError("the prompt must fit its layout's text rows")
-    _, patch_h, patch_w = patch_size
-    latent_height, latent_width = latent_raster(canvas)
-    rows = packing.padded_tokens
-    frames = video_latent_frames(num_frames)
-    audio_frames = audio_latent_frames(num_frames)
-    origin = float(num_text_tokens)
-
-    positions = torch.zeros((rows, 3), dtype=torch.float64, device="cpu")
+    _, patch_h, patch_w = patch
     sqrt_area = math.sqrt(latent_height * latent_width)
     height_grid = _spatial_grid(latent_height, patch_h, sqrt_area)
     width_grid = _spatial_grid(latent_width, patch_w, sqrt_area)
@@ -586,48 +676,206 @@ def dense_tables(
         ],
         dim=-1,
     )
-    video = torch.empty(
-        (frames, spatial.shape[0], 3), dtype=torch.float64, device="cpu"
-    )
-    video[:, :, 0] = _temporal_grid(frames, origin)[:, None]
-    video[:, :, 1:] = spatial[None]
-    positions[: packing.video_rows] = video.reshape(-1, 3)
+    return spatial, width_grid
 
-    audio = slice(packing.video_rows, packing.prefix_start)
-    positions[audio, 0] = (
-        origin + torch.arange(audio_frames, dtype=torch.float64, device="cpu")
+
+def _place_audio(
+    positions: torch.Tensor,
+    rows: slice,
+    frames: int,
+    origin: float,
+    width_grid: torch.Tensor,
+) -> None:
+    """Place one channel-major stereo block from ``origin``.
+
+    Audio advances one unit per latent; it has no height coordinate, and the
+    two channels sit at the two ends of ``width_grid``.
+    """
+    positions[rows, 0] = (
+        origin + torch.arange(frames, dtype=torch.float64, device="cpu")
     ).repeat(AUDIO_CHANNELS)
-    positions[audio, 2] = torch.cat(
+    positions[rows, 2] = torch.cat(
         (
-            torch.full(
-                (audio_frames,), float(width_grid[0]), dtype=torch.float64
-            ),
-            torch.full(
-                (audio_frames,), float(width_grid[-1]), dtype=torch.float64
-            ),
+            torch.full((frames,), float(width_grid[0]), dtype=torch.float64),
+            torch.full((frames,), float(width_grid[-1]), dtype=torch.float64),
         )
     )
+
+
+def _place_frames(
+    positions: torch.Tensor,
+    rows: slice,
+    frames: int,
+    origin: float,
+    spatial: torch.Tensor,
+) -> None:
+    """Place ``frames`` latent frames of one raster from ``origin``."""
+    block = torch.empty(
+        (frames, spatial.shape[0], 3), dtype=torch.float64, device="cpu"
+    )
+    block[:, :, 0] = _temporal_grid(frames, origin)[:, None]
+    block[:, :, 1:] = spatial[None]
+    positions[rows] = block.reshape(-1, 3)
+
+
+def _video_span(frames: int) -> float:
+    """Rotary time ``frames`` latent frames occupy, summed sequentially.
+
+    The reference advances its ``ref2va`` clock past a reference video by
+    this Python ``sum``; ``_keyframe_span`` sums the same series pairwise,
+    and the two differ in the last place from 16 latent frames on.
+    """
+    return sum(
+        ROPE_FRAME_RESCALE
+        * ROPE_FRAMES_PER_LATENT[index % len(ROPE_FRAMES_PER_LATENT)]
+        for index in range(frames)
+    )
+
+
+def _keyframe_span(frames: int) -> float:
+    """Rotary time ``frames`` latent frames occupy, summed pairwise.
+
+    The reference anchors a last keyframe with numpy's pairwise sum of the
+    frame spans (see ``_video_span``).
+    """
+    spans = np.ones(frames, dtype=np.float64) * ROPE_FRAME_RESCALE
+    cycle = len(ROPE_FRAMES_PER_LATENT)
+    for offset in range(cycle):
+        spans[offset::cycle] *= ROPE_FRAMES_PER_LATENT[offset]
+    return float(spans.sum())
+
+
+def dense_tables(
+    packing: DensePacking,
+    *,
+    num_frames: int,
+    canvas: image.Config,
+    num_text_tokens: int,
+    segments: tuple[Segment, ...] = (),
+    vision_spans: tuple[tuple[int, int], ...] = (),
+    patch_size: tuple[int, int, int] = (1, 2, 2),
+) -> DenseTables:
+    """Build one request's tables in its dense layout.
+
+    The coordinates are the released contract (spec section 2.3). Text row
+    ``i`` sits at ``(i, 0, 0)`` and the media clock starts at the prompt
+    length. References advance it in packed order: an image by one unit at
+    its own spatial grid; an audio track by its latent count, its channels
+    at the ends of the target width grid; a video by the longer of its
+    soundtrack and its frames, the soundtrack starting with the frames at
+    the ends of the video's own width grid. The generated audio and video
+    start where the references leave the clock, the audio one unit per
+    latent and the video frames at ``(5 / 3) * (1, 4, 4, 4, 4)[k mod 5]``
+    spacing. A keyframe sits on the generated timeline at the target grid:
+    at its start, or at its last latent frame.
+
+    Text rows in ``vision_spans`` are tagged video; visual condition rows
+    read the visual-condition timestep group and audio reference rows the
+    audio-reference group.
+
+    Raises:
+        ValueError: The prompt and conditions do not fit the layout's prefix
+            region, or a vision span leaves the prompt.
+    """
+    condition_rows = sum(
+        segment.video_rows + segment.audio_rows for segment in segments
+    )
+    if (
+        not 1 <= num_text_tokens <= packing.text_rows
+        or condition_rows > packing.condition_rows
+    ):
+        raise ValueError(
+            "the prompt and conditions must fit their layout's prefix region"
+        )
+    if any(
+        not 0 <= start < stop <= num_text_tokens for start, stop in vision_spans
+    ):
+        raise ValueError("vision spans must lie within the prompt")
+    latent_height, latent_width = latent_raster(canvas)
+    rows = packing.padded_tokens
+    frames = video_latent_frames(num_frames)
+    audio_frames = audio_latent_frames(num_frames)
+    spatial, width_grid = _frame_grid(latent_height, latent_width, patch_size)
+
+    positions = torch.zeros((rows, 3), dtype=torch.float64, device="cpu")
+    tags = torch.full((rows,), VIDEO_TAG, dtype=torch.int64, device="cpu")
+    groups = torch.full((rows,), VIDEO_GROUP, dtype=torch.int64, device="cpu")
+    prefix_index = torch.full(
+        (rows,), packing.zero_row, dtype=torch.int64, device="cpu"
+    )
+
     text = slice(packing.prefix_start, packing.prefix_start + num_text_tokens)
     positions[text, 0] = torch.arange(
         num_text_tokens, dtype=torch.float64, device="cpu"
     )
-
-    tags = torch.full((rows,), VIDEO_TAG, dtype=torch.int64, device="cpu")
-    tags[audio] = AUDIO_TAG
     tags[text] = TEXT_TAG
-    groups = torch.full((rows,), VIDEO_GROUP, dtype=torch.int64, device="cpu")
-    groups[audio] = AUDIO_GROUP
-
-    prefix_index = torch.full(
-        (rows,), packing.zero_row, dtype=torch.int64, device="cpu"
-    )
+    for start, stop in vision_spans:
+        tags[text.start + start : text.start + stop] = VIDEO_TAG
     prefix_index[text] = torch.arange(num_text_tokens, dtype=torch.int64)
+
+    # Condition rows follow the text in packed order and gather the prefix
+    # source rows after its text capacity.
+    cursor = text.stop
+    prefix_index[cursor : cursor + condition_rows] = torch.arange(
+        packing.text_rows,
+        packing.text_rows + condition_rows,
+        dtype=torch.int64,
+    )
+    clock = float(num_text_tokens)
+    keyframes = []
+    for segment in segments:
+        audio = slice(cursor, cursor + segment.audio_rows)
+        visual = slice(audio.stop, audio.stop + segment.video_rows)
+        cursor = visual.stop
+        tags[audio], groups[audio] = AUDIO_TAG, AUDIO_CONDITION_GROUP
+        tags[visual], groups[visual] = VIDEO_TAG, VISUAL_CONDITION_GROUP
+        if segment.kind == SegmentKind.KEYFRAME:
+            # Placed once the generated timeline's origin is known.
+            keyframes.append((segment, visual))
+        elif segment.kind == SegmentKind.IMAGE:
+            grid, _ = _frame_grid(
+                segment.latent_height, segment.latent_width, patch_size
+            )
+            positions[visual, 0] = clock
+            positions[visual, 1:] = grid
+            # An image takes one integer slot, not a latent frame's span.
+            clock += 1.0
+        elif segment.kind == SegmentKind.AUDIO:
+            _place_audio(
+                positions, audio, segment.audio_frames, clock, width_grid
+            )
+            clock += float(segment.audio_frames)
+        else:
+            grid, own_width = _frame_grid(
+                segment.latent_height, segment.latent_width, patch_size
+            )
+            _place_audio(
+                positions, audio, segment.audio_frames, clock, own_width
+            )
+            _place_frames(positions, visual, segment.latent_frames, clock, grid)
+            clock += max(
+                float(segment.audio_frames), _video_span(segment.latent_frames)
+            )
+    for segment, visual in keyframes:
+        positions[visual, 0] = (
+            clock
+            if segment.anchor == ConditionRole.FIRST_FRAME
+            else clock + _keyframe_span(frames) - ROPE_FRAME_RESCALE
+        )
+        positions[visual, 1:] = spatial
+
+    _place_frames(
+        positions, slice(0, packing.video_rows), frames, clock, spatial
+    )
+    audio = slice(packing.video_rows, packing.prefix_start)
+    _place_audio(positions, audio, audio_frames, clock, width_grid)
+    tags[audio], groups[audio] = AUDIO_TAG, AUDIO_GROUP
     return DenseTables(
         position_ids=positions,
         token_tags=tags,
         groups=groups,
         prefix_index=prefix_index,
-        used=packing.prefix_start + num_text_tokens,
+        used=cursor,
     )
 
 

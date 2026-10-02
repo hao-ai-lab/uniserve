@@ -200,9 +200,7 @@ def _generate(
             mesh = meshes["denoiser"]
             pipeline = mesh.get_group("pp" if "pp" in axes else ())
             tensor = mesh.get_group("tp" if "tp" in axes else ())
-            size = denoiser.make_size(
-                frames, len(token_ids), canvas=WIDE, condition_rows=0
-            )
+            size = denoiser.make_size(frames, len(token_ids), canvas=WIDE)
             # Calls evaluate the prompt's layout: its conditioning fills the
             # leading text rows, and its own tables are request state.
             layout = denoiser.layout_size(size)

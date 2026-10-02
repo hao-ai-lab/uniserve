@@ -37,7 +37,7 @@ from uniserve.diffusion import (
     uniform_grid,
 )
 from uniserve.media import image
-from uniserve.model import LatentInput, VideoDenoiser
+from uniserve.model import Condition, LatentInput, VideoDenoiser
 from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
 from uniserve.nn.attention import SequenceLengths, VisibleInput, vsa
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
@@ -58,6 +58,7 @@ from .packing import (
     DensePacking,
     TilePacking,
     audio_latent_frames,
+    condition_segments,
     dense_packing,
     dense_tables,
     latent_raster,
@@ -253,20 +254,46 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         num_text_tokens: int,
         *,
         canvas: image.Config,
-        condition_rows: int,
+        conditions: tuple[Condition, ...] = (),
+        vision_spans: tuple[tuple[int, int], ...] = (),
     ) -> DenoiserSize:
         """Build this network's size descriptor for one admitted request.
 
+        The condition rows are the packed rows of ``conditions``
+        (``packing.condition_segments``).
+
         Raises:
-            ValueError: A canvas the checkpoint does not generate, or an
-                invalid frame count, prompt length or condition count.
+            ValueError: A canvas the checkpoint does not generate, an invalid
+                frame count, prompt length or vision span, or conditions this
+                network does not take: keyframes without an ``fl2va`` or
+                ``ref2va`` task, references without ``ref2va``, or any
+                condition under sparse attention.
         """
         canvases = self.config.canvases
         if canvases is not None and canvas not in canvases:
             raise ValueError(
                 f"this H3 checkpoint generates only {canvases}, not {canvas}"
             )
-        return DenoiserSize(num_frames, canvas, num_text_tokens, condition_rows)
+        segments = condition_segments(tuple(conditions), canvas)
+        tasks = self.config.tasks
+        if segments and not self.dense:
+            raise ValueError("sparse H3 attention takes no conditions")
+        if any(segment.anchor is None for segment in segments) and (
+            "ref2va" not in tasks
+        ):
+            raise ValueError("this H3 denoiser takes no references")
+        if segments and not {"fl2va", "ref2va"} & set(tasks):
+            raise ValueError("this H3 denoiser takes no keyframes")
+        return DenoiserSize(
+            num_frames,
+            canvas,
+            num_text_tokens,
+            sum(
+                segment.video_rows + segment.audio_rows for segment in segments
+            ),
+            tuple(conditions),
+            tuple(vision_spans),
+        )
 
     def layout_size(self, size: DenoiserSize) -> DenoiserSize:
         """Return the smallest layout that holds ``size``.
@@ -320,6 +347,144 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         if not self.dense:
             return layout.num_text_tokens
         return layout.num_text_tokens + layout.condition_rows + 1
+
+    def condition_noise_shapes(
+        self, size: DenoiserSize
+    ) -> tuple[tuple[int, ...], ...]:
+        """Native draws of the visual conditions, in packed order.
+
+        Each is a ``[1, channels, frames, height, width]`` latent the
+        condition's anchoring mixes in (``encode_conditions``). Audio
+        references are conditioned at their posterior mean, so they draw
+        none.
+        """
+        return tuple(
+            (
+                1,
+                self.config.transformer.video_channels,
+                segment.latent_frames,
+                segment.latent_height,
+                segment.latent_width,
+            )
+            for segment in condition_segments(size.conditions, size.canvas)
+            if segment.video_rows
+        )
+
+    def condition_noise_capacity(self, layout: DenoiserSize) -> int:
+        """FP32 elements of the condition draws of any size ``layout`` holds.
+
+        A draw holds one element per channel of each latent pixel, as many
+        as its rows hold, so the condition capacity bounds them.
+        """
+        return (
+            layout.condition_rows * self.config.transformer.video_channels * 4
+        )
+
+    @torch.inference_mode()
+    def encode_conditions(
+        self,
+        size: DenoiserSize,
+        layout: DenoiserSize,
+        *,
+        latents: tuple[torch.Tensor, ...],
+        noise: tuple[torch.Tensor, ...],
+        out: torch.Tensor,
+    ) -> None:
+        """Project a request's conditions into its prefix source.
+
+        ``latents`` lists each condition's encoded latents in request order:
+        a visual condition's normalized ``[rows, channels * 4]`` FP32 patch
+        rows, then, for a condition with audio, its ``[2 * frames,
+        audio_channels]`` FP32 channel-major rows. ``noise`` holds the
+        ``condition_noise_shapes`` draws on the host. A visual condition is
+        anchored as ``t z + (1 - t) noise`` at ``t = VISUAL_CONDITION_TIME``
+        in FP32; an audio reference is its latent unchanged. Each is then
+        projected once by the layer that projects the generated rows of its
+        modality, and the BF16 rows fill ``out`` past the layout's text
+        capacity in packed order, where the request's prefix rows gather them
+        (``dense_tables``). A pipeline stage without the input projections
+        never reads the prefix source and writes nothing.
+
+        Raises:
+            ValueError: Inputs that do not match ``size`` or a retained
+                conditioning that does not match ``layout``.
+        """
+        segments = condition_segments(size.conditions, size.canvas)
+        visual_count = sum(1 for segment in segments if segment.video_rows)
+        expected = sum(
+            (condition.video is not None) + (condition.audio_samples > 0)
+            for condition in size.conditions
+        )
+        if (
+            not self.holds(layout, size)
+            or len(latents) != expected
+            or len(noise) != visual_count
+            or out.shape
+            != (self.text_condition_rows(layout), self.text_condition_width)
+        ):
+            raise ValueError(
+                "H3 condition encoding requires each condition's latents, its "
+                "draws and the retained conditioning of a layout that holds it"
+            )
+        if self.transformer.video_input is None:
+            return
+
+        # Each condition's visual and audio latents, in request order.
+        remaining = iter(latents)
+        encoded = [
+            (
+                next(remaining) if condition.video is not None else None,
+                next(remaining) if condition.audio_samples else None,
+            )
+            for condition in size.conditions
+        ]
+        draws = iter(noise)
+        level = torch.tensor(
+            VISUAL_CONDITION_TIME, dtype=torch.float32, device=out.device
+        )
+        row = layout.num_text_tokens
+        for segment in segments:
+            visual, audio = encoded[segment.condition]
+            if segment.audio_rows:
+                if audio is None or audio.shape != (
+                    segment.audio_rows,
+                    self.config.transformer.audio_channels,
+                ):
+                    raise ValueError("H3 audio condition rows do not match")
+                rows = audio.to(device=out.device, dtype=torch.float32)
+                out[row : row + segment.audio_rows].copy_(
+                    self.transformer.audio_input(
+                        rows, output_dtype=torch.float32
+                    ).to(out.dtype)
+                )
+                row += segment.audio_rows
+            if segment.video_rows:
+                draw = next(draws)
+                width = self.config.transformer.video_channels * 4
+                if (
+                    visual is None
+                    or visual.shape != (segment.video_rows, width)
+                    or tuple(draw.shape)
+                    != (
+                        1,
+                        self.config.transformer.video_channels,
+                        segment.latent_frames,
+                        segment.latent_height,
+                        segment.latent_width,
+                    )
+                ):
+                    raise ValueError("H3 visual condition rows do not match")
+                clean = visual.to(device=out.device, dtype=torch.float32)
+                draw = patchify_video(draw.to(device=out.device))[0]
+                # The reference's anchoring, op for op in FP32; mixing after
+                # patching is the same elementwise arithmetic.
+                anchored = level * clean + (1.0 - level) * draw
+                out[row : row + segment.video_rows].copy_(
+                    self.transformer.video_input(
+                        anchored, output_dtype=torch.float32
+                    ).to(out.dtype)
+                )
+                row += segment.video_rows
 
     def bind_inputs(
         self,
@@ -549,6 +714,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             num_frames=size.num_frames,
             canvas=size.canvas,
             num_text_tokens=size.num_text_tokens,
+            segments=condition_segments(size.conditions, size.canvas),
+            vision_spans=size.vision_spans,
         )
         interval = self._token_slice(packing.padded_tokens)
         cosine, sine = self.rotary(

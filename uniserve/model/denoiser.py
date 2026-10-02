@@ -2,6 +2,8 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Generic, Protocol, TypeVar
 
 import torch
@@ -9,7 +11,7 @@ from torch import nn
 
 from uniserve.diffusion import NoiseScale, Schedule, Solver
 from uniserve.distributed import DeviceMesh
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.nn.functional import patchify
 from uniserve.processing import BranchSource
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
@@ -20,8 +22,59 @@ InputT = TypeVar("InputT", bound=DenoiserInput)
 SizeT = TypeVar("SizeT")
 
 
+class ConditionRole(StrEnum):
+    """How a conditioning input relates to the generated video."""
+
+    # Anchors the first generated frame.
+    FIRST_FRAME = "first_frame"
+    # Anchors the last generated frame.
+    LAST_FRAME = "last_frame"
+    # Conditions the generation as a whole.
+    REFERENCE = "reference"
+
+
+@dataclass(frozen=True, slots=True)
+class Condition:
+    """One conditioning input of a video request, as its encoders see it.
+
+    Attributes:
+        role: Keyframe anchor or reference.
+        video: The encoded pixels' frame count and raster, as the video
+            encoder receives them; an image is one frame. None for audio
+            alone.
+        audio_samples: Samples of the encoded track at the model's audio
+            rate: an audio reference, or a video's soundtrack; 0 without one.
+    """
+
+    role: ConditionRole
+    video: video.Config | None
+    audio_samples: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.role, ConditionRole):
+            raise TypeError("a condition's role must be a ConditionRole")
+        if self.video is not None and not isinstance(self.video, video.Config):
+            raise TypeError("a condition's pixels must be a video.Config")
+        if type(self.audio_samples) is not int or self.audio_samples < 0:
+            raise ValueError("a condition's audio samples must be nonnegative")
+        if self.video is None and self.audio_samples == 0:
+            raise ValueError("a condition must carry pixels or audio")
+        if self.role != ConditionRole.REFERENCE and (
+            self.video is None
+            or self.video.num_frames != 1
+            or self.audio_samples
+        ):
+            raise ValueError("a keyframe is one encoded frame without audio")
+
+
 class VideoSize(Protocol):
-    """A video request's output timeline, raster and conditioning lengths."""
+    """A video request's output timeline, raster and conditioning lengths.
+
+    ``conditions`` lists the request's conditioning inputs in request order
+    and ``condition_rows`` the rows the network gives them;
+    ``vision_spans`` are the ``(start, stop)`` token ranges of the presented
+    prompt that hold vision tokens.
+    """
 
     @property
     def num_frames(self) -> int: ...
@@ -34,6 +87,12 @@ class VideoSize(Protocol):
 
     @property
     def condition_rows(self) -> int: ...
+
+    @property
+    def conditions(self) -> tuple[Condition, ...]: ...
+
+    @property
+    def vision_spans(self) -> tuple[tuple[int, int], ...]: ...
 
 
 VideoSizeT = TypeVar("VideoSizeT", bound=VideoSize)
@@ -229,10 +288,59 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         num_text_tokens: int,
         *,
         canvas: image.Config,
-        condition_rows: int,
+        conditions: tuple[Condition, ...] = (),
+        vision_spans: tuple[tuple[int, int], ...] = (),
     ) -> VideoSizeT:
-        """Build the size descriptor of one request."""
+        """Build the size descriptor of one request.
+
+        ``conditions`` are the request's conditioning inputs in request
+        order; ``vision_spans`` the presented prompt's vision-token ranges.
+        """
         raise NotImplementedError
+
+    def condition_noise_shapes(
+        self, size: VideoSizeT
+    ) -> tuple[tuple[int, ...], ...]:
+        """Native FP32 noise draws of a request's conditions, in order.
+
+        They precede the generated modalities' draws in the request's seeded
+        stream, each drawn as its own tensor. A network without noised
+        conditions draws none.
+        """
+        return ()
+
+    def condition_noise_capacity(self, layout: VideoSizeT) -> int:
+        """Bound the condition draws of every size ``layout`` holds.
+
+        Returns the FP32 elements that hold all of one request's
+        ``condition_noise_shapes`` draws.
+        """
+        return 0
+
+    def encode_conditions(
+        self,
+        size: VideoSizeT,
+        layout: VideoSizeT,
+        *,
+        latents: tuple[torch.Tensor, ...],
+        noise: tuple[torch.Tensor, ...],
+        out: torch.Tensor,
+    ) -> None:
+        """Write a request's encoded conditions into its retained rows.
+
+        ``latents`` are the condition latents in request order as the latent
+        encoders produced them; ``noise`` the draws of
+        ``condition_noise_shapes``; ``out`` the request's retained
+        conditioning (``text_condition_rows(layout)`` rows, the refined
+        prompt leading), into whose rows past the prompt capacity the network
+        writes.
+
+        Raises:
+            ValueError: The request has conditions this network does not
+                take, or inputs that do not match ``size``.
+        """
+        if size.conditions:
+            raise ValueError("this network takes no conditioning inputs")
 
     def state_buffers(self, size: VideoSizeT) -> Mapping[str, BufferConfig]:
         """Describe one request's state for the layout ``size`` occupies."""
