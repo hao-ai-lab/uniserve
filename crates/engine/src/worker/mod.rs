@@ -190,7 +190,7 @@ pub struct WorkerProcessArgs {
     pub expert_parallel: Option<ExpertParallelPlacement>,
 }
 
-/// How an expert-parallel world moves each token to its experts and back.
+/// How replicas access distributed experts: token exchange or weight prefetch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExpertExchange {
@@ -203,6 +203,10 @@ pub enum ExpertExchange {
     /// and combines in one launch per layer over NVSHMEM; NVFP4 experts only.
     #[serde(rename = "megamoe")]
     MegaMoe,
+    /// Independent data-parallel execution with asynchronous peer weight
+    /// prefetch into double buffers. Inference has no rank collectives.
+    #[serde(rename = "dwdp")]
+    Dwdp,
 }
 
 /// One single-rank replica's place in an expert-parallel world.

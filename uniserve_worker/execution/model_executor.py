@@ -301,6 +301,7 @@ class ModelExecutor:
         # ``configure_inputs`` builds; ``None`` without such layers. The
         # runners stepping through it are registered at capture.
         self.experts = None
+        self.expert_weights = None
         self._expert_runners: list[ModelRunner] = []
         # With graphs, a rank without a forward of its own joins each expert
         # step by replaying the captured join of the step's capacity
@@ -1137,6 +1138,14 @@ class ModelExecutor:
         self.table_widths = tuple(table_widths)
         config = self.worker_config
         self._initialize_streams(event_slots=max_inflight + 1)
+        if config.expert_exchange == "dwdp":
+            from uniserve.runtime.weight_prefetch import WeightPrefetch
+
+            if len(self._lane_streams) > 1:
+                raise ValueError(
+                    "DWDP weight buffers require one execution lane"
+                )
+            self.expert_weights = WeightPrefetch(self.model)
         self.experts = self._expert_exchange(input_config.max_tokens)
 
         # A decode or prefill row, and the request of every canvas a call
@@ -1333,6 +1342,7 @@ class ModelExecutor:
                             groups=call.groups,
                             derive_host_lengths=False,
                             experts=self.experts,
+                            weights=self.expert_weights,
                         )
                         # Text staging counts canonical tokens. Spatial codecs
                         # and vision towers expand those into different query
@@ -1434,6 +1444,8 @@ class ModelExecutor:
         from uniserve.nn.moe import FusedMoE
         from uniserve.runtime.expert_exchange import ExpertExchange
 
+        if self.expert_weights is not None:
+            return None
         layers = [
             module
             for module in self.model.modules()
@@ -1872,6 +1884,8 @@ class ModelExecutor:
             actions.append(self._diffusion.close)
         for entry in self.entries.values():
             actions.append(entry.close)
+        if self.expert_weights is not None:
+            actions.append(self.expert_weights.close)
 
         # Each stream retires the communicators every context on it shared,
         # then its native resources. Streams close in reverse creation order

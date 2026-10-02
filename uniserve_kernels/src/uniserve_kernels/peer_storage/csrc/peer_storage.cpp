@@ -182,6 +182,9 @@ struct PeerMapping {
   size_t total_bytes = 0;
   size_t segment_bytes = 0;
   size_t mapped_segments = 0;
+  // Composite mappings contain segments of unequal size. Ordinary peer
+  // mappings retain their uniform segment description above.
+  std::vector<std::pair<CUdeviceptr, size_t>> ranges;
   int device = 0;
   std::vector<CUmemGenericAllocationHandle> handles;
 
@@ -194,6 +197,9 @@ struct PeerMapping {
     for (size_t index = 0; index < mapped_segments; ++index) {
       cuMemUnmap(address + index * segment_bytes, segment_bytes);
     }
+    for (const auto& [start, length] : ranges) {
+      cuMemUnmap(start, length);
+    }
     if (address) {
       cuMemAddressFree(address, total_bytes);
     }
@@ -202,6 +208,57 @@ struct PeerMapping {
     }
   }
 };
+
+// Concatenate physical allocations in virtual space, without copying bytes.
+// Each input exposes one complete allocation, starting at its beginning.
+// Fabric handles do not support partial mappings. Retaining the CUDA handle
+// lets the result outlive the input tensor's original virtual mapping.
+torch::Tensor map_segments(const std::vector<torch::Tensor>& parts) {
+  TORCH_CHECK(!parts.empty(), "composite mapping needs at least one segment");
+  TORCH_CHECK(parts.front().is_cuda(), "composite mapping requires CUDA allocations");
+  const auto device = parts.front().get_device();
+  const c10::cuda::CUDAGuard guard(device);
+  const auto granularity = allocation_granularity(device);
+  auto mapping = std::make_shared<PeerMapping>();
+  mapping->device = device;
+  for (const auto& part : parts) {
+    const auto size = part.nbytes();
+    TORCH_CHECK(part.is_cuda() && part.get_device() == device &&
+                    part.scalar_type() == at::kByte && part.is_contiguous() &&
+                    size > 0 && size % granularity == 0 &&
+                    reinterpret_cast<uintptr_t>(part.data_ptr()) % granularity == 0,
+                "composite segments must be page-aligned CUDA byte spans on one device");
+    TORCH_CHECK(mapping->total_bytes <= std::numeric_limits<size_t>::max() - size,
+                "composite mapping size exceeds size_t");
+    mapping->total_bytes += size;
+    CUmemGenericAllocationHandle handle;
+    check_cuda(cuMemRetainAllocationHandle(&handle, part.data_ptr()),
+               "retain composite segment allocation");
+    mapping->handles.push_back(handle);
+  }
+  check_cuda(cuMemAddressReserve(&mapping->address, mapping->total_bytes, 0, 0, 0),
+             "reserve composite tensor address range");
+  auto address = mapping->address;
+  for (size_t index = 0; index < parts.size(); ++index) {
+    const auto length = parts[index].nbytes();
+    check_cuda(cuMemMap(address, length, 0, mapping->handles[index], 0),
+               "map composite tensor segment");
+    mapping->ranges.emplace_back(address, length);
+    address += length;
+  }
+  CUmemAccessDesc access{};
+  access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  access.location.id = device;
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  check_cuda(cuMemSetAccess(mapping->address, mapping->total_bytes, &access, 1),
+             "enable composite tensor access");
+  return at::for_blob(reinterpret_cast<void*>(mapping->address),
+                     {static_cast<int64_t>(mapping->total_bytes)})
+      .deleter([mapping](void*) {})
+      .options(parts.front().options())
+      .target_device(c10::Device(c10::kCUDA, device))
+      .make_tensor();
+}
 
 // One physical allocation of `shape` elements of the prototype's dtype on the
 // prototype's device. The constructor requires the byte size to be an exact
@@ -553,6 +610,7 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, binding) {
   binding.def("allocation_granularity", &allocation_granularity);
+  binding.def("map_segments", &map_segments);
   binding.def("exports_fabric_handles", &exports_fabric_handles);
   binding.def("export_handle", &export_handle);
   binding.def("import_handle", &import_handle);

@@ -149,8 +149,8 @@ curl -s http://127.0.0.1:8000/v1/systemone \
 | `--device` | `cuda` | Worker device |
 | `--worker-ranks` | `1` | Ranks, forming one tensor-parallel group, in each replica's default Worker instance when `--workers` is omitted |
 | `--data-parallel-size` | `1` | Independent model replicas, each with its own scheduler, KV cache and ranks; every request goes to the replica with the fewest requests in flight. With `--workers`, the file lists the replicas as equal consecutive blocks of Worker instances |
-| `--expert-parallel` | Off | Shard the routed experts of a mixture-of-experts model across the data-parallel replicas, one rank each: every replica keeps its share of each expert layer and exchanges tokens with the others over NVLink at every such layer, while attention and every other layer stay data-parallel |
-| `--expert-exchange` | `alltoall` | How expert-parallel replicas exchange tokens at every expert layer: `alltoall` runs FlashInfer's NVLink all-to-all around each GPU's grouped expert kernel; `megamoe` runs the fused MegaMoE kernel, which dispatches, computes and combines in one launch per layer over NVSHMEM and serves NVFP4 experts |
+| `--expert-parallel` | Off | Shard the routed experts across the data-parallel replicas, one rank each, using the selected expert exchange; attention and every other layer stay data-parallel |
+| `--expert-exchange` | `alltoall` | Access distributed experts through `alltoall` (FlashInfer NVLink token exchange), `megamoe` (fused NVFP4 dispatch, compute and combine over NVSHMEM), or `dwdp` (asynchronous NVLink weight prefetch into double buffers, with independent replica progress and CuTeDSL BF16/NVFP4 kernels) |
 | `--workers` | One `model` entry over every rank of each replica | Path to a JSON deployment configuration: Worker instances, node/device ranks, and the components placed on them |
 | `--max-model-len` | Model configuration | Context-length ceiling |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |

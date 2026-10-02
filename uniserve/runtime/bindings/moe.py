@@ -29,17 +29,38 @@ class MoEBinding:
     encoding, dense hidden states otherwise.
     """
 
-    def __init__(self, module, backend, size, device, allocate, exchange=None):
+    def __init__(
+        self,
+        module,
+        backend,
+        size,
+        device,
+        allocate,
+        exchange=None,
+        weights=None,
+    ):
         self.module, self.backend, self.device = module, backend, device
         self.allocate = allocate
         self.size = size
         self.operator = None
         self.provider = None
-        self.exchange = exchange if module.expert_group.size > 1 else None
-        if module.expert_group.size > 1 and exchange is None:
+        self.weights = (
+            weights
+            if weights is not None and weights.contains(module)
+            else None
+        )
+        self.exchange = (
+            exchange
+            if module.expert_group.size > 1 and self.weights is None
+            else None
+        )
+        if (
+            module.expert_group.size > 1
+            and exchange is None
+            and self.weights is None
+        ):
             raise ValueError(
-                "an expert-parallel call site needs the worker's expert "
-                "exchange"
+                "distributed experts require token exchange or weight prefetch"
             )
         # Unit route weights of an uncombined expert-parallel call, filled
         # once for the exchange's largest local token count.
@@ -156,7 +177,12 @@ class MoEBinding:
         exchange = self.exchange
         if exchange is None:
             operator = self.prepare(TextSize(hidden.shape[0], 1))
-            return operator(hidden, topk_ids, topk_weights, combine=combine)
+            if self.weights is not None:
+                self.weights.before(self.module)
+            output = operator(hidden, topk_ids, topk_weights, combine=combine)
+            if self.weights is not None:
+                self.weights.after(self.module)
+            return output
 
         operator = self.prepare(TextSize(hidden.shape[0], 1))
         if exchange.transport == "megamoe":

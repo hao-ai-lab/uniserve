@@ -194,7 +194,7 @@ class FusedMoE(nn.Module):
             result = operator(hidden, topk_ids, topk_weights, combine=combine)
         elif self.expert_group.size > 1:
             raise RuntimeError(
-                "expert-parallel experts exchange tokens through the operator "
+                "distributed experts require the weight access operator "
                 "an execution context binds"
             )
         elif hidden.device.type == "cpu":

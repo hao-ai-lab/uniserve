@@ -50,7 +50,11 @@ CHECKPOINTS = {
 }
 # One series per replica: requests each replica's scheduler admitted.
 # Each replica keeps every expert, or the replicas shard the experts.
-TOPOLOGIES = {"replicas": (), "experts": ("--expert-parallel",)}
+TOPOLOGIES = {
+    "replicas": (),
+    "experts": ("--expert-parallel",),
+    "dwdp": ("--expert-parallel", "--expert-exchange", "dwdp"),
+}
 ADMITTED = re.compile(
     r'^uniserve:num_requests_admitted_total\{[^}]*engine="(\d+)"[^}]*\} (\S+)$',
     re.MULTILINE,
@@ -218,7 +222,7 @@ def test_every_replica_answers_a_seeded_request(served):
         assert choice["message"]["content"].strip()
         assert choice["finish_reason"] in ("stop", "length")
         assert 0 < reply["usage"]["completion_tokens"] <= 256
-    if topology == "replicas":
+    if topology in {"replicas", "dwdp"}:
         first = replies[0]
         for reply in replies[1:]:
             assert reply["choices"] == first["choices"]

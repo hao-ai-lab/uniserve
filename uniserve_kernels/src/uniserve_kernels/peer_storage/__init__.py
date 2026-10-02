@@ -119,6 +119,19 @@ def exports_fabric_handles(device: int) -> bool:
     return _extension().exports_fabric_handles(device)
 
 
+def map_segments(parts: list[torch.Tensor]) -> torch.Tensor:
+    """Alias whole CUDA allocations back to back as one byte tensor.
+
+    Each part must be a contiguous uint8 span starting at the beginning of
+    a VMM physical allocation, with its complete physical byte length.
+    Fabric handles do not permit partial mappings. The result retains each
+    physical handle and owns its virtual mapping; no bytes move. Callers
+    retire every reader before dropping the result and synchronize writes
+    through aliased views.
+    """
+    return _extension().map_segments(parts)
+
+
 def export_handle(tensor: torch.Tensor) -> tuple[bytes, int, int] | None:
     """Export shared storage as a shareable handle, byte capacity and offset.
 

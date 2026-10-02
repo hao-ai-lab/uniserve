@@ -87,13 +87,15 @@ impl From<SchedulerPolicyArg> for SchedulingPolicy {
     }
 }
 
-/// Expert-parallel token exchange accepted by the command line.
+/// Distributed expert access accepted by the command line.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum ExpertExchangeArg {
     /// FlashInfer's NVLink all-to-all around each rank's grouped experts.
     Alltoall,
     /// The fused CuTeDSL MegaMoE kernel (NVFP4 experts).
     Megamoe,
+    /// Distributed weight data parallelism with asynchronous NVLink prefetch.
+    Dwdp,
 }
 
 impl From<ExpertExchangeArg> for uniserve_engine::ExpertExchange {
@@ -101,6 +103,7 @@ impl From<ExpertExchangeArg> for uniserve_engine::ExpertExchange {
         match value {
             ExpertExchangeArg::Alltoall => Self::AllToAll,
             ExpertExchangeArg::Megamoe => Self::MegaMoe,
+            ExpertExchangeArg::Dwdp => Self::Dwdp,
         }
     }
 }
@@ -189,13 +192,12 @@ pub(crate) struct SharedRuntimeArgs {
     pub data_parallel_size: usize,
     /// Shard the model's routed experts across the data-parallel replicas:
     /// each one-rank replica keeps its share of every expert layer and
-    /// exchanges tokens with the others there, while attention and every
-    /// other layer stay data-parallel.
+    /// uses the selected expert exchange, while attention and every other
+    /// layer stay data-parallel.
     #[arg(long = "expert-parallel", default_value_t = false)]
     pub expert_parallel: bool,
-    /// How expert-parallel replicas exchange tokens at every expert layer:
-    /// the NVLink all-to-all around each rank's grouped expert kernel, or
-    /// the fused MegaMoE kernel, which serves NVFP4 experts.
+    /// Access distributed experts through NVLink all-to-all, fused MegaMoE,
+    /// or DWDP's asynchronous weight prefetch with independent rank progress.
     #[arg(long = "expert-exchange", value_enum, default_value = "alltoall")]
     pub expert_exchange: ExpertExchangeArg,
     /// Path to a JSON deployment configuration: the Worker instances to serve,

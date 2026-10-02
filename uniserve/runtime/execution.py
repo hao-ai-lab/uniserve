@@ -173,6 +173,7 @@ class ExecutionContext(Generic[SizeT]):
         scratch: Scratch | None = None,
         derive_host_lengths: bool = True,
         experts=None,
+        weights=None,
     ):
         # Close releases the module; a closed context never executes again.
         self.module: nn.Module | None = module
@@ -188,6 +189,9 @@ class ExecutionContext(Generic[SizeT]):
         self._moe_backend = moe
         self._derive_host_lengths = derive_host_lengths
         self.experts = experts
+        # Borrowed immutable expert storage and local prefetch scheduling.
+        # Its owner outlives every context and graph using these views.
+        self.weights = weights
 
         reference: torch.Tensor | None = next(
             (value for value in module.parameters() if not value.is_meta), None
@@ -557,6 +561,7 @@ class ExecutionContext(Generic[SizeT]):
                         device,
                         self._moe_workspace,
                         self.experts,
+                        self.weights,
                     )
                     self._moe[id(child)] = moe_binding
                     if isinstance(size, TextSize):
@@ -832,6 +837,8 @@ class ExecutionContext(Generic[SizeT]):
             _install(scope, _binding.moe, self._moe)
             _install(scope, _binding.attention_storage, self._exchange)
             _install(scope, _binding.linear_chunks, self._chunks)
+            if self.weights is not None:
+                scope.enter_context(self.weights.activate())
             yield
 
     def _release(self):

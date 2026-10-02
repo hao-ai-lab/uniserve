@@ -109,7 +109,9 @@ class CanvasRunner(ModelRunner):
         # expert exchange once per step at the step's agreed capacity; a
         # rank-local tail replays graphs per slot bucket. Experts are
         # partitioned at loading, before the runner is built.
-        self.local_tail = not tail_exchanges(self.model)
+        self.local_tail = self.context.experts is None or not tail_exchanges(
+            self.model
+        )
 
     @property
     def canvas_length(self) -> int:
