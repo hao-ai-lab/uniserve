@@ -119,7 +119,7 @@ class Dense(nn.Module):
             axis_dims=(self.head_dim,),
             rounding=self.rounding,
         )
-        attended = self.attention(q, k, v.contiguous(), inputs.visible)
+        attended = self.attention(q, k, v, inputs.visible)
         yield inputs.token_slice, self.output(attended.flatten(1))
 
     def forward(self, hidden, cos, sin, inputs, *, workspace):

@@ -148,7 +148,7 @@ class TokenRefiner(nn.Module):
             visible = VisibleInput(
                 counts,
                 counts,
-                lengths.unsqueeze(1).expand(documents, rows).contiguous(),
+                lengths.reshape(documents, 1),
                 None,
                 prefix_bounds=True,
                 fully_visible=False,

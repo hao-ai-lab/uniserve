@@ -798,9 +798,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 "cos": BufferConfig((rows, width), torch.float32),
                 "sin": BufferConfig((rows, width), torch.float32),
                 "modulation_indices": BufferConfig((rows,), torch.int64),
-                "visible_end": BufferConfig(
-                    (1, packing.padded_tokens), torch.int32
-                ),
+                # One endpoint that every query row shares.
+                "visible_end": BufferConfig((1, 1), torch.int32),
             }
         if self.regional:
             packing = self._region_packing(size)
@@ -865,9 +864,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             "sin": sine.flatten(1),
             # Row ``3 * group + tag`` of each step's modulation products.
             "modulation_indices": groups * 3 + tags,
-            "visible_end": torch.full(
-                (1, packing.padded_tokens), tables.used, dtype=torch.int32
-            ),
+            "visible_end": torch.full((1, 1), tables.used, dtype=torch.int32),
         }
 
     def _region_state(
