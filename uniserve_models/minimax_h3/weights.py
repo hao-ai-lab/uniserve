@@ -304,9 +304,9 @@ def _prepare_heads(model, schedule: PddGrid, reader):
     The checkpoint's ``proj_out`` and ``audio_proj_out`` stack one head per
     fine-grid interval, head-major. Block ``k`` of each modality fuses its
     heads ``[nodes[k], nodes[k + 1])`` with that modality's normalized
-    integration weights, accumulated in FP32 and rounded to the checkpoint
-    dtype, as the student was trained; the FP32 projection then consumes the
-    rounded head.
+    integration weights in FP32. The output projections are FP32 parameters,
+    as in the released DiTs and the reference inference, so the checkpoint's
+    heads widen to FP32 before fusing and the fused head keeps FP32.
     """
     for projection, source, shift in (
         (model.video_output, "proj_out", schedule.video_shift),
@@ -319,9 +319,11 @@ def _prepare_heads(model, schedule: PddGrid, reader):
             max_t=schedule.max_t,
             device="cpu",
         )
-        device = projection.weight.device
+        device, dtype = projection.weight.device, projection.weight.dtype
         weight, bias = (
-            reader.get(f"{source}.{field}").read().to(device)
+            reader.get(f"{source}.{field}")
+            .read()
+            .to(device=device, dtype=dtype)
             for field in ("weight", "bias")
         )
         for block in range(len(schedule.nodes) - 1):
