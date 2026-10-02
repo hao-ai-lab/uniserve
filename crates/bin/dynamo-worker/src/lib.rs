@@ -10,9 +10,10 @@
 //! The Dynamo frontend forwards each `/v1/videos` request to
 //! `RawEngine::generate`, nesting unknown client fields under `extra_args`.
 //! The worker serves FastH3 text-to-video-and-audio at its single 1344x768
-//! canvas: `prepare_request` maps the Dynamo request onto a `t2va` request
-//! of UniServe's video API and refuses any control FastH3 does not implement
-//! rather than ignoring it. The request then enters
+//! canvas and refuses at startup a deployment that serves any other task or
+//! canvas, such as a MiniMax-H3 base checkpoint: `prepare_request` maps the
+//! Dynamo request onto a `t2va` request of UniServe's video API and refuses
+//! any control FastH3 does not implement rather than ignoring it. The request then enters
 //! `ServingRuntime::generate_video`, the lifecycle the HTTP `/v1/videos`
 //! route uses, and a successful request yields one terminal response object
 //! carrying the single MP4 artifact.
@@ -268,9 +269,14 @@ impl DynamoFastH3Engine {
 
         // Use the same checkpoint-derived schedule as the HTTP serving path.
         // A request may confirm that schedule, but cannot override it.
-        if state.runtime().model().video_capabilities().is_null() {
+        let capabilities = state.runtime().model().video_capabilities();
+        if capabilities.is_null() {
             let _ = state.engine().shutdown().await;
             return Err(invalid_argument("checkpoint is not MiniMax H3"));
+        }
+        if let Err(message) = check_fasth3(&capabilities) {
+            let _ = state.engine().shutdown().await;
+            return Err(invalid_argument(message));
         }
         Ok(state)
     }
@@ -626,6 +632,20 @@ fn prepare_request(
     })
 }
 
+/// Checks that a deployment's video capabilities are FastH3's: `t2va` alone
+/// on the single 1344x768 canvas, the only request `prepare_request` builds.
+fn check_fasth3(capabilities: &Value) -> Result<(), String> {
+    let tasks = &capabilities["tasks"];
+    let canvases = &capabilities["canvas"]["canvases"];
+    if *tasks == json!(["t2va"]) && *canvases == json!([{"width": H3_WIDTH, "height": H3_HEIGHT}]) {
+        return Ok(());
+    }
+    Err(format!(
+        "the Dynamo worker serves FastH3 text-to-video at {H3_WIDTH}x{H3_HEIGHT} only; \
+         this deployment serves tasks {tasks} on canvases {canvases}"
+    ))
+}
+
 fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> {
     match value {
         Some(_) => Err(invalid_argument(format!(
@@ -723,6 +743,19 @@ mod tests {
             "response_format": "b64_json",
             "nvext": {"fps": 24, "num_frames": 124, "num_inference_steps": 4, "seed": 1000}
         })
+    }
+
+    fn capabilities(tasks: Value, canvases: Value) -> Value {
+        json!({"tasks": tasks, "canvas": {"canvases": canvases}})
+    }
+
+    #[test]
+    fn only_fasth3_deployments_are_served() {
+        let canvas = json!([{"width": 1344, "height": 768}]);
+        assert!(check_fasth3(&capabilities(json!(["t2va"]), canvas.clone())).is_ok());
+        // A base checkpoint serves every named canvas and more tasks.
+        assert!(check_fasth3(&capabilities(json!(["t2va", "fl2va"]), Value::Null)).is_err());
+        assert!(check_fasth3(&capabilities(json!(["ref2va"]), canvas)).is_err());
     }
 
     #[test]
