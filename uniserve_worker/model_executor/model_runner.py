@@ -129,6 +129,8 @@ class ModelRunner(Execution, ABC):
         self._startup_complete = False
         # Bound by execution when this capability reaches expert layers.
         self.expert_step = False
+        self.expert_order = 0
+        self.expert_joins = None
 
     @abstractmethod
     def batch_forward(
@@ -511,8 +513,25 @@ class ModelRunner(Execution, ABC):
         tokens = self.expert_tokens(batch)
         if selected is not None:
             tokens = max(tokens, self.graph_tokens(selected[0]))
-        with profile_range("uniserve.expert.agree"):
-            capacity = exchange.agree(tokens)
+        while True:
+            with profile_range("uniserve.expert.agree"):
+                capacity = exchange.agree(tokens, kind=self.expert_order)
+            if exchange.kind == self.expert_order:
+                break
+            # Keep this capability's staged input intact while a peer's
+            # different capability runs. The join uses only expert backing,
+            # never this runner's attention, sampling or input buffers.
+            with profile_range(
+                f"uniserve.expert.step tokens=0 capacity={capacity}"
+            ):
+                if self.expert_joins is not None:
+                    self.expert_joins.replay(capacity)
+                else:
+                    exchange.begin(capacity)
+                    try:
+                        self.context.join_expert_layers()
+                    finally:
+                        exchange.end()
         exchange.begin(capacity)
         try:
             # Query tokens describe this rank's input, before graph padding;

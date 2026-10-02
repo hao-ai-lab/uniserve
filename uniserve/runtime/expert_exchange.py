@@ -26,12 +26,14 @@ also agree on
 the order and the token capacity of every exchange, since ``MoeAlltoAll``
 pairs the ranks' calls by position and lays out its receive buffers by the
 capacity. Every forward that reaches expert layers is therefore one step:
-``agree`` gathers each rank's token count over the group's host backend and
-returns one transfer capacity every rank computes alike. All-to-all uses
+``agree`` gathers each rank's token count and capability ordinal over the
+group's host backend, selects a ready capability in cyclic order, and
+returns one transfer capacity every rank computes alike. Other capabilities
+retain their input and join the selected step with no tokens. All-to-all uses
 powers of two plus the configured maximum, independently of the local
-numerical graph shapes. MegaMoE always uses its maximum-sized symmetric
-staging, masking the rows after the local tokens. Ranks send only their
-local graph's tokens;
+numerical graph shapes. MegaMoE retains maximum-sized symmetric storage
+while dispatching and reducing only the local numerical extent. Ranks send
+only their local graph's tokens;
 ``begin`` opens the step, each
 expert layer exchanges at that capacity, and ``invoked`` records the layers
 the forward reached, so the execution context can join the layers it
@@ -129,7 +131,10 @@ class ExpertExchange:
             )
             + (max_tokens,)
         )
-        self._records = torch.zeros((group.size, 2), dtype=torch.int64)
+        self._records = torch.zeros((group.size, 3), dtype=torch.int64)
+        # Capabilities take turns among the ranks that currently have work.
+        # All ranks derive the same ordinal from the common runner catalog.
+        self.kind = -1
         # Whether the last agreement found every rank leaving the group.
         self.released = False
 
@@ -164,14 +169,19 @@ class ExpertExchange:
                 ),
             )
 
-    def agree(self, tokens: int, *, leaving: bool = False) -> int:
+    def agree(
+        self, tokens: int, *, kind: int = 0, leaving: bool = False
+    ) -> int:
         """Agree with the group on the next step's per-rank capacity.
 
         Every rank contributes the tokens its local graph or eager forward
         sends, or zero tokens when it has no forward, over
         the group's Gloo backend; every rank then computes the same result.
-        Returns zero when no rank has tokens, else the smallest capacity at
-        least the most tokens any rank sends. A rank shutting
+        Ready capability ordinals take turns in ascending cyclic order;
+        ``self.kind`` identifies the selected capability after agreement. A rank
+        with another capability joins with no tokens, then agrees again
+        with its still-pending input. Returns zero when no rank has tokens,
+        else the smallest capacity holding the selected senders. A rank shutting
         down agrees with ``leaving`` until ``released`` reports that every
         rank is leaving without tokens, so no rank stops agreeing while
         another still waits on it.
@@ -179,15 +189,18 @@ class ExpertExchange:
         Raises:
             RuntimeError: A rank sends more than the configured maximum.
         """
-        local = torch.tensor([[tokens, int(leaving)]])
+        local = torch.tensor([[tokens, int(leaving), kind]])
         dist.all_gather(
             list(self._records.split(1)), local, group=self.group._require()
         )
         records = self._records.tolist()
-        most = max(count for count, _ in records)
-        self.released = not most and all(left for _, left in records)
-        if not most:
+        ready = sorted({tag for count, _, tag in records if count})
+        self.released = not ready and all(left for _, left, _ in records)
+        if not ready:
             return 0
+
+        self.kind = next((tag for tag in ready if tag > self.kind), ready[0])
+        most = max(count for count, _, tag in records if tag == self.kind)
 
         capacity = next(
             (value for value in self.capacities if value >= most), None

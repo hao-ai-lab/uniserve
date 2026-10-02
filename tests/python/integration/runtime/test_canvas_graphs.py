@@ -383,6 +383,20 @@ def _expert_reads(rank, root, port):
                     else ForwardMode.PREFILL
                 )
                 observations.append(_values(_run(runner, manager, rows, kind)))
+                if rank == 0:
+                    observations.append(
+                        _values(
+                            _run(
+                                runner, manager, prompt[:2], ForwardMode.PREFILL
+                            )
+                        )
+                    )
+
+                # Independent callers can finish at different times. The
+                # completed rank serves its peer's remaining expert work
+                # until both release, as the worker service does on close.
+                while not runner.experts.released:
+                    runner.join_expert_step(leaving=True)
             results.append(observations)
 
         # The existing native BF16 graph/eager contract permits rounding

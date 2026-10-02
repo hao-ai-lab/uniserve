@@ -1511,6 +1511,7 @@ class ModelExecutor:
             ):
                 continue
             entry.expert_step = True
+            entry.expert_order = len(self._expert_runners)
             self._expert_runners.append(entry)
 
         # Warmup executes collectives too. Equal transfer catalogs alone do
@@ -1699,6 +1700,8 @@ class ModelExecutor:
             exchange.capacities,
             pools=runner.pools,
         )
+        for entry in self._expert_runners:
+            entry.expert_joins = self._expert_joins
 
     def complete_startup(self):
         """Seal startup: check captured-graph storage budgets and stream grants.
