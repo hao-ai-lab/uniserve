@@ -76,7 +76,9 @@ from uniserve_worker.storage.tensor_store import (
 # further batches of ``max_batch_calls`` calls.
 _DEVICE_PRODUCTS_PER_CALL = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
-# Upper bound on ``ArenaCapacity.transfer_tickets``.
+# Upper bound on the reads ``ArenaCapacity.transfer_tickets`` lets a rank
+# keep in flight for its queued calls; see ``request_tensor_arena_capacity``
+# for the floor a request-tensor rank keeps above it.
 _MAX_TRANSFER_ENTRIES = 256
 # A token worker's host-lane bound; request-tensor workers derive theirs.
 _HOST_LANE_INFLIGHT = 256
@@ -637,7 +639,16 @@ def request_tensor_arena_capacity(
             + relay_bytes
         ),
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
-        transfer_tickets=max(1, min(slots, _MAX_TRANSFER_ENTRIES)),
+        # Read tickets bound the reads in flight: a ticket returns when its
+        # read retires, and a batch whose imports need more than are free
+        # waits for returns (``Executor.advance_inputs``). One product's reads
+        # start together, and a product is written by at most every rank of
+        # the group producing it, so the rank keeps at least its own group's
+        # world size: the products it reads in several regions come from its
+        # own group's sequence-parallel or distributed components.
+        transfer_tickets=max(
+            int(worker_config.world_size), min(slots, _MAX_TRANSFER_ENTRIES)
+        ),
         host_lane_inflight=state_slots * (unresolved_window + 1),
     )
 

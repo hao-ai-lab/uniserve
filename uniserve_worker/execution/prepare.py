@@ -42,6 +42,7 @@ import torch
 from uniserve.media import image as media_image
 from uniserve_worker.errors import (
     invalid_descriptor,
+    resource_error,
     unsupported_call,
     unsupported_setup,
 )
@@ -84,6 +85,7 @@ from uniserve_worker.storage.tensor_store import (
     ImageMetadata,
     TensorRead,
 )
+from uniserve_worker.transport.pool import ReadBackpressureError
 
 if TYPE_CHECKING:
     from uniserve_worker.config.execution.execution import WorkerConfig
@@ -285,12 +287,19 @@ def prepare_inputs(
 ) -> None:
     """Reserve transfer destinations, start their fetches, and stage predicates.
 
-    The executor calls this once per batch after `prepare_batch`; when the
-    batch has transferred inputs, the executor first waits for the batch's
-    storage dependencies. Each cross-call input descriptor is validated
-    against its declared product before a destination is reserved; on
-    failure, every input reserved so far is released before the error
-    propagates.
+    The executor calls this after `prepare_batch`; when the batch has
+    transferred inputs, the executor first waits for the batch's storage
+    dependencies. Each cross-call input descriptor is validated against its
+    declared product before a destination is reserved; on failure, every
+    input reserved so far is released before the error propagates.
+
+    A product import starts all of its reads or none, and too few free read
+    tickets refuse it (`ReadBackpressureError`): the imports already started
+    keep their destinations and reads, `state.inputs_started` counts the
+    handled entries, and the error propagates. Read tickets return as reads
+    retire whatever the batch does, so the executor calls again once one
+    returns and preparation resumes at the refused import. A KV installation
+    is not resumed part way, so a refused one fails the batch.
 
     Inputs read in place are recorded in `state.borrowed_inputs` instead of
     imported: a video encode's input held in a shared-memory segment on this
@@ -338,8 +347,13 @@ def prepare_inputs(
         )
     }
     state.borrowed_inputs.update(borrowed)
+    # Only a refused product import leaves the batch resumable.
+    resumable = True
     try:
-        for entry in entries:
+        for index in range(state.inputs_started, len(entries)):
+            entry = entries[index]
+            # Every entry before this one has started its reads.
+            state.inputs_started = index
             assert transports
             if entry.product.buffer_id in borrowed:
                 continue
@@ -606,19 +620,28 @@ def prepare_inputs(
                 state.latent_imports[entry.product.buffer_id] = binding
                 from uniserve_worker.transport.fetch import fetch_tensor
 
-                fetch_tensor(
-                    value.tensor,
-                    binding.spans,
-                    bindings={
-                        (location.source, location.backend): transports[
-                            location.backend
-                        ]
-                        for location in value.tensor.locations
-                        if location.backend in transports
-                    },
-                    retain=partial(pool.retain_transfer, binding),
-                )
+                try:
+                    fetch_tensor(
+                        value.tensor,
+                        binding.spans,
+                        bindings={
+                            (location.source, location.backend): transports[
+                                location.backend
+                            ]
+                            for location in value.tensor.locations
+                            if location.backend in transports
+                        },
+                        retain=partial(pool.retain_transfer, binding),
+                    )
+                except ReadBackpressureError:
+                    # No read started; the resumed import reserves its pages
+                    # again.
+                    del state.latent_imports[entry.product.buffer_id]
+                    pool.abandon_import(binding)
+                    raise
 
+        state.inputs_started = len(entries)
+        resumable = False
         for kv_transfer in kv_entries:
             consumers = tuple(
                 call
@@ -709,12 +732,18 @@ def prepare_inputs(
             model_runner=model_runner,
         )
     except BaseException as error:
+        if resumable and isinstance(error, ReadBackpressureError):
+            # The refused import started nothing; the earlier ones keep their
+            # reads for the call that resumes here.
+            raise
         # Release every input reserved above; a cleanup failure annotates the
         # original error rather than masking it.
         try:
             state.close_inputs(tensor_store, latent_pool, kv_cache)
         except BaseException as cleanup_error:
             error.add_note(f"batch input cleanup failed: {cleanup_error!r}")
+        if isinstance(error, ReadBackpressureError):
+            raise resource_error(error.message) from error
         raise
 
 
