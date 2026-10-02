@@ -9,6 +9,7 @@ the request body without a task is refused.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -120,3 +121,18 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
             assert media.audio_sample_rate == 32_000
             assert abs(media.audio_duration_s - 124 / 24) <= 1 / 24
             assert media.video_variance > 0 and media.audio_rms > 0, ratio
+
+            # The server reports each generation phase it observed, from
+            # scheduling to completion; the phases tile the inference time.
+            stages = json.loads(response.headers["x-stage-durations"])
+            assert set(stages) == {
+                "encoding",
+                "preparing",
+                "denoising",
+                "decoding",
+                "finalizing",
+            }, ratio
+            assert min(stages.values()) >= 0
+            assert stages["denoising"] > stages["decoding"] > 0
+            inference = float(response.headers["x-inference-time-s"])
+            assert abs(sum(stages.values()) - inference) <= 0.01, ratio

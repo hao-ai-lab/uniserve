@@ -22,7 +22,9 @@
 //! publication. Responses and retained jobs hold that mapping by `Arc`, and
 //! `media_body` streams from it without gathering the video into one buffer.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::openai::VideoGenerationRequest;
 use crate::openai::serve_error_to_api;
@@ -37,7 +39,7 @@ use futures::StreamExt as _;
 use uniserve_core::SharedMedia;
 
 use crate::AppState;
-use crate::video_jobs::JobSlot;
+use crate::video_jobs::{GenerationTiming, JobSlot};
 
 use crate::http::middleware::RequestId;
 use crate::openai::ApiError;
@@ -81,11 +83,15 @@ pub(crate) async fn videos_sync(
     // event, including `Cancelled` and `Aborted`, is answered as an
     // incompatible runtime event.
     let mut artifact = None;
+    let mut clock = StageClock::default();
     loop {
         let event = match stream.next().await.transpose() {
             Ok(event) => event,
             Err(error) => return serve_error_to_api(error).into_response(),
         };
+        if let Some(event) = &event {
+            clock.observe(event);
+        }
         match event {
             Some(RequestOutput::Artifact(value)) => artifact = Some(value),
             Some(RequestOutput::Finished {
@@ -135,19 +141,29 @@ pub(crate) async fn videos_sync(
     });
 
     let generation_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, &artifact.content_type)
         .header(header::CONTENT_LENGTH, length)
         .header(
             "server-timing",
             format!("generation;dur={generation_ms:.1}"),
-        )
-        .body(media_body(media))
-        .unwrap_or_else(|error| {
-            ApiError::server_error(format!("failed to construct media response: {error}"))
-                .into_response()
-        })
+        );
+    if let Some(timing) = clock.finish() {
+        response = response
+            .header(
+                "x-inference-time-s",
+                format!("{:.3}", timing.inference_time_s),
+            )
+            .header(
+                "x-stage-durations",
+                serde_json::to_string(&timing.stage_durations).unwrap_or_default(),
+            );
+    }
+    response.body(media_body(media)).unwrap_or_else(|error| {
+        ApiError::server_error(format!("failed to construct media response: {error}"))
+            .into_response()
+    })
 }
 
 /// Video request extractor accepting `application/json` or
@@ -360,6 +376,8 @@ pub(crate) async fn videos_create(
         phase: "queued".to_owned(),
         completed_steps: 0,
         total_steps: sampling.num_inference_steps,
+        inference_time_s: None,
+        stage_durations: None,
         error: None,
     };
     let cancellation = match state.videos.insert(record.clone(), slot) {
@@ -374,6 +392,7 @@ pub(crate) async fn videos_create(
     // deleted job holds it until the task ends, and `AppState::shutdown` waits
     // for the task.
     tokio::spawn(async move {
+        let mut clock = StageClock::default();
         let result = async {
             let mut artifact = None;
             let mut cancelled = false;
@@ -393,6 +412,9 @@ pub(crate) async fn videos_create(
                     }
                 };
                 let event = event.transpose().map_err(|error| VideoFailure { code: "generation_failed", message: error.to_string() })?;
+                if let Some(event) = &event {
+                    clock.observe(event);
+                }
                 match event {
                     // Scheduling is reported as the `encoding` phase; later
                     // phases arrive as `MediaProgress`.
@@ -457,10 +479,59 @@ pub(crate) async fn videos_create(
         // `finish` fails a successful result whose bytes do not fit the
         // remaining retained-byte budget, and discards the result if the
         // record was deleted.
-        state.videos.finish(&id, result);
+        state.videos.finish(&id, result, clock.finish());
     });
 
     (StatusCode::OK, axum::Json(record)).into_response()
+}
+
+/// Times one generation's phases from its runtime events.
+///
+/// Scheduling starts the `encoding` phase; each `MediaProgress` report whose
+/// phase differs from the current one starts that phase. `finish` closes the
+/// current phase and yields `GenerationTiming`, or `None` when the request
+/// was never scheduled.
+#[derive(Default)]
+struct StageClock {
+    scheduled: Option<Instant>,
+    phases: Vec<(String, Instant)>,
+}
+
+impl StageClock {
+    fn observe(&mut self, event: &RequestOutput) {
+        let now = Instant::now();
+        match event {
+            RequestOutput::Scheduled { .. } if self.scheduled.is_none() => {
+                self.scheduled = Some(now);
+                self.phases.push(("encoding".to_owned(), now));
+            }
+            RequestOutput::MediaProgress { phase, .. }
+                if self.scheduled.is_some()
+                    && self
+                        .phases
+                        .last()
+                        .is_some_and(|(current, _)| current != phase) =>
+            {
+                self.phases.push((phase.clone(), now));
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(&self) -> Option<GenerationTiming> {
+        let scheduled = self.scheduled?;
+        let end = Instant::now();
+        let mut stage_durations = BTreeMap::new();
+        for (index, (phase, start)) in self.phases.iter().enumerate() {
+            let stop = self.phases.get(index + 1).map_or(end, |(_, next)| *next);
+            *stage_durations.entry(phase.clone()).or_insert(0.0) +=
+                stop.duration_since(*start).as_secs_f64();
+        }
+        Some(GenerationTiming {
+            inference_time_s: end.duration_since(scheduled).as_secs_f64(),
+            stage_durations,
+        })
+    }
 }
 
 /// Builds the `429 Too Many Requests` response for a job-store refusal.
