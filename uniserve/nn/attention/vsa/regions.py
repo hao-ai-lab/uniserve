@@ -91,8 +91,9 @@ class RegionAttention(nn.Module):
 
     The inputs cover the complete packed sequence for this rank's heads, as
     a head-parallel projection of the gathered sequence produces them. Under
-    Ulysses (``exchange``, bound by ``parallelize_``), the attended rows are
-    exchanged back to the token shard each rank owns with every head.
+    Ulysses, the attended rows are exchanged back to the token shard each
+    rank owns with every head; ``parallelize_`` binds ``exchange`` and
+    declares its group in ``communication_groups``.
     """
 
     # Recorded by parallelize_ once the layer is bound to its partition.
@@ -103,11 +104,6 @@ class RegionAttention(nn.Module):
         super().__init__()
         self.attention = attention
         self.exchange = HeadExchange(Communicator())
-
-    @property
-    def communication_groups(self) -> tuple[Communicator, ...]:
-        """The Ulysses group the attended rows return over."""
-        return (self.exchange.group,)
 
     @torch.inference_mode()
     def forward(
