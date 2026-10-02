@@ -2,7 +2,17 @@
 
 from .guidance import AdditiveGuidance, Branch, Guidance, NestedGuidance, Renorm
 from .noise import NoiseScale, normal_noise
-from .schedule import Schedule, make_schedule
+from .schedule import (
+    BlockGrid,
+    Schedule,
+    block_grid,
+    fixed_point_increments,
+    fixed_point_shift,
+    fuse_heads,
+    ladder,
+    make_schedule,
+    uniform_grid,
+)
 from .solver import (
     CleanSampleEulerSolver,
     EulerSolver,
@@ -22,8 +32,15 @@ __all__ = [
     "advance_",
     "NoiseScale",
     "normal_noise",
+    "BlockGrid",
     "Schedule",
+    "block_grid",
+    "fixed_point_increments",
+    "fixed_point_shift",
+    "fuse_heads",
+    "ladder",
     "make_schedule",
+    "uniform_grid",
     "CleanSampleEulerSolver",
     "EulerSolver",
     "Solver",
