@@ -32,7 +32,7 @@ use anyhow::Context;
 use uniserve_core::CommandWaker;
 use uniserve_worker_ipc::{
     BatchCommand, BufferAllocation, BufferId, Call, KvTransfer, NewRequest, RequestKey,
-    TensorPublication,
+    TensorPublication, TensorRef,
 };
 
 /// One worker's outstanding submission; returned calls leave this record.
@@ -147,6 +147,12 @@ enum Dispatch {
 struct BufferRoute {
     worker_index: usize,
     component: String,
+    /// The buffer is one of its producing call's declared `outputs`, which
+    /// a component publishes from its output ranks
+    /// (`ComponentConfig::publishes_on_every_rank`). Every member rank
+    /// holds its own copy of the call's other results: its device scalars,
+    /// encoder features, image, latents and KV.
+    declared_output: bool,
 }
 
 /// Dispatch targeted calls and track their independently completed results.
@@ -892,9 +898,10 @@ impl WorkerExecutor {
     /// layouts, including when both components belong to this WorkerGroup.
     ///
     /// The caller has established that both run on the producer's worker.
-    /// Returns true for the producing component itself, or for two components
-    /// on the same single rank; false otherwise, including when either
-    /// component is not loaded on the worker.
+    /// Returns true for the producing component itself when each of its ranks
+    /// holds its own copy of the buffer, or for two components on the same
+    /// single rank; false otherwise, including when either component of a
+    /// pair is not loaded on the worker.
     fn shares_product_storage(&self, producer: &BufferRoute, consumer_entry: &str) -> bool {
         let entries = &self.workers[producer.worker_index].1.info().components;
         let source = entries
@@ -903,13 +910,17 @@ impl WorkerExecutor {
         let destination = entries.iter().find(|entry| entry.name == consumer_entry);
         if producer.component == consumer_entry {
             // A consumer call on the component that produced the product runs on
-            // the same ranks. Each rank reads the copy it wrote when every rank
-            // writes one: a distributed component's round deals the same media
-            // units in the same order to the same ranks, and a sequence-parallel
-            // rank writes its own shard. A tensor-parallel or pipelined component
-            // publishes from its output ranks alone, so its other ranks read the
-            // product's publication.
-            return source.is_some_and(|source| source.config.publishes_on_every_rank());
+            // the same ranks, and each rank reads the copy it holds when every
+            // rank holds one. Every rank holds a call's own results beside its
+            // declared outputs. A declared output is written by every rank of a
+            // distributed component, whose round deals the same media units in
+            // the same order to the same ranks, and of a sequence-parallel one,
+            // whose ranks each write their shard; a tensor-parallel or pipelined
+            // component publishes it from its output ranks alone, so its other
+            // ranks read the product's publication. Without a description of
+            // the component, its ranks are taken to hold their own copies.
+            return !producer.declared_output
+                || source.is_none_or(|source| source.config.publishes_on_every_rank());
         }
         source
             .zip(destination)
@@ -1579,10 +1590,16 @@ impl Executor for WorkerExecutor {
                     "call targets unloaded component {}",
                     call.component
                 );
+                let declared = call
+                    .outputs
+                    .iter()
+                    .map(TensorRef::buffer_id)
+                    .collect::<HashSet<_>>();
                 for output in call.output_buffers() {
                     let route = BufferRoute {
                         worker_index: call_worker,
                         component: call.component.clone(),
+                        declared_output: declared.contains(&output),
                     };
                     if let Some(existing) = self.buffer_routes.get(&output) {
                         anyhow::ensure!(
