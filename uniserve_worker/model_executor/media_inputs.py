@@ -116,6 +116,12 @@ class MediaBuilder:
     admitted size needs a layout of its own. What distinguishes the request
     within its layout is state the builder stages with its samples.
 
+    A request with conditions evaluates instead in a layout of its own: the
+    smallest text capacity with the request's own condition region, which
+    its runner prepares on first use and steps without a graph.
+    ``maximum_layout`` bounds every such layout: the largest text-only
+    layout widened to the worker's condition capacity.
+
     The samples a solver step rewrites live in the worker's latent pool (see
     ``sample_pages``); the request's slot holds only state written once: the
     denoiser's tables, the retained conditioning and the host staging.
@@ -129,6 +135,7 @@ class MediaBuilder:
         max_text_tokens: int,
         min_frames: int = 1,
         text_capacities: tuple[int, ...] = (),
+        condition_rows: int = 0,
     ) -> None:
         """Bound admitted sizes and fix the capacity layouts.
 
@@ -137,11 +144,18 @@ class MediaBuilder:
         capacities are prompt token counts; the largest must hold
         ``max_text_tokens``, and without any they are ``TEXT_CAPACITY_FIRST``
         and then steps of ``TEXT_CAPACITY_STEP`` up to it.
+        ``condition_rows`` is the packed condition rows a request may bring,
+        zero for a worker that serves no conditions.
 
         Raises:
-            ValueError: No frame count is admitted, or a text capacity is
-                not positive or none holds ``max_text_tokens``.
+            ValueError: No frame count is admitted, a text capacity is not
+                positive or none holds ``max_text_tokens``, or the condition
+                capacity is negative or exceeds what the denoiser takes
+                (``VideoDenoiser.condition_layout``).
         """
+        if type(condition_rows) is not int or condition_rows < 0:
+            raise ValueError("media input condition capacity is negative")
+        self.condition_rows = condition_rows
         # Admission advertises complete native windows, including the final
         # overlap. Cover the configured duration with the next legal input.
         frames = denoiser.legal_frame_count(max_frames)
@@ -198,8 +212,16 @@ class MediaBuilder:
         )
         # State descriptions per layout. Describing one builds the layout's
         # packing on the host, so each is cached; layouts are the bounded set
-        # ``layouts`` lists.
+        # ``layouts`` lists and the conditioned layouts requests evaluate in.
         self._states: dict[object, Mapping[str, BufferConfig]] = {}
+
+        # The layout that bounds every layout the worker evaluates.
+        maximum = denoiser.layout_size(self.maximum)
+        self.maximum_layout = (
+            denoiser.condition_layout(maximum, condition_rows)
+            if condition_rows
+            else maximum
+        )
 
     def _size(
         self,
@@ -248,10 +270,11 @@ class MediaBuilder:
             size.num_frames not in self.frame_counts
             or size.canvas not in self.canvases
             or size.num_text_tokens > self.max_text_tokens
+            or size.condition_rows > self.condition_rows
         ):
             raise ValueError(
-                "media input exceeds the worker frame, canvas or "
-                "conditioning capacity"
+                "media input exceeds the worker frame, canvas, conditioning "
+                "or condition capacity"
             )
         return size
 
@@ -271,12 +294,15 @@ class MediaBuilder:
         """Return the capacity layout a request of ``size`` evaluates in.
 
         It is the smallest text capacity at the request's frame count that
-        holds the request (``Denoiser.holds``). Requests of one layout share
-        its prepared constants and captured graphs.
+        holds the request (``Denoiser.holds``), with the condition region
+        the request's own conditions take. Text-only requests evaluate in
+        one of ``layouts`` and share its prepared constants and captured
+        graphs; a request with conditions evaluates in a layout of its own,
+        which its runner prepares on first use.
 
         Raises:
-            ValueError: ``size`` is not an admitted frame count, or no
-                capacity holds it.
+            ValueError: ``size`` is not an admitted frame count or canvas,
+                or no capacity holds it.
         """
         if (
             size.num_frames not in self.frame_counts
@@ -285,19 +311,25 @@ class MediaBuilder:
             raise ValueError("media input has no admitted capacity layout")
         for capacity in self.text_capacities:
             layout = self.denoiser.layout_size(
-                self._size(size.num_frames, capacity, size.canvas)
+                self._size(
+                    size.num_frames,
+                    capacity,
+                    size.canvas,
+                    conditions=size.conditions,
+                )
             )
             if self.denoiser.holds(layout, size):
                 return layout
         raise ValueError("media input has no admitted capacity layout")
 
     def layouts(self) -> tuple:
-        """List every capacity layout, the largest first.
+        """List every text-only capacity layout, the largest first.
 
-        The first is the maximum: it bounds every other layout's row-shaped
-        workspace dimension by dimension. Layouts follow canvases in
-        decreasing generated rows, then frame counts and text capacities in
-        decreasing order.
+        These are the layouts startup prepares and captures. The first is
+        the largest; ``maximum_layout`` bounds it and every other layout's
+        row-shaped workspace dimension by dimension. Layouts follow canvases
+        in decreasing generated rows, then frame counts and text capacities
+        in decreasing order.
         """
         canvases = sorted(
             self.canvases,
@@ -318,25 +350,34 @@ class MediaBuilder:
         )
 
     def _state(self, size) -> Mapping[str, BufferConfig]:
-        layout = self.layout(size)
+        return self._layout_state(self.layout(size))
+
+    def _layout_state(self, layout) -> Mapping[str, BufferConfig]:
         state = self._states.get(layout)
         if state is None:
             state = self._states[layout] = self.denoiser.state_buffers(layout)
         return state
 
     def _largest(self) -> tuple:
-        """The largest layout of every admitted canvas.
+        """The largest layout of every prepared canvas.
 
-        Storage grows with frames and text, so these layouts bound every
-        admitted layout of their canvas.
+        Storage grows with frames, text and conditions, so these layouts,
+        widened to the condition capacity, bound every admitted layout of
+        their canvas.
         """
-        return tuple(
+        layouts = tuple(
             self.layout(
                 self._size(
                     self.maximum.num_frames, self.max_text_tokens, canvas
                 )
             )
             for canvas in self.canvases
+        )
+        if not self.condition_rows:
+            return layouts
+        return tuple(
+            self.denoiser.condition_layout(layout, self.condition_rows)
+            for layout in layouts
         )
 
     @cached_property
@@ -374,32 +415,38 @@ class MediaBuilder:
         return tuple(range(1 + (int(slot) - 1) * count, 1 + int(slot) * count))
 
     def _sample_offsets(self, size) -> tuple[dict[str, int], int]:
-        state = self._state(size)
+        return self._layout_offsets(self.layout(size))
+
+    def _layout_offsets(self, layout) -> tuple[dict[str, int], int]:
+        state = self._layout_state(layout)
         offsets, cursor = {}, 0
         for name in self.denoiser.modalities:
             offsets[name] = cursor
             cursor += _aligned(math.prod(state[name].shape))
         return offsets, cursor
 
-    def layout_pages(self, size) -> int:
-        """Count the leading request pages that hold the samples of ``size``.
+    def layout_pages(self, layout) -> int:
+        """Count the leading request pages that hold ``layout``'s samples.
 
         A denoising step of the layout gathers and writes back only these.
         """
-        _, elements = self._sample_offsets(size)
+        _, elements = self._layout_offsets(layout)
         page_units = self.sample_pages.page_units
         return -(-elements // page_units)
 
     def sample_views(
-        self, size, flat: torch.Tensor
+        self, size, flat: torch.Tensor, *, layout=None
     ) -> Mapping[str, torch.Tensor]:
         """View each modality's local sample of ``size`` in gathered pages.
 
         ``flat`` holds a request's leading pages contiguously, in any shape.
+        ``layout`` is the layout the request evaluates in, ``layout(size)``
+        by default.
         """
+        layout = self.layout(size) if layout is None else layout
         flat = flat.view(-1)
-        state = self._state(size)
-        offsets, _ = self._sample_offsets(size)
+        state = self._layout_state(layout)
+        offsets, _ = self._layout_offsets(layout)
         return {
             name: flat[
                 offsets[name] : offsets[name] + math.prod(state[name].shape)
@@ -409,25 +456,34 @@ class MediaBuilder:
 
     def tables(self, size) -> tuple[str, ...]:
         """Name the state fields other than the samples, filled per request."""
+        return self._layout_tables(self.layout(size))
+
+    def _layout_tables(self, layout) -> tuple[str, ...]:
         return tuple(
             name
-            for name in self._state(size)
+            for name in self._layout_state(layout)
             if name not in self.denoiser.modalities
         )
 
     def buffers(self, size) -> Mapping[str, BufferConfig]:
         """Describe one request's slot storage, shaped by its layout.
 
+        See ``layout_buffers``.
+        """
+        return self.layout_buffers(self.layout(size))
+
+    def layout_buffers(self, layout) -> Mapping[str, BufferConfig]:
+        """Describe the slot storage of a request evaluating in ``layout``.
+
         The denoiser's device tables, the complete CPU draws (the
         conditions' in one flat ``condition_noise`` field holding every
         request of the layout), a CPU source for every state field to stage
         from, samples included, and the retained conditioning over the
-        layout's text rows, zero past the prompt. The device samples live in
-        the latent pool, not here.
+        layout's text and condition rows, zero past the prompt. The device
+        samples live in the latent pool, not here.
         """
-        layout = self.layout(size)
-        state = self._state(size)
-        result = {name: state[name] for name in self.tables(size)}
+        state = self._layout_state(layout)
+        result = {name: state[name] for name in self._layout_tables(layout)}
         for name in self.denoiser.modalities:
             result[f"{name}_noise"] = BufferConfig(
                 self.denoiser.noise_shape(name, layout),
@@ -453,15 +509,16 @@ class MediaBuilder:
     def capacity_buffers(self) -> Mapping[str, BufferConfig]:
         """Cover every shard produced by an admitted size.
 
-        The storage of every admitted canvas's largest layout, combined
-        dimension by dimension (``envelope``). A shorter prompt can move
+        The storage of every prepared canvas's largest layout, widened to
+        the condition capacity, combined dimension by dimension
+        (``envelope``). A shorter prompt can move
         additional media tokens onto a particular sequence rank, so each
         sample source is bounded by the modality's global extent rather than
         by the largest request's shard.
         """
         largest = self._largest()
         result = dict(
-            envelope(tuple(self.buffers(layout) for layout in largest))
+            envelope(tuple(self.layout_buffers(layout) for layout in largest))
         )
         for name in self.denoiser.modalities:
             capacity = tuple(
@@ -483,8 +540,9 @@ class MediaBuilder:
     ) -> tuple[torch.Tensor, ...]:
         """View a request's condition draws in its ``condition_noise`` field.
 
-        The draws of ``VideoDenoiser.condition_noise_shapes`` occupy the
-        field's leading elements one after another.
+        The draws of ``VideoDenoiser.condition_noise_shapes``, each leading
+        with the request's batch of one, occupy the field's leading elements
+        one after another.
         """
         flat, views, offset = tensors["condition_noise"], [], 0
         for shape in self.denoiser.condition_noise_shapes(size):
@@ -495,23 +553,28 @@ class MediaBuilder:
 
     @torch.inference_mode()
     def stage_request(
-        self, size, tensors: Mapping[str, torch.Tensor], *, seed: int
+        self,
+        size,
+        tensors: Mapping[str, torch.Tensor],
+        *,
+        seed: int,
+        layout=None,
     ) -> None:
         """Fill a request's host inputs that its admission determines.
 
         The seeded native draw and the request's own state tables depend only
         on the seed and the exact size, so they can be prepared on another
         thread before the request's latents are. The seed's stream draws the
-        conditions' noise first, then each generated modality's.
+        conditions' noise first, then each generated modality's. ``layout``
+        is the layout the request evaluates in, ``layout(size)`` by default.
         """
-        # The denoiser's numerical calls batch over leading size 1.
+        layout = self.layout(size) if layout is None else layout
+        # The denoiser's numerical calls batch over leading size 1, which a
+        # condition's native draw already leads with.
         normal_noise(
             (seed,),
             out=(
-                *(
-                    view.unsqueeze(0)
-                    for view in self.condition_noise(size, tensors)
-                ),
+                *self.condition_noise(size, tensors),
                 *(
                     tensors[f"{name}_noise"].unsqueeze(0)
                     for name in self.denoiser.modalities
@@ -520,8 +583,11 @@ class MediaBuilder:
         )
         self.denoiser.prepare_state(
             (size,),
-            layouts=(self.layout(size),),
-            out={name: tensors[f"{name}_source"] for name in self.tables(size)},
+            layouts=(layout,),
+            out={
+                name: tensors[f"{name}_source"]
+                for name in self._layout_tables(layout)
+            },
         )
 
     @torch.inference_mode()
@@ -533,20 +599,23 @@ class MediaBuilder:
         *,
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
+        layout=None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """Fill sample sources from the drawn noise.
 
         Returns destination/source pairs for staging: each modality's source
         into its device view in ``samples``, and every table's source into
-        the slot.
+        the slot. ``layout`` is the layout the request evaluates in,
+        ``layout(size)`` by default.
         """
+        layout = self.layout(size) if layout is None else layout
         names = self.denoiser.modalities
         noise = {name: tensors[f"{name}_noise"].unsqueeze(0) for name in names}
         source = {
             name: tensors[f"{name}_source"].unsqueeze(0) for name in names
         }
         self.denoiser.prepare_latents(
-            (self.layout(size),),
+            (layout,),
             noise=noise,
             state=source,
             constants=constants,
@@ -556,7 +625,7 @@ class MediaBuilder:
             *((samples[name], tensors[f"{name}_source"]) for name in names),
             *(
                 (tensors[name], tensors[f"{name}_source"])
-                for name in self.tables(size)
+                for name in self._layout_tables(layout)
             ),
         )
 
@@ -601,11 +670,14 @@ class MediaBuilder:
         samples: Mapping[str, torch.Tensor],
         schedules: Mapping[str, Schedule],
         index: int,
+        *,
+        layout=None,
     ):
         """Assemble one denoising step's typed input.
 
         The latents are the ``samples`` views a denoising step advances and
-        the text features are the slot's retained conditioning.
+        the text features are the slot's retained conditioning. ``layout``
+        is the layout the request evaluates in, ``layout(size)`` by default.
         """
         if not 0 <= index < self.num_steps:
             raise ValueError("denoising index is outside the fixed schedule")
@@ -622,7 +694,7 @@ class MediaBuilder:
                 )
                 for name in names
             },
-            sizes=(self.layout(size),),
+            sizes=(self.layout(size) if layout is None else layout,),
             step=schedules[names[0]].step(index),
             text_features=(tensors["text_condition"],),
         )

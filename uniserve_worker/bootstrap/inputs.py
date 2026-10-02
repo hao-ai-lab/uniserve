@@ -109,6 +109,18 @@ def executed_video_tasks(denoiser: VideoDenoiser) -> tuple[str, ...]:
     )
 
 
+def condition_capacity(denoiser: VideoDenoiser, config: WorkerConfig) -> int:
+    """Packed condition rows a worker provisions for one request.
+
+    Only a conditioned task carries conditions, so a deployment whose
+    denoiser executes none provisions none, whatever ``max_condition_rows``
+    grants.
+    """
+    if not set(executed_video_tasks(denoiser)) - {"t2va"}:
+        return 0
+    return config.max_condition_rows
+
+
 def media_builder(model: nn.Module, config: WorkerConfig):
     """Instantiate the video input builder within the worker's frame budget.
 
@@ -147,4 +159,5 @@ def media_builder(model: nn.Module, config: WorkerConfig):
         if config.min_video_seconds is None
         else round(config.min_video_seconds * output.frame_rate),
         text_capacities=config.video_text_capacities,
+        condition_rows=condition_capacity(denoiser, config),
     )

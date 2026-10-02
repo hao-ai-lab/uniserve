@@ -303,6 +303,9 @@ class ModelExecutor:
         self.diffusion_bank: Mapping[str, torch.Tensor] = {}
         self.latent_pool: LatentPool | None = None
         self._diffusion: DiffusionRunner | None = None
+        # Layouts the runner prepared while serving, least recently used
+        # first (``diffusion_layout``).
+        self._serving_layouts: OrderedDict[object, None] = OrderedDict()
 
         self.uses_lanes = False
         self._startup_complete = self._closed = False
@@ -983,7 +986,7 @@ class ModelExecutor:
             self._diffusion = DiffusionRunner.for_layouts(
                 name,
                 call,
-                builder.layouts()[0],
+                builder.maximum_layout,
                 device=binding.device,
                 stream=stream,
                 storage=self.graph_storage,
@@ -1002,18 +1005,49 @@ class ModelExecutor:
         return self._diffusion
 
     def prepare_layouts(self) -> tuple:
-        """Prepare every layout the media builder admits, largest first.
+        """Prepare the media builder's capacity layouts, largest first.
 
-        Collective across the denoiser's ranks, which prepare the same
-        layouts in the same order. Returns the layouts.
+        The runner first prepares ``maximum_layout``, which bounds every
+        layout's workspace, then every layout of ``layouts``. Collective
+        across the denoiser's ranks, which prepare the same layouts in the
+        same order. Returns ``layouts``, the layouts startup warms and
+        captures.
         """
         builder = cast("MediaBuilder", self.media_builder)
         runner = self.diffusion
         layouts = builder.layouts()
-        for layout in layouts:
+        for layout in (builder.maximum_layout, *layouts):
             runner.prepare(layout, pages=builder.layout_pages(layout))
         self.graph_storage.check()
         return layouts
+
+    def diffusion_layout(self, layout):
+        """Return a prepared layout, preparing it on first use.
+
+        A layout startup did not prepare, such as the own layout of a
+        request with conditions, is prepared while serving and its steps run
+        eagerly. At most ``max_request_pool_size`` such
+        layouts stay prepared; reaching the bound retires the least recently
+        used, which a later request prepares again. Collective across the
+        denoiser's ranks, which run a request's calls in the same order.
+
+        Raises:
+            ValueError: The layout's workspace does not fit
+                ``maximum_layout``'s, or its samples exceed the runner's.
+        """
+        builder = cast("MediaBuilder", self.media_builder)
+        runner, serving = self.diffusion, self._serving_layouts
+        if layout in serving:
+            serving.move_to_end(layout)
+            return runner.layout(layout)
+        if layout in runner.layouts:
+            return runner.layout(layout)
+        if len(serving) >= self.worker_config.max_request_pool_size:
+            retired, _ = serving.popitem(last=False)
+            runner.retire(retired)
+        entry = runner.prepare(layout, pages=builder.layout_pages(layout))
+        serving[layout] = None
+        return entry
 
     def run_denoising(self, ladder, index, bank):
         """Run one denoising step of a bound ladder and time it.

@@ -6,7 +6,8 @@ import pytest
 import torch
 
 from tests.python.fixtures.h3 import WIDE, base_config, fasth3_config
-from uniserve.media import image
+from uniserve.media import image, video
+from uniserve.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import Model
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
@@ -136,3 +137,72 @@ def test_every_named_canvas_has_layouts_that_fit_the_slot_storage():
             ), name
     with pytest.raises(ValueError):
         builder.size(124, 64, image.Config(512, 2016))
+
+
+def test_a_condition_capacity_bounds_each_conditioned_layout():
+    """Requests with conditions evaluate in their own bounded layouts.
+
+    A worker serving conditions sizes the slot storage and the layout its
+    runner prepares first by its condition capacity; each conditioned
+    request takes the smallest text capacity with its own condition tiles,
+    and text-only requests keep the prepared ladder.
+    """
+    with torch.device("meta"):
+        denoiser = Model(base_config()).denoiser
+    first = Condition(ConditionRole.FIRST_FRAME, video.Config(1, WIDE))
+    plain = MediaBuilder(
+        denoiser, max_frames=124, max_text_tokens=4096, min_frames=96
+    )
+    builder = MediaBuilder(
+        denoiser,
+        max_frames=124,
+        max_text_tokens=4096,
+        min_frames=96,
+        condition_rows=2048,
+    )
+    # Without conditions the largest layout bounds every other.
+    assert plain.maximum_layout == plain.layouts()[0]
+    assert builder.layouts() == plain.layouts()
+    assert builder.maximum_layout.condition_rows == 2048
+
+    # One 16:9 keyframe is 1008 rows, 16 whole tiles, beside 100 tokens in
+    # the 1024-token rung.
+    size = builder.size(124, 100, WIDE, conditions=(first,))
+    layout = builder.layout(size)
+    assert layout not in builder.layouts()
+    assert (layout.num_text_tokens, layout.condition_rows) == (1024, 1024)
+    assert denoiser.holds(layout, size)
+    assert builder.layout(builder.size(124, 100, WIDE)) in builder.layouts()
+
+    # The runner's maximum bounds the conditioned layout's workspace, the
+    # slot storage holds its buffers, and the retained conditioning holds
+    # the widened maximum's rows.
+    maximum = denoiser.workspace_buffers(builder.maximum_layout)
+    for name, config in denoiser.workspace_buffers(layout).items():
+        assert all(
+            extent <= bound
+            for extent, bound in zip(
+                config.shape, maximum[name].shape, strict=True
+            )
+        ), name
+    capacity = builder.capacity_buffers()
+    for name, config in builder.buffers(size).items():
+        assert all(
+            extent <= bound
+            for extent, bound in zip(
+                config.shape, capacity[name].shape, strict=True
+            )
+        ), name
+    assert capacity["text_condition"].shape[0] == denoiser.text_condition_rows(
+        builder.maximum_layout
+    )
+    assert capacity["condition_noise"].shape[0] == (
+        denoiser.condition_noise_capacity(builder.maximum_layout)
+    )
+    assert plain.capacity_buffers()["condition_noise"].shape == (0,)
+
+    # Three keyframe rows sets exceed the 2048-row capacity.
+    with pytest.raises(ValueError, match="condition capacity"):
+        builder.size(124, 100, WIDE, conditions=(first, first, first))
+    with pytest.raises(ValueError, match="condition capacity"):
+        plain.size(124, 100, WIDE, conditions=(first,))

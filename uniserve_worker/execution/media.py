@@ -267,7 +267,7 @@ def prepare_call(
                 runner.media_builder.buffers(size)
             )
         layout = runner.media_builder.layout(size)
-        return slot.tensors["denoising"], runner.diffusion.layout(layout)
+        return slot.tensors["denoising"], runner.diffusion_layout(layout)
 
     if kind is MediaCall.VIDEO_DECODING:
         # A decode round also converts its media unit to RGB, cross-faded with
@@ -306,13 +306,14 @@ def _stage_placeholder(builder, size, views, samples, diffusion, layout):
     conditioning.
     """
     entry = diffusion.layout(layout)
-    builder.stage_request(size, views, seed=0)
+    builder.stage_request(size, views, seed=0, layout=layout)
     staged = builder.initialize(
         size,
         views,
         samples,
         constants=entry.constants,
         workspace=entry.workspace,
+        layout=layout,
     )
     with diffusion.context.activate():
         for destination, source in staged:
@@ -371,8 +372,10 @@ def prepare_denoising(
                 min(layout.num_text_tokens, builder.max_text_tokens),
                 layout.canvas,
             )
-            views = storage[0].view(builder.buffers(size))
-            samples = builder.sample_views(size, diffusion.samples)
+            views = storage[0].view(builder.layout_buffers(layout))
+            samples = builder.sample_views(
+                size, diffusion.samples, layout=layout
+            )
             if staged:
                 _stage_placeholder(
                     builder, size, views, samples, diffusion, layout
@@ -380,7 +383,9 @@ def prepare_denoising(
             return diffusion.bind(
                 layout,
                 tuple(
-                    builder.bind(size, views, samples, schedules, index)
+                    builder.bind(
+                        size, views, samples, schedules, index, layout=layout
+                    )
                     for index in range(builder.num_steps)
                 ),
                 schedules,
@@ -397,8 +402,14 @@ def prepare_denoising(
         # layout's warm step and captures also leave storage outside the
         # pool (loaded modules, graph executables), so the budget is checked
         # per layout: an overrun is refused at the layout that causes it,
-        # before the device itself runs out.
-        for layout in layouts:
+        # before the device itself runs out. The layout bounding the
+        # condition capacity warms first, so the scratch every layout
+        # borrows already holds the largest step, that of a request with
+        # conditions evaluating eagerly in a layout of its own; it is never
+        # captured.
+        maximum = builder.maximum_layout
+        warm = layouts if maximum in layouts else (maximum, *layouts)
+        for layout in warm:
             diffusion.warmup(ladder(layout, staged=True))
             runner.graph_storage.check()
         warmed = time.perf_counter()

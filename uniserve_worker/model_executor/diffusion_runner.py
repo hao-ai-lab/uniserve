@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -320,7 +321,14 @@ class DiffusionRunner(ModelRunner):
         constants = getattr(module, "constant_buffers", None)
         workspace = getattr(module, "workspace_buffers", None)
         requirements = {} if constants is None else constants(layout)
-        with self.graph_storage.allocate(self):
+        # Once a step is captured, the pool's free blocks are that graph's
+        # intermediates, so a layout prepared afterwards, while serving,
+        # takes its storage from the device allocator instead.
+        with (
+            self.graph_storage.allocate(self)
+            if not self.buckets
+            else nullcontext()
+        ):
             backing = TensorBuffers.allocate(requirements, device=device)
             rows = torch.empty((2, pages), dtype=torch.int64, device=device)
         try:
@@ -344,6 +352,28 @@ class DiffusionRunner(ModelRunner):
         entry = LayoutEntry(backing, constants, workspace, pages, rows)
         self.layouts[layout] = entry
         return entry
+
+    def retire(self, layout) -> None:
+        """Release a prepared layout that has no captured step.
+
+        Work queued on the runner's stream may still read the layout's
+        constants, so the stream drains first. The maximum, which every
+        layout's workspace views, and captured layouts stay prepared.
+
+        Raises:
+            ValueError: ``layout`` is the maximum or has a captured step.
+        """
+        bucket = self.buckets.get(layout)
+        if layout == self._maximum or (
+            bucket is not None and bucket.graphs.get(None) is not None
+        ):
+            raise ValueError("a captured or maximum layout stays prepared")
+        entry = self.layouts.pop(layout, None)
+        if entry is None:
+            return
+        if self.context.stream is not None:
+            self.context.stream.synchronize()
+        entry.backing.close()
 
     def layout(self, layout) -> LayoutEntry:
         """Return a prepared layout.
@@ -786,12 +816,9 @@ class DiffusionRunner(ModelRunner):
         ``bank`` holds the request's committed samples; the successor is
         written to the other bank of its pages. Returns the successor
         samples, which the runner's samples hold until its next step, and
-        the execution path: ``"graph_replay"`` for a capturing runner, which
-        requires the layout's graph to be resident, and ``"eager"`` for a
-        runner without graphs.
-
-        Raises:
-            RuntimeError: A capturing runner has no graph for the layout.
+        the execution path: ``"graph_replay"`` for a layout whose step
+        ``capture`` made resident, and ``"eager"`` for any other layout,
+        such as one prepared while serving, or for a runner without graphs.
         """
         if not self.binds(ladder):
             raise ValueError("the ladder was bound by another runner")
@@ -799,10 +826,6 @@ class DiffusionRunner(ModelRunner):
         live = ladder.inputs[index]
         bucket = self.buckets.get(ladder.layout)
         graph = None if bucket is None else bucket.graphs.get(None)
-        if self.captures and graph is None:
-            raise RuntimeError(
-                "a capturing denoiser has no graph for this layout"
-            )
         if bucket is not None and bucket.signature != ladder.signature:
             raise ValueError(
                 "a ladder's structure differs from its layout's captured steps"

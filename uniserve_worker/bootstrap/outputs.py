@@ -37,7 +37,6 @@ from uniserve_worker.protocol.tensor import (
     ShapeBound,
     StaticDim,
 )
-from uniserve_worker.protocol.video import VideoTask
 
 # Torch dtypes a product may carry on the wire. An output in any other dtype
 # is refused by ``resolve_outputs``.
@@ -115,7 +114,7 @@ def resolve_outputs(
     )
     from uniserve_worker.bootstrap.inputs import (
         capability,
-        executed_video_tasks,
+        condition_capacity,
         media_builder,
         video_denoiser,
     )
@@ -126,15 +125,15 @@ def resolve_outputs(
         encoded_units_layout,
     )
 
-    # Only a conditioned task carries conditions, so a deployment whose
-    # denoiser executes none provisions no condition product, whatever its
-    # condition capacity.
+    # Condition products are sized by the condition rows the deployment's
+    # denoiser provisions (``condition_capacity``).
     denoiser = video_denoiser(model, config)
-    if config.max_condition_rows and (
-        denoiser is None
-        or not set(executed_video_tasks(denoiser)) - {VideoTask.T2VA}
-    ):
-        config = replace(config, max_condition_rows=0)
+    config = replace(
+        config,
+        max_condition_rows=0
+        if denoiser is None
+        else condition_capacity(denoiser, config),
+    )
 
     builder = media_builder(model, config)
     decoder = capability(model, VideoDecoder)
