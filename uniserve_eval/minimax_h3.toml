@@ -1,17 +1,18 @@
 # MiniMax-H3 base checkpoint text-to-video-and-audio on NVIDIA GB200 GPUs:
-# the UniServe deployments of the W1 and W2 performance workloads.
-# UNISERVE_MINIMAX_H3_MODEL names a local copy of MiniMaxAI/MiniMax-H3 at
-# revision 42ed227ee7df40d41602854ae760620d6eb651fe.
+# the UniServe, SGLang and vLLM-Omni deployments of the W1 and W2 performance
+# workloads. UNISERVE_MINIMAX_H3_MODEL names a local copy of
+# MiniMaxAI/MiniMax-H3 at revision 42ed227ee7df40d41602854ae760620d6eb651fe.
 #
 # Both workloads send the official t2va request prompt (537 prompt tokens) as
 # a t2va request whose target is the 16:9 canvas (1344x768) and state the
 # checkpoint's schedule: 50 sigma points (49 denoiser evaluations), video
-# shift 12 and audio shift 3; the server refuses a request whose schedule is
-# not the one it serves. W1 generates 5 seconds (124 frames) and W2 15
-# seconds (362 frames). A point first sends its one warmup request, which is
-# not measured, then its measured requests one at a time: eight for W1 and
-# four for W2, each with its own seed. Each suite covers one hardware
-# configuration; run points serially, one server at a time.
+# shift 12 and audio shift 3. UniServe refuses a request whose schedule is not
+# the one it serves; the baselines run the schedule they are sent. W1
+# generates 5 seconds (124 frames) and W2 15 seconds (362 frames). A point
+# first sends its one warmup request, which is not measured, then its
+# measured requests one at a time: eight for W1 and four for W2, each with
+# its own seed. Each suite covers one system on one hardware configuration;
+# run points serially, one server at a time.
 #
 # A deployment admits the full 15-second range and one 1024-token text
 # capacity, which holds the official prompt. The serving options follow the
@@ -156,8 +157,205 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
+# Baselines on one four-GPU GB200 host. UNISERVE_MINIMAX_H3_SGLANG and
+# UNISERVE_MINIMAX_H3_VLLM_OMNI name the virtual environments of SGLang at
+# ef867fa40d and vLLM-Omni at bbee488da (with vLLM 0.30.0). Both load the
+# checkpoint's native FL2VA partition of the same revision, the release's own
+# layout of the model UniServe loads from the root diffusers components, and
+# hold only that denoiser.
+# Their requests carry the same work as UniServe's: the canvas, the frame
+# count, the 50-point schedule (vLLM-Omni counts its 49 intervals), the
+# shifts and the seed. Neither runs a lossy path: no step cache, no sparse or
+# quantized attention, no FP8. The servers draw the audio noise from a
+# generator reseeded with the request seed rather than continuing the video
+# generator, so a seed gives a different sample than UniServe's, at the same
+# cost. Their MP4 encoders differ from UniServe's libx264 ultrafast: SGLang
+# runs preset fast at CRF 25, a preset its source fixes, and vLLM-Omni
+# ultrafast at CRF 18.
+#
+# SGLang follows its cookbook's GB200 recipe: Ulysses 4 with every component
+# resident (performance mode speed), the Qwen3-VL text encoder folded across
+# the four ranks, platform attention (cuDNN SDPA for the dense packed
+# attention) and eager execution. Its cross-request conditioning cache is
+# disabled: every measured row repeats the official prompt, and UniServe
+# encodes each request's prompt. Requests state quality=lossless, which also
+# keeps an environment-enabled Cache-DiT policy off. SGLang has no
+# synchronous video route, so the evaluator polls the job and fetches the MP4
+# that the server writes to its output directory; the output and upload
+# directories are on the host's local disk rather than in this tree.
+[servers.sglang-gb200-4]
+host = "127.0.0.1"
+port = 18083
+command = ["${UNISERVE_MINIMAX_H3_SGLANG}/bin/sglang", "serve", "--model-path", "${UNISERVE_MINIMAX_H3_MODEL}", "--model-variant", "fl2va", "--num-gpus", "4", "--ulysses-degree", "4", "--performance-mode", "speed", "--disable-conditioning-cache", "--output-path", "/tmp/sglang-minimax-h3/outputs", "--input-save-path", "/tmp/sglang-minimax-h3/inputs", "--host", "127.0.0.1", "--port", "18083"]
+
+# The H3 pipeline requires ffmpeg and ffprobe on PATH; the environment's bin
+# directory provides the Ubuntu 24.04 package that SGLang's image installs.
+# Importing the Qwen3-VL encoder imports DeepEP, which H3 never runs; its
+# import-time check counts the host's NCCL network plugin as a second NCCL
+# runtime, so EP_SUPPRESS_NCCL_CHECK skips that check.
+[servers.sglang-gb200-4.environment]
+CUDA_HOME = "/usr/local/cuda"
+PATH = "${UNISERVE_MINIMAX_H3_SGLANG}/bin:/usr/local/cuda/bin:${PATH}"
+SGLANG_RUST_BUILD_MODE = "never"
+EP_SUPPRESS_NCCL_CHECK = "1"
+
+[benchmarks.sglang-gb200-4-w1]
+server = "sglang-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos"
+
+[benchmarks.sglang-gb200-4-w1.video]
+backend = "sglang"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 5.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+[benchmarks.sglang-gb200-4-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+[benchmarks.sglang-gb200-4-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.sglang-gb200-4-w2]
+server = "sglang-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos"
+
+[benchmarks.sglang-gb200-4-w2.video]
+backend = "sglang"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 15.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+[benchmarks.sglang-gb200-4-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+[benchmarks.sglang-gb200-4-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# vLLM-Omni follows its four-GPU recipe: Ulysses 4, ring 1, VAE patch
+# parallelism 4 in the native tile mode, regional torch.compile of the DiT
+# blocks, and the default dense BF16 TRTLLM_ATTN attention. --task-type
+# fl2va loads only the FL2VA denoiser, which serves t2va, where the recipe's
+# combined service would also hold the Ref2VA one. The server compiles on
+# its first request, which the warmup request covers. --cache-backend none
+# keeps an environment-selected cache backend off, the synchronous route's
+# timeout matches the request timeout, and NCCL_NVLS_ENABLE=0 matches the
+# UniServe deployments and SGLang's default.
+[servers.vllm-omni-gb200-4]
+host = "127.0.0.1"
+port = 18083
+command = ["${UNISERVE_MINIMAX_H3_VLLM_OMNI}/bin/vllm", "serve", "${UNISERVE_MINIMAX_H3_MODEL}/FL2VA", "--omni", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--trust-remote-code", "--task-type", "fl2va", "--num-gpus", "4", "--usp", "4", "--ring", "1", "--vae-patch-parallel-size", "4", "--vae-parallel-mode", "tile", "--vae-use-tiling", "--cache-backend", "none"]
+
+# The environment's bin directory provides the ffmpeg and ffprobe the server
+# requires, and opt/x11-lib the X11 and GL client libraries (from the same
+# Ubuntu 24.04 packages) that its opencv-python build loads. Without them the
+# server's OpenCV import fails and leaves OpenCV's package directory on
+# sys.path; the spawned workers inherit it, resolve the standard typing module
+# into OpenCV, and exit before loading the model.
+[servers.vllm-omni-gb200-4.environment]
+PATH = "${UNISERVE_MINIMAX_H3_VLLM_OMNI}/bin:${PATH}"
+LD_LIBRARY_PATH = "${UNISERVE_MINIMAX_H3_VLLM_OMNI}/opt/x11-lib"
+VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT = "3600"
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.vllm-omni-gb200-4-w1]
+server = "vllm-omni-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.vllm-omni-gb200-4-w1.video]
+backend = "vllm-omni"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 5.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.vllm-omni-gb200-4-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+[benchmarks.vllm-omni-gb200-4-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.vllm-omni-gb200-4-w2]
+server = "vllm-omni-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.vllm-omni-gb200-4-w2.video]
+backend = "vllm-omni"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 15.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.vllm-omni-gb200-4-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+[benchmarks.vllm-omni-gb200-4-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
 [suites.gb200-4]
 points = ["gb200-4-w1", "gb200-4-w2"]
 
 [suites.gb200-8]
 points = ["gb200-8-w1", "gb200-8-w2"]
+
+[suites.sglang-gb200-4]
+points = ["sglang-gb200-4-w1", "sglang-gb200-4-w2"]
+
+[suites.vllm-omni-gb200-4]
+points = ["vllm-omni-gb200-4-w1", "vllm-omni-gb200-4-w2"]
