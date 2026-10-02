@@ -19,10 +19,12 @@ one that stopped its block runs as a no-op, decided on the device from its
 slot's continuation flag: its state stays as the stopping step left it,
 and it reports ``STEP_SKIPPED``.
 
-On CUDA, startup captures one graph per canvas row bucket (``canvas_rows``)
-and call kind, and every call replays the smallest bucket that holds its
-canvases; after startup a call no captured bucket holds fails. A canvas
-step graph holds the whole step: the pass, the head and the sampler of
+On CUDA, startup captures graphs by canvas row count and call kind. Readout
+graphs also bucket the canvas length, so shorter canvases do not evaluate
+a full model canvas of padding per row. Every call replays the smallest
+bucket that holds its canvases; after startup a call no captured bucket
+holds fails. A canvas step graph holds the whole step: the pass, the head
+and the sampler of
 every chunk, and the commit of the stepped state, for the one sampling the
 deployment serves; a call whose rows all start their canvas replays its own
 graph, whose pass skips the self-conditioning signal, zero at step zero. A
@@ -149,6 +151,25 @@ class CanvasRunner(ModelRunner):
         return tuple(rows for rows in CANVAS_ROW_BUCKETS if rows < limit) + (
             (limit,) if limit > 0 else ()
         )
+
+    @property
+    def readout_lengths(self) -> tuple[int, ...]:
+        """Captured readout lengths, bounded by the model's canvas.
+
+        Independent replicas can use shorter local token capacities. Expert
+        steps share their capacity negotiation with generating canvases,
+        whose rows always have the model's length; those steps retain the
+        same full-row capacities for every participant in the exchange.
+        """
+        length = self.canvas_length
+        if self.context.experts is not None:
+            return (length,)
+        buckets = []
+        value = 16
+        while value < length:
+            buckets.append(value)
+            value *= 2
+        return (*buckets, length)
 
     def bind_canvas_slots(self, slots) -> None:
         """Borrow the resident sampler state of generating canvases.
@@ -367,7 +388,8 @@ class CanvasRunner(ModelRunner):
 
     def graph_capacity(self, key) -> int:
         """A canvas bucket's canvas tokens; its graph exchanges at that many."""
-        return key[1] * self.canvas_length
+        length = key[2] if key[0] == "canvas" else self.canvas_length
+        return key[1] * length
 
     def expert_tokens(self, batch) -> int:
         """Every staged canvas sends its whole canvas through the exchange."""
@@ -378,8 +400,8 @@ class CanvasRunner(ModelRunner):
 
         Returns ``None`` for eager execution, without graph pools or for an
         ineligible call. Otherwise returns ``(key, padded_batch, True)``: a
-        readout key is ``("canvas", rows)`` and its padded batch holds the
-        canvas pass's input alone; a step key is ``("canvas_step", rows,
+        readout key is ``("canvas", rows, length)`` and its padded batch holds
+        the canvas pass's input alone; a step key is ``("canvas_step", rows,
         sampling, first)``, where ``first`` is whether every row starts its
         canvas; padding rows start one too. In an expert step of per-rank
         ``capacity`` tokens the call pads to the bucket of that many canvas
@@ -393,6 +415,12 @@ class CanvasRunner(ModelRunner):
             return None
         inputs = batch.inputs
         length = self.canvas_length
+        maximum = max(inputs.attention.queries.host)
+        if not isinstance(inputs, CanvasStepInput):
+            length = next(
+                (value for value in self.readout_lengths if value >= maximum),
+                length,
+            )
         buckets = self.canvas_rows
         rows = next(
             (
@@ -403,7 +431,7 @@ class CanvasRunner(ModelRunner):
             ),
             None,
         )
-        if rows is None or max(inputs.attention.queries.host) > length:
+        if rows is None or maximum > length:
             raise CUDAGraphError(
                 f"{self.name} has no canvas graph for a call of "
                 f"{batch.row_count} canvases of up to "
@@ -425,7 +453,7 @@ class CanvasRunner(ModelRunner):
             padded = _pad_readout(
                 batch, rows, length, widths, self.input_buffers
             )
-            key = ("canvas", rows)
+            key = ("canvas", rows, length)
         return key, padded, True
 
     def capture_graph(self, key, execution, forward):

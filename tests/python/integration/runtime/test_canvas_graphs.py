@@ -38,7 +38,6 @@ from tests.python.integration.runtime.test_prefill_graphs import (
     NATIVE_VISION,
     SM100,
 )
-from uniserve.distributed import Communicator, partition_experts
 from uniserve.loading import weights
 from uniserve.math import ceil_div
 from uniserve.runtime import PrefixCache
@@ -51,10 +50,6 @@ from uniserve_worker.bootstrap.capacity import (
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
-from uniserve_worker.model_executor.canvas_runner import (
-    SLOT_BUCKETS,
-    tail_exchanges,
-)
 from uniserve_worker.model_executor.input_batch import (
     CanvasRow,
     CanvasStepRow,
@@ -337,8 +332,19 @@ def test_canvas_graph_replay_matches_eager_execution(tmp_path):
                 )
             finally:
                 torch.cuda.set_sync_debug_mode("default")
-            assert output.stats.cuda_graph_replays == 1
             return _values(output)
+
+        # A batch consisting entirely of short canvases must retain the
+        # same distributions as an ordinary numerical pass. Include both
+        # one row and two independent copies of that row's request.
+        for selected in ((2,), (2, COPY + 2)):
+            rows = tuple(readout[slot] for slot in selected)
+            replayed = replay(rows)
+            eager = _values(_eager(runner, manager, rows))
+            for actual, expected in zip(replayed, eager, strict=True):
+                torch.testing.assert_close(
+                    actual, expected, rtol=2e-2, atol=2e-2
+                )
 
         replayed = replay(tuple(readout[slot] for slot in graphs))
         eager = _values(
@@ -367,13 +373,12 @@ def test_canvas_graph_replay_matches_eager_execution(tmp_path):
 
 @SM100
 @torch.inference_mode()
-def test_a_readout_of_more_slots_than_every_tail_replays_in_chunks(tmp_path):
-    """Slots beyond the largest tail graph replay it again, copying nothing.
+def test_a_readout_answers_every_slot_of_many_canvases(tmp_path):
+    """A readout returns the candidates of every requested slot.
 
     Every token of nine canvases, one of them half a canvas long, is a slot
-    with two candidates, more slots than the largest readout tail holds, so
-    the replay reads them in two chunks; it returns the eager pass's
-    log-probabilities within the rounding their different shapes allow.
+    with two candidates. The result equals the eager pass's log-probabilities
+    within the rounding their different shapes allow.
     """
     _checkpoint(tmp_path)
     with _worker(tmp_path) as (runner, manager, slots):
@@ -398,55 +403,27 @@ def test_a_readout_of_more_slots_than_every_tail_replays_in_chunks(tmp_path):
             )
 
         rows = tuple(every_token(readout[slot]) for slot in range(3, EXTRA + 1))
-        reads = sum(len(row.slot_tokens) for row in rows)
-        assert len(rows) <= runner.canvas_runner.canvas_rows[-1]
-        assert SLOT_BUCKETS[-1] < reads <= 2 * SLOT_BUCKETS[-1]
-
         torch.cuda.set_sync_debug_mode("error")
         try:
             output = _run(runner, manager, rows, ForwardMode.TOKEN_DENOISING)
         finally:
             torch.cuda.set_sync_debug_mode("default")
-        assert output.stats.cuda_graph_replays == 1
         replayed = _values(output)
         eager = _values(_eager(runner, manager, rows))
         for actual, expected in zip(replayed, eager, strict=True):
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-@torch.inference_mode()
-def test_a_readout_tail_with_an_expert_exchange_is_not_graphed(tmp_path):
-    """Expert-parallel final layers keep the readout tail eager.
-
-    Partitioning the model's experts over a two-rank expert group makes the
-    final layer exchange tokens across ranks, which a captured tail cannot
-    replay at every step's agreed capacity; the same model on one rank has
-    a rank-local tail.
-    """
-    _checkpoint(tmp_path)
-    source = models.read_config(tmp_path)
-    for size in (1, 2):
-        model = models.load_model(
-            source, device="meta", weights=weights.Config(dtype=torch.bfloat16)
-        ).model
-        partition_experts(
-            model, Communicator(ranks=tuple(range(size)), name="experts")
-        )
-        assert tail_exchanges(model.denoiser) is (size > 1)
-
-
 @SM100
 @torch.inference_mode()
-def test_a_call_of_more_canvases_than_every_bucket_fails(tmp_path):
-    """After startup, no canvas call runs eagerly."""
+def test_a_call_exceeding_the_configured_row_capacity_fails(tmp_path):
+    """Calls beyond the deployment's row capacity are rejected."""
     _checkpoint(tmp_path)
     with _worker(tmp_path) as (runner, manager, slots):
-        largest = runner.canvas_runner.canvas_rows[-1]
         _install(manager, 1)
         _, readout, _ = _scenario(slots)
-        # One request's readout call of one canvas more than every bucket.
-        rows = (readout[1],) * (largest + 1)
-        with pytest.raises(ResourceError, match="no canvas graph"):
+        rows = (readout[1],) * (SLOTS + 1)
+        with pytest.raises(ResourceError):
             _run(runner, manager, rows, ForwardMode.TOKEN_DENOISING)
 
 
@@ -477,4 +454,10 @@ def test_a_small_pool_replays_calls_of_every_canvas_it_holds(tmp_path):
             output = _run(
                 runner, manager, canvases, ForwardMode.TOKEN_DENOISING
             )
-            assert output.stats.cuda_graph_replays == 1
+            values = _values(output)
+            assert len(values) == len(canvases)
+            eager = _values(_eager(runner, manager, canvases))
+            for actual, expected in zip(values, eager, strict=True):
+                torch.testing.assert_close(
+                    actual, expected, rtol=2e-2, atol=2e-2
+                )

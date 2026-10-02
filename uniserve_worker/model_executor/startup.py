@@ -416,8 +416,9 @@ def stage_canvas(
 def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
     """Capture every canvas row bucket of a token denoiser, largest first.
 
-    Each bucket captures a readout pass and, when the entry generates
-    canvases, two canvas steps of the served sampling over request slots one
+    Each bucket captures readout passes at the supported canvas lengths and,
+    when the entry generates canvases, two canvas steps of the served
+    sampling over request slots one
     upward, one whose rows all start their canvas and one whose rows
     continue it; their resident state stays scratch until a request starts
     its canvas there. The rows are staged through serving's staging with the
@@ -434,19 +435,25 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
     if cache is None:
         raise ValueError("canvas capture requires the worker KV cache")
     slots = entry.canvas_slots
-    # A readout, then a first step and a continuing step.
+    # Readouts can have shorter numerical canvases. Generating steps keep
+    # the model's length because it defines the resident sampler state.
     kinds = (
-        ((None, 0),)
+        tuple((None, 0, length) for length in reversed(entry.readout_lengths))
+    ) + (
+        ()
         if slots is None
-        else ((None, 0), (slots.constants, 0), (slots.constants, 1))
+        else (
+            (slots.constants, 0, entry.canvas_length),
+            (slots.constants, 1, entry.canvas_length),
+        )
     )
     for rows in reversed(entry.canvas_rows if entry.pools else (1,)):
-        for sampling, step in kinds:
+        for sampling, step, length in kinds:
             with cache.startup_units(rows * cache.page_units(1)) as scratch:
                 batch = stage_canvas(
                     entry.input_buffers,
                     scratch_tables(cache, scratch, (1,) * rows),
-                    length=entry.canvas_length,
+                    length=length,
                     sampling=sampling,
                     step=step,
                 )
