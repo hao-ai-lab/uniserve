@@ -42,7 +42,12 @@ from uniserve.diffusion import (
     uniform_grid,
 )
 from uniserve.media import image
-from uniserve.model import Condition, LatentInput, VideoDenoiser
+from uniserve.model import (
+    Condition,
+    ConditionTiles,
+    LatentInput,
+    VideoDenoiser,
+)
 from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
 from uniserve.nn.attention import SequenceLengths, VisibleInput, vsa
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
@@ -67,6 +72,7 @@ from .inputs import (
 )
 from .packing import (
     AUDIO_TAG,
+    VIDEO_TILE_SHAPES,
     DensePacking,
     RegionPacking,
     TilePacking,
@@ -253,6 +259,19 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     @property
     def max_sequence_rows(self) -> int | None:
         return self.config.max_sequence_rows
+
+    @property
+    def condition_tiles(self) -> ConditionTiles | None:
+        """The region packing's tiles under multi-region sparse attention.
+
+        ``make_size`` counts a condition's rows as ``region_tiles`` of
+        ``VIDEO_TILE_SHAPES[tile]`` video tiles; dense attention and
+        single-region sparse attention, which takes no conditions, count
+        densely.
+        """
+        if not self.regional:
+            return None
+        return ConditionTiles(self._tile, VIDEO_TILE_SHAPES[self._tile])
 
     @property
     def dense(self) -> bool:

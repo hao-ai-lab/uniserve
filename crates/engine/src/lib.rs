@@ -51,4 +51,6 @@ pub use crate::worker::{
     BatchSubmitError, CallReaders, FlashInferBackend, FlashInferBackendParseError, LaneConfig,
     WorkerExecutor, WorkerGroup, WorkerProcessArgs,
 };
-pub use uniserve_worker_ipc::{AttentionBackend, DEFAULT_COMPONENT, VideoDenoiserInfo};
+pub use uniserve_worker_ipc::{
+    AttentionBackend, ConditionTiles, DEFAULT_COMPONENT, VideoDenoiserInfo,
+};

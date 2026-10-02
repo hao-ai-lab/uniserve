@@ -7,6 +7,7 @@ from .decoder import ImageDecoder
 from .denoiser import (
     Condition,
     ConditionRole,
+    ConditionTiles,
     Denoiser,
     ImageDenoiser,
     VideoDenoiser,
@@ -56,6 +57,7 @@ __all__ = [
     "VideoSize",
     "Condition",
     "ConditionRole",
+    "ConditionTiles",
     "ImageDecoder",
     "AudioDecoder",
     "AudioEncoder",

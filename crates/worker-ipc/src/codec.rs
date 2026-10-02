@@ -605,6 +605,10 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
             })
             .unwrap_or_default(),
         max_sequence_rows: table.max_sequence_rows(),
+        condition_tiles: table.condition_tiles().map(|tiles| crate::ConditionTiles {
+            rows: tiles.rows(),
+            video: [tiles.frames(), tiles.height(), tiles.width()],
+        }),
     }
 }
 

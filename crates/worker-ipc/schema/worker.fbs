@@ -203,10 +203,16 @@ table ComponentInfo {
 /// A video raster in pixels.
 struct Canvas { width:uint; height:uint; }
 
+/// Whole tiles of `rows` rows a multi-region denoiser packs each condition
+/// into; a video's token grid is cut into tiles of `frames x height x width`
+/// tokens.
+struct ConditionTiles { rows:uint; frames:uint; height:uint; width:uint; }
+
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
 /// (sigma points including the clean endpoint, and the per-modality shifts)
 /// and the canvases and packed rows it accepts. An empty canvas list is the
-/// model's canvas rule; an absent capacity is unbounded by the checkpoint.
+/// model's canvas rule; an absent capacity is unbounded by the checkpoint;
+/// absent condition tiles pack conditions densely, one row per token.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
@@ -214,6 +220,7 @@ table VideoDenoiserInfo {
   audio_shift:double;
   canvases:[Canvas];
   max_sequence_rows:uint = null;
+  condition_tiles:ConditionTiles;
 }
 
 /// Binds a media call to the component that runs it; the decoder rejects a

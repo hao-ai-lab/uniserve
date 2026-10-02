@@ -213,10 +213,45 @@ impl WorkerEndpoint {
 /// no checkpoint identity because it loads no checkpoint.
 const STUB_MODEL_PREFIX: &str = "uniserve_models.stub";
 
+/// Whole-tile condition packing of a multi-region video denoiser.
+///
+/// Each condition occupies whole tiles of `rows` rows: its audio rows fill
+/// tiles of their own, then an image's rows fill tiles, while a video's
+/// `(latent frames, height, width)` token grid is cut into tiles of `video`
+/// tokens along those axes, each tile taking `rows` rows however few tokens
+/// it holds. A condition's packed rows are its tile count times `rows`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConditionTiles {
+    /// Rows of one tile.
+    pub rows: u32,
+    /// Tokens of one video tile along latent frames, height and width; their
+    /// product is `rows`.
+    pub video: [u32; 3],
+}
+
+impl ConditionTiles {
+    /// Packed rows of a condition with `audio_rows` audio rows and either
+    /// `image_rows` image rows or a video token grid `(frames, height,
+    /// width)`.
+    pub fn rows(&self, audio_rows: u32, image_rows: u32, video_grid: Option<[u32; 3]>) -> u64 {
+        let tiles = |count: u32, size: u32| u64::from(count.div_ceil(size));
+        let visual = match video_grid {
+            Some(grid) => grid
+                .iter()
+                .zip(self.video)
+                .map(|(&extent, size)| tiles(extent, size))
+                .product(),
+            None => tiles(image_rows, self.rows),
+        };
+        (tiles(audio_rows, self.rows) + visual) * u64::from(self.rows)
+    }
+}
+
 /// What the video denoiser a deployment places serves.
 ///
 /// The denoiser fixes its schedule, so requests may only restate it; the
-/// tasks, canvases and sequence capacity bound what admission accepts.
+/// tasks, canvases, condition packing and sequence capacity bound what
+/// admission accepts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
     /// Task names the denoiser serves, in canonical order.
@@ -235,12 +270,17 @@ pub struct VideoDenoiserInfo {
     /// The checkpoint's packed sequence capacity in rows, when it has one.
     #[serde(default)]
     pub max_sequence_rows: Option<u32>,
+    /// How the denoiser packs condition rows: in whole tiles for a
+    /// multi-region denoiser, or densely, one row per condition token, when
+    /// absent.
+    #[serde(default)]
+    pub condition_tiles: Option<ConditionTiles>,
 }
 
 impl VideoDenoiserInfo {
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, and every canvas and the capacity are
-    /// positive.
+    /// and positive finite shifts, every canvas and the capacity are
+    /// positive, and condition tiles are video tiles of their row count.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -261,6 +301,19 @@ impl VideoDenoiserInfo {
                 .all(|canvas| canvas.width > 0 && canvas.height > 0)
                 && self.max_sequence_rows != Some(0),
             "a video denoiser declares an empty canvas or sequence capacity"
+        );
+        ensure_valid!(
+            self.condition_tiles.is_none_or(|tiles| {
+                tiles.rows > 0
+                    && tiles.video.iter().all(|&size| size > 0)
+                    && tiles
+                        .video
+                        .iter()
+                        .map(|&size| u64::from(size))
+                        .product::<u64>()
+                        == u64::from(tiles.rows)
+            }),
+            "a video denoiser's condition tiles are not video tiles of their rows"
         );
         Ok(())
     }

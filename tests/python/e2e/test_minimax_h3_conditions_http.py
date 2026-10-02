@@ -179,6 +179,23 @@ def test_base_reference_requests(tmp_path: Path) -> None:
     )
 
 
+# The OmniRef reference DiT packs each condition into whole 128-row tiles,
+# a video's token grid in tiles of 4 latent frames by 4 by 8 tokens, so the
+# same video-plus-audio request takes 47,104 rows there: its 37 x 24 x 42
+# reference video fills 10 x 6 x 6 tiles and its soundtrack and audio
+# reference 4 tiles each, against 38,124 rows packed densely.
+OMNIREF_OPTIONS = [
+    "--max-video-seconds",
+    "5",
+    "--max-model-len",
+    "8192",
+    "--video-text-capacities",
+    "8192",
+    "--max-condition-rows",
+    "49152",
+]
+
+
 def test_omniref_reference_requests(tmp_path: Path) -> None:
     inputs = _inputs()
     export = os.environ.get("UNISERVE_MINIMAX_H3_OMNIREF")
@@ -196,7 +213,7 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
             "ulysses4-reference.json",
             port,
             inputs,
-            [*REFERENCE_OPTIONS, "--base-model", base_copy],
+            [*OMNIREF_OPTIONS, "--base-model", base_copy],
         ),
         f"http://127.0.0.1:{port}",
         tmp_path,

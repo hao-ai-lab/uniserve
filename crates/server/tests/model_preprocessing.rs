@@ -52,6 +52,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
         audio_shift: 3.0,
         canvases: Vec::new(),
         max_sequence_rows: None,
+        condition_tiles: None,
     }
 }
 
@@ -579,6 +580,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             height: 768,
         }],
         max_sequence_rows: None,
+        condition_tiles: None,
     };
     let processor = |max_video_seconds: f64| {
         let mut config = loaded.config().clone();

@@ -637,6 +637,7 @@ def video_denoiser_info(denoiser: VideoDenoiser) -> VideoDenoiserInfo:
         if canvases is None
         else tuple((canvas.width, canvas.height) for canvas in canvases),
         max_sequence_rows=denoiser.max_sequence_rows,
+        condition_tiles=denoiser.condition_tiles,
     )
 
 

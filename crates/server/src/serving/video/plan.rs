@@ -36,6 +36,8 @@ use uniserve_core::{
     Canvas, ConditionMedia, ConditionVision, ImageFit, MediaLocator, VideoCondition, VideoTask,
 };
 
+use uniserve_engine::ConditionTiles;
+
 use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
 use super::{RequestField, VideoInputError};
 use crate::serving::{VIDEO_FPS, video_frame_count};
@@ -543,6 +545,31 @@ pub struct ConditionPlan {
 }
 
 impl ConditionPlan {
+    /// Denoiser rows the condition takes, packed as `tiles` prescribes: its
+    /// video and audio rows without tiles, or the rows of the whole tiles
+    /// they fill, a video's in tiles of its `(latent frames, height / 32,
+    /// width / 32)` token grid. `None` for a keyframe under tiles, which a
+    /// region packing does not hold.
+    pub fn packed_rows(&self, tiles: Option<ConditionTiles>) -> Option<u64> {
+        let Some(tiles) = tiles else {
+            return Some(u64::from(self.video_rows) + u64::from(self.audio_rows));
+        };
+        match &self.prepared {
+            Prepared::Keyframe(_) => None,
+            Prepared::Image(_) => Some(tiles.rows(self.audio_rows, self.video_rows, None)),
+            Prepared::Video(clip) => Some(tiles.rows(
+                self.audio_rows,
+                0,
+                Some([
+                    clip.latent_frames,
+                    clip.canvas.height / CANVAS_MULTIPLE,
+                    clip.canvas.width / CANVAS_MULTIPLE,
+                ]),
+            )),
+            Prepared::Audio(_) => Some(tiles.rows(self.audio_rows, 0, None)),
+        }
+    }
+
     /// Denoiser video rows of each temporal unit the video encoder encodes,
     /// in unit order.
     ///
@@ -702,6 +729,15 @@ impl RequestPlan {
     /// Denoiser audio rows of all conditions.
     pub fn condition_audio_rows(&self) -> u32 {
         self.conditions.iter().map(|plan| plan.audio_rows).sum()
+    }
+
+    /// Denoiser rows of all conditions, packed as `tiles` prescribes (see
+    /// [`ConditionPlan::packed_rows`]); `None` when a keyframe meets tiles.
+    pub fn condition_rows(&self, tiles: Option<ConditionTiles>) -> Option<u64> {
+        self.conditions
+            .iter()
+            .map(|plan| plan.packed_rows(tiles))
+            .sum()
     }
 }
 

@@ -1430,6 +1430,10 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             .map(|canvas| fbs::Canvas::new(canvas.width, canvas.height))
             .collect::<Vec<_>>();
         let canvases = Some(b.create_vector(&canvases));
+        let condition_tiles = value.condition_tiles.map(|tiles| {
+            let [frames, height, width] = tiles.video;
+            fbs::ConditionTiles::new(tiles.rows, frames, height, width)
+        });
         fbs::VideoDenoiserInfo::create(
             b,
             &fbs::VideoDenoiserInfoArgs {
@@ -1439,6 +1443,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 audio_shift: value.audio_shift,
                 canvases,
                 max_sequence_rows: value.max_sequence_rows,
+                condition_tiles: condition_tiles.as_ref(),
             },
         )
     });

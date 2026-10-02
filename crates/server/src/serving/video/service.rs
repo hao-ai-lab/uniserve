@@ -318,20 +318,26 @@ impl VideoService {
 
     /// Bounds a planned request's denoiser rows.
     ///
-    /// The condition rows (video and audio) may not exceed the deployment's
-    /// condition capacity, and the packed sequence (the presentation's text
-    /// rows, the condition rows and the generated audio and video rows, not
-    /// counting alignment padding) may not exceed the denoiser's sequence
-    /// capacity, when its checkpoint has one.
+    /// The condition rows, counted as the denoiser packs them (densely, or
+    /// in the whole tiles its handshake declares), may not exceed the
+    /// deployment's condition capacity, and the packed sequence (the
+    /// presentation's text rows, the condition rows and the generated audio
+    /// and video rows, not counting alignment padding) may not exceed the
+    /// denoiser's sequence capacity, when its checkpoint has one.
     ///
     /// # Errors
     ///
     /// Returns `invalid_request` for `conditions` naming the rows the request
     /// needs and the capacity, and for a deployment's condition capacity the
-    /// option that raises it.
+    /// option that raises it; and for a keyframe a tile-packing denoiser
+    /// holds no rows for.
     fn check_rows(&self, plan: &RequestPlan, text_rows: usize) -> Result<(), ApiError> {
-        let condition_rows =
-            u64::from(plan.condition_video_rows()) + u64::from(plan.condition_audio_rows());
+        let Some(condition_rows) = plan.condition_rows(self.denoiser.condition_tiles) else {
+            return Err(ApiError::invalid_request(
+                "conditions: this denoiser packs references in region tiles and holds no keyframes",
+                Some("conditions"),
+            ));
+        };
         if condition_rows > u64::from(self.max_condition_rows) {
             return Err(ApiError::invalid_request(
                 format!(
@@ -489,9 +495,9 @@ mod tests {
     use uniserve_core::{
         Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoTask, VisionGrid,
     };
-    use uniserve_engine::VideoDenoiserInfo;
+    use uniserve_engine::{ConditionTiles, VideoDenoiserInfo};
 
-    use super::super::plan::tests::{fixture, vision};
+    use super::super::plan::tests::{Request, fixture, vision};
     use super::super::presentation::tests::character_tokenizer;
     use super::VideoService;
     use crate::config::VideoMediaSettings;
@@ -501,6 +507,16 @@ mod tests {
     /// A base denoiser serving every task, with an optional checkpoint
     /// sequence capacity, and a deployment condition capacity.
     fn service(max_condition_rows: u32, max_sequence_rows: Option<u32>) -> VideoService {
+        packed_service(max_condition_rows, max_sequence_rows, None)
+    }
+
+    /// A denoiser serving every task that packs conditions as `tiles`
+    /// prescribes.
+    fn packed_service(
+        max_condition_rows: u32,
+        max_sequence_rows: Option<u32>,
+        condition_tiles: Option<ConditionTiles>,
+    ) -> VideoService {
         VideoService::new(
             VideoDenoiserInfo {
                 tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
@@ -509,6 +525,7 @@ mod tests {
                 audio_shift: 3.0,
                 canvases: Vec::new(),
                 max_sequence_rows,
+                condition_tiles,
             },
             vision(&fixture()),
             15.0,
@@ -517,6 +534,80 @@ mod tests {
             Arc::new(character_tokenizer()),
         )
         .unwrap()
+    }
+
+    /// The FastH3 OmniRef reference denoiser's condition tiles: 128 rows, a
+    /// video tile of 4 latent frames by 4 by 8 tokens.
+    const REGION_TILES: ConditionTiles = ConditionTiles {
+        rows: 128,
+        video: [4, 4, 8],
+    };
+
+    /// The plan of the vectors request named `name`.
+    fn planned(name: &str) -> super::RequestPlan {
+        let fixture = fixture();
+        let case = fixture["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap();
+        Request::parse(case).plan(&vision(&fixture)).unwrap()
+    }
+
+    fn refusal(error: ApiError) -> String {
+        match error {
+            ApiError::InvalidRequest { message, param } => {
+                assert_eq!(param, Some("conditions"));
+                message
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    /// A tile-packing denoiser's conditions take the rows of their whole
+    /// tiles. The video-plus-audio request (a 37-frame 1344x768 reference
+    /// video whose token grid is 37 x 24 x 42, its 414-row soundtrack, and
+    /// a 240-row audio reference) takes 37,296 + 414 + 240 = 37,950 rows
+    /// densely, but 10 * 6 * 6 + 4 + 2 = 366 tiles of 128 rows, 46,848, in
+    /// 4x4x8-token video tiles: admitted at exactly that capacity, refused
+    /// one row below it, while a dense denoiser still counts 37,950.
+    #[test]
+    fn tile_packed_conditions_are_bounded_by_their_tiles() {
+        let plan = planned("ref2va_video_audio");
+        let text_rows = 1024;
+
+        assert_eq!(service(37_950, None).check_rows(&plan, text_rows), Ok(()));
+        let message = refusal(
+            service(37_949, None)
+                .check_rows(&plan, text_rows)
+                .unwrap_err(),
+        );
+        assert!(message.contains("37950"), "{message}");
+
+        let packed = |capacity| packed_service(capacity, None, Some(REGION_TILES));
+        assert_eq!(packed(46_848).check_rows(&plan, text_rows), Ok(()));
+        let message = refusal(packed(46_847).check_rows(&plan, text_rows).unwrap_err());
+        assert!(
+            message.contains("46848")
+                && message.contains("46847")
+                && message.contains("--max-condition-rows"),
+            "{message}"
+        );
+    }
+
+    /// A keyframe has no rows in a region packing, so a tile-packing
+    /// denoiser refuses it while a dense one admits it.
+    #[test]
+    fn tile_packing_refuses_keyframes() {
+        let plan = planned("fl2va_first_auto");
+        assert_eq!(service(1 << 17, None).check_rows(&plan, 1024), Ok(()));
+        let message = refusal(
+            packed_service(1 << 17, None, Some(REGION_TILES))
+                .check_rows(&plan, 1024)
+                .unwrap_err(),
+        );
+        assert!(message.contains("keyframes"), "{message}");
     }
 
     fn png(width: u32, height: u32) -> Vec<u8> {

@@ -1472,6 +1472,7 @@ mod tests {
                 audio_shift: 3.0,
                 canvases: Vec::new(),
                 max_sequence_rows: None,
+                condition_tiles: None,
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],

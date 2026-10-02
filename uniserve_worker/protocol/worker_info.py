@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
+from uniserve.model import ConditionTiles
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.protocol.call import (
@@ -302,7 +303,9 @@ class VideoDenoiserInfo:
     fixed schedule's sigma points, the clean endpoint included; ``canvases``
     lists the only canvases the denoiser generates, empty when it follows the
     model's canvas rule; ``max_sequence_rows`` is the checkpoint's packed
-    sequence capacity, ``None`` when the checkpoint sets none.
+    sequence capacity, ``None`` when the checkpoint sets none;
+    ``condition_tiles`` is the whole-tile condition packing of a
+    multi-region denoiser, ``None`` for dense packing.
     """
 
     tasks: tuple[str, ...]
@@ -311,6 +314,7 @@ class VideoDenoiserInfo:
     audio_shift: float
     canvases: tuple[tuple[int, int], ...] = ()
     max_sequence_rows: int | None = None
+    condition_tiles: ConditionTiles | None = None
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -323,12 +327,36 @@ class VideoDenoiserInfo:
                 for width, height in self.canvases
             ],
             "max_sequence_rows": self.max_sequence_rows,
+            "condition_tiles": None
+            if self.condition_tiles is None
+            else {
+                "rows": self.condition_tiles.rows,
+                "video": list(self.condition_tiles.video),
+            },
         }
 
     @classmethod
     def from_mapping(cls, value: object, where: str) -> VideoDenoiserInfo:
         data = _map(value, where)
         rows = data.get("max_sequence_rows")
+        tiles = data.get("condition_tiles")
+        if tiles is not None:
+            tiles = _map(tiles, f"{where}.condition_tiles")
+            video = tuple(
+                _uint(size, f"{where}.condition_tiles.video")
+                for size in _seq(
+                    tiles.get("video", ()), f"{where}.condition_tiles.video"
+                )
+            )
+            try:
+                tiles = ConditionTiles(
+                    _uint(tiles.get("rows"), f"{where}.condition_tiles.rows"),
+                    video,  # type: ignore[arg-type]
+                )
+            except ValueError as error:
+                raise invalid_descriptor(
+                    f"{where}.condition_tiles: {error}"
+                ) from None
         return cls(
             tasks=tuple(
                 _str(task, f"{where}.tasks")
@@ -354,6 +382,7 @@ class VideoDenoiserInfo:
             max_sequence_rows=None
             if rows is None
             else _uint(rows, f"{where}.max_sequence_rows"),
+            condition_tiles=tiles,
         )
 
 
