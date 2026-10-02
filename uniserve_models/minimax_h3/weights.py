@@ -20,7 +20,7 @@ from torch.nn import functional as F
 
 from uniserve.loading import checkpoint, weights
 from uniserve.nn import Modulation
-from uniserve_models.qwen3.weights import parameter_sources
+from uniserve_models import qwen3_vl
 
 from . import audio_vae, video_vae
 from .conditioning import assignments as conditioning_assignments
@@ -315,33 +315,16 @@ def transformer_component(model, diffusion):
 
 
 def _text_component(model):
-    # The text encoder checkpoint is a Qwen3-VL model whose language model
-    # lives under ``model.language_model.``; the resident Qwen3 backbone
-    # loads from there and every other native tensor is nonresident.
-    names = {
-        "network." + target.removeprefix("backbone."): source.replace(
-            "model.", "model.language_model.", 1
-        )
-        for target, source in parameter_sources(model.network.config).items()
-        if target.startswith("backbone.")
-    }
-    parameters = dict(model.named_parameters())
-    used = {names[name] for name in parameters}
-
-    def assign(reader):
-        available = frozenset(reader.names())
-        return tuple(
-            weights.Assignment(parameter, reader.get(names[name]))
-            for name, parameter in parameters.items()
-            if names[name] in available
-        )
-
+    # The text encoder checkpoint is a whole Qwen3-VL model: the resident
+    # language-model layers and the vision tower load from it, and every
+    # other native tensor (the language head, layers past the retained
+    # depth) is nonresident.
     return weights.ModuleMapping(
         model,
         "text_encoder",
-        assign,
-        frozenset(parameters),
-        nonresident=_text_names(model.config) - used,
+        lambda reader: qwen3_vl.weights.assignments(model, reader),
+        frozenset(name for name, _ in model.named_parameters()),
+        nonresident=_text_names(model.config) - qwen3_vl.weights.sources(model),
     )
 
 
