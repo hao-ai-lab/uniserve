@@ -19,16 +19,26 @@ from uniserve.distributed import DeviceMesh
 from uniserve.nn import _binding
 
 from ..config import AttentionParallelConfig
-from .inputs import BlockInput, Input, NormRope, Workspace
+from .inputs import TILE_SIZES, BlockInput, Input, NormRope, Workspace
 
 
 class BlockAttention(nn.Module):
-    """Compute attention over an explicit per-head selected key-block domain."""
+    """Compute attention over an explicit per-head selected key-block domain.
+
+    ``tile_size`` rows form one query tile and one key block; the block
+    inputs this layer attends declare the same size (``Pattern.tile``).
+    """
 
     def __init__(self, scale: float, tile_size: int = 64):
         super().__init__()
-        if not math.isfinite(scale) or scale <= 0 or tile_size != 64:
-            raise ValueError("VSA requires a positive scale and tile size 64")
+        if (
+            not math.isfinite(scale)
+            or scale <= 0
+            or tile_size not in TILE_SIZES
+        ):
+            raise ValueError(
+                f"VSA requires a positive scale and a tile of {TILE_SIZES} rows"
+            )
         self.scale, self.tile_size = scale, tile_size
 
     @contextmanager
@@ -46,7 +56,7 @@ class BlockAttention(nn.Module):
 
         if q.is_cuda and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("bind and prepare VSA before CUDA graph capture")
-        provider = vsa.resolve("auto", device=q.device)
+        provider = vsa.resolve("auto", device=q.device, tile=batch.pattern.tile)
         options = {
             "num_heads": q.shape[1],
             "head_dim": q.shape[2],
@@ -65,6 +75,8 @@ class BlockAttention(nn.Module):
             buffers.close()
 
     def forward(self, q, k, v, batch: BlockInput, *, out=None):
+        if batch.pattern.tile != self.tile_size:
+            raise ValueError("VSA block input must use this layer's tile size")
         if out is None:
             out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
         with self._operator(q, batch) as operator:
@@ -189,9 +201,11 @@ class Attention(nn.Module):
         mesh: DeviceMesh | None = None,
     ):
         super().__init__()
-        if tile_size != attention.tile_size:
+        # The pooling, block-map and compression kernels of this composition
+        # address 64-row tiles (``RegionAttention`` serves other tiles).
+        if tile_size != 64 or tile_size != attention.tile_size:
             raise ValueError(
-                "VSA selection and block attention must use the same tile size"
+                "VSA selection and block attention must share 64-row tiles"
             )
         self.attention, self.tile_size = attention, tile_size
         self.mesh = (
