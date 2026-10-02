@@ -35,5 +35,7 @@ uniserve_eval = [
     "profiles.toml",
     "fast_h3.toml",
     "fast_h3_h200.toml",
+    "minimax_h3.toml",
     "workloads/fast_h3/*.jsonl",
+    "workloads/minimax_h3/*.jsonl",
 ]
