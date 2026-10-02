@@ -185,10 +185,9 @@ VIDEO_WORK_FIELDS = {
 }
 
 
-# Video tasks the video benchmark builds requests for. Dataset rows carry no
-# condition media, so a request's condition list is empty, which only t2va
-# accepts.
-VIDEO_TASKS = frozenset({"t2va"})
+# Video tasks the video benchmark builds requests for. A t2va request carries
+# no conditions; fl2va and ref2va rows carry their condition media.
+VIDEO_TASKS = frozenset({"t2va", "fl2va", "ref2va"})
 
 # The schedule fields of the canonical request body: sigma points including
 # the clean endpoint, then the video and audio schedule shifts.
@@ -227,6 +226,15 @@ class VideoConfig:
     them: SGLang and vLLM-Omni need all three, and FastVideo, whose shifts
     come from its checkpoint, needs the point count and refuses the shifts.
 
+    ``condition_root`` is the directory that the condition media paths of
+    fl2va and ref2va rows are relative to; a t2va point has none. Every
+    backend receives the same files from it, each in its own request form.
+
+    ``parallel_decoding`` marks a FastVideo point that measures a parallel
+    decoding (PDD) student, such as FastH3 OmniRef. FastVideo counts such a
+    checkpoint's schedule in fused-block forwards, one fewer than its sigma
+    points, where it counts the DMD and uniform schedules in sigma points.
+
     ``prompt_tokens`` is the tokenizer length of the prompts that the
     MiniMax H3 dataset synthesizes. ``extra_params`` adds serving options to
     every request of a backend that accepts them: vLLM-Omni receives them in
@@ -246,6 +254,8 @@ class VideoConfig:
     backend: str = "uniserve"
     poll_interval_s: float = 0.1
     media_dir: str | None = None
+    condition_root: str | None = None
+    parallel_decoding: bool = False
     extra_params: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -253,9 +263,13 @@ class VideoConfig:
         if not math.isfinite(self.seconds) or self.seconds <= 0.0:
             raise ValueError("video seconds must be finite and positive")
         if self.task not in VIDEO_TASKS:
+            raise ValueError(f"video task must be one of {sorted(VIDEO_TASKS)}")
+        # Conditioned tasks read their rows' media from the root; t2va rows
+        # carry none, so a root there would be configuration without effect.
+        if (self.task == "t2va") != (self.condition_root is None):
             raise ValueError(
-                f"video task must be one of {sorted(VIDEO_TASKS)}; requests "
-                "carry no condition media"
+                "video condition_root names the condition media of fl2va "
+                "and ref2va rows and is required exactly for those tasks"
             )
         if not isinstance(self.aspect_ratio, str):
             raise ValueError("video aspect_ratio must be a string")
@@ -265,6 +279,11 @@ class VideoConfig:
             raise ValueError("unknown video backend")
         if not math.isfinite(self.poll_interval_s) or self.poll_interval_s <= 0:
             raise ValueError("poll_interval_s must be finite and positive")
+        # Only FastVideo's request counts steps by the checkpoint's kind.
+        if self.parallel_decoding and self.backend != "fastvideo":
+            raise ValueError(
+                "video parallel_decoding applies only to fastvideo"
+            )
         self._check_schedule()
         if self.extra_params and self.backend not in VIDEO_WORK_FIELDS:
             raise ValueError(
@@ -327,6 +346,11 @@ class Example:
     ``output_len`` are dataset-side token counts that stand in for
     server-reported usage when a chat response carries none; the text task
     also uses ``output_len`` as its output limit.
+
+    ``conditions`` lists a video row's condition media in request order, each
+    an object with the request's ``type``, ``role`` and, where they apply,
+    ``frame_index`` and ``start_time_seconds``, plus ``media``: the file's
+    path relative to the point's ``video.condition_root``.
     """
 
     id: str
@@ -343,6 +367,7 @@ class Example:
     seed: int | None = None
     aspect_ratio: str | None = None
     seconds: float | None = None
+    conditions: list[dict[str, Any]] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -364,6 +389,22 @@ class VideoShape:
 
 
 @dataclass(frozen=True)
+class ConditionMedia:
+    """A condition's media file, read before the request is measured.
+
+    Attributes:
+        path: Absolute local path of the file.
+        mime: The file's media type, from its suffix.
+        data: The file's bytes, for a backend that receives media as
+            request parts.
+    """
+
+    path: str
+    mime: str
+    data: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
 class TaskRequest:
     """Contains an endpoint payload and its streaming mode.
 
@@ -371,7 +412,10 @@ class TaskRequest:
     ``conditions``, ``target``, ``seed`` and any stated schedule), which the
     native video transport sends to UniServe and SGLang as is and translates
     for the other backends; those take explicit dimensions or a frame count
-    from ``video_shape``.
+    from ``video_shape``. Its conditions name their media by ``file://`` URI;
+    ``condition_media`` holds the same files in the same order for backends
+    that take uploads or plain paths instead. ``video_parallel_decoding`` is
+    the point's ``VideoConfig.parallel_decoding``.
     """
 
     endpoint: str
@@ -381,6 +425,8 @@ class TaskRequest:
     poll_interval_s: float = 0.1
     video_extra_params: dict[str, Any] = field(default_factory=dict)
     video_shape: VideoShape | None = None
+    condition_media: tuple[ConditionMedia, ...] = ()
+    video_parallel_decoding: bool = False
 
 
 @dataclass(frozen=True)
@@ -541,6 +587,15 @@ class RequestRecord:
     video_body: bytes | None = field(default=None, repr=False)
     video_mime: str = ""
     requested_seconds: float | None = None
+    # The canvas and frame count the request's target resolves to, which
+    # the output is validated against.
+    video_shape: VideoShape | None = None
+    # Timings a video server reported for this request, as it defines them:
+    # its inference time, its named stage durations, and its peak device
+    # memory in MiB. Servers that report none leave them unset.
+    server_inference_s: float | None = None
+    server_stage_s: dict[str, float] = field(default_factory=dict)
+    server_peak_memory_mib: float | None = None
     media_checks: dict[str, bool] = field(default_factory=dict)
     original_output: dict[str, Any] | None = None
     example: dict[str, Any] | None = None
@@ -805,6 +860,14 @@ class RequestRecord:
                 else None
             ),
             "requested_seconds": self.requested_seconds,
+            "video_shape": (
+                asdict(self.video_shape)
+                if self.video_shape is not None
+                else None
+            ),
+            "server_inference_s": self.server_inference_s,
+            "server_stage_s": dict(self.server_stage_s),
+            "server_peak_memory_mib": self.server_peak_memory_mib,
             "media_checks": self.media_checks,
             "original_output": self.original_output,
             "example": self.example,

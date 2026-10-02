@@ -88,7 +88,9 @@ def run(args: argparse.Namespace) -> None:
     still performs its own declared warmup and priming. Results go to
     `<output root>/<point name>`, which `run_point` requires to be absent or
     empty, and server output goes to `<output root>/server-logs/<first point
-    of the deployment>.log`, with a `.replica-<i>` infix per replica.
+    of the deployment>.log`, with a `.replica-<i>` infix per replica. Each
+    point's launch record carries its deployment's `startup_s`, the seconds
+    from launch until every process was ready (`ManagedServer`).
 
     Exits with status 2 when a point completes with a failed validation,
     immediately unless `--keep-going` asks to measure the remaining points
@@ -147,6 +149,11 @@ def run(args: argparse.Namespace) -> None:
                 with ManagedDeployment(
                     processes, timeout_s=args.launch_timeout_s
                 ) as deployment:
+                    # Every point the deployment serves reports the startup
+                    # it was launched with.
+                    launch_record["deployment"]["startup_s"] = (
+                        deployment.startup_s
+                    )
                     for point in group:
                         exited = deployment.exited()
                         if exited:

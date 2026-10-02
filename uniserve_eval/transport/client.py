@@ -76,6 +76,7 @@ async def send_request(
             record.requested_seconds = float(
                 payload["target"]["duration_seconds"]
             )
+            record.video_shape = request.video_shape
             # One deadline covers dispatch, polling and the complete media body.
             async with asyncio.timeout(timeout_s):
                 await receive_video(client, base_url, request, record)

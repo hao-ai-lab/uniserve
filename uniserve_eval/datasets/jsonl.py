@@ -30,6 +30,7 @@ _OPTIONAL = (
     "seed",
     "aspect_ratio",
     "seconds",
+    "conditions",
     "metadata",
 )
 

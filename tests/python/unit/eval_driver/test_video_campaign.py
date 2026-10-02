@@ -30,6 +30,7 @@ from uniserve_eval.types import (
     RequestRecord,
     TaskName,
     VideoConfig,
+    VideoShape,
 )
 
 pytestmark = pytest.mark.unit
@@ -86,6 +87,44 @@ def form_fields(request):
     }
 
 
+def decoded(width=1344, height=768, frames=124, audio_samples=None):
+    """A decoded output with the H3 media contract at the given shape."""
+    return DecodedVideo(
+        data=b"",
+        sha256="",
+        byte_size=0,
+        mime="video/mp4",
+        width=width,
+        height=height,
+        frame_count=frames,
+        fps_numerator=24,
+        fps_denominator=1,
+        video_codec="h264",
+        audio_codec="aac",
+        audio_channels=2,
+        audio_sample_rate=32000,
+        audio_samples=(
+            round(frames / 24 * 32000)
+            if audio_samples is None
+            else audio_samples
+        ),
+        sample_filename="sample.mp4",
+        video_variance=1,
+        audio_rms=0.1,
+    )
+
+
+def answered(request, video):
+    """The record of a request whose response decoded to ``video``."""
+    return RequestRecord(
+        request_id="row",
+        task="video",
+        requested_seconds=request.payload["target"]["duration_seconds"],
+        video_shape=request.video_shape,
+        decoded_video=video,
+    )
+
+
 def test_each_duration_uses_ties_to_even_and_native_alignment():
     task = VideoTask(point())
     records = []
@@ -97,33 +136,9 @@ def test_each_duration_uses_ties_to_even_and_native_alignment():
         (10, 243),
         (15, 362),
     ]:
-        video = DecodedVideo(
-            data=b"",
-            sha256="",
-            byte_size=0,
-            mime="video/mp4",
-            width=1344,
-            height=768,
-            frame_count=frames,
-            fps_numerator=24,
-            fps_denominator=1,
-            video_codec="h264",
-            audio_codec="aac",
-            audio_channels=2,
-            audio_sample_rate=32000,
-            audio_samples=round(frames / 24 * 32000),
-            sample_filename="sample.mp4",
-            video_variance=1,
-            audio_rms=0.1,
-        )
-        records.append(
-            RequestRecord(
-                request_id=str(seconds),
-                task="video",
-                requested_seconds=seconds,
-                decoded_video=video,
-            )
-        )
+        request = task.build_request(Example("row", "scene", seconds=seconds))
+        assert request.video_shape == VideoShape(1344, 768, frames)
+        records.append(answered(request, decoded(frames=frames)))
     assert task.validate_output(records).valid
     records[-1].decoded_video = replace(
         records[-1].decoded_video, frame_count=124
@@ -145,30 +160,13 @@ def test_each_duration_uses_ties_to_even_and_native_alignment():
 def test_media_length_tolerates_one_frame_around_the_aligned_duration(
     frames, audio_samples, valid
 ):
-    video = DecodedVideo(
-        data=b"",
-        sha256="",
-        byte_size=0,
-        mime="video/mp4",
-        width=1344,
-        height=768,
-        frame_count=frames,
-        fps_numerator=24,
-        fps_denominator=1,
-        video_codec="h264",
-        audio_codec="aac",
-        audio_channels=2,
-        audio_sample_rate=32000,
-        audio_samples=audio_samples,
-        sample_filename="sample.mp4",
-        video_variance=1,
-        audio_rms=0.1,
-    )
-    record = RequestRecord(
-        request_id="15", task="video", requested_seconds=15, decoded_video=video
+    task = VideoTask(point())
+    request = task.build_request(Example("row", "scene", seconds=15))
+    record = answered(
+        request, decoded(frames=frames, audio_samples=audio_samples)
     )
 
-    assert VideoTask(point()).validate_output([record]).valid is valid
+    assert task.validate_output([record]).valid is valid
 
 
 @pytest.mark.parametrize(
@@ -187,32 +185,12 @@ def test_media_must_have_the_canvas_the_target_resolves_to(
     aspect_ratio, canvas
 ):
     width, height = canvas
-    video = DecodedVideo(
-        data=b"",
-        sha256="",
-        byte_size=0,
-        mime="video/mp4",
-        width=width,
-        height=height,
-        frame_count=124,
-        fps_numerator=24,
-        fps_denominator=1,
-        video_codec="h264",
-        audio_codec="aac",
-        audio_channels=2,
-        audio_sample_rate=32000,
-        audio_samples=round(124 / 24 * 32000),
-        sample_filename="sample.mp4",
-        video_variance=1,
-        audio_rms=0.1,
-    )
-    record = RequestRecord(
-        request_id="5", task="video", requested_seconds=5, decoded_video=video
-    )
     task = VideoTask(point(video=VideoConfig(aspect_ratio=aspect_ratio)))
+    request = task.build_request(Example("row", "scene", seconds=5))
+    record = answered(request, decoded(width, height))
 
     assert task.validate_output([record]).valid
-    record.decoded_video = replace(video, width=width + 32)
+    record.decoded_video = decoded(width + 32, height)
     assert not task.validate_output([record]).checks["target_canvas"]
 
 
@@ -544,8 +522,11 @@ def test_video_extra_params_cannot_change_the_work_or_go_unsent(
         ({"num_inference_steps": 1}, "at least 2"),
         ({"flow_shift": 0.0}, "flow_shift"),
         ({"audio_flow_shift": float("nan")}, "audio_flow_shift"),
-        # Rows carry no condition media, which fl2va and ref2va require.
-        ({"task": "fl2va"}, "condition media"),
+        # A conditioned task reads its rows' media from a condition root,
+        # which a t2va point has no use for.
+        ({"task": "fl2va"}, "condition_root"),
+        ({"task": "ref2va"}, "condition_root"),
+        ({"condition_root": "inputs"}, "condition_root"),
     ],
 )
 def test_video_config_refuses_work_a_backend_cannot_be_sent(settings, message):
