@@ -6,6 +6,8 @@ condition ahead of the generated rows, and writes each condition's projected
 rows into the request's retained conditioning past the prompt capacity.
 """
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -229,3 +231,48 @@ def test_reference_region_state_follows_its_layout():
     # row takes its zero row.
     zero = model.text_condition_rows(layout) - 1
     assert int((out["prefix_index"] != zero).sum()) == prefix
+
+
+def test_a_condition_layout_holds_its_condition_rows():
+    model = _meta(base_denoiser(tasks=("ref2va",)))
+    layout = model.layout_size(model.make_size(124, 64, canvas=WIDE))
+    # The clip's 4032 + 120 rows and the image's 2304 take 101 whole 64-row
+    # tiles; the rest of the layout is kept.
+    size = model.make_size(124, 64, canvas=WIDE, conditions=(CLIP, IMAGE))
+    widened = model.condition_layout(layout, size.condition_rows)
+    assert widened.condition_rows == 101 * 64
+    assert (
+        widened.num_frames,
+        widened.canvas,
+        widened.num_text_tokens,
+    ) == (layout.num_frames, layout.canvas, layout.num_text_tokens)
+    # The widened layout holds the request; the text-only one does not.
+    assert model.holds(widened, size)
+    assert not model.holds(layout, size)
+    # A layout whose region already holds the rows is kept as it is.
+    assert model.condition_layout(widened, 64) == widened
+
+
+def test_a_condition_layout_respects_the_attention_and_sequence_bound():
+    with pytest.raises(ValueError, match="single-region sparse"):
+        model = _meta(dmd_denoiser())
+        model.condition_layout(
+            model.layout_size(model.make_size(124, 64, canvas=WIDE)), 64
+        )
+
+    # Region packing takes conditions in its own 128-row tiles.
+    model = _meta(omniref_denoiser())
+    layout = model.layout_size(model.make_size(124, 300, canvas=WIDE))
+    widened = model.condition_layout(layout, 7000)
+    assert widened.condition_rows == 55 * 128
+    size = model.make_size(124, 300, canvas=WIDE, conditions=(CLIP, IMAGE))
+    widened = model.condition_layout(layout, size.condition_rows)
+    assert model.holds(widened, size)
+
+    # 37296 video, 414 audio and 64 text rows of a 5 s 16:9 layout leave
+    # 1024 rows below a 38798-row bound: 16 tiles fit, 17 do not.
+    model = _meta(replace(base_denoiser(), max_sequence_rows=38_798))
+    layout = model.layout_size(model.make_size(124, 64, canvas=WIDE))
+    assert model.condition_layout(layout, 1024).condition_rows == 1024
+    with pytest.raises(ValueError, match="38798 sequence rows"):
+        model.condition_layout(layout, 1025)

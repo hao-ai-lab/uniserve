@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import cast
 
 import torch
@@ -429,6 +430,49 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return (
             layout.condition_rows * self.config.transformer.video_channels * 4
         )
+
+    def condition_layout(
+        self, layout: DenoiserSize, condition_rows: int
+    ) -> DenoiserSize:
+        """Return ``layout`` with a condition region of ``condition_rows``.
+
+        Conditions occupy whole tiles (64 rows, or the region packing's
+        tile), as ``layout_size`` rounds them, and a larger region is kept.
+        The checkpoint's ``max_sequence_rows`` bounds the widened layout's
+        generated, text and condition rows.
+
+        Raises:
+            ValueError: Single-region sparse attention, which takes no
+                conditions, a negative row count, or a widened layout beyond
+                ``max_sequence_rows``.
+        """
+        if not (self.dense or self.regional):
+            raise ValueError(
+                "single-region sparse H3 attention takes no conditions"
+            )
+        if type(condition_rows) is not int or condition_rows < 0:
+            raise ValueError("H3 condition rows must be a nonnegative count")
+        tile = self._tile
+        widened = replace(
+            layout,
+            condition_rows=max(
+                layout.condition_rows, math.ceil(condition_rows / tile) * tile
+            ),
+        )
+        limit = self.max_sequence_rows
+        if limit is not None:
+            rows = (
+                self.latent_shape("video", widened)[0]
+                + self.latent_shape("audio", widened)[0]
+                + widened.num_text_tokens
+                + widened.condition_rows
+            )
+            if rows > limit:
+                raise ValueError(
+                    f"an H3 layout of {rows} rows exceeds the checkpoint's "
+                    f"{limit} sequence rows"
+                )
+        return widened
 
     @torch.inference_mode()
     def encode_conditions(

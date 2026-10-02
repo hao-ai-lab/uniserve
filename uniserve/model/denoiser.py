@@ -317,6 +317,22 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         """
         return 0
 
+    def condition_layout(
+        self, layout: VideoSizeT, condition_rows: int
+    ) -> VideoSizeT:
+        """Widen ``layout`` so its condition region holds ``condition_rows``.
+
+        Returns ``layout`` with a condition region that holds
+        ``condition_rows`` packed condition rows, and is otherwise equal; a
+        layout that already holds them is returned as it is. A serving owner
+        sizes the layout that bounds its condition capacity this way.
+
+        Raises:
+            ValueError: The network takes no conditions, or the widened
+                layout exceeds ``max_sequence_rows``.
+        """
+        raise ValueError("this network takes no conditioning inputs")
+
     def encode_conditions(
         self,
         size: VideoSizeT,
