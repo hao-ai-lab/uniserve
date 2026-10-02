@@ -395,7 +395,12 @@ class RegionSparse(nn.Module):
             rounding=self.rounding,
         )
         attended = self.vsa(q, k, v, gate, inputs.regions)
-        yield inputs.token_slice, self.output(attended.flatten(1))
+        # The caller runs the feed-forward update while this generator waits
+        # at its yield; release the projections and attended rows first.
+        del chunks, q, k, v, gate
+        output = self.output(attended.flatten(1))
+        del attended
+        yield inputs.token_slice, output
 
     def forward(self, hidden, cos, sin, inputs, *, workspace):
         return next(

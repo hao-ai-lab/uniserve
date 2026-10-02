@@ -170,8 +170,6 @@ class RegionAttention(nn.Module):
         weights = scores.masked_fill(~live, -torch.inf).softmax(-1)
         compressed = torch.matmul(weights, pooled_value).to(q.dtype)
         tiled = (tiles, tile, heads, width)
-        attended = fine.view(tiled) + (
-            compressed.permute(1, 0, 2)[:, None] * gate.reshape(tiled)
-        )
-        attended = attended.view(regions.padded_tokens, heads, width)
-        return self.exchange.tokens(attended)
+        gated = compressed.permute(1, 0, 2)[:, None] * gate.view(tiled)
+        fine.view(tiled).add_(gated)
+        return self.exchange.tokens(fine)

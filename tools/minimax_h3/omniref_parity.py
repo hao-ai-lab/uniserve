@@ -132,6 +132,10 @@ def run(args) -> dict:
     )
     model = models.load_model(config, device=device).model
     denoiser = getattr(model, COMPONENT)
+    # Loading materializes the 13B-parameter AdaLN projections only while it
+    # precomputes the modulation products; return their cached storage so
+    # the run shares its device with other jobs.
+    torch.cuda.empty_cache()
     loaded = time.perf_counter()
 
     conditions = _conditions(args.run)
