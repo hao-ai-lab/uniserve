@@ -114,7 +114,8 @@ def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(
                 steps=4,
                 groups=2,
             ),
-            config,
+            # The FastH3 student's transformer, which rounds once.
+            denoiser.transformer,
             checkpoint=(
                 checkpoint.Config("denoiser").resolve(
                     tmp_path, io=loading.Config()

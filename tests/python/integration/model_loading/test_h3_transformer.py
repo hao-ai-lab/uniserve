@@ -200,7 +200,8 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
             steps=4,
             groups=2,
         ),
-        config,
+        # The FastH3 student's transformer, which rounds once.
+        denoiser.transformer,
         checkpoint=(
             checkpoint.Config("denoiser").resolve(
                 tmp_path, io=loading.Config()

@@ -46,6 +46,7 @@ class TransformerLayer(nn.Module):
     def __init__(self, config: TransformerConfig, attention: Dense | Sparse):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.rounding = config.rounding
         self.norm = nn.ModuleList(
             (
                 RMSNorm(config.hidden_size, config.norm_eps),
@@ -53,7 +54,11 @@ class TransformerLayer(nn.Module):
             )
         )
         self.attention = attention
-        self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
+        self.mlp = GatedMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            rounding=config.rounding,
+        )
 
     @torch.inference_mode()
     def forward_chunks(
@@ -139,6 +144,7 @@ class TransformerLayer(nn.Module):
                         indices[local],
                         eps=attention_norm.eps,
                         retain=hidden[local],
+                        rounding=self.rounding,
                     ),
                 )
 
@@ -176,6 +182,7 @@ class TransformerLayer(nn.Module):
                         scale_mlp,
                         selected,
                         eps=mlp_norm.eps,
+                        rounding=self.rounding,
                     )
                 )
                 normalized: torch.Tensor = quantizer.from_tensors(
@@ -193,9 +200,14 @@ class TransformerLayer(nn.Module):
                     scale_mlp,
                     selected,
                     eps=mlp_norm.eps,
+                    rounding=self.rounding,
                 )
             return functional.gated_residual(
-                residual, self.mlp(normalized), gate_mlp, selected
+                residual,
+                self.mlp(normalized),
+                gate_mlp,
+                selected,
+                rounding=self.rounding,
             )
 
         # Dynamic tensor-wide statistics (uncalibrated NVFP4, tensor-wide FP8)

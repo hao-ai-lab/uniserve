@@ -21,6 +21,7 @@ from types import MappingProxyType
 from typing import Any, TypeAlias
 
 from uniserve.media import image
+from uniserve.nn.functional import Rounding
 
 from . import audio_vae, output, video_vae
 from .checkpoint import (
@@ -110,7 +111,12 @@ class TransformerConfig:
 
     ``output_heads`` is 1 for an ordinary DiT and the fine-grid interval
     count for a parallel-decoding (PDD) student, whose output projections
-    hold one head-major prediction per interval.
+    hold one head-major prediction per interval. ``rounding`` is the
+    checkpoint's elementwise recipe for the block epilogues (modulation,
+    gated residuals, Q/K rotation and SwiGLU gating): the released base and
+    component checkpoints are defined by references that round after every
+    eager BF16 operation; FastH3 exports keep UniServe's single-rounding
+    kernels, whose served results their release fixed.
     """
 
     hidden_size: int = 5376
@@ -130,6 +136,7 @@ class TransformerConfig:
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     output_heads: int = 1
+    rounding: Rounding = Rounding.STEPWISE
 
     def __post_init__(self) -> None:
         for name in (
@@ -163,6 +170,8 @@ class TransformerConfig:
                 raise ValueError(
                     f"H3 transformer {name} must be finite and positive"
                 )
+        if not isinstance(self.rounding, Rounding):
+            raise ValueError("H3 transformer rounding must be a Rounding")
         # Each of the three rotary axes (time, height, width) rotates
         # 2 * rope_frequency_dim channels of a head; the rest stay unrotated.
         if (
@@ -419,7 +428,8 @@ class Config:
         # Packing, attention, native reconstruction and checkpoint identity
         # implement this architecture; typed configs do not imply arbitrary
         # variants. The latent statistics come from each checkpoint and are
-        # exempt, as are the PDD output heads.
+        # exempt, as are the PDD output heads and the checkpoint family's
+        # rounding recipe.
         expected_networks: tuple[tuple[str, object, object], ...] = (
             ("text_encoder", self.text_encoder, TextEncoderConfig()),
             ("video_vae", self.video_vae, video_vae.Config()),
@@ -436,6 +446,7 @@ class Config:
                     "latents_mean",
                     "latents_std",
                     "output_heads",
+                    "rounding",
                 }:
                     continue
                 value = getattr(actual, field.name)
@@ -682,7 +693,9 @@ def _pdd_denoiser(
     )
 
 
-def _transformer(values: Mapping[str, Any], *, heads: int) -> TransformerConfig:
+def _transformer(
+    values: Mapping[str, Any], *, heads: int, rounding: Rounding
+) -> TransformerConfig:
     missing = set(TRANSFORMER_FIELDS) - values.keys()
     if missing:
         raise ValueError(
@@ -697,6 +710,7 @@ def _transformer(values: Mapping[str, Any], *, heads: int) -> TransformerConfig:
         )
     return TransformerConfig(
         output_heads=heads,
+        rounding=rounding,
         **{
             target: values[source]
             for source, target in TRANSFORMER_FIELDS.items()
@@ -833,7 +847,13 @@ def normalize(
                 "unsupported MiniMax-H3 checkpoint: transformer pdd_steps "
                 f"must be a positive integer, got {heads!r}"
             )
-        transformer = _transformer(values, heads=heads)
+        transformer = _transformer(
+            values,
+            heads=heads,
+            rounding=Rounding.ONCE
+            if layout.kind is Kind.FASTVIDEO_EXPORT
+            else Rounding.STEPWISE,
+        )
         if layout.kind is Kind.FASTVIDEO_EXPORT:
             assert layout.contract is not None
             denoisers[component] = _dmd_denoiser(

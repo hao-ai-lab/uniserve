@@ -51,6 +51,7 @@ class Dense(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.head_dim = config.head_dim
+        self.rounding = config.rounding
         # Rotated channels of each head: two halves of three axes' frequencies.
         self.rotary_width = 6 * config.rope_frequency_dim
         inner = config.num_attention_heads * config.head_dim
@@ -113,6 +114,7 @@ class Dense(nn.Module):
             (sin, unrotated),
             eps=self.query_norm.eps,
             axis_dims=(self.rotary_width, self.head_dim - self.rotary_width),
+            rounding=self.rounding,
         )
         attended = self.attention(q, k, v.contiguous(), inputs.visible)
         yield inputs.token_slice, self.output(attended.flatten(1))
@@ -134,6 +136,12 @@ class Sparse(nn.Module):
 
     def __init__(self, config: TransformerConfig, *, sparsity: float):
         super().__init__()
+        # VSA normalizes and rotates Q/K inside its fused input preparation,
+        # which implements the single-rounding recipe only.
+        if config.rounding is not functional.Rounding.ONCE:
+            raise ValueError(
+                "H3 sparse attention prepares Q/K with a single rounding"
+            )
         self.head_dim = config.head_dim
         self.sparsity = sparsity
         inner = config.num_attention_heads * config.head_dim

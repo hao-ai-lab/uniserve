@@ -10,7 +10,7 @@ from uniserve.nn.attention import (
     QKVProjection,
     RotaryQKVProjection,
 )
-from uniserve.nn.functional import apply_rotary, qk_norm_rope
+from uniserve.nn.functional import Rounding, apply_rotary, qk_norm_rope
 from uniserve.nn.linear import QKVParallelLinear
 from uniserve.nn.rope import DynamicScaling, LinearScaling, LongRoPEScaling
 
@@ -727,3 +727,56 @@ def test_sections_with_shared_coordinates_reproduce_one_axis_factors(device):
 def test_sections_must_partition_the_interleaved_frequencies(sections):
     with pytest.raises(ValueError, match="M-RoPE sections"):
         RotaryEmbedding(128, sections=sections)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+def test_stepwise_qk_rotation_rounds_each_eager_operation(device):
+    """Stepwise Q/K preparation equals eager BF16 PyTorch bit for bit.
+
+    Heads of +-1 have an exact unit mean square, so each weighted
+    normalization rounds to its weight in BF16 for any reduction order, and
+    the rotation's BF16 products and sums are exact functions of the
+    operands. 96 of the 128 channels rotate split-half.
+    """
+    generator = torch.Generator().manual_seed(183)
+    rows, heads, dim, rotated, eps = 37, 4, 128, 96, 1e-6
+
+    def unit_heads():
+        signs = torch.randint(0, 2, (rows, heads, dim), generator=generator)
+        return (signs * 2 - 1).to(device=device, dtype=torch.bfloat16)
+
+    q, k = unit_heads(), unit_heads()
+    q_weight, k_weight = (
+        (torch.rand(dim, generator=generator) + 0.5).to(
+            device=device, dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    angles = torch.rand(rows, rotated // 2, generator=generator) * 40
+    cos, sin = angles.cos().to(device), angles.sin().to(device)
+
+    def eager(value, weight):
+        normalized = F.rms_norm(value, (dim,), weight, eps)
+        head, tail = normalized[..., :rotated], normalized[..., rotated:]
+        first, second = head.chunk(2, dim=-1)
+        cosine = torch.cat((cos, cos), -1).to(torch.bfloat16)[:, None]
+        sine = torch.cat((sin, sin), -1).to(torch.bfloat16)[:, None]
+        turned = torch.cat((-second, first), dim=-1)
+        return torch.cat((head * cosine + turned * sine, tail), dim=-1)
+
+    query, key = qk_norm_rope(
+        q,
+        k,
+        (q_weight,),
+        (k_weight,),
+        (cos, cos[..., :0]),
+        (sin, sin[..., :0]),
+        eps=eps,
+        axis_dims=(rotated, dim - rotated),
+        rounding=Rounding.STEPWISE,
+    )
+
+    torch.testing.assert_close(query, eager(q, q_weight), rtol=0, atol=0)
+    torch.testing.assert_close(key, eager(k, k_weight), rtol=0, atol=0)

@@ -69,7 +69,11 @@ class RefinerBlock(nn.Module):
             config.hidden_size,
             bias=False,
         )
-        self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
+        self.mlp = GatedMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            rounding=config.rounding,
+        )
 
     def forward(
         self, hidden: torch.Tensor, visible: VisibleInput | None = None

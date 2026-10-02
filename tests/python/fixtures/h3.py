@@ -1,6 +1,9 @@
 """MiniMax-H3 denoiser configurations of the released checkpoint families."""
 
+from dataclasses import replace
+
 from uniserve.media import image
+from uniserve.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     Config,
     DenoiserConfig,
@@ -25,9 +28,12 @@ def dmd_denoiser(
     video_shift: float = 12.0,
     sparsity: float = 0.9,
 ) -> DenoiserConfig:
-    """A FastH3 DMD student: sparse tile-64 attention, text-only, 16:9."""
+    """A FastH3 DMD student: sparse tile-64 attention, text-only, 16:9.
+
+    Its transformer rounds once, as normalization assigns FastH3 exports.
+    """
     return DenoiserConfig(
-        transformer=transformer,
+        transformer=replace(transformer, rounding=Rounding.ONCE),
         schedule=DmdLadder(
             rungs=rungs, video_shift=video_shift, audio_shift=3.0
         ),

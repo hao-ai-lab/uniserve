@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from uniserve.loading import Config as IOConfig
+from uniserve.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     DenseAttention,
     Model,
@@ -63,6 +64,8 @@ def test_full_vsa_checkpoint_resolves_its_trained_rungs(checkpoint):
     assert [(canvas.width, canvas.height) for canvas in denoiser.canvases] == [
         (1344, 768)
     ]
+    # FastH3 exports keep the single-rounding block epilogues.
+    assert denoiser.transformer.rounding is Rounding.ONCE
 
 
 def test_diffusers_root_serves_both_task_families(base):
@@ -81,6 +84,8 @@ def test_diffusers_root_serves_both_task_families(base):
         )
         assert denoiser.canvases is None
         assert denoiser.max_sequence_rows is None
+        # The released DiTs follow the diffusers eager BF16 arithmetic.
+        assert denoiser.transformer.rounding is Rounding.STEPWISE
     points = entry_points(config)
     assert {"denoiser", "reference_denoiser"} <= set(points)
     with torch.device("meta"):
@@ -147,6 +152,8 @@ def test_component_export_states_its_parallel_decoding_contract(checkpoint):
     )
     assert denoiser.tasks == ("ref2va",)
     assert denoiser.max_sequence_rows == 131_072
+    # Component exports follow their reference's eager BF16 arithmetic.
+    assert denoiser.transformer.rounding is Rounding.STEPWISE
     # A student whose heads disagree with its contract is rejected.
     metadata["reference_denoiser"] = {**transformer, "pdd_steps": 16}
     with pytest.raises(ValueError, match="pdd_steps"):
