@@ -79,7 +79,8 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         httpx.Client(base_url=base, timeout=1800) as client,
     ):
         video = client.get("/v1/capabilities").json()["video"]
-        assert video["tasks"] == ["t2va"]
+        # The base DiT generates from the prompt alone and from keyframes.
+        assert video["tasks"] == ["t2va", "fl2va"]
         assert video["schedule"] == {
             "num_inference_steps": 50,
             "flow_shift": 12.0,
