@@ -38,4 +38,5 @@ uniserve_eval = [
     "minimax_h3.toml",
     "workloads/fast_h3/*.jsonl",
     "workloads/minimax_h3/*.jsonl",
+    "servers/minimax_h3/*.yaml",
 ]
