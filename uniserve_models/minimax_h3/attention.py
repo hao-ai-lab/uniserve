@@ -361,43 +361,65 @@ class RegionSparse(nn.Module):
         chunk covering the shard.
         """
         rows = inputs.regions.padded_tokens
-        chunks = sorted(
-            self.projection.forward_chunks(
-                hidden, token_slice=inputs.token_slice, num_tokens=rows
-            ),
-            key=lambda chunk: chunk[0].start,
-        )
-        if [chunk[0].start for chunk in chunks] != [
-            0,
-            *(chunk[0].stop for chunk in chunks[:-1]),
-        ] or chunks[-1][0].stop != rows:
-            raise ValueError("H3 region projections must cover every row")
-        q, k, v, gate = (
-            (
-                chunks[0][1][name]
-                if len(chunks) == 1
-                else torch.cat([values[name] for _, values in chunks])
-            ).view(rows, -1, self.head_dim)
-            for name in ("q", "k", "v", "gate")
-        )
         # One RMS domain spans each whole head; the leading axis rotates its
         # 96 channels split-half and the trailing 32 channels pass through.
         unrotated = cos[..., :0]
-        q, k = functional.qk_norm_rope(
-            q,
-            k,
-            (self.query_norm.weight,),
-            (self.key_norm.weight,),
-            (cos, unrotated),
-            (sin, unrotated),
-            eps=self.query_norm.eps,
-            axis_dims=(self.rotary_width, self.head_dim - self.rotary_width),
-            rounding=self.rounding,
+        # Projected intervals of the gathered sequence arrive in any order.
+        # Each normalizes and rotates in place of its rows, so the per-row
+        # recipe's temporaries stay the size of one interval.
+        rotated: dict[str, torch.Tensor] = {}
+        covered = []
+        for interval, values in self.projection.forward_chunks(
+            hidden, token_slice=inputs.token_slice, num_tokens=rows
+        ):
+            branches = {
+                name: values[name].view(
+                    -1, values[name].shape[-1] // self.head_dim, self.head_dim
+                )
+                for name in ("q", "k", "v", "gate")
+            }
+            if not rotated:
+                rotated = {
+                    name: value.new_empty((rows, *value.shape[1:]))
+                    for name, value in branches.items()
+                }
+            rotated["q"][interval], rotated["k"][interval] = (
+                functional.qk_norm_rope(
+                    branches["q"],
+                    branches["k"],
+                    (self.query_norm.weight,),
+                    (self.key_norm.weight,),
+                    (cos[interval], unrotated[interval]),
+                    (sin[interval], unrotated[interval]),
+                    eps=self.query_norm.eps,
+                    axis_dims=(
+                        self.rotary_width,
+                        self.head_dim - self.rotary_width,
+                    ),
+                    rounding=self.rounding,
+                )
+            )
+            for name in ("v", "gate"):
+                rotated[name][interval].copy_(branches[name])
+            covered.append((interval.start, interval.stop))
+        covered.sort()
+        if (
+            not covered
+            or [start for start, _ in covered]
+            != [0, *(stop for _, stop in covered[:-1])]
+            or covered[-1][1] != rows
+        ):
+            raise ValueError("H3 region projections must cover every row")
+        attended = self.vsa(
+            rotated["q"],
+            rotated["k"],
+            rotated["v"],
+            rotated["gate"],
+            inputs.regions,
         )
-        attended = self.vsa(q, k, v, gate, inputs.regions)
         # The caller runs the feed-forward update while this generator waits
         # at its yield; release the projections and attended rows first.
-        del chunks, q, k, v, gate
+        del rotated
         output = self.output(attended.flatten(1))
         del attended
         yield inputs.token_slice, output
