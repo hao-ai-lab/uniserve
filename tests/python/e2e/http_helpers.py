@@ -124,6 +124,23 @@ def post_sse(
         return list(iter_sse_events(response.iter_lines()))
 
 
+def t2va_request(
+    model: str, prompt: str, seconds: float, seed: int
+) -> dict[str, Any]:
+    """A MiniMax-H3 text-to-video-and-audio request at the 16:9 canvas."""
+    return {
+        "model": model,
+        "prompt": prompt,
+        "task": "t2va",
+        "target": {
+            "short_edge": 768,
+            "aspect_ratio": "16:9",
+            "duration_seconds": seconds,
+        },
+        "seed": seed,
+    }
+
+
 def png_size_from_b64(pixels_png_b64: str) -> tuple[int, int]:
     image = Image.open(io.BytesIO(base64.b64decode(pixels_png_b64)))
     image.load()

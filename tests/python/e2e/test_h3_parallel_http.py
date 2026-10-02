@@ -20,6 +20,7 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
+    t2va_request,
     written_deployment,
 )
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
@@ -27,6 +28,7 @@ from uniserve_eval.transport.video import inspect_video_bytes
 from uniserve_eval.types import (
     BenchmarkPoint,
     LoadConfig,
+    MetricDefinition,
     TaskName,
     VideoConfig,
 )
@@ -435,19 +437,13 @@ def test_component_bindings_release_cancelled_requests(
             task=TaskName.VIDEO,
             model="FastH3",
             dataset="minimax-h3",
-            metrics=(),
+            # The point only synthesizes the prompt; its metric is never read.
+            metrics=(MetricDefinition(("videos_per_second",), "higher"),),
             load=LoadConfig(num_prompts=1),
             video=VideoConfig(seconds=seconds, prompt_tokens=tokens),
         )
         prompt = MiniMaxH3Dataset(case).load(tokenizer)[0].prompt
-        payloads.append(
-            {
-                "model": "MiniMax-H3",
-                "prompt": prompt,
-                "seconds": seconds,
-                "seed": 1000,
-            }
-        )
+        payloads.append(t2va_request("MiniMax-H3", prompt, seconds, 1000))
     with server_process(
         command,
         base_url,
@@ -464,7 +460,7 @@ def test_component_bindings_release_cancelled_requests(
     ):
         # Warm both decode geometries before exercising cancellation. Three
         # disconnects exceed the two provisioned slots and require their reuse.
-        for payload, (_seconds, _tokens, frames) in zip(
+        for payload, (seconds, _tokens, frames) in zip(
             payloads, shapes, strict=True
         ):
             response = httpx.post(
@@ -477,13 +473,12 @@ def test_component_bindings_release_cancelled_requests(
                 response.content, declared_mime=response.headers["content-type"]
             )
             assert media.frame_count == frames
+            # The 16:9 target's canvas.
             assert (media.width, media.height) == (1344, 768)
             assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
-            (tmp_path / f"{payload['seconds']}s.mp4").write_bytes(
-                response.content
-            )
+            (tmp_path / f"{seconds}s.mp4").write_bytes(response.content)
             print(
-                f"{parallel_kind}/{precision}: {payload['seconds']}s "
+                f"{parallel_kind}/{precision}: {seconds}s "
                 "complete media passed",
                 flush=True,
             )
@@ -577,37 +572,86 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     ):
         caps = client.get("/v1/capabilities").json()
         assert caps["model"] == "FastH3"
-        assert caps["video"]["tasks"] == ["t2va"]
-        assert caps["video"]["request_fields"] == [
+        video = caps["video"]
+        assert video["tasks"] == ["t2va"]
+        assert video["task_conditions"] == {"t2va": {"conditions": []}}
+        # A FastH3 DMD export generates the 16:9 canvas alone.
+        assert video["canvas"]["aspect_ratios"] == ["16:9"]
+        assert video["canvas"]["canvases"] == [{"width": 1344, "height": 768}]
+        # The schedule counts sigma points: one per trained rung and the
+        # clean endpoint.
+        schedule = video["schedule"]
+        assert schedule["num_inference_steps"] == expected_steps + 1
+        assert set(video["request_fields"]) == {
             "model",
             "prompt",
-            "seconds",
+            "task",
+            "conditions",
+            "target",
             "seed",
-        ]
+            "num_inference_steps",
+            "flow_shift",
+            "audio_flow_shift",
+            "num_outputs_per_prompt",
+            "n",
+            "quality",
+            "seconds",
+            "size",
+            "width",
+            "height",
+        }
+        river = t2va_request("FastH3", "A river", 5, 1001)
         for payload in (
-            {"input_reference": "image.png"},
-            {"num_inference_steps": 8},
-            {"seconds": 16},
+            {**river, "input_reference": "image.png"},
+            # Denoiser forwards are one fewer than the schedule's points.
+            {**river, "num_inference_steps": expected_steps},
+            {**river, "target": {**river["target"], "duration_seconds": 16}},
+            {**river, "target": {**river["target"], "aspect_ratio": "9:16"}},
+            {**river, "seconds": 10},
         ):
+            response = client.post("/v1/videos", json=payload)
+            assert response.status_code == 400, (payload, response.text)
+        # The duration-only body without a task or target is refused on both
+        # routes, naming the missing task.
+        for route in ("/v1/videos", "/v1/videos/sync"):
             response = client.post(
-                "/v1/videos",
-                json={"model": "FastH3", "prompt": "A river", **payload},
+                route,
+                json={
+                    "model": "FastH3",
+                    "prompt": "A river",
+                    "seconds": 5,
+                    "seed": 1001,
+                },
             )
             assert response.status_code == 400
-        payload = {
-            "model": "FastH3",
-            "prompt": "A river flows through a forest, with birds singing.",
+            error = response.json()["error"]
+            assert error["type"] == "invalid_request_error"
+            assert "task" in error["message"], error
+        payload = t2va_request(
+            "FastH3",
+            "A river flows through a forest, with birds singing.",
+            5,
+            1001,
+        )
+        # Multipart fields carry the same names; the target is JSON text.
+        # Restating the reported schedule and the SGLang client's duration
+        # and size is accepted.
+        form = {
+            **payload,
+            "target": json.dumps(payload["target"]),
+            **schedule,
             "seconds": 5,
-            "seed": 1001,
+            "size": "1344x768",
         }
         response = client.post(
             "/v1/videos",
-            files={name: (None, str(value)) for name, value in payload.items()},
+            files={name: (None, str(value)) for name, value in form.items()},
         )
         response.raise_for_status()
         job_id = response.json()["id"]
         job = completed(client, job_id)
         assert job["seconds"] == 5 and job["num_frames"] == 124
+        assert job["size"] == "1344x768"
         assert job["actual_seconds"] == 124 / 24
         assert job["completed_steps"] == job["total_steps"] == expected_steps
         assert job["expires_at"] > job["completed_at"]
@@ -651,7 +695,12 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         # genuinely active job.
         for seed in range(3):
             active = client.post(
-                "/v1/videos", json={**payload, "seconds": 15, "seed": seed}
+                "/v1/videos",
+                json={
+                    **payload,
+                    "target": {**payload["target"], "duration_seconds": 15},
+                    "seed": seed,
+                },
             ).json()["id"]
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline:
