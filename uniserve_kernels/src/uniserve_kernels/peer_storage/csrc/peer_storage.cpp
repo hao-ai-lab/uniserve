@@ -208,7 +208,7 @@ struct PeerMapping {
 // multiple of the allocation granularity rather than rounding it up. The object
 // holds one reference to the allocation; mappings it creates hold their own,
 // so they outlive it.
-class PeerAllocation {
+class PeerAllocation : public std::enable_shared_from_this<PeerAllocation> {
  public:
   PeerAllocation(torch::Tensor prototype, std::vector<int64_t> shape)
       : options_(prototype.options()), shape_(std::move(shape)), device_(prototype.get_device()) {
@@ -318,8 +318,11 @@ class PeerAllocation {
     shape[0] *= descriptors.size();
     // The first segment can physically belong to a remote GPU. Tensor execution
     // belongs to the current mapping's device, not CUDA's pointer-owner query.
+    // Imported handles keep pages alive but do not keep the original fabric
+    // export importable. A slower peer may still be importing that export
+    // after this call returns, so retain its owner through tensor retirement.
     return at::for_blob(reinterpret_cast<void*>(mapping->address), shape)
-        .deleter([mapping](void*) {})
+        .deleter([mapping, owner = shared_from_this()](void*) {})
         .options(options_)
         .target_device(c10::Device(c10::kCUDA, device_))
         .make_tensor();
@@ -555,7 +558,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, binding) {
   binding.def("import_handle", &import_handle);
   binding.def("copy_host_device", &copy_host_device);
   binding.def("record_host_usage", &record_host_usage);
-  pybind11::class_<PeerAllocation>(binding, "PeerAllocation")
+  pybind11::class_<PeerAllocation, std::shared_ptr<PeerAllocation>>(binding, "PeerAllocation")
       .def(pybind11::init<torch::Tensor, std::vector<int64_t>>())
       .def("export_handle", &PeerAllocation::export_handle)
       .def("map_local", &PeerAllocation::map_local)

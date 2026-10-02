@@ -67,9 +67,10 @@ def allocate(
     :func:`exports_fabric_handles`); ``map_local()``, a tensor of ``shape``
     over its own storage; and ``map_peers(handles)``, which maps an ordered
     list of handles, one per owner allocating the same shape and dtype, into
-    one tensor whose first dimension is ``shape[0] * len(handles)``. Handle
-    transport, publication, reuse, and retirement belong to the distributed
-    runtime.
+    one tensor whose first dimension is ``shape[0] * len(handles)``. Both
+    mappings retain the originating allocation, keeping its exported handle
+    importable until the tensor retires. Handle transport, publication,
+    reuse, and retirement belong to the distributed runtime.
     """
     return _extension().PeerAllocation(
         torch.empty(0, dtype=dtype, device=device), list(shape)
