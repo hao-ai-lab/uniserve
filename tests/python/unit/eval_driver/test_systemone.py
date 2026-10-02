@@ -80,6 +80,46 @@ def _write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
     )
 
 
+def test_session_trace_keeps_order_and_session_identity(tmp_path: Path) -> None:
+    dataset = tmp_path / "trace.jsonl"
+    raw = [
+        {**_CORPUS_ROW, "id": f"{bot}:{step}", "session_id": bot}
+        for step in range(3)
+        for bot in ("a", "b")
+    ]
+    _write_rows(dataset, raw)
+    rows = SystemOneDataset(
+        _point(dataset_path=str(dataset), num_prompts=6)
+    ).load()
+
+    assert [row.id for row in rows] == [row["id"] for row in raw]
+    assert [row.session_id for row in rows] == [
+        row["session_id"] for row in raw
+    ]
+    task = SystemOneTask(_point())
+    assert all(
+        "session_id" not in task.build_request(row).payload for row in rows
+    )
+
+
+@pytest.mark.parametrize("session", ["", 0, [], None])
+def test_incomplete_or_invalid_session_trace_fails(
+    tmp_path: Path, session
+) -> None:
+    dataset = tmp_path / "trace.jsonl"
+    _write_rows(
+        dataset,
+        [
+            {**_CORPUS_ROW, "id": "a:0", "session_id": "a"},
+            {**_CORPUS_ROW, "id": "b:0", "session_id": session},
+        ],
+    )
+    with pytest.raises(ValueError, match="session_id"):
+        SystemOneDataset(
+            _point(dataset_path=str(dataset), num_prompts=2)
+        ).load()
+
+
 def test_corpus_rows_carry_only_the_request_in_the_official_types(
     tmp_path: Path,
 ) -> None:

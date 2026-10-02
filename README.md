@@ -215,6 +215,8 @@ just test-python-gpu
 
 The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
+For decision-session replay, use the `systemone` dataset with a non-empty `session_id` on every JSONL row. The evaluator preserves file order within each session and sends the next decision only after that session's previous response. Set `load.request_rate = inf`, `load.warmup_requests = 0`, and `load.max_concurrency` to the number of sessions. Each initial cold request is included in the measured trace. Session identifiers are benchmark metadata and are not sent to the model. Rows without session identifiers retain the seeded shuffled workload behavior.
+
 ## Repository layout
 
 ```text

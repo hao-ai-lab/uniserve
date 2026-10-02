@@ -214,6 +214,9 @@ class Example:
     state: Any = None
     questions: dict[str, Any] | None = None
     images: list[str] | None = None
+    # Rows in one session are successive decisions: the next arrives only
+    # after the preceding response. This identity never enters the request.
+    session_id: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return populated fields as a JSON-compatible mapping."""

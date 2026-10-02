@@ -6,6 +6,11 @@ NanoJev and DJev corpus format load unchanged: their `boolean` question type
 is the corpus spelling of the official `noul` type, and every field outside
 the request contract (gold labels, teacher outputs, metadata) is dropped, so
 only the state, the questions, and the images can reach the server.
+
+An optional non-empty ``session_id`` on every row declares a chronological
+closed-loop trace. Such rows retain file order instead of being shuffled;
+the load driver sends each session's next row after its previous response.
+Session identifiers remain client-side metadata.
 """
 
 from __future__ import annotations
@@ -40,8 +45,9 @@ class SystemOneDataset(Dataset):
     def load(self, tokenizer: Any | None = None) -> list[Example]:
         """Return `num_prompts` rows in a seeded order.
 
-        The file's rows are shuffled with `random.Random(point.load.seed)`
-        and the first `point.load.num_prompts` are taken, so a fixed file and
+        Independent rows are shuffled with `random.Random(point.load.seed)`;
+        session traces keep file order. The first `point.load.num_prompts`
+        are taken, so a fixed file and
         seed select the same rows in the same order, and consecutive rows
         mix the file's families instead of following its grouping. Question
         order within a row is the file's, which fixes the prompt and canvas
@@ -73,7 +79,15 @@ class SystemOneDataset(Dataset):
                 seen.add(row.id)
                 rows.append(row)
 
-        random.Random(point.load.seed).shuffle(rows)
+        # Session traces preserve each client's decision order. Shuffling
+        # them would change both closed-loop arrivals and prefix reuse.
+        if any(row.session_id is not None for row in rows):
+            if any(row.session_id is None for row in rows):
+                raise ValueError(
+                    "session traces require session_id on every row"
+                )
+        else:
+            random.Random(point.load.seed).shuffle(rows)
         return rows[: point.load.num_prompts]
 
 
@@ -122,10 +136,19 @@ def _decision_row(raw: Any, line_no: int) -> Example:
             f"systemone row {line_no} images must be a non-empty string list"
         )
 
+    session_id = raw.get("session_id")
+    if session_id is not None and (
+        not isinstance(session_id, str) or not session_id
+    ):
+        raise ValueError(
+            f"systemone row {line_no} session_id must be a non-empty string"
+        )
+
     return Example(
         id=str(raw["id"]),
         prompt="",
         state=raw["state"],
         questions=normalized,
         images=list(images) if images is not None else None,
+        session_id=session_id,
     )
