@@ -32,6 +32,7 @@ from .checkpoint import (
     detect,
 )
 from .encoder import TextEncoderConfig
+from .packing import CANVAS_MULTIPLE
 
 # DMD rungs are unshifted noise levels on the 1000-step training clock.
 TRAINING_CLOCK = 1000.0
@@ -40,11 +41,12 @@ TRAINING_CLOCK = 1000.0
 # evaluations and the clean endpoint.
 UNIFORM_GRID_POINTS = 50
 
-# The released canvas rule: a 768-pixel short edge, an area cap of the 16:9
-# canvas, sides on the 32-pixel grid, and aspect ratios from 1:4 to 4:1.
+# The released (adapt_shape_v1) canvas rule: a 768-pixel short edge, an area
+# cap of the 16:9 canvas, sides on the packing's 32-pixel grid, and aspect
+# ratios from 1:4 to 4:1. Request planning and the denoisers' canvases both
+# resolve through ``canvas``.
 CANVAS_SHORT_EDGE = 768
 CANVAS_MAX_PIXELS = 768 * 1344
-CANVAS_MULTIPLE = 32
 MIN_ASPECT_RATIO, MAX_ASPECT_RATIO = 1 / 4, 4
 
 # Width:height ratios a text- or reference-conditioned request may name.
@@ -76,6 +78,8 @@ def canvas(aspect_width: float, aspect_height: float) -> image.Config:
         width, height = float(CANVAS_SHORT_EDGE), CANVAS_SHORT_EDGE / ratio
     area = width * height
     if area > CANVAS_MAX_PIXELS:
+        # ``** 0.5`` rather than ``math.sqrt`` reproduces the reference's
+        # arithmetic.
         scale = (CANVAS_MAX_PIXELS / area) ** 0.5
         width, height = width * scale, height * scale
     return image.Config(

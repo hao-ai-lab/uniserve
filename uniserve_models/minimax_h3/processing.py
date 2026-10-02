@@ -42,8 +42,16 @@ from typing import Protocol
 
 from uniserve.media import image
 
+from .config import (
+    CANVAS_SHORT_EDGE,
+    MAX_ASPECT_RATIO,
+    MIN_ASPECT_RATIO,
+    NAMED_ASPECT_RATIOS,
+    canvas,
+)
 from .packing import (
     AUDIO_CHANNELS,
+    CANVAS_MULTIPLE,
     FPS,
     TEXT_TAG,
     VIDEO_TAG,
@@ -93,17 +101,8 @@ __all__ = [
 MIN_SECONDS = 4.0
 MAX_SECONDS = 15.0
 
-# The adapt_shape_v1 canvas rule, implemented by `canvas` alone: the short
-# edge starts at 768 pixels, the area is capped at 768 * 1344 and each side
-# rounds to the nearest multiple of 32 (the VAE's 16x spatial compression
-# times the 2x2 patch). t2va and ref2va accept the named ratios; their `auto`
-# is 16:9.
-CANVAS_SHORT_EDGE = 768
-CANVAS_MAX_PIXELS = 768 * 1344
-CANVAS_MULTIPLE = 32
-MIN_ASPECT_RATIO = 1 / 4
-MAX_ASPECT_RATIO = 4.0
-NAMED_ASPECT_RATIOS = ((21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16))
+# Canvases resolve through ``config.canvas``. t2va and ref2va accept its
+# named ratios; their ``auto`` is 16:9.
 DEFAULT_ASPECT_RATIO = (16, 9)
 
 # An image reference is encoded at its own 2048-pixel short edge, upscaling
@@ -552,41 +551,6 @@ class RequestPlan:
     def condition_audio_rows(self) -> int:
         """Denoiser audio rows of all conditions."""
         return sum(condition.audio_rows for condition in self.conditions)
-
-
-def canvas(aspect_width: float, aspect_height: float) -> image.Config:
-    """Resolve a display aspect into a canvas with the adapt_shape_v1 rule.
-
-    Only the ratio of the arguments matters. The short edge starts at 768
-    pixels, an area above ``768 * 1344`` scales both sides down, and each
-    side rounds to the nearest multiple of 32, so the final area may end up
-    slightly above the cap.
-
-    Raises:
-        ValueError: The ratio lies outside 1:4 to 4:1.
-    """
-    if not (aspect_width > 0 and aspect_height > 0):
-        raise ValueError(
-            f"aspect must be positive, got {aspect_width}:{aspect_height}"
-        )
-    ratio = aspect_width / aspect_height
-    if not MIN_ASPECT_RATIO <= ratio <= MAX_ASPECT_RATIO:
-        raise ValueError(
-            f"aspect {aspect_width}:{aspect_height} lies outside 1:4 to 4:1"
-        )
-    if ratio >= 1.0:
-        width, height = CANVAS_SHORT_EDGE * ratio, float(CANVAS_SHORT_EDGE)
-    else:
-        width, height = float(CANVAS_SHORT_EDGE), CANVAS_SHORT_EDGE / ratio
-    area = width * height
-    if area > CANVAS_MAX_PIXELS:
-        # `** 0.5` rather than `math.sqrt` reproduces the reference's
-        # arithmetic.
-        scale = (CANVAS_MAX_PIXELS / area) ** 0.5
-        width, height = width * scale, height * scale
-    return image.Config(
-        height=_nearest_multiple(height), width=_nearest_multiple(width)
-    )
 
 
 def rows_per_frame(size: image.Config) -> int:
