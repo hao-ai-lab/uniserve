@@ -610,17 +610,6 @@ def _run_megamoe(rank, port, activation):
         )
         module.up_gate.input_quantizer, module.down.input_quantizer = quantizers
 
-        # The first rank routes token e to expert e, over both ranks'
-        # experts; the second rank has no tokens and serves its experts'
-        # routes by joining the step.
-        tokens = EXPERTS if rank == 0 else 0
-        hidden = torch.zeros(
-            tokens, HIDDEN, device=device, dtype=torch.bfloat16
-        )
-        hidden[:, 0] = 6.0
-        ids = torch.arange(tokens, dtype=torch.int32, device=device)[:, None]
-        weights = torch.ones(tokens, 1, device=device)
-
         exchange = ExpertExchange(
             groups.experts,
             max_tokens=CAPACITY,
@@ -642,71 +631,91 @@ def _run_megamoe(rank, port, activation):
         ):
             context.prepare(TextSize(CAPACITY, 1))
 
-            def step(states):
-                """One expert step: this rank's tokens, or a join."""
-                exchange.begin(CAPACITY)
-                try:
-                    output = (
-                        module(states, ids, weights)
-                        if tokens
-                        else hidden.new_empty((0, HIDDEN))
+            # Unequal and empty senders share one resident expert binding.
+            # Moving from full to short calls must not reuse prior routes;
+            # each rank also serves its peer while it has no local tokens.
+            for counts in (
+                (CAPACITY, 3),
+                (5, CAPACITY),
+                (EXPERTS, 0),
+                (0, EXPERTS),
+            ):
+                tokens = counts[rank]
+                hidden = torch.zeros(
+                    tokens, HIDDEN, device=device, dtype=torch.bfloat16
+                )
+                hidden[:, 0] = 6.0
+                ids = (
+                    (
+                        torch.arange(tokens, dtype=torch.int32, device=device)
+                        + 3 * rank
                     )
-                    context.join_expert_layers()
-                finally:
-                    exchange.end()
-                return output
+                    % EXPERTS
+                )[:, None]
+                weights = torch.ones(tokens, 1, device=device)
 
-            # The probe rows encode exactly, so the experts' input encoding
-            # of them stages the bytes the kernel's own encoder stores.
-            encoded = (
-                module.up_gate.input_quantizer.quantize(hidden)
-                if tokens
-                else hidden
-            )
-            with context.activate():
-                eager = step(hidden).clone()
-                stored = step(encoded).clone()
-            with CUDAGraph(context=context) as graph:
-                graph.capture(lambda: step(hidden))
-                captured = graph.replay()
-                stream.synchronize()
+                def step(states):
+                    """One expert step: this rank's tokens, or a join."""
+                    exchange.begin(CAPACITY)
+                    try:
+                        output = (
+                            module(states, ids, weights)
+                            if tokens
+                            else hidden.new_empty((0, HIDDEN))
+                        )
+                        context.join_expert_layers()
+                    finally:
+                        exchange.end()
+                    return output
 
-        for actual in (eager, stored, captured):
-            assert actual.shape == (tokens, HIDDEN)
-        if not tokens:
-            return
-        # Hidden states stored in the experts' encoding are read as stored.
-        assert torch.equal(stored, eager)
+                # These probe rows encode exactly. Stored input must retain
+                # those bytes, including across different sender lengths.
+                encoded = (
+                    module.up_gate.input_quantizer.quantize(hidden)
+                    if tokens
+                    else hidden
+                )
+                with context.activate():
+                    eager = step(hidden).clone()
+                    stored = step(encoded).clone()
+                with CUDAGraph(context=context) as graph:
+                    graph.capture(lambda: step(hidden))
+                    captured = graph.replay().clone()
+                    stream.synchronize()
 
-        # The portable reference over every expert encodes the FC2 input
-        # with exact FP32 division and the exact nonlinearity.
-        expected = functional.fused_moe(
-            hidden.float(),
-            _nvfp4(up_gate[0], device, up_gate[1]),
-            _nvfp4(down[0], device, down[1]),
-            ids,
-            weights,
-            activation=activation,
-            input_quantizers=quantizers,
-        )
-        # The kernel's approximate nonlinearity and reciprocal may round a
-        # block scale near an E4M3 midpoint to the neighboring value: one
-        # E4M3 step, at most 2**-3 of the value, plus the BF16 output
-        # rounding.
-        for actual in (eager, captured):
-            torch.testing.assert_close(
-                actual.float(), expected, rtol=2**-3 + _gamma(1), atol=0
-            )
+                for actual in (eager, stored, captured):
+                    assert actual.shape == (tokens, HIDDEN)
+                if not tokens:
+                    continue
+                assert torch.equal(stored, eager)
+
+                # The portable reference encodes FC2 input with exact FP32
+                # division and evaluates the declared gated nonlinearity.
+                expected = functional.fused_moe(
+                    hidden.float(),
+                    _nvfp4(up_gate[0], device, up_gate[1]),
+                    _nvfp4(down[0], device, down[1]),
+                    ids,
+                    weights,
+                    activation=activation,
+                    input_quantizers=quantizers,
+                )
+                # Approximate activation/reciprocal may round a scale near
+                # an E4M3 midpoint to its neighbor: one E4M3 step plus BF16
+                # output rounding, as in the existing numerical contract.
+                for actual in (eager, captured):
+                    torch.testing.assert_close(
+                        actual.float(), expected, rtol=2**-3 + _gamma(1), atol=0
+                    )
 
 
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
-def test_megamoe_ranks_gate_with_the_declared_nonlinearity(activation):
-    """The fused MegaMoE exchange applies each expert's gate nonlinearity.
+def test_megamoe_ranks_preserve_routed_results_across_local_sizes(activation):
+    """Unequal, full and empty senders retain the declared routed equation.
 
-    Tokens of one rank reach experts on both ranks, while the other rank
-    has no tokens and joins; eager calls, calls on hidden states stored in
-    the experts' input encoding, and graph replays return the portable
-    reference's routed equation.
+    Tokens reach experts on both ranks through eager calls, stored-input
+    calls and graph replays. Every nonempty result matches the portable
+    reference with the declared gate nonlinearity.
     """
     if torch.cuda.device_count() < len(TOKENS):
         pytest.fail(f"expert exchange needs {len(TOKENS)} GPUs")

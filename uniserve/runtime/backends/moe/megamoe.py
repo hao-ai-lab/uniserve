@@ -126,23 +126,26 @@ class MegaMoEBuffer:
             combine_dtype="bf16",
             activation=activation,
         )
-        # Prebuilt kernel launches, one per (layer weights, stream): a
-        # capture runs on its own stream and needs its own launch arguments.
-        self._launches: dict[tuple[int, int], object] = {}
+        # Captured launches bind both a stream and a local token extent;
+        # all extents retain the same maximum-sized symmetric allocation.
+        self._launches: dict[tuple[int, int, int], object] = {}
 
-    def launch(self, weights, fc1, fc2):
+    def launch(self, weights, fc1, fc2, tokens: int):
         """Return the launch of one layer's weights on the current stream.
 
         ``weights`` names the layer; ``fc1`` and ``fc2`` are its kernel-ready
-        ``(weight, block scale)`` pairs.
+        ``(weight, block scale)`` pairs. ``tokens`` is the positive local
+        extent staged for this invocation, bounded by ``max_tokens``.
         """
         from uniserve_kernels.megamoe import nvfp4_mega_launch_thunk
 
         stream = torch.cuda.current_stream().cuda_stream
-        key = (weights, stream)
+        key = (weights, stream, tokens)
         thunk = self._launches.get(key)
         if thunk is None:
-            thunk = nvfp4_mega_launch_thunk(fc1, fc2, self.symmetric)
+            thunk = nvfp4_mega_launch_thunk(
+                fc1, fc2, self.symmetric, num_tokens=tokens
+            )
             self._launches[key] = thunk
         return thunk
 
@@ -205,8 +208,8 @@ class _MegaMoE(NVFP4Operator):
         # Stage this rank's rows in the experts' input encoding, as FlashInfer's
         # MegaMoE backend stages pre-quantized inputs (moe_ep/backends/mega/
         # kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/backend.py:181-210): values and
-        # linear block scales, their routes, and every row past them masked
-        # from dispatch. Rows stored in that encoding stage as they are; BF16
+        # linear block scales and their routes. The launch reads only the
+        # staged extent. Rows stored in that encoding stage as they are; BF16
         # rows encode with the operator's fp4_quantize, so both give the bytes
         # the other NVFP4 providers read.
         symmetric = self.buffer.symmetric
@@ -219,7 +222,12 @@ class _MegaMoE(NVFP4Operator):
         staged_scales[:tokens].copy_(fields["block_scale"])
         symmetric.topk_idx[:tokens].copy_(topk_ids)
         symmetric.topk_weights[:tokens].copy_(topk_weights)
-        symmetric.topk_idx[tokens:].fill_(-1)
+        # The frontend's zero-token call is a no-op, but an idle EP rank
+        # must still serve its peers. One invalid row keeps the collective
+        # active without contributing a route or a caller-visible output.
+        active_tokens = max(1, tokens)
+        if not tokens:
+            symmetric.topk_idx[:1].fill_(-1)
         note_staged_tokens(symmetric.topk_idx, tokens)
         # The staging's per-expert scales are shared by every layer.
         symmetric.fc1_alpha.copy_(self._fc1_alpha)
@@ -227,7 +235,7 @@ class _MegaMoE(NVFP4Operator):
         symmetric.fc1_norm_const.copy_(self._fc1_norm)
         # A rank with no tokens still launches, serving the tokens the other
         # ranks route to its experts.
-        self.buffer.launch(id(self), self._fc1, self._fc2)()
+        self.buffer.launch(id(self), self._fc1, self._fc2, active_tokens)()
         return symmetric.output_activation[:tokens].clone()
 
     def close(self) -> None:

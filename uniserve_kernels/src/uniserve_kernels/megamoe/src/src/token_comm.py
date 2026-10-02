@@ -675,11 +675,14 @@ class TokenInPullTokenBackPush:
                         scope="cta",
                     )
                     token_topk_word = Int32(token_global * self.num_topk + topk_slot)
-                    MAX_SLOT_C: cutlass.Constexpr[int] = num_tokens * self.num_topk
+                    # Peer metadata is allocated at maximum capacity. Local
+                    # input extents may differ across ranks and launches;
+                    # they bound dispatch work, not the receiving strides.
                     elem_off = (
-                        (local_expert * Int32(self.world_size) + Int32(local_rank))
-                        * Int32(MAX_SLOT_C)
-                        + slot
+                        local_expert * Int32(src_token_topk_idx.stride[0])
+                        + Int32(local_rank)
+                        * Int32(src_token_topk_idx.stride[1])
+                        + slot * Int32(src_token_topk_idx.stride[2])
                     ) * Int32(4)
                     peer_addr = peer_rank_ptr_mapper.map(
                         src_token_topk_idx.iterator.toint(),

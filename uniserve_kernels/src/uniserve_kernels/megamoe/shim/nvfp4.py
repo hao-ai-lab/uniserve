@@ -540,12 +540,6 @@ class MegaMoENvfp4Frontend:
         self._mega = mega
         return self._mega
 
-    # NOTE: the new kernel drop reduces the top-k combine INSIDE the mega kernel
-    # (Sm100MegaMoEKernel.__call__), so there is no separate topk-reduce launch.
-    # The drop's moe_nvfp4_swapab.topk_reduce.TopkReduce class covers the
-    # standalone combine-reduce path, which moe_ep does not use; port it here
-    # (with a test) if a caller ever needs in_kernel_fc2_reduce=False combine.
-
     # ------------------------------------------------------------------
     # Launch helpers
     # ------------------------------------------------------------------
@@ -584,12 +578,8 @@ class MegaMoENvfp4Frontend:
             return None
         self._validate_inputs(inputs, num_tokens=resolved)
         buf_tokens = inputs.activation.shape[0]
-        if not self.config.fc2_reduces_topk and resolved < buf_tokens:
-            raise ValueError(
-                "Partial num_tokens is not supported when in_kernel_fc2_reduce=False "
-                f"(top-k reduce compiles for the full buffer of {buf_tokens} tokens). "
-                f"Got num_tokens={resolved}."
-            )
+        # Communication metadata keeps its maximum-capacity strides, while
+        # dispatch and TopkReduce use the runtime input/output row extent.
         if resolved == buf_tokens:
             return inputs
         return self._slice_inputs(inputs, resolved)
@@ -1291,13 +1281,19 @@ def nvfp4_mega_launch_thunk(
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoESymmBuffer,
+    *,
+    num_tokens: int | None = None,
 ) -> Callable[[], None]:
     """Prebuilt zero-arg NVFP4 mega launcher for steady-state timing loops.
 
     Tester-parity timed region (``tester/solver.py perf_run``): the returned
     thunk is a bare compiled-kernel launch -- args prebuilt once, no per-call
     Python, no workspace reset (the kernel tail-cleans), no sync, no output
-    copy.  The reduced bf16 output lands in ``symm_buffer.output_activation``.
+    copy. ``num_tokens`` bounds the local rows read and reduced; None uses
+    the complete buffer. The reduced bf16 output lands in the corresponding
+    prefix of ``symm_buffer.output_activation``. A zero count is a no-op,
+    so expert-parallel callers must supply a positive masked extent when
+    joining peers without local tokens.
     Compiles on this call if needed.  Rebuild the thunk after knob/clamp
     changes or buffer destruction.
     """
@@ -1319,7 +1315,9 @@ def nvfp4_mega_launch_thunk(
         fc1_norm_const=symm_buffer.fc1_norm_const,
         output_activation=symm_buffer.output_activation,
     )
-    return symm_buffer._frontend.make_launch_thunk(inputs)
+    return symm_buffer._frontend.make_launch_thunk(
+        inputs, num_tokens=num_tokens
+    )
 
 
 def make_dummy_epilogue_params(
