@@ -26,11 +26,13 @@ call bound starts, and replays calls of as many canvases as the pool holds.
 
 from __future__ import annotations
 
+import socket
 from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
 from tests.python.integration.runtime.test_prefill_graphs import (
@@ -41,6 +43,10 @@ from tests.python.integration.runtime.test_prefill_graphs import (
 from uniserve.loading import weights
 from uniserve.math import ceil_div
 from uniserve.runtime import PrefixCache
+from uniserve.runtime.process_groups import (
+    Rendezvous,
+    initialize_process_groups,
+)
 from uniserve_models import loading as models
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import (
@@ -97,7 +103,7 @@ SAMPLING = CanvasSampling(
 
 
 @contextmanager
-def _worker(root, units=UNITS):
+def _worker(root, units=UNITS, *, device="cuda:0", experts=None, graphs=True):
     """Bind a DiffusionGemma worker with graphs generating ``SAMPLING``.
 
     The KV pool holds ``units`` units. Yields the executor, the unit pool's
@@ -106,11 +112,12 @@ def _worker(root, units=UNITS):
     source = models.read_config(root)
     model = models.load_model(
         source,
-        device="cuda:0",
+        device=device,
         weights=weights.Config(dtype=torch.bfloat16),
+        experts=experts,
     ).model
     config = WorkerConfig(
-        device="cuda:0",
+        device=device,
         model_dtype="bfloat16",
         block_size=16,
         max_batch_calls=SLOTS,
@@ -120,13 +127,14 @@ def _worker(root, units=UNITS):
         prefill_graph_token_sizes=(64, 256),
         decode_graph_batch_sizes=(1,),
         canvas_sampling=SAMPLING,
+        graph_policy="auto" if graphs else "off",
     )
     processor = source.image_processor
     cache = PrefixCache(
         model.text.cache_config,
         num_units=units,
         block_size=16,
-        device="cuda:0",
+        device=device,
     )
     manager = KVCacheManager(
         cache,
@@ -144,7 +152,7 @@ def _worker(root, units=UNITS):
             kv_cache=manager,
             latent_pool=None,
             decode_predicates=torch.zeros(
-                SLOTS + 1, dtype=torch.bool, device="cuda:0"
+                SLOTS + 1, dtype=torch.bool, device=device
             ),
             max_calls=SLOTS,
             request_slots=SLOTS,
@@ -158,7 +166,7 @@ def _worker(root, units=UNITS):
             request_pool_size=SLOTS,
             max_rows=canvas_runner.max_canvases,
             sampling=SAMPLING,
-            device="cuda:0",
+            device=device,
         )
         runner.bind_canvas_slots(slots)
         runner.capture(tokenizer=None, latents=None)
@@ -305,6 +313,102 @@ def _checkpoint(root):
         unit_scores=True,
         canvas_length=CANVAS,
     )
+
+
+@torch.inference_mode()
+def _expert_reads(rank, root, port):
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    with initialize_process_groups(
+        rank=0,
+        local_rank=rank,
+        world_size=1,
+        device=device,
+        experts=(rank, 2, Rendezvous("127.0.0.1", port)),
+    ) as groups:
+        results = []
+        for graphs in (False, True):
+            observations = []
+            with _worker(
+                root, device=device, experts=groups.experts, graphs=graphs
+            ) as (runner, manager, slots):
+                _install(manager, EXTRA)
+                prompt, readout, _ = _scenario(slots)
+                _run(runner, manager, prompt[:6], ForwardMode.PREFILL)
+                _run(runner, manager, prompt[6:], ForwardMode.PREFILL)
+
+                # One rank keeps the same small prefill while its peer
+                # changes canvas batches. Reverse the capabilities too:
+                # a compact readout must retain its result alongside a
+                # peer's longer prefill. All rows have disjoint KV slots.
+                for count in (1, 5, 11):
+                    rows = (
+                        prompt[:1]
+                        if rank == 0
+                        else tuple(
+                            readout[slot] for slot in range(1, count + 1)
+                        )
+                    )
+                    kind = (
+                        ForwardMode.PREFILL
+                        if rank == 0
+                        else ForwardMode.TOKEN_DENOISING
+                    )
+                    observations.append(
+                        _values(_run(runner, manager, rows, kind))
+                    )
+                for count in (1, 3, 6):
+                    rows = (readout[2],) if rank == 0 else prompt[:count]
+                    kind = (
+                        ForwardMode.TOKEN_DENOISING
+                        if rank == 0
+                        else ForwardMode.PREFILL
+                    )
+                    observations.append(
+                        _values(_run(runner, manager, rows, kind))
+                    )
+
+                # Repeated slot reads can make the final expert layer's
+                # sender larger than the compact canvas that produced it.
+                repeated = replace(
+                    readout[2],
+                    slot_tokens=(0,) * 96,
+                    candidate_offsets=tuple(range(0, 193, 2)),
+                    candidate_ids=readout[2].candidate_ids[:2] * 96,
+                )
+                rows = (repeated,) if rank == 0 else prompt[:1]
+                kind = (
+                    ForwardMode.TOKEN_DENOISING
+                    if rank == 0
+                    else ForwardMode.PREFILL
+                )
+                observations.append(_values(_run(runner, manager, rows, kind)))
+            results.append(observations)
+
+        # The existing native BF16 graph/eager contract permits rounding
+        # from different batch shapes, including expert route reductions.
+        eager, replayed = results
+        for expected_rows, actual_rows in zip(eager, replayed, strict=True):
+            for expected, actual in zip(
+                expected_rows, actual_rows, strict=True
+            ):
+                torch.testing.assert_close(
+                    actual, expected, rtol=2e-2, atol=2e-2
+                )
+
+
+@SM100
+def test_expert_peers_preserve_results_across_unequal_numerical_batches(
+    tmp_path,
+):
+    """Mixed prefill/readout ranks return the eager numerical results."""
+    if torch.cuda.device_count() < 2:
+        pytest.fail("expert-parallel canvas calls need two GPUs")
+    _checkpoint(tmp_path)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    mp.spawn(_expert_reads, (tmp_path, port), nprocs=2, join=True)
 
 
 @SM100

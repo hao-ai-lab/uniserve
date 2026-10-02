@@ -30,6 +30,7 @@ from typing import cast
 import torch
 
 from uniserve.nn.attention import AttentionBatch, PagedInput, SegmentedInput
+from uniserve.profiling import profile_range
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout, TensorOutput
@@ -126,10 +127,8 @@ class ModelRunner(Execution, ABC):
         # ``bootstrap.capacity.graph_table_widths``.
         self.table_widths: tuple[int, ...] = ()
         self._startup_complete = False
-        # This runner's step kind in its expert exchange
-        # (``ExpertExchange.register``); None when its forwards reach no
-        # expert-parallel layer.
-        self.expert_kind: int | None = None
+        # Bound by execution when this capability reaches expert layers.
+        self.expert_step = False
 
     @abstractmethod
     def batch_forward(
@@ -150,18 +149,8 @@ class ModelRunner(Execution, ABC):
             rows, forward_mode=forward_mode, **numerical
         )
 
-    def expert_capacities(self) -> frozenset[int]:
-        """Per-rank token capacities this runner's graphs step at.
-
-        A graph of an expert-parallel forward exchanges at exactly the
-        capacity it was captured with, so an expert step serves this
-        runner's batches only at these capacities. Empty for runners whose
-        graphs are not expert steps.
-        """
-        return frozenset()
-
-    def graph_capacity(self, key) -> int:
-        """The per-rank token capacity the graph of ``key`` exchanges at."""
+    def graph_tokens(self, key) -> int:
+        """Tokens this rank's numerical graph computes, including padding."""
         raise NotImplementedError
 
     def expert_tokens(self, batch) -> int:
@@ -170,7 +159,15 @@ class ModelRunner(Execution, ABC):
         assert tokens is not None
         return tokens
 
-    def select_graph_shape(self, batch, *, eligible, capacity=None):
+    def capture_plan(self):
+        """Numerical captures whose startup collectives must pair on peers."""
+        return (
+            tuple(sorted(self.call_kinds)),
+            self.decode_shapes,
+            self.prefill_shapes,
+        )
+
+    def select_graph_shape(self, batch, *, eligible):
         """Use the exact numerical signature for non-text graph variants.
 
         Returns ``None`` for eager execution: when the caller marks the batch
@@ -178,9 +175,8 @@ class ModelRunner(Execution, ABC):
         off. Otherwise returns ``(key, execution, bucketed)``: the graph key,
         the batch to replay, and whether the key names a configured bucket
         that may be captured on first use before startup is sealed. Exact
-        keys are never bucketed. ``capacity``, the expert step's per-rank
-        token capacity, applies only to runners whose graphs step
-        (``expert_capacities``).
+        keys are never bucketed. The local numerical shape is independent
+        of the transfer capacity of an expert step.
         """
         if not eligible or not self.pools or not self.exact_graphs:
             return None
@@ -325,9 +321,7 @@ class ModelRunner(Execution, ABC):
             attention = getattr(batch.inputs, "attention", None)
             if attention is not None:
                 self.context.bind_attention(attention)
-            exchange = (
-                None if self.expert_kind is None else self.context.experts
-            )
+            exchange = self.context.experts if self.expert_step else None
             if exchange is None or exchange.capacity:
                 return forward(batch)
             exchange.begin(exchange.max_tokens)
@@ -386,28 +380,57 @@ class ModelRunner(Execution, ABC):
         with self.graph_storage.allocate(self):
             static = execution if padded else clone_inputs(execution)
 
-        # An expert step captures its exchanges at the graph's own capacity.
-        # Every rank of the expert group captures the same graphs in the same
-        # order, so their warm-up exchanges pair without a synchronization.
-        exchange = None if self.expert_kind is None else self.context.experts
-        if exchange is not None:
-            exchange.begin(self.graph_capacity(key))
-        try:
-            graph = self.capture_graph(
-                key,
-                static,
-                partial(self.batch_forward, padded=True) if padded else forward,
+        # Each local shape has a variant for every transfer capacity that
+        # holds it. Every rank captures the same pairs in the same order;
+        # their warm-up exchanges therefore pair without an agreement.
+        exchange = self.context.experts if self.expert_step else None
+        capacities = (
+            tuple(
+                value
+                for value in reversed(exchange.capacities)
+                if value >= self.graph_tokens(key)
             )
-            layers = frozenset(() if exchange is None else exchange.invoked)
-        finally:
-            if exchange is not None:
-                exchange.end()
+            if exchange is not None
+            else (None,)
+        )
+        if not capacities:
+            raise CUDAGraphError(
+                f"local graph of {self.graph_tokens(key)} tokens exceeds "
+                "the expert exchange capacity"
+            )
+        bucket = GraphBucket()
         try:
-            self.graph_storage.check()
-        except BaseException:
-            graph.close()
+            for capacity in capacities:
+                if exchange is not None:
+                    exchange.begin(capacity)
+                try:
+                    bucket.graphs[capacity] = self.capture_graph(
+                        key,
+                        static,
+                        partial(self.batch_forward, padded=True)
+                        if padded
+                        else forward,
+                    )
+                    bucket.expert_layers = frozenset(
+                        () if exchange is None else exchange.invoked
+                    )
+                finally:
+                    if exchange is not None:
+                        exchange.end()
+                self.graph_storage.check()
+        except BaseException as error:
+            error.add_note(
+                f"capturing {self.name} bucket {key!r}, "
+                f"expert capacity {capacity}"
+            )
+            bucket.close()
             raise
-        self.buckets[key] = GraphBucket({None: graph}, expert_layers=layers)
+        self.buckets[key] = bucket
+
+    def batch_graph(self, key):
+        """Return the local bucket's variant for the current expert step."""
+        capacity = self.context.experts.capacity if self.expert_step else None
+        return self.buckets[key].graphs[capacity]
 
     def capture_graph(self, key, execution, forward):
         """Capture the graph of ``key`` over its fixed input ``execution``.
@@ -437,7 +460,7 @@ class ModelRunner(Execution, ABC):
         overwrites.
         """
         result = replay_batch(
-            self.buckets[key].graphs[None],
+            self.batch_graph(key),
             execution,
             rows=batch.row_count,
             borrow=borrow,
@@ -476,37 +499,40 @@ class ModelRunner(Execution, ABC):
             )
 
     def _run_batch(self, batch, forward, *, eligible, borrow_output=False):
+        selected = self.select_graph_shape(batch, eligible=eligible)
         exchange = self.context.experts
-        if exchange is None or self.expert_kind is None:
+        if exchange is None or not self.expert_step:
             return self._run_forward(
-                batch, forward, eligible=eligible, borrow_output=borrow_output
+                batch, forward, selected=selected, borrow_output=borrow_output
             )
 
-        # One expert step: the expert group agrees on the step's per-rank
-        # capacity from every rank's tokens (ranks without work join with
-        # none), this rank pads its forward to a graph of that capacity, and
-        # joins the expert layers its forward skipped.
-        capacity = exchange.agree(self.expert_kind, self.expert_tokens(batch))
+        # Agree on the selected local graph's padded count, not just the
+        # live input count: the transfer must hold every row it sends.
+        tokens = self.expert_tokens(batch)
+        if selected is not None:
+            tokens = max(tokens, self.graph_tokens(selected[0]))
+        with profile_range("uniserve.expert.agree"):
+            capacity = exchange.agree(tokens)
         exchange.begin(capacity)
         try:
-            result = self._run_forward(
-                batch,
-                forward,
-                eligible=eligible,
-                borrow_output=borrow_output,
-                capacity=capacity,
-            )
-            self.context.join_expert_layers()
+            # Query tokens describe this rank's input, before graph padding;
+            # capacity is the common transfer size selected by all ranks.
+            with profile_range(
+                f"uniserve.expert.step tokens={batch.query_tokens} "
+                f"capacity={capacity} local_tokens={tokens}"
+            ):
+                result = self._run_forward(
+                    batch,
+                    forward,
+                    selected=selected,
+                    borrow_output=borrow_output,
+                )
+                self.context.join_expert_layers()
         finally:
             exchange.end()
         return result
 
-    def _run_forward(
-        self, batch, forward, *, eligible, borrow_output=False, capacity=None
-    ):
-        selected = self.select_graph_shape(
-            batch, eligible=eligible, capacity=capacity
-        )
+    def _run_forward(self, batch, forward, *, selected, borrow_output=False):
         if selected is None:
             return replace(
                 self.eager_batch(batch, forward),
@@ -543,7 +569,7 @@ class ModelRunner(Execution, ABC):
         assert live_tokens is not None and bucket_tokens is not None
 
         exchange = self.context.experts
-        if exchange is not None and capacity is not None:
+        if exchange is not None and self.expert_step:
             # Replayed exchanges run no host code; the bucket names them.
             exchange.invoked.update(self.buckets[key].expert_layers)
         result = self.replay_graph(key, execution, batch, borrow=borrow_output)

@@ -7,8 +7,8 @@ rows all select ``CACHE`` only writes the K/V cache (``CausalLM.fill_cache``).
 With pipeline parallelism, only the last stage projects vocabulary columns,
 and it broadcasts the selected results so every stage returns the same rows.
 
-Graphs serve two kinds of text calls. A decode bucket captures the
-final-position logits of every row together with greedy decoding. A prefill
+Graphs serve two kinds of text calls. Decode buckets share final-position
+logit backing and capture greedy decoding with it. A prefill
 bucket captures the backbone's hidden states alone, copied into one output
 backing that every prefill bucket of the runner shares; after the replay,
 ``select_outputs`` projects the rows' logits and slices their hidden states
@@ -62,6 +62,9 @@ class TextRunner(ModelRunner):
         # Hidden states of the latest prefill replay: [tokens, hidden] rows
         # every prefill graph writes, sized by the first (largest) capture.
         self._prefill_output: torch.Tensor | None = None
+        # Decode graphs run serially on this runner. Their transfer-capacity
+        # variants need one vocabulary output, not one per captured graph.
+        self._decode_output: torch.Tensor | None = None
         try:
             self._bind_vocabulary()
         except BaseException:
@@ -101,6 +104,13 @@ class TextRunner(ModelRunner):
         size, padded, start, stop = descriptor.cpu().tolist()
         self.vocab = VocabShard(size, slice(start, stop), padded, tensor_group)
 
+    def close_graphs(self):
+        try:
+            super().close_graphs()
+        finally:
+            self._prefill_output = None
+            self._decode_output = None
+
     def last_logits(self, inputs: TextInput) -> ExecutionOutput:
         """Project one final position per sequence, padding rows included.
 
@@ -129,6 +139,27 @@ class TextRunner(ModelRunner):
                 )
             )
         self.pipeline.broadcast(values, src=self.pipeline.size - 1)
+        backing = self._decode_output
+        if backing is None:
+            # Startup captures largest first. Retain the first graph's output
+            # inside capture, where the allocator protects its address from
+            # later captures sharing the pool. Eager warmup stays transient.
+            if torch.cuda.is_current_stream_capturing():
+                self._decode_output = values
+        else:
+            if (
+                values.shape[0] > backing.shape[0]
+                or values.shape[1:] != backing.shape[1:]
+                or values.dtype != backing.dtype
+                or values.device != backing.device
+            ):
+                raise CUDAGraphError(
+                    "decode graphs capture largest first; logits exceed "
+                    "the shared output backing"
+                )
+            output = backing[: values.shape[0]]
+            output.copy_(values)
+            values = output
         return ExecutionOutput(
             tuple(values.split(1)), (self.vocab,) * inputs.batch_size
         )
@@ -347,15 +378,11 @@ class TextRunner(ModelRunner):
             else self(batch.inputs, batch.token_selections)
         )
 
-    def expert_capacities(self) -> frozenset[int]:
-        """The prefill buckets' token counts: an expert step pads to one."""
-        return frozenset(shape.token_bucket for shape in self.prefill_shapes)
-
-    def graph_capacity(self, key) -> int:
-        """A text bucket's token count; its graph exchanges at that many."""
+    def graph_tokens(self, key) -> int:
+        """The local text bucket's token count, including padding."""
         return key[1][1]
 
-    def select_graph_shape(self, batch, *, eligible, capacity=None):
+    def select_graph_shape(self, batch, *, eligible):
         """Choose a captured text graph bucket and pad the batch to it.
 
         Only buckets that startup captures are candidates. A decode batch
@@ -368,8 +395,8 @@ class TextRunner(ModelRunner):
         disabled for a non-decode batch), otherwise ``(key, padded_batch,
         True)``; a decode key starts with ``"text"`` and a prefill key with
         ``"prefill"``, and both carry the ``text_shape`` tuple second. In an
-        expert step of per-rank ``capacity`` tokens, a prefill batch pads to
-        a bucket of exactly that many tokens, whose graph exchanges at it.
+        expert step, the local bucket's tokens and the shared transfer
+        capacity select separate dimensions of its captured graph.
 
         Raises:
             CUDAGraphError: No decode bucket holds a decode batch, or prefill
@@ -383,12 +410,6 @@ class TextRunner(ModelRunner):
             and batch.inputs.attention.queries.host == (1,) * batch.row_count
         )
         prefill_shapes = self._prefill_family(batch)
-        if capacity is not None:
-            prefill_shapes = tuple(
-                shape
-                for shape in prefill_shapes
-                if shape.token_bucket == capacity
-            )
         if not decode and not prefill_shapes:
             return None
 
@@ -546,7 +567,7 @@ class TextRunner(ModelRunner):
         """
         if key[0] != "prefill":
             return super().replay_graph(key, execution, batch, borrow=borrow)
-        hidden = replay_hidden(self.buckets[key].graphs[None], execution)
+        hidden = replay_hidden(self.batch_graph(key), execution)
         if not key[-1]:
             return self._cache_rows(batch.row_count)
         with self.context.activate():

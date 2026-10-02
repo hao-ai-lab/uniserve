@@ -26,11 +26,13 @@ also agree on
 the order and the token capacity of every exchange, since ``MoeAlltoAll``
 pairs the ranks' calls by position and lays out its receive buffers by the
 capacity. Every forward that reaches expert layers is therefore one step:
-``agree`` gathers each rank's step kind and token count over the group's
-host backend and returns one capacity every rank computes alike, the
-smallest capacity every participating kind's graphs serve that holds the
-most tokens any rank sends (ranks pad to it, as SGLang's and vLLM's
-data-parallel ranks pad to the largest rank); ``begin`` opens the step, each
+``agree`` gathers each rank's token count over the group's host backend and
+returns one transfer capacity every rank computes alike. All-to-all uses
+powers of two plus the configured maximum, independently of the local
+numerical graph shapes. MegaMoE always uses its maximum-sized symmetric
+staging, masking the rows after the local tokens. Ranks send only their
+local graph's tokens;
+``begin`` opens the step, each
 expert layer exchanges at that capacity, and ``invoked`` records the layers
 the forward reached, so the execution context can join the layers it
 skipped with zero tokens before ``end`` closes the step. A rank without
@@ -116,10 +118,18 @@ class ExpertExchange:
         # expert layers it has exchanged at, by module identity.
         self.capacity = 0
         self.invoked: set[int] = set()
-        # The capacities each registered step kind's graphs serve, in
-        # registration order, which every rank follows alike.
-        self._kinds: list[frozenset[int]] = []
-        self._records = torch.zeros((group.size, 3), dtype=torch.int64)
+        # Powers of two bound the transfer graph variants logarithmically
+        # while receive-buffer padding stays below twice the largest sender.
+        # Local attention, dense layers and sampling keep their own shapes.
+        self.capacities = (
+            (max_tokens,)
+            if self.fused is not None
+            else tuple(
+                1 << power for power in range((max_tokens - 1).bit_length())
+            )
+            + (max_tokens,)
+        )
+        self._records = torch.zeros((group.size, 2), dtype=torch.int64)
         # Whether the last agreement found every rank leaving the group.
         self.released = False
 
@@ -154,71 +164,43 @@ class ExpertExchange:
                 ),
             )
 
-    @property
-    def kinds(self) -> tuple[frozenset[int], ...]:
-        """The capacities each registered step kind serves, in order."""
-        return tuple(self._kinds)
-
-    def register(self, capacities: frozenset[int]) -> int:
-        """Register a step kind whose graphs serve ``capacities``; return it.
-
-        Every rank registers the same kinds in the same order, so a kind
-        number names the same graphs on every rank. A capacity above the
-        exchange's ``max_tokens`` is not served.
-        """
-        self._kinds.append(
-            frozenset(value for value in capacities if value <= self.max_tokens)
-        )
-        return len(self._kinds) - 1
-
-    def agree(
-        self, kind: int | None, tokens: int, *, leaving: bool = False
-    ) -> int:
+    def agree(self, tokens: int, *, leaving: bool = False) -> int:
         """Agree with the group on the next step's per-rank capacity.
 
-        Every rank contributes its step kind and the tokens its forward
-        sends, or ``kind=None`` and no tokens when it has no forward, over
+        Every rank contributes the tokens its local graph or eager forward
+        sends, or zero tokens when it has no forward, over
         the group's Gloo backend; every rank then computes the same result.
         Returns zero when no rank has tokens, else the smallest capacity at
-        least the most tokens any rank sends that every kind taking part
-        serves; a rank without work serves any capacity. A rank shutting
+        least the most tokens any rank sends. A rank shutting
         down agrees with ``leaving`` until ``released`` reports that every
         rank is leaving without tokens, so no rank stops agreeing while
         another still waits on it.
 
         Raises:
-            RuntimeError: No capacity serves every kind taking part.
+            RuntimeError: A rank sends more than the configured maximum.
         """
-        local = torch.tensor(
-            [[-1 if kind is None else kind, tokens, int(leaving)]]
-        )
+        local = torch.tensor([[tokens, int(leaving)]])
         dist.all_gather(
             list(self._records.split(1)), local, group=self.group._require()
         )
         records = self._records.tolist()
-        most = max(count for _, count, _ in records)
-        self.released = not most and all(left for _, _, left in records)
+        most = max(count for count, _ in records)
+        self.released = not most and all(left for _, left in records)
         if not most:
             return 0
 
-        served = [self._kinds[number] for number, count, _ in records if count]
-        capacity = min(
-            (
-                value
-                for value in frozenset().union(*served)
-                if value >= most and all(value in kind for kind in served)
-            ),
-            default=None,
+        capacity = next(
+            (value for value in self.capacities if value >= most), None
         )
         if capacity is None:
             raise RuntimeError(
-                f"no expert step capacity serves {most} tokens for every "
-                "step kind taking part"
+                f"expert step of {most} tokens exceeds the configured "
+                f"{self.max_tokens} tokens per rank"
             )
         return capacity
 
     def begin(self, capacity: int) -> None:
-        """Open a step whose exchanges carry ``capacity`` tokens per rank."""
+        """Open a step carrying at most ``capacity`` tokens from each rank."""
         if not 0 < capacity <= self.max_tokens:
             raise ValueError(
                 f"step capacity {capacity} is outside the exchange's "

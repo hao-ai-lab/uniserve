@@ -1490,14 +1490,12 @@ class ModelExecutor:
             activation=first.activation,
         )
 
-    def _register_expert_steps(self):
-        """Give each runner whose forwards reach expert layers a step kind.
+    def _bind_expert_steps(self):
+        """Bind forwards reaching experts to a common transfer catalog.
 
-        Prefill and canvas runners step through the expert exchange at the
-        capacities their graphs serve. Every rank of the expert group must
-        register the same kinds with the same capacities, or its steps would
-        pad to graphs the others lack; the plans are compared once here and
-        a mismatch fails startup on every rank.
+        Every local numerical graph captures the transfer capacities that
+        hold its tokens. All ranks must share the same catalog, including
+        ranks whose next step has no local work.
 
         Raises:
             RuntimeError: The ranks' step plans differ.
@@ -1512,18 +1510,22 @@ class ModelExecutor:
                 & set(entry.call_kinds)
             ):
                 continue
-            entry.expert_kind = exchange.register(entry.expert_capacities())
+            entry.expert_step = True
             self._expert_runners.append(entry)
 
-        plan = [sorted(kind) for kind in exchange.kinds]
+        # Warmup executes collectives too. Equal transfer catalogs alone do
+        # not establish that peers capture the same local numerical calls.
+        plan = (
+            exchange.capacities,
+            tuple(entry.capture_plan() for entry in self._expert_runners),
+        )
         plans = [None] * exchange.group.size
         torch.distributed.all_gather_object(
             plans, plan, group=exchange.group._require()
         )
         if any(other != plan for other in plans):
             raise RuntimeError(
-                "expert-parallel ranks capture different step capacities: "
-                f"{plans}"
+                f"expert-parallel ranks have different capture plans: {plans}"
             )
 
     def join_expert_step(self, *, leaving: bool = False) -> bool:
@@ -1538,7 +1540,8 @@ class ModelExecutor:
         exchange = self.experts
         if exchange is None or not self._expert_runners:
             return False
-        capacity = exchange.agree(None, 0, leaving=leaving)
+        with profile_range("uniserve.expert.agree"):
+            capacity = exchange.agree(0, leaving=leaving)
         if not capacity:
             return False
         runner = self._expert_runners[0]
@@ -1546,11 +1549,15 @@ class ModelExecutor:
         if stream is not None:
             stream.wait(torch.cuda.current_stream(runner.device))
         try:
-            with torch.inference_mode():
+            with (
+                torch.inference_mode(),
+                profile_range(
+                    f"uniserve.expert.step tokens=0 capacity={capacity}"
+                ),
+            ):
                 if self._expert_joins is not None:
-                    # Every capacity the agreement returns is one some
-                    # runner's graphs step at, and startup captured a join
-                    # at each; a missing one fails rather than join eagerly.
+                    # Startup captured every shared transfer capacity; a
+                    # missing one fails rather than join eagerly.
                     self._expert_joins.replay(capacity)
                 else:
                     # Without graphs every step, joins included, is eager.
@@ -1628,7 +1635,7 @@ class ModelExecutor:
             prepare_prefill,
         )
 
-        self._register_expert_steps()
+        self._bind_expert_steps()
         for phase in ("prefill", "decode", "canvas", "flow"):
             for entry in self.entries.values():
                 forward = entry.batch_forward
@@ -1668,8 +1675,8 @@ class ModelExecutor:
     def _capture_expert_joins(self):
         """Capture a rank's join of an expert step at every step capacity.
 
-        The step agreement returns a capacity some expert runner's graphs
-        step at (``ExpertExchange.agree``), so a join graph at each of those
+        The step agreement returns a configured transfer capacity
+        (``ExpertExchange.agree``), so a join graph at each of those
         capacities serves every step this rank joins without a forward of
         its own; replaying it keeps the join at device speed instead of a
         host-launched run of kernels per layer, which every other rank would
@@ -1689,7 +1696,7 @@ class ModelExecutor:
         self._expert_joins = JoinGraphs(
             runner.context,
             exchange,
-            frozenset().union(*exchange.kinds),
+            exchange.capacities,
             pools=runner.pools,
         )
 

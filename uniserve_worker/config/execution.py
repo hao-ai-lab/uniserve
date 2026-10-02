@@ -458,6 +458,28 @@ def worker_config_from_namespace(
         WorkerError: If the assembled configuration violates a
             ``WorkerConfig`` invariant.
     """
+    expert_parallel = getattr(namespace, "expert_parallel", None) or {}
+    prefill_tokens = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
+    if (
+        expert_parallel
+        and expert_parallel.get("exchange", "alltoall") == "alltoall"
+    ):
+        # Each local shape also captures larger transfer capacities. Bound
+        # that product with geometric small buckets and 512-token spacing
+        # thereafter; the default catalog's maximum padding gap stays 512,
+        # within the same KV padding allocation as independent replicas.
+        # An explicit launch catalog still takes precedence below.
+        prefill_tokens = (
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            *range(1024, 16385, 512),
+        )
     return WorkerConfig(
         device=device,
         rank=int(namespace.rank),
@@ -495,15 +517,11 @@ def worker_config_from_namespace(
         ),
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
         prefill_outputs=bool(getattr(namespace, "prefill_outputs", True)),
-        expert_exchange=str(
-            (getattr(namespace, "expert_parallel", None) or {}).get(
-                "exchange", "alltoall"
-            )
-        ),
+        expert_exchange=str(expert_parallel.get("exchange", "alltoall")),
         flow_cuda_graph=bool(getattr(namespace, "flow_cuda_graph", True)),
         prefill_graph_token_sizes=_parse_positive_int_csv(
             namespace.prefill_graph_token_sizes,
-            default=DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
+            default=prefill_tokens,
         ),
         flow_graph_batch_sizes=_parse_positive_int_csv(
             namespace.flow_graph_batch_sizes,

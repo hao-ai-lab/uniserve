@@ -79,7 +79,7 @@ def _text_runner(model, provider, decode_capacity=2, image_processor=None):
         max_sequence_tokens=64,
         prefill_cuda_graph=True,
         prefill_graph_token_sizes=(16,),
-        decode_graph_batch_sizes=(decode_capacity,),
+        decode_graph_batch_sizes=(1, decode_capacity),
     )
     cache = PrefixCache(
         model.cache_config, num_units=16, block_size=16, device="cuda:0"
@@ -221,19 +221,20 @@ def test_text_graph_replay_uses_live_lengths_tokens_and_cache_blocks(
                     actual, expected, rtol=2e-2, atol=2e-2
                 )
 
-        for length in (2, 19, 31):
+        retained = None
+        for length, count in ((2, 2), (19, 1), (31, 2)):
             sequences = tuple(
                 tuple(
                     (token * 7 + index) % 36 + 1 for token in range(length + 1)
                 )
-                for index in range(2)
+                for index in range(count)
             )
-            pages = ((4, 5), (0, 1))
+            pages = ((4, 5), (0, 1))[:count]
             execute(tuple(sequence[:-1] for sequence in sequences), pages)
             output = execute(
                 tuple((sequence[-1],) for sequence in sequences),
                 pages,
-                prefixes=(length,) * 2,
+                prefixes=(length,) * count,
                 decode=True,
                 finish=length == 19,
             )
@@ -247,7 +248,18 @@ def test_text_graph_replay_uses_live_lengths_tokens_and_cache_blocks(
             assert output.greedy.tokens.tolist() == [
                 value.argmax().item() for value in output.values
             ]
-            assert output.greedy.finish.tolist() == [length == 19, False]
+            assert output.greedy.finish.tolist() == [
+                length == 19 and index == 0 for index in range(count)
+            ]
+            if retained is not None:
+                for actual, saved in zip(*retained, strict=True):
+                    torch.testing.assert_close(actual, saved, rtol=0, atol=0)
+            # Decode output is borrowed. A caller retaining it across another
+            # invocation explicitly clones it through the output contract.
+            retained = (
+                output.clone().values,
+                tuple(v.clone() for v in output.values),
+            )
         # Different graph shapes share the entry's staged columns. An
         # earlier prefill must still execute correctly after decode has
         # changed the same storage's lengths, IDs, positions and writes.

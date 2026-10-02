@@ -218,7 +218,9 @@ class GraphBucket:
 
     ``expert_layers`` names, by module identity, the expert-parallel layers
     whose exchanges the graphs replay, so a step that replays them knows
-    which layers its forward reached.
+    which layers its forward reached. Expert-step variants are keyed by
+    transfer capacity; independent calls use ``None``. Every variant keeps
+    the same local numerical shape and input backing.
     """
 
     graphs: dict = field(default_factory=dict)

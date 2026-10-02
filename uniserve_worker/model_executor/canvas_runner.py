@@ -112,6 +112,9 @@ class CanvasRunner(ModelRunner):
         self.local_tail = self.context.experts is None or not tail_exchanges(
             self.model
         )
+        # All readout graphs on this runner execute serially. The largest
+        # capture owns their common per-token output, including EP variants.
+        self._readout_state: tuple[torch.Tensor, ...] | None = None
 
     @property
     def canvas_length(self) -> int:
@@ -158,20 +161,31 @@ class CanvasRunner(ModelRunner):
     def readout_lengths(self) -> tuple[int, ...]:
         """Captured readout lengths, bounded by the model's canvas.
 
-        Independent replicas can use shorter local token capacities. Expert
-        steps share their capacity negotiation with generating canvases,
-        whose rows always have the model's length; those steps retain the
-        same full-row capacities for every participant in the exchange.
+        Readouts keep their local canvas length even when an expert peer
+        computes a full generating canvas. The exchange capacity selects
+        a separate graph variant without adding local canvas tokens.
         """
         length = self.canvas_length
-        if self.context.experts is not None:
-            return (length,)
         buckets = []
         value = 16
         while value < length:
             buckets.append(value)
             value *= 2
         return (*buckets, length)
+
+    def capture_plan(self):
+        return (
+            super().capture_plan(),
+            self.canvas_rows,
+            self.readout_lengths,
+            None if self.canvas_slots is None else self.canvas_slots.constants,
+        )
+
+    def close_graphs(self):
+        try:
+            super().close_graphs()
+        finally:
+            self._readout_state = None
 
     def bind_canvas_slots(self, slots) -> None:
         """Borrow the resident sampler state of generating canvases.
@@ -384,20 +398,23 @@ class CanvasRunner(ModelRunner):
                 )
         return records
 
-    def expert_capacities(self) -> frozenset[int]:
-        """The canvas buckets' token counts: an expert step pads to one."""
-        return frozenset(rows * self.canvas_length for rows in self.canvas_rows)
-
-    def graph_capacity(self, key) -> int:
-        """A canvas bucket's canvas tokens; its graph exchanges at that many."""
+    def graph_tokens(self, key) -> int:
+        """The local bucket's canvas tokens, including row padding."""
         length = key[2] if key[0] == "canvas" else self.canvas_length
         return key[1] * length
 
     def expert_tokens(self, batch) -> int:
-        """Every staged canvas sends its whole canvas through the exchange."""
-        return batch.row_count * self.canvas_length
+        """Largest sender in the canvas pass and its selected-slot tail.
 
-    def select_graph_shape(self, batch, *, eligible, capacity=None):
+        Readout slots may select the same canvas position more than once,
+        so a tail's expert layer can send more rows than the canvas pass.
+        """
+        tokens = super().expert_tokens(batch)
+        if isinstance(batch.inputs, ReadoutInput) and not self.local_tail:
+            tokens = max(tokens, batch.inputs.slot_tokens.numel())
+        return tokens
+
+    def select_graph_shape(self, batch, *, eligible):
         """Choose the canvas graph bucket of a call and pad the call to it.
 
         Returns ``None`` for eager execution, without graph pools or for an
@@ -406,8 +423,8 @@ class CanvasRunner(ModelRunner):
         the canvas pass's input alone; a step key is ``("canvas_step", rows,
         sampling, first)``, where ``first`` is whether every row starts its
         canvas; padding rows start one too. In an expert step of per-rank
-        ``capacity`` tokens the call pads to the bucket of that many canvas
-        tokens, whose graph exchanges at it.
+        ``capacity`` tokens, a separate graph variant exchanges at that
+        capacity while this local bucket keeps its own canvas shape.
 
         Raises:
             CUDAGraphError: The call holds more canvases than every bucket,
@@ -425,12 +442,7 @@ class CanvasRunner(ModelRunner):
             )
         buckets = self.canvas_rows
         rows = next(
-            (
-                value
-                for value in buckets
-                if value >= batch.row_count
-                and (capacity is None or value * length == capacity)
-            ),
+            (value for value in buckets if value >= batch.row_count),
             None,
         )
         if rows is None or maximum > length:
@@ -458,6 +470,39 @@ class CanvasRunner(ModelRunner):
             key = ("canvas", rows, length)
         return key, padded, True
 
+    def _attend_state(self, batch):
+        """Copy a readout's per-token state into shared graph output backing.
+
+        The first, largest graph retains its own output allocations. Later
+        captures reuse those addresses, so neither local shapes nor transfer
+        variants retain another complete canvas state. Warmup before the first
+        capture returns temporary state without retaining it in the graph pool.
+        """
+        state = self.model.attend(batch.inputs)
+        backing = self._readout_state
+        if backing is None:
+            if torch.cuda.is_current_stream_capturing():
+                self._readout_state = state
+            return state
+        if len(state) != len(backing) or any(
+            value.shape[0] > target.shape[0]
+            or value.shape[1:] != target.shape[1:]
+            or value.dtype != target.dtype
+            or value.device != target.device
+            for value, target in zip(state, backing, strict=True)
+        ):
+            raise CUDAGraphError(
+                "readout graphs capture largest first; state exceeds "
+                "the shared output backing"
+            )
+        output = tuple(
+            target[: value.shape[0]]
+            for value, target in zip(state, backing, strict=True)
+        )
+        for value, target in zip(state, output, strict=True):
+            target.copy_(value)
+        return output
+
     def capture_graph(self, key, execution, forward):
         """Capture a readout bucket's pass, or a whole canvas step.
 
@@ -469,7 +514,7 @@ class CanvasRunner(ModelRunner):
         graph = capture_hidden(
             self.context,
             execution,
-            lambda static: self.model.attend(static.inputs),
+            self._attend_state,
             pools=self.pools,
             cache=self.cache,
         )
@@ -540,7 +585,7 @@ class CanvasRunner(ModelRunner):
         """
         if key[0] != "canvas":
             return super().replay_graph(key, execution, batch, borrow=borrow)
-        state = replay_hidden(self.buckets[key].graphs[None], execution)
+        state = replay_hidden(self.batch_graph(key), execution)
         with self.context.activate():
             if self.local_tail:
                 return self._replay_tails(state, batch.inputs)

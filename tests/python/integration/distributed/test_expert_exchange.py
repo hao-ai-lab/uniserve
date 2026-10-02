@@ -125,7 +125,6 @@ def _run(rank, port):
             hidden_size=HIDDEN,
             device=device,
         )
-        kind = exchange.register(frozenset({CAPACITY}))
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
         stream.wait(torch.cuda.current_stream(device))
         expected = _reference(hidden, up_gate, down, ids, weights)
@@ -151,9 +150,7 @@ def _run(rank, port):
                     exchange.end()
                 return output
 
-            capacity = exchange.agree(
-                kind if hidden.shape[0] else None, hidden.shape[0]
-            )
+            capacity = exchange.agree(hidden.shape[0])
             assert capacity == CAPACITY
             with context.activate():
                 eager = step()
