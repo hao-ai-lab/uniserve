@@ -1,7 +1,8 @@
 """Generate the MiniMax-H3 multi-region sparse layout vectors from FastVideo.
 
-The vectors in ``minimax_h3_regions.json`` are consumed by
-``tests/python/unit/models/test_h3_regions.py``. Every expected value comes
+Writes ``tests/python/fixtures/minimax_h3_regions.json``, the vectors
+``tests/python/unit/models/test_h3_regions.py`` checks the region packing
+against. Every expected value comes
 from FastVideo's FastH3 OmniRef inference path (branch
 ``feat/fasth3-omniref-pdd-inference``), run on the latent geometry of each
 case on the CPU:
@@ -27,7 +28,7 @@ FastVideo's prepared references hold (``17 * n + 5`` frames to
 Run with the FastVideo environment's interpreter from the repository root:
 
     /workspace/envs/minimax_h3/fastvideo/bin/python \
-        tests/python/fixtures/generate_minimax_h3_regions.py
+        tools/minimax_h3/region_vectors.py
 """
 
 from __future__ import annotations
@@ -54,7 +55,10 @@ from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_denoising import (
     _h3_vsa_ref2va_segments,
 )
 
-OUTPUT = Path(__file__).with_name("minimax_h3_regions.json")
+OUTPUT = (
+    Path(__file__).resolve().parents[2]
+    / "tests/python/fixtures/minimax_h3_regions.json"
+)
 PATCH = (1, 2, 2)
 # The FastH3 OmniRef contract (fastvideo_inference.json).
 TILE, SPARSITY, REFERENCE_KEEP = 128, 0.9, 0.1

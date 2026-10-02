@@ -8,8 +8,8 @@ segment, and each reference video and the target video form a region of
 region layout holds the same rows in another physical order with spare text
 and condition tiles. Every row's rotary coordinates, tag and timestep group
 must equal the reference's, every tile must hold the same rows in the same
-order, and selection must keep the reference's key tiles
-(``minimax_h3_regions.json``, written by ``generate_minimax_h3_regions.py``).
+order, and selection must keep the reference's key tiles. The vectors,
+``minimax_h3_regions.json``, come from ``tools/minimax_h3/region_vectors.py``.
 """
 
 import json
