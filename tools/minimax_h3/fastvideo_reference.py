@@ -64,6 +64,16 @@ CHECKPOINTS = {
 }
 DUMP_ENV = "MINIMAX_H3_DUMP_DIR"
 REPLAY_ENV = "MINIMAX_H3_REPLAY_NOISE"
+KERNEL_ENV = "MINIMAX_H3_VSA_KERNEL"
+REPLAY_TEXT_ENV = "MINIMAX_H3_REPLAY_TEXT"
+TEACHER_ENV = "MINIMAX_H3_TEACHER_TRAJECTORY"
+
+# Block-sparse kernels that evaluate FastVideo's VSA-H3 tile-128 forward. The
+# sm_100a CUDA kernel is FastVideo's own route; ``triton`` is fastvideo-kernel's
+# ``block_sparse_attn_128`` Triton route, which expands the same 128-token
+# block map onto its 64-token Triton kernel. Both evaluate the same mask, so
+# the pair measures the reference's kernel-to-kernel variation.
+VSA_KERNELS = ("sm100a", "triton")
 
 
 def _save(path: Path, tensors: dict) -> None:
@@ -73,6 +83,50 @@ def _save(path: Path, tensors: dict) -> None:
             for name, value in tensors.items()
         },
         str(path),
+    )
+
+
+def _route_tile128_to_triton() -> None:
+    """Evaluate VSA-H3's tile-128 forward with fastvideo-kernel's Triton route.
+
+    FastVideo calls the sm_100a kernel with the index form of its block map
+    (``map_to_index``). The replacement rebuilds the same boolean map from
+    those indices and hands it, with the same valid sizes, to
+    ``block_sparse_attn_128``, which runs the 64-token Triton kernel on the
+    map expanded two by two. Selection, compression and the gate stay
+    FastVideo's own code.
+    """
+    import types
+
+    from fastvideo.attention.backends import video_sparse_attn_h3 as backend
+    from fastvideo_kernel import block_sparse_attn_256 as routes
+
+    native = backend._sm100a
+
+    def block_sparse_attn_sm100a(
+        q, k, v, q2k_idx, q2k_num, variable_block_sizes, need_lse=False
+    ):
+        if need_lse:
+            raise ValueError("the Triton tile-128 route returns no LSE")
+        batch, heads, query_tiles, width = q2k_idx.shape
+        key_tiles = variable_block_sizes.numel()
+        listed = torch.arange(width, device=q2k_idx.device) < q2k_num[..., None]
+        # Unlisted slots scatter into one spare column that is dropped.
+        columns = torch.where(listed, q2k_idx.long(), key_tiles)
+        mask = torch.zeros(
+            (batch, heads, query_tiles, key_tiles + 1),
+            dtype=torch.bool,
+            device=q.device,
+        )
+        mask.scatter_(-1, columns, True)
+        os.environ["FASTVIDEO_VSA_TRITON"] = "1"
+        return routes.block_sparse_attn_128(
+            q, k, v, mask[..., :key_tiles], variable_block_sizes
+        )
+
+    backend._sm100a = types.SimpleNamespace(
+        is_supported=native.is_supported,
+        block_sparse_attn_sm100a=block_sparse_attn_sm100a,
     )
 
 
@@ -137,14 +191,50 @@ def _install_worker_seams(dump_dir: Path) -> None:
     preparation.randn_tensor = recorded_randn(preparation.randn_tensor)
     packing.randn_tensor = recorded_randn(packing.randn_tensor)
 
+    if os.environ.get(KERNEL_ENV, "sm100a") == "triton":
+        _route_tile128_to_triton()
+
     stage = conditioning.MiniMaxH3ConditioningStage
     original_encode = stage._encode_tokens
+    original_conditioning = stage.forward
+
+    recorded_text = None
+    if os.environ.get(REPLAY_TEXT_ENV):
+        text_path = Path(os.environ[REPLAY_TEXT_ENV])
+        recorded_text = (
+            load_file(str(text_path))["qwen_hidden_states_50"],
+            json.loads((text_path.parent / "presentation.json").read_text())[
+                "token_ids"
+            ],
+        )
+
+        def conditioning_forward(self, batch, fastvideo_args):
+            # The recorded encoder output replaces the encoder call, so the
+            # offloaded encoder never moves to the device: a stand-in without
+            # parameters takes its place for the duration of the stage.
+            encoder = self.conditioner
+            self.conditioner = torch.nn.Module()
+            try:
+                return original_conditioning(self, batch, fastvideo_args)
+            finally:
+                self.conditioner = encoder
+
+        stage.forward = conditioning_forward
 
     def encode_tokens(self, token_ids, token_tags, device, **vision_inputs):
         start = time.perf_counter()
-        embeds, tags = original_encode(
-            self, token_ids, token_tags, device, **vision_inputs
-        )
+        if recorded_text is None:
+            embeds, tags = original_encode(
+                self, token_ids, token_tags, device, **vision_inputs
+            )
+        else:
+            embeds, recorded_ids = recorded_text
+            if list(token_ids) != recorded_ids:
+                raise ValueError(
+                    "the replayed text encoding presents other token ids"
+                )
+            embeds = embeds.to(device=device)
+            tags = torch.tensor(token_tags, dtype=torch.long)
         torch.cuda.synchronize()
         state["text"] = {
             "token_ids": list(token_ids),
@@ -234,6 +324,13 @@ def _install_worker_seams(dump_dir: Path) -> None:
     latents_stage.forward = prepare
 
     original_step = sched.MiniMaxH3Scheduler.step
+    # Teacher forcing: every step continues from the recorded run's sample of
+    # that step, so each prediction is made on the recorded run's inputs.
+    teacher = (
+        load_file(os.environ[TEACHER_ENV])
+        if os.environ.get(TEACHER_ENV)
+        else None
+    )
 
     def step(self, model_output, timestep, sample, return_dict=True):
         stream = "video" if model_output.shape[-1] == 96 else "audio"
@@ -255,6 +352,11 @@ def _install_worker_seams(dump_dir: Path) -> None:
                 "sample": updated.detach().float().cpu().clone(),
             }
         )
+        if teacher is not None:
+            # The recorded sample is this run's own update; the next step
+            # reads the recorded run's.
+            index = len(state["steps"][stream]) - 1
+            updated.copy_(teacher[f"{stream}_samples"][index])
         if stream == "audio":
             torch.cuda.synchronize()
             state["step_times"].append(time.perf_counter())
@@ -530,6 +632,11 @@ def run(args: argparse.Namespace) -> None:
     os.environ[DUMP_ENV] = str(run_dir)
     if args.replay_noise is not None:
         os.environ[REPLAY_ENV] = str(args.replay_noise.resolve())
+    os.environ[KERNEL_ENV] = args.vsa_kernel
+    if args.replay_text is not None:
+        os.environ[REPLAY_TEXT_ENV] = str(args.replay_text.resolve())
+    if args.teacher_trajectory is not None:
+        os.environ[TEACHER_ENV] = str(args.teacher_trajectory.resolve())
 
     from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
         align_num_frames,
@@ -620,9 +727,11 @@ def run(args: argparse.Namespace) -> None:
                         source=str(path), media_type=condition.kind
                     )
                 )
-        generator = VideoGenerator.from_config(
-            example.build_generator_config(model_dir, contract, 1)
-        )
+        config = example.build_generator_config(model_dir, contract, 1)
+        # Layerwise offload streams each DiT block's unchanged weights to the
+        # GPU before it runs; it bounds device memory, not the arithmetic.
+        config.engine.offload.dit_layerwise = args.dit_layerwise_offload
+        generator = VideoGenerator.from_config(config)
         steps = contract["num_inference_steps"]
         inputs_config = InputConfig(references=references)
     loaded = time.perf_counter()
@@ -704,6 +813,12 @@ def run(args: argparse.Namespace) -> None:
             },
         },
         "fastvideo_environment": environment,
+        "vsa_kernel": args.vsa_kernel,
+        "dit_layerwise_offload": args.dit_layerwise_offload,
+        "replayed_text": str(args.replay_text) if args.replay_text else None,
+        "teacher_trajectory": (
+            str(args.teacher_trajectory) if args.teacher_trajectory else None
+        ),
         "timings_seconds": {
             "load": loaded - started,
             "text_encoding": worker["text_encoding"],
@@ -752,7 +867,36 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--impl", default=None)
     parser.add_argument("--replay-noise", type=Path, default=None)
+    parser.add_argument(
+        "--vsa-kernel",
+        choices=VSA_KERNELS,
+        default="sm100a",
+        help="block-sparse kernel of the OmniRef tile-128 forward",
+    )
+    parser.add_argument(
+        "--replay-text",
+        type=Path,
+        default=None,
+        help="text.safetensors whose Qwen hidden states replace the encoder",
+    )
+    parser.add_argument(
+        "--teacher-trajectory",
+        type=Path,
+        default=None,
+        help="trajectory.safetensors whose samples every step continues from",
+    )
+    parser.add_argument(
+        "--dit-layerwise-offload",
+        action="store_true",
+        help="keep the OmniRef DiT on the host and stream it layer by layer",
+    )
     args = parser.parse_args()
+    if args.checkpoint != "omniref" and (
+        args.vsa_kernel != "sm100a" or args.dit_layerwise_offload
+    ):
+        parser.error(
+            "--vsa-kernel and --dit-layerwise-offload apply to the OmniRef run"
+        )
     if (args.height is None) != (args.width is None):
         parser.error("--height and --width go together")
     if args.impl is None:
