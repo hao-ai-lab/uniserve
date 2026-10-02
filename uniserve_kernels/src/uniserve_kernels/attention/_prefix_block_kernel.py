@@ -179,6 +179,11 @@ class PrefixBlockAttentionSm100:
             ``start_page[b] + j`` rather than page ``j``.
         has_lse: Whether to store each row's log-sum-exp.
         lse_base2: Store base-2 LSE if true, natural LSE otherwise.
+        pdl: Launch as a programmatic dependent of the preceding kernel
+            (see ``uniserve_kernels.triton.dependent_launch``): every thread
+            waits for the preceding grid after the TMA descriptor prefetch
+            and before its first global memory access, then releases the
+            next grid.
     """
 
     def __init__(
@@ -194,6 +199,7 @@ class PrefixBlockAttentionSm100:
         has_start_page: bool,
         has_lse: bool,
         lse_base2: bool,
+        pdl: bool,
     ) -> None:
         if head_dim not in (256, 512):
             raise ValueError("head_dim must be 256 or 512")
@@ -214,6 +220,7 @@ class PrefixBlockAttentionSm100:
         self.has_start_page = has_start_page
         self.has_lse = has_lse
         self.lse_base2 = lse_base2
+        self.pdl = pdl
 
         # Rows per cluster tile and per CTA; see the module docstring.
         self.tile_rows = tile_rows
@@ -595,6 +602,7 @@ class PrefixBlockAttentionSm100:
             cluster=[2, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.pdl,
         )
 
     # ---------------------------------------------------------- tile metadata
@@ -751,6 +759,17 @@ class PrefixBlockAttentionSm100:
             cpasync.prefetch_descriptor(tma_vp)
             cpasync.prefetch_descriptor(tma_kc)
             cpasync.prefetch_descriptor(tma_vc)
+        if const_expr(self.pdl):
+            # The descriptors are launch parameters, not preceding outputs,
+            # so their prefetch may overlap the preceding grid. Every thread
+            # waits for that grid before the first global access (tile
+            # metadata, page lookups, TMA loads and all stores), so it reads
+            # complete inputs and overwrites nothing the grid still reads.
+            # The release follows at once: the next grid becomes eligible
+            # after every CTA has signaled or completed. Its own wait still
+            # protects accesses to this grid's data until completion.
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
 
         bidx, _, _ = cute.arch.block_idx()
         # Position of this CTA in the MMA pair: rows [v * R, v * R + R) of a

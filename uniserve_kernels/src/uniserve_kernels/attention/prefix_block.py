@@ -65,6 +65,8 @@ from typing import Any
 
 import torch
 
+from uniserve_kernels.triton import dependent_launch
+
 _IMPORT_ERROR: BaseException | None = None
 _cute: Any | None
 _from_dlpack: Any | None
@@ -580,6 +582,7 @@ def prefix_block_attention(
         "has_start_page": start_page is not None,
         "has_lse": lse is not None,
         "lse_base2": bool(lse_base2),
+        "pdl": dependent_launch(query.device),
     }
     arguments = (
         query,

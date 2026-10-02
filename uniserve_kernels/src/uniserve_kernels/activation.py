@@ -22,7 +22,13 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from uniserve_kernels.triton import tl, triton, unsupported_operands
+from uniserve_kernels.triton import (
+    dependent_launch,
+    pdl_prologue,
+    tl,
+    triton,
+    unsupported_operands,
+)
 
 #: Gate activations of the packed ``act_and_mul`` kernels: ``silu``, exact
 #: (erf) ``gelu`` and ``gelu_tanh``, PyTorch's ``approximate="tanh"`` form.
@@ -85,14 +91,18 @@ if triton is not None:
         ACTIVATION: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
         WIDE: tl.constexpr,  # noqa: N803
+        PDL: tl.constexpr,  # noqa: N803
     ):
         """Store ``act(gate) * value`` for one block of the flattened output.
 
         Grid: ``ceil(elements / BLOCK)`` programs over the contiguous
         ``[rows, n_cols]`` output. Input rows start ``x_row_stride``
         elements apart. ``WIDE`` computes offsets in int64, which launches
-        whose input or output spans ``2**31`` elements require.
+        whose input or output spans ``2**31`` elements require. ``PDL``
+        launches run :func:`pdl_prologue` before the first load.
         """
+        pdl_prologue(PDL)
+
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         if WIDE:
             offsets = offsets.to(tl.int64)
@@ -454,6 +464,7 @@ def act_and_mul(x: torch.Tensor, out: torch.Tensor, *, activation: str) -> None:
     # The last program's offsets reach elements + BLOCK; input offsets reach
     # rows * stride (packed rows span at least 2 * width).
     span = max(rows * max(stride, 2 * width), elements) + _GATED_BLOCK
+    pdl = dependent_launch(x.device)
     _act_and_mul_kernel[(triton.cdiv(elements, _GATED_BLOCK),)](
         x,
         out,
@@ -463,7 +474,9 @@ def act_and_mul(x: torch.Tensor, out: torch.Tensor, *, activation: str) -> None:
         activation,
         _GATED_BLOCK,
         span >= 2**31,
+        pdl,
         num_warps=_GATED_WARPS,
+        launch_pdl=pdl,
     )
 
 

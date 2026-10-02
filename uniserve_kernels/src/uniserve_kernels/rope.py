@@ -23,7 +23,13 @@ from __future__ import annotations
 
 import torch
 
-from uniserve_kernels.triton import tl, triton, unsupported_operands
+from uniserve_kernels.triton import (
+    dependent_launch,
+    pdl_prologue,
+    tl,
+    triton,
+    unsupported_operands,
+)
 
 if triton is not None:  # pragma: no cover - depends on the accelerator stack.
     from triton.language.extra.cuda import libdevice
@@ -44,13 +50,17 @@ if triton is not None:
         frequency_stride: tl.constexpr,
         scale: tl.constexpr,
         block: tl.constexpr,
+        PDL: tl.constexpr,  # noqa: N803
     ):
         """Store scaled cosine and sine factors for strided positions.
 
         ``offsets`` flatten the contiguous ``[*positions.shape, width]``
         outputs. ``shape`` holds the trailing position extents and ``strides``
-        every position stride, both as compile-time tuples.
+        every position stride, both as compile-time tuples. ``PDL`` launches
+        run :func:`pdl_prologue` before the first load.
         """
+        pdl_prologue(PDL)
+
         offsets = tl.program_id(0) * block + tl.arange(0, block)
         rows = offsets // width
         position_offsets = tl.full((block,), 0, tl.int64)
@@ -306,14 +316,18 @@ if triton is not None:
         EPS: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
         ROWS: tl.constexpr,  # noqa: N803
+        PDL: tl.constexpr,  # noqa: N803
     ):
         """Normalize and rotate Q rows, then K rows, over one program grid.
 
         Programs below ``cdiv(q_rows, ROWS)`` process query rows and the
         rest process key rows; Q and K share domains, axes and factor tables
         but keep their own weights, head counts and strides. The branch is
-        uniform within each program.
+        uniform within each program. ``PDL`` launches run
+        :func:`pdl_prologue` before the first load.
         """
+        pdl_prologue(PDL)
+
         program = tl.program_id(0)
         query_programs = tl.cdiv(q_rows, ROWS)
         if program < query_programs:
@@ -406,6 +420,7 @@ def rotary_factors(
         return
     # Triton launches on the thread's current device, whereas this numerical
     # call follows its input tensors, as PyTorch does.
+    pdl = dependent_launch(positions.device)
     with torch.cuda.device(positions.device):
         _rotary_factors_kernel[(triton.cdiv(total, 256),)](
             positions,
@@ -419,6 +434,8 @@ def rotary_factors(
             frequencies.stride(0),
             scale,
             256,
+            pdl,
+            launch_pdl=pdl,
         )
 
 
@@ -676,6 +693,7 @@ def qk_norm_rope(
     # tables' pointers.
     cosines = tuple(cosine if cosine.shape[-1] else q for cosine in cosines)
     sines = tuple(sine if sine.shape[-1] else q for sine in sines)
+    pdl = dependent_launch(q.device)
     _qk_norm_rope_kernel[grid](
         q,
         k,
@@ -705,7 +723,9 @@ def qk_norm_rope(
         float(eps),
         block,
         tile_rows,
+        pdl,
         num_warps=4,
+        launch_pdl=pdl,
     )
 
 

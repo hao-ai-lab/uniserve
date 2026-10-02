@@ -12,7 +12,13 @@ from __future__ import annotations
 
 import torch
 
-from uniserve_kernels.triton import tl, triton, unsupported_operands
+from uniserve_kernels.triton import (
+    dependent_launch,
+    pdl_prologue,
+    tl,
+    triton,
+    unsupported_operands,
+)
 
 #: One program reduces a complete row, bounding the normalized width.
 MAX_WIDTH = 8192
@@ -54,13 +60,17 @@ if triton is not None:
         n_cols: tl.constexpr,
         eps: tl.constexpr,
         block: tl.constexpr,
+        PDL: tl.constexpr,  # noqa: N803
     ):
         """Normalize one hidden-state row per Triton program.
 
         Input and output rows are addressed through their own leading-axis
         strides with unit channel stride. Every program loads its whole row
-        before storing, so the output may alias the input.
+        before storing, so the output may alias the input. ``PDL`` launches
+        run :func:`pdl_prologue` before the first load.
         """
+        pdl_prologue(PDL)
+
         # ``n_cols``, ``eps`` and the row geometry are constexpr, so Triton
         # compiles one variant per distinct width, epsilon and view layout;
         # the leading extent (token count) is not part of the key.
@@ -88,8 +98,14 @@ if triton is not None:
         n_cols: tl.constexpr,
         eps: tl.constexpr,
         block: tl.constexpr,
+        PDL: tl.constexpr,  # noqa: N803
     ):
-        """Add a residual, preserve the sum, and normalize it in one program."""
+        """Add a residual, preserve the sum, and normalize it in one program.
+
+        ``PDL`` launches run :func:`pdl_prologue` before the first load.
+        """
+        pdl_prologue(PDL)
+
         # Rows are contiguous; int64 row bases keep offsets past 2**31 valid.
         row = tl.program_id(0).to(tl.int64)
         offs = tl.arange(0, block)
@@ -219,6 +235,7 @@ def rms_norm(
     block, warps = row_launch(width)
     x_shape, x_strides = row_axes(x)
     out_shape, out_strides = row_axes(out)
+    pdl = dependent_launch(x.device)
     _rms_norm_kernel[(rows,)](
         x,
         weight,
@@ -230,7 +247,9 @@ def rms_norm(
         width,
         float(eps),
         block,
+        pdl,
         num_warps=warps,
+        launch_pdl=pdl,
     )
 
 
@@ -251,6 +270,7 @@ def add_rms_norm(
     if rows == 0:
         return
     block, warps = row_launch(width)
+    pdl = dependent_launch(x.device)
     _add_rms_norm_kernel[(rows,)](
         x,
         residual,
@@ -260,5 +280,7 @@ def add_rms_norm(
         width,
         float(eps),
         block,
+        pdl,
         num_warps=warps,
+        launch_pdl=pdl,
     )
