@@ -33,6 +33,9 @@ mod sampling;
 pub(crate) mod test_support;
 /// Text tokenization, decoding, and sampling utilities.
 pub mod text;
+/// MiniMax-H3 condition ingestion: media sources, probing, planning and
+/// presentation.
+pub mod video;
 
 use std::borrow::Borrow;
 use std::fmt;
