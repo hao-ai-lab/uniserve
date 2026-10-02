@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 from torch import nn
 
@@ -107,10 +109,21 @@ class TransformerDecoder(nn.Module):
         attention: AttentionInput,
         *,
         routes: tuple[RouteSpan, ...] = (),
+        deepstack: Mapping[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """Run this stage's resident layers over the packed tokens.
+
+        ``positions`` is ``[tokens]`` or ``[axes, tokens]``. ``deepstack``
+        maps layer keys to complete ``[tokens, hidden]`` features added to
+        the residual stream after that layer (DeepStack); rows that receive
+        nothing hold zeros. Keys of layers on other pipeline stages are
+        ignored.
+        """
         count = positions.shape[-1]
         if not routes and self._default_route is not None:
             routes = (RouteSpan(self._default_route, 0, count),)
+        if deepstack and routes:
+            raise ValueError("DeepStack features require one packed stream")
         partition = TokenShard(count, self._tokens)
         positions = partition.local(positions, dim=positions.ndim - 1)
 
@@ -157,13 +170,27 @@ class TransformerDecoder(nn.Module):
                     residual, local_routes, routes=keys
                 )
 
-        for layer in self.layers.values():
+        for key, layer in self.layers.items():
             if routes:
                 hidden, residual = layer(
                     hidden, residual, positions, attention, routes=local_routes
                 )
             else:
                 hidden, residual = layer(hidden, residual, positions, attention)
+
+            features = None if deepstack is None else deepstack.get(key)
+            if features is not None:
+                # The reference model rounds the layer output into the
+                # residual stream before adding the features, so the sum is
+                # materialized first. The next normalization then reads that
+                # stream against a zero update, which adds nothing.
+                assert isinstance(hidden, torch.Tensor)
+                assert isinstance(residual, torch.Tensor)
+                residual = residual + hidden
+                residual = residual + partition.local(features).to(
+                    residual.dtype
+                )
+                hidden = torch.zeros_like(residual)
         # Every layer returns the residual stream it carries forward.
         assert residual is not None
 

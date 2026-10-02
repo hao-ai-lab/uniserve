@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from collections.abc import Sequence
+from math import prod
 from typing import Generic, TypeVar
 
 import torch
@@ -11,7 +12,7 @@ from uniserve.media import image
 from uniserve.nn.attention import SequenceLengths, VarlenInput
 from uniserve.tensors import OutputLayout
 
-from .inputs import VisionInput
+from .inputs import EmbeddingReplacement, VisionInput
 from .transformer import TransformerDecoder
 
 InputT = TypeVar("InputT")
@@ -118,6 +119,9 @@ class PatchEncoder(Encoder[VisionInput]):
     downsample counts input patches per output feature on each spatial axis.
     Patch serialization for an architecture is defined by its network;
     complete CHW images are stacked without altering their pixel order.
+    A packed sample with a ``(time, height, width)`` grid keeps its time
+    axis: each output feature merges patches of one time step, so the sample
+    yields ``time * height * width / downsample**2`` features.
     """
 
     def __init__(
@@ -149,9 +153,12 @@ class PatchEncoder(Encoder[VisionInput]):
     def encode(self, inputs: VisionInput) -> tuple[torch.Tensor, ...]:
         groups = defaultdict(list)
         for index, value in enumerate(inputs.images):
+            # Packed samples share one network call when their patch width
+            # and grid rank agree, so their grids concatenate.
             key = (
                 value.ndim,
                 value.shape[1:] if value.ndim == 2 else value.shape,
+                len(inputs.grid_shapes[index] or ()),
                 value.dtype,
                 value.device,
             )
@@ -183,14 +190,15 @@ class PatchEncoder(Encoder[VisionInput]):
                         "packed vision samples require their grid and host "
                         "shape"
                     )
-                elif value.shape[0] != shape[0] * shape[1]:
+                elif value.shape[0] != prod(shape):
                     raise ValueError(
                         "vision grid dimensions must cover their patch rows"
                     )
                 if (
-                    grid.shape != (1, 2)
+                    len(shape) not in (2, 3)
+                    or grid.shape != (1, len(shape))
                     or min(shape) < 1
-                    or any(axis % self.downsample for axis in shape)
+                    or any(axis % self.downsample for axis in shape[-2:])
                 ):
                     raise ValueError(
                         "vision grids must align with spatial downsampling"
@@ -208,7 +216,7 @@ class PatchEncoder(Encoder[VisionInput]):
             features = self.connector(features).to(self._output_dtype)
 
             counts = tuple(
-                height * width // self.downsample**2 for height, width in shapes
+                prod(shape) // self.downsample**2 for shape in shapes
             )
             if features.shape != (sum(counts), self._output_size):
                 raise ValueError(
@@ -271,13 +279,36 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
         )
 
     def encode(
-        self, tokens: tuple[torch.Tensor, ...]
+        self,
+        tokens: tuple[torch.Tensor, ...],
+        *,
+        positions: tuple[torch.Tensor, ...] | None = None,
+        embeddings: tuple[EmbeddingReplacement | None, ...] | None = None,
+        deepstack: tuple[tuple[torch.Tensor, ...] | None, ...] | None = None,
     ) -> tuple[torch.Tensor, ...] | None:
         """Return complete sequence features on the final pipeline stage.
 
         All participating stages execute the retained network. Earlier stages
         return None after forwarding their activations; sequence partitions
         are gathered by the final decoder stage before restoring sample bounds.
+
+        The optional inputs hold one entry per sample of ``tokens``:
+
+        - ``positions``: rotary coordinates, ``[length]`` or, for
+          multimodal rotary positions, ``[axes, length]`` with the same axes
+          in every sample. Without them a sample's tokens take positions
+          ``0..length-1``.
+        - ``embeddings``: an ``EmbeddingReplacement`` whose dense
+          ``[length, hidden]`` values replace the token embeddings where its
+          ``[length]`` mask is set, or None to keep every token embedding.
+        - ``deepstack``: dense ``[length, hidden]`` features added to the
+          residual stream after the leading retained layers, the ``j``-th
+          after retained layer ``j`` (DeepStack), or None. Rows without
+          features hold zeros. Every sample that has features has the same
+          number of them, at most one per retained layer.
+
+        Raises:
+            ValueError: An optional input does not match the samples.
         """
         if not tokens:
             return (
@@ -292,9 +323,28 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
             )
         counts = tuple(value.numel() for value in tokens)
         packed = torch.cat(tokens)
-        positions = torch.cat(
-            tuple(torch.arange(count, device=packed.device) for count in counts)
-        )
+        if positions is None:
+            packed_positions = torch.cat(
+                tuple(
+                    torch.arange(count, device=packed.device)
+                    for count in counts
+                )
+            )
+        else:
+            if (
+                len(positions) != len(counts)
+                or any(
+                    value.shape[-1] != count
+                    for value, count in zip(positions, counts, strict=True)
+                )
+                or len({value.shape[:-1] for value in positions}) != 1
+            ):
+                raise ValueError(
+                    "positions must cover every sample's tokens with one "
+                    "common axis layout"
+                )
+            packed_positions = torch.cat(positions, dim=-1)
+        additions = self._deepstack(counts, deepstack)
         values = torch.cat(
             tuple(
                 packed.new_full((1,), count, dtype=torch.int32)
@@ -307,15 +357,94 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
         lengths = SequenceLengths(host=counts, values=values, offsets=offsets)
         attention = VarlenInput(lengths, lengths, (True,) * len(counts))
 
-        embeddings = (
-            self.network.embed_input_ids(packed)
-            if self.network._pipeline.rank == 0
-            else None
+        embedded = None
+        if self.network._pipeline.rank == 0:
+            embedded = self._embed(packed, counts, embeddings)
+        features = self.network(
+            embedded, packed_positions, attention, deepstack=additions
         )
-        features = self.network(embeddings, positions, attention)
         if self.network._pipeline.rank != self.network._pipeline.size - 1:
             return None
         return tuple(features.split(counts))
+
+    def _embed(
+        self,
+        packed: torch.Tensor,
+        counts: tuple[int, ...],
+        embeddings: tuple[EmbeddingReplacement | None, ...] | None,
+    ) -> torch.Tensor:
+        """Embed packed tokens, splicing each sample's replaced rows."""
+        embedded = self.network.embed_input_ids(packed)
+        if embeddings is None:
+            return embedded
+        if len(embeddings) != len(counts):
+            raise ValueError("embedding replacements must align with samples")
+
+        parts = list(embedded.split(counts))
+        for index, replacement in enumerate(embeddings):
+            if replacement is None:
+                continue
+            if replacement.values.shape != parts[index].shape or (
+                replacement.mask.shape != (counts[index],)
+            ):
+                raise ValueError(
+                    "embedding replacements must cover their sample's rows"
+                )
+            parts[index] = torch.where(
+                replacement.mask.reshape(-1, 1),
+                replacement.values.to(embedded.dtype),
+                parts[index],
+            )
+        return torch.cat(parts)
+
+    def _deepstack(
+        self,
+        counts: tuple[int, ...],
+        deepstack: tuple[tuple[torch.Tensor, ...] | None, ...] | None,
+    ) -> dict[str, torch.Tensor] | None:
+        """Pack per-sample DeepStack features by the layer receiving them.
+
+        Returns packed ``[tokens, hidden]`` additions keyed by the retained
+        layer's network key, or None when no sample has features.
+        """
+        if deepstack is None:
+            return None
+        if len(deepstack) != len(counts):
+            raise ValueError("DeepStack features must align with samples")
+        provided = [values for values in deepstack if values]
+        if not provided:
+            return None
+        depth, reference = len(provided[0]), provided[0][0]
+        if (
+            depth > len(self.retained_layers)
+            or any(
+                len(values) != depth
+                for values in deepstack
+                if values is not None
+            )
+            or any(
+                feature.shape != (count, self.network.hidden_size)
+                for values, count in zip(deepstack, counts, strict=True)
+                if values is not None
+                for feature in values
+            )
+        ):
+            raise ValueError(
+                "DeepStack features must give every sample the same leading "
+                "retained layers and cover its rows"
+            )
+
+        additions = {}
+        for layer in range(depth):
+            additions[str(self.retained_layers[layer])] = torch.cat(
+                tuple(
+                    reference.new_zeros((count, self.network.hidden_size))
+                    if values is None
+                    else values[layer].to(reference.dtype)
+                    for values, count in zip(deepstack, counts, strict=True)
+                )
+            )
+        return additions
 
     def output_layout(self, num_tokens: int, dtype: torch.dtype):
         """Describe the encoded conditioning this encoder emits.
