@@ -17,8 +17,8 @@ use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
 use super::{
-    CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutOptions, ReadoutPlan,
-    StartupError, SystemOneError, SystemOneRequest,
+    CandidateTokens, CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutOptions,
+    ReadoutPlan, StartupError, SystemOneError, SystemOneRequest,
 };
 use axum::http::StatusCode;
 use base64::Engine as _;
@@ -502,6 +502,7 @@ fn independent_layout_gives_every_question_its_own_prompt() {
     let options = ReadoutOptions {
         layout: ReadoutLayout::Independent,
         canvas: CanvasMode::Full,
+        ..ReadoutOptions::default()
     };
     let encoder = checkpoint.encoder(options, 4096);
     let plan = encoder
@@ -530,6 +531,7 @@ fn compact_canvases_end_at_the_next_multiple_of_16() {
     let options = ReadoutOptions {
         layout: ReadoutLayout::Joint,
         canvas: CanvasMode::Compact,
+        ..ReadoutOptions::default()
     };
     let encoder = checkpoint.encoder(options, 4096);
     let tokens = checkpoint.profile.tokens;
@@ -550,6 +552,99 @@ fn compact_canvases_end_at_the_next_multiple_of_16() {
                 .all(|token| *token == tokens.pad)
         );
     }
+}
+
+#[test]
+fn fixed_canvases_split_questions_and_preserve_every_answer() {
+    let checkpoint = Checkpoint::new(&[]);
+    let encoder = checkpoint.encoder(
+        ReadoutOptions {
+            canvas: "64".parse().unwrap(),
+            ..ReadoutOptions::default()
+        },
+        8192,
+    );
+    let questions: serde_json::Map<String, Value> =
+        (0..15).map(|i| (format!("q{i}"), noul("?"))).collect();
+    let plan = encoder
+        .plan(&request(Value::Object(questions)), &[])
+        .unwrap();
+
+    // Questions 1–9 use four tokens each; 10–14 use five. Together with
+    // <turn|> they fill 62 positions, leaving question 15 for another canvas.
+    assert_eq!(plan.prompts.len(), 2);
+    assert_eq!(plan.prompts[0].rows[0].slots.len(), 14);
+    assert_eq!(plan.prompts[1].rows[0].slots.len(), 1);
+    for prompt in &plan.prompts {
+        assert_eq!(prompt.rows[0].token_ids.len(), 64);
+    }
+    let values = logprobs(&plan, |_, _, _, _| 0.1);
+    let response = serde_json::to_value(plan.assemble("m", &values).unwrap()).unwrap();
+    let answers = response["answers"].as_object().unwrap();
+    assert_eq!(answers.len(), 15);
+    for i in 0..15 {
+        assert_close(&answers[&format!("q{i}")]["noul"], 0.5);
+    }
+}
+
+#[test]
+fn invalid_fixed_canvas_lengths_fail_at_startup() {
+    let checkpoint = Checkpoint::new(&[]);
+    for length in [0, 15, 272] {
+        let result = ReadoutEncoder::load(
+            &checkpoint.files,
+            Arc::clone(&checkpoint.tokenizer),
+            &checkpoint.profile,
+            ReadoutOptions {
+                canvas: CanvasMode::Fixed(length),
+                ..ReadoutOptions::default()
+            },
+            4096,
+        );
+        assert!(matches!(result, Err(StartupError::Contract(_))));
+    }
+}
+
+#[test]
+fn primary_candidates_use_space_prefixed_probabilities() {
+    let checkpoint = Checkpoint::new(&[]);
+    let encoder = checkpoint.encoder(
+        ReadoutOptions {
+            candidates: CandidateTokens::Primary,
+            ..ReadoutOptions::default()
+        },
+        4096,
+    );
+    let plan = encoder
+        .plan(
+            &request(json!({
+                "team": {"type": "choice", "criteria": {"red": null, "blue": null}},
+                "level": {"type": "score", "criteria": ["low", "high"]},
+                "ready": noul("Ready?"),
+            })),
+            &[],
+        )
+        .unwrap();
+    let table: HashMap<u32, f64> = [
+        (" A", 0.1),
+        ("A", 0.6),
+        (" B", 0.3),
+        ("B", 0.0),
+        (" no", 0.2),
+        (" yes", 0.6),
+    ]
+    .into_iter()
+    .map(|(text, probability)| (checkpoint.token(text), probability))
+    .collect();
+    let values = logprobs(&plan, |_, _, _, token| table[&token]);
+    let response = serde_json::to_value(plan.assemble("m", &values).unwrap()).unwrap();
+    let answers = &response["answers"];
+    assert_eq!(answers["team"]["choice"], "blue");
+    assert_close(&answers["team"]["probabilities"]["red"], 0.25);
+    assert_close(&answers["team"]["x_candidate_mass"], 0.4);
+    assert_close(&answers["level"]["score"], 0.75);
+    assert_close(&answers["level"]["x_candidate_mass"], 0.4);
+    assert_close(&answers["ready"]["noul"], 0.75);
 }
 
 #[test]
@@ -774,6 +869,7 @@ async fn the_route_answers_every_question_from_the_engine_readout() {
     let options = ReadoutOptions {
         layout: ReadoutLayout::Independent,
         canvas: CanvasMode::Full,
+        ..ReadoutOptions::default()
     };
     let router = readout_router(&checkpoint, options);
     let questions = json!({"urgent": noul("Is it urgent?"), "team": choice(3)});

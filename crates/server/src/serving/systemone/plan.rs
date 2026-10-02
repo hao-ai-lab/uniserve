@@ -89,6 +89,33 @@ pub enum CanvasMode {
     Full,
     /// The smallest multiple of 16 tokens that holds the scaffold and `<turn|>`.
     Compact,
+    /// A fixed multiple of 16, no longer than the checkpoint's canvas.
+    Fixed(u32),
+}
+
+/// Spellings whose probability contributes to each answer candidate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateTokens {
+    /// Sum every supported single-token spelling of a candidate.
+    #[default]
+    Variants,
+    /// Read only the primary, space-prefixed spelling of each candidate.
+    Primary,
+}
+
+impl FromStr for CandidateTokens {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "variants" => Ok(Self::Variants),
+            "primary" => Ok(Self::Primary),
+            other => Err(format!(
+                "unknown readout candidates `{other}`; expected variants or primary"
+            )),
+        }
+    }
 }
 
 impl FromStr for ReadoutLayout {
@@ -109,14 +136,17 @@ impl FromStr for ReadoutLayout {
 impl FromStr for CanvasMode {
     type Err = String;
 
-    /// Parses `full` or `compact`.
+    /// Parses `full`, `compact`, or a positive token count divisible by 16.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "full" => Ok(Self::Full),
             "compact" => Ok(Self::Compact),
-            other => Err(format!(
-                "unknown readout canvas `{other}`; expected full or compact"
-            )),
+            other => match other.parse::<u32>() {
+                Ok(length) if length > 0 && length.is_multiple_of(16) => Ok(Self::Fixed(length)),
+                _ => Err(format!(
+                    "unknown readout canvas `{other}`; expected full, compact, or a positive multiple of 16"
+                )),
+            },
         }
     }
 }
@@ -128,6 +158,9 @@ pub struct ReadoutOptions {
     pub layout: ReadoutLayout,
     /// Canvas length.
     pub canvas: CanvasMode,
+    /// Candidate spellings contributing to the returned probabilities.
+    #[serde(default)]
+    pub candidates: CandidateTokens,
 }
 
 /// Pixel dimensions of one decoded request image.
@@ -205,8 +238,28 @@ impl ReadoutEncoder {
                 placeholder_token: placeholder,
             }),
         )?;
-        let vocabulary = Vocabulary::resolve(&tokenizer).map_err(StartupError::Contract)?;
-        let canvas_length = profile.canvas_length as usize;
+        let mut vocabulary = Vocabulary::resolve(&tokenizer).map_err(StartupError::Contract)?;
+        if options.candidates == CandidateTokens::Primary {
+            // The first entry is the verified space-prefixed spelling, so
+            // planning and probability assembly share exactly the same set.
+            for variants in &mut vocabulary.label_variants {
+                variants.truncate(1);
+            }
+            vocabulary.yes_variants.truncate(1);
+            vocabulary.no_variants.truncate(1);
+        }
+        let canvas_length = match options.canvas {
+            CanvasMode::Fixed(length) => {
+                if length == 0 || !length.is_multiple_of(16) || length > profile.canvas_length {
+                    return Err(StartupError::Contract(format!(
+                        "readout canvas {length} must be a positive multiple of 16 no greater than {}",
+                        profile.canvas_length
+                    )));
+                }
+                length as usize
+            }
+            CanvasMode::Full | CanvasMode::Compact => profile.canvas_length as usize,
+        };
         let numbers = (1..=canvas_length)
             .map(|number| tokenizer.encode(&format!("{number}:"), false))
             .collect::<Result<Vec<_>, _>>()?;
@@ -604,7 +657,7 @@ impl ReadoutEncoder {
         }
         token_ids.push(self.tokens.turn_end);
         let length = match self.options.canvas {
-            CanvasMode::Full => self.canvas_length,
+            CanvasMode::Full | CanvasMode::Fixed(_) => self.canvas_length,
             CanvasMode::Compact => token_ids
                 .len()
                 .next_multiple_of(COMPACT_CANVAS_MULTIPLE)

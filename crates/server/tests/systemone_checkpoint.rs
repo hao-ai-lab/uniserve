@@ -22,8 +22,8 @@ use uniserve_server::profile::diffusion_gemma::ImagePlacement;
 use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_server::profile::{ModelConfig, ModelDescription, ModelParameters};
 use uniserve_server::serving::systemone::{
-    CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutOptions, ReadoutPlan,
-    SystemOneRequest,
+    CandidateTokens, CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutOptions,
+    ReadoutPlan, SystemOneRequest,
 };
 
 #[derive(Deserialize)]
@@ -37,6 +37,8 @@ struct Case {
     name: String,
     layout: String,
     canvas: String,
+    #[serde(default)]
+    candidates: CandidateTokens,
     request: Value,
     #[serde(default)]
     images: Vec<Size>,
@@ -150,10 +152,15 @@ async fn check_checkpoint(variable: &str, quantized: bool) {
     ))
     .unwrap();
     assert_eq!(fixture.canvas_length, profile.canvas_length as usize);
-    for case in fixture.cases {
+    let mcjev: Fixture = serde_json::from_str(include_str!(
+        "../../../tests/python/fixtures/mcjev_readout_prompts.json"
+    ))
+    .unwrap();
+    for case in fixture.cases.into_iter().chain(mcjev.cases) {
         let options = ReadoutOptions {
             layout: case.layout.parse::<ReadoutLayout>().unwrap(),
             canvas: case.canvas.parse::<CanvasMode>().unwrap(),
+            candidates: case.candidates,
         };
         let encoder =
             ReadoutEncoder::load(&files, Arc::clone(&tokenizer), profile, options, 262_144)

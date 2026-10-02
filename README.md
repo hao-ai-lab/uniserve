@@ -61,6 +61,8 @@ Run `uniserve serve --help` for the complete option set.
 | `POST /v1/images/generations` | Single-image generation adapter for configured omni descriptions |
 | `POST /v1/systemone` | TypeSafe System One decision readout (DiffusionGemma) |
 
+DiffusionGemma readout settings are fixed when the server starts. `--readout-canvas full` uses the checkpoint's full canvas; `compact` rounds each answer scaffold up to a multiple of 16. A numeric value, such as `--readout-canvas 64`, fixes every canvas to that length and splits larger question sets across complete canvases. Numeric lengths must be positive multiples of 16 no greater than the checkpoint's canvas length. `--readout-candidates variants` sums the supported token spellings of each answer; `primary` reads only the space-prefixed spelling (` A`, ` B`, ` yes`, ` no`, and so on). Defaults are `full` and `variants`. Canvas length and candidate selection change the returned distribution and must match between systems in a numerical or performance comparison.
+
 List the configured model:
 
 ```bash

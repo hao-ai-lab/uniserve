@@ -23,7 +23,9 @@ use uniserve_engine::{
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
-use uniserve_server::serving::systemone::{CanvasMode, ReadoutLayout, ReadoutOptions};
+use uniserve_server::serving::systemone::{
+    CandidateTokens, CanvasMode, ReadoutLayout, ReadoutOptions,
+};
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, ImageFetchPolicy,
     SchedulingPolicy,
@@ -333,9 +335,15 @@ pub(crate) struct SharedRuntimeArgs {
     pub readout_layout: ReadoutLayout,
     /// Length of every System One readout canvas on a DiffusionGemma server:
     /// `full` is the checkpoint's canvas length; `compact` the smallest
-    /// multiple of 16 tokens that holds the answer scaffold.
+    /// multiple of 16 tokens that holds the answer scaffold; a positive
+    /// multiple of 16 fixes the length, up to the checkpoint's canvas length.
     #[arg(long = "readout-canvas", default_value = "full")]
     pub readout_canvas: CanvasMode,
+    /// Candidate token spellings used by System One readouts: `variants`
+    /// sums supported spellings; `primary` uses only each candidate's
+    /// space-prefixed token.
+    #[arg(long = "readout-candidates", default_value = "variants")]
+    pub readout_candidates: CandidateTokens,
     /// Block-diffusion sampling of every reply a DiffusionGemma server
     /// generates, as a JSON object that replaces any of the checkpoint's
     /// `generation_config.json` values `max_denoising_steps`,
@@ -481,6 +489,7 @@ impl SharedRuntimeArgs {
             readout: ReadoutOptions {
                 layout: self.readout_layout,
                 canvas: self.readout_canvas,
+                candidates: self.readout_candidates,
             },
             diffusion_generation: self.diffusion_generation_config.unwrap_or_default(),
         }
