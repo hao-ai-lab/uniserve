@@ -843,6 +843,8 @@ fn diffusion_params_to_py<'py>(
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "num_frames"), diffusion.num_frames)?;
     dict.set_item(intern!(py, "video_units"), diffusion.video_units)?;
+    dict.set_item(intern!(py, "height"), diffusion.height)?;
+    dict.set_item(intern!(py, "width"), diffusion.width)?;
     dict.set_item(
         intern!(py, "num_inference_steps"),
         diffusion.num_inference_steps,
@@ -2089,6 +2091,8 @@ mod tests {
                 video_units: 3,
                 num_inference_steps: 4,
                 seed: 29,
+                height: 1344,
+                width: 768,
             },
         )
         .unwrap();

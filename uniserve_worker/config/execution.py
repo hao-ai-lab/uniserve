@@ -325,6 +325,9 @@ class WorkerConfig:
     # Text capacities, in prompt tokens, of the denoiser's layouts; empty
     # selects ``MediaBuilder``'s default spacing.
     video_text_capacities: tuple[int, ...] = ()
+    # Output (height, width) rasters a video model prepares and serves;
+    # empty keeps the model's configured rasters.
+    video_frame_sizes: tuple[tuple[int, int], ...] = ()
     max_request_pool_size: int = 128
     encoder_cache_entries: int = 256
     generation_device: str | None = None
@@ -445,6 +448,11 @@ def worker_config_from_namespace(
         video_text_capacities=_parse_positive_int_csv(
             getattr(namespace, "video_text_capacities", None), default=()
         ),
+        video_frame_sizes=_parse_image_shapes(
+            getattr(namespace, "video_frame_sizes", None),
+            default=(),
+            name="video frame sizes",
+        ),
         kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
         attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
@@ -561,26 +569,32 @@ def _parse_positive_int_csv(
     return values
 
 
-def _parse_image_shapes(raw: object | None) -> tuple[tuple[int, int], ...]:
-    """Parse ``HEIGHTxWIDTH`` image shapes, in pixels, for flow graphs.
+def _parse_image_shapes(
+    raw: object | None,
+    *,
+    default: tuple[tuple[int, int], ...] = ((1152, 2048), (2048, 1152)),
+    name: str = "flow graph shapes",
+) -> tuple[tuple[int, int], ...]:
+    """Parse comma-separated ``HEIGHTxWIDTH`` image shapes, in pixels.
 
-    The shapes must be unique and positive; ``None`` selects the defaults.
+    The shapes must be unique and positive; ``None`` selects ``default``.
+    ``name`` labels the option in errors.
     """
     if raw is None:
-        return ((1152, 2048), (2048, 1152))
+        return default
 
     values: list[tuple[int, int]] = []
     for item in str(raw).split(","):
         height_text, separator, width_text = item.strip().lower().partition("x")
         if not separator:
-            raise ValueError("flow graph shapes must use HEIGHTxWIDTH")
+            raise ValueError(f"{name} must use HEIGHTxWIDTH")
         shape = int(height_text), int(width_text)
         if min(shape) < 1 or shape in values:
-            raise ValueError("flow graph shapes must be positive and unique")
+            raise ValueError(f"{name} must be positive and unique")
         values.append(shape)
 
     if not values:
-        raise ValueError("flow graph shapes must not be empty")
+        raise ValueError(f"{name} must not be empty")
     return tuple(values)
 
 

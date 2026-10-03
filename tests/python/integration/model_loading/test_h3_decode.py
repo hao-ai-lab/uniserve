@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from uniserve.media import image, video
 from uniserve.runtime import (
     ExecutionContext,
     TensorBuffers,
@@ -87,6 +88,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
             # after another request has consumed the same reconstruction owner.
             # 107 frames is a count whose audio timeline rounds down.
             for frames in (39, 22, 39, 107):
+                output = video.Config(frames, image.Config(768, 1344))
                 count = video_latent_frames(frames)
                 native = (
                     torch.randn(
@@ -101,7 +103,12 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                     .permute(0, 2, 3, 5, 1, 4, 6)
                     .reshape(-1, 96)
                 )
-                packed = build_packing(num_text_tokens=64, num_frames=frames)
+                packed = build_packing(
+                    num_text_tokens=64,
+                    num_frames=frames,
+                    height=768,
+                    width=1344,
+                )
                 latents = raster.index_select(
                     0, packed.video_raster_indices.to("cuda:0")
                 )
@@ -126,9 +133,9 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                                 "video_decoder",
                                 (latents,),
                                 method="decode",
-                                size=frames,
+                                size=output,
                                 frames=(window,),
-                                num_frames=(frames,),
+                                sizes=(output,),
                             )
                             actual = result.values[0]
                             assert actual.dtype == torch.float16
@@ -204,10 +211,10 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
 
                 # A new timeline ignores overlap retained from prior requests.
                 state = storage.view(
-                    model.video_postprocessor.state_buffers(frames)
+                    model.video_postprocessor.state_buffers(output)
                 )
                 state["video_overlap"].fill_(1)
-                layout = model.video_decoder.output_layout(frames)["video"]
+                layout = model.video_decoder.output_layout(output)["video"]
                 pixel = torch.tensor(
                     [124, 116, 104], dtype=torch.uint8, device="cuda:0"
                 )
@@ -228,9 +235,9 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                         "video_decoder",
                         (TensorOutput(segment, segment_layout),),
                         method="forward",
-                        size=frames,
+                        size=output,
                         frames=(window,),
-                        num_frames=(frames,),
+                        sizes=(output,),
                         state=state,
                     )
                     pixels = result.values[0]
@@ -260,9 +267,9 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                     "video_decoder",
                     (latents,),
                     method="decode",
-                    size=frames,
+                    size=output,
                     frames=(windows[0],),
-                    num_frames=(frames,),
+                    sizes=(output,),
                 )
                 video_done.record(video_stream)
             with torch.cuda.stream(audio_stream):

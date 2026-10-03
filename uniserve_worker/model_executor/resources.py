@@ -13,6 +13,7 @@ from collections.abc import Mapping
 
 import torch
 
+from uniserve.media import image, video
 from uniserve.model import (
     AudioDecoder,
     Denoiser,
@@ -27,7 +28,7 @@ from uniserve_worker.model_executor.component_binding import (
     Call,
     ComponentBinding,
 )
-from uniserve_worker.model_executor.media_inputs import MediaBuilder
+from uniserve_worker.model_executor.media_inputs import MediaBuilder, bound
 
 
 def media_state_buffers(
@@ -56,7 +57,7 @@ def media_state_buffers(
             ):
                 fields = builder.capacity_buffers()
             elif isinstance(call.module, VideoPostprocessor):
-                fields = call.module.state_buffers(builder.maximum.num_frames)
+                fields = _postprocess_state(call.module, builder)
             else:
                 continue
 
@@ -67,6 +68,31 @@ def media_state_buffers(
                     )
                 result[name] = field
     return result
+
+
+def _postprocess_state(
+    postprocessor: VideoPostprocessor, builder: MediaBuilder
+) -> dict[str, BufferConfig]:
+    """Bound the post-processor's overlap state over every served raster."""
+    result: dict[str, BufferConfig] = {}
+    for frame in builder.frame_sizes:
+        size = video.Config(builder.max_frames, frame)
+        for name, field in postprocessor.state_buffers(size).items():
+            result[name] = (
+                bound(result[name], field) if name in result else field
+            )
+    return result
+
+
+def largest_frame(decoder: VideoDecoder) -> image.Config:
+    """Return the decoder's raster with the most pixels, the first among equals.
+
+    A declared video product is sized at it: every served raster fits its
+    pixel count, which the engine checks when it reserves a request's rows.
+    """
+    return max(
+        decoder.frame_sizes, key=lambda frame: frame.height * frame.width
+    )
 
 
 def holds_samples(
@@ -83,24 +109,22 @@ def holds_samples(
 
 
 def decoded_units_layout(
-    decoder: VideoDecoder, num_frames: int
+    decoder: VideoDecoder,
+    num_frames: int,
+    frame: image.Config | None = None,
 ) -> OutputLayout:
     """Describe a video decoding round's product: RGB media units.
 
-    Each row holds one media unit's frames at the output raster; a unit
+    Each row holds one media unit's frames at ``frame``, by default the
+    decoder's largest raster, which bounds every request's rows; a unit
     shorter than the longest fills its row's leading frames, and the unit
     division names how many. The rows are host products a host rank's
     encoder reads in place.
     """
     windows = decoder.frame_slices(num_frames)
     frames = max(window.stop - window.start for window in windows)
-    shape = (
-        len(windows),
-        frames,
-        decoder.frame_size.height,
-        decoder.frame_size.width,
-        3,
-    )
+    frame = largest_frame(decoder) if frame is None else frame
+    shape = (len(windows), frames, frame.height, frame.width, 3)
     return OutputLayout(
         shape,
         torch.uint8,
@@ -116,15 +140,17 @@ def encoded_units_layout(
     """Describe a video encoding round's product: framed encoded unit rows.
 
     An encoded unit's length is not known when its row is reserved, so a row
-    is bounded by the largest unit and carries its own length.
+    is bounded by the largest unit at any of the decoder's rasters and
+    carries its own length. The row's extent is static, so every request
+    reserves the same row whatever raster it selects.
     """
     from uniserve_worker.media.mux import encoded_unit_bytes
 
     windows = decoder.frame_slices(num_frames)
-    row = encoded_unit_bytes(
-        max(window.stop - window.start for window in windows),
-        decoder.frame_size.height,
-        decoder.frame_size.width,
+    frames = max(window.stop - window.start for window in windows)
+    row = max(
+        encoded_unit_bytes(frames, size.height, size.width)
+        for size in decoder.frame_sizes
     )
     return OutputLayout(
         (len(windows), row),
@@ -141,15 +167,17 @@ def output_layouts(
     builder: MediaBuilder | None = None,
     clock: VideoPostprocessor | None = None,
     frames: int | None = None,
+    frame: image.Config | None = None,
     prompt_tokens: int | None = None,
 ) -> Mapping[str, OutputLayout]:
     """Describe the products one call publishes, keyed by product name.
 
-    ``frames`` and ``prompt_tokens`` size the layout for one request and
-    default to the admitted maxima. ``clock`` is the video post-processor
-    whose frame rate relates audio samples to video frames; with a clock, a
-    video decoder's product is its RGB media units (``decoded_units_layout``)
-    rather than its own declared layout.
+    ``frames``, ``frame`` and ``prompt_tokens`` size the layout for one request.
+    They default to the admitted maxima, the largest raster for a video
+    decoder's product and the first served raster otherwise. ``clock`` is the
+    video post-processor whose frame rate relates audio samples to video frames;
+    with a clock, a video decoder's product is its RGB media units
+    (``decoded_units_layout``) rather than its own declared layout.
 
     The mapping is empty for a video post-processor, for a call that is
     neither a text encoder's ``encode`` nor a denoiser, video decoder or
@@ -187,12 +215,16 @@ def output_layouts(
                 # Standalone decoders have no serving timeline bound. Their
                 # caller supplies the exact frame range with the invocation.
                 return {}
-            count = builder.maximum.num_frames
+            count = builder.max_frames
         else:
             count = frames
         if clock is None:
-            return component.output_layout(count)
-        return {"video": decoded_units_layout(component, count)}
+            return component.output_layout(
+                video.Config(
+                    count, largest_frame(component) if frame is None else frame
+                )
+            )
+        return {"video": decoded_units_layout(component, count, frame)}
 
     if builder is None:
         # Image execution returns its features and decoded raster through the
@@ -200,7 +232,8 @@ def output_layouts(
         return {}
 
     size = builder.size(
-        builder.maximum.num_frames if frames is None else frames,
+        builder.max_frames if frames is None else frames,
+        builder.frame_sizes[0] if frame is None else frame,
         config.max_sequence_tokens if prompt_tokens is None else prompt_tokens,
     )
     if isinstance(component, Denoiser):

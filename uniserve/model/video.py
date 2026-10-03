@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from uniserve.distributed import Communicator
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.nn.vae import LatentDecoder
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
@@ -16,25 +16,29 @@ from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 class VideoDecoder(nn.Module):
     """Decode ordered latent windows.
 
-    Describe their place in the native output. Subclasses define legal output
-    frame slices, native output layout and ``unpack_latents``: the
-    mathematical conversion from a complete packed latent to one decoder
-    input. Decoder inputs and scratch remain borrowed.
+    Describe their place in the native output. ``frame_sizes`` lists the
+    output rasters the decoder reconstructs; a ``video.Config`` names one
+    video's duration and raster and sizes every prepared resource.
+    Subclasses define legal output frame slices, native output layout and
+    ``unpack_latents``: the mathematical conversion from a complete packed
+    latent to one decoder input. Decoder inputs and scratch remain borrowed.
     """
 
-    def __init__(self, decoder: LatentDecoder, *, frame_size: image.Config):
+    def __init__(
+        self, decoder: LatentDecoder, *, frame_sizes: tuple[image.Config, ...]
+    ):
         super().__init__()
-        self.decoder, self.frame_size = decoder, frame_size
+        if not frame_sizes or len(set(frame_sizes)) != len(frame_sizes):
+            raise ValueError("video decoder requires distinct output rasters")
+        self.decoder, self.frame_sizes = decoder, tuple(frame_sizes)
 
     def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
         raise NotImplementedError
 
-    def output_layout(self, num_frames: int) -> Mapping[str, OutputLayout]:
+    def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
         raise NotImplementedError
 
-    def unpack_latents(
-        self, latent, frames, num_frames, *, constants, workspace
-    ):
+    def unpack_latents(self, latent, frames, size, *, constants, workspace):
         """Return the native latent window for one legal output frame slice."""
         raise NotImplementedError
 
@@ -44,22 +48,20 @@ class VideoDecoder(nn.Module):
         latents: tuple[torch.Tensor, ...],
         *,
         frames: tuple[slice, ...],
-        num_frames: tuple[int, ...],
+        sizes: tuple[video.Config, ...],
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
     ) -> tuple[TensorOutput | None, ...]:
         if (
             not latents
             or len(latents) != len(frames)
-            or len(latents) != len(num_frames)
+            or len(latents) != len(sizes)
         ):
-            raise ValueError(
-                "video latents, frame slices and durations must align"
-            )
+            raise ValueError("video latents, frame slices and sizes must align")
 
         units = []
-        for interval, count in zip(frames, num_frames, strict=True):
-            legal = self.frame_slices(count)
+        for interval, size in zip(frames, sizes, strict=True):
+            legal = self.frame_slices(size.num_frames)
             if interval not in legal:
                 raise ValueError(
                     "video frame slice must select one complete "
@@ -68,13 +70,13 @@ class VideoDecoder(nn.Module):
             units.append(legal.index(interval))
 
         outputs = []
-        for latent, interval, count, unit in zip(
-            latents, frames, num_frames, units, strict=True
+        for latent, interval, size, unit in zip(
+            latents, frames, sizes, units, strict=True
         ):
             inputs = self.unpack_latents(
                 latent,
                 interval,
-                count,
+                size,
                 constants=constants,
                 workspace=workspace,
             )
@@ -83,7 +85,7 @@ class VideoDecoder(nn.Module):
             # across later numerical calls within this batch.
             if len(latents) > 1:
                 decoded = decoded.clone()
-            layout = self.output_layout(count)["video"]
+            layout = self.output_layout(size)["video"]
             outputs.append(
                 TensorOutput(
                     decoded,
@@ -238,6 +240,7 @@ class AudioDecoder(nn.Module):
 class VideoPostprocessor(nn.Module):
     """Blend temporal overlaps, crop decoder padding and produce RGB24 frames.
 
+    Each call reconstructs at the raster of the ``video.Config`` it is given.
     ``overlap_weights`` weights the current window, in the decoded precision.
     A subclass supplies ``reconstruction_slices`` for the body and successor
     overlap within each native NCTHW segment. A frame slice starting at zero
@@ -257,7 +260,6 @@ class VideoPostprocessor(nn.Module):
         self,
         overlap_weights: torch.Tensor,
         *,
-        frame_size: image.Config,
         frame_rate: int,
     ):
         super().__init__()
@@ -277,7 +279,7 @@ class VideoPostprocessor(nn.Module):
         self.register_buffer(
             "overlap_weights", overlap_weights, persistent=False
         )
-        self.frame_size, self.frame_rate = frame_size, frame_rate
+        self.frame_rate = frame_rate
         # Rebound by the runtime to the ranks this component is placed on.
         self.units = Communicator()
 
@@ -290,7 +292,7 @@ class VideoPostprocessor(nn.Module):
         """
         raise NotImplementedError
 
-    def state_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
+    def state_buffers(self, size: video.Config) -> Mapping[str, BufferConfig]:
         """Describe the state carried between the rounds of one video.
 
         The state holds the decoded overlap a unit's successor blends with.
@@ -303,7 +305,7 @@ class VideoPostprocessor(nn.Module):
         segments: tuple[TensorOutput, ...],
         *,
         frames: tuple[slice, ...],
-        num_frames: tuple[int, ...],
+        sizes: tuple[video.Config, ...],
         state: Mapping[str, torch.Tensor],
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
@@ -313,16 +315,19 @@ class VideoPostprocessor(nn.Module):
 
         ``unit_count`` is how many members of ``units`` hold a media unit in
         this round, which is fewer than the whole ring when the track has fewer
-        units left than the component has ranks.
+        units left than the component has ranks. Every segment of one call
+        shares the overlap state, so every size names the same raster.
         """
         if (
             not segments
             or len(segments) != len(frames)
-            or len(segments) != len(num_frames)
+            or len(segments) != len(sizes)
         ):
             raise ValueError(
-                "video segments, frame slices and durations must align"
+                "video segments, frame slices and sizes must align"
             )
+        if len({size.frame for size in sizes}) != 1:
+            raise ValueError("video segments of one call must share a raster")
         if (
             type(unit_count) is not int
             or not 0 <= self.units.rank < unit_count <= self.units.size
@@ -334,13 +339,14 @@ class VideoPostprocessor(nn.Module):
         overlap = retained
         pixels = workspace["rgb_frames"]
         mean, std = constants["pixel_mean"], constants["pixel_std"]
-        height, width = self.frame_size.height, self.frame_size.width
+        height, width = sizes[0].frame.height, sizes[0].frame.width
         extent = self.overlap_weights.numel()
         values, slices = [], []
         total_frames = 0
-        for index, (segment, interval, count) in enumerate(
-            zip(segments, frames, num_frames, strict=True)
+        for index, (segment, interval, size) in enumerate(
+            zip(segments, frames, sizes, strict=True)
         ):
+            count = size.num_frames
             if (
                 type(count) is not int
                 or count < 1
@@ -363,7 +369,7 @@ class VideoPostprocessor(nn.Module):
             ):
                 raise ValueError(
                     "video segments must have native NCTHW shape and the "
-                    "configured raster"
+                    "requested raster"
                 )
             body, successor = value[:, :, body_slice], value[:, :, next_slice]
             expected = body.shape[2] + (extent if interval.stop == count else 0)
@@ -384,7 +390,7 @@ class VideoPostprocessor(nn.Module):
                 index
                 and interval.start != 0
                 and (
-                    num_frames[index - 1] != count
+                    sizes[index - 1] != size
                     or frames[index - 1].stop != interval.start
                 )
             ):
@@ -453,9 +459,10 @@ class VideoPostprocessor(nn.Module):
         )
         cursor = 0
         outputs = []
-        for value, (body_slice, next_slice), interval, count in zip(
-            values, slices, frames, num_frames, strict=True
+        for value, (body_slice, next_slice), interval, size in zip(
+            values, slices, frames, sizes, strict=True
         ):
+            count = size.num_frames
             body = value[:, :, body_slice]
             if interval.start:
                 blended = (
