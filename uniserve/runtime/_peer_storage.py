@@ -230,7 +230,9 @@ def allocate_symmetric_storage(
         handle = None
         peers = (local,)
     else:
-        if dist.get_backend(group._require()) != "nccl":
+        if "cuda:nccl" not in dist.get_backend_config(group._require()).split(
+            ","
+        ):
             raise RuntimeError(
                 "symmetric peer storage requires the NCCL backend"
             )
