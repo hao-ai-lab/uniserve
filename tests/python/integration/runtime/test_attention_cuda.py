@@ -150,7 +150,7 @@ def test_paged_replay_reads_changed_causal_flags(provider):
     )
     with PrefixCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
-        num_blocks=4,
+        num_units=4,
         block_size=16,
         device=device,
     ) as cache:
