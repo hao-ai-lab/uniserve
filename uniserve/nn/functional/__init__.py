@@ -10,6 +10,7 @@ when a kernel supports their layout.
 from ._activation import (
     gelu_and_mul,
     silu_and_mul,
+    softcap,
     swiglu,
     swiglu_absmax,
     value_first_swiglu,
@@ -19,6 +20,7 @@ from ._activation import (
 from ._attention import attention
 from ._frame import frame_pad
 from ._linear import linear, merged_linear
+from ._moe import Routes, fused_moe, topk_softmax
 from ._norm import (
     add_rms_norm,
     gated_residual,
@@ -26,6 +28,7 @@ from ._norm import (
     gated_residual_rms_norm_fp8,
     modulated_rms_norm,
     rms_norm,
+    sandwich_rms_norm,
     scaled_residual_,
     scaled_residual_layer_norm,
     scaled_residual_layer_norm_absmax,
@@ -40,6 +43,7 @@ from ._tensors import Rounding
 
 __all__ = [
     "Rounding",
+    "Routes",
     "add_rms_norm",
     "apply_rotary",
     "attention",
@@ -47,6 +51,7 @@ __all__ = [
     "gated_residual",
     "gated_residual_rms_norm",
     "gated_residual_rms_norm_fp8",
+    "fused_moe",
     "gelu_and_mul",
     "linear",
     "merged_linear",
@@ -55,14 +60,17 @@ __all__ = [
     "qk_bias_rms_norm_rope_",
     "qk_norm_rope",
     "rms_norm",
+    "sandwich_rms_norm",
     "scaled_residual_",
     "scaled_residual_layer_norm",
     "scaled_residual_layer_norm_absmax",
     "scaled_residual_rms_norm_",
     "scaled_residual_rms_norm_absmax_",
     "silu_and_mul",
+    "softcap",
     "swiglu",
     "swiglu_absmax",
+    "topk_softmax",
     "unpatchify",
     "unpatchify_video_tokens",
     "value_first_swiglu",

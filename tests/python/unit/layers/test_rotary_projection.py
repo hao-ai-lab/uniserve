@@ -789,3 +789,153 @@ def test_stepwise_qk_rotation_rounds_each_eager_operation(device, axes, packed):
 
     torch.testing.assert_close(query, eager(q, q_weight), rtol=0, atol=0)
     torch.testing.assert_close(key, eager(k, k_weight), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+@pytest.mark.parametrize(
+    ("heads", "axis_dims", "rotated"),
+    (
+        # One head-wide domain over two spatial axes: a 2-D vision RoPE.
+        ((16, 16), (36, 36), (36, 36)),
+        # A partially rotated head with different Q and K head counts.
+        ((16, 2), (512,), (128,)),
+        # A rotated axis beside a partially rotated axis in one domain.
+        ((4, 2), (64, 64), (64, 32)),
+    ),
+)
+def test_single_domain_rotates_every_axis_with_its_own_factors(
+    device, heads, axis_dims, rotated
+):
+    generator = torch.Generator(device=device).manual_seed(97)
+    width = sum(axis_dims)
+    query, key = (
+        torch.randn(
+            (2, 7, count, width), generator=generator, device=device
+        ).to(torch.bfloat16)
+        for count in heads
+    )
+    weights = tuple(
+        torch.rand(width, generator=generator, device=device) + 0.5
+        for _ in range(2)
+    )
+    angles = tuple(
+        torch.randn((2, 7, turned // 2), generator=generator, device=device)
+        for turned in rotated
+    )
+    cosines = tuple(angle.cos() for angle in angles)
+    sines = tuple(angle.sin() for angle in angles)
+
+    with torch.inference_mode():
+        actual = qk_norm_rope(
+            query,
+            key,
+            weights[:1],
+            weights[1:],
+            cosines,
+            sines,
+            eps=1e-6,
+            axis_dims=axis_dims,
+        )
+
+    for source, weight, result in zip(
+        (query, key), weights, actual, strict=True
+    ):
+        normalized = _normalize(source, weight, 1e-6)
+        parts = []
+        for part, cosine, sine, turned in zip(
+            normalized.split(axis_dims, dim=-1),
+            cosines,
+            sines,
+            rotated,
+            strict=True,
+        ):
+            parts.append(
+                torch.cat(
+                    (
+                        _rotate(
+                            part[..., :turned],
+                            cosine.double(),
+                            sine.double(),
+                            "split",
+                        ),
+                        part[..., turned:],
+                    ),
+                    dim=-1,
+                )
+            )
+        torch.testing.assert_close(
+            result.double(), torch.cat(parts, dim=-1), rtol=2e-2, atol=2e-2
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rotation", ["split", "interleaved"])
+@pytest.mark.parametrize("rotated", [512, 96])
+def test_cuda_rotation_of_strided_rows_matches_the_portable_formula(
+    rotation, rotated
+):
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    # One head per token, borrowed as a half of FP32 [tokens, 1024] features.
+    features = torch.randn((37, 1024), generator=generator, device="cuda")
+    value = features.chunk(2, dim=-1)[0].unsqueeze(1)
+    angles = torch.randn((37, rotated // 2), generator=generator, device="cuda")
+    cosine, sine = angles.cos(), angles.sin()
+    expected = apply_rotary(
+        value.cpu(), cosine.cpu(), sine.cpu(), rotation=rotation
+    )
+
+    with torch.inference_mode():
+        actual = apply_rotary(value, cosine, sine, rotation=rotation)
+        in_place = apply_rotary(
+            value, cosine, sine, rotation=rotation, out=value
+        )
+
+    torch.testing.assert_close(actual.cpu(), expected)
+    assert in_place is value
+    torch.testing.assert_close(features[:, :512].cpu(), expected.squeeze(1))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    (
+        ("transposed_tokens", "token axes"),
+        ("head_too_wide", "head width"),
+        ("overlapping_output", "overlaps"),
+        ("records_autograd", "autograd"),
+    ),
+)
+def test_cuda_rotary_calls_without_a_kernel_raise(case, reason):
+    width = 2048 if case == "head_too_wide" else 64
+    value = torch.randn((3, 5, 2, width), device="cuda")
+    angles = torch.randn((3, 5, width // 2), device="cuda")
+    cosine, sine = angles.cos(), angles.sin()
+    weight = torch.ones(width, device="cuda")
+    out = None
+    if case == "transposed_tokens":
+        value = value.transpose(0, 1).contiguous().transpose(0, 1)
+    elif case == "overlapping_output":
+        storage = torch.empty((3 * 5 * 2 * width + 1,), device="cuda")
+        out = storage[1:].view(value.shape)
+        value = storage[:-1].view(value.shape).copy_(value)
+    elif case == "records_autograd":
+        value.requires_grad_()
+
+    with pytest.raises(ValueError, match=f"apply_rotary.*{reason}"):
+        apply_rotary(value, cosine, sine, rotation="split", out=out)
+    with pytest.raises(ValueError, match=f"qk_norm_rope.*{reason}"):
+        qk_norm_rope(
+            value,
+            value if out is None else out,
+            (weight,),
+            (weight,),
+            (cosine,),
+            (sine,),
+            eps=1e-6,
+            axis_dims=(width,),
+            out=None if out is None else (out, value),
+        )

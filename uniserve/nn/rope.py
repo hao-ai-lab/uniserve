@@ -296,9 +296,12 @@ class RotaryEmbedding(nn.Module):
         config.num_attention_heads = 1
         config.max_position_embeddings = self._maximum
         config.rope_parameters = parameters
-        frequencies, scale = ROPE_INIT_FUNCTIONS[parameters["rope_type"]](
-            config, device, seq_len=sequence_length
-        )
+        # Upstream recipes allocate some intermediates on the default device;
+        # pin it so meta model construction still yields real frequencies.
+        with torch.device(device):
+            frequencies, scale = ROPE_INIT_FUNCTIONS[parameters["rope_type"]](
+                config, device, seq_len=sequence_length
+            )
         return frequencies[::2] if self.keep_freq_range else frequencies, scale
 
     @torch.no_grad()
@@ -359,9 +362,17 @@ class RotaryEmbedding(nn.Module):
             frequencies = self.inv_freq.to(device=positions.device)
             scale = self._frequency_scale
 
+        from uniserve_kernels.triton import require_kernel
+
         from uniserve_kernels import rope
 
-        if rope.can_run_rotary_factors(positions, frequencies, dtype):
+        if positions.is_cuda:
+            require_kernel(
+                "RotaryEmbedding",
+                rope.unsupported_rotary_factors(positions, frequencies, dtype),
+                positions=positions,
+                frequencies=frequencies,
+            )
             shape = (*positions.shape, frequencies.numel())
             cosine = torch.empty(shape, device=positions.device, dtype=dtype)
             sine = torch.empty_like(cosine)
