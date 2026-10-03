@@ -168,7 +168,7 @@ docker run --rm \
     --max-running-requests 2
 ```
 
-The image build compiles UniServe's native kernels. The first startup compiles the Triton and FlashInfer kernels FastH3 runs; later startups load the cached builds without compiling. They land in `~/.triton/cache` and `~/.cache/flashinfer`. If container restarts must reuse them, mount `/root/.cache` and `/root/.triton`, or point `TRITON_CACHE_DIR` and `FLASHINFER_WORKSPACE_BASE` at mounted directories.
+The image build compiles UniServe's native kernels for the architectures the Dockerfile's `TORCH_CUDA_ARCH_LIST` names: Hopper (9.0), data-center Blackwell (10.0) and RTX PRO 6000 Blackwell (12.0). The first startup compiles the Triton and FlashInfer kernels FastH3 runs; later startups load the cached builds without compiling. They land in `~/.triton/cache` and `~/.cache/flashinfer`. If container restarts must reuse them, mount `/root/.cache` and `/root/.triton`, or point `TRITON_CACHE_DIR` and `FLASHINFER_WORKSPACE_BASE` at mounted directories.
 
 ## Generate a video
 
