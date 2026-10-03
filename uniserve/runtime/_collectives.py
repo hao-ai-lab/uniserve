@@ -500,16 +500,19 @@ class GatherPool:
     Iterators may nest while upstream projections still have unread payloads.
     Each active borrower receives distinct backing; completed borrowers reuse
     storage on the owner's serialized stream. Captured graphs keep addressing
-    every buffer, so buffers live as long as the pool. With a communicator,
-    each buffer is registered as one of its windows when it is created.
+    every buffer, so buffers live as long as the pool.
+
+    The buffers are ordinary device allocations that collectives move through
+    NCCL's own transport buffers. They are never registered as symmetric
+    windows: in-place all-gathers into registered windows of some sizes hang,
+    fault on NVLink or deliver wrong rows on GB200 hosts, while the same
+    gathers without windows are exact.
     """
 
-    def __init__(self, group, communicator: NcclCommunicator | None):
+    def __init__(self, group):
         self.group = group
-        self.communicator = communicator
         self.buffers: list[torch.Tensor] = []
         self.borrowed: set[int] = set()
-        self.symmetric = dist.get_backend(group._require()) == "nccl"
 
     @contextmanager
     def borrow(self, size, device, *, capacity=None):
@@ -534,16 +537,7 @@ class GatherPool:
                 raise RuntimeError(
                     "prepare projection exchange backing before capture"
                 )
-            if self.symmetric:
-                from ._peer_storage import allocate_collective_buffer
-
-                buffer = allocate_collective_buffer(
-                    (amount,), dtype=torch.uint8, device=device
-                )
-            else:
-                buffer = torch.empty(amount, dtype=torch.uint8, device=device)
-            if self.communicator is not None:
-                self.communicator.register_buffers(buffer)
+            buffer = torch.empty(amount, dtype=torch.uint8, device=device)
             self.buffers.append(buffer)
 
         self.borrowed.add(id(buffer))
@@ -628,9 +622,7 @@ class StreamCommunication:
         self._open()
         pool = self._gather_pools.get(group)
         if pool is None:
-            pool = GatherPool(
-                group, self._communicators.get(group._require().group_name)
-            )
+            pool = GatherPool(group)
             self._gather_pools[group] = pool
         return pool
 

@@ -17,6 +17,7 @@ from ._activation import (
     value_first_swiglu_fp8,
 )
 from ._attention import attention
+from ._frame import frame_pad
 from ._linear import linear, merged_linear
 from ._norm import (
     add_rms_norm,
@@ -35,11 +36,14 @@ from ._norm import (
 )
 from ._patch import patchify, unpatchify, unpatchify_video_tokens
 from ._rope import apply_rotary, qk_bias_rms_norm_rope_, qk_norm_rope
+from ._tensors import Rounding
 
 __all__ = [
+    "Rounding",
     "add_rms_norm",
     "apply_rotary",
     "attention",
+    "frame_pad",
     "gated_residual",
     "gated_residual_rms_norm",
     "gated_residual_rms_norm_fp8",

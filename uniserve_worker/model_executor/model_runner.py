@@ -443,11 +443,13 @@ def runner_type(module):
     """
     from uniserve.model import (
         AudioDecoder,
+        AudioEncoder,
         CausalLM,
         Denoiser,
         Encoder,
         ImageDecoder,
         VideoDecoder,
+        VideoEncoder,
         VideoPostprocessor,
     )
     from uniserve.nn.vae import PatchAutoencoder
@@ -467,6 +469,8 @@ def runner_type(module):
         module, (AudioDecoder, ImageDecoder, VideoDecoder, VideoPostprocessor)
     ):
         return DecoderRunner
-    if isinstance(module, (Encoder, PatchAutoencoder)):
+    if isinstance(
+        module, (Encoder, PatchAutoencoder, VideoEncoder, AudioEncoder)
+    ):
         return EncoderRunner
     raise TypeError("module has no supported numerical capability")

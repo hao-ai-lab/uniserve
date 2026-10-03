@@ -3,21 +3,27 @@
 `TransferCapacity` is one Worker rank's budget of reserved bytes and read
 tickets, shared by every backend `make_transports` builds. `TransferPool`
 runs one backend's reads on its own threads against that budget: a read holds
-its ticket slot and bytes from submission until it physically retires, and a
-CUDA read copies on a per-thread read stream that it drains before the read
-retires. `chunk_word` supplies the host words a read writes into a
-`vmm_pool` chunk header to claim and acknowledge that chunk.
+its ticket and bytes from submission until it physically retires, and a CUDA
+read copies on a per-thread read stream that it drains before the read
+retires. A fetch takes the tickets of all its reads together
+(`ReadReservation`). `chunk_word` supplies the host words a read writes into
+a `vmm_pool` chunk header to claim and acknowledge that chunk.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import threading
+from collections.abc import Callable
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
 from uniserve.runtime import EventPool
-from uniserve_worker.errors import resource_error
+from uniserve_worker.errors import (
+    ResourceError,
+    resource_error,
+    unsupported_setup,
+)
 from uniserve_worker.transport import vmm_pool
 from uniserve_worker.transport.layout import copy_pairs
 from uniserve_worker.transport.ticket import TransferTicket
@@ -26,13 +32,39 @@ if TYPE_CHECKING:
     import torch
 
 
+class ReadBackpressureError(ResourceError):
+    """Too few of the rank's read tickets are free for a fetch right now.
+
+    A ticket returns when its read physically retires, which happens once the
+    read's copy drains, whatever its submitter does next. A caller therefore
+    retries after a return of ``capacity``'s tickets: ``returns`` is its
+    return count when the fetch was refused, which
+    `TransferCapacity.notify_reads_returned` compares against so that no
+    return between the refusal and the request for a notification is missed.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        capacity: TransferCapacity,
+        returns: int,
+        **kw: Any,
+    ) -> None:
+        super().__init__(message, **kw)
+        self.capacity = capacity
+        self.returns = returns
+
+
 class TransferCapacity:
     """Share a Worker rank's byte and read-ticket budget across its backends.
 
-    Neither budget blocks: `acquire` raises `resource_error` when the bytes
-    are exhausted, and `read_slots` is taken without blocking by
-    `TransferPool.submit` and by `LocalTransport` for borrowed views, so an
-    exhausted budget surfaces as backpressure to the caller.
+    Neither budget blocks. `acquire` raises `resource_error` when the bytes
+    are exhausted. A read takes one ticket when it is submitted and returns
+    it when it physically retires, and a local borrowed view holds one until
+    its consumers finish; `take_reads` raises `ReadBackpressureError` while too
+    few are free, and `notify_reads_returned` tells the caller when to try
+    again.
     """
 
     def __init__(self, byte_capacity: int, ticket_capacity: int) -> None:
@@ -45,9 +77,73 @@ class TransferCapacity:
         self.ticket_capacity = int(ticket_capacity)
         if min(self.capacity, self.ticket_capacity) < 1:
             raise ValueError("transfer byte capacity must be positive")
-        self.read_slots = threading.BoundedSemaphore(self.ticket_capacity)
         self.used = 0
         self._lock = threading.Lock()
+        self._reads_free = self.ticket_capacity
+        # Ticket returns so far, and the callbacks waiting for the next one.
+        self._returns = 0
+        self._return_waiters: list[Callable[[], None]] = []
+
+    def take_reads(
+        self,
+        count: int = 1,
+        *,
+        message: str = "asynchronous transfer ticket capacity is exhausted",
+    ) -> None:
+        """Take ``count`` read tickets together, without blocking.
+
+        Raises:
+            ValueError: ``count`` is less than one.
+            WorkerError: `unsupported_setup` when ``count`` exceeds the
+                rank's tickets, which no wait can grant, and
+                `ReadBackpressureError` (with ``message``) when fewer are free
+                now.
+        """
+        if type(count) is not int or count < 1:
+            raise ValueError("a read ticket reservation takes at least one")
+        if count > self.ticket_capacity:
+            raise unsupported_setup(
+                f"a fetch of {count} reads exceeds the rank's "
+                f"{self.ticket_capacity} read tickets"
+            )
+        with self._lock:
+            if count > self._reads_free:
+                raise ReadBackpressureError(
+                    message, capacity=self, returns=self._returns
+                )
+            self._reads_free -= count
+
+    def return_reads(self, count: int = 1) -> None:
+        """Return read tickets and wake the callers waiting for a return.
+
+        Raises:
+            RuntimeError: More tickets would be free than the rank has.
+        """
+        with self._lock:
+            if count < 0 or self._reads_free + count > self.ticket_capacity:
+                raise RuntimeError(
+                    "read ticket return exceeds the tickets taken"
+                )
+            self._reads_free += count
+            self._returns += 1
+            waiters, self._return_waiters = self._return_waiters, []
+        for waiter in waiters:
+            waiter()
+
+    def notify_reads_returned(
+        self, callback: Callable[[], None], *, after: int
+    ) -> None:
+        """Call ``callback`` once a read ticket returns after ``after``.
+
+        ``after`` is the return count a `ReadBackpressureError` carried. When a
+        ticket has returned since, ``callback`` runs at once on this thread;
+        otherwise it runs on the thread that returns the next one.
+        """
+        with self._lock:
+            if self._returns == after:
+                self._return_waiters.append(callback)
+                return
+        callback()
 
     def acquire(self, amount: int) -> None:
         """Reserve bytes if capacity is available, else report backpressure."""
@@ -77,6 +173,47 @@ class TransferCapacity:
                     "transfer byte release exceeds the live reservation"
                 )
             self.used -= value
+
+
+class ReadReservation:
+    """Read tickets one fetch takes together for all of its reads.
+
+    Each read submitted with the reservation uses one of its tickets, which
+    returns to the capacity when that read retires. `close` returns the
+    tickets no read used, so a fetch that fails part way holds none it did
+    not submit.
+    """
+
+    def __init__(self, capacity: TransferCapacity, count: int) -> None:
+        """Take ``count`` tickets; see `TransferCapacity.take_reads`."""
+        capacity.take_reads(count)
+        self._capacity = capacity
+        self._unused = count
+        self._lock = threading.Lock()
+
+    def use(self) -> None:
+        """Hand one ticket to a read being submitted.
+
+        Raises:
+            RuntimeError: Every ticket is already in use.
+        """
+        with self._lock:
+            if self._unused < 1:
+                raise RuntimeError("read reservation has no ticket left")
+            self._unused -= 1
+
+    def close(self) -> None:
+        """Return the tickets no read used; later calls do nothing."""
+        with self._lock:
+            unused, self._unused = self._unused, 0
+        if unused:
+            self._capacity.return_reads(unused)
+
+    def __enter__(self) -> ReadReservation:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 @cache
@@ -121,8 +258,7 @@ class TransferPool:
             max_workers=workers,
             thread_name_prefix=name,
         )
-        self._entries = capacity.read_slots
-        self._bytes = capacity
+        self._capacity = capacity
         self._events = event_pool
         self._completion_wake: Any = None
         self._lock = threading.Lock()
@@ -149,6 +285,7 @@ class TransferPool:
         *args: Any,
         nbytes: int,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        reservation: ReadReservation | None = None,
     ) -> TransferTicket:
         """Reserve a read and run `call(ticket, *args)` on a transport thread.
 
@@ -156,14 +293,16 @@ class TransferPool:
         calling it. When `destination` is on a CUDA device, the caller's
         current stream on that device is recorded here, on the caller's
         thread, so the read stream waits for work the caller already queued
-        on the destination. The ticket slot and `nbytes` stay reserved until
-        the read physically retires.
+        on the destination. The read uses a ticket of `reservation`, or takes
+        one of its own without one; the ticket and `nbytes` stay reserved
+        until the read physically retires.
 
         Raises:
             BaseException: The pool's recorded failure, if any.
-            WorkerError: `resource_error` when read tickets or bytes are
-                exhausted. An error submitting to the executor propagates
-                after both reservations are returned.
+            WorkerError: `ReadBackpressureError` when no read ticket is free and
+                `resource_error` when the bytes are exhausted. An error
+                submitting to the executor propagates after both
+                reservations are returned.
         """
         import torch
 
@@ -171,14 +310,14 @@ class TransferPool:
             if self._error is not None:
                 raise self._error
 
-        if not self._entries.acquire(blocking=False):
-            raise resource_error(
-                "asynchronous transfer ticket capacity is exhausted"
-            )
+        if reservation is None:
+            self._capacity.take_reads(1)
+        else:
+            reservation.use()
         try:
-            self._bytes.acquire(nbytes)
+            self._capacity.acquire(nbytes)
         except BaseException:
-            self._entries.release()
+            self._capacity.return_reads(1)
             raise
 
         ticket = TransferTicket(self._events)
@@ -227,8 +366,8 @@ class TransferPool:
             # lists undrained resources no device access to its storage
             # remains.
             if not ticket._unretired:
-                self._bytes.release(nbytes)
-                self._entries.release()
+                self._capacity.release(nbytes)
+                self._capacity.return_reads(1)
                 ticket._retire()
             if work.cancelled():
                 ticket._fail(
@@ -244,8 +383,8 @@ class TransferPool:
         try:
             work = self._executor.submit(run)
         except BaseException:
-            self._bytes.release(nbytes)
-            self._entries.release()
+            self._capacity.release(nbytes)
+            self._capacity.return_reads(1)
             raise
         ticket._work = work
         work.add_done_callback(finished)

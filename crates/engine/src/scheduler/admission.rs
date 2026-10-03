@@ -18,6 +18,16 @@
 use super::*;
 use uniserve_worker_ipc::ForwardMode;
 
+/// One product a video request reserves: its declared name, the component
+/// output it is reserved under, and its request-sized shape.
+pub(super) struct MediaOutput {
+    pub(super) name: &'static str,
+    pub(super) component: String,
+    pub(super) index: u32,
+    pub(super) dtype: DType,
+    pub(super) shape: ShapeBound,
+}
+
 impl Scheduler {
     /// Validates and queues one token-generation request or rejects it synchronously.
     ///
@@ -149,86 +159,111 @@ impl Scheduler {
         self.waiting.insert(position, st);
     }
 
-    /// Resolves the result tensors a media request reserves at admission.
+    /// Resolves the products a video request reserves at admission.
     ///
-    /// Reads the output declarations of the component serving text encoding,
-    /// denoising, video decoding, video encoding, and audio decoding, as bound
-    /// on each call's first placement candidate. The text encoder's
-    /// `DimBound::Device` dimensions become `num_prompt_tokens`, and the
-    /// leading dimension of the video decoder and encoder outputs becomes
-    /// `sampling.video_units`. Returns one `(component, output index, dtype,
-    /// shape bound)` entry per declared output.
+    /// Each product of the request's graph is found by name among the
+    /// outputs of the component serving its call, as bound on that call's
+    /// first placement candidate. A product with a request extent takes it
+    /// as the extent of its output's device-sized axis, which must not exceed
+    /// the declared maximum; a product without one keeps its declared
+    /// extent there. An output declaring raster axes takes the request's
+    /// canvas height and width in them, each at most the declared extent.
+    /// Returns one entry per product: its name, component, output index,
+    /// dtype and shape bound.
     ///
-    /// Returns `None` when one of those calls has no reported component or no
-    /// candidate, the candidate declares no binding for the component it
-    /// serves, a component declares an unexpected number of outputs, a text
-    /// encoder output has no device dimension, a video output's leading
-    /// dimension is missing or not a device bound, or the prompt length or
-    /// unit count is zero or exceeds the declared maximum. `enqueue_media`
+    /// # Errors
+    ///
+    /// Returns a message naming the product when no component serves its
+    /// call, the component declares no output of that name, the output has
+    /// no device-sized axis for a request extent, or the request's extent or
+    /// canvas is zero or exceeds the declared maximum. `enqueue_media`
     /// rejects such a request, and `admit_media` calls this again to size the
     /// reservation.
-    fn media_outputs(
-        &self,
-        sampling: uniserve_core::DiffusionSamplingParams,
-        num_prompt_tokens: u32,
-    ) -> Option<Vec<(String, u32, DType, ShapeBound)>> {
-        use uniserve_worker_ipc::MediaCall;
-
+    fn media_outputs(&self, graph: &VideoGraph) -> Result<Vec<MediaOutput>, String> {
         let mut outputs = Vec::new();
-        for (role, output_count) in [
-            (MediaCall::TextEncoding, 1),
-            (MediaCall::Denoising, 2),
-            // The video decoder declares its decoded media units and the
-            // video encoder the rows encoded from them; both are indexed by
-            // media unit.
-            (MediaCall::VideoDecoding, 1),
-            (MediaCall::VideoEncoding, 1),
-            (MediaCall::AudioDecoding, 1),
-        ] {
-            let name = self.info.media_components.get(&role)?;
+        for product in graph.products() {
+            let name = self
+                .info
+                .media_components
+                .get(&product.call)
+                .ok_or_else(|| format!("no loaded component serves {:?}", product.call))?;
             let (_, bound, info) = self
                 .placement
-                .component_candidates(self.executor.as_ref(), CallKind::Media(role), name)
-                .next()?;
+                .component_candidates(self.executor.as_ref(), CallKind::Media(product.call), name)
+                .next()
+                .ok_or_else(|| format!("component {name} has no loaded candidate"))?;
             let component = info
                 .components
                 .iter()
-                .find(|component| component.name == bound)?;
-            if component.outputs.len() != output_count {
-                return None;
-            }
-            for (index, output) in component.outputs.iter().enumerate() {
-                let mut shape = output.shape_bound.clone();
-                if role == MediaCall::TextEncoding {
-                    let mut selected = false;
-                    for dim in &mut shape.dims {
-                        if let DimBound::Device { max } = *dim {
-                            if num_prompt_tokens == 0 || num_prompt_tokens > max {
-                                return None;
-                            }
-                            *dim = DimBound::Static(num_prompt_tokens);
-                            selected = true;
-                        }
-                    }
-                    if !selected {
-                        return None;
-                    }
-                } else if matches!(role, MediaCall::VideoDecoding | MediaCall::VideoEncoding) {
-                    let Some(DimBound::Device { max }) = shape.dims.first().copied() else {
-                        return None;
+                .find(|component| component.name == bound)
+                .ok_or_else(|| format!("component {bound} is not bound on its worker"))?;
+            let (index, output) = component
+                .outputs
+                .iter()
+                .enumerate()
+                .find(|(_, output)| output.name == product.name)
+                .ok_or_else(|| format!("component {name} declares no {} output", product.name))?;
+            let mut shape = output.shape_bound.clone();
+            // A product laid out at the request's raster holds the canvas in
+            // its raster axes, whose declared extents are the largest the
+            // worker admits.
+            if let Some(raster) = output.raster_axes {
+                let canvas = graph.canvas();
+                for (axis, extent, side) in [
+                    (raster.height, canvas.height, "height"),
+                    (raster.width, canvas.width, "width"),
+                ] {
+                    let Some(DimBound::Static(max)) = shape.dims.get(axis as usize).copied() else {
+                        return Err(format!(
+                            "{} of component {name} has no static {side} axis",
+                            product.name
+                        ));
                     };
-                    if sampling.video_units == 0 || sampling.video_units > max {
-                        return None;
+                    if extent == 0 || extent > max {
+                        return Err(format!(
+                            "{} of component {name} holds a {side} of at most {max} pixels, the \
+                             request's canvas has {extent}",
+                            product.name
+                        ));
                     }
-                    shape.dims[0] = DimBound::Static(sampling.video_units);
+                    shape.dims[axis as usize] = DimBound::Static(extent);
                 }
-                outputs.push((name.clone(), index as u32, output.dtype, shape));
             }
+            if let Some(extent) = product.extent {
+                let dim = shape
+                    .dims
+                    .iter_mut()
+                    .find(|dim| matches!(dim, DimBound::Device { .. }))
+                    .ok_or_else(|| {
+                        format!(
+                            "{} of component {name} has no request-sized axis",
+                            product.name
+                        )
+                    })?;
+                let DimBound::Device { max } = *dim else {
+                    unreachable!("the selected axis is device-sized");
+                };
+                if extent == 0 || extent > max {
+                    return Err(format!(
+                        "{} of component {name} holds 1 to {max}, the request needs {extent}",
+                        product.name
+                    ));
+                }
+                *dim = DimBound::Static(extent);
+            }
+            outputs.push(MediaOutput {
+                name: product.name,
+                component: name.clone(),
+                index: index as u32,
+                dtype: output.dtype,
+                shape,
+            });
         }
-        Some(outputs)
+        Ok(outputs)
     }
 
-    /// Chooses one physical owner for every component of a media request.
+    /// Chooses one physical owner for every component a media request's
+    /// calls run on.
     ///
     /// The denoiser is selected first because it defines the expensive replica
     /// residency. Components co-located with that worker follow it; shared
@@ -240,28 +275,35 @@ impl Scheduler {
     /// Returns a map from component name to worker, or `None` when some
     /// component has no ready candidate that is already on the route or has
     /// a free request row. When the executor reports admissible video
-    /// encoders for the video decoder's chosen worker, the video encoder's
+    /// codecs for the video decoder's chosen worker, the video codec's
     /// candidates are further limited to those.
-    fn media_routes(&self) -> Option<HashMap<String, crate::WorkerId>> {
+    fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::WorkerId>> {
         use uniserve_worker_ipc::MediaCall;
 
-        let mut required = self
-            .info
-            .media_components
+        let mut required = graph
+            .calls()
             .iter()
-            .map(|(call, component)| (*call, component.clone()))
+            .filter_map(|call| {
+                self.info
+                    .media_components
+                    .get(call)
+                    .map(|component| (*call, component.clone()))
+            })
             .collect::<Vec<_>>();
         // Routing order: the denoiser first, then the calls that feed it, then
-        // decoders before encoders, since the video encoder's admissible
+        // decoders before encoders, since the video codec's admissible
         // workers depend on the route chosen for the video decoder.
         required.sort_by_key(|(call, _)| match call {
             MediaCall::Denoising => 0,
-            MediaCall::TextEncoding | MediaCall::LatentPreparation => 1,
+            MediaCall::MediaReading
+            | MediaCall::VisionEncoding
+            | MediaCall::LatentEncoding
+            | MediaCall::TextEncoding
+            | MediaCall::LatentPreparation => 1,
             MediaCall::VideoDecoding | MediaCall::AudioDecoding => 2,
             MediaCall::VideoEncoding | MediaCall::AudioEncoding | MediaCall::Muxing => 3,
             _ => 4,
         });
-
         let mut routes = HashMap::new();
         let mut selected_workers = HashSet::new();
         for (call, component) in required {
@@ -275,7 +317,7 @@ impl Scheduler {
                 .then(|| {
                     let decoder = self.info.media_components.get(&MediaCall::VideoDecoding)?;
                     let worker = routes.get(decoder)?;
-                    self.executor.info().video_encoders.get(worker)
+                    self.executor.info().video_codecs.get(worker)
                 })
                 .flatten();
             let candidates = self
@@ -320,21 +362,28 @@ impl Scheduler {
         Some(routes)
     }
 
-    /// Validates and queues one terminal media-generation request.
+    /// Validates and queues one video request.
     ///
     /// Rejects with `RejectionKind::Invalid` when the request fails
-    /// validation, the worker reports no muxing component, the request's
-    /// inference-step count differs from the loaded model's, `media_outputs`
-    /// cannot bound its results, or the worker has fewer than two request
-    /// slots; rejects with `RejectionKind::Overloaded` when the waiting bound
-    /// is reached. A rejection's send result is ignored.
-    pub(super) fn enqueue_media(&mut self, submission: PendingMedia) {
-        let request = &submission.request;
+    /// validation; the worker reports no muxing component or no video
+    /// denoiser; the denoiser does not serve the request's task; the request's
+    /// inference-step count differs from the loaded model's; its call graph
+    /// cannot be built; `media_outputs` cannot bound its products; or the
+    /// worker has fewer than two request slots. A served task's calls all
+    /// have components: the executor checked them at startup. Rejects with
+    /// `RejectionKind::Overloaded` when the waiting bound is reached. A
+    /// rejection's send result is ignored.
+    pub(super) fn enqueue_media(
+        &mut self,
+        request: DiffusionRequest,
+        event_tx: EventTx,
+        queued_at: f64,
+    ) {
+        let reject = |kind: RejectionKind, message: String| {
+            let _ = event_tx.send(EngineCoreOutput::Rejected { kind, message });
+        };
         if let Err(message) = request.validate() {
-            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: message.to_string(),
-            });
+            reject(RejectionKind::Invalid, message.to_string());
             return;
         }
         // A worker reports the component serving each media call it
@@ -345,47 +394,76 @@ impl Scheduler {
             .media_components
             .contains_key(&uniserve_worker_ipc::MediaCall::Muxing)
         {
-            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: "worker does not provide the video media components".to_string(),
-            });
+            reject(
+                RejectionKind::Invalid,
+                "worker does not provide the video media components".to_string(),
+            );
+            return;
+        }
+        let Some(denoiser) = self.info.video_denoiser.as_ref() else {
+            reject(
+                RejectionKind::Invalid,
+                "worker reports no video denoiser".to_string(),
+            );
+            return;
+        };
+        if !denoiser
+            .tasks
+            .iter()
+            .any(|task| task == request.task.as_str())
+        {
+            reject(
+                RejectionKind::Invalid,
+                format!(
+                    "the deployment's denoiser does not serve {}",
+                    request.task.as_str()
+                ),
+            );
             return;
         }
         if request.sampling.num_inference_steps != self.info.num_inference_steps {
-            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: "request prediction count disagrees with the loaded model".to_string(),
-            });
+            reject(
+                RejectionKind::Invalid,
+                "request prediction count disagrees with the loaded model".to_string(),
+            );
             return;
         }
-        if self
-            .media_outputs(request.sampling, request.prompt_token_ids.len() as u32)
-            .is_none()
-        {
-            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: "loaded media components cannot represent the requested output bounds"
-                    .into(),
-            });
+        let graph = match VideoGraph::new(&request) {
+            Ok(graph) => graph,
+            Err(message) => {
+                reject(RejectionKind::Invalid, message);
+                return;
+            }
+        };
+        if let Err(message) = self.media_outputs(&graph) {
+            reject(
+                RejectionKind::Invalid,
+                format!("loaded media components cannot hold the request: {message}"),
+            );
             return;
         }
         if self.info.request_slots < 2 {
-            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: "worker does not provide two resident media state slots".to_string(),
-            });
+            reject(
+                RejectionKind::Invalid,
+                "worker does not provide two resident media state slots".to_string(),
+            );
             return;
         }
         if self.waiting.len() + self.waiting_media.len() + self.output.retained_len()
             >= self.config.max_num_waiting
         {
-            let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Overloaded,
-                message: "scheduler waiting queue is full".to_string(),
-            });
+            reject(
+                RejectionKind::Overloaded,
+                "scheduler waiting queue is full".to_string(),
+            );
             return;
         }
-        self.waiting_media.push_back(submission);
+        self.waiting_media.push_back(PendingMedia {
+            request,
+            graph,
+            event_tx,
+            queued_at,
+        });
     }
 
     /// Reserves a media request's row and output buffers on every routed worker.
@@ -403,7 +481,7 @@ impl Scheduler {
         &mut self,
         route_workers: &HashSet<crate::WorkerId>,
         request_key: RequestKey,
-        outputs: Vec<(String, u32, DType, ShapeBound)>,
+        outputs: &[MediaOutput],
     ) -> Result<Option<MediaAllocations>, UnknownMediaWorker> {
         let mut reserved = MediaAllocations {
             request_slots: HashMap::new(),
@@ -420,14 +498,16 @@ impl Scheduler {
             };
             reserved.request_slots.insert(worker.clone(), slot);
         }
-        for (component, index, dtype, shape_bound) in outputs {
-            let bytes = shape_bound
+        for output in outputs {
+            let (component, index) = (output.component.clone(), output.index);
+            let bytes = output
+                .shape
                 .max_elements()
-                .saturating_mul(dtype.element_bytes());
+                .saturating_mul(output.dtype.element_bytes());
             let mut tensor = MediaTensorAllocation {
                 allocations: HashMap::new(),
-                dtype,
-                shape_bound,
+                dtype: output.dtype,
+                shape_bound: output.shape.clone(),
             };
             for worker in route_workers {
                 let Some(storage) = self.storage.media_storage.get_mut(worker) else {
@@ -461,22 +541,19 @@ impl Scheduler {
             let id = submission.request.request_id;
             let request_epoch = self.next_request_epoch;
             let request_key = RequestKey::new(self.engine_id, id, request_epoch);
-            let sampling = submission.request.sampling;
-            let Some(routes) = self.media_routes() else {
+            let Some(routes) = self.media_routes(&submission.graph) else {
                 self.waiting_media.push_front(submission);
                 break;
             };
             // Submission validated these bounds against the same loaded
             // components, so a request reaching admission has them.
-            let Some(outputs) =
-                self.media_outputs(sampling, submission.request.prompt_token_ids.len() as u32)
-            else {
+            let Ok(outputs) = self.media_outputs(&submission.graph) else {
                 self.waiting_media.push_front(submission);
                 self.invariant_broken("a queued media request has valid output bounds");
                 break;
             };
             let route_workers = routes.values().cloned().collect::<HashSet<_>>();
-            let allocations = match self.reserve_media(&route_workers, request_key, outputs) {
+            let allocations = match self.reserve_media(&route_workers, request_key, &outputs) {
                 Ok(Some(allocations)) => allocations,
                 Ok(None) => {
                     self.waiting_media.push_front(submission);
@@ -494,12 +571,18 @@ impl Scheduler {
             // another worker uses that worker's row.
             let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
             let request_pool_idx = allocations.request_slot(&routes[primary_component]);
-            // Submission validated the prompt and sampling this admission carries.
+            // Submission validated the prompt, sampling and conditions this
+            // admission carries.
             let admission = match NewRequest::new_media(
                 request_key,
                 request_pool_idx,
                 submission.request.prompt_token_ids.clone(),
                 submission.request.sampling,
+                uniserve_worker_ipc::VideoAdmission {
+                    task: submission.request.task,
+                    text_tags: submission.request.text_tags.clone(),
+                    conditions: submission.request.conditions.clone(),
+                },
             ) {
                 Ok(admission) => admission,
                 Err(error) => {
@@ -526,9 +609,20 @@ impl Scheduler {
             let steps = submission.request.sampling.num_inference_steps;
             let mut state = MediaFlowState {
                 request: submission.request,
+                graph: submission.graph,
                 output: output::EventJournal::new(submission.event_tx),
                 allocations,
+                reservations: outputs
+                    .iter()
+                    .map(|output| (output.name, (output.component.clone(), output.index)))
+                    .collect(),
                 buffer_bindings: HashMap::new(),
+                condition_media: HashMap::new(),
+                vision_features: None,
+                scheduled_condition_units: 0,
+                encoded_condition_units: 0,
+                condition_video_latents: Vec::new(),
+                condition_audio_latents: None,
                 conditioning: None,
                 latents: Vec::new(),
                 decoded_units: BTreeMap::new(),
@@ -539,6 +633,8 @@ impl Scheduler {
                 audio: None,
                 admission,
                 admission_state: WorkerRegistration::Unsubmitted,
+                media_reading_scheduled: false,
+                vision_encoding_scheduled: false,
                 text_encoding_scheduled: false,
                 latent_preparation_scheduled: false,
                 denoising: Denoising::new(steps),

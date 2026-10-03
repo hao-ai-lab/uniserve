@@ -180,4 +180,49 @@ impl ComponentConfig {
             units_per_rank: 1,
         }
     }
+
+    /// Reports whether every member rank publishes its own copy of the
+    /// component's products.
+    ///
+    /// A distributed component's ranks each publish the units dealt to them,
+    /// and sequence-parallel ranks each publish their own shard. A tensor
+    /// replica publishes once, from tensor-parallel coordinate zero, and only
+    /// the final pipeline stage publishes, so a component with either degree
+    /// above one leaves some member ranks without a copy. The worker's
+    /// `ComponentBinding.output_ranks` selects the publishing ranks by the
+    /// same rule.
+    pub fn publishes_on_every_rank(&self) -> bool {
+        self.distribution.is_some()
+            || (self.parallel_config.tensor_parallel_size == 1
+                && self.parallel_config.pipeline_parallel_size == 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_replicated_or_pipelined_components_leave_ranks_without_a_copy() {
+        let component = |tensor_parallel_size, pipeline_parallel_size, sequence_parallel| {
+            ComponentConfig::parallel(
+                vec![0, 1, 2, 3],
+                ParallelConfig {
+                    tensor_parallel_size,
+                    pipeline_parallel_size,
+                    sequence_parallel,
+                },
+            )
+        };
+        let ulysses = |ulysses_degree| SequenceParallel::Ulysses { ulysses_degree };
+
+        assert!(component(1, 1, ulysses(4)).publishes_on_every_rank());
+        assert!(!component(4, 1, SequenceParallel::Local).publishes_on_every_rank());
+        assert!(!component(2, 1, ulysses(2)).publishes_on_every_rank());
+        assert!(!component(1, 4, SequenceParallel::Local).publishes_on_every_rank());
+
+        let mut distributed = ComponentConfig::parallel(vec![0, 1, 2, 3], Default::default());
+        distributed.distribution = Some(ComponentDistribution::TemporalUnits);
+        assert!(distributed.publishes_on_every_rank());
+    }
 }

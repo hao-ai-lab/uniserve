@@ -1,4 +1,4 @@
-"""Shared spatial tiling for numerical video decoders."""
+"""Shared spatial tiling for numerical video encoders and decoders."""
 
 from __future__ import annotations
 
@@ -164,3 +164,80 @@ class SpatialDecoder(nn.Module):
             for start in range(0, len(flat_tiles), columns)
         ]
         return stitch_tiles(rows, y_overlaps, x_overlaps)
+
+
+class SpatialEncoder(nn.Module):
+    """Encode an aligned raster directly or as overlapping tiles.
+
+    The concrete ``forward`` encodes one tile, including any latent-channel
+    projection after its encoder. Tile extents and minimum overlaps are input
+    pixels aligned to the spatial compression ratio; ``split_tiles`` spreads
+    any excess overlap over the seams, and the encoded tiles cross-fade over
+    ``overlap / ratio`` latent positions in the encoder's output precision.
+    Tiles are encoded one after another: an encoder's activations at input
+    resolution dominate its memory, so the peak stays that of one tile
+    whatever the raster.
+    """
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        *,
+        spatial_compression: int,
+        tile_height: int,
+        tile_width: int,
+        overlap_height: int,
+        overlap_width: int,
+    ):
+        super().__init__()
+        for extent, overlap in (
+            (tile_height, overlap_height),
+            (tile_width, overlap_width),
+        ):
+            split_tiles(extent, extent, overlap, spatial_compression)
+        self.encoder = encoder
+        self.spatial_compression = spatial_compression
+        self.tile_height, self.tile_width = tile_height, tile_width
+        self.overlap_height, self.overlap_width = overlap_height, overlap_width
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        return self.encoder(pixels)
+
+    def encode(self, pixels: torch.Tensor, *, tiled: bool) -> torch.Tensor:
+        """Encode ``[..., height, width]`` pixels into ``[..., h, w]`` latents.
+
+        The raster must align with the spatial compression ratio when tiled.
+        """
+        if pixels.ndim < 3 or pixels.shape[0] < 1:
+            raise ValueError("spatial encoding requires a nonempty raster")
+        if not tiled:
+            return self(pixels)
+
+        ratio = self.spatial_compression
+        y_indices, y_lengths, y_overlaps = split_tiles(
+            int(pixels.shape[-2]), self.tile_height, self.overlap_height, ratio
+        )
+        x_indices, x_lengths, x_overlaps = split_tiles(
+            int(pixels.shape[-1]), self.tile_width, self.overlap_width, ratio
+        )
+        rows = [
+            [
+                self(
+                    pixels[
+                        ...,
+                        y_pos : y_pos + y_length,
+                        x_pos : x_pos + x_length,
+                    ]
+                )
+                for x_pos, x_length in zip(x_indices, x_lengths, strict=True)
+            ]
+            for y_pos, y_length in zip(y_indices, y_lengths, strict=True)
+        ]
+
+        # Pixel overlaps are multiples of the ratio, so every seam spans whole
+        # latent positions.
+        return stitch_tiles(
+            rows,
+            [overlap // ratio for overlap in y_overlaps],
+            [overlap // ratio for overlap in x_overlaps],
+        )

@@ -3,12 +3,14 @@
 ``weight_config`` expands a named preset, optionally with per-component
 overrides, into a ``uniserve.loading.weights.Config`` whose ``dtypes`` and
 ``quantization`` mappings are keyed by module path and resolved by longest
-prefix. ``precisions`` holds every complete preset selectable by name at
-load time, and ``checkpoint_precision`` is the dense base for a calibrated
-ModelOpt checkpoint, onto which ``uniserve_models.loading`` overlays the
-checkpoint's own quantized modules.
+prefix; the paths cover the denoisers the checkpoint holds. ``precisions``
+lists every complete preset selectable by name at load time, and
+``checkpoint_precision`` is the dense base for a calibrated ModelOpt
+checkpoint, onto which ``uniserve_models.loading`` overlays the checkpoint's
+own quantized modules.
 """
 
+from collections.abc import Mapping
 from types import MappingProxyType
 
 import torch
@@ -16,7 +18,7 @@ import torch
 from uniserve.loading import weights
 from uniserve.quantization import QuantizationConfig, Quantizer
 
-from .config import TransformerConfig
+from .config import Config, TransformerConfig
 from .video_vae import Config as VideoConfig
 
 # This table is the single definition of each named numerical tier. Both
@@ -35,6 +37,7 @@ _formats = {
 
 
 def weight_config(
+    config: Config,
     *,
     preset: str = "default",
     attention: str | None = None,
@@ -45,11 +48,14 @@ def weight_config(
     """Expand a preset and independent component choices into module paths.
 
     Args:
+        config: The checkpoint's configuration; every denoiser it holds
+            takes the same representation.
         preset: A key of the preset table; supplies every component the
             keyword overrides leave as None.
         attention: Denoiser attention projections: bf16, fp8 or nvfp4.
         mlp: Denoiser feed-forward projections: bf16, fp8, mxfp8 or nvfp4.
-        text_encoder: Text encoder linear layers: bf16, fp8 or nvfp4.
+        text_encoder: Text encoder language-layer linear layers: bf16, fp8
+            or nvfp4. The vision tower keeps the checkpoint's BF16.
         video_vae: Video VAE decoder projections: fp16, bf16 or nvfp4.
 
     Returns:
@@ -96,15 +102,20 @@ def weight_config(
         )
         return QuantizationConfig(quantizer, quantizer)
 
-    # The audio decoder and the transformer's latent input and output heads
-    # stay FP32 and unquantized. Under the longest-prefix rule, every video
-    # decoder parameter without a more specific entry below (norms, residual
-    # scales, register tokens) also stays FP32.
+    # The audio decoder, both condition encoders and each transformer's
+    # latent input and output heads stay FP32 and unquantized, the VAEs'
+    # native precision. Under the longest-prefix rule, every video decoder
+    # parameter without a more specific entry below (norms, residual scales,
+    # register tokens) also stays FP32. Every denoising component a
+    # checkpoint may hold takes the same representation.
     dtypes = {
         "audio_decoder": torch.float32,
         "video_decoder": torch.float32,
+        "video_encoder": torch.float32,
+        "audio_encoder": torch.float32,
         **{
-            f"denoiser.transformer.{name}": torch.float32
+            f"{component}.transformer.{name}": torch.float32
+            for component in config.denoisers
             for name in (
                 "video_input",
                 "audio_input",
@@ -114,16 +125,21 @@ def weight_config(
         },
     }
     quantization = {}
-    for index in range(TransformerConfig().num_hidden_layers):
-        path = f"denoiser.transformer.layers.{index}"
-        # With FP8, the merged Q/K/V/gate projection takes one tensor-wide
-        # scale; the attention output and feed-forward take per-row scales.
-        quantization[f"{path}.attention.projection"] = encoded(
-            attention, tensorwise=True
-        )
-        quantization[f"{path}.attention.output"] = encoded(attention)
-        quantization[f"{path}.mlp"] = encoded(mlp)
+    for component in config.denoisers:
+        for index in range(TransformerConfig().num_hidden_layers):
+            path = f"{component}.transformer.layers.{index}"
+            # With FP8, the merged attention projection takes one tensor-wide
+            # scale; the attention output and feed-forward take per-row
+            # scales.
+            quantization[f"{path}.attention.projection"] = encoded(
+                attention, tensorwise=True
+            )
+            quantization[f"{path}.attention.output"] = encoded(attention)
+            quantization[f"{path}.mlp"] = encoded(mlp)
     quantization["text_encoder"] = encoded(text_encoder)
+    # The text encoder representations were chosen for its language layers;
+    # its vision tower has no quantized representation and keeps BF16.
+    quantization["text_encoder.vision"] = None
 
     # This path names video_vae.Decoder; its ``decoder`` child is the VAE
     # transformer whose ``input`` weight dtype video_vae.Model.compute_dtype
@@ -152,16 +168,24 @@ def weight_config(
     return weights.Config(dtypes=dtypes, quantization=quantization)
 
 
-# Complete presets that uniserve_models.loading.load_model accepts by name
-# for a dense checkpoint; a calibrated ModelOpt checkpoint offers none.
-# read_config takes the "default" entry as a dense checkpoint's base weights,
-# which a checkpoint quantization_config may refine.
-precisions = MappingProxyType(
-    {name: weight_config(preset=name) for name in _formats}
-)
+def precisions(config: Config) -> Mapping[str, weights.Config]:
+    """Complete presets ``uniserve_models.loading.load_model`` accepts by name.
 
-# Dense modules of a calibrated checkpoint keep BF16, the video VAE
-# projections included, so the VAE runs under BF16 autocast as with the NVFP4
-# video_vae choice. The audio decoder, the latent heads, and the untargeted
-# video decoder parameters stay FP32.
-checkpoint_precision = weight_config(preset="quality", video_vae="bf16")
+    These apply to a dense checkpoint; a calibrated ModelOpt checkpoint offers
+    none. ``read_config`` takes the "default" entry as a dense checkpoint's
+    base weights, which a checkpoint quantization_config may refine.
+    """
+    return MappingProxyType(
+        {name: weight_config(config, preset=name) for name in _formats}
+    )
+
+
+def checkpoint_precision(config: Config) -> weights.Config:
+    """Dense base of a calibrated checkpoint's modules.
+
+    Dense modules keep BF16, the video VAE projections included, so the VAE
+    runs under BF16 autocast as with the NVFP4 video_vae choice. The audio
+    decoder, the latent heads, and the untargeted video decoder parameters
+    stay FP32.
+    """
+    return weight_config(config, preset="quality", video_vae="bf16")

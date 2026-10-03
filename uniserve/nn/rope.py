@@ -131,12 +131,37 @@ _RECIPE_NAMES = {
 }
 
 
+def _interleaved_axes(sections: tuple[int, ...]) -> tuple[int, ...]:
+    """Assign each compact frequency to its multimodal position axis.
+
+    Interleaved M-RoPE (Qwen3-VL) cycles the axes over the frequencies:
+    frequency ``j`` rotates by axis ``a = j % len(sections)`` while
+    ``j < sections[a] * len(sections)``; axis 0 takes every remaining
+    frequency. Each axis therefore receives exactly its section width, and
+    every axis keeps frequencies from the whole spectrum.
+    """
+    count = len(sections)
+    axes = []
+    for frequency in range(sum(sections)):
+        axis = frequency % count
+        axes.append(axis if frequency < sections[axis] * count else 0)
+    return tuple(axes)
+
+
 class RotaryEmbedding(nn.Module):
     """Produce compact [..., dimension / 2] cosine and sine factors.
 
     Positions select coordinates; sequence_length independently selects a
     dynamic recipe's frequency domain. Calls never mutate model frequencies,
     so separate contexts can evaluate different lengths on shared weights.
+
+    ``sections`` selects multimodal rotary positions (M-RoPE): positions
+    then carry a leading axis of ``len(sections)`` coordinates, such as
+    (temporal, height, width), and each frequency rotates by the coordinate
+    of the axis it is interleaved onto (see ``_interleaved_axes``). The
+    widths must sum to the compact factor width. A token whose axes share
+    one coordinate, such as text, receives exactly the factors of the
+    one-dimensional recipe.
     """
 
     def __init__(
@@ -149,6 +174,7 @@ class RotaryEmbedding(nn.Module):
         keep_freq_range: bool = False,
         max_position_embeddings: int = 10000,
         partial_rotary_factor: float = 1.0,
+        sections: tuple[int, ...] | None = None,
         device: torch.device | str | None = None,
     ):
         super().__init__()
@@ -177,8 +203,24 @@ class RotaryEmbedding(nn.Module):
             raise ValueError(
                 "dynamic NTK scaling requires a width greater than two"
             )
+        if sections is not None and (
+            not isinstance(sections, tuple)
+            or len(sections) < 2
+            or any(type(width) is not int or width < 1 for width in sections)
+            or sum(sections) != self.dim // 2
+            or tuple(
+                _interleaved_axes(sections).count(axis)
+                for axis in range(len(sections))
+            )
+            != sections
+        ):
+            raise ValueError(
+                "M-RoPE sections must be positive widths partitioning every "
+                "interleaved rotary frequency"
+            )
 
         self.theta = theta
+        self.sections = sections
         self.scaling = scaling
         self.attention_scale = attention_scale
         self.keep_freq_range = keep_freq_range
@@ -207,6 +249,17 @@ class RotaryEmbedding(nn.Module):
             actual_device, sequence_length=0
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        if sections is not None:
+            # [dim / 2] position axis of each compact frequency.
+            self.register_buffer(
+                "frequency_axes",
+                torch.tensor(
+                    _interleaved_axes(sections),
+                    dtype=torch.int64,
+                    device=actual_device,
+                ),
+                persistent=False,
+            )
 
     def _frequencies(self, device, *, sequence_length):
         if self.scaling is None:
@@ -252,7 +305,38 @@ class RotaryEmbedding(nn.Module):
     def forward(self, positions, *, dtype: torch.dtype, sequence_length: int):
         """Return ``(cos, sin)`` factors of shape [..., dim / 2] for
         ``positions``.
+
+        With ``sections``, ``positions`` is ``[len(sections), ...]``: one
+        coordinate per position axis for each token, and the factors cover
+        the trailing token axes.
         """  # noqa: D205
+        if self.sections is None:
+            return self._factors(
+                positions, dtype=dtype, sequence_length=sequence_length
+            )
+        if positions.ndim < 2 or positions.shape[0] != len(self.sections):
+            raise ValueError(
+                "M-RoPE positions require one leading coordinate per section"
+            )
+
+        # Factors of every axis's coordinates, [axes, ..., dim / 2]; each
+        # frequency then selects the factors of the axis it rotates by.
+        # Selection copies values exactly, so equal coordinates on every axis
+        # reproduce the one-dimensional factors bit for bit.
+        cosine, sine = self._factors(
+            positions, dtype=dtype, sequence_length=sequence_length
+        )
+        axes = self.frequency_axes.to(device=positions.device)
+        selected_cosine, selected_sine = cosine[0], sine[0]
+        for axis in range(1, len(self.sections)):
+            chosen = axes == axis
+            selected_cosine = torch.where(chosen, cosine[axis], selected_cosine)
+            selected_sine = torch.where(chosen, sine[axis], selected_sine)
+        return selected_cosine, selected_sine
+
+    @torch.no_grad()
+    def _factors(self, positions, *, dtype: torch.dtype, sequence_length: int):
+        """Evaluate the one-dimensional recipe at every position coordinate."""
         if type(sequence_length) is not int or sequence_length < 0:
             raise ValueError(
                 "rotary sequence length must be a nonnegative host integer"
@@ -314,7 +398,11 @@ class RotaryEmbedding(nn.Module):
         }
 
     def prepare_constants(self, max_position: int, *, out):
-        """Fill caller-owned factors for one complete sequence-length domain."""
+        """Fill caller-owned factors for one complete sequence-length domain.
+
+        Rows are indexed by one coordinate. With ``sections`` they are the
+        per-axis table every position axis looks its coordinate up in.
+        """
         from .functional._tensors import result as _result
 
         expected = self.constant_buffers(max_position)
@@ -323,7 +411,7 @@ class RotaryEmbedding(nn.Module):
                 "rotary constant storage must supply cosine and sine tables"
             )
         positions = torch.arange(max_position, device=out["cos"].device)
-        values = self(
+        values = self._factors(
             positions, dtype=torch.float32, sequence_length=max_position
         )
         for name, value in zip(("cos", "sin"), values, strict=True):

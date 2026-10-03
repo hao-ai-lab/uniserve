@@ -146,4 +146,6 @@ def test_timestep_projection_preserves_both_modality_coordinates():
             downscale_freq_shift=0,
         )
         expected = reference(features).reshape(*times.shape, config.time_dim)
-        torch.testing.assert_close(model(times), expected, rtol=1e-5, atol=1e-6)
+        # Each row is one step's (video, audio) group vector.
+        actual = torch.stack([model(step) for step in times])
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)

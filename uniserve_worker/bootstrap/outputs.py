@@ -5,13 +5,14 @@ this rank's slice, variable axes). The worker reports products to the engine
 as ``OutputInfo`` values in ``ComponentInfo.outputs``, with a protocol
 ``DType`` and a ``ShapeBound``. This module owns that translation, the
 protocol names of media products, and the ``encoded_units`` product the host
-video encoder publishes. ``uniserve_worker.bootstrap.capacity`` and
+video codec publishes. ``uniserve_worker.bootstrap.capacity`` and
 ``uniserve_worker.bootstrap.report`` also size product storage from the result.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from types import MappingProxyType
 
 import torch
@@ -19,8 +20,11 @@ from torch import nn
 
 from uniserve.model import (
     AudioDecoder,
+    AudioEncoder,
     Denoiser,
+    PatchEncoder,
     VideoDecoder,
+    VideoEncoder,
     VideoPostprocessor,
 )
 from uniserve.tensors import OutputLayout
@@ -51,13 +55,21 @@ def product_name(module: nn.Module, name: str) -> str:
     """Name a numerical modality by its downstream protocol use.
 
     A denoiser's ``video``/``audio`` outputs are latents, a video decoder's
-    ``video`` output is its decoded media units, and an audio decoder's
-    ``audio`` output is audio samples. Every other name passes through.
+    ``video`` output is its decoded media units, an audio decoder's
+    ``audio`` output is audio samples, a vision encoder's ``features`` are
+    vision features, and the condition encoders' outputs are condition
+    latents. Every other name passes through.
     """
     if isinstance(module, Denoiser):
         return {"video": "video_latents", "audio": "audio_latents"}.get(
             name, name
         )
+    if isinstance(module, PatchEncoder) and name == "features":
+        return "vision_features"
+    if isinstance(module, VideoEncoder) and name == "video":
+        return "condition_video_latents"
+    if isinstance(module, AudioEncoder) and name == "audio":
+        return "condition_audio_latents"
     if isinstance(module, VideoDecoder) and name == "video":
         return "video_units"
     if isinstance(module, AudioDecoder) and name == "audio":
@@ -75,7 +87,12 @@ def resolve_outputs(
     output layouts retain only their numerical representation and placement.
 
     Every component ``describe_components`` reports for ``model`` is
-    resolved, not only the components this rank holds.
+    resolved, not only the components this rank holds. Condition products
+    are declared only where the deployment's video denoiser executes a
+    conditioned task and ``config`` grants condition capacity. The video
+    decoder's RGB media units name their raster axes, which each request
+    binds to its canvas; the video codec's encoded rows are bounded by the
+    largest unit of every admitted canvas, the row every request uses.
 
     Returns:
         A read-only mapping from component name to its products. Components
@@ -83,17 +100,40 @@ def resolve_outputs(
 
     Raises:
         ValueError: An output's dtype has no protocol ``DType``, an output
-            has more than one variable axis, or the video encoder component is
+            has more than one variable axis, the video codec component is
             present but the model has no ``MediaBuilder`` or no
-            ``VideoDecoder``. Errors from ``media_builder``, the capability
-            lookups, ``describe_components`` and ``output_layouts`` propagate.
+            ``VideoDecoder``, or the media reader serves conditions for a
+            model without both condition encoders and a vision encoder.
+            Errors from ``media_builder``, the capability lookups,
+            ``describe_components`` and ``output_layouts`` propagate.
     """
     from uniserve_worker.bootstrap.components import (
-        VIDEO_ENCODER_COMPONENT,
+        MEDIA_READER_COMPONENT,
+        VIDEO_CODEC_COMPONENT,
         describe_components,
     )
-    from uniserve_worker.bootstrap.inputs import capability, media_builder
-    from uniserve_worker.model_executor.resources import encoded_units_layout
+    from uniserve_worker.bootstrap.inputs import (
+        capability,
+        condition_capacity,
+        media_builder,
+        video_denoiser,
+    )
+    from uniserve_worker.model_executor.resources import (
+        DECODED_UNITS_RASTER_AXES,
+        bounding_layout,
+        condition_media_layouts,
+        encoded_units_layout,
+    )
+
+    # Condition products are sized by the condition rows the deployment's
+    # denoiser provisions (``condition_capacity``).
+    denoiser = video_denoiser(model, config)
+    config = replace(
+        config,
+        max_condition_rows=0
+        if denoiser is None
+        else condition_capacity(denoiser, config),
+    )
 
     builder = media_builder(model, config)
     decoder = capability(model, VideoDecoder)
@@ -112,15 +152,52 @@ def resolve_outputs(
                 clock=clock,
             ).items()
         ]
-        if component == VIDEO_ENCODER_COMPONENT:
+        if component == VIDEO_CODEC_COMPONENT:
             if builder is None or decoder is None:
                 raise ValueError("video encoding requires a decoder timeline")
             layouts.append(
                 (
                     None,
                     "encoded_units",
-                    encoded_units_layout(decoder, builder.maximum.num_frames),
+                    bounding_layout(
+                        tuple(
+                            encoded_units_layout(decoder, size)
+                            for size in builder.video_sizes()
+                        )
+                    ),
                 )
+            )
+        # The media reader's products are the condition media it decodes,
+        # declared only where the deployment serves conditions.
+        if component == MEDIA_READER_COMPONENT and config.max_condition_rows:
+            encoders = (
+                capability(model, VideoEncoder),
+                capability(model, AudioEncoder),
+                capability(model, PatchEncoder),
+            )
+            if builder is None or any(value is None for value in encoders):
+                raise ValueError(
+                    "media reading requires the condition encoders and a "
+                    "video timeline"
+                )
+            video_encoder, audio_encoder, vision = encoders
+            # A condition encodes one frame (an image) or a reference
+            # video's leading frames, a count the denoiser generates.
+            denoiser = builder.denoiser
+            frame_counts = [1, denoiser.legal_frame_count(1)]
+            while (
+                count := denoiser.legal_frame_count(frame_counts[-1] + 1)
+            ) <= builder.maximum.num_frames:
+                frame_counts.append(count)
+            layouts.extend(
+                (None, name, layout)
+                for name, layout in condition_media_layouts(
+                    config,
+                    video_encoder=video_encoder,
+                    audio_encoder=audio_encoder,
+                    vision=vision,
+                    frame_counts=tuple(frame_counts),
+                ).items()
             )
         for module, name, layout in layouts:
             dtype = _DTYPES.get(layout.dtype)
@@ -136,6 +213,15 @@ def resolve_outputs(
             # A variable axis becomes a device-sized bound; every other
             # extent is a static protocol dimension. ``ShapeBound`` admits at
             # most one ``DeviceDim``, which the check above reports by name.
+            # Decoded media units hold each request's own raster, at most the
+            # largest admitted one.
+            raster = (
+                DECODED_UNITS_RASTER_AXES
+                if isinstance(module, VideoDecoder)
+                and name == "video"
+                and clock is not None
+                else None
+            )
             outputs.append(
                 OutputInfo(
                     name if module is None else product_name(module, name),
@@ -148,6 +234,7 @@ def resolve_outputs(
                             for axis, extent in enumerate(layout.shape)
                         )
                     ),
+                    raster_axes=raster,
                 )
             )
         if outputs:

@@ -16,6 +16,7 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
+    t2va_request,
 )
 from tests.python.e2e.test_h3_parallel_http import _assert_media_values_close
 from uniserve_eval.datasets.minimax_h3 import _PROMPT
@@ -152,12 +153,9 @@ def test_every_admitted_duration_and_prompt_length_replays(
             before = _settled(client)
             response = client.post(
                 "/v1/videos/sync",
-                json={
-                    "model": "FastH3",
-                    "prompt": _prompt(tokenizer, tokens),
-                    "seconds": seconds,
-                    "seed": 2000 + index,
-                },
+                json=t2va_request(
+                    "FastH3", _prompt(tokenizer, tokens), seconds, 2000 + index
+                ),
             )
             response.raise_for_status()
             media = inspect_video_bytes(
@@ -165,6 +163,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
                 declared_mime=response.headers["content-type"],
             )
             assert media.frame_count == frames, (seconds, tokens)
+            # The 16:9 target's canvas.
             assert (media.width, media.height) == (1344, 768)
             assert (media.audio_channels, media.audio_sample_rate) == (
                 2,
@@ -181,18 +180,8 @@ def test_every_admitted_duration_and_prompt_length_replays(
 
         # Two layouts in flight together keep their own slots and state.
         payloads = [
-            {
-                "model": "FastH3",
-                "prompt": _prompt(tokenizer, 500),
-                "seconds": 7.3,
-                "seed": 3001,
-            },
-            {
-                "model": "FastH3",
-                "prompt": _prompt(tokenizer, 9000),
-                "seconds": 12.2,
-                "seed": 3002,
-            },
+            t2va_request("FastH3", _prompt(tokenizer, 500), 7.3, 3001),
+            t2va_request("FastH3", _prompt(tokenizer, 9000), 12.2, 3002),
         ]
         ids = [
             client.post("/v1/videos", json=payload).json()["id"]

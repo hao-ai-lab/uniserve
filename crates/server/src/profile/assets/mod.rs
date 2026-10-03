@@ -2,7 +2,9 @@
 //!
 //! [`model_files`] locates checkpoint files in a local directory, the local
 //! Hugging Face Hub cache, or the Hub itself; [`pipeline_index`] reads the
-//! root index that identifies a diffusers pipeline checkpoint; [`checkpoint`]
+//! root index that identifies a diffusers pipeline checkpoint, and
+//! [`pipeline`] locates its component files, including those a component
+//! export draws from the base checkpoint it pins; [`checkpoint`]
 //! reads tensor shapes from a safetensors header without loading weights;
 //! [`config`] deserializes the JSON metadata that profile resolution in the
 //! parent module consumes. Every failure is reported as this module's
@@ -16,6 +18,7 @@ pub mod error;
 #[cfg(test)]
 mod hub_stub;
 pub mod model_files;
+pub mod pipeline;
 pub mod pipeline_index;
 
 pub use checkpoint::resolve_tensor_shape;
@@ -25,4 +28,5 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use model_files::{ResolvedModelFiles, resolve_model_file};
+pub use pipeline::PipelineCheckpoint;
 pub use pipeline_index::{PipelineIndex, resolve_pipeline_index};

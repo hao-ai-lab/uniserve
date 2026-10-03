@@ -1,10 +1,11 @@
 //! Loopback stand-in for the Hugging Face Hub endpoints the asset resolvers use.
 //!
 //! The stub serves a repository listing (`/api/models/{repo}/revision/main`)
-//! and whole or byte-range file downloads (`/{repo}/resolve/main/{file}`),
-//! answering an unpublished file with 404 as the Hub does, or answers either
-//! kind of request with a fixed failure status. Tests drive the real Hub
-//! client against it, so only the network boundary is replaced.
+//! and whole or byte-range file downloads (`/{repo}/resolve/{revision}/{file}`)
+//! of one commit's files, answering an unpublished file with 404 as the Hub
+//! does, or answers either kind of request with a fixed failure status. Tests
+//! drive the real Hub client against it, so only the network boundary is
+//! replaced.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,10 +16,10 @@ use axum::response::{IntoResponse, Response};
 use hf_hub::Cache;
 use hf_hub::api::tokio::ApiBuilder;
 
-use crate::profile::assets::model_files::ModelSource;
+use crate::profile::assets::model_files::{HubClient, ModelSource};
 
-/// Commit the stub reports for every file, and the snapshot [`seed_cache`]
-/// writes, so downloads land beside seeded files.
+/// Commit the stub reports for every file unless told otherwise, and the
+/// snapshot [`seed_cache`] writes, so downloads land beside seeded files.
 const COMMIT: &str = "5f3b0c1e";
 
 /// Repository contents and failure modes served by the stub.
@@ -30,6 +31,9 @@ pub(super) struct HubStub {
     pub(super) listing_status: Option<StatusCode>,
     /// Status answered for every file download in place of its content.
     pub(super) download_status: Option<StatusCode>,
+    /// Commit reported for every file in place of [`COMMIT`], whatever
+    /// revision the request names.
+    pub(super) commit: Option<&'static str>,
 }
 
 impl HubStub {
@@ -51,6 +55,15 @@ impl HubStub {
     /// whose cache lives under `cache_root`, the directory [`seed_cache`]
     /// writes.
     pub(super) async fn serve(self, cache_root: &Path, repo_id: &str) -> ModelSource {
+        ModelSource::Hub {
+            api: self.client(cache_root).await.api,
+            repo_id: repo_id.to_owned(),
+        }
+    }
+
+    /// Serves the stub on a loopback port for the rest of the test and
+    /// returns a client that talks to it, with its cache under `cache_root`.
+    pub(super) async fn client(self, cache_root: &Path) -> HubClient {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let router = Router::new().fallback(move |uri: Uri, headers: HeaderMap| {
@@ -61,15 +74,18 @@ impl HubStub {
 
         // A cache under the test directory also keeps the client from reading
         // a token file outside it.
-        let api = ApiBuilder::from_cache(Cache::new(cache_root.join("hub")))
+        let cache = Cache::new(cache_root.join("hub"));
+        let api = ApiBuilder::from_cache(cache.clone())
             .with_endpoint(endpoint)
             .with_progress(false)
             .build()
             .unwrap();
-        ModelSource::Hub {
-            api,
-            repo_id: repo_id.to_owned(),
-        }
+        HubClient { api, cache }
+    }
+
+    /// The commit the stub reports.
+    fn commit(&self) -> &'static str {
+        self.commit.unwrap_or(COMMIT)
     }
 
     /// Answers one request by its path and `Range` header.
@@ -84,11 +100,14 @@ impl HubStub {
                 .keys()
                 .map(|name| serde_json::json!({ "rfilename": name }))
                 .collect::<Vec<_>>();
-            return axum::Json(serde_json::json!({ "siblings": siblings, "sha": COMMIT }))
+            return axum::Json(serde_json::json!({ "siblings": siblings, "sha": self.commit() }))
                 .into_response();
         }
 
-        let Some((_, filename)) = path.split_once("/resolve/main/") else {
+        let Some((_, filename)) = path
+            .split_once("/resolve/")
+            .and_then(|(_, rest)| rest.split_once('/'))
+        else {
             return StatusCode::NOT_FOUND.into_response();
         };
         if let Some(status) = self.download_status {
@@ -125,7 +144,10 @@ impl HubStub {
                     header::CONTENT_RANGE,
                     format!("bytes {first}-{end}/{}", content.len()),
                 ),
-                (HeaderName::from_static("x-repo-commit"), COMMIT.to_owned()),
+                (
+                    HeaderName::from_static("x-repo-commit"),
+                    self.commit().to_owned(),
+                ),
             ],
             content[first..=end].to_vec(),
         )
@@ -136,16 +158,29 @@ impl HubStub {
 /// Writes `files` into the Hub cache under `cache_root` as the snapshot of
 /// `repo_id` that `refs/main` names, the layout an earlier download leaves.
 pub(super) fn seed_cache(cache_root: &Path, repo_id: &str, files: &[(&str, &str)]) {
+    let repository = seed_snapshot(cache_root, repo_id, COMMIT, files);
+    std::fs::create_dir_all(repository.join("refs")).unwrap();
+    std::fs::write(repository.join("refs").join("main"), COMMIT).unwrap();
+}
+
+/// Writes `files` into the Hub cache under `cache_root` as the snapshot of
+/// `repo_id` at `commit`, with no ref naming it, the layout
+/// `huggingface_hub` leaves when it downloads at a commit revision. Returns
+/// the repository's cache directory.
+pub(super) fn seed_snapshot(
+    cache_root: &Path,
+    repo_id: &str,
+    commit: &str,
+    files: &[(&str, &str)],
+) -> std::path::PathBuf {
     let repository = cache_root
         .join("hub")
         .join(format!("models--{}", repo_id.replace('/', "--")));
-    std::fs::create_dir_all(repository.join("refs")).unwrap();
-    std::fs::write(repository.join("refs").join("main"), COMMIT).unwrap();
-
-    let snapshot = repository.join("snapshots").join(COMMIT);
+    let snapshot = repository.join("snapshots").join(commit);
     for (name, content) in files {
         let path = snapshot.join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
     }
+    repository
 }

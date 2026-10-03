@@ -65,7 +65,7 @@ uniserve serve "$H3_MODEL" \
   --max-running-requests 2
 ```
 
-`configs/fast_h3/ulysses4.json` is a deployment file: it lists the participating devices and, under `components`, the placement and parallel configuration of each of FastH3's five components. It places the numerical components on four devices of one host, as the `model` worker: four-way Ulysses denoising, TP4 text encoding, one video and one audio media unit per rank. A second worker, `host`, has five ranks on the host with `"device": "cpu"` and holds the two host components every video deployment needs: `video_encoder` on ranks 0 to 3, one media unit of each decode round per rank, and `muxer` on rank 4, which encodes the audio track and assembles the MP4. Each host rank is one codec slot: it runs one encode or assembly step at a time in its own process. The muxer must be on the head's host, and every worker that decodes video needs an encoder that keeps each media unit on the host that decoded it; the server refuses a placement that violates either at startup and routes each request to such an encoder. Under Ulysses each rank keeps only its own heads' share of the denoiser's merged query, key, value and gate projections, a quarter of those weights on four devices; the other denoiser weights are replicated on every rank. Serving a different width, or sharding the denoiser by tensor or pipeline, is a different deployment file.
+`configs/fast_h3/ulysses4.json` is a deployment file: it lists the participating devices and, under `components`, the placement and parallel configuration of each of FastH3's five components. It places the numerical components on four devices of one host, as the `model` worker: four-way Ulysses denoising, TP4 text encoding, one video and one audio media unit per rank. A second worker, `host`, has five ranks on the host with `"device": "cpu"` and holds the two host components every video deployment needs: `video_codec` on ranks 0 to 3, one media unit of each decode round per rank, and `muxer` on rank 4, which encodes the audio track and assembles the MP4. Each host rank is one codec slot: it runs one encode or assembly step at a time in its own process. The muxer must be on the head's host, and every worker that decodes video needs a `video_codec` rank that keeps each media unit on the host that decoded it; the server refuses a placement that violates either at startup and routes each request to such a codec. Under Ulysses each rank keeps only its own heads' share of the denoiser's merged query, key, value and gate projections, a quarter of those weights on four devices; the other denoiser weights are replicated on every rank. Serving a different width, or sharding the denoiser by tensor or pipeline, is a different deployment file.
 
 ### Deployments
 
@@ -136,7 +136,7 @@ Cross-rank products move over the mechanism named for that edge. CUDA VMM reads 
 
 A FastH3 deployment defaults to `--max-video-seconds 15` and `--max-model-len 16384`; set them only to change those limits. `--max-running-requests` caps concurrently resident requests, and the engine clamps that cap to the worker's advertised request-slot capacity; lowering it trades throughput for per-request latency and storage headroom.
 
-Startup prepares every computation an admitted request reaches. The denoiser is prepared for each of the 16 output frame counts up to `--max-video-seconds`, at every text capacity: `--video-text-capacities` lists those capacities in prompt tokens (default: 1024, then steps of 2048 up to `--max-model-len`), and a request evaluates in the smallest capacity that holds its prompt. The text encoder and the text refiner are prepared at every text capacity, and the video and audio decoders at every admitted duration. With graphs enabled (`--graph-policy auto`, the default, or `full`), startup captures one denoising graph per layout and every text-encoding and decoding call before the server reports ready, and accepted requests replay them: serving never captures and never falls back to eager execution. A layout's graph evaluates any of the eight solver steps, because the step index, the timesteps and the schedule are inputs each replay copies in. The video post-processor, which converts decoded frames for encoding, runs eagerly by design. The denoiser's layouts share one workspace and one graph pool, so its resident memory follows the largest layout rather than their count, while startup time grows with the count; fewer capacities start faster, and finer ones pad shorter prompts less. Decoder graphs keep one output per duration, so decoder memory grows with `--max-video-seconds`. With the default settings on four GB200 devices (`configs/fast_h3/ulysses4.json`), startup captures 144 denoising graphs, one per layout, and the server becomes ready in about 11 minutes; about 6 of them prepare the denoiser, almost all running one warm step per layout and about one minute capturing. The first startup on a machine also compiles the kernels those steps run and takes about 19 minutes; later startups load them from the caches described in [Build and run with Docker](#build-and-run-with-docker). Until preparation finishes, the log reports `worker still busy during Worker startup` with the elapsed seconds. Each model worker process then holds about 110 GiB on its device as NVML reports it, the figure its storage grant charges; the caching allocator reserves about 87 GiB of that, about 32 GiB of it in graph pools. A deployment whose startup storage does not fit its devices fails before it reports ready; the startup log lists the bytes each process holds on each device, the caching allocator's share of them, and the graph storage of each component. `--graph-policy off` serves the same layouts without graphs.
+Startup prepares every computation an admitted request reaches. The denoiser is prepared for each of the 16 output frame counts up to `--max-video-seconds`, at every text capacity: `--video-text-capacities` lists those capacities in prompt tokens (default: 1024, then steps of 2048 up to `--max-model-len`), and a request evaluates in the smallest capacity that holds its prompt. The text encoder and the text refiner are prepared at every text capacity, and the audio decoder at every admitted duration. The video decoder reconstructs each media unit from a fixed window of latent frames, so it is prepared once for the canvas and every duration shares it; a request's unit is unpacked from its complete latent before the window is decoded. With graphs enabled (`--graph-policy auto`, the default, or `full`), startup captures one denoising graph per layout and every text-encoding and decoding call before the server reports ready, and accepted requests replay them: serving never captures and never falls back to eager execution. A layout's graph evaluates any of the eight solver steps, because the step index, the timesteps and the schedule are inputs each replay copies in. The video post-processor, which converts decoded frames for encoding, runs eagerly by design. The denoiser's layouts share one workspace and one graph pool, so its resident memory follows the largest layout rather than their count, while startup time grows with the count; fewer capacities start faster, and finer ones pad shorter prompts less. Audio decoder graphs keep one output per duration, so audio decoder memory grows with `--max-video-seconds`; the video decoder keeps one graph per canvas. With the default settings on four GB200 devices (`configs/fast_h3/ulysses4.json`), startup captures 144 denoising graphs, one per layout, and the server becomes ready in about 11 minutes; about 6 of them prepare the denoiser, almost all running one warm step per layout and about one minute capturing. The first startup on a machine also compiles the kernels those steps run and takes about 19 minutes; later startups load them from the caches described in [Build and run with Docker](#build-and-run-with-docker). Until preparation finishes, the log reports `worker still busy during Worker startup` with the elapsed seconds. Each model worker process then holds about 102 GiB on its device as NVML reports it, the figure its storage grant charges; the caching allocator reserves about 78 GiB of that, about 24 GiB of it in graph pools. A deployment whose startup storage does not fit its devices fails before it reports ready; the startup log lists the bytes each process holds on each device, the caching allocator's share of them, and the graph storage of each component. `--graph-policy off` serves the same layouts without graphs.
 
 Check the live limits and served model name after startup:
 
@@ -146,7 +146,7 @@ curl --fail-with-body http://127.0.0.1:8000/v1/models
 curl --fail-with-body http://127.0.0.1:8000/v1/capabilities | python -m json.tool
 ```
 
-`/v1/capabilities` reports the accepted request fields, the frame geometry, the duration limits, and the job retention bounds described below.
+`/v1/capabilities` reports the served tasks and their condition rules, the canvas rule and the canvases the checkpoint serves, the duration limits, the checkpoint's schedule, the prompt capacity, the accepted media sources and request fields, and the job retention bounds described below.
 
 ## Build and run with Docker
 
@@ -172,17 +172,32 @@ The first startup compiles UniServe's native kernels and the Triton and FlashInf
 
 ## Generate a video
 
-Only `model`, `prompt`, `seconds`, and `seed` are accepted, as JSON or as `multipart/form-data`. `seconds` is a finite number of seconds from 4 to 15 inclusive, fractional values included; it defaults to 5 seconds, or to `--max-video-seconds` when that is shorter, and `seed` defaults to 0. `--max-video-seconds` sets the deployment's capacity within that range (default 15); a request longer than the capacity is rejected, and `GET /v1/capabilities` reports the capacity as `max_seconds` next to the API range `min_seconds` and `model_max_seconds`.
+A request is the MiniMax-H3 request body, sent as JSON or as `multipart/form-data` with the same field names and `conditions` and `target` as JSON text. FastH3 generates text-to-video-and-audio (`t2va`) at the 16:9 canvas, 1344×768:
+
+| Field | Rule |
+| --- | --- |
+| `model` | Required; the served model name |
+| `prompt` | Required; not blank |
+| `task` | Required; `t2va` |
+| `conditions` | Optional; empty for `t2va` |
+| `target` | Required: `short_edge` 768, `aspect_ratio` `16:9` or `auto` (16:9 for `t2va`), and `duration_seconds`, a finite number of seconds from 4 to 15 inclusive, fractional values included |
+| `seed` | Optional unsigned integer; defaults to 42 |
+| `num_inference_steps`, `flow_shift`, `audio_flow_shift` | Optional; when present, each must equal the checkpoint's schedule that `/v1/capabilities` reports under `schedule`. `num_inference_steps` counts sigma points including the clean endpoint, one more than the denoiser forwards: 9 for the 8-Step checkpoints and 5 for the 4-step ones |
+| `n`, `num_outputs_per_prompt` | Optional; only 1 |
+| `quality` | Optional; only `lossless` |
+| `seconds`, `size`, `width`, `height` | Optional; accepted only when they agree with the duration and canvas the target resolves to |
+
+Any other field is rejected, and so is a request without `task` or `target`; the response names the field. `--max-video-seconds` sets the deployment's duration capacity within the API range (default 15); a request longer than the capacity is rejected, and `GET /v1/capabilities` reports the capacity as `max_seconds` next to the API range `min_seconds` and `model_max_seconds`.
 
 ```bash
 curl --fail-with-body --max-time 600 \
   http://127.0.0.1:8000/v1/videos/sync \
   -H 'Content-Type: application/json' \
-  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","seconds":5,"seed":1000}' \
+  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","task":"t2va","target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5},"seed":1000}' \
   --output forest.mp4
 ```
 
-The synchronous endpoint returns MP4 bytes at 24 frames per second. H3 converts the requested duration to `seconds * 24` frames, rounded half to even, and extends that count up to its next complete temporal window of `17n + 5` frames, so the video can last slightly longer than requested. A 4-second request produces 107 frames (about 4.46 seconds), a 5-second request 124 frames (about 5.17 seconds), and a 15-second request 362 frames (about 15.08 seconds). A fixed output resolution therefore has exactly 16 frame counts: 107, 124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345, and 362.
+The synchronous endpoint returns MP4 bytes at 24 frames per second. H3 converts the requested `duration_seconds` to `duration_seconds * 24` frames, rounded half to even, and extends that count up to its next complete temporal window of `17n + 5` frames, so the video can last slightly longer than requested. A 4-second request produces 107 frames (about 4.46 seconds), a 5-second request 124 frames (about 5.17 seconds), and a 15-second request 362 frames (about 15.08 seconds). A fixed output resolution therefore has exactly 16 frame counts: 107, 124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345, and 362.
 
 ## Use asynchronous jobs
 
@@ -191,7 +206,7 @@ Create a job:
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/v1/videos \
   -H 'Content-Type: application/json' \
-  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","seconds":5,"seed":1000}'
+  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","task":"t2va","target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5},"seed":1000}'
 ```
 
 Use the returned `video_...` ID:
@@ -205,7 +220,7 @@ curl --fail-with-body http://127.0.0.1:8000/v1/videos
 curl --fail-with-body -X DELETE "http://127.0.0.1:8000/v1/videos/$VIDEO_ID"
 ```
 
-Job states are `queued`, `in_progress`, `completed`, and `failed`. A running job also reports `phase` (`encoding`, `preparing`, `denoising`, `decoding`, then `finalizing`), `completed_steps` against `total_steps`, and both the requested `seconds` and the generated `num_frames` with their duration `actual_seconds`. Jobs and retained MP4s live in the server process, expire after one hour, and disappear on restart. The server retains at most 1 GiB of artifacts, and retained jobs and in-flight synchronous requests share 128 job slots. Deleting a queued or running job cancels it.
+Job states are `queued`, `in_progress`, `completed`, and `failed`. A running job also reports `phase` (`encoding`, `preparing`, `denoising`, `decoding`, then `finalizing`), `completed_steps` against `total_steps`, the requested duration `seconds`, the generated `num_frames` with their duration `actual_seconds`, and the generated canvas `size` (`1344x768`). Jobs and retained MP4s live in the server process, expire after one hour, and disappear on restart. The server retains at most 1 GiB of artifacts, and retained jobs and in-flight synchronous requests share 128 job slots. Deleting a queued or running job cancels it.
 
 A request to either endpoint while all 128 job slots are taken returns HTTP 429 with code `video_job_capacity_exceeded`. A failed job reports `error.code`: `invalid_request_error` when the deployment cannot serve the request as specified, `server_overloaded` when the engine's waiting queue was full and the same request may be resubmitted, and `generation_failed` when execution failed. The synchronous endpoint returns the same conditions as HTTP 400, 503, and 500.
 
@@ -252,7 +267,7 @@ The BF16 checkpoints run on Hopper in the default `quality` precision. Hopper co
 --quantization-config '{"components":{"mlp":"fp8"}}'
 ```
 
-H200 deployments at 15-second capacity use `--mem-fraction-static 0.92`: the default 0.70 grant does not hold the BF16 weights and full-duration decoder graphs.
+H200 deployments at 15-second capacity use `--mem-fraction-static 0.92`, the grant their published measurements use.
 
 ## Reproduce the measurements
 

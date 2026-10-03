@@ -671,7 +671,8 @@ impl Scheduler {
                 // worker completion flags do not determine diffusion termination.
             }
             CallKind::Media(
-                MediaCall::VideoDecoding
+                MediaCall::MediaReading
+                | MediaCall::VideoDecoding
                 | MediaCall::AudioDecoding
                 | MediaCall::AudioEncoding
                 | MediaCall::Muxing,

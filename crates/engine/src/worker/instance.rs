@@ -292,37 +292,53 @@ fn call_identity(
     )
 }
 
-/// Refuses a placement whose muxer is not on the head's host.
+/// Refuses a placement whose muxer or media reader is not on the head's host.
 ///
-/// The artifact a muxer publishes is a POSIX shared-storage object the head
-/// opens by name, and such a name resolves in one host's namespace. A muxer
-/// placed elsewhere would fail on the first request, so the placement is
-/// refused at startup, naming the component and the host it was placed on.
-pub(crate) fn refuse_muxer_off_head(
+/// Both exchange POSIX shared-storage objects with the head by name, and such
+/// a name resolves in one host's namespace: the head opens the artifact a
+/// muxer publishes, and the media reader opens the condition media the head
+/// published. Either placed elsewhere would fail on the first request, so the
+/// placement is refused at startup, naming the component and the host it was
+/// placed on.
+pub(crate) fn refuse_shared_storage_off_head(
     head: &str,
     ranks: &[crate::WorkerRank],
     components: &BTreeMap<String, crate::executor::ComponentConfig>,
     media_components: &BTreeMap<uniserve_worker_ipc::MediaCall, String>,
 ) -> anyhow::Result<()> {
-    let Some(component) = media_components.get(&uniserve_worker_ipc::MediaCall::Muxing) else {
-        return Ok(());
-    };
-    let placement = components.get(component).with_context(|| {
-        format!("component {component} serves muxing but the placement binds no such component")
-    })?;
-    for &rank in &placement.ranks {
-        let node = ranks
-            .get(rank)
-            .map(|placed| placed.node.as_str())
-            .with_context(|| {
-                format!("component {component} names rank {rank} outside the placement")
-            })?;
-        anyhow::ensure!(
-            node == head,
-            "component {component} serves muxing on rank {rank} on host {node}, but the head is \
-             on host {head}, and the artifact it publishes is a shared-storage object named in \
-             one host's namespace"
-        );
+    use uniserve_worker_ipc::MediaCall;
+
+    for (call, work, object) in [
+        (
+            MediaCall::Muxing,
+            "muxing",
+            "the artifact it publishes is a shared-storage object",
+        ),
+        (
+            MediaCall::MediaReading,
+            "media reading",
+            "the condition media it reads are shared-storage objects",
+        ),
+    ] {
+        let Some(component) = media_components.get(&call) else {
+            continue;
+        };
+        let placement = components.get(component).with_context(|| {
+            format!("component {component} serves {work} but the placement binds no such component")
+        })?;
+        for &rank in &placement.ranks {
+            let node = ranks
+                .get(rank)
+                .map(|placed| placed.node.as_str())
+                .with_context(|| {
+                    format!("component {component} names rank {rank} outside the placement")
+                })?;
+            anyhow::ensure!(
+                node == head,
+                "component {component} serves {work} on rank {rank} on host {node}, but the head \
+                 is on host {head}, and {object} named in one host's namespace"
+            );
+        }
     }
     Ok(())
 }
@@ -514,7 +530,7 @@ impl WorkerGroup {
             );
         }
 
-        refuse_muxer_off_head(
+        refuse_shared_storage_off_head(
             &process_args.host,
             &process_args.ranks,
             &process_args.components,
@@ -1158,12 +1174,14 @@ impl WorkerGroup {
     /// Acknowledgment slots of the ranks that read the products a call
     /// produces on `rank`, where `members` are the ranks executing the call.
     ///
-    /// A video call's readers are the ranks of the components serving the
+    /// A media call's readers are the ranks of the components serving the
     /// calls that consume it, less the ranks that produce their own copy: a
-    /// consumer reads the copy it holds before any other. `routed` names the
-    /// worker each consuming component was routed to for the call's request.
-    /// Work outside the video graph is read by the destinations of the rank's
-    /// transfer edges.
+    /// consumer reads the copy it holds before any other. For a video
+    /// request's call, `routed` names each component its request's graph
+    /// reads the products with, and the worker the request was routed to for
+    /// it. An image generation call's readers follow from its kind
+    /// (`generation_consuming_calls`). Other work is read by the destinations
+    /// of the rank's transfer edges.
     fn consumer_slots(
         &self,
         call: &uniserve_worker_ipc::Call,
@@ -1173,17 +1191,23 @@ impl WorkerGroup {
     ) -> Vec<u32> {
         let transfer = &self.process_args.transfer;
         let worker = &self.process_args.worker_id;
-        let consuming = match call.code {
-            uniserve_worker_ipc::CallKind::Media(media_call) => {
-                crate::scheduler::consuming_calls(media_call)
+        let consuming: Vec<uniserve_worker_ipc::MediaCall> = match (routed, call.code) {
+            (Some(readers), _) => self
+                .media_routing
+                .iter()
+                .filter(|(_, component)| readers.contains_key(*component))
+                .map(|(media_call, _)| *media_call)
+                .collect(),
+            (None, uniserve_worker_ipc::CallKind::Media(media_call)) => {
+                match crate::scheduler::generation_consuming_calls(media_call) {
+                    Some(consuming) => consuming.to_vec(),
+                    None => return transfer.product_consumers(worker, rank as u32),
+                }
             }
-            _ => None,
-        };
-        let Some(consuming) = consuming else {
-            return transfer.product_consumers(worker, rank as u32);
+            _ => return transfer.product_consumers(worker, rank as u32),
         };
         media_consumer_slots(
-            consuming,
+            &consuming,
             &self.media_routing,
             routed.unwrap_or(&BTreeMap::new()),
             worker,
@@ -1931,7 +1955,7 @@ impl Drop for WorkerGroup {
 
 #[cfg(test)]
 mod tests {
-    use super::{refuse_checkpoint_mismatch, refuse_muxer_off_head};
+    use super::{refuse_checkpoint_mismatch, refuse_shared_storage_off_head};
     use crate::WorkerRank;
     use crate::executor::ComponentConfig;
     use std::collections::BTreeMap;
@@ -1962,18 +1986,23 @@ mod tests {
     #[test]
     fn a_muxer_on_the_head_host_is_admitted() {
         let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
-        refuse_muxer_off_head("rank-0", &ranks, &components(vec![0]), &muxing("muxer"))
+        refuse_shared_storage_off_head("rank-0", &ranks, &components(vec![0]), &muxing("muxer"))
             .expect("a muxer on the head's host serves the artifact the head opens");
         // A deployment without a muxer publishes no artifact and is unaffected.
-        refuse_muxer_off_head("rank-0", &ranks, &components(vec![3]), &BTreeMap::new())
+        refuse_shared_storage_off_head("rank-0", &ranks, &components(vec![3]), &BTreeMap::new())
             .expect("a placement without muxing has no artifact to place");
     }
 
     #[test]
     fn a_muxer_off_the_head_host_is_refused_by_name() {
         let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
-        let error = refuse_muxer_off_head("rank-0", &ranks, &components(vec![3]), &muxing("muxer"))
-            .expect_err("a muxer on another host cannot publish an artifact the head opens");
+        let error = refuse_shared_storage_off_head(
+            "rank-0",
+            &ranks,
+            &components(vec![3]),
+            &muxing("muxer"),
+        )
+        .expect_err("a muxer on another host cannot publish an artifact the head opens");
         let message = format!("{error:#}");
         assert!(
             message.contains("muxer"),
@@ -1988,10 +2017,43 @@ mod tests {
             "the refusal names the head's host: {message}"
         );
 
-        let error =
-            refuse_muxer_off_head("rank-0", &ranks, &components(vec![0]), &muxing("output"))
-                .expect_err("a muxing component the placement does not bind is refused");
+        let error = refuse_shared_storage_off_head(
+            "rank-0",
+            &ranks,
+            &components(vec![0]),
+            &muxing("output"),
+        )
+        .expect_err("a muxing component the placement does not bind is refused");
         assert!(format!("{error:#}").contains("output"));
+    }
+
+    /// The media reader opens the condition media the head published by name,
+    /// so it is refused off the head's host as the muxer is.
+    #[test]
+    fn a_media_reader_off_the_head_host_is_refused_by_name() {
+        let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
+        let reading = |ranks: Vec<usize>| {
+            (
+                BTreeMap::from([(
+                    "media_reader".to_owned(),
+                    ComponentConfig::parallel(ranks, Default::default()),
+                )]),
+                BTreeMap::from([(MediaCall::MediaReading, "media_reader".to_owned())]),
+            )
+        };
+
+        let (components, calls) = reading(vec![1]);
+        refuse_shared_storage_off_head("rank-0", &ranks, &components, &calls)
+            .expect("a media reader on the head's host reads the published media");
+
+        let (components, calls) = reading(vec![2]);
+        let error = refuse_shared_storage_off_head("rank-0", &ranks, &components, &calls)
+            .expect_err("a media reader on another host cannot open the published media");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("media_reader") && message.contains("rank-1"),
+            "the refusal names the component and its host: {message}"
+        );
     }
 
     const SERVED: &str = "0000000000000000000000000000000000000000000000000000000000000000";

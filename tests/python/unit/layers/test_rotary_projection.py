@@ -10,7 +10,7 @@ from uniserve.nn.attention import (
     QKVProjection,
     RotaryQKVProjection,
 )
-from uniserve.nn.functional import apply_rotary, qk_norm_rope
+from uniserve.nn.functional import Rounding, apply_rotary, qk_norm_rope
 from uniserve.nn.linear import QKVParallelLinear
 from uniserve.nn.rope import DynamicScaling, LinearScaling, LongRoPEScaling
 
@@ -663,3 +663,129 @@ def test_full_head_rotation_preserves_strided_heads_and_value_rows(
         assert torch.equal(value, original[:, query_heads + key_heads :])
     else:
         assert torch.equal(packed, original)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+def test_interleaved_sections_match_qwen3_vl_multimodal_rotary(device):
+    from transformers import Qwen3VLTextConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLTextRotaryEmbedding,
+    )
+
+    # Qwen3-VL-32B's language rotary: 64 compact frequencies interleaved
+    # over (temporal, height, width) coordinates.
+    config = Qwen3VLTextConfig(
+        head_dim=128,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 5_000_000.0,
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+        },
+    )
+    reference = Qwen3VLTextRotaryEmbedding(config).to(device)
+    rotary = RotaryEmbedding(128, theta=5_000_000.0, sections=(24, 20, 20)).to(
+        device
+    )
+    generator = torch.Generator().manual_seed(911)
+    positions = torch.randint(0, 40_000, (3, 97), generator=generator).to(
+        device
+    )
+
+    # The reference repeats the compact factors over both head halves.
+    expected = reference(
+        torch.empty((), dtype=torch.float32, device=device),
+        positions[:, None],
+    )
+    actual = rotary(positions, dtype=torch.float32, sequence_length=97)
+    for value, wanted in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, wanted[0, :, :64])
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+def test_sections_with_shared_coordinates_reproduce_one_axis_factors(device):
+    # Text advances every axis together; its multimodal factors must equal
+    # the one-dimensional recipe exactly, not merely closely.
+    plain = RotaryEmbedding(128, theta=5_000_000.0).to(device)
+    sectioned = RotaryEmbedding(
+        128, theta=5_000_000.0, sections=(24, 20, 20)
+    ).to(device)
+    positions = torch.arange(1000, 1313, device=device)
+    expected = plain(positions, dtype=torch.float32, sequence_length=313)
+    actual = sectioned(
+        positions.expand(3, -1), dtype=torch.float32, sequence_length=313
+    )
+    for value, wanted in zip(actual, expected, strict=True):
+        assert torch.equal(value, wanted)
+
+
+@pytest.mark.parametrize("sections", [(24, 20), (24, 20, 21), (8, 28, 28)])
+def test_sections_must_partition_the_interleaved_frequencies(sections):
+    with pytest.raises(ValueError, match="M-RoPE sections"):
+        RotaryEmbedding(128, sections=sections)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+@pytest.mark.parametrize("axes", ["one partial axis", "rotated and plain axes"])
+@pytest.mark.parametrize("packed", [False, True])
+def test_stepwise_qk_rotation_rounds_each_eager_operation(device, axes, packed):
+    """Stepwise Q/K preparation equals eager BF16 PyTorch bit for bit.
+
+    Heads of +-1 have an exact unit mean square, so each weighted
+    normalization rounds to its weight in BF16 for any reduction order, and
+    the rotation's BF16 products and sums are exact functions of the
+    operands. 96 of the 128 channels rotate split-half, declared either as
+    one axis whose factors cover a prefix or as a rotated axis followed by
+    an unrotated one. ``packed`` Q/K are strided row views of one fused
+    projection output, as attention layers produce them.
+    """
+    generator = torch.Generator().manual_seed(183)
+    rows, heads, dim, rotated, eps = 37, 4, 128, 96, 1e-6
+
+    signs = torch.randint(0, 2, (rows, 3, heads, dim), generator=generator)
+    projection = (signs * 2 - 1).to(device=device, dtype=torch.bfloat16)
+    q, k, _ = projection.unbind(1)
+    if not packed:
+        q, k = q.contiguous(), k.contiguous()
+    q_weight, k_weight = (
+        (torch.rand(dim, generator=generator) + 0.5).to(
+            device=device, dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    angles = torch.rand(rows, rotated // 2, generator=generator) * 40
+    cos, sin = angles.cos().to(device), angles.sin().to(device)
+
+    def eager(value, weight):
+        normalized = F.rms_norm(value, (dim,), weight, eps)
+        head, tail = normalized[..., :rotated], normalized[..., rotated:]
+        first, second = head.chunk(2, dim=-1)
+        cosine = torch.cat((cos, cos), -1).to(torch.bfloat16)[:, None]
+        sine = torch.cat((sin, sin), -1).to(torch.bfloat16)[:, None]
+        turned = torch.cat((-second, first), dim=-1)
+        return torch.cat((head * cosine + turned * sine, tail), dim=-1)
+
+    if axes == "one partial axis":
+        factors, axis_dims = ((cos,), (sin,)), (dim,)
+    else:
+        factors = ((cos, cos[..., :0]), (sin, sin[..., :0]))
+        axis_dims = (rotated, dim - rotated)
+    query, key = qk_norm_rope(
+        q,
+        k,
+        (q_weight,),
+        (k_weight,),
+        *factors,
+        eps=eps,
+        axis_dims=axis_dims,
+        rounding=Rounding.STEPWISE,
+    )
+
+    torch.testing.assert_close(query, eager(q, q_weight), rtol=0, atol=0)
+    torch.testing.assert_close(key, eager(k, k_weight), rtol=0, atol=0)
