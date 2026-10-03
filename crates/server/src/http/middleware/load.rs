@@ -25,24 +25,37 @@ use crate::AppState;
 ///
 /// Entries are matched against the route template (`MatchedPath`), so they must
 /// equal the paths registered in `routes::build_router`.
-const TRACKED_HANDLERS: &[&str] = &["/v1/chat/completions", "/v1/images/generations"];
+const TRACKED_HANDLERS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/images/generations",
+    SYSTEMONE_PATH,
+];
+
+/// The System One readout route, whose errors follow FastAPI's
+/// `{"detail": ...}` shape rather than OpenAI's.
+const SYSTEMONE_PATH: &str = "/v1/systemone";
 
 /// `Retry-After` hint (in seconds) advertised when shedding load.
 const RETRY_AFTER_SECONDS: &str = "1";
 
 /// Builds the 503 load-shedding response returned when the in-flight limit is
-/// reached.
-fn overloaded_response(limit: u64) -> Response {
-    let body = json!({
-        "error": {
-            "message": format!(
-                "Server overloaded: {limit} concurrent requests already in flight. \
-                 Retry after a short delay."
-            ),
-            "type": "service_unavailable",
-            "code": "server_overloaded",
-        }
-    });
+/// reached, in the error shape of the route `handler` matched.
+fn overloaded_response(limit: u64, handler: &str) -> Response {
+    let message = format!(
+        "Server overloaded: {limit} concurrent requests already in flight. \
+         Retry after a short delay."
+    );
+    let body = if handler == SYSTEMONE_PATH {
+        json!({ "detail": message })
+    } else {
+        json!({
+            "error": {
+                "message": message,
+                "type": "service_unavailable",
+                "code": "server_overloaded",
+            }
+        })
+    };
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [(RETRY_AFTER, HeaderValue::from_static(RETRY_AFTER_SECONDS))],
@@ -81,7 +94,7 @@ pub(crate) async fn track_server_load(
     if let Some(limit) = state.max_concurrent_requests()
         && state.server_load() >= limit
     {
-        return overloaded_response(limit);
+        return overloaded_response(limit, handler);
     }
 
     // The guard is created right after the increment so that the decrement

@@ -1,23 +1,70 @@
 //! Streaming tool-call parsers and normalized tool descriptors.
 //!
-//! The Qwen3 chat output stage (`serving::chat::output::qwen3`) feeds visible
-//! assistant text to `Qwen3XmlToolParser` chunk by chunk. The parser turns
-//! each chunk into an ordered sequence of plain text and `ToolCallDelta`
-//! updates, holding back bytes it cannot classify yet, such as a partial
-//! marker or an incomplete tool-call header.
+//! The chat output tool stage (`serving::chat::output`) feeds visible
+//! assistant text chunk by chunk to a [`ToolParser`]: `Qwen3XmlToolParser`
+//! for Qwen3 and `Gemma4ToolParser` for Gemma-4. The parser turns each chunk
+//! into an ordered sequence of plain text and `ToolCallDelta` updates, holding
+//! back bytes it cannot classify yet, such as a partial marker or an
+//! incomplete tool call.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #[macro_use]
 mod error;
+mod gemma4;
 mod json;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_utils;
 mod utils;
 
 pub use error::{Result, ToolParserError};
+pub use gemma4::Gemma4ToolParser;
 pub use json::Qwen3XmlToolParser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Incremental extraction of tool calls from one assistant turn's visible
+/// text.
+///
+/// Call `parse_into` for each text chunk and `finish` once at end of
+/// generation. After a failure, `reset` recovers the input that emitted
+/// output does not represent, so the caller can surface it as text.
+pub trait ToolParser: Send {
+    /// Parses one text chunk into an existing output accumulator.
+    ///
+    /// Fails with `ToolParserError::ParsingFailed` when the input cannot be
+    /// interpreted under the parser's grammar or its pending buffer exceeds
+    /// the parser's size cap. Events parsed before the failure remain in
+    /// `output`, and `reset` returns the input that `output` does not
+    /// represent.
+    fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()>;
+
+    /// Flushes buffered parser state at end of generation.
+    ///
+    /// Buffered input that belongs to no published tool call is returned as
+    /// plain text. Fails, leaving the state unchanged, when a published call
+    /// is still open.
+    fn finish(&mut self) -> Result<ToolParserOutput>;
+
+    /// Resets parser state and returns the buffered input that no emitted
+    /// output represents.
+    fn reset(&mut self) -> String;
+
+    #[cfg(any(test, feature = "test-util"))]
+    /// Parses one incremental text chunk.
+    fn parse_chunk(&mut self, chunk: &str) -> Result<ToolParserOutput> {
+        let mut output = ToolParserOutput::default();
+        self.parse_into(chunk, &mut output)?;
+        Ok(output)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    /// Parses a complete assistant response and flushes all state.
+    fn parse_complete(&mut self, text: &str) -> Result<ToolParserOutput> {
+        let mut output = self.parse_chunk(text)?;
+        output.append(self.finish()?);
+        Ok(output.coalesce_calls())
+    }
+}
 
 /// One function-style tool made available to the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,8 +87,10 @@ pub struct ToolCallDelta {
     /// Function name, present on the first update for one tool call.
     pub name: Option<String>,
     /// Arguments text contributed by this update. Concatenating every update
-    /// for one `tool_index` yields the arguments JSON exactly as the model
-    /// wrote it; the text is neither parsed as JSON nor normalized.
+    /// for one `tool_index` yields the call's arguments as JSON text.
+    /// `Qwen3XmlToolParser` forwards the JSON exactly as the model wrote it,
+    /// neither parsed nor normalized; `Gemma4ToolParser` translates Gemma-4's
+    /// native argument encoding into JSON.
     pub arguments: String,
 }
 
@@ -123,9 +172,8 @@ impl ToolParserOutput {
     /// Each merged call takes the first name any of its deltas carries and the
     /// concatenation of their arguments. A call's deltas are contiguous in
     /// parser output, so this yields one item per call there.
-    /// `Qwen3XmlToolParser::parse_complete` and the test helper
-    /// `collect_stream` use this to collapse streamed argument fragments into
-    /// final tool calls.
+    /// `ToolParser::parse_complete` and the test helper `collect_stream` use
+    /// this to collapse streamed argument fragments into final tool calls.
     pub fn coalesce_calls(self) -> Self {
         let mut coalesced = Self::default();
 
