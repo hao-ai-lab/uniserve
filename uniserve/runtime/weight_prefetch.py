@@ -8,8 +8,11 @@ is collective; inference waits solely on local copy/compute events.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
+from itertools import zip_longest
 
 import torch
 from torch import nn
@@ -26,6 +29,7 @@ from uniserve_kernels import peer_storage
 class _Call:
     started: bool = False
     queued: int | None = None
+    last: int | None = None
 
 
 class WeightPrefetch:
@@ -40,13 +44,16 @@ class WeightPrefetch:
     or no invocations at all, while retaining their immutable weight storage.
 
     ``activate`` brackets a numerical invocation. Bindings call ``before``
-    and ``after`` around each expert computation. The first call forks a
-    copy stream; scope exit joins it, also when a forward skips its final
-    expert layer. Thus the complete dependency chain is capturable.
+    and ``after`` around each expert computation. External CUDA events
+    order the copy stream against computation, including speculative reads
+    for a skipped tail layer. Runtime graph capture splits at batch-copy
+    submissions, preserving these dependencies across graph segments.
     """
 
     @torch.inference_mode()
     def __init__(self, model: nn.Module, *, backend="auto"):
+        from cuda.bindings import runtime as cudart
+
         layers = [
             layer
             for layer in model.modules()
@@ -63,18 +70,29 @@ class WeightPrefetch:
         if self.device.type != "cuda":
             raise ValueError("DWDP requires CUDA peer memory")
         self._layers = {id(layer): index for index, layer in enumerate(layers)}
-        self._copies: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
+        self._copies: list[list[tuple[int, torch.Tensor, torch.Tensor]]] = []
+        self._plans: list[tuple[list[int], list[int], list[int]]] = []
+        self._submissions: list[Callable[[], None]] = []
+        self._capture: Callable[[Callable[[], None]], None] | None = None
+        self._runtime = cudart
+        self._attributes = cudart.cudaMemcpyAttributes()
+        self._attributes.srcAccessOrder = (
+            cudart.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
+        )
         self._storage: list[torch.Tensor] = []
         self._slots: dict[tuple, torch.Tensor] = {}
         self._calls: list[_Call] = []
         self._stream = torch.cuda.Stream(device=self.device)
-        self._ready = [torch.cuda.Event() for _ in range(2)]
-        self._consumed = [torch.cuda.Event() for _ in range(2)]
+        self._ready = [torch.cuda.Event(external=True) for _ in range(2)]
+        self._consumed = [torch.cuda.Event(external=True) for _ in range(2)]
         self._closed = False
         self.resident_bytes = self.buffer_bytes = self.transfer_bytes = 0
 
         try:
             self._prepare(layers, backend)
+            for index, copies in enumerate(self._copies):
+                self._plans.append(self._plan(copies))
+                self._submissions.append(partial(self._copy, index))
         except BaseException:
             # A peer can still read already-published pages when this rank
             # fails during setup. Do not unmap them or wait collectively in
@@ -94,7 +112,7 @@ class WeightPrefetch:
             provider.prepare(
                 module=layer, size=TextSize(1, 1), workspace={}
             ).close()
-            copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+            copies: list[tuple[int, torch.Tensor, torch.Tensor]] = []
             self._copies.append(copies)
             for name in ("up_gate", "down"):
                 linear = getattr(layer, name)
@@ -213,7 +231,7 @@ class WeightPrefetch:
                 if persistent:
                     destination.copy_(source)
                 else:
-                    copies.append((destination, source))
+                    copies.append((peer, destination, source))
                     self.transfer_bytes += stop - start
         shape = (value.shape[0] * size, *value.shape[1:])
         return whole.view(value.dtype).view(shape)
@@ -228,20 +246,78 @@ class WeightPrefetch:
         try:
             yield
         finally:
-            if call.started:
-                torch.cuda.current_stream(self.device).wait_stream(self._stream)
+            if call.last is not None:
+                # Also join a speculative prefetch when this invocation
+                # omits its final expert layer. No fork spans graph segments.
+                torch.cuda.current_stream(self.device).wait_event(
+                    self._ready[call.last % 2]
+                )
             self._calls.pop()
 
-    def _prefetch(self, index: int) -> None:
+    @contextmanager
+    def capture(self, submit: Callable[[Callable[[], None]], None]):
+        """Bind the graph owner's recorder for eager DMA submissions."""
+        previous, self._capture = self._capture, submit
+        try:
+            yield
+        finally:
+            self._capture = previous
+
+    @staticmethod
+    def _plan(copies):
+        # Match the upstream batch plan: 2 MiB slices round-robin across
+        # source peers. All destinations are disjoint, so the batch API may
+        # pipeline independent DMA operations without changing their values.
+        peers: dict[int, list[tuple[int, int, int]]] = {}
+        chunk = 2 << 20
+        for peer, destination, source in copies:
+            size = destination.numel() * destination.element_size()
+            slices = peers.setdefault(peer, [])
+            for offset in range(0, size, chunk):
+                slices.append(
+                    (
+                        destination.data_ptr() + offset,
+                        source.data_ptr() + offset,
+                        min(chunk, size - offset),
+                    )
+                )
+        destinations, sources, sizes = [], [], []
+        for row in zip_longest(*peers.values()):
+            for item in row:
+                if item is not None:
+                    destination, source, size = item
+                    destinations.append(destination)
+                    sources.append(source)
+                    sizes.append(size)
+        return destinations, sources, sizes
+
+    def _copy(self, index: int) -> None:
         slot = index % 2
         with torch.cuda.stream(self._stream):
             self._stream.wait_event(self._consumed[slot])
-            for destination, source in self._copies[index]:
-                # Both views have this process's local CUDA device identity;
-                # the source mapping resolves to immutable peer pages. A
-                # contiguous same-dtype copy uses DMA rather than an SM kernel.
-                destination.copy_(source, non_blocking=True)
+            destinations, sources, sizes = self._plans[index]
+            if destinations:
+                (status,) = self._runtime.cudaMemcpyBatchAsync(
+                    destinations,
+                    sources,
+                    sizes,
+                    len(destinations),
+                    [self._attributes],
+                    [0],
+                    1,
+                    self._stream.cuda_stream,
+                )
+                if status != self._runtime.cudaError_t.cudaSuccess:
+                    raise RuntimeError(f"DWDP weight prefetch failed: {status}")
             self._ready[slot].record(self._stream)
+
+    def _prefetch(self, index: int) -> None:
+        self._calls[-1].last = index
+        submit = self._submissions[index]
+        if self._capture is None:
+            submit()
+        else:
+            self._capture(submit)
 
     def before(self, module: nn.Module) -> None:
         """Wait for this layer and overlap the next layer's peer reads."""
@@ -253,7 +329,6 @@ class WeightPrefetch:
         if not call.started:
             for event in self._consumed:
                 event.record(compute)
-            self._stream.wait_stream(compute)
             call.started = True
         if call.queued != index:
             self._prefetch(index)
@@ -276,6 +351,8 @@ class WeightPrefetch:
         if not self._closed:
             self._stream.synchronize()
             self._copies.clear()
+            self._plans.clear()
+            self._submissions.clear()
             self._storage.clear()
             self._slots.clear()
             self._closed = True

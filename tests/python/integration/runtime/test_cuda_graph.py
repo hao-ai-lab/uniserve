@@ -5,6 +5,7 @@ import torch
 
 from uniserve.nn import Linear
 from uniserve.runtime import CUDAStream, ExecutionContext
+from uniserve.runtime.cuda import CUDAError, verify_graph_context
 from uniserve.runtime.cuda_graph import CUDAGraph
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -43,3 +44,24 @@ def test_closing_a_graph_keeps_its_siblings_replayable():
         torch.cuda.synchronize(device)
         context.close()
         stream.close()
+
+
+@torch.inference_mode()
+def test_graph_context_validation_rejects_foreign_compute():
+    """Validation must inspect compute even when the graph is very small."""
+    device = torch.device("cuda:0")
+    stream = torch.cuda.Stream(device=device)
+    values = torch.ones(16, device=device)
+    output = torch.empty_like(values)
+    with torch.cuda.stream(stream):
+        torch.add(values, 1, out=output)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            torch.add(values, 1, out=output)
+        # No real CUDA context has the null handle. The captured computation
+        # therefore lies outside this declared set of allowed contexts.
+        with pytest.raises(CUDAError, match="escaped its owning context"):
+            verify_graph_context(graph, frozenset({0}))
+    finally:
+        graph.reset()

@@ -125,6 +125,7 @@ def _run(rank, port, quantized, prepared, finished):
         expected_context.prepare(TextSize(32, 1))
         context.prepare(TextSize(32, 1))
         generator = torch.Generator(device=device).manual_seed(89 + rank)
+        pool = torch.cuda.MemPool()
         cases = []
         for count, depth in ((7 + rank * 6, 4), (3 + rank * 2, 3)):
             hidden = torch.rand(
@@ -150,20 +151,25 @@ def _run(rank, port, quantized, prepared, finished):
                 weights=weights,
                 depth=depth,
             ):
-                return tuple(
-                    layer(hidden, ids, weights) for layer in layers[:depth]
-                )
+                # Later layers consume intermediate results from earlier
+                # layers; captured outputs and temporaries must remain valid
+                # across every prefetch and pool reuse boundary.
+                outputs = []
+                for layer in layers[:depth]:
+                    hidden = layer(hidden, ids, weights)
+                    outputs.append(hidden)
+                return tuple(outputs)
 
             with expected_context.activate():
-                expected = tuple(
-                    layer(hidden, ids, weights) for layer in reference[:depth]
-                )
+                expected = forward(layers=reference)
             with context.activate():
                 eager = forward()
             stream.synchronize()
             for actual, wanted in zip(eager, expected, strict=True):
                 torch.testing.assert_close(actual, wanted, atol=0, rtol=0)
-            graph = scope.enter_context(CUDAGraph(context=context))
+            graph = scope.enter_context(
+                CUDAGraph(context=context, pools={device: pool})
+            )
             graph.capture(forward)
             cases.append((graph, expected))
 
@@ -176,6 +182,19 @@ def _run(rank, port, quantized, prepared, finished):
         for _ in range(2 + rank * 3):
             for graph, expected in cases:
                 replay(graph, expected)
+
+        # Queue different invocations without a host synchronization between
+        # them. Their stream dependencies must protect shared weight slots.
+        pending = []
+        with torch.cuda.stream(stream.stream):
+            for graph, expected in (*cases, *reversed(cases)):
+                pending.append(
+                    (tuple(value.clone() for value in graph.replay()), expected)
+                )
+        stream.synchronize()
+        for actual, expected in pending:
+            for value, wanted in zip(actual, expected, strict=True):
+                torch.testing.assert_close(value, wanted, atol=0, rtol=0)
 
         # This setup fence starts the idle-peer phase after all ranks have
         # prepared their graphs. Only the last rank submits CUDA work until
@@ -191,6 +210,14 @@ def _run(rank, port, quantized, prepared, finished):
                 for graph, expected in reversed(cases):
                     replay(graph, expected)
             finished.set()
+
+        # Closing one captured invocation must preserve other invocations
+        # borrowing the same execution context and allocator pool.
+        cases[0][0].close()
+        replay(*cases[1])
+        # Every source process must retain its published pages until all
+        # peers have finished this final read.
+        prepared.wait(timeout=240)
 
 
 @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "nvfp4"])
