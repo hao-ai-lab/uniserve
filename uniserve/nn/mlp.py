@@ -7,12 +7,15 @@ from uniserve.quantization import Quantizer
 from uniserve.tensors import _join_channels
 
 from .activation import GELUAndMul, SiLUAndMul
+from .functional import Rounding
 from .linear import MergedColumnParallelLinear, RowParallelLinear
 
 
 class GatedMLP(nn.Module):
     """Compose named gate/up projections, activation, and a reduced down
     projection.
+
+    ``rounding`` selects the SiLU gating recipe (see ``SiLUAndMul``).
     """  # noqa: D205
 
     activation: SiLUAndMul | GELUAndMul
@@ -23,13 +26,16 @@ class GatedMLP(nn.Module):
         intermediate_size: int,
         *,
         activation: str = "silu",
+        rounding: Rounding = Rounding.ONCE,
         bias: bool = False,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        if activation != "silu" and rounding is not Rounding.ONCE:
+            raise ValueError("gated rounding recipes apply to SiLU gating")
         if activation == "silu":
-            self.activation = SiLUAndMul()
+            self.activation = SiLUAndMul(rounding)
         elif activation in {"gelu", "gelu_pytorch_tanh"}:
             self.activation = GELUAndMul(
                 approximate="tanh" if activation.endswith("tanh") else "none"
@@ -60,8 +66,9 @@ class GatedMLP(nn.Module):
             and self.down.input_quantizer == Quantizer("fp8", axis=0)
             and self.down.group.size == 1
         ):
-            # The fused producer computes FP32 gating and encodes once before
-            # the contraction. K-sharded scales must instead cover all shards.
+            # The fused producer computes the gating under the activation's
+            # rounding recipe and encodes once before the contraction.
+            # K-sharded scales must instead cover all shards.
             shape = (*packed.shape[:-1], packed.shape[-1] // 2)
             matrix = packed.reshape(-1, packed.shape[-1])
             encoded = self.down.input_quantizer.empty(
