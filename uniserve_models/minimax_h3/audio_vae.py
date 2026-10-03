@@ -19,7 +19,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils import parametrizations
 
-from uniserve.nn.attention import Attention, DenseInput
+from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
 from uniserve.nn.vae import LatentEncoder
 from uniserve.nn.vae.decoder import LatentDecoder
 
@@ -483,7 +483,10 @@ class AttentionProjection(nn.Module):
             .unbind(0)
         )
         attended = self.attention(
-            query, key, value, DenseInput(causal=True, mask=None)
+            query,
+            key,
+            value,
+            AttentionBatch.single(DenseInput(causal=True, mask=None)),
         )
         # Average the heads of every frame, then pool the head width down to
         # the latent channels: [batch, frames, channels].

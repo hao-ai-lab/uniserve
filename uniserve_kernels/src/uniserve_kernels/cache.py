@@ -3,21 +3,21 @@
 Caches store ``[blocks, tokens, heads, dim]`` rows. Writes address physical
 token slots ``block * block_size + token``; ``-1`` skips a token.
 
-These kernels back ``uniserve.cache.paged.paged_kv_write``,
-``uniserve.cache._fp8.rescale_`` and ``uniserve.runtime._block_fill.BlockFill``;
-``uniserve_kernels.attention.paged`` also calls the scatter body from its own
-kernel. The scatter and the fill have eligibility checks
-(``can_run_paged_kv_write``, ``can_fill_blocks``); ``paged_kv_write`` and
-``BlockFill`` in ``uniserve`` take a tensor-operation path when a check fails.
-Every launch selects the device of its tensors, independently of the calling
-thread's current CUDA device.
+These kernels back ``uniserve.cache.paged.paged_kv_write`` and
+``uniserve.cache._fp8.rescale_``; ``uniserve_kernels.attention.paged`` also
+calls the scatter body from its own kernel. The scatter has an eligibility
+check (``unsupported_paged_kv_write``); ``paged_kv_write`` raises on CUDA
+when it reports a reason. Every launch selects the device of its tensors,
+independently of the calling thread's current CUDA device. Block initialization
+backs ``uniserve.runtime._block_fill.BlockFill``; its eligibility check
+selects native fills for supported contiguous CUDA fields.
 """
 
 from __future__ import annotations
 
 import torch
 
-from uniserve_kernels.triton import launchable, tl, triton
+from uniserve_kernels.triton import launchable, tl, triton, unsupported_operands
 
 # Elements of one flattened ``heads * dim`` cache row per scatter program.
 # ``uniserve_kernels.attention.paged`` passes the same width as a literal.
@@ -181,36 +181,51 @@ if triton is not None:
             first += tiles[field]
 
 
-def can_run_paged_kv_write(
+#: Cache dtypes a scatter may convert floating sources into; the store
+#: rounds to nearest even like ``Tensor.to``.
+_CONVERTIBLE = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def unsupported_paged_kv_write(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     slots: torch.Tensor,
     k_source: torch.Tensor,
     v_source: torch.Tensor,
-) -> bool:
-    """Return whether contiguous CUDA caches and slot rows fit the scatter.
+    *,
+    cast: bool = False,
+) -> str | None:
+    """Return why the scatter cannot write these rows, or ``None``.
 
-    Sources are ``[rows, heads, dim]`` views with arbitrary strides and the
-    cache dtype; a write that needs a dtype conversion is ineligible. The
-    check requires autograd to be disabled. Slot values are not inspected
-    here; the kernel asserts their bounds.
+    Caches are contiguous ``[blocks, block_size, heads, dim]`` tensors of one
+    shape and dtype, slots a contiguous int32/int64 vector, and sources
+    ``[rows, heads, dim]`` views with arbitrary strides and one row per
+    slot. Sources share the cache dtype unless ``cast`` requests the
+    conversion into a float16, bfloat16 or float32 cache. Slot values are
+    not inspected here; the kernel asserts their bounds.
     """
-    tensors = (k_cache, v_cache, slots, k_source, v_source)
-    return (
-        launchable(k_cache.device)
-        and not torch.is_grad_enabled()
-        and all(tensor.device == k_cache.device for tensor in tensors)
-        and slots.dtype in (torch.int32, torch.int64)
-        and k_cache.shape == v_cache.shape
-        and k_cache.dtype == v_cache.dtype
-        and k_source.dtype == k_cache.dtype
-        and v_source.dtype == v_cache.dtype
-        and all(tensor.is_contiguous() for tensor in (k_cache, v_cache, slots))
-        and slots.numel() > 0
-        and int(k_source.shape[0]) == slots.numel()
-        and int(v_source.shape[0]) == slots.numel()
-        and int(k_source.shape[1] * k_source.shape[2]) > 0
-    )
+    reason = unsupported_operands(k_cache, v_cache, slots, k_source, v_source)
+    if reason is not None:
+        return reason
+    if slots.dtype not in (torch.int32, torch.int64):
+        return f"slot dtype {slots.dtype} is not int32 or int64"
+    if k_cache.shape != v_cache.shape or k_cache.dtype != v_cache.dtype:
+        return "key and value caches differ in shape or dtype"
+    if not all(tensor.is_contiguous() for tensor in (k_cache, v_cache, slots)):
+        return "a cache or the slot vector is not contiguous"
+    if k_source.ndim != 3 or any(
+        int(source.shape[0]) != slots.numel() for source in (k_source, v_source)
+    ):
+        return "sources are not [rows, heads, dim] with one row per slot"
+    if k_source.dtype != k_cache.dtype or v_source.dtype != v_cache.dtype:
+        if not cast:
+            return "source dtypes differ from the cache dtype"
+        if k_cache.dtype not in _CONVERTIBLE:
+            return (
+                f"conversion into a {k_cache.dtype} cache has no kernel; "
+                "encoded caches write their own codes"
+            )
+    return None
 
 
 def paged_kv_write(
@@ -223,7 +238,8 @@ def paged_kv_write(
 ) -> None:
     """Scatter source rows into their slots and mark written blocks.
 
-    Launch only after ``can_run_paged_kv_write`` accepts the same tensors.
+    Launch only after ``unsupported_paged_kv_write`` accepts the same
+    tensors. Sources of another floating dtype convert on store.
 
     Args:
         k_cache: Contiguous ``[blocks, block_size, heads, dim]`` key cache,
@@ -231,9 +247,8 @@ def paged_kv_write(
         v_cache: Value cache with the key cache's shape and dtype.
         slots: Contiguous flat int32 or int64 slots, one per source row;
             ``-1`` skips the row.
-        k_source: ``[rows, heads, dim]`` key rows in the cache dtype, with
-            arbitrary strides.
-        v_source: ``[rows, heads, dim]`` value rows in the cache dtype.
+        k_source: ``[rows, heads, dim]`` key rows with arbitrary strides.
+        v_source: ``[rows, heads, dim]`` value rows.
         initialized: Optional key and value ``[blocks]`` bool flags; every
             block that receives a row is set to ``True``.
 
@@ -243,6 +258,8 @@ def paged_kv_write(
     """
     num_pages, page_size, heads, head_dim = (int(dim) for dim in k_cache.shape)
     row_width = heads * head_dim
+    if slots.numel() == 0 or row_width == 0:
+        return
     with torch.cuda.device(k_cache.device):
         _paged_kv_write_kernel[
             (int(slots.numel()), triton.cdiv(row_width, _WRITE_BLOCK))

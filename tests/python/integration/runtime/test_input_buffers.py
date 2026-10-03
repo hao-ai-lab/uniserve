@@ -240,7 +240,7 @@ def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls()
                 (7 if slot == 1 else 11) + iteration for slot in order
             ]
             assert batch.inputs.positions.cpu().tolist() == [23 + iteration] * 2
-            attention = batch.inputs.attention
+            attention = batch.inputs.attention.entry(0)
             assert attention.prefixes.values.cpu().tolist() == [
                 lengths[slot - 1] for slot in order
             ]

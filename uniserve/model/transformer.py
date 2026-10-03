@@ -13,9 +13,8 @@ from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.distributed.tokens import TokenShard
 from uniserve.nn.attention import (
     Attention,
-    AttentionInput,
+    AttentionBatch,
     AttentionParallelConfig,
-    VarlenInput,
 )
 from uniserve.nn.functional import add_rms_norm
 from uniserve.nn.norm import RMSNorm
@@ -106,7 +105,7 @@ class TransformerDecoder(nn.Module):
         self,
         embeddings: torch.Tensor | None,
         positions: torch.Tensor,
-        attention: AttentionInput,
+        attention: AttentionBatch,
         *,
         routes: tuple[RouteSpan, ...] = (),
         deepstack: Mapping[str, torch.Tensor] | None = None,
@@ -236,10 +235,12 @@ class TransformerEncoder(nn.Module):
         self.layers, self.norm = layers, norm
 
     def forward(
-        self, features: torch.Tensor, attention: VarlenInput
+        self, features: torch.Tensor, attention: AttentionBatch
     ) -> torch.Tensor:
+        """Encode packed features over one uncached variable-length batch."""
         if (
-            attention.queries.num_tokens is not None
+            attention.queries is not None
+            and attention.queries.num_tokens is not None
             and features.shape[0] != attention.queries.num_tokens
         ):
             raise ValueError(

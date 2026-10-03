@@ -16,6 +16,7 @@ from tests.python.fixtures.checkpoints import (
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image
 from uniserve.model import TextSize
+from uniserve.nn.attention import AttentionBatch
 from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import input_buffer_config
@@ -241,7 +242,9 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             )
             from uniserve_worker.model_executor.cuda_graph import map_tensors
 
-            attention = map_tensors(attention, lambda value: value.to("cuda:0"))
+            attention = AttentionBatch.single(
+                map_tensors(attention, lambda value: value.to("cuda:0"))
+            )
             inputs = factory.bind(
                 samples=(sample,) * len(branches),
                 sizes=(size,) * len(branches),
@@ -311,7 +314,11 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
 @pytest.mark.parametrize("name", ["bagel", "sensenova_u1"])
 def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
     from uniserve.model import EmbeddingReplacement, TextInput
-    from uniserve.nn.attention import SequenceLengths, VarlenInput
+    from uniserve.nn.attention import (
+        AttentionBatch,
+        SequenceLengths,
+        VarlenInput,
+    )
     from uniserve_worker.bootstrap.components import supported_calls
     from uniserve_worker.model_executor.input_batch import TokenRow
     from uniserve_worker.sampling.metadata import TokenSelection
@@ -393,14 +400,17 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         inputs = TextInput(
             tokens,
             positions,
-            VarlenInput(lengths, lengths, (True,)),
+            AttentionBatch.single(VarlenInput(lengths, lengths, (True,))),
             EmbeddingReplacement(features, mask),
         )
         # Feature appends use noncausal visibility with either hidden states
         # or logits; all forms consume live spatial positions and features.
         for selection in (TokenSelection.HIDDEN, TokenSelection.LAST_LOGITS):
             visual = replace(
-                inputs, attention=VarlenInput(lengths, lengths, (False,))
+                inputs,
+                attention=AttentionBatch.single(
+                    VarlenInput(lengths, lengths, (False,))
+                ),
             )
             with ExecutionContext(model.text, attention="torch") as context:
                 context.prepare(TextSize(3, 1))
@@ -495,7 +505,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 inputs = TextInput(
                     tokens,
                     positions,
-                    VarlenInput(lengths, lengths, (True,)),
+                    AttentionBatch.single(
+                        VarlenInput(lengths, lengths, (True,))
+                    ),
                     EmbeddingReplacement(features, mask),
                 )
                 expected = model.text.compute_logits(

@@ -44,4 +44,25 @@ def visible_end_mask(
     return kv_idx < limit
 
 
-__all__ = ["visible_end_mask"]
+@cute.jit
+def paged_causal_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    q_idx: cute.TensorSSA,
+    kv_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors: list,
+) -> cute.TensorSSA:
+    """Apply a sequence's live causal flag over its paged prefix and block.
+
+    Auxiliary columns are int32 causal flags and absolute prefix lengths.
+    Non-causal rows see the entire block; causal rows include their own key.
+    The attention kernel separately masks positions past each live length.
+    """
+    del head, seqlen_info
+    causal = scalar_to_ssa(aux_tensors[0][batch[0]], cutlass.Int32)
+    prefix = scalar_to_ssa(aux_tensors[1][batch[0]], cutlass.Int32)
+    return (causal == 0) | (kv_idx <= prefix + q_idx)
+
+
+__all__ = ["paged_causal_mask", "visible_end_mask"]

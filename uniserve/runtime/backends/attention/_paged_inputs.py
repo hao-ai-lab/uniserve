@@ -5,8 +5,19 @@ from uniserve_kernels.attention import paged
 from uniserve_kernels import cache
 
 
-def prepare(state, key, value, batch, *, lengths, offsets):
+def prepare(
+    state, key, value, batch, *, lengths=None, offsets=None, semaphore=None
+):
     """Read live sequence columns and commit this call's optional cache write.
+
+    ``lengths`` and ``offsets`` receive each row's key count and their
+    cumulative offsets, counted from the row's first block table column: a
+    table with start pages yields keys from token ``start_page *
+    block_size`` on, so kernels aligning queries to the end of their keys
+    keep the same relative causal positions and history window. A caller
+    whose kernel reads the lengths itself passes neither. ``semaphore``, an
+    optional int32 word, is zeroed by the same launch: the ticket counter of
+    the attention launch that follows on the stream.
 
     Dense contiguous backing can share a launch with metadata generation.
     Other numerical representations use the state's ordinary write call.
@@ -21,8 +32,14 @@ def prepare(state, key, value, batch, *, lengths, offsets):
                 "attention cache update requires bound prefix state"
             )
         state._validate_update(key, value, indices)
-        fused = cache.can_run_paged_kv_write(
-            state.key, state.value, indices.reshape(-1), key, value
+        # The fused launch writes plain same-dtype rows; conversions and
+        # encoded representations take the state's own write call.
+        fused = (
+            indices.numel() > 0
+            and cache.unsupported_paged_kv_write(
+                state.key, state.value, indices.reshape(-1), key, value
+            )
+            is None
         )
         if not fused:
             state.update(key, value, indices=indices)
@@ -37,6 +54,11 @@ def prepare(state, key, value, batch, *, lengths, offsets):
         lengths,
         offsets,
         batch_size=batch.queries.batch_size,
+        start_pages=(
+            None
+            if batch.block_table.start_page is None
+            else (batch.block_table.start_page, batch.block_table.block_size)
+        ),
         write=(
             state.key,
             state.value,
@@ -49,4 +71,5 @@ def prepare(state, key, value, batch, *, lengths, offsets):
         )
         if fused
         else None,
+        semaphore=semaphore,
     )

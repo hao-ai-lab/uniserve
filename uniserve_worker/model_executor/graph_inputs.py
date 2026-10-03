@@ -18,6 +18,7 @@ import torch
 
 from uniserve.model import EmbeddingReplacement, TextInput
 from uniserve.nn.attention import (
+    AttentionBatch,
     BlockTable,
     PagedInput,
     SegmentedInput,
@@ -159,14 +160,24 @@ def select_prefill_captures(
 def bind_attention(static, live):
     """Pair captured addresses with the current host sequence metadata.
 
-    Returns ``static`` with its device tensors unchanged and the host query
-    and prefix lengths taken from ``live``, for
+    ``static`` and ``live`` are ``AttentionBatch`` values over the same
+    tables. Returns ``static`` with its device tensors unchanged and every
+    table's host query and prefix lengths taken from ``live``, for
     ``ExecutionContext.bind_attention`` planning before a replay.
     """
-    return replace(
-        static,
-        queries=replace(static.queries, host=live.queries.host),
-        prefixes=replace(static.prefixes, host=live.prefixes.host),
+    queries = replace(static.queries, host=live.queries.host)
+    return AttentionBatch(
+        {
+            table: replace(
+                entry,
+                queries=queries,
+                prefixes=replace(
+                    entry.prefixes, host=live.entries[table].prefixes.host
+                ),
+            )
+            for table, entry in static.entries.items()
+        },
+        queries,
     )
 
 
@@ -188,17 +199,21 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
         ValueError: If the attention input has no host query lengths.
     """
     inputs = batch.inputs
-    if not isinstance(inputs, TextInput) or not isinstance(
-        inputs.attention, PagedInput
+    if not isinstance(inputs, TextInput) or not all(
+        isinstance(entry, PagedInput)
+        for entry in inputs.attention.entries.values()
     ):
         return None
 
-    attention = inputs.attention
+    # Tables share the query domain and causality; they differ only in their
+    # pages, so the widest table sets the staged width.
+    entries = tuple(inputs.attention.entries.values())
+    attention = entries[0]
     selection = batch.token_selections[0]
     causal = attention.causal[0]
     if any(value is not selection for value in batch.token_selections):
         return None
-    if any(value != causal for value in attention.causal):
+    if any(value != causal for entry in entries for value in entry.causal):
         return None
     queries = attention.queries.host
     if queries is None:
@@ -206,7 +221,10 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
     if any(length < 1 for length in queries):
         return None
 
-    width = max(context_blocks, attention.block_table.indices.shape[1])
+    width = max(
+        context_blocks,
+        *(entry.block_table.indices.shape[1] for entry in entries),
+    )
     if (
         batch.forward_mode is ForwardMode.DECODE
         and selection is TokenSelection.LAST_LOGITS
@@ -275,6 +293,7 @@ def pad_text(batch, rows, tokens, width, decode):
     attention, live_tokens = inputs.attention, inputs.input_ids.numel()
     if rows < live_rows or tokens < live_tokens:
         raise ValueError("graph shape is smaller than its live inputs")
+    causal = next(iter(attention.entries.values())).causal[0]
 
     padding, extra = tokens - live_tokens, rows - live_rows
     if padding and not extra:
@@ -302,9 +321,9 @@ def pad_text(batch, rows, tokens, width, decode):
 
     slots = _fixed_view(batch.request_pool_indices, (rows,))
     slots[live_rows:].zero_()
-    table = _fixed_view(attention.block_table.indices, (rows, width))
-    table[live_rows:].zero_()
 
+    # The shared query domain pads once; every table then pads its own page
+    # columns, prefixes and write addresses against it.
     queries = _fixed_view(attention.queries.values, (rows,))
     queries[live_rows:].zero_()
     if decode:
@@ -313,30 +332,37 @@ def pad_text(batch, rows, tokens, width, decode):
         queries[live_rows : live_rows + 1].fill_(padding)
     query_offsets = _fixed_view(attention.queries.offsets, (rows + 1,))
     torch.cumsum(queries, dim=0, out=query_offsets[1:])
-
-    prefix = _fixed_view(attention.prefixes.values, (rows,))
-    prefix[live_rows:].zero_()
-    prefix_offsets = _fixed_view(attention.prefixes.offsets, (rows + 1,))
-    torch.cumsum(prefix, dim=0, out=prefix_offsets[1:])
-
-    writes = attention.write_indices
-    if writes is not None:
-        writes = _fixed_view(writes, (tokens,))
-        writes[live_tokens:].fill_(-1)
-
-    padded = PagedInput(
-        SequenceLengths(
-            host=host_queries, values=queries, offsets=query_offsets
-        ),
-        SequenceLengths(
-            host=attention.prefixes.host + (0,) * extra,
-            values=prefix,
-            offsets=prefix_offsets,
-        ),
-        BlockTable(table, attention.block_table.block_size),
-        writes,
-        (attention.causal[0],) * rows,
+    shared = SequenceLengths(
+        host=host_queries, values=queries, offsets=query_offsets
     )
+
+    entries = {}
+    for number, entry in attention.entries.items():
+        table = _fixed_view(entry.block_table.indices, (rows, width))
+        table[live_rows:].zero_()
+
+        prefix = _fixed_view(entry.prefixes.values, (rows,))
+        prefix[live_rows:].zero_()
+        prefix_offsets = _fixed_view(entry.prefixes.offsets, (rows + 1,))
+        torch.cumsum(prefix, dim=0, out=prefix_offsets[1:])
+
+        writes = entry.write_indices
+        if writes is not None:
+            writes = _fixed_view(writes, (tokens,))
+            writes[live_tokens:].fill_(-1)
+
+        entries[number] = PagedInput(
+            shared,
+            SequenceLengths(
+                host=entry.prefixes.host + (0,) * extra,
+                values=prefix,
+                offsets=prefix_offsets,
+            ),
+            BlockTable(table, entry.block_table.block_size),
+            writes,
+            (causal,) * rows,
+        )
+    padded = AttentionBatch(entries, shared)
 
     embeddings = inputs.embeddings
     if embeddings is not None:
@@ -371,19 +397,24 @@ def pad_text(batch, rows, tokens, width, decode):
 def widen_prefix(batch, width):
     """Borrow fixed table capacity while retaining live prefix lengths."""
     attention = getattr(batch.inputs, "attention", None)
-    if not isinstance(attention, (PagedInput, SegmentedInput)):
+    if attention is None or not all(
+        isinstance(entry, (PagedInput, SegmentedInput))
+        for entry in attention.entries.values()
+    ):
         return batch
-    if attention.block_table.indices.shape[1] > width:
-        raise ValueError("prefix table exceeds its configured graph width")
-    table = _fixed_view(attention.block_table.indices, (batch.row_count, width))
+    entries = {}
+    for number, entry in attention.entries.items():
+        if entry.block_table.indices.shape[1] > width:
+            raise ValueError("prefix table exceeds its configured graph width")
+        table = _fixed_view(entry.block_table.indices, (batch.row_count, width))
+        entries[number] = replace(
+            entry, block_table=BlockTable(table, entry.block_table.block_size)
+        )
     return replace(
         batch,
         inputs=replace(
             batch.inputs,
-            attention=replace(
-                attention,
-                block_table=BlockTable(table, attention.block_table.block_size),
-            ),
+            attention=AttentionBatch(entries, attention.queries),
         ),
     )
 
@@ -400,21 +431,27 @@ def restore_writes(batch, cache: PrefixCache | None):
     """
     snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
     attention = getattr(batch.inputs, "attention", None)
-    if (
-        cache is not None
-        and isinstance(attention, (PagedInput, SegmentedInput))
-        and attention.write_indices is not None
+    for number, entry in (
+        () if cache is None or attention is None else attention.entries.items()
     ):
+        if (
+            not isinstance(entry, (PagedInput, SegmentedInput))
+            or entry.write_indices is None
+        ):
+            continue
         blocks = tuple(
             sorted(
                 {
-                    int(value) // attention.block_table.block_size
-                    for value in attention.write_indices.cpu().tolist()
+                    int(value) // entry.block_table.block_size
+                    for value in entry.write_indices.cpu().tolist()
                     if value >= 0
                 }
             )
         )
+        # Only the layers addressed through this table own these pages.
         for name in cache.config.layers:
+            if cache.table(name) != number:
+                continue
             for tensors in cache.state(name).transfer_views(blocks).values():
                 snapshots.extend((tensor, tensor.clone()) for tensor in tensors)
     if batch.decode_force_finish is not None:
@@ -522,7 +559,10 @@ def greedy_decode(
     force_finish = batch.decode_force_finish
     if (
         not isinstance(batch.inputs, TextInput)
-        or not isinstance(batch.inputs.attention, PagedInput)
+        or not all(
+            isinstance(entry, PagedInput)
+            for entry in batch.inputs.attention.entries.values()
+        )
         or batch.inputs.attention.queries.host != (1,) * batch.row_count
         or predicate_state is None
         or force_finish is None

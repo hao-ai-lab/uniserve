@@ -20,12 +20,7 @@ from uniserve.model import (
     ImageDenoiser,
     TransformerDecoder,
 )
-from uniserve.nn.attention import (
-    Attention,
-    DenseInput,
-    PagedInput,
-    SegmentedInput,
-)
+from uniserve.nn.attention import Attention
 from uniserve.tensors import OutputLayout, TensorOutput
 
 from .config import Config
@@ -104,35 +99,26 @@ class Denoiser(ImageDenoiser):
 
         # The host query token total sizes the K/V rows written below; dense
         # inputs and inputs without host lengths cannot supply it.
-        if (
-            isinstance(inputs.attention, DenseInput)
-            or inputs.attention.queries.num_tokens is None
-        ):
+        queries = inputs.attention.queries
+        if queries is None or queries.num_tokens is None:
             raise ValueError(
                 "simulation denoising requires packed host query lengths"
             )
         # [query tokens, kv heads, head dim] for the one-head, width-one cache.
-        count = inputs.attention.queries.num_tokens
         reference = inputs.latents["image"][0].tensor
-        values = reference.new_zeros((count, 1, 1))
+        values = reference.new_zeros((queries.num_tokens, 1, 1))
 
-        # Paged or segmented inputs with write indices publish the step's zero
-        # K/V through the backbone's single attention layer, the cache
-        # ``model._Layer`` writes for text tokens; other inputs leave the
-        # cache untouched.
-        if (
-            isinstance(inputs.attention, (PagedInput, SegmentedInput))
-            and inputs.attention.write_indices is not None
-        ):
-            cache = self.backbone.layers["0"].attention
-            if not isinstance(cache, Attention):
-                raise ValueError(
-                    "simulation backbone must publish through its scalar "
-                    "attention cache layer"
-                )
-            cache.update_cache(
-                values, values, indices=inputs.attention.write_indices
+        # The step's zero K/V publish through the backbone's single attention
+        # layer, the cache ``model._Layer`` writes for text tokens. The
+        # layer's table entry supplies the addresses; an entry without write
+        # addresses leaves the cache untouched.
+        cache = self.backbone.layers["0"].attention
+        if not isinstance(cache, Attention):
+            raise ValueError(
+                "simulation backbone must publish through its scalar "
+                "attention cache layer"
             )
+        cache.update_cache(values, values, inputs.attention)
 
         # The prediction is exactly zero; only the shape must match each
         # latent's canonical patch grid.
