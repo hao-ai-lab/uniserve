@@ -78,6 +78,7 @@ from uniserve_worker.protocol.transfer import (
     PosixShmTransfer,
 )
 from uniserve_worker.sampling.result import SAMPLING_COMPLETION_FIELDS
+from uniserve_worker.storage.block_tables import GroupTable
 from uniserve_worker.storage.latent_pool import LatentImport
 from uniserve_worker.storage.output import OutputBuffer
 from uniserve_worker.storage.tensor_store import (
@@ -188,7 +189,7 @@ def prepare_batch(
             supplied.add(source)
 
     # Without pending cache accesses there is nothing a write could wait for,
-    # so the page scan is skipped.
+    # so the unit scan is skipped.
     cache = kv_cache
     tables = request_tables
     if cache is not None and tables is not None and cache.has_pending_accesses:
@@ -199,44 +200,33 @@ def prepare_batch(
         kv_inputs = {
             publication.source: publication for publication in kv_entries
         }
-        assigned = {
-            (table.request_pool_idx, table.group_id): table.page_ids
-            for table in batch.block_tables
-        }
 
-        # A block table supplied by this batch takes precedence over the
-        # table installed by an earlier batch.
-        def pages_for(slot: int, group: int) -> tuple[int, ...]:
-            pages = assigned.get((slot, group))
-            return tables.pages(slot, group) if pages is None else pages
-
-        # New pages are covered in full. A forward row that writes KV covers
-        # its `query_lens` tokens after the `seq_lens - query_lens` tokens
-        # already in its sequence, in group 0.
-        for allocation in batch.new_cache_pages:
+        # New units are covered in full, since a unit leaving one group may
+        # hold any tokens of another. A forward row that writes KV covers its
+        # `query_lens` tokens after the `seq_lens - query_lens` tokens
+        # already in its sequence, in every group.
+        for allocation in batch.new_cache_units:
             storage_dependencies.extend(
                 cache.write_dependencies(
-                    allocation.page_ids,
-                    group=allocation.group_id,
-                    start=0,
-                    length=len(allocation.page_ids) * cache.info.block_size,
+                    cache.unit_spans(cache.validate_units(allocation.unit_ids))
                 )
             )
 
         for row, write_kv in enumerate(batch.write_kv):
             if not write_kv:
                 continue
-            storage_dependencies.extend(
-                cache.write_dependencies(
-                    pages_for(batch.request_pool_indices[row], 0),
-                    group=0,
-                    start=batch.seq_lens[row] - batch.query_lens[row],
-                    length=batch.query_lens[row],
+            start = batch.seq_lens[row] - batch.query_lens[row]
+            for table in _slot_tables(
+                batch, tables, batch.request_pool_indices[row]
+            ):
+                storage_dependencies.extend(
+                    cache.write_dependencies(
+                        table.spans(start, batch.query_lens[row])
+                    )
                 )
-            )
 
         # An installation overwrites the published extent of its source into
-        # the destination request's page table.
+        # the destination request's unit tables.
         for call in batch.calls:
             if call.kind is not TransferMode.KV_INSTALL:
                 continue
@@ -257,19 +247,56 @@ def prepare_batch(
                 )
             kv_publication = kv_inputs.get(source)
             if kv_publication is not None:
-                storage_dependencies.extend(
-                    cache.write_dependencies(
-                        pages_for(slot, kv_publication.group_id),
-                        group=kv_publication.group_id,
-                        start=kv_publication.base_extent,
-                        length=kv_publication.published_extent
-                        - kv_publication.base_extent,
+                # Each group's import writes at most the suffix after the
+                # base that its destination table still holds.
+                end = kv_publication.published_extent
+                for table in _slot_tables(batch, tables, slot):
+                    start = max(
+                        kv_publication.base_extent,
+                        table.start_page * table.shape.page_tokens,
                     )
-                )
+                    if start < end:
+                        storage_dependencies.extend(
+                            cache.write_dependencies(
+                                table.spans(start, end - start)
+                            )
+                        )
 
     prepared.storage_dependencies = tuple(storage_dependencies)
     prepared.input_products = tuple(entries)
     prepared.kv_inputs = tuple(kv_entries)
+
+
+def _slot_tables(
+    batch: Batch, tables: BlockTables, slot: int
+) -> tuple[GroupTable, ...]:
+    """Return a slot's table of every cache group for this batch.
+
+    A block table supplied by the batch takes precedence over the table an
+    earlier batch installed.
+
+    Raises:
+        WorkerError: ``invalid_descriptor`` when a group has neither.
+    """
+    supplied = {
+        table.group_id: table
+        for table in batch.block_tables
+        if table.request_pool_idx == slot
+    }
+    result = []
+    for group, shape in enumerate(tables.groups):
+        table = supplied.get(group)
+        result.append(
+            tables.table(slot, group)
+            if table is None
+            else GroupTable(
+                shape,
+                int(table.start_page),
+                tuple(int(unit) for unit in table.unit_ids),
+                int(table.allocated_tokens),
+            )
+        )
+    return tuple(result)
 
 
 def prepare_inputs(
@@ -685,42 +712,19 @@ def prepare_inputs(
                     "KV transfer has no admitted request slot"
                 )
 
-            # Prefer scheduler-supplied block tables; otherwise fall back to
-            # the request's currently installed pages and allocated length.
-            table = next(
-                (
-                    table
-                    for table in batch.block_tables
-                    if (table.request_pool_idx, table.group_id)
-                    == (slot, kv_transfer.group_id)
-                ),
-                None,
-            )
-            pages = (
-                tables.pages(slot, kv_transfer.group_id)
-                if table is None
-                else table.page_ids
-            )
-            allocated = (
-                tables.allocated_length(slot)
-                if table is None
-                else table.allocated_tokens
-            )
-            # New pages of the destination table are zeroed by the import
+            # New units of the destination tables are zeroed by the import
             # itself before its copy; `_bind_cache_tables` skips them.
             initialized = tuple(
-                page
-                for allocation in batch.new_cache_pages
-                if (allocation.request_pool_idx, allocation.group_id)
-                == (slot, kv_transfer.group_id)
-                for page in allocation.page_ids
+                unit
+                for allocation in batch.new_cache_units
+                if allocation.request_pool_idx == slot
+                for unit in allocation.unit_ids
             )
             write = publications.prepare_install(
                 kv_transfer,
                 request_pool_idx=slot,
-                page_ids=pages,
-                allocated_length=allocated,
-                initialized_pages=initialized,
+                tables=_slot_tables(batch, tables, slot),
+                initialized_units=initialized,
                 transports=transports,
             )
             state.cache_imports[kv_transfer.source] = write
@@ -1688,12 +1692,12 @@ def _bind_cache_tables(
 
     For every slot the active calls read or write, including the
     alternative-prefix slots of their forward rows, the batch's block tables
-    are validated and installed in `BlockTables`, and new cache pages that no
+    are validated and installed in `BlockTables`, and new cache units that no
     KV import initializes are zeroed. Each call's forward rows are then
     recorded in `state.forward_indices`, the main row's prefix is checked
-    against the call's projected visible KV length, and the pages each row
-    accesses are retained in the `KVCacheManager` until the batch's output
-    buffer completes.
+    against the call's projected visible KV length, and the units each row
+    accesses in every group are retained in the `KVCacheManager` until the
+    batch's output buffer completes.
     """
     cache = kv_cache
     page_tables = request_tables
@@ -1720,53 +1724,48 @@ def _bind_cache_tables(
         }
     )
 
+    # `BlockTables.install` checks each table's page shape and allocated
+    # extent against its group.
     tables = []
     for table in inputs.block_tables:
         if table.request_pool_idx not in slots:
             continue
-        pages = cache.validate_pages(table.page_ids, group=table.group_id)
-        if int(table.allocated_tokens) > len(pages) * cache.info.block_size:
-            raise invalid_descriptor(
-                "block-table allocation exceeds physical capacity"
-            )
         tables.append(
             (
                 int(table.request_pool_idx),
-                int(table.group_id),
-                pages,
+                cache.validate_group(table.group_id),
+                int(table.start_page),
+                cache.validate_units(table.unit_ids),
                 int(table.allocated_tokens),
             )
         )
     page_tables.install(tuple(tables))
 
-    for allocation in inputs.new_cache_pages:
+    for allocation in inputs.new_cache_units:
         if allocation.request_pool_idx not in slots:
             continue
-        pages = cache.validate_pages(
-            allocation.page_ids,
-            group=allocation.group_id,
+        units = cache.validate_units(allocation.unit_ids)
+        installed = page_tables.table(
+            allocation.request_pool_idx,
+            cache.validate_group(allocation.group_id),
         )
-        installed = page_tables.pages(
-            allocation.request_pool_idx, allocation.group_id
-        )
-        if not set(pages).issubset(installed):
+        if not set(units).issubset(installed.units):
             raise invalid_descriptor(
-                "new cache pages are outside the installed block table"
+                "new cache units are outside the installed block table"
             )
 
-        # A KV import zeroes the new pages it covers before copying into them
-        # (`CacheImport.initialized_pages`); every other new page is zeroed
-        # here so stale cache content is never read.
+        # A KV import zeroes the new units it covers before copying into them
+        # (`CacheImport.initialized_units`); every other new unit resets the
+        # metadata its next writer reads;
+        # retained payload values remain outside the visible token intervals.
         initialized = {
-            page
+            unit
             for write in state.cache_imports.values()
-            if (write.request_pool_idx, write.publication.group_id)
-            == (allocation.request_pool_idx, allocation.group_id)
-            for page in write.initialized_pages
+            if write.request_pool_idx == allocation.request_pool_idx
+            for unit in write.initialized_units
         }
-        cache.zero_pages(
-            allocation.group_id,
-            tuple(page for page in pages if page not in initialized),
+        cache.recycle_units(
+            tuple(unit for unit in units if unit not in initialized)
         )
 
     # Forward rows index `inputs.calls`, the full batch including predicated
@@ -1810,7 +1809,6 @@ def _bind_cache_tables(
 
         for descriptor in call_rows:
             slot = inputs.request_pool_indices[descriptor]
-            pages = page_tables.pages(slot, 0)
             if slot != main_slot and (
                 inputs.seq_lens[descriptor] - inputs.query_lens[descriptor]
             ) > page_tables.allocated_length(slot):
@@ -1822,20 +1820,21 @@ def _bind_cache_tables(
 
             # Rows that write KV retain their prefix plus the query tokens
             # they write (`seq_lens`); read-only rows retain only the
-            # `seq_lens - query_lens` prefix. The retention lasts until the
-            # batch's completion future resolves.
-            cache.retain_execution(
-                call.request_key,
-                pages,
-                group=0,
-                length=inputs.seq_lens[descriptor]
-                - (
-                    0
-                    if inputs.write_kv[descriptor]
-                    else inputs.query_lens[descriptor]
-                ),
-                completion=state.output_buffer.completion_future(),
+            # `seq_lens - query_lens` prefix. Each group's retention starts
+            # at its table's first held page and lasts until the batch's
+            # completion future resolves.
+            length = inputs.seq_lens[descriptor] - (
+                0
+                if inputs.write_kv[descriptor]
+                else inputs.query_lens[descriptor]
             )
+            for group in range(len(page_tables.groups)):
+                cache.retain_execution(
+                    call.request_key,
+                    page_tables.table(slot, group),
+                    length=length,
+                    completion=state.output_buffer.completion_future(),
+                )
 
     record_component(state.component_us, "bc_tables", started)
 

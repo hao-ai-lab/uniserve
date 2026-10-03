@@ -27,7 +27,7 @@ from uniserve_worker.protocol.batch import (
     BatchCommand,
     BlockTable,
     BufferAllocation,
-    CachePageAllocation,
+    CacheUnitAllocation,
     GenerationParams,
     LatentParams,
     NewRequest,
@@ -445,7 +445,7 @@ def execution_batch(
     kv_inputs: Sequence[KvTransfer] = (),
     commands: Sequence[BatchCommand] = (),
     block_tables: Sequence[BlockTable] = (),
-    new_cache_pages: Sequence[CachePageAllocation] = (),
+    new_cache_units: Sequence[CacheUnitAllocation] = (),
 ) -> Batch:
     """Build scheduler columns and physical allocations.
 
@@ -510,7 +510,7 @@ def execution_batch(
         if lengths is None:
             return None
         pages = tuple(_BLOCK_TABLES.get(call.request_key, ()))
-        return BlockTable(slot, 0, pages, len(pages) * _BLOCK_SIZE)
+        return BlockTable(slot, 0, 0, pages, len(pages) * _BLOCK_SIZE)
 
     tables: dict[tuple[int, int], BlockTable] = {}
     allocations: dict[tuple[int, int], set[int]] = {}
@@ -573,6 +573,7 @@ def execution_batch(
                     tables[(alt_slot, 0)] = BlockTable(
                         alt_slot,
                         0,
+                        0,
                         alt_pages,
                         len(alt_pages) * _BLOCK_SIZE,
                     )
@@ -594,9 +595,9 @@ def execution_batch(
                 seq_lens.append(seq_len + query_len)
                 query_lens.append(query_len)
                 write_kv.append(False)
-    for allocation in new_cache_pages:
+    for allocation in new_cache_units:
         identity = (allocation.request_pool_idx, allocation.group_id)
-        allocations.setdefault(identity, set()).update(allocation.page_ids)
+        allocations.setdefault(identity, set()).update(allocation.unit_ids)
     # A call's identity names the batch that carries it, so a submission that
     # carries calls takes its identity from them; `batch_id` names a
     # command-only submission and orders every submission's collectives.
@@ -605,8 +606,8 @@ def execution_batch(
         collective_seq=int(batch_id) * 1024 + 2,
         calls=tuple(calls),
         block_tables=tuple(tables.values()),
-        new_cache_pages=tuple(
-            CachePageAllocation(slot, group, tuple(sorted(pages)))
+        new_cache_units=tuple(
+            CacheUnitAllocation(slot, group, tuple(sorted(pages)))
             for (slot, group), pages in allocations.items()
             if pages
         ),
@@ -775,7 +776,7 @@ def token_call(
         kind=mode,
         bounds=Bounds(
             max_tokens=max(1, len(tokens)),
-            max_kv_pages=len(added),
+            max_kv_units=len(added),
             max_completion_bytes=((1 << 16) - 1 if logprobs else 0),
         ),
         input_token_ids=tuple(int(value) for value in tokens),

@@ -352,7 +352,8 @@ def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent()
     invalid_table = BlockTable(
         request_pool_idx=admission.request_pool_idx,
         group_id=0,
-        page_ids=(),
+        start_page=0,
+        unit_ids=(),
         allocated_tokens=0,
     )
 
@@ -873,7 +874,7 @@ def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> (
             requests=(admission.request_key,)
         )
         with pytest.raises(WorkerError, match="executing producer or consumer"):
-            worker.kv_cache.zero_pages(0, (5,))
+            worker.kv_cache.zero_units((5,))
 
         worker.runner.synchronize()
         torch.cuda.current_stream("cuda:0").synchronize()
@@ -881,7 +882,7 @@ def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> (
         assert worker.kv_cache.retirement_ready(
             requests=(admission.request_key,)
         )
-        worker.kv_cache.zero_pages(0, (5,))
+        worker.kv_cache.zero_units((5,))
     finally:
         worker.close()
 

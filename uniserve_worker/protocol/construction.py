@@ -17,7 +17,7 @@ from .batch import (
     BatchCommand,
     BlockTable,
     BufferAllocation,
-    CachePageAllocation,
+    CacheUnitAllocation,
     DecodeRange,
     LatentParams,
     TensorPublication,
@@ -31,7 +31,7 @@ def batch_from_validated(
     collective_seq: int,
     calls: tuple[Call, ...],
     block_tables: tuple[BlockTable, ...],
-    new_cache_pages: tuple[CachePageAllocation, ...],
+    new_cache_units: tuple[CacheUnitAllocation, ...],
     forward_inputs: tuple[
         tuple[int, ...],
         tuple[int, ...],
@@ -61,7 +61,7 @@ def batch_from_validated(
         collective_seq: Sequence number ordering collective communication.
         calls: Calls in submission order.
         block_tables: Complete KV page table per request slot and KV group.
-        new_cache_pages: KV pages newly assigned by this batch.
+        new_cache_units: KV units newly assigned by this batch.
         forward_inputs: The columnar forward inputs, in this order:
             ``forward_call_indices``, ``request_pool_indices``,
             ``seq_lens``, ``query_lens``, ``write_kv``.
@@ -83,7 +83,7 @@ def batch_from_validated(
     set_field(batch, "collective_seq", collective_seq)
     set_field(batch, "calls", calls)
     set_field(batch, "block_tables", block_tables)
-    set_field(batch, "new_cache_pages", new_cache_pages)
+    set_field(batch, "new_cache_units", new_cache_units)
     set_field(batch, "forward_call_indices", forward_inputs[0])
     set_field(batch, "request_pool_indices", forward_inputs[1])
     set_field(batch, "seq_lens", forward_inputs[2])

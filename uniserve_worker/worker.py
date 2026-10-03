@@ -33,7 +33,6 @@ import torch
 from torch import nn
 
 from uniserve.distributed.mesh import Communicator
-from uniserve.math import ceil_div
 from uniserve.model import CausalLM, VideoPostprocessor
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import Quantizer
@@ -44,10 +43,17 @@ from uniserve.runtime.process_groups import (
     initialize_process_groups,
 )
 from uniserve.runtime.resources import close_resources
+from uniserve_worker.bootstrap.cache import (
+    group_layers,
+    plan_cache,
+    resident_width,
+    resolve_page_size,
+    storage,
+)
 from uniserve_worker.bootstrap.capacity import (
     check_startup_storage,
-    decode_context_blocks,
     device_total_bytes,
+    graph_table_widths,
     latent_pool_plan,
     resolve_request_capacity,
 )
@@ -374,6 +380,19 @@ class Worker:
 
             self.attention = runner.attention
 
+            # The KV page size follows from the cache layers and the
+            # attention kernels that read them when the operator set none;
+            # everything planned from here on uses the resolved size.
+            worker_config = resolve_page_size(
+                model,
+                worker_config,
+                runner.attention,
+                group=None
+                if process_groups is None
+                else process_groups.process_group,
+            )
+            runner.worker_config = worker_config
+
             endpoint = WorkerEndpoint.local(worker_id, int(worker_config.rank))
 
             # Measure the remaining grant after the runner binds persistent
@@ -457,10 +476,9 @@ class Worker:
 
             self.kv_cache = None
             self.block_tables = None
-            max_blocks_per_row = 0
 
-            # A worker with a `CausalLM` owns the paged KV cache and its
-            # per-request block tables, sized by the layout's `KVCacheInfo`.
+            # A worker with a `CausalLM` owns the K/V unit pool and its
+            # per-request group tables, sized by the layout's `KVCacheInfo`.
             # The runner borrows both through `configure_inputs` below.
             if cache is not None:
                 assert text is not None
@@ -470,47 +488,33 @@ class Worker:
                         "KV model worker has no KV-cache configuration"
                     )
 
-                # Block-table width: the pages of the longest sequence.
-                max_blocks_per_row = max(
-                    1,
-                    ceil_div(
-                        worker_config.max_sequence_tokens,
-                        int(worker_config.block_size),
-                    ),
-                )
-
-                # Cache groups occupy consecutive ranges in the shared page
-                # pool.
-                group_ranges: list[tuple[int, int]] = []
-                group_offset = 0
-                for group in kv_cache.groups:
-                    group_ranges.append((group_offset, int(group.num_blocks)))
-                    group_offset += int(group.num_blocks)
-
-                # An FP8 cache passes each layer an FP8 `Quantizer` in place
-                # of a storage dtype.
-                encoded = kv_cache.dtype == "float8_e4m3fn"
+                # The pool's planes follow the same plan that sized the
+                # advertised unit bytes; an FP8 cache passes each layer an
+                # FP8 `Quantizer` in place of a storage dtype.
+                planes = plan_cache(text, worker_config)
+                dtype, fp8 = storage(worker_config)
                 self.kv_cache = KVCacheManager(
                     PrefixCache(
                         cache,
-                        num_blocks=kv_cache.num_blocks,
-                        block_size=kv_cache.block_size,
+                        num_units=kv_cache.num_units,
+                        block_size=int(worker_config.block_size),
                         device=worker_config.device,
-                        dtype=None
-                        if encoded
-                        else getattr(torch, kv_cache.dtype),
+                        dtype=dtype,
                         quantization={
                             name: Quantizer("fp8", axis=0)
                             for name in cache.layers
                         }
-                        if encoded
+                        if fp8
                         else None,
                     ),
                     info=kv_cache,
-                    group_ranges=tuple(group_ranges) if group_ranges else None,
+                    group_layers=group_layers(text, planes),
                     import_capacity=int(info.max_unresolved_calls),
                     request_pool_size=int(info.request_slots),
-                    max_blocks_per_request=max_blocks_per_row,
+                    table_width=resident_width(
+                        planes,
+                        max_sequence_tokens=worker_config.max_sequence_tokens,
+                    ),
                     staging_depth=int(queue_depth),
                 )
                 startup.callback(self.kv_cache.close)
@@ -706,7 +710,7 @@ class Worker:
                     request_slots=int(info.request_slots),
                     max_tokens=int(info.max_batch_tokens),
                     latent_capacity_units=int(info.latent_capacity_units),
-                    decode_context_blocks=decode_context_blocks(
+                    table_widths=graph_table_widths(
                         model, worker_config, self.kv_cache
                     ),
                     max_inflight=int(queue_depth),

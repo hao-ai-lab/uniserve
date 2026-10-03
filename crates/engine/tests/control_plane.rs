@@ -18,9 +18,9 @@
 //! - `SimEngine::set_queue_depth` bounds the batches the scheduler may keep
 //!   unresolved. Depth 1 is the serial oracle that the depth-invariance tests
 //!   compare depth 2 against.
-//! - The KV block size is 64 tokens (`WorkerInfo::default`) unless a test
-//!   calls `SimEngine::set_block_size`, and generated images default to
-//!   512x512 (`ImageParams::default`).
+//! - The KV page size is 64 tokens, one unit per page (`WorkerInfo::default`),
+//!   unless a test calls `SimEngine::set_page_tokens` or `set_groups`, and
+//!   generated images default to 512x512 (`ImageParams::default`).
 //! - The `general` request gauges and the `kv_cache` and `encoder` counters in
 //!   `SchedulerStats` are snapshots that `Scheduler::publish_cache_stats`
 //!   refreshes as the loop runs, not when an event is sent, so they can trail
@@ -681,7 +681,7 @@ fn call_window_metrics_record_the_full_lifecycle() {
         assert!(domain.completed_batches.load(Ordering::Relaxed) > 0);
     }
     let mut reporter = uniserve_engine::SchedulerStatsReporter::default();
-    let snapshot = reporter.snapshot(&scheduler.stats, 16);
+    let snapshot = reporter.snapshot(&scheduler.stats);
     let decoded_active = snapshot
         .domain_stats
         .iter()
@@ -1053,60 +1053,125 @@ fn stop_string_cutoff_is_request_local() {
     ));
 }
 
-/// A text request completes on a worker that advertises a full-attention and a
-/// sliding-window KV group in one block pool.
+/// Text requests complete on a worker whose unit pool holds a full-attention
+/// group and a sliding-window group with different page shapes. The prompt
+/// is several times the window, so the sliding group retires pages while the
+/// request runs and its declared tables carry only in-window pages, and a
+/// second request with the same prompt reuses the first one's prefix. Every
+/// unit returns to the pool once both finish.
 #[test]
-fn hybrid_groups_handshake_runs() {
+fn hybrid_groups_share_one_unit_pool() {
+    use std::sync::atomic::Ordering;
     use uniserve_core::{KvCacheGroup, KvGroupKind};
+
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
-    // Groups take consecutive block-id ranges of the shared pool: group 0
-    // covers [0, 2048) and group 1 covers [2048, 4096).
+    sim.set_text_len(4);
+    sim.set_num_units(64);
+    let base = sim.mut_info_for_test().kv_cache.clone().unwrap().groups[0].clone();
     sim.set_groups(vec![
         KvCacheGroup {
-            num_blocks: 2048,
-            kind: KvGroupKind::Full,
+            layer_ids: (0..4).collect(),
+            ..base.clone()
         },
         KvCacheGroup {
-            num_blocks: 2048,
             kind: KvGroupKind::SlidingWindow {
-                window: 4096,
-                sink: 256,
+                window: 96,
+                sink: 0,
             },
+            page_tokens: 32,
+            units_per_page: 3,
+            layer_ids: (4..16).collect(),
+            ..base
         },
     ]);
-    let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
+    let mut executor = SimExecutor::new(sim);
+    let dispatched = executor.observe();
+    let mut sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    // A 64-token chunk reads at most six sliding pages with the window.
+    sched.set_long_prefill_threshold(64);
+    let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let mut erx = handle
-        .submit(generation_request(
-            RequestId(1),
-            text_input(vec![1, 2, 3]),
-            SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
-            16,
-        ))
-        .unwrap();
-
-    let mut finished = false;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !finished && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(EngineCoreOutput::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
+    // 20 full pages of 64 tokens alone take 20 units; holding every sliding
+    // page of 1280 tokens as well would take another 120, beyond the pool.
+    let prompt: Vec<u32> = (0..1280u32).map(|i| (i % 61) + 3).collect();
+    let run_one = |rid: u64| {
+        let mut erx = handle
+            .submit(generation_request(
+                RequestId(rid),
+                text_input(prompt.clone()),
+                SamplingParams::default(),
+                ImageParams::default(),
+                GenerationConstraint::UndOnly,
+                16,
+            ))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match erx.try_recv() {
+                Ok(EngineCoreOutput::Finished { reason, .. }) => return reason,
+                Ok(EngineCoreOutput::Rejected { message, .. }) => {
+                    panic!("request {rid} was rejected: {message}")
+                }
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
         }
-    }
+        panic!("request {rid} did not finish under hybrid groups");
+    };
+
+    assert_ne!(run_one(1), FinishReason::Error);
+    let reused_before = stats.prefix.hit_tokens.load(Ordering::Relaxed);
+    assert_ne!(run_one(2), FinishReason::Error);
+    // The reused prefix is a multiple of the 64-token largest page whose
+    // sliding window [M - 96, M) the first request published before retiring.
+    let reused = stats.prefix.hit_tokens.load(Ordering::Relaxed) - reused_before;
+    assert!(
+        reused >= 1024 && reused.is_multiple_of(64),
+        "reused {reused} tokens"
+    );
+
     handle.shutdown();
     let _ = jh.join();
-    assert!(
-        finished,
-        "request did not complete under hybrid-group handshake"
+    assert_eq!(
+        stats.kv_cache.free_units.load(Ordering::Relaxed),
+        stats.kv_cache.num_units.load(Ordering::Relaxed)
     );
+
+    // Every declared table covers whole pages of its group from its start
+    // page; the sliding group's tables move their start and never hold more
+    // than the pages a window and two pipelined chunks intersect.
+    let mut retired = false;
+    for event in dispatched.try_iter() {
+        let BatchEvent::Submitted(batch) = event else {
+            continue;
+        };
+        for (_, placement) in &batch.requests {
+            for table in &placement.block_tables {
+                let (page_tokens, units_per_page) = if table.group_id == 0 {
+                    (64, 1)
+                } else {
+                    (32, 3)
+                };
+                assert_eq!(table.unit_ids.len() % units_per_page, 0);
+                let pages = (table.unit_ids.len() / units_per_page) as u32;
+                assert_eq!(
+                    table.allocated_tokens,
+                    (table.start_page + pages) * page_tokens
+                );
+                if table.group_id == 1 {
+                    assert!(pages <= (96 + 2 * 64) / 32 + 1, "{table:?}");
+                    retired |= table.start_page > 0;
+                } else {
+                    assert_eq!(table.start_page, 0);
+                }
+            }
+        }
+    }
+    assert!(retired, "the sliding group never retired a page");
 }
 
 /// Two sequential requests with the same prompt: the first publishes its full
@@ -1123,9 +1188,8 @@ fn prefix_cache_reuses_shared_prompt() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    // 600 tokens span 9 full 64-token blocks plus a partial block; the
-    // assertions below are lower bounds. `prefix.hits` accumulates reused
-    // blocks, not lookups.
+    // 600 tokens span 9 full 64-token pages plus a partial page; the
+    // assertions below are lower bounds.
     let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
 
     let run_one = |rid: u64, handle: &EngineHandle| {
@@ -1154,19 +1218,18 @@ fn prefix_cache_reuses_shared_prompt() {
     // Cold: req1 populates the prefix cache.
     run_one(1, &handle);
     assert!(
-        stats.kv_cache.blocks_stored.load(Ordering::Relaxed) >= 2,
-        "req1 should cache >= 2 full prompt blocks"
+        stats.kv_cache.pages_stored.load(Ordering::Relaxed) >= 2,
+        "req1 should cache >= 2 full prompt pages"
     );
-    let hits_before = stats.prefix.hits.load(Ordering::Relaxed);
+    let hits_before = stats.prefix.hit_tokens.load(Ordering::Relaxed);
 
     // Warm: req2 (same prompt) reuses the cached prefix.
     run_one(2, &handle);
-    let hits_after = stats.prefix.hits.load(Ordering::Relaxed);
+    let hits_after = stats.prefix.hit_tokens.load(Ordering::Relaxed);
     assert!(
-        hits_after - hits_before >= 2,
-        "req2 should reuse >= 2 cached prefix blocks (before={hits_before} after={hits_after})"
+        hits_after - hits_before >= 512,
+        "req2 should reuse >= 512 cached prefix tokens (before={hits_before} after={hits_after})"
     );
-    assert!(stats.prefix.hit_tokens.load(Ordering::Relaxed) >= 512);
 
     handle.shutdown();
     let _ = jh.join();
@@ -1216,33 +1279,36 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
     };
 
     run(1, true, true, 11);
-    let cold_hits = stats.prefix.hits.load(Ordering::Relaxed);
+    let cold_hits = stats.prefix.hit_tokens.load(Ordering::Relaxed);
     run(2, true, true, 22);
     assert_eq!(
-        stats.prefix.hits.load(Ordering::Relaxed),
+        stats.prefix.hit_tokens.load(Ordering::Relaxed),
         cold_hits,
-        "a different isolation key reused cached blocks"
+        "a different isolation key reused cached pages"
     );
     run(3, true, true, 11);
     assert!(
-        stats.prefix.hits.load(Ordering::Relaxed) >= cold_hits + 2,
+        stats.prefix.hit_tokens.load(Ordering::Relaxed) >= cold_hits + 128,
         "the matching isolation key did not reuse its prefix"
     );
 
-    let before_bypass = stats.prefix.hits.load(Ordering::Relaxed);
+    let before_bypass = stats.prefix.hit_tokens.load(Ordering::Relaxed);
     run(4, false, true, 33);
-    assert_eq!(stats.prefix.hits.load(Ordering::Relaxed), before_bypass);
+    assert_eq!(
+        stats.prefix.hit_tokens.load(Ordering::Relaxed),
+        before_bypass
+    );
     run(5, true, true, 33);
     assert!(
-        stats.prefix.hits.load(Ordering::Relaxed) >= before_bypass + 2,
+        stats.prefix.hit_tokens.load(Ordering::Relaxed) >= before_bypass + 128,
         "read bypass prevented a write-enabled request from publishing its prefix"
     );
 
-    let before_no_store = stats.prefix.hits.load(Ordering::Relaxed);
+    let before_no_store = stats.prefix.hit_tokens.load(Ordering::Relaxed);
     run(6, true, false, 44);
     run(7, true, true, 44);
     assert_eq!(
-        stats.prefix.hits.load(Ordering::Relaxed),
+        stats.prefix.hit_tokens.load(Ordering::Relaxed),
         before_no_store,
         "a write-disabled request published its prefix"
     );
@@ -2168,15 +2234,15 @@ fn gen_branch_model_image_starts_spend_budget() {
 }
 
 /// Image-generating requests reserve their worst-case KV at admission. The
-/// prompt plus the 32,768-token text budget alone exceeds this 128-block x
-/// 256-token pool, so the scheduler rejects the request (a `Rejected` event and
-/// no `Finished`) instead of admitting it.
+/// prompt plus the 32,768-token text budget alone exceeds this pool of 128
+/// usable units of one 256-token page each, so the scheduler rejects the
+/// request (a `Rejected` event and no `Finished`) instead of admitting it.
 #[test]
 fn gen_branch_rejects_oversized_worstcase_at_admission() {
     let mut sim = SimEngine::new();
     sim.set_text_len(8);
-    sim.set_num_blocks(128);
-    sim.set_block_size(256);
+    sim.set_num_units(129);
+    sim.set_page_tokens(256);
     let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -2668,8 +2734,8 @@ fn kv_resources_return_after_completion() {
     assert_eq!(sched.stats.general.running.load(Ordering::Relaxed), 0);
     assert_eq!(sched.stats.general.in_flight.load(Ordering::Relaxed), 0);
     assert_eq!(
-        sched.stats.kv_cache.free_blocks.load(Ordering::Relaxed),
-        sched.stats.kv_cache.num_blocks.load(Ordering::Relaxed)
+        sched.stats.kv_cache.free_units.load(Ordering::Relaxed),
+        sched.stats.kv_cache.num_units.load(Ordering::Relaxed)
     );
 }
 

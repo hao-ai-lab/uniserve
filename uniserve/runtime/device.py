@@ -11,6 +11,7 @@ import pynvml
 import torch
 
 __all__ = [
+    "async_tensor_h2d",
     "canonical_device",
     "fill_cpu_bools",
     "fill_cpu_ints",
@@ -119,6 +120,23 @@ def canonical_device(device: torch.device | str) -> torch.device:
     if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
         return torch.device("cuda", torch.cuda.current_device())
     return dev
+
+
+def async_tensor_h2d(
+    values: Sequence[int], *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Copy host integers into a new tensor on ``device`` without a host wait.
+
+    On CUDA the values are staged in pinned memory from PyTorch's caching
+    host allocator and copied non-blocking on the current stream. The
+    allocator reuses that pinned block only after the copy completes, so the
+    calling thread never waits for device work queued ahead of the copy, and
+    the result is ordered before every later operation on the stream. Other
+    devices receive an ordinary copy.
+    """
+    pinned = device.type == "cuda"
+    host = torch.tensor(values, dtype=dtype, pin_memory=pinned)
+    return host.to(device, non_blocking=pinned)
 
 
 def fill_cpu_ints(cpu: torch.Tensor, values: Sequence[int]) -> None:

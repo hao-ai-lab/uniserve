@@ -4,7 +4,7 @@
 before ``ModelExecutor.complete_startup`` seals graph capture. They stage
 startup rows (token ID zero for text; for image denoising, guidance-branch
 prefixes resolved through the model's ``FlowPrompt``) through the same
-``TokenBuffers`` and ``DiffusionBuffers`` serving uses, on scratch KV pages and
+``TokenBuffers`` and ``DiffusionBuffers`` serving uses, on scratch KV units and
 latent values leased from the idle pools, and capture each configured bucket;
 when graphs are disabled, representative calls run eagerly as warmup instead.
 """
@@ -18,9 +18,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve.diffusion import Renorm
-from uniserve.math import ceil_div
 from uniserve.media import image as media_image
-from uniserve_worker.model_executor.attention import from_blocks
+from uniserve_worker.model_executor.attention import from_tables, table_pages
 from uniserve_worker.model_executor.diffusion_inputs import (
     DiffusionRow,
     resolve_prefix,
@@ -31,6 +30,7 @@ from uniserve_worker.model_executor.model_runner import ModelRunner
 from uniserve_worker.model_executor.output import ExecutionOutput
 from uniserve_worker.protocol.call import ForwardMode, ImageParams
 from uniserve_worker.sampling.metadata import TokenSelection
+from uniserve_worker.storage.block_tables import GroupTable
 from uniserve_worker.storage.kv_cache import KVCacheManager
 
 if TYPE_CHECKING:
@@ -38,11 +38,38 @@ if TYPE_CHECKING:
     from uniserve_worker.model_executor.graph_inputs import PrefillShape
 
 
+def scratch_tables(
+    cache: KVCacheManager, units: Sequence[int], lengths: Sequence[int]
+) -> tuple[tuple[GroupTable, ...], ...]:
+    """Partition scratch units into each row's tables of every cache group.
+
+    Row ``i`` receives, in every group, whole pages from page zero covering
+    ``lengths[i]`` tokens (at least one page), taken from ``units`` in order;
+    ``units`` must hold ``sum(map(cache.page_units, lengths))`` units.
+    """
+    result, cursor = [], 0
+    for length in lengths:
+        row = []
+        for shape in cache.shapes:
+            pages = max(1, -(-int(length) // shape.page_tokens))
+            count = pages * shape.units_per_page
+            row.append(
+                GroupTable(
+                    shape,
+                    0,
+                    tuple(units[cursor : cursor + count]),
+                    pages * shape.page_tokens,
+                )
+            )
+            cursor += count
+        result.append(tuple(row))
+    return tuple(result)
+
+
 def stage_text(
     buffers: TokenBuffers,
-    cache: KVCacheManager,
     tokens: tuple[tuple[int, ...], ...],
-    pages: Sequence[Sequence[int]],
+    tables: Sequence[Sequence[GroupTable]],
     *,
     prefixes: tuple[int, ...] | None = None,
     decode: bool = False,
@@ -52,10 +79,10 @@ def stage_text(
 ) -> InputBatch:
     """Stage synthetic token rows through serving's staging path.
 
-    ``tokens`` holds each row's token IDs and ``pages`` its physical KV
-    pages. Rows default to empty prefixes and to request slots ``1..rows``;
-    slot 0 is the inactive sentinel. Every row writes KV. A decode batch
-    also carries the staging's cleared force-finish column.
+    ``tokens`` holds each row's token IDs and ``tables`` its scratch tables
+    of every cache group. Rows default to empty prefixes and to request
+    slots ``1..rows``; slot 0 is the inactive sentinel. Every row writes KV.
+    A decode batch also carries the staging's cleared force-finish column.
     """
     rows = len(tokens)
     lengths = tuple(len(value) for value in tokens)
@@ -65,13 +92,12 @@ def stage_text(
         for prefix, length in zip(prefixes, lengths, strict=True)
     )
 
-    attention = from_blocks(
-        pages=pages,
+    attention = from_tables(
+        table_pages(tables, prefix_lengths=prefixes, query_lengths=lengths),
         query_lengths=lengths,
         prefix_lengths=prefixes,
         causal=(causal,) * rows,
         write=(True,) * rows,
-        block_size=cache.info.block_size,
     )
 
     slots = slots or tuple(range(1, rows + 1))
@@ -114,7 +140,7 @@ def prepare_prefill(
 
     Buckets are ordered by token-times-row footprint. Each capture stages
     ``live_rows`` rows totaling the bucket's token count on zeroed scratch
-    KV pages; the runner's ``select_graph_shape`` pads them to the bucket.
+    KV units; the runner's ``select_graph_shape`` pads them to the bucket.
 
     Raises:
         ValueError: A bucket is prepared on a worker without a KV cache.
@@ -132,24 +158,15 @@ def prepare_prefill(
             shape.token_bucket - shape.live_rows + 1,
             *(1,) * (shape.live_rows - 1),
         )
-        counts = tuple(
-            ceil_div(length, runner.worker_config.block_size)
-            for length in lengths
-        )
-
         cache = runner.kv_cache
         if cache is None:
             raise ValueError("prefill capture requires the worker KV cache")
-        with cache.startup_pages(sum(counts)) as scratch:
-            pages = tuple(
-                scratch[sum(counts[:index]) : sum(counts[: index + 1])]
-                for index in range(len(counts))
-            )
+        count = sum(map(cache.page_units, lengths))
+        with cache.startup_units(count) as scratch:
             batch = stage_text(
                 buffers,
-                cache,
-                tuple((0,) * count for count in lengths),
-                pages,
+                tuple((0,) * length for length in lengths),
+                scratch_tables(cache, scratch, lengths),
                 causal=shape.causal,
                 selection=shape.selection,
             )
@@ -179,19 +196,19 @@ def prepare_decode(
         cache = runner.kv_cache
         if cache is None:
             raise ValueError("decode capture requires the worker KV cache")
-        with cache.startup_pages(rows) as scratch:
-            pages = tuple((page,) for page in scratch)
+        # Each row holds its one-token prompt and one decoded token.
+        with cache.startup_units(rows * cache.page_units(2)) as scratch:
+            tables = scratch_tables(cache, scratch, (2,) * rows)
 
             # Prefill the one-token prompt eagerly so the decode capture below
             # attends over K/V the model wrote rather than zeroed scratch.
-            prompt = stage_text(buffers, cache, ((0,),) * rows, pages)
+            prompt = stage_text(buffers, ((0,),) * rows, tables)
             entry.eager_batch(prompt, forward)
 
             batch = stage_text(
                 buffers,
-                cache,
                 ((0,),) * rows,
-                pages,
+                tables,
                 prefixes=(1,) * rows,
                 decode=True,
             )
@@ -232,7 +249,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     """Warm and capture configured image shapes on real conditioning prefixes.
 
     For each shape, the prefix entry first prefills every nonempty branch
-    prompt prefix eagerly into scratch KV pages, then the denoising entry
+    prompt prefix eagerly into scratch KV units, then the denoising entry
     stages rows that read those prefixes and captures them, or runs them
     eagerly when graph capture or prefill graphs are disabled. Rows are
     ordered by request with guidance branches varying fastest, and the
@@ -240,8 +257,6 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     """
     import math
 
-    from uniserve.math import ceil_div
-    from uniserve_worker.model_executor.attention import from_blocks
     from uniserve_worker.model_executor.graph_inputs import DiffusionShape
     from uniserve_worker.protocol.call import MediaCall
 
@@ -334,13 +349,12 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 )
                 * shape.rows
             )
-            page_counts = tuple(
-                ceil_div(len(prefix), cache.info.block_size)
-                for prefix in prefixes
-            )
+            lengths = tuple(map(len, prefixes))
 
             with (
-                cache.startup_pages(sum(page_counts)) as scratch,
+                cache.startup_units(
+                    sum(map(cache.page_units, lengths))
+                ) as scratch,
                 latent_pool.startup_values(
                     shape.rows, builder.denoiser.latent_shape("image", size)[0]
                 ) as latents,
@@ -348,10 +362,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 for value in latents:
                     value.zero_()
 
-                pages, cursor = [], 0
-                for count in page_counts:
-                    pages.append(tuple(scratch[cursor : cursor + count]))
-                    cursor += count
+                tables = scratch_tables(cache, scratch, lengths)
 
                 # Only nonempty prefixes are prefilled, with hidden-state
                 # selection whose output is discarded; the denoising rows
@@ -362,9 +373,8 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 if selected:
                     batch = stage_text(
                         prefix_entry.input_buffers,
-                        cache,
                         tuple(prefixes[index] for index in selected),
-                        tuple(pages[index] for index in selected),
+                        tuple(tables[index] for index in selected),
                         selection=TokenSelection.HIDDEN,
                         slots=tuple(
                             1 + index // shape.cfg_branches
@@ -386,12 +396,13 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                             prefix_stream.stream
                         )
 
-                attention = from_blocks(
-                    pages=tuple(pages),
-                    query_lengths=(builder.sequence_length(size),)
-                    * len(prefixes),
-                    prefix_lengths=tuple(map(len, prefixes)),
-                    block_size=cache.info.block_size,
+                queries = (builder.sequence_length(size),) * len(prefixes)
+                attention = from_tables(
+                    table_pages(
+                        tables, prefix_lengths=lengths, query_lengths=queries
+                    ),
+                    query_lengths=queries,
+                    prefix_lengths=lengths,
                     causal=(False,) * len(prefixes),
                     write=(False,) * len(prefixes),
                 )
