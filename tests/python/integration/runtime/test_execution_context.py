@@ -9,11 +9,17 @@ from dataclasses import replace
 import pytest
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from uniserve.cache import Config, mha
 from uniserve.model import TextSize
 from uniserve.nn import Linear, MergedColumnParallelLinear
-from uniserve.nn.attention import Attention, AttentionBatch, PagedInput
+from uniserve.nn.attention import (
+    Attention,
+    AttentionBatch,
+    DenseInput,
+    PagedInput,
+)
 from uniserve.quantization import Quantizer
 from uniserve.runtime import (
     CUDAGraph,
@@ -71,7 +77,7 @@ def test_device_lengths_drive_current_attention_values(
         stream if stream is not None else nullcontext(),
         PrefixCache(
             Config({"attention": mha.Config(2, 64, (0, 1), dtype)}),
-            num_blocks=2,
+            num_units=2,
             block_size=16,
             device=device,
         ) as cache,
@@ -178,10 +184,8 @@ def test_nested_execution_contexts_keep_prefixes_independent():
     module.projection.weight.copy_(torch.eye(64))
     config = Config({"attention": mha.Config(1, 64, (0,), torch.float32)})
     with (
-        PrefixCache(config, num_blocks=1, block_size=16, device="cpu") as first,
-        PrefixCache(
-            config, num_blocks=1, block_size=16, device="cpu"
-        ) as second,
+        PrefixCache(config, num_units=1, block_size=16, device="cpu") as first,
+        PrefixCache(config, num_units=1, block_size=16, device="cpu") as second,
         ExecutionContext(module, cache=first, attention="torch") as a,
     ):
         a.prepare(TextSize(1, 1))
@@ -282,9 +286,7 @@ def test_eager_attention_replans_changed_sequence_boundaries():
         for _ in range(2)
     )
     with (
-        PrefixCache(
-            config, num_blocks=2, block_size=16, device=device
-        ) as cache,
+        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
         ExecutionContext(layer, cache=cache, attention="flashinfer") as context,
     ):
         context.prepare(TextSize(5, 2))
@@ -372,9 +374,7 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
         prefixes=replace(initial.prefixes, host=None),
     )
     with (
-        PrefixCache(
-            config, num_blocks=2, block_size=16, device=device
-        ) as cache,
+        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
         ExecutionContext(layer, cache=cache, attention=provider) as context,
     ):
         context.prepare(TextSize(5, 2))
@@ -398,6 +398,74 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
                 rtol=2e-2,
                 atol=2e-2,
             )
+
+
+@pytest.mark.gpu
+@torch.inference_mode()
+def test_context_without_derived_lengths_plans_only_with_host_mirrors():
+    """A context that reads no lengths from the device uses the batch's own.
+
+    Planning with the host lengths a batch carries serves its calls, while a
+    batch whose lengths exist only on the device fails to bind and to run
+    rather than copying them to the host.
+    """
+    device = torch.device("cuda", 0)
+    dtype = torch.bfloat16
+    layer = Attention(2, 1, 64, cache_name="attention")
+    config = Config({"attention": mha.Config(1, 64, (0,), dtype)})
+    generator = torch.Generator(device=device).manual_seed(37)
+    q = torch.randn(5, 2, 64, dtype=dtype, device=device, generator=generator)
+    k, v = (
+        torch.randn(5, 1, 64, dtype=dtype, device=device, generator=generator)
+        for _ in range(2)
+    )
+    batch = PagedInput.from_blocks(
+        blocks=((0,), (1,)),
+        query_lengths=(4, 1),
+        prefix_lengths=(0, 0),
+        block_size=16,
+        causal=True,
+        device=device,
+    )
+    stripped = replace(
+        batch,
+        queries=replace(batch.queries, host=None),
+        prefixes=replace(batch.prefixes, host=None),
+    )
+    expected = torch.cat(
+        [
+            F.scaled_dot_product_attention(
+                query.transpose(0, 1).unsqueeze(0),
+                key.transpose(0, 1).unsqueeze(0),
+                value.transpose(0, 1).unsqueeze(0),
+                is_causal=True,
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+            for query, key, value in zip(
+                q.split((4, 1)), k.split((4, 1)), v.split((4, 1)), strict=True
+            )
+        ]
+    )
+    with (
+        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
+        ExecutionContext(
+            layer, cache=cache, attention="torch", derive_host_lengths=False
+        ) as context,
+    ):
+        context.prepare(TextSize(5, 2))
+        context.bind_attention(AttentionBatch.single(batch))
+        torch.testing.assert_close(
+            layer(q, k, v, AttentionBatch.single(batch)),
+            expected,
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        with pytest.raises(ValueError, match="host query lengths"):
+            context.bind_attention(AttentionBatch.single(stripped))
+        with pytest.raises(ValueError, match="host query lengths"):
+            layer(q, k, v, AttentionBatch.single(stripped))
 
 
 class _Workspace(nn.Module):
@@ -534,3 +602,96 @@ def test_contexts_sharing_scratch_replay_their_own_values():
                         outputs[rows][name], value, rtol=2**-7, atol=2**-10
                     )
     scratch.close()
+
+
+def _reference(query, key, value, allowed):
+    """Grouped-query attention over ``[tokens, heads, dim]`` with a mask."""
+    return (
+        F.scaled_dot_product_attention(
+            query.transpose(0, 1).unsqueeze(0),
+            key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0),
+            attn_mask=allowed,
+            enable_gqa=True,
+        )
+        .squeeze(0)
+        .transpose(0, 1)
+    )
+
+
+@torch.inference_mode()
+def test_table_batches_plan_cached_layers_beside_cacheless_layers():
+    # A windowed and a full-attention layer read two cache tables of one
+    # unit pool; a layer without a cache table reads its own single-entry
+    # batch. Planning the table batch must leave that layer alone.
+    generator = torch.Generator().manual_seed(47)
+    windowed = Attention(2, 1, 4, cache_name="windowed", window=1)
+    full = Attention(2, 1, 8, cache_name="full")
+    dense = Attention(2, 2, 4)
+    module = nn.ModuleDict({"windowed": windowed, "full": full, "dense": dense})
+    config = Config(
+        {
+            "windowed": mha.Config(1, 4, (0,), torch.float32, window=1),
+            "full": mha.Config(1, 8, (0,), torch.float32),
+        }
+    )
+    with (
+        PrefixCache(config, num_units=4, block_size=2, device="cpu") as cache,
+        ExecutionContext(module, cache=cache, attention="torch") as context,
+    ):
+        context.prepare(TextSize(3, 1))
+        # The full rows are the widest: two-token full pages, four-token
+        # windowed pages, and disjoint units for the two groups' tables.
+        assert (cache.table("windowed"), cache.table("full")) == (0, 1)
+        first = PagedInput.from_blocks(
+            blocks=((1,),),
+            query_lengths=(3,),
+            prefix_lengths=(0,),
+            block_size=4,
+            causal=True,
+            device="cpu",
+        )
+        second = PagedInput.from_blocks(
+            blocks=((2, 3),),
+            query_lengths=(3,),
+            prefix_lengths=(0,),
+            block_size=2,
+            causal=True,
+            device="cpu",
+        )
+        batch = AttentionBatch(
+            {
+                0: first,
+                1: replace(
+                    second, queries=first.queries, prefixes=first.prefixes
+                ),
+            },
+            first.queries,
+        )
+        context.bind_attention(batch)
+
+        positions = torch.arange(3)
+        causal = positions[None] <= positions[:, None]
+        for layer, width, allowed in (
+            (windowed, 4, causal & (positions[None] >= positions[:, None] - 1)),
+            (full, 8, causal),
+        ):
+            query = torch.randn(3, 2, width, generator=generator)
+            key, value = (
+                torch.randn(3, 1, width, generator=generator) for _ in range(2)
+            )
+            out = torch.empty_like(query)
+            layer(query, key, value, batch, out=out)
+            torch.testing.assert_close(
+                out, _reference(query, key, value, allowed)
+            )
+
+        single = AttentionBatch.single(DenseInput(causal=False, mask=None))
+        context.bind_attention(single)
+        query = torch.randn(3, 2, 4, generator=generator)
+        key, value = (
+            torch.randn(3, 2, 4, generator=generator) for _ in range(2)
+        )
+        out = torch.empty_like(query)
+        dense(query, key, value, single, out=out)
+        torch.testing.assert_close(out, _reference(query, key, value, None))

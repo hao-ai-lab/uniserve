@@ -26,7 +26,7 @@ def test_text_prefill_decode_and_zero_query_match_qwen_equations(tmp_path):
     with torch.no_grad():
         expected = reference(tokens[None]).logits[0]
     with PrefixCache(
-        model.text.cache_config, num_blocks=1, block_size=4, device="cpu"
+        model.text.cache_config, num_units=1, block_size=4, device="cpu"
     ) as cache:
         with ExecutionContext(
             model.text, cache=cache, attention="torch"

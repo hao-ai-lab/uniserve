@@ -44,13 +44,13 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
     )
     runner = ModelExecutor(model, config)
     cache = PrefixCache(
-        model.text.cache_config, num_blocks=8, block_size=16, device="cpu"
+        model.text.cache_config, num_units=8, block_size=16, device="cpu"
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_blocks=8),
+        info=cache_info(model.text, config, num_units=8),
         request_pool_size=3,
-        max_blocks_per_request=2,
+        table_width=2,
     )
     latents = LatentPool(
         request_pool_size=3,
@@ -70,7 +70,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
             request_slots=3,
             max_tokens=64,
             latent_capacity_units=16,
-            decode_context_blocks=2,
+            table_widths=(2,),
             max_inflight=1,
         )
         runner.complete_startup()

@@ -2,7 +2,7 @@
 
 A `Batch` is one numerical call on one component together with everything a
 rank needs to run it: the per-request `Call` descriptors, the lifecycle
-commands (`Start`, `Finish`, `Free`) applied with it, the KV page tables and
+commands (`Start`, `Finish`, `Free`) applied with it, the KV unit tables and
 latent, decode, and persistent-buffer allocations the scheduler chose, and
 host-supplied input tensors (`TensorPublication`). The records mirror the
 Rust `Batch` in `uniserve_worker_ipc`, whose `Batch::validate` is the
@@ -12,7 +12,7 @@ Records reach Python on two paths. The PyO3 transport (`crates/worker-ipc-py`)
 decodes and validates a frame in Rust, builds each member record through its
 constructor, and assembles the `Batch` with
 `construction.batch_from_validated`, which skips `Batch.validate`. It calls
-`BlockTable`, `CachePageAllocation`, `Start`, `Finish`, and `Free`
+`BlockTable`, `CacheUnitAllocation`, `Start`, `Finish`, and `Free`
 positionally, so their field order is part of that contract, and the other
 records by keyword, so their field names are. Python callers build a `Batch`
 through its constructor or `Batch.from_mapping`, both of which run
@@ -457,27 +457,35 @@ class NewRequest:
 
 @dataclass(frozen=True, slots=True)
 class BlockTable:
-    """The complete KV page table of one request slot and KV cache group."""
+    """The complete unit table of one request slot and KV cache group.
+
+    ``unit_ids`` lists the units of logical pages ``start_page..``,
+    page-major: the group's ``units_per_page`` units of ``start_page`` come
+    first. Earlier pages are retired window pages that no call reads.
+    ``allocated_tokens`` is the absolute token extent the table covers; the
+    worker checks it against the group's page shape.
+    """
 
     # Request-pool slot owning the table; slot 0 is rejected.
     request_pool_idx: int
     # KV cache group addressed by the table.
     group_id: int
-    # Physical page identifiers in logical order; unique, page 0 rejected.
-    page_ids: tuple[int, ...]
-    # Token capacity the installed pages cover; zero when ``page_ids`` is
-    # empty.
+    # First logical page the units cover.
+    start_page: int
+    # Physical unit identifiers; unique, unit 0 rejected.
+    unit_ids: tuple[int, ...]
+    # Absolute token extent the table covers.
     allocated_tokens: int
 
     def __post_init__(self) -> None:
-        """Validate the slot, pages, and token capacity."""
+        """Validate the slot, group, start page and units."""
         if (
             self.request_pool_idx < 1
             or self.group_id < 0
+            or self.start_page < 0
             or self.allocated_tokens < 0
-            or any(page < 1 for page in self.page_ids)
-            or len(set(self.page_ids)) != len(self.page_ids)
-            or (not self.page_ids and self.allocated_tokens != 0)
+            or any(unit < 1 for unit in self.unit_ids)
+            or len(set(self.unit_ids)) != len(self.unit_ids)
         ):
             raise invalid_descriptor("block table is invalid")
 
@@ -487,84 +495,87 @@ class BlockTable:
         value: object,
         where: str = "block table",
     ) -> BlockTable:
-        """Parse an installed KV page table and its allocated token extent."""
+        """Parse an installed KV unit table and its allocated token extent."""
         data = _map(value, where)
 
         def uint_field(name: str) -> int:
             """Decode a nonnegative integer field."""
             return _uint(data.get(name), f"{where}.{name}")
 
-        page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
+        unit_ids = _uints(data.get("unit_ids", ()), f"{where}.unit_ids")
         fields = (
             uint_field("request_pool_idx"),
             uint_field("group_id"),
-            page_ids,
+            uint_field("start_page"),
+            unit_ids,
             uint_field("allocated_tokens"),
         )
         return cls(*fields)
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize an installed request-and-group KV page table."""
+        """Serialize an installed request-and-group KV unit table."""
         return {
             "request_pool_idx": self.request_pool_idx,
             "group_id": self.group_id,
-            "page_ids": list(self.page_ids),
+            "start_page": self.start_page,
+            "unit_ids": list(self.unit_ids),
             "allocated_tokens": self.allocated_tokens,
         }
 
 
 @dataclass(frozen=True, slots=True)
-class CachePageAllocation:
-    """Physical KV pages newly assigned to a request slot and KV group.
+class CacheUnitAllocation:
+    """Physical KV units newly assigned to a request slot and KV group.
 
-    The pages are a subset of the batch's `BlockTable` for the same slot and
+    The units are a subset of the batch's `BlockTable` for the same slot and
     group; the Rust `Batch::validate` checks this, `Batch.validate` does not.
+    The worker resets every listed unit before a call uses it.
     """
 
-    # Request-pool slot receiving the pages; slot 0 is rejected.
+    # Request-pool slot receiving the units; slot 0 is rejected.
     request_pool_idx: int
     group_id: int
-    # Newly assigned physical pages; non-empty, unique, page 0 rejected.
-    page_ids: tuple[int, ...]
+    # Newly assigned physical units; non-empty, unique, unit 0 rejected.
+    unit_ids: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        """Validate the slot, group, and newly assigned pages."""
+        """Validate the slot, group, and newly assigned units."""
         if (
             self.request_pool_idx < 1
             or self.group_id < 0
-            or not self.page_ids
-            or any(page < 1 for page in self.page_ids)
-            or len(set(self.page_ids)) != len(self.page_ids)
+            or not self.unit_ids
+            or any(unit < 1 for unit in self.unit_ids)
+            or len(set(self.unit_ids)) != len(self.unit_ids)
         ):
-            raise invalid_descriptor("cache-page allocation is invalid")
+            raise invalid_descriptor("cache-unit allocation is invalid")
 
     @classmethod
     def from_mapping(
         cls,
         value: object,
-        where: str = "cache-page allocation",
-    ) -> CachePageAllocation:
-        """Parse newly assigned KV pages for one slot and cache group."""
+        where: str = "cache-unit allocation",
+    ) -> CacheUnitAllocation:
+        """Parse newly assigned KV units for one slot and cache group."""
         data = _map(value, where)
 
         def uint_field(name: str) -> int:
             """Decode a nonnegative integer field."""
             return _uint(data.get(name), f"{where}.{name}")
 
-        page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
+        unit_ids = _uints(data.get("unit_ids", ()), f"{where}.unit_ids")
         fields = (
             uint_field("request_pool_idx"),
             uint_field("group_id"),
-            page_ids,
+            unit_ids,
         )
         return cls(*fields)
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize newly assigned KV pages for lane registration."""
+        """Serialize newly assigned KV units for lane registration."""
         return {
             "request_pool_idx": self.request_pool_idx,
             "group_id": self.group_id,
-            "page_ids": list(self.page_ids),
+            "unit_ids": list(self.unit_ids),
         }
 
 
@@ -849,7 +860,7 @@ class Batch:
     collective_seq: int = 1
     calls: tuple[call.Call, ...] = ()
     block_tables: tuple[BlockTable, ...] = ()
-    new_cache_pages: tuple[CachePageAllocation, ...] = ()
+    new_cache_units: tuple[CacheUnitAllocation, ...] = ()
 
     # Columnar model-forward inputs: one row per forward, all columns the same
     # length. ``forward_call_indices`` indexes ``calls``; ``seq_lens`` counts
@@ -1077,14 +1088,14 @@ class Batch:
                     )
                 )
             ),
-            new_cache_pages=tuple(
-                CachePageAllocation.from_mapping(
-                    item, f"execute batch.new_cache_pages[{index}]"
+            new_cache_units=tuple(
+                CacheUnitAllocation.from_mapping(
+                    item, f"execute batch.new_cache_units[{index}]"
                 )
                 for index, item in enumerate(
                     _seq(
-                        data.get("new_cache_pages", ()),
-                        "execute batch.new_cache_pages",
+                        data.get("new_cache_units", ()),
+                        "execute batch.new_cache_units",
                     )
                 )
             ),
@@ -1156,8 +1167,8 @@ class Batch:
             "collective_seq": self.collective_seq,
             "calls": [value.to_mapping() for value in self.calls],
             "block_tables": [value.to_mapping() for value in self.block_tables],
-            "new_cache_pages": [
-                value.to_mapping() for value in self.new_cache_pages
+            "new_cache_units": [
+                value.to_mapping() for value in self.new_cache_units
             ],
             "forward_call_indices": list(self.forward_call_indices),
             "request_pool_indices": list(self.request_pool_indices),

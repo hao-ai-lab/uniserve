@@ -150,6 +150,13 @@ class ExecutionContext(Generic[SizeT]):
     ``FusedMoE`` layers exchange tokens through; its owner opens a step
     around every forward and retires it after this context. ``weights`` is
     borrowed expert storage whose owner outlives its contexts and graphs.
+
+    ``derive_host_lengths`` lets attention planning read host sequence
+    lengths and table start pages a batch lacks from its device columns, a
+    synchronizing device-to-host copy for direct library callers. A caller
+    whose inputs always carry those host mirrors, such as the serving
+    worker, passes False, and a call missing one then raises instead of
+    copying. Planning never reads device values during graph capture.
     """
 
     def __init__(
@@ -166,6 +173,7 @@ class ExecutionContext(Generic[SizeT]):
         scratch: Scratch | None = None,
         experts=None,
         weights=None,
+        derive_host_lengths: bool = True,
     ):
         # Close releases the module; a closed context never executes again.
         self.module: nn.Module | None = module
@@ -181,6 +189,7 @@ class ExecutionContext(Generic[SizeT]):
         self._moe_backend = moe
         self.experts = experts
         self.weights = weights
+        self._derive_host_lengths = derive_host_lengths
 
         reference: torch.Tensor | None = next(
             (value for value in module.parameters() if not value.is_meta), None
@@ -586,6 +595,7 @@ class ExecutionContext(Generic[SizeT]):
                         self._attention_workspace,
                         self._context_transport,
                         table,
+                        derive_host_lengths=self._derive_host_lengths,
                     )
                     self._attention[id(child)] = attention_binding
 
@@ -706,25 +716,42 @@ class ExecutionContext(Generic[SizeT]):
             binding.join(binding.module.hidden_size, self._dtype)
 
     def bind_attention(self, batch):
-        """Plan one call's attention metadata on every attention layer.
+        """Plan one call's attention metadata on the layers that read it.
 
-        ``batch`` is the call's ``AttentionBatch``; each layer plans its own
-        table's entry. Required before graph capture. In eager execution the
-        next call of each layer on ``batch`` uses these plans instead of
-        planning again; bind again after changing lengths in place. Exact
-        host lengths are read at most once for all layers and tables.
+        ``batch`` is the call's ``AttentionBatch``. A layer with a cache
+        table reads that table's entry, and a layer without one reads only a
+        single-entry batch; every other layer, such as a vision tower beside
+        a batch of several text cache tables, keeps its plans, and running it
+        on this batch fails in the layer. Required before graph capture. In
+        eager execution the next call of each planned layer on ``batch`` uses
+        these plans instead of planning again; bind again after changing
+        lengths in place. Exact host lengths are read at most once for all
+        layers and tables, and only when the batch lacks them and the context
+        derives host lengths; otherwise a plan that needs a missing mirror
+        raises ``ValueError``.
         """
         from .backends.attention._sequences import batch_host_lengths
 
         self._open()
         with self.activate():
+            readers = tuple(
+                binding
+                for binding in self._attention.values()
+                if (
+                    len(batch.entries) == 1
+                    if binding.table is None
+                    else binding.table in batch.entries
+                )
+            )
             mirrored = batch
             if any(
                 binding.reads_host_lengths(batch.entry(binding.table))
-                for binding in self._attention.values()
+                for binding in readers
             ):
-                mirrored = batch_host_lengths(batch)
-            for binding in self._attention.values():
+                mirrored = batch_host_lengths(
+                    batch, derive=self._derive_host_lengths
+                )
+            for binding in readers:
                 binding.bind(mirrored, source=batch)
 
     @contextmanager

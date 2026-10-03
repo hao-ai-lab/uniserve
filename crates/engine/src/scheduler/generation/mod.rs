@@ -18,7 +18,7 @@
 //! are resolved afterwards in `output`.
 
 use super::{EncoderCachePin, FlowPrefixState, Phase, RequestAllocations, TerminalIntent};
-use crate::kv::BlockTable;
+use crate::kv::{BlockTable, KvAllocation};
 
 use std::collections::HashSet;
 use uniserve_worker_ipc::{
@@ -610,22 +610,20 @@ pub(super) fn plan_close_kv(
 
 /// Declares the physically visible KV range as a transferable input to diffusion.
 ///
-/// The transfer bound, `kv_bytes_per_token * physical_kv_len`, also makes the
+/// `publication_bytes` bounds the publication of the visible extent over
+/// every cache group (`KvCacheInfo::publication_bytes`); it also makes the
 /// call hold one of the scheduler's transfer reservations. Fails with
-/// `MissingProductBound` when either factor is zero.
+/// `MissingProductBound` when it is zero, which includes an empty extent.
 pub(super) fn plan_kv_publish(
-    kv_bytes_per_token: u64,
+    publication_bytes: u64,
     request: &GenerationRequest,
-    physical_kv_len: u32,
 ) -> Result<Call, PlanningError> {
-    if physical_kv_len == 0 || kv_bytes_per_token == 0 {
+    if publication_bytes == 0 {
         return Err(PlanningError::MissingProductBound);
     }
     let mut call = computation(request, CallKind::Transfer(TransferMode::KvPublish));
     call.bounds.max_tokens = 0;
-    call.bounds.max_transfer_bytes = kv_bytes_per_token
-        .checked_mul(u64::from(physical_kv_len))
-        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+    call.bounds.max_transfer_bytes = publication_bytes;
     // Owner and producer are the placeholders from `computation`;
     // `register_call` stamps them.
     call.kv_output = Some(BufferId {
@@ -709,7 +707,7 @@ pub(super) fn plan_diffusion_finalize(
 ///
 /// `max_latent_bytes` is the largest encoder, latent, or image output.
 /// `max_completion_bytes` covers the logprob payload of a token-producing call
-/// plus, for image decoding, the base64 PNG. `max_kv_pages` starts at zero;
+/// plus, for image decoding, the base64 PNG. `max_kv_units` starts at zero;
 /// `Scheduler::plan_computation` sets it for forward calls.
 fn finish_plan(
     request: &GenerationRequest,
@@ -737,7 +735,7 @@ fn finish_plan(
     let max_transfer_bytes = call.bounds.max_transfer_bytes;
     call.bounds = Bounds {
         max_tokens: call.bounds.max_tokens,
-        max_kv_pages: 0,
+        max_kv_units: 0,
         max_latent_bytes,
         max_completion_bytes: logprob_bytes.saturating_add(image_completion_bytes),
         max_transfer_bytes,
@@ -1223,19 +1221,21 @@ pub(crate) struct RequestState {
     pub(super) feedback_features: Option<TensorRef>,
     /// Whether the current epoch is registered with its execution workers.
     pub(super) worker_registered: bool,
-    /// Number of positive-branch KV blocks already delivered to the worker.
-    pub(super) num_kv_blocks_sent: usize,
+    /// Allocation serial of the request's KV units already declared to the
+    /// workers: units allocated at or after it are fresh for the next
+    /// dispatch (`KvAllocation::allocated_units`).
+    pub(super) num_kv_units_sent: u64,
     /// Whether admission reserves the complete multimodal KV requirement.
     pub(super) reserve_worstcase: bool,
-    /// Worst-case KV block count computed at submission; reserved only when
-    /// `reserve_worstcase` is set.
-    pub(super) max_reserved_kv_blocks: usize,
-    /// Per-group prefix hashes retained for publishing reusable input blocks.
-    pub(super) prefix_block_hashes: Vec<Vec<u64>>,
-    /// Whether prompt-block publication to the prefix cache has succeeded,
-    /// including as a no-op when prefix caching is disabled or the request
-    /// does not write the cache.
-    pub(super) prefix_cached: bool,
+    /// Worst-case KV token extent computed at submission; its units are
+    /// reserved only when `reserve_worstcase` is set.
+    pub(super) max_reserved_kv_tokens: usize,
+    /// Per-group chained hashes of the complete prompt pages, retained for
+    /// publishing reusable prompt pages as prefill completes.
+    pub(super) prefix_page_hashes: Vec<Vec<u64>>,
+    /// Per group, the leading prompt pages already published to the prefix
+    /// cache, or reused from it.
+    pub(super) prefix_published: Vec<usize>,
     /// Accepted text and control tokens used by penalties and trigger matching.
     pub(super) generated_token_ids: Vec<u32>,
     /// Tokens since the last model round boundary, used by suffix-trigger matching.
@@ -1278,10 +1278,10 @@ impl RequestState {
         self.allocations().map(RequestAllocations::block_tables)
     }
 
-    /// Returns mutable access to the request's block tables once admitted.
-    pub(super) fn block_tables_mut(&mut self) -> Option<&mut Vec<BlockTable>> {
+    /// Returns mutable access to the request's KV tables once admitted.
+    pub(super) fn kv_mut(&mut self) -> Option<&mut KvAllocation> {
         self.allocations_mut()
-            .map(RequestAllocations::block_tables_mut)
+            .map(|allocations| &mut allocations.kv)
     }
 
     /// Returns whether the request includes context images.

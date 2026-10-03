@@ -28,7 +28,7 @@ from uniserve_worker.execution.diffusion import (
     prefix_row,
 )
 from uniserve_worker.execution.model_executor import ModelExecutor
-from uniserve_worker.model_executor.attention import from_blocks
+from uniserve_worker.model_executor.attention import TablePages, from_tables
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -126,13 +126,13 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
     factory = runner.image_builder
     shape = factory.denoiser.latent_shape("image", size)
     cache = PrefixCache(
-        model.text.cache_config, num_blocks=8, block_size=16, device="cuda:0"
+        model.text.cache_config, num_units=8, block_size=16, device="cuda:0"
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_blocks=8),
+        info=cache_info(model.text, config, num_units=8),
         request_pool_size=3,
-        max_blocks_per_request=2,
+        table_width=2,
     )
     latents = LatentPool(
         request_pool_size=3,
@@ -155,13 +155,17 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             request_slots=3,
             max_tokens=64,
             latent_capacity_units=16,
-            decode_context_blocks=2,
+            table_widths=(2,),
             max_inflight=1,
         )
         runner.capture(tokenizer=None, latents=latents)
         runner.complete_startup()
         manager.block_tables.install(
-            ((1, 0, (1, 2), 32), (2, 0, (3, 4), 32), (3, 0, (5, 6), 32))
+            (
+                (1, 0, 0, (1, 2), 32),
+                (2, 0, 0, (3, 4), 32),
+                (3, 0, 0, (5, 6), 32),
+            )
         )
         oracle.prepare(TextSize(64, 3))
         params = ImageParams(
@@ -206,7 +210,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
 
             result = runner.run_forward_group(
                 tuple(
-                    prefix_row(tokens, (slot + 1, 0, 0, 32))
+                    prefix_row(tokens, (slot + 1, 0, 32))
                     for slot, tokens in enumerate(prefixes)
                 ),
                 calls=calls(ForwardMode.PREFILL),
@@ -229,21 +233,31 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 factory.positions(size, prefix_length, device="cuda:0")
                 for _ in branches
             )
-            attention = from_blocks(
-                pages=tuple(
-                    (slot * 2 + 1, slot * 2 + 2)
-                    for slot in range(len(branches))
+            # The model's one cache group has one-unit pages, so its single
+            # table holds each branch's prefix pages.
+            attention = from_tables(
+                (
+                    TablePages(
+                        16,
+                        False,
+                        (0,) * len(branches),
+                        tuple(
+                            (slot * 2 + 1, slot * 2 + 2)
+                            for slot in range(len(branches))
+                        ),
+                    ),
                 ),
                 query_lengths=(factory.sequence_length(size),) * len(branches),
                 prefix_lengths=(prefix_length,) * len(branches),
-                block_size=16,
                 causal=(False,) * len(branches),
                 write=(False,) * len(branches),
             )
             from uniserve_worker.model_executor.cuda_graph import map_tensors
 
             attention = AttentionBatch.single(
-                map_tensors(attention, lambda value: value.to("cuda:0"))
+                map_tensors(
+                    attention.entries[0], lambda value: value.to("cuda:0")
+                )
             )
             inputs = factory.bind(
                 samples=(sample,) * len(branches),
@@ -384,7 +398,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
     ) as worker:
         worker.warmup()
         assert worker.requests.request_ids() == ()
-        worker.kv_cache.block_tables.install(((1, 0, (4, 5), 32),))
+        worker.kv_cache.block_tables.install(((1, 0, 0, (4, 5), 32),))
         tokens = torch.tensor([3, 7, 2], device="cuda:0")
         positions = torch.tensor(
             [[0, 1, 2], [0, 1, 0], [0, 2, 0]], device="cuda:0"
@@ -564,7 +578,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             from uniserve_worker.protocol.tensor import DeviceDim, ShapeBound
 
             configure_physical_pool(
-                cache_pages=worker.info.kv_cache.num_blocks,
+                cache_pages=worker.info.kv_cache.num_units,
                 request_pool_size=worker.info.request_slots,
                 block_size=16,
                 commit_marker_tokens=0,
