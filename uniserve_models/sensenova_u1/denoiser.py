@@ -23,8 +23,8 @@ from torch import nn
 from uniserve.diffusion import (
     AdditiveGuidance,
     EulerSolver,
+    LinearGrid,
     Renorm,
-    make_schedule,
 )
 from uniserve.model import ImageDenoiser
 from uniserve.nn.functional import unpatchify
@@ -112,6 +112,11 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             noise_scale=config.flow.noise,
             prediction_dtype=torch.float32,
             solver=EulerSolver("velocity"),
+            # Network time rises from pure noise (0) to the clean image (1),
+            # the direction ``flow.Velocity``'s ``1 - t`` denominator
+            # assumes. A requested shift applies in the sigma domain; by
+            # default the grid is unshifted.
+            grid=LinearGrid(1.0, direction="ascending", shift_domain="sigma"),
         )
         # ``backbone`` is the same instance as ``Model.text.backbone``; its
         # weights load once, through the backbone mapping of
@@ -151,20 +156,6 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             )
             decoder = nn.Identity()
         self.prediction = flow.Velocity(head, decoder, patch_size=stride)
-
-    def make_schedules(self, steps, *, shift, device):
-        # Network time rises from pure noise (0) to the clean image (1), the
-        # direction ``flow.Velocity``'s ``1 - t`` denominator assumes. A
-        # requested shift applies in the sigma domain; none means no shift.
-        return {
-            "image": make_schedule(
-                steps,
-                shift=1.0 if shift is None else shift,
-                direction="ascending",
-                shift_domain="sigma",
-                device=device,
-            )
-        }
 
     def make_guidance(
         self,

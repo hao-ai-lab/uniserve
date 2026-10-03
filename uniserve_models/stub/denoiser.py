@@ -13,8 +13,8 @@ import torch
 from uniserve.diffusion import (
     AdditiveGuidance,
     EulerSolver,
+    LinearGrid,
     NoiseScale,
-    make_schedule,
 )
 from uniserve.model import (
     ImageDenoiser,
@@ -77,19 +77,9 @@ class Denoiser(ImageDenoiser):
             noise_scale=NoiseScale(1.0, "constant", 1.0, 1.0),
             prediction_dtype=torch.bfloat16,
             solver=EulerSolver(),
+            grid=LinearGrid(1.0, direction="ascending", shift_domain="time"),
         )
         self.backbone = backbone
-
-    def make_schedules(self, steps, *, shift, device):
-        return {
-            "image": make_schedule(
-                steps,
-                shift=1.0 if shift is None else shift,
-                direction="ascending",
-                shift_domain="time",
-                device=device,
-            )
-        }
 
     def make_guidance(
         self, *, text_scale, image_scale, interval, renorm, renorm_min

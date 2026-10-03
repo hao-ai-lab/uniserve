@@ -11,10 +11,10 @@ from uniserve.diffusion import (
     Branch,
     CleanSampleEulerSolver,
     EulerSolver,
+    LinearGrid,
     NestedGuidance,
     NoiseScale,
     Renorm,
-    make_schedule,
     normal_noise,
 )
 
@@ -22,9 +22,9 @@ pytestmark = pytest.mark.unit
 
 
 def test_guidance_interval_uses_unrounded_coordinate():
-    schedule = make_schedule(
-        3, shift=1.0, direction="ascending", shift_domain="time", device="cpu"
-    )
+    schedule = LinearGrid(
+        1.0, direction="ascending", shift_domain="time"
+    ).schedule(steps=3, device="cpu")
     guidance = AdditiveGuidance(4.0, 1.0, (1 / 3, 1 / 3), Renorm.NONE, 0.0)
     assert guidance.branches(schedule, 1) == (
         Branch.CONDITIONED,
@@ -44,9 +44,9 @@ def test_guidance_interval_uses_unrounded_coordinate():
     ],
 )
 def test_guidance_combines_text_and_image_equations(guidance, expected):
-    schedule = make_schedule(
-        1, shift=1.0, direction="ascending", shift_domain="time", device="cpu"
-    )
+    schedule = LinearGrid(
+        1.0, direction="ascending", shift_domain="time"
+    ).schedule(steps=1, device="cpu")
     # C = [[5, -1], [3, 7]], T = [[1, 1], [1, 3]], I = [[-1, 1], [3, 1]].
     # Additive: I + 2(T-I) + 3(C-T); nested: I + 2(T + 3(C-T) - I).
     outputs = {
@@ -61,9 +61,9 @@ def test_guidance_combines_text_and_image_equations(guidance, expected):
 
 
 def test_guidance_channel_norm_does_not_expand_predictions():
-    schedule = make_schedule(
-        1, shift=1, direction="ascending", shift_domain="time", device="cpu"
-    )
+    schedule = LinearGrid(
+        1, direction="ascending", shift_domain="time"
+    ).schedule(steps=1, device="cpu")
     options = AdditiveGuidance(2, 1, (0, 1), Renorm.CHANNEL, 0)
     outputs = {
         Branch.CONDITIONED: torch.tensor([[3.0, 4.0], [0.0, 2.0]]),
@@ -87,8 +87,8 @@ def test_guidance_channel_norm_does_not_expand_predictions():
     ],
 )
 def test_shifted_schedule_has_complete_endpoints(direction, domain, expected):
-    schedule = make_schedule(
-        2, shift=3, direction=direction, shift_domain=domain, device="cpu"
+    schedule = LinearGrid(3, direction=direction, shift_domain=domain).schedule(
+        steps=2, device="cpu"
     )
     assert schedule.coordinates == expected
     assert schedule.num_steps == 2
@@ -183,18 +183,8 @@ def test_public_image_step_uses_borrowed_sample_and_input_time():
                 noise_scale=NoiseScale(2, "constant", 1, 3),
                 prediction_dtype=torch.float32,
                 solver=EulerSolver(),
+                grid=LinearGrid(1, direction="ascending", shift_domain="time"),
             )
-
-        def make_schedules(self, steps, *, shift, device):
-            return {
-                "image": make_schedule(
-                    steps,
-                    shift=1 if shift is None else shift,
-                    direction="ascending",
-                    shift_domain="time",
-                    device=device,
-                )
-            }
 
         def forward(self, inputs, *, state, constants, workspace):
             outputs = []

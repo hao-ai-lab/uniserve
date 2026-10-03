@@ -75,7 +75,7 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
                 sigmas[index], torch.tensor(expected), rtol=0, atol=1e-7
             )
         assert sigmas[8] == 0
-    with pytest.raises(ValueError, match="8 evaluations"):
+    with pytest.raises(ValueError, match="evaluates the network 8 times"):
         model.denoiser.make_schedules(4, shift=None, device="cpu")
 
 

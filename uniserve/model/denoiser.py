@@ -7,7 +7,7 @@ from typing import Any, Generic, Protocol, TypeVar
 import torch
 from torch import nn
 
-from uniserve.diffusion import NoiseScale, Schedule, Solver
+from uniserve.diffusion import Grid, NoiseScale, Schedule, Solver
 from uniserve.distributed import DeviceMesh
 from uniserve.media import image
 from uniserve.nn.functional import patchify
@@ -36,7 +36,10 @@ VideoSizeT = TypeVar("VideoSizeT", bound=VideoSize)
 class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
     """A network prediction.
 
-    With explicit solver and mathematical partitioning.
+    With explicit solver, evaluation grids and mathematical partitioning.
+    ``grids`` declares each modality's ``Grid``; every modality's trajectory
+    evaluates the network equally often, so the grids either all fix the
+    same step count or all leave it to requests.
     """
 
     def __init__(
@@ -45,6 +48,7 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
         modalities: tuple[str, ...],
         prediction_dtype: torch.dtype,
         solver: Solver,
+        grids: Mapping[str, Grid],
     ):
         super().__init__()
         if (
@@ -55,11 +59,20 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
             raise ValueError(
                 "denoiser modalities must be distinct nonempty names"
             )
+        if set(grids) != set(modalities) or any(
+            not isinstance(grid, Grid) for grid in grids.values()
+        ):
+            raise ValueError("a denoiser declares one grid per modality")
+        if len({grid.num_steps for grid in grids.values()}) != 1:
+            raise ValueError(
+                "every modality's grid must evaluate the network equally often"
+            )
         self.modalities, self.prediction_dtype, self.solver = (
             modalities,
             prediction_dtype,
             solver,
         )
+        self.grids = dict(grids)
         self.mesh = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0)
 
     @property
@@ -79,15 +92,32 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
         """
         raise NotImplementedError
 
-    @abstractmethod
-    def make_schedules(
-        self, steps: int, *, shift: float | None, device: torch.device | str
-    ) -> Mapping[str, Schedule]:
-        """Construct complete schedules.
+    @property
+    def num_steps(self) -> int | None:
+        """Network evaluations of a trajectory, None when requests choose."""
+        return next(iter(self.grids.values())).num_steps
 
-        Using this network's time parameterization.
+    def make_schedules(
+        self,
+        steps: int | None,
+        *,
+        shift: float | None,
+        device: torch.device | str,
+    ) -> Mapping[str, Schedule]:
+        """Build every modality's schedule for a request.
+
+        ``steps`` and ``shift`` are the request's choices, None leaving a
+        parameter to the grids (``Grid.schedule``).
+
+        Raises:
+            ValueError: A grid does not admit the requested parameters.
         """
-        raise NotImplementedError
+        return {
+            name: self.grids[name].schedule(
+                steps=steps, shift=shift, device=device
+            )
+            for name in self.modalities
+        }
 
     def layout_size(self, size: SizeT) -> SizeT:
         """Return the smallest layout that holds ``size``.
@@ -160,17 +190,17 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     """A standalone denoiser that generates a video timeline from text features.
 
     A request is sized by its output frame count, frame raster and prompt
-    length. The network
-    fixes its step count, rounds a requested duration to its native windows,
-    and describes the request state and outputs that the caller's storage
-    holds; the caller advances the fixed schedule and supplies each step's
-    borrowed tensors to ``bind_inputs``.
+    length. The network's grids fix its step count (``num_steps``); it rounds
+    a requested duration to its native windows and describes the request
+    state and outputs that the caller's storage holds; the caller advances
+    the fixed schedule and supplies each step's borrowed tensors to
+    ``bind_inputs``.
     """
 
-    @property
-    def num_steps(self) -> int:
-        """Number of denoising steps in the network's fixed schedule."""
-        raise NotImplementedError
+    def __init__(self, **options):
+        super().__init__(**options)
+        if self.num_steps is None:
+            raise ValueError("a video denoiser fixes its step count")
 
     @property
     def text_condition_width(self) -> int:
@@ -268,11 +298,13 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
         noise_scale: NoiseScale,
         prediction_dtype: torch.dtype,
         solver: Solver,
+        grid: Grid,
     ):
         super().__init__(
             modalities=("image",),
             prediction_dtype=prediction_dtype,
             solver=solver,
+            grids={"image": grid},
         )
         if any(
             type(value) is not int or value < 1
