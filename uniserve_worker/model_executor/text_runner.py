@@ -553,19 +553,21 @@ class TextRunner(ModelRunner):
         # A prefill that stops after the final layer's cache write skips that
         # layer's experts; inside an expert step the graph joins them, so its
         # replay makes all of the step's exchanges.
+        call = joining_experts(
+            lambda static: (
+                self.hidden_states(static.inputs)
+                if outputs
+                else self.model.fill_cache(static.inputs)
+            ),
+            self.context,
+        )
         return capture_hidden(
             self.context,
             execution,
-            joining_experts(
-                lambda static: (
-                    self.hidden_states(static.inputs)
-                    if outputs
-                    else self.model.fill_cache(static.inputs)
-                ),
-                self.context,
-            ),
+            call,
             pools=self.pools,
             cache=self.cache,
+            warmup=lambda value: self.warm_experts(call, value),
         )
 
     def replay_graph(self, key, execution, batch, *, borrow):

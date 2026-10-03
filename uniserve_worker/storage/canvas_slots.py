@@ -4,12 +4,12 @@ Between two denoising steps a generating canvas keeps its tokens, the argmax
 canvases its stopping rule compares, and the self-conditioning embedding of
 its latest sampling distribution (``uniserve.diffusion.canvas.CanvasState``,
 one row per canvas). ``CanvasSlots`` keeps these rows for every request-pool
-slot in one device bank per field, with a leading slot axis. A pass stages
-the rows of its slots into contiguous row views (``stage``), the sampler
-steps them in place, and ``commit`` writes them back; ``CanvasRunner`` runs
-that numerical flow in chunks of at most ``step_rows`` canvases, whose
-sampler scratch (``CanvasWorkspace``) this owner also holds. Slot ``0`` is
-the padding sentinel, as in ``DecodeState``.
+slot in one device bank per field, with a leading slot axis. A pass gathers
+the rows of its slots into its own contiguous input buffers (``stage``),
+the sampler steps them in place, and ``commit`` writes them back.
+Concurrent executions own separate staging and sampler workspaces while
+sharing these banks for disjoint request slots. Slot ``0`` is the padding
+sentinel, as in ``DecodeState``.
 
 Every canvas uses the one block-diffusion sampling the deployment serves
 (``WorkerConfig.canvas_sampling``): its stability threshold sizes the
@@ -39,8 +39,7 @@ from uniserve.tensors import BufferConfig
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.batch import CanvasSampling
 
-# Sampler state fields kept per slot, each a bank with one row per slot and
-# a staging area with one row per canvas of a pass.
+# Sampler state fields kept per slot, each a bank with one row per slot.
 FIELDS = ("canvas", "history", "self_conditioning")
 # The first value of a canvas step's int64 result row: the step left its
 # block running, stopped it, or was skipped since an earlier step had
@@ -97,7 +96,6 @@ class CanvasSlots:
         self,
         *,
         request_pool_size: int,
-        max_rows: int,
         tokens: CanvasTokens,
         vocab_size: int,
         hidden_size: int,
@@ -105,11 +103,10 @@ class CanvasSlots:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
-        """Allocate the banks, the pass staging and the step workspace.
+        """Allocate the resident sampler state banks.
 
         Args:
             request_pool_size: Number of real request slots.
-            max_rows: Most canvases one pass stages.
             tokens: The length and tokens of the canvases the model
                 generates.
             vocab_size: Vocabulary size of the denoiser's logits.
@@ -131,14 +128,12 @@ class CanvasSlots:
             )
         fields = self.buffers(
             request_pool_size=request_pool_size,
-            max_rows=max_rows,
             canvas_length=tokens.length,
             hidden_size=hidden_size,
             history_depth=sampling.stability_threshold,
             dtype=dtype,
         )
         self.request_pool_size = int(request_pool_size)
-        self.max_rows = int(max_rows)
         self.tokens = tokens
         self.canvas_length = tokens.length
         self.vocab_size = int(vocab_size)
@@ -157,11 +152,6 @@ class CanvasSlots:
             eos_ids=tokens.eos_token_ids,
             pad_id=tokens.pad_token_id,
         )
-        self.step_rows = step_rows(
-            canvas_length=tokens.length,
-            vocab_size=vocab_size,
-            max_rows=max_rows,
-        )
         self.device = torch.device(device)
         self._backing = TensorBuffers.allocate(fields, device=self.device)
         tensors = self._backing.view(fields)
@@ -174,16 +164,6 @@ class CanvasSlots:
         # step it ran last. Step zero sets it, and a step that stops the
         # block clears it.
         self.live = tensors["live"]
-        # One step chunk's sampler scratch, which every chunk of every pass
-        # reuses in stream order.
-        self.workspace = sampler.CanvasWorkspace.empty(
-            self.step_rows,
-            tokens.length,
-            vocab_size,
-            hidden_size,
-            dtype=dtype,
-            device=self.device,
-        )
         # Per slot, the (block, step) it ran last; absent for a slot whose
         # canvas has not started since its request was admitted.
         self._last: dict[int, tuple[int, int]] = {}
@@ -194,7 +174,6 @@ class CanvasSlots:
         denoiser: TokenDenoiser,
         *,
         request_pool_size: int,
-        max_rows: int,
         sampling: CanvasSampling,
         device: torch.device | str,
     ) -> CanvasSlots:
@@ -205,7 +184,6 @@ class CanvasSlots:
         """
         return cls(
             request_pool_size=request_pool_size,
-            max_rows=max_rows,
             sampling=sampling,
             device=device,
             **denoiser_fields(denoiser),
@@ -217,56 +195,36 @@ class CanvasSlots:
         denoiser: TokenDenoiser,
         *,
         request_pool_size: int,
-        max_rows: int,
         history_depth: int,
-        device_type: str,
     ) -> int:
         """Device bytes of the slots ``for_denoiser`` allocates.
 
-        The banks and their staging (``buffers``) and one step chunk's
-        ``CanvasWorkspace`` on a device of type ``device_type``. Startup
-        sizing (``bootstrap.report``) charges them without an instance.
+        Startup sizing charges the banks without an instance. Per-execution
+        staging and sampler workspaces are charged by ``CanvasRunner``.
         """
         fields = denoiser_fields(denoiser)
         tokens = fields.pop("tokens")
-        vocab_size = fields.pop("vocab_size")
+        fields.pop("vocab_size")
         buffers = cls.buffers(
             request_pool_size=request_pool_size,
-            max_rows=max_rows,
             canvas_length=tokens.length,
             history_depth=history_depth,
             **fields,
         )
-        rows = step_rows(
-            canvas_length=tokens.length,
-            vocab_size=vocab_size,
-            max_rows=max_rows,
-        )
-        return sum(
-            config.nbytes for config in buffers.values()
-        ) + sampler.CanvasWorkspace.nbytes(
-            rows,
-            tokens.length,
-            vocab_size,
-            fields["hidden_size"],
-            dtype=fields["dtype"],
-            device_type=device_type,
-        )
+        return sum(config.nbytes for config in buffers.values())
 
     @staticmethod
     def buffers(
         *,
         request_pool_size: int,
-        max_rows: int,
         canvas_length: int,
         hidden_size: int,
         history_depth: int,
         dtype: torch.dtype,
     ) -> dict[str, BufferConfig]:
-        """Describe the banks and their staging, by name.
+        """Describe the resident banks by name.
 
-        Each field's bank has one row per slot and the sentinel, and its
-        staging (``staged_<field>``) one row per canvas of a pass. A row of
+        Each field's bank has one row per slot and the sentinel. A row of
         ``canvas`` holds int64 tokens ``[canvas]``, of ``history`` the int64
         argmax canvases ``[history_depth, canvas]``, and of
         ``self_conditioning`` the embeddings ``[canvas, hidden]``. ``live``
@@ -277,30 +235,26 @@ class CanvasSlots:
                 is negative.
         """
         if (
-            min(request_pool_size, max_rows, canvas_length) < 1
+            min(request_pool_size, canvas_length) < 1
             or hidden_size < 1
             or history_depth < 0
         ):
             raise ValueError("canvas state dimensions must be positive")
-        counts = {"": int(request_pool_size) + 1, "staged_": int(max_rows)}
+        count = int(request_pool_size) + 1
         return {
-            f"{prefix}{name}": config
-            for prefix, count in counts.items()
-            for name, config in {
-                "canvas": BufferConfig((count, canvas_length), torch.int64),
-                "history": BufferConfig(
-                    (count, history_depth, canvas_length), torch.int64
-                ),
-                "self_conditioning": BufferConfig(
-                    (count, canvas_length, hidden_size), dtype
-                ),
-            }.items()
-        } | {"live": BufferConfig((counts[""],), torch.uint8)}
+            "canvas": BufferConfig((count, canvas_length), torch.int64),
+            "history": BufferConfig(
+                (count, history_depth, canvas_length), torch.int64
+            ),
+            "self_conditioning": BufferConfig(
+                (count, canvas_length, hidden_size), dtype
+            ),
+            "live": BufferConfig((count,), torch.uint8),
+        }
 
     def close(self) -> None:
-        """Release the banks and the workspace once every reader has retired."""
+        """Release the banks once every reader has retired."""
         self.banks = {}
-        self.workspace = None
         self._backing.close()
 
     def sampling(self, admitted: CanvasSampling) -> sampler.CanvasSampling:
@@ -350,54 +304,43 @@ class CanvasSlots:
         for slot in slots:
             self._last.pop(int(slot), None)
 
-    def stage(self, slots: torch.Tensor, depth: int) -> dict[str, torch.Tensor]:
-        """Gather the state of ``slots`` into contiguous row views.
+    def stage(
+        self, slots: torch.Tensor, views: dict[str, torch.Tensor]
+    ) -> None:
+        """Gather the state of ``slots`` into caller-owned contiguous views.
 
-        ``slots`` is a device int64 ``[rows]`` vector. Returns, per field,
-        the staging's leading rows in slot order: ``canvas`` ``[rows,
+        ``slots`` is a device int64 ``[rows]`` vector. The views hold, per
+        field, the rows in slot order: ``canvas`` ``[rows,
         canvas]``, ``history`` ``[rows, depth, canvas]`` holding each slot's
         first ``depth`` argmax canvases, and ``self_conditioning`` ``[rows,
-        canvas, hidden]``. The views stay valid until the next ``stage``.
-
-        Raises:
-            ValueError: When the rows exceed the staging or ``depth`` the
-                history.
+        canvas, hidden]``. Concurrent callers must supply distinct storage
+        and own disjoint real request slots until their commits complete.
         """
-        rows = int(slots.numel())
-        if (
-            not 0 < rows <= self.max_rows
-            or not 0 <= depth <= self.history_depth
-        ):
-            raise ValueError("canvas rows exceed the staged sampler state")
-        shapes = {
-            "canvas": (rows, self.canvas_length),
-            "history": (rows, depth, self.canvas_length),
-            "self_conditioning": (rows, self.canvas_length, self.hidden_size),
-        }
-        staged = self._backing.view(
-            {
-                f"staged_{name}": BufferConfig(shape, self.banks[name].dtype)
-                for name, shape in shapes.items()
-            }
-        )
-        views = {name: staged[f"staged_{name}"] for name in FIELDS}
         for name, view in views.items():
             bank = self.banks[name]
             if name == "history":
-                bank = bank[:, :depth]
+                bank = bank[:, : view.shape[1]]
             torch.index_select(bank, 0, slots, out=view)
-        return views
 
     def commit(
-        self, slots: torch.Tensor, views: dict[str, torch.Tensor]
+        self,
+        slots: torch.Tensor,
+        views: dict[str, torch.Tensor],
+        *,
+        live: torch.Tensor,
     ) -> None:
-        """Write staged row views back to the banks' rows of ``slots``."""
-        for name, values in views.items():
-            bank = self.banks[name]
+        """Commit active rows and continuation flags; zero slots never write."""
+        from uniserve_kernels.diffusion.canvas import commit_rows
+
+        for name, values in (*views.items(), ("live", live)):
+            bank = self.live if name == "live" else self.banks[name]
             if name == "history":
-                bank[slots, : values.shape[1]] = values
+                bank = bank[:, : values.shape[1]]
+            if bank.is_cuda:
+                commit_rows(bank, slots, values)
             else:
-                bank.index_copy_(0, slots, values)
+                selected = slots > 0
+                bank[slots[selected]] = values[selected]
 
     def _validate(self, slots: Sequence[int]) -> None:
         if any(not 1 <= int(slot) <= self.request_pool_size for slot in slots):

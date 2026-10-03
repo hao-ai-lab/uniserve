@@ -361,7 +361,7 @@ def local_product_storage_bytes(
             producer = bindings.get(entry)
             produces = (
                 producer is not None
-                and producer.process_group.global_rank in producer.output_ranks
+                and producer.process_group.rank in producer.output_ranks
             )
             consumes = any(
                 consumer in bindings and bindings[consumer].owns

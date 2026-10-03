@@ -325,10 +325,12 @@ class WorkerConfig:
     device: str = "cpu"
     rank: int = 0
     world_size: int = 1
+    role: str = "model"
     # How an expert-parallel replica exchanges tokens at every expert layer:
     # "alltoall" (NVLink all-to-all around the grouped expert kernel) or
     # "megamoe" (the fused MegaMoE kernel, NVFP4 experts).
     expert_exchange: str = "alltoall"
+    expert_microbatches: int = 1
     # Tokens per KV page of the cache group with the widest token rows; None
     # until resolved.
     block_size: int | None = None
@@ -395,6 +397,15 @@ class WorkerConfig:
         """
         if self.graph_policy not in {"off", "auto", "full"}:
             raise invalid_descriptor("graph policy must be off, auto, or full")
+        if self.role not in {"model", "experts"}:
+            raise invalid_descriptor("worker role must be model or experts")
+        if (
+            type(self.expert_microbatches) is not int
+            or not 1 <= self.expert_microbatches <= 4
+        ):
+            raise invalid_descriptor(
+                "expert microbatches must be from one to four"
+            )
         if not self.device:
             raise invalid_descriptor("worker device must be named")
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
@@ -475,6 +486,13 @@ def worker_config_from_namespace(
             ``WorkerConfig`` invariant.
     """
     expert_parallel = getattr(namespace, "expert_parallel", None) or {}
+    microbatches = getattr(namespace, "expert_microbatches", 1)
+    if type(microbatches) is not int or not 1 <= microbatches <= 4:
+        raise ValueError(
+            "expert_microbatches must be an integer from one to four"
+        )
+    if microbatches > 1 and not expert_parallel.get("attention_ranks", 0):
+        raise ValueError("expert microbatches require disaggregated experts")
     prefill_tokens = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
     if (
         expert_parallel
@@ -539,6 +557,8 @@ def worker_config_from_namespace(
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
         prefill_outputs=bool(getattr(namespace, "prefill_outputs", True)),
         expert_exchange=str(expert_parallel.get("exchange", "alltoall")),
+        expert_microbatches=microbatches,
+        role=str(getattr(namespace, "role", "model")),
         flow_cuda_graph=bool(getattr(namespace, "flow_cuda_graph", True)),
         prefill_graph_token_sizes=_parse_positive_int_csv(
             namespace.prefill_graph_token_sizes,

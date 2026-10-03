@@ -27,7 +27,7 @@ mod sim;
 pub mod storage;
 mod worker;
 
-pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank};
+pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank, WorkerRole};
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, ParallelConfig,

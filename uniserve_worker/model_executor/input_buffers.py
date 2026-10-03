@@ -271,6 +271,19 @@ class InputBuffers:
         self._request_host.close()
         self._backing.close()
 
+    def validate_rows(self, rows):
+        """Check types and capacity before staging or partitioning rows."""
+        if not 0 < len(rows) <= self.max_rows:
+            raise ValueError("row count exceeds input-buffer capacity")
+        if any(not isinstance(row, self.row_type) for row in rows):
+            types = (
+                self.row_type
+                if isinstance(self.row_type, tuple)
+                else (self.row_type,)
+            )
+            names = " or ".join(kind.__name__ for kind in types)
+            raise TypeError(f"this staging requires {names} inputs")
+
     def prepare_inputs(self, rows, *, forward_mode, **numerical):
         """Stage one numerical call and retain its output request slots.
 
@@ -291,16 +304,7 @@ class InputBuffers:
             WorkerError: ``row_tables`` rejects the rows while attention
                 is built from ``cache`` and ``tables``.
         """
-        if not 0 < len(rows) <= self.max_rows:
-            raise ValueError("row count exceeds input-buffer capacity")
-        if any(not isinstance(row, self.row_type) for row in rows):
-            types = (
-                self.row_type
-                if isinstance(self.row_type, tuple)
-                else (self.row_type,)
-            )
-            names = " or ".join(kind.__name__ for kind in types)
-            raise TypeError(f"this staging requires {names} inputs")
+        self.validate_rows(rows)
         # Token rows of any ForwardMode share one staging layout; a media row
         # must match the call kind exactly.
         if any(
@@ -371,6 +375,11 @@ class AttentionBuffers(InputBuffers):
     def close(self):
         self._row_host.close()
         super().close()
+
+    def validate_rows(self, rows):
+        super().validate_rows(rows)
+        if sum(row.query_tokens for row in rows) > self.max_tokens:
+            raise ValueError("query tokens exceed input-buffer capacity")
 
     def stage_rows(self, rows, *, tables, cache):
         """Stage the attention columns of token rows from their slots' tables.
@@ -750,6 +759,11 @@ class TokenBuffers(AttentionBuffers):
         self._finish_host.close()
         super().close()
 
+    def validate_rows(self, rows):
+        super().validate_rows(rows)
+        if sum(row.query_tokens for row in rows) > self.max_text_tokens:
+            raise ValueError("text token count exceeds input-buffer capacity")
+
     def _prepare_inputs(
         self, rows, *, attention=None, cache=None, tables=None, states=None
     ):
@@ -1064,6 +1078,7 @@ class CanvasBuffers(AttentionBuffers):
         # Candidate matrix and selection indices share one int64 backing.
         self._candidates = torch.empty(0, dtype=torch.int64, device=self.device)
         self._canvas_slots = None
+        self._canvas_backing = None
         # Pinned sources of the step columns, which stage with one copy.
         self._step_host = HostBuffers(
             self.step_columns.shape,
@@ -1074,11 +1089,38 @@ class CanvasBuffers(AttentionBuffers):
 
     def close(self):
         self._step_host.close()
+        if self._canvas_backing is not None:
+            self._canvas_backing.close()
         super().close()
 
     def bind_canvas_slots(self, slots) -> None:
         """Borrow the resident sampler state that canvas steps stage from."""
         self._canvas_slots = slots
+        self._canvas_backing = TensorBuffers.allocate(
+            self.sampler_buffers(
+                max_rows=min(self.max_rows, slots.request_pool_size),
+                canvas_length=slots.canvas_length,
+                hidden_size=slots.hidden_size,
+                history_depth=slots.history_depth,
+                dtype=slots.banks["self_conditioning"].dtype,
+            ),
+            device=self.device,
+        )
+
+    @staticmethod
+    def sampler_buffers(
+        *, max_rows, canvas_length, hidden_size, history_depth, dtype
+    ):
+        """Contiguous sampler input storage owned by one execution stream."""
+        return {
+            "canvas": BufferConfig((max_rows, canvas_length), torch.int64),
+            "history": BufferConfig(
+                (max_rows, history_depth, canvas_length), torch.int64
+            ),
+            "self_conditioning": BufferConfig(
+                (max_rows, canvas_length, hidden_size), dtype
+            ),
+        }
 
     def _prepare_inputs(
         self, rows, *, attention=None, cache=None, tables=None, states=None
@@ -1211,7 +1253,18 @@ class CanvasBuffers(AttentionBuffers):
 
         # The staged canvases are the model's input tokens, and their
         # self-conditioning rows its self-conditioning input, back to back.
-        views = state.stage(vectors["step_slots"], depths.pop())
+        views = dict(
+            self._canvas_backing.view(
+                self.sampler_buffers(
+                    max_rows=count,
+                    canvas_length=length,
+                    hidden_size=state.hidden_size,
+                    history_depth=depths.pop(),
+                    dtype=state.banks["self_conditioning"].dtype,
+                )
+            )
+        )
+        state.stage(vectors["step_slots"], views)
         self_conditioning = views["self_conditioning"].view(
             count * length, state.hidden_size
         )

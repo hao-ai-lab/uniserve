@@ -580,10 +580,15 @@ impl WorkerInfo {
             );
         }
 
-        // Capability and scheduling limits must describe a usable worker.
+        // A collective-only participant owns no request components or KV.
+        // It remains addressable for progress, failure and shutdown.
         ensure_valid!(
-            !self.supported_calls.is_empty(),
-            "worker info declares no call kinds"
+            !self.supported_calls.is_empty()
+                || (self.components.is_empty()
+                    && self.kv_cache.is_none()
+                    && self.latent_pages == 0
+                    && self.media_components.is_empty()),
+            "a worker without call kinds must own no request computation"
         );
         ensure_valid!(
             self.supported_calls

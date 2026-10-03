@@ -65,6 +65,8 @@ pub struct WorkerProcessArgs {
     /// whose placement node matches it, so a placement may name its host
     /// explicitly instead of relying on a reserved local name.
     pub host: String,
+    /// Whether this group owns model capabilities or shared routed experts.
+    pub role: crate::WorkerRole,
     /// Component membership and parallel geometry.
     pub components: std::collections::BTreeMap<String, crate::ComponentConfig>,
     /// Every worker's component membership, keyed by worker identity, this
@@ -198,6 +200,8 @@ pub struct WorkerProcessArgs {
     /// replica joins, when the deployment shards routed experts across the
     /// replicas; `None` keeps every expert on the group's own ranks.
     pub expert_parallel: Option<ExpertParallelPlacement>,
+    /// Independent numerical microbatches overlapping attention and remote experts.
+    pub expert_microbatches: u32,
 }
 
 /// How replicas access distributed experts: token exchange or weight prefetch.
@@ -213,23 +217,24 @@ pub enum ExpertExchange {
     /// and combines in one launch per layer over NVSHMEM; NVFP4 experts only.
     #[serde(rename = "megamoe")]
     MegaMoe,
+    /// Elastic source/expert dispatch and combine with grouped expert compute.
+    #[serde(rename = "deepep")]
+    DeepEp,
     /// Independent data-parallel execution with asynchronous peer weight
     /// prefetch into double buffers. Inference has no rank collectives.
     #[serde(rename = "dwdp")]
     Dwdp,
 }
 
-/// One single-rank replica's place in an expert-parallel world.
-///
-/// The world's ranks are the data-parallel replicas in order: replica `rank`
-/// of `size` keeps routed experts `[rank * E / size, (rank + 1) * E / size)`
-/// and exchanges tokens with the other replicas at every expert layer.
+/// A worker group's consecutive ranks in the deployment's expert union.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ExpertParallelPlacement {
-    /// The replica's rank in the expert-parallel world.
+    /// The group's first physical rank in the expert union.
     pub rank: u32,
-    /// Number of replicas sharing the experts.
+    /// Number of physical ranks sharing the experts.
     pub size: u32,
+    /// Leading source-only ranks; zero for colocated expert parallelism.
+    pub attention_ranks: u32,
     /// TCP address of the world's rendezvous store. `WorkerGroup::spawn_all`
     /// reserves it once the deployment's hosts are known; world rank 0 serves
     /// it on a socket the head binds.
