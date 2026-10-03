@@ -74,14 +74,14 @@ def test_pixel_packing_matches_the_checkpoint_processor(num_frames):
         dtype=torch.uint8,
         generator=torch.Generator().manual_seed(127),
     )
-    options = dict(
-        patch_size=config.patch_size,
-        temporal_patch_size=config.temporal_patch_size,
-        merge_size=config.spatial_merge_size,
-        size={"shortest_edge": 384, "longest_edge": 384},
-        image_mean=pixels.mean,
-        image_std=pixels.std,
-    )
+    options = {
+        "patch_size": config.patch_size,
+        "temporal_patch_size": config.temporal_patch_size,
+        "merge_size": config.spatial_merge_size,
+        "size": {"shortest_edge": 384, "longest_edge": 384},
+        "image_mean": pixels.mean,
+        "image_std": pixels.std,
+    }
     # Nonaligned spatial extents require resizing, and the odd video length
     # requires repeating its final frame to fill the last temporal patch.
     if num_frames == 1:
