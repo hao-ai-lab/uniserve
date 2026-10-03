@@ -215,7 +215,7 @@ def test_image_processing_metadata_has_resolved_token_identities(
     assert injection.start_token_id == 1
     assert injection.end_token_id == 2
     assert config.image_processor.vit.patch_size == 2
-    assert config.image_processor.vit.downsample_ratio == 0.5
+    assert config.image_processor.vit.downsample == 2
     assert config.flow_prompt is not None
     assert load_tokenizer(config.tokenizer).convert_tokens_to_ids("<img>") == 1
 

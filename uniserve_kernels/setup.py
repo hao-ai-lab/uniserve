@@ -90,6 +90,27 @@ def _cuda_extensions():
                 "nvcc": ["-O3", "-std=c++20"],
             },
         ),
+        # SM100a block-diffusion canvas steps and their cuBLASLt
+        # self-conditioning product. The sources compile without fast math:
+        # the Gumbel scores use the accurate logf, and the divisions and
+        # temperature use explicit round-to-nearest intrinsics.
+        CUDAExtension(
+            "uniserve_kernels.diffusion._canvas",
+            [
+                _source("diffusion", "csrc", "canvas.cu"),
+                _source("diffusion", "csrc", "product.cpp"),
+            ],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20"],
+                "nvcc": [
+                    "-O3",
+                    "-std=c++20",
+                    "--expt-relaxed-constexpr",
+                    "-gencode=arch=compute_100a,code=sm_100a",
+                ],
+            },
+            libraries=["cublasLt"],
+        ),
     ]
 
 
