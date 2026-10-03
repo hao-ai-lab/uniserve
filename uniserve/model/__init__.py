@@ -20,7 +20,13 @@ from .inputs import (
 from .logits import Logits, VocabShard
 from .text import CausalLM
 from .transformer import TransformerDecoder, TransformerEncoder
-from .video import AudioDecoder, VideoDecoder, VideoPostprocessor
+from .video import (
+    AudioDecoder,
+    AudioEncoder,
+    VideoDecoder,
+    VideoEncoder,
+    VideoPostprocessor,
+)
 
 __all__ = [
     "DenoiserInput",
@@ -43,7 +49,9 @@ __all__ = [
     "VideoSize",
     "ImageDecoder",
     "AudioDecoder",
+    "AudioEncoder",
     "VideoDecoder",
+    "VideoEncoder",
     "VideoPostprocessor",
     "Encoder",
     "PatchEncoder",
