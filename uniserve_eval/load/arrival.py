@@ -1,4 +1,4 @@
-"""Executes warmup and measured loads with immediate or Poisson arrivals.
+"""Executes immediate, Poisson, or closed-loop session arrivals.
 
 ``run_point`` drives one benchmark point through ``run_load`` with a
 ``submit`` coroutine that builds and sends one request. This module owns only
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, Callable, Coroutine
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -28,11 +28,19 @@ Submit = Callable[[Example, float | None], Coroutine[Any, Any, T]]
 
 @dataclass(frozen=True)
 class LoadResult:
-    """Contains warmup outputs, measured outputs, and measured duration."""
+    """Contains warmup outputs, measured outputs, and the measured window.
+
+    ``window_start`` and ``window_end`` are wall-clock ``time.time()``
+    seconds bounding the measured window, for aligning it with telemetry
+    sampled on that clock; ``duration_s`` is the same window measured on
+    the monotonic clock.
+    """
 
     warmup_outputs: tuple[Any, ...]
     outputs: tuple[Any, ...]
     duration_s: float
+    window_start: float = 0.0
+    window_end: float = 0.0
 
 
 class WarmupFailure(RuntimeError):  # noqa: N818  # deliberate taxonomy name
@@ -88,17 +96,23 @@ async def run_load(
     warmup_requests: int = 1,
     warmup_rows: list[Example] | None = None,
     inspect_warmup: Callable[[list[T]], None] | None = None,
+    before_measure: Callable[[], Awaitable[None]] | None = None,
 ) -> LoadResult:
     """Run excluded warmup and measured requests under a concurrency limit.
 
     Warmup sends ``rows[0]`` ``warmup_requests`` times concurrently, within
     the concurrency limit. The measured phase then submits every row once at
-    its arrival time and waits for all of them.
+    its arrival time and waits for all of them. When every row has a
+    ``session_id``, sessions run concurrently and each awaits its previous
+    response before submitting its next row. Session traces require an
+    infinite request rate, zero repeated-row warmup, and, if specified, a
+    concurrency equal to their session count. Initial cold requests are
+    measured as part of the trace.
 
     Args:
         rows: Examples in submission order.
         request_rate: Mean arrivals per second; ``inf`` submits all rows at
-            once.
+            once, or starts all declared closed-loop sessions.
         max_concurrency: Maximum in-flight submissions, or ``None`` (or
             ``0``) for no limit.
         submit: Coroutine that sends one example; see ``Submit``.
@@ -106,6 +120,8 @@ async def run_load(
         warmup_rows: Explicit excluded corpus, replacing first-row repetition.
         inspect_warmup: Inspect excluded outputs after their slots are released
             and before checking warmup success.
+        before_measure: Coroutine awaited before the measured window opens;
+            the runner snapshots server counters there.
 
     Returns:
         Warmup and measured outputs in submission order, and the measured
@@ -123,6 +139,28 @@ async def run_load(
     """
     if not rows:
         return LoadResult((), (), 0.0)
+
+    sessions: dict[str, list[tuple[int, Example]]] = {}
+    if any(getattr(row, "session_id", None) is not None for row in rows):
+        if request_rate != float("inf"):
+            raise ValueError(
+                "closed-loop sessions require infinite request_rate"
+            )
+        for index, row in enumerate(rows):
+            if not row.session_id:
+                raise ValueError(
+                    "closed-loop sessions require every session_id"
+                )
+            sessions.setdefault(row.session_id, []).append((index, row))
+        if max_concurrency and len(sessions) != max_concurrency:
+            raise ValueError(
+                "closed-loop session count must equal max_concurrency"
+            )
+        if warmup_requests:
+            raise ValueError(
+                "session traces require warmup_requests=0; "
+                "include each session's initial cold request in the trace"
+            )
 
     # Warmup and measurement share the declared in-flight limit. The arrival
     # timestamp is taken before the semaphore, so time queued here appears
@@ -152,11 +190,47 @@ async def run_load(
         ):
             raise WarmupFailure(list(warmup_outputs))
 
+    if before_measure is not None:
+        await before_measure()
+    # Align monotonic transport timestamps with wall-clock GPU telemetry.
+    clock_offset = time.time() - time.perf_counter()
+
     tasks: list[asyncio.Task[T]] = []
     try:
-        async for row in get_request(rows, request_rate):
-            tasks.append(asyncio.create_task(limited(row, time.perf_counter())))
-        outputs = await asyncio.gather(*tasks)
+        if sessions:
+
+            async def run_session(
+                sequence: list[tuple[int, Example]],
+            ) -> list[tuple[int, T]]:
+                completed = []
+                for index, row in sequence:
+                    # Arrival follows this client's previous completion;
+                    # another client's speed cannot advance its trace.
+                    output = await submit(row, time.perf_counter())
+                    completed.append((index, output))
+                return completed
+
+            session_tasks = [
+                asyncio.create_task(run_session(sequence))
+                for sequence in sessions.values()
+            ]
+            try:
+                completed = await asyncio.gather(*session_tasks)
+            except BaseException:
+                for task in session_tasks:
+                    task.cancel()
+                await asyncio.gather(*session_tasks, return_exceptions=True)
+                raise
+            ordered = sorted(
+                item for sequence in completed for item in sequence
+            )
+            outputs = [output for _, output in ordered]
+        else:
+            async for row in get_request(rows, request_rate):
+                tasks.append(
+                    asyncio.create_task(limited(row, time.perf_counter()))
+                )
+            outputs = await asyncio.gather(*tasks)
     except BaseException:
         # ``gather`` leaves sibling tasks running when one raises. They are
         # cancelled and awaited here, so no submission outlives the failed
@@ -173,9 +247,12 @@ async def run_load(
         if output.final_event_time is None:
             raise RuntimeError("request dispatch returned an unclosed record")
         ends.append(output.final_event_time)
-    duration = max(ends) - min(output.start_time for output in outputs)
+    first = min(output.start_time for output in outputs)
+    last = max(ends)
     return LoadResult(
         tuple(warmup_outputs),
         tuple(outputs),
-        duration,
+        last - first,
+        clock_offset + first,
+        clock_offset + last,
     )
