@@ -17,7 +17,7 @@ from safetensors.torch import save_file
 
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve_models.minimax_h3 import video_vae
 from uniserve_models.minimax_h3.encoding import VideoEncoder
 
@@ -79,7 +79,7 @@ def test_video_reconstruction_matches_independent_transformer_and_crop(
         )
 
     model = loading.load_model(
-        lambda config: video_vae.Model(config, frame_size=image.Config(8, 12)),
+        video_vae.Model,
         config,
         checkpoint=(
             checkpoint.Config().resolve(tmp_path, io=loading.Config()),
@@ -182,7 +182,9 @@ def test_unit_encoding_assembles_the_native_whole_video_conditioning(
 
     # Encode every unit in its own call, last first, as separate ranks would,
     # and place each result's rows where its layout says they belong.
-    layout = model.output_layout(num_frames, image.Config(272, 20))["video"]
+    layout = model.output_layout(
+        video.Config(num_frames, image.Config(272, 20))
+    )["video"]
     assembled = torch.full(layout.shape, torch.nan)
     for unit in reversed(model.frame_slices(num_frames)):
         (result,) = model.encode(
