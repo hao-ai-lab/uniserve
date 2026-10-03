@@ -129,9 +129,10 @@ impl EngineClient {
         self.core.generation_limits()
     }
 
-    /// Returns the fixed media prediction count advertised by the loaded model.
-    pub fn denoise_steps(&self) -> u32 {
-        self.core.info().denoise_steps()
+    /// Returns what the deployment's video denoiser serves, as its worker
+    /// reported at startup; `None` for a model without one.
+    pub fn video_denoiser(&self) -> Option<uniserve_engine::VideoDenoiserInfo> {
+        self.core.info().video_denoiser.clone()
     }
 
     /// Returns whether the worker supports token sampling calls.

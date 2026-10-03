@@ -220,6 +220,43 @@ def summarize(
             ],
             scale=1000,
         )
+        summary.update(_server_timings(successful))
+    return summary
+
+
+def _server_timings(successful: list[RequestRecord]) -> dict[str, Any]:
+    """Summarize the timings video servers reported for their requests.
+
+    Each value keeps the reporting server's own definition; a stage that
+    only some requests report is summarized over those. Keys are absent
+    when no request reported the value.
+    """
+    summary: dict[str, Any] = {}
+    inference = [
+        record.server_inference_s
+        for record in successful
+        if record.server_inference_s is not None
+    ]
+    if inference:
+        summary["server_inference_ms"] = distribution(inference, scale=1000)
+
+    stages: dict[str, list[float]] = {}
+    for record in successful:
+        for name, seconds in record.server_stage_s.items():
+            stages.setdefault(name, []).append(seconds)
+    if stages:
+        summary["server_stage_ms"] = {
+            name: distribution(values, scale=1000)
+            for name, values in stages.items()
+        }
+
+    peaks = [
+        record.server_peak_memory_mib
+        for record in successful
+        if record.server_peak_memory_mib is not None
+    ]
+    if peaks:
+        summary["server_peak_memory_mib"] = max(peaks)
     return summary
 
 
