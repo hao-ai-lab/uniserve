@@ -32,7 +32,7 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
     )
     module = vsa.BlockAttention(width**-0.5)
     batch = vsa.BlockInput(
-        vsa.Pattern(((2, 2, 2, 2),), 0, 0), indices, counts, valid_sizes, 0
+        vsa.Pattern(((2, 2, 2, 2),), 0, 0, 64), indices, counts, valid_sizes, 0
     )
     with ExecutionContext(module) as context:
         context.prepare(None)
@@ -90,7 +90,15 @@ def test_sparse_query_partitions_preserve_complete_key_attention(heads):
     def attend(q, k, v, selected, selected_counts):
         out = torch.empty_like(q)
         vsa_native.block_sparse_attention(
-            q, k, v, out, selected, selected_counts, valid, scale=scale
+            q,
+            k,
+            v,
+            out,
+            selected,
+            selected_counts,
+            valid,
+            scale=scale,
+            block=64,
         )
         return out
 
@@ -133,6 +141,7 @@ def test_sparse_query_partitions_preserve_complete_key_attention(heads):
             tail_counts,
             valid,
             scale=scale,
+            block=64,
         )
     for _ in range(2):
         graph.replay()
@@ -197,3 +206,70 @@ def test_fused_composition_restores_each_rows_head_interval(members):
             rtol=2e-2,
             atol=2e-2,
         )
+
+
+@pytest.mark.parametrize("heads", [7, 14])
+def test_block128_attention_attends_selected_blocks_of_valid_keys(heads):
+    from uniserve_kernels.attention import vsa_native
+
+    if not vsa_native.supported():
+        pytest.skip("the native sparse kernel requires SM100")
+
+    torch.manual_seed(321)
+    tile, width = 128, 128
+    # An odd tile count, partial tiles and one empty tile.
+    valid = torch.tensor(
+        [128, 1, 77, 0, 128, 128, 40], device="cuda", dtype=torch.int32
+    )
+    tiles = valid.numel()
+    rows = tiles * tile
+    # Interleaved projections exercise strided Q/K/V rows.
+    projected = torch.randn(
+        rows, heads, 3, width, device="cuda", dtype=torch.bfloat16
+    )
+    query, key, value = projected.unbind(2)
+    # Each head keeps its own key blocks; the empty tile attends nothing.
+    generator = torch.Generator().manual_seed(5)
+    selected = torch.rand(heads, tiles, tiles, generator=generator) < 0.5
+    selected[:, :, 0] = True
+    selected[:, :, 3] = False
+    selected[:, 3, :] = False
+    selected = selected.cuda()
+    counts = selected.sum(-1, dtype=torch.int32)
+    keys = torch.where(selected, torch.arange(tiles, device="cuda"), tiles)
+    indices = keys.sort(-1).values.clamp_max(tiles - 1).to(torch.int32)
+
+    module = vsa.BlockAttention(width**-0.5, tile_size=tile)
+    batch = vsa.BlockInput(
+        vsa.Pattern(((tiles,) * tiles,), 0, 0, tile),
+        indices,
+        counts,
+        valid,
+        0,
+    )
+    with ExecutionContext(module) as context:
+        context.prepare(None)
+        actual = module(query, key, value, batch)
+
+    live = torch.arange(rows, device="cuda") % tile < valid.repeat_interleave(
+        tile
+    )
+    mask = selected.repeat_interleave(tile, 1).repeat_interleave(tile, 2)
+    mask &= live.view(1, 1, -1)
+    reference = F.scaled_dot_product_attention(
+        query.transpose(0, 1).double(),
+        key.transpose(0, 1).double(),
+        value.transpose(0, 1).double(),
+        attn_mask=mask,
+    ).to(torch.bfloat16)
+    # The established BF16 attention tolerance covers softmax/MMA rounding;
+    # only valid query rows belong to the attention contract, and a query
+    # tile that keeps no key block produces zeros.
+    attending = live & (counts[0] > 0).repeat_interleave(tile)
+    torch.testing.assert_close(
+        actual.transpose(0, 1)[:, attending],
+        reference[:, attending],
+        rtol=2e-2,
+        atol=2e-2,
+    )
+    assert not actual[3 * tile : 4 * tile].any()

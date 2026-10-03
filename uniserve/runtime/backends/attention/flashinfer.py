@@ -315,8 +315,7 @@ class _PagePlan:
                 self.mask if visible is None else visible,
                 self.mask,
                 self.counts.numel(),
-                0 if visible is None else visible.stride(0),
-                0 if visible is None else visible.stride(1),
+                *_visible_strides(visible),
                 visible is not None,
             )
         # The native run consumes this scalar; all shape-dependent planning is
@@ -325,6 +324,16 @@ class _PagePlan:
         return self.wrapper.run(
             query.contiguous(), (key, value), out=out, return_lse=lse
         )
+
+
+def _visible_strides(visible):
+    """Return the row and column strides the mask kernels read endpoints by.
+
+    A shared ``[batch, 1]`` endpoint column broadcasts to every query row.
+    """
+    if visible is None:
+        return 0, 0
+    return visible.stride(0), 0 if visible.shape[1] == 1 else visible.stride(1)
 
 
 @triton.jit
@@ -484,8 +493,7 @@ class _RaggedPlan:
                 self.mask if visible is None else visible,
                 self.mask,
                 self.count,
-                0 if visible is None else visible.stride(0),
-                0 if visible is None else visible.stride(1),
+                *_visible_strides(visible),
                 visible is not None,
             )
         self.wrapper._sm_scale = scale

@@ -148,3 +148,86 @@ def test_prefix_tiles_preserve_live_visibility_and_sequence_boundaries(
         operator.bind(inputs())
         graph.replay()
         torch.testing.assert_close(actual, reference(), atol=0.01, rtol=0.01)
+
+
+@pytest.mark.parametrize("provider", ["flash_attn_4", "flashinfer"])
+@torch.inference_mode()
+def test_shared_endpoints_bound_each_sequence_across_replays(provider):
+    """A ``[batch, 1]`` endpoint column bounds every query of its sequence.
+
+    A captured call reads changed endpoints on replay, and an endpoint
+    beyond the sequence's keys sees all of them.
+    """
+    device = torch.device("cuda", 0)
+    torch.manual_seed(811)
+    query_lengths, key_lengths = (193, 301), (385, 257)
+    query = torch.randn(
+        sum(query_lengths), 4, 128, device=device, dtype=torch.bfloat16
+    )
+    key = torch.randn(
+        sum(key_lengths), 2, 128, device=device, dtype=torch.bfloat16
+    )
+    value = torch.randn_like(key)
+    ends = torch.tensor([[200], [257]], device=device, dtype=torch.int32)
+    batch = VisibleInput(
+        SequenceLengths.from_lengths(query_lengths, device=device),
+        SequenceLengths.from_lengths(key_lengths, device=device),
+        ends,
+        None,
+        True,
+        False,
+    )
+
+    def reference():
+        values = []
+        q_begin = k_begin = 0
+        for index, (q_len, k_len) in enumerate(
+            zip(query_lengths, key_lengths, strict=True)
+        ):
+            visible = min(int(ends[index, 0]), k_len)
+            keys = slice(k_begin, k_begin + visible)
+            values.append(
+                F.scaled_dot_product_attention(
+                    query[q_begin : q_begin + q_len].double().transpose(0, 1),
+                    key[keys].double().transpose(0, 1),
+                    value[keys].double().transpose(0, 1),
+                    enable_gqa=True,
+                )
+                .transpose(0, 1)
+                .to(query.dtype)
+            )
+            q_begin += q_len
+            k_begin += k_len
+        return torch.cat(values)
+
+    backend = resolve(provider, device=device)
+    arguments = {
+        "num_heads": 4,
+        "num_kv_heads": 2,
+        "head_dim": 128,
+        "dtype": query.dtype,
+        "size": TextSize(sum(query_lengths), 2),
+        "cache": None,
+    }
+    requirements = backend.workspace_buffers(**arguments)
+    with ExitStack() as scope:
+        buffers = scope.enter_context(
+            TensorBuffers.allocate(requirements, device=device)
+        )
+        operator = backend.prepare(
+            **arguments, workspace=buffers.view(requirements)
+        )
+        scope.callback(operator.close)
+        operator.bind(batch)
+        actual = torch.empty_like(query)
+        operator(query, key, value, batch, scale=128**-0.5, out=actual)
+        torch.testing.assert_close(actual, reference(), atol=0.01, rtol=0.01)
+
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        scope.callback(graph.reset)
+        with torch.cuda.graph(graph):
+            operator(query, key, value, batch, scale=128**-0.5, out=actual)
+        ends.copy_(torch.tensor([[500], [1]], device=device))
+        graph.replay()
+        torch.testing.assert_close(actual, reference(), atol=0.01, rtol=0.01)

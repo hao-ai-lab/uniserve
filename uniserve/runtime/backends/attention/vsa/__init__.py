@@ -17,10 +17,11 @@ class Operator:
     """One numerical signature's plans, scratch and per-scale row producers.
 
     Serialized call sites may share an operator; block IDs remain live inputs.
-    A concrete operator supplies ``kernel``, the
-    block-64 numerical call ``kernel(q, k, v, out, indices, counts,
-    valid_sizes, scale=...)`` that evaluates complete calls, and may supply a
-    different ``row_kernel`` for row production.
+    A concrete operator supplies ``kernel``, the numerical call
+    ``kernel(q, k, v, out, indices, counts, valid_sizes, scale=...)`` that
+    evaluates complete calls over the pattern's tiles (``Pattern.tile``
+    rows), and may supply a different ``row_kernel`` for row production,
+    which serves 64-row tiles.
     """
 
     kernel: Callable[..., object]
@@ -78,17 +79,18 @@ class Operator:
         dimensions.
         """
         self.bind(batch)
+        tile = self.pattern.tile
         if (
             q.shape
             != (
-                len(self.pattern.row_counts[0]) * 64,
+                len(self.pattern.row_counts[0]) * tile,
                 self.num_heads,
                 self.head_dim,
             )
             or k.shape != v.shape
             or k.ndim != 3
             or k.shape[1:] != q.shape[1:]
-            or k.shape[0] != batch.valid_sizes.numel() * 64
+            or k.shape[0] != batch.valid_sizes.numel() * tile
             or out.shape != q.shape
             or out.dtype != q.dtype
             or any(value.dtype != self.dtype for value in (q, k, v))
@@ -104,7 +106,7 @@ class Operator:
                 )
             )
             or batch.block_indices.shape[:2]
-            != (self.num_heads, q.shape[0] // 64)
+            != (self.num_heads, q.shape[0] // tile)
         ):
             raise ValueError(
                 "VSA tensors disagree with the prepared numerical dimensions"
@@ -146,8 +148,14 @@ class Operator:
         packed query domain; every interval then composes its own rows into
         its transport destinations. ``out`` stays borrowed until the last
         interval has been composed.
+
+        Raises:
+            ValueError: The pattern's tiles are not 64 rows, the tile the
+                row composition addresses.
         """
         self.bind(batch)
+        if self.pattern.tile != 64:
+            raise ValueError("VSA row production composes 64-row tiles")
         producer = self._rows.get(scale)
         if producer is None:
             producer = self._rows[scale] = _Rows(
@@ -221,26 +229,44 @@ class Backend:
         )
 
 
-def resolve(backend, *, device):
-    """Return the Backend for a name or instance.
+def resolve(backend, *, device, tile):
+    """Return the Backend for a name or instance that serves ``tile``.
 
-    Return the Backend for a name, an existing instance, or 'auto' device
-    probing.
+    ``backend`` is a name, an existing instance, or ``"auto"``, which probes
+    the device for the first available provider of ``tile``-row tiles. A
+    provider module declares the tile sizes it serves in ``TILES``.
+
+    Raises:
+        RuntimeError: No installed provider (or not the named one) serves
+            ``tile``-row tiles on ``device``. Only SM100 (data-center
+            Blackwell) devices serve 128-row tiles.
+        ValueError: An unknown backend name.
     """
     if isinstance(backend, Backend):
         return backend
+    # Every provider runs CUDA kernels; other devices have none to probe.
+    cuda = torch.device(device).type == "cuda"
     if backend == "auto":
         for name in ("sm100", "flashinfer", "triton"):
             candidate = import_module(f"{__name__}.{name}")
-            if candidate.available(device):
+            if cuda and tile in candidate.TILES and candidate.available(device):
                 return candidate.Backend()
-        raise RuntimeError(f"no installed VSA backend supports {device}")
+        raise RuntimeError(
+            f"no installed VSA backend serves {tile}-row tiles on {device}"
+            + (
+                "; 128-row tiles require an SM100 (data-center Blackwell) "
+                "device"
+                if tile == 128
+                else ""
+            )
+        )
 
     if backend not in {"sm100", "cute", "flashinfer", "triton"}:
         raise ValueError(f"unknown VSA backend {backend!r}")
     module = import_module(f"{__name__}.{backend}")
-    if not module.available(device):
+    if not cuda or tile not in module.TILES or not module.available(device):
         raise RuntimeError(
-            f"VSA backend {backend!r} is unavailable on {device}"
+            f"VSA backend {backend!r} does not serve {tile}-row tiles on "
+            f"{device}"
         )
     return module.Backend()
