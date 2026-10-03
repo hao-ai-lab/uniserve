@@ -158,12 +158,11 @@ Unknown fields are refused, at every level. `GET /v1/capabilities` reports the s
 
 ## Precision
 
-The default `--quantization-config`, `{"mode":"quality"}`, serves the checkpoint's own BF16 transformers and FP16 video decoder, the lossless path. The base checkpoint also accepts the `balanced`, `performance` and `maximum` presets and the per-component overrides the [FastH3 guide](../fast_h3/fast_h3.md#precision-and-graphs) lists; they quantize the video decoder (`balanced`), the denoiser MLPs (`performance`, `maximum`) and the text encoder (`maximum`), and need Blackwell. On W1 with four GB200s they take 36.2 s, 34.1 s and 33.0 s against `quality`'s 36.4 s (diagnostic runs, eight requests each). They are lossy: `balanced` changes only the decoded frames (34.6 dB PSNR against `quality` at the same seed), and the presets that quantize the denoiser change the generated sample itself, so their outputs diverge from `quality`'s; no quality acceptance has been established for them.
+The default `--quantization-config`, `{"mode":"quality"}`, serves the checkpoint's own BF16 transformers and FP16 video decoder. The base checkpoint also accepts the `balanced`, `performance` and `maximum` presets and the per-component overrides the [FastH3 guide](../fast_h3/fast_h3.md#precision-and-graphs) lists; they quantize the video decoder (`balanced`), the denoiser MLPs (`performance`, `maximum`) and the text encoder (`maximum`), and need Blackwell. These presets are lossy: `balanced` changes the decoded frames, and quantizing the denoiser changes the generated latent sample. Quality acceptance must be established for the intended workload before choosing a lossy preset.
 
 ## Numerical behavior
 
 The base DiTs evaluate their block epilogues (modulation, gated residuals, rotary Q/K and SwiGLU gating) the way the diffusers reference does, rounding to BF16 after each operation; OmniRef follows FastVideo's eager arithmetic, which rounds the same way. Seeded draws follow each checkpoint's reference: a request draws its condition noise, then its video and audio noise, on the CPU from its seed. The Python library computes what a server computes on the same placement: given the server's capacity layout (`minimax_h3.generation.generate(..., layout=...)`), a single-GPU library generation equals a single-GPU server's.
-
 
 The [Python library guide](library.md) describes direct loading and generation with the same numerical modules.
 
