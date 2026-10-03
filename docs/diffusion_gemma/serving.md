@@ -2,7 +2,7 @@
 
 UniServe serves DiffusionGemma through decision readout at `/v1/systemone` and block-diffusion generation at `/v1/chat/completions`. Both use the same loaded model and prefix cache. The supported checkpoints are [Google's BF16 model](https://huggingface.co/google/diffusiongemma-26B-A4B-it) and [NVIDIA's NVFP4 model](https://huggingface.co/nvidia/diffusiongemma-26B-A4B-it-NVFP4). The NVFP4 kernels require a supported Blackwell GPU.
 
-See the [Python readout and DJev adapter examples](../../examples/diffusion_gemma/README.md) for library and HTTP integration, and the [four-GB200 performance comparison](performance.md) for measured decision throughput and its numerical scope.
+See the [Python readout and DJev adapter examples](../../examples/diffusion_gemma/README.md) for library and HTTP integration, the [four-GB200 performance comparison](performance.md) for measured decision throughput, and the [quality measurements](quality.md) for readout and generation results and their scope.
 
 ## Install and load
 
