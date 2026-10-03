@@ -6,11 +6,12 @@
 //!   generation assembler (`assemble`) and the video media planner
 //!   (`prepare_media_batches`) for batches while a rank queue has room, and
 //!   `dispatch_submissions` hands them to the executor in order per worker.
-//! - Video media scheduling: a video request is a fixed graph of media calls
-//!   (`consuming_calls`, `ready_calls`). Calls occupy device lanes and, for
-//!   encoding and muxing, host lanes, tracked by the lane ledger, and
-//!   `plan_media_call` builds one call with its products, buffer bindings and
-//!   latent pages.
+//! - Video media scheduling: a video request runs the calls of its graph
+//!   (`graph::VideoGraph`, built at admission from its task and conditions),
+//!   offered by `ready_calls` as their inputs become available. Calls occupy
+//!   device lanes and, for media reading, encoding and muxing, host lanes,
+//!   tracked by the lane ledger, and `plan_media_call` builds one call with
+//!   its products, buffer bindings, latent pages and reading components.
 //! - Successor projection: queries such as `projected_coordinates`,
 //!   `pending_successor_code` and `can_queue_successor` project a token
 //!   request's accepted state through its in-flight calls, so the batching
@@ -289,32 +290,19 @@ impl Scheduler {
     }
 }
 
-/// The calls that read a video call's products, or `None` for a call
-/// outside the video call graph.
+/// The calls that read the products of an image generation call, or `None`
+/// for a call whose readers are the destinations of its transfer edges.
 ///
-/// This is the same graph `ready_calls` walks and the input binding reads:
-/// text encoding feeds latent preparation, which opens the denoising ladder;
-/// each step feeds the next and the last feeds both decoders; a decoder's
-/// media units feed their encoder, whose encoded unit rows feed the muxer,
-/// which also assembles the encoded audio. `WorkerGroup::consumer_slots`
-/// uses it to tell a producing rank which ranks read its products, because
-/// the rank cannot know on its own.
-pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCall]> {
+/// Image generation chains its state calls on one denoising component: text
+/// features feed latent preparation, which feeds the denoising steps.
+/// `WorkerGroup::consumer_slots` reads this for a media call whose placement
+/// names no readers; a video request's calls name theirs from the request's
+/// graph (`plan_media_call`).
+pub(crate) fn generation_consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCall]> {
     Some(match media_call {
         MediaCall::TextEncoding => &[MediaCall::LatentPreparation],
-        MediaCall::LatentPreparation => &[MediaCall::Denoising],
-        MediaCall::Denoising => &[
-            MediaCall::Denoising,
-            MediaCall::VideoDecoding,
-            MediaCall::AudioDecoding,
-        ],
-        MediaCall::VideoDecoding => &[MediaCall::VideoEncoding],
-        MediaCall::VideoEncoding => &[MediaCall::Muxing],
-        MediaCall::AudioDecoding => &[MediaCall::AudioEncoding],
-        MediaCall::AudioEncoding | MediaCall::Muxing => &[],
-        MediaCall::VisionEncoding | MediaCall::LatentEncoding | MediaCall::ImageDecoding => {
-            return None;
-        }
+        MediaCall::LatentPreparation | MediaCall::Denoising => &[MediaCall::Denoising],
+        _ => return None,
     })
 }
 
@@ -415,11 +403,19 @@ impl Scheduler {
 
     /// Lists every call of one request that can be scheduled now.
     ///
-    /// A request is a set of calls with data dependencies, so a tick offers all
-    /// of them and the lane ledger decides which ones fit. At most one call of
-    /// each kind is ready at once: the cursors this returns against advance as
-    /// calls are scheduled, so a unit group only becomes ready once its
-    /// predecessor is submitted.
+    /// A request is a graph of calls with data dependencies, so a tick offers
+    /// all of them and the lane ledger decides which ones fit. At most one
+    /// call of each kind is ready at once: the cursors this returns against
+    /// advance as calls are scheduled, so a unit group only becomes ready
+    /// once its predecessor is submitted.
+    ///
+    /// A conditioned request first reads its media on a host rank. The calls
+    /// reading those host products wait until the read has completed, so a
+    /// model worker's queue never holds a call blocked on a host task. Then
+    /// the vision encoding precedes the text encoding that splices its
+    /// features in, on the same component, while the latent encoding covers
+    /// the visual condition units in rounds and then the audio tracks.
+    /// Latent preparation follows once every one of them is scheduled.
     ///
     /// Latent preparation, the denoising steps and the two decoders become
     /// ready once their predecessor is scheduled; they name their inputs by
@@ -428,6 +424,7 @@ impl Scheduler {
     /// completed, and muxing waits for completed encode rounds.
     fn ready_calls(&self, state: &MediaFlowState) -> Vec<MediaCall> {
         let sampling = state.request.sampling;
+        let graph = &state.graph;
         // A product is produced once its producing call has left the
         // request's in-flight calls.
         let produced = |product: &TensorRef| {
@@ -442,11 +439,31 @@ impl Scheduler {
                 })
         };
 
-        // Text encoding, latent preparation and the denoising steps are
-        // sequential: each is scheduled in full before any later call is
-        // offered.
-        if !state.text_encoding_scheduled {
-            return vec![MediaCall::TextEncoding];
+        // The calls before latent preparation, then latent preparation and
+        // the denoising steps, are scheduled in full before any later call
+        // is offered.
+        if graph.reads_media() {
+            if !state.media_reading_scheduled {
+                return vec![MediaCall::MediaReading];
+            }
+            if !state.condition_media.values().all(produced) {
+                return Vec::new();
+            }
+        }
+        let mut ready = Vec::new();
+        if graph.encodes_vision() && !state.vision_encoding_scheduled {
+            ready.push(MediaCall::VisionEncoding);
+        } else if !state.text_encoding_scheduled {
+            ready.push(MediaCall::TextEncoding);
+        }
+        let visual_units = graph.condition_units().len() as u32;
+        if state.scheduled_condition_units < visual_units
+            || (graph.encodes_condition_audio() && state.condition_audio_latents.is_none())
+        {
+            ready.push(MediaCall::LatentEncoding);
+        }
+        if !ready.is_empty() {
+            return ready;
         }
         if !state.latent_preparation_scheduled {
             return vec![MediaCall::LatentPreparation];
@@ -459,7 +476,6 @@ impl Scheduler {
 
         // Consume completed decoder outputs first. Audio and video retain
         // independent readiness and capacity when the other branch is busy.
-        let mut ready = Vec::new();
         if let Some((_, product)) = state.decoded_units.get(&state.scheduled_encode_units)
             && produced(product)
         {
@@ -507,32 +523,6 @@ impl Scheduler {
         )
     }
 
-    /// Returns the `(height, width)` raster of the video the denoiser's samples
-    /// decode to.
-    ///
-    /// Reads dimensions 2 and 3 of the first declared output of the component
-    /// serving video decoding. The worker declares that product as RGB media
-    /// units (`decoded_units_layout`): units, frames, height, width and
-    /// channels. An extent that is missing or not static reads as zero.
-    fn video_raster(&self) -> (u32, u32) {
-        let component = self.media_component(MediaCall::VideoDecoding);
-        let dims = self
-            .executor
-            .info()
-            .workers
-            .iter()
-            .flat_map(|(_, info)| &info.components)
-            .find(|binding| Some(&binding.name) == component.as_ref())
-            .and_then(|binding| binding.outputs.first())
-            .map(|output| output.shape_bound.dims.clone())
-            .unwrap_or_default();
-        let fixed = |index: usize| match dims.get(index) {
-            Some(DimBound::Static(value)) => *value,
-            _ => 0,
-        };
-        (fixed(2), fixed(3))
-    }
-
     /// Returns where a video request's samples live on its denoiser worker.
     ///
     /// A standalone denoiser's latent pool gives every request slot the same
@@ -546,7 +536,12 @@ impl Scheduler {
     /// `1 + (s - 1) * pages`.
     ///
     /// Returns `None` when `worker` is not a loaded worker.
-    fn sample_placement(&self, worker: &crate::WorkerId, slot: u32) -> Option<LatentPlacement> {
+    fn sample_placement(
+        &self,
+        worker: &crate::WorkerId,
+        slot: u32,
+        sampling: &uniserve_core::DiffusionSamplingParams,
+    ) -> Option<LatentPlacement> {
         let (_, info) = self
             .executor
             .info()
@@ -555,12 +550,11 @@ impl Scheduler {
             .find(|(id, _)| id == worker)?;
         let pages = info.latent_pages.saturating_sub(1) / info.request_slots.max(1);
         let first = 1 + slot.saturating_sub(1) * pages;
-        let (height, width) = self.video_raster();
         Some(LatentPlacement {
             page_table: (first..first + pages).collect(),
             latent_units: pages * info.latent_page_units,
-            height,
-            width,
+            height: sampling.height,
+            width: sampling.width,
         })
     }
 
@@ -629,8 +623,8 @@ impl Scheduler {
     /// Returns the lanes one media call occupies and how much of each.
     ///
     /// Only decoding calls on a unit-measured lane charge media units; every
-    /// other placed call holds its component lane exclusively. Encoding and
-    /// muxing calls also place tasks on host lanes.
+    /// other placed call holds its component lane exclusively. Media
+    /// reading, encoding and muxing calls also place tasks on host lanes.
     fn lane_demand(&self, request: RequestKey, media_call: MediaCall, units: u32) -> LaneDemand {
         let component = self.media_component(media_call);
         let placed_component = component.as_ref().and_then(|component| {
@@ -651,9 +645,10 @@ impl Scheduler {
             _ => 0,
         };
         let host_ranks = match media_call {
-            MediaCall::VideoEncoding | MediaCall::AudioEncoding | MediaCall::Muxing => {
-                self.host_lane_ranks(request, component.as_deref(), units)
-            }
+            MediaCall::MediaReading
+            | MediaCall::VideoEncoding
+            | MediaCall::AudioEncoding
+            | MediaCall::Muxing => self.host_lane_ranks(request, component.as_deref(), units),
             _ => Vec::new(),
         };
         LaneDemand {
@@ -806,6 +801,17 @@ impl Scheduler {
             MediaCall::VideoDecoding => {
                 width().min(state.request.sampling.video_units - state.scheduled_decode_units)
             }
+            // A visual round covers the condition units its component's
+            // ranks encode together; the audio tracks are one call.
+            MediaCall::LatentEncoding => {
+                let remaining =
+                    state.graph.condition_units().len() as u32 - state.scheduled_condition_units;
+                if remaining > 0 {
+                    width().min(remaining)
+                } else {
+                    1
+                }
+            }
             MediaCall::AudioDecoding => width(),
             // An encode round covers the media units the decode round produced.
             MediaCall::VideoEncoding => state
@@ -824,10 +830,15 @@ impl Scheduler {
     ///
     /// Planning advances the request's scheduling cursors, selects the worker
     /// (recording the request's residency there), binds every product to its
-    /// reserved buffer on that worker, and registers the call as in flight.
-    /// The cursors advance before the worker is selected, so an error can
-    /// leave the request partially planned; `prepare_media_batches` latches
-    /// engine-fatal on any error.
+    /// reserved buffer on that worker, names the components that read the
+    /// call's products from the request's graph, and registers the call as in
+    /// flight. The cursors advance before the worker is selected, so an error
+    /// can leave the request partially planned; `prepare_media_batches`
+    /// latches engine-fatal on any error.
+    ///
+    /// A latent encoding call is a visual round while condition units remain
+    /// unscheduled, covering the next units its component's ranks encode
+    /// together, and otherwise the request's one audio call.
     fn plan_media_call(
         &mut self,
         id: RequestId,
@@ -844,6 +855,9 @@ impl Scheduler {
         // A video request advances its ladder one step per call.
         let step = self.scheduled_steps(id, &state.denoising);
         let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step, 1);
+        let units = state.graph.condition_units();
+        let visual_round = media_call == MediaCall::LatentEncoding
+            && state.scheduled_condition_units < units.len() as u32;
         // Freeze the actual decode/write interval before advancing scheduled
         // counters. Completion consumes this same range from the submission.
         let decode = match media_call {
@@ -876,6 +890,23 @@ impl Scheduler {
                 cursor: 0,
                 max_units: 1,
             }),
+            // A visual round covers the next condition units the latent
+            // encoder's ranks encode together; the audio call is one unit.
+            MediaCall::LatentEncoding if visual_round => Some(DecodeRange {
+                request_key,
+                call_id,
+                cursor: state.scheduled_condition_units,
+                max_units: self
+                    .component_width(request_key, work, &component)
+                    .ok_or("a scheduled latent encoder has a loaded owner")?
+                    .min(units.len() as u32 - state.scheduled_condition_units),
+            }),
+            MediaCall::LatentEncoding => Some(DecodeRange {
+                request_key,
+                call_id,
+                cursor: 0,
+                max_units: 1,
+            }),
             _ => None,
         };
 
@@ -897,14 +928,31 @@ impl Scheduler {
             None
         };
 
+        let media_input = |name: &str| {
+            state
+                .condition_media
+                .get(name)
+                .cloned()
+                .ok_or("the media reader has declared the condition input")
+        };
         let inputs = match media_call {
-            MediaCall::LatentPreparation => vec![
+            MediaCall::VisionEncoding => vec![media_input(product::VISION_PIXELS)?],
+            MediaCall::TextEncoding => state.vision_features.iter().cloned().collect(),
+            MediaCall::LatentEncoding if visual_round => {
+                vec![media_input(product::CONDITION_PIXELS)?]
+            }
+            MediaCall::LatentEncoding => vec![media_input(product::CONDITION_SAMPLES)?],
+            // The text features, then the visual condition rows in unit
+            // order, then the audio condition rows.
+            MediaCall::LatentPreparation => std::iter::once(
                 state
                     .conditioning
-                    .as_ref()
-                    .ok_or("text encoding has declared its conditioning output")?
-                    .clone(),
-            ],
+                    .clone()
+                    .ok_or("text encoding has declared its conditioning output")?,
+            )
+            .chain(state.condition_video_latents.iter().cloned())
+            .chain(state.condition_audio_latents.iter().cloned())
+            .collect(),
             MediaCall::VideoDecoding => vec![state.latents[0].clone()],
             MediaCall::AudioDecoding => vec![state.latents[1].clone()],
             MediaCall::VideoEncoding => {
@@ -930,49 +978,83 @@ impl Scheduler {
             _ => Vec::new(),
         };
 
-        // Declare the call's products against the request's reservations.
-        // `output_starts` holds each product's first media unit within its
+        // Declare the call's products against the request's reservations,
+        // by the names their component declares them under. A slice holds
+        // the product's leading extent and its first unit within the
         // reservation.
-        let mut outputs = Vec::new();
-        let mut output_starts = Vec::new();
-        if media_call == MediaCall::TextEncoding
-            || last_step
-            || matches!(
-                media_call,
-                MediaCall::VideoDecoding | MediaCall::AudioDecoding | MediaCall::VideoEncoding
-            )
-        {
-            // A component declares its products in the order its methods
-            // do: the denoiser's last step reserves both latents, every
-            // other call its component's first product.
-            let declared: &[u32] = if last_step { &[0, 1] } else { &[0] };
-            for &index in declared {
-                let reserved = &state.allocations.tensors[&(component.to_owned(), index)];
-                let mut shape_bound = reserved.shape_bound.clone();
-                // A media unit round writes its own slice of the track's
-                // reservation, whether the slice holds decoded media units
-                // or the rows encoded from them.
-                let start = if matches!(
-                    media_call,
-                    MediaCall::VideoDecoding | MediaCall::VideoEncoding
-                ) {
-                    let range = decode.as_ref().ok_or("a media round has a unit range")?;
-                    shape_bound.dims[0] = DimBound::Static(range.max_units);
-                    range.cursor
-                } else {
-                    0
-                };
-                let product = TensorRef {
-                    request_key,
-                    producer_call_id: call_id,
-                    output_index: index as u16,
-                    generation: 1,
-                    dtype: reserved.dtype,
-                    shape_bound,
-                };
-                outputs.push(product);
-                output_starts.push(start);
+        let mut declared: Vec<(&'static str, Option<(u32, u32)>)> = Vec::new();
+        match media_call {
+            MediaCall::MediaReading => {
+                for name in [
+                    product::CONDITION_PIXELS,
+                    product::CONDITION_SAMPLES,
+                    product::VISION_PIXELS,
+                ] {
+                    if state.graph.product(name).is_some() {
+                        declared.push((name, None));
+                    }
+                }
             }
+            MediaCall::VisionEncoding => declared.push((product::VISION_FEATURES, None)),
+            MediaCall::TextEncoding => declared.push((product::CONDITIONING, None)),
+            // A visual round writes the rows of its own units, which follow
+            // the rows of every earlier unit.
+            MediaCall::LatentEncoding if visual_round => {
+                let range = decode.as_ref().ok_or("a latent round has a unit range")?;
+                let cursor = range.cursor as usize;
+                let first: u32 = units[..cursor].iter().sum();
+                let rows: u32 = units[cursor..cursor + range.max_units as usize]
+                    .iter()
+                    .sum();
+                declared.push((product::CONDITION_VIDEO_LATENTS, Some((rows, first))));
+            }
+            MediaCall::LatentEncoding => declared.push((product::CONDITION_AUDIO_LATENTS, None)),
+            MediaCall::Denoising if last_step => {
+                declared.push((product::VIDEO_LATENTS, None));
+                declared.push((product::AUDIO_LATENTS, None));
+            }
+            // A media unit round writes its own slice of the track's
+            // reservation, whether the slice holds decoded media units or
+            // the rows encoded from them.
+            MediaCall::VideoDecoding | MediaCall::VideoEncoding => {
+                let range = decode.as_ref().ok_or("a media round has a unit range")?;
+                let name = if media_call == MediaCall::VideoDecoding {
+                    product::VIDEO_UNITS
+                } else {
+                    product::ENCODED_UNITS
+                };
+                declared.push((name, Some((range.max_units, range.cursor))));
+            }
+            MediaCall::AudioDecoding => declared.push((product::AUDIO_SAMPLES, None)),
+            _ => {}
+        }
+        let mut outputs = Vec::new();
+        let mut output_names = Vec::new();
+        let mut output_starts = Vec::new();
+        for (name, slice) in declared {
+            let reservation = state
+                .reservations
+                .get(name)
+                .ok_or("every product of the graph is reserved")?;
+            let reserved = &state.allocations.tensors[reservation];
+            let mut shape_bound = reserved.shape_bound.clone();
+            let start = match slice {
+                Some((extent, start)) => {
+                    shape_bound.dims[0] = DimBound::Static(extent);
+                    start
+                }
+                None => 0,
+            };
+            outputs.push(TensorRef {
+                request_key,
+                producer_call_id: call_id,
+                output_index: reservation.1 as u16,
+                generation: 1,
+                dtype: reserved.dtype,
+                shape_bound,
+            });
+            output_names.push(name);
+            output_starts.push((reservation.clone(), start));
         }
 
         // The step interval of a call that advances the trajectory; its
@@ -1035,17 +1117,40 @@ impl Scheduler {
             admissions.push(state.admission.clone());
             state.admission_state = WorkerRegistration::InFlight;
         }
-        for (product, start) in call.outputs.iter().zip(&output_starts) {
-            let replaced = state.buffer_bindings.insert(
-                product.buffer_id(),
-                (component.clone(), u32::from(product.output_index), *start),
-            );
+        for (product, ((component, index), start)) in call.outputs.iter().zip(output_starts) {
+            let replaced = state
+                .buffer_bindings
+                .insert(product.buffer_id(), (component, index, start));
             debug_assert!(replaced.is_none(), "media buffer identity was reused");
         }
         match media_call {
+            MediaCall::MediaReading => {
+                state.media_reading_scheduled = true;
+                for (name, product) in output_names.iter().zip(&call.outputs) {
+                    state.condition_media.insert(name, product.clone());
+                }
+            }
+            MediaCall::VisionEncoding => {
+                state.vision_features = call.outputs.first().cloned();
+                state.vision_encoding_scheduled = true;
+            }
             MediaCall::TextEncoding => {
                 state.conditioning = call.outputs.first().cloned();
                 state.text_encoding_scheduled = true;
+            }
+            MediaCall::LatentEncoding => {
+                let product = call
+                    .outputs
+                    .first()
+                    .cloned()
+                    .ok_or("latent encoding declares its rows")?;
+                if visual_round {
+                    let range = decode.as_ref().ok_or("a latent round has a unit range")?;
+                    state.scheduled_condition_units += range.max_units;
+                    state.condition_video_latents.push(product);
+                } else {
+                    state.condition_audio_latents = Some(product);
+                }
             }
             MediaCall::LatentPreparation => state.latent_preparation_scheduled = true,
             // Submitted steps are derived from the call's latent interval.
@@ -1088,8 +1193,8 @@ impl Scheduler {
                 }
                 state.muxing_in_flight = true;
             }
-            MediaCall::VisionEncoding | MediaCall::LatentEncoding | MediaCall::ImageDecoding => {
-                unreachable!("video scheduling selects only its fixed calls")
+            MediaCall::ImageDecoding => {
+                unreachable!("a video request's graph has no image decoding")
             }
         }
         if stateful {
@@ -1124,15 +1229,12 @@ impl Scheduler {
 
         // Request slots are allocated per worker, so the slot and the latent
         // pages it owns are those of the selected worker.
-        let request_pool_idx = self
-            .media_state(id)
-            .ok_or("a selected media request is running")?
-            .allocations
-            .request_slot(&worker);
+        let request_pool_idx = state.allocations.request_slot(&worker);
+        let sampling = state.request.sampling;
         let latent = match interval {
             Some((start_step, step_count)) => {
                 let samples = self
-                    .sample_placement(&worker, request_pool_idx)
+                    .sample_placement(&worker, request_pool_idx, &sampling)
                     .ok_or("a placed call's worker is loaded")?;
                 Some(Denoising::params(
                     request_key,
@@ -1147,10 +1249,11 @@ impl Scheduler {
 
         // Admission routed every component of the request, so the replicas
         // reading this call's products are known here: the producer names
-        // their ranks alone, not every replica that could serve the
-        // component in some other request.
-        let readers = consuming_calls(media_call)
-            .unwrap_or_default()
+        // the ranks of the components its request's graph reads them with,
+        // on the replicas the request was routed to.
+        let readers = state
+            .graph
+            .consumers(media_call)
             .iter()
             .filter_map(|consumer| {
                 let component = self.info.media_components.get(consumer)?;
@@ -1171,7 +1274,7 @@ impl Scheduler {
             latent,
             decode,
             buffers,
-            readers,
+            readers: Some(readers),
         };
         self.register_inflight(
             call.clone(),
@@ -2213,8 +2316,46 @@ impl Scheduler {
                         TerminalIntent::Failure("media worker call failed".to_string());
                 }
             } else if let Some(state) = self.media_state_mut(id) {
+                // A condition product retires once the calls reading it have
+                // completed: the vision patches with the vision encoding, the
+                // vision features with the text encoding, the pixels with the
+                // last visual latent round, the PCM with the audio latent
+                // encoding, and the condition rows with latent preparation.
                 match call.code {
-                    CallKind::Media(MediaCall::LatentPreparation) => state.denoising.open(None),
+                    CallKind::Media(MediaCall::VisionEncoding) => {
+                        consumed_products
+                            .extend(state.condition_media.remove(product::VISION_PIXELS));
+                    }
+                    CallKind::Media(MediaCall::TextEncoding) => {
+                        consumed_products.extend(state.vision_features.take());
+                    }
+                    CallKind::Media(MediaCall::LatentEncoding) => {
+                        let audio = state
+                            .condition_audio_latents
+                            .as_ref()
+                            .is_some_and(|product| product.producer_call_id == call.call_id);
+                        if audio {
+                            consumed_products
+                                .extend(state.condition_media.remove(product::CONDITION_SAMPLES));
+                        } else if let Some(range) = decode.as_ref() {
+                            state.encoded_condition_units += range.max_units;
+                            if state.encoded_condition_units
+                                == state.graph.condition_units().len() as u32
+                            {
+                                consumed_products.extend(
+                                    state.condition_media.remove(product::CONDITION_PIXELS),
+                                );
+                            }
+                        } else {
+                            self.invariant_broken("a submitted latent round keeps its unit range");
+                            return;
+                        }
+                    }
+                    CallKind::Media(MediaCall::LatentPreparation) => {
+                        state.denoising.open(None);
+                        consumed_products.extend(state.condition_video_latents.iter().cloned());
+                        consumed_products.extend(state.condition_audio_latents.iter().cloned());
+                    }
                     // `valid` requires a denoising result to complete its interval.
                     CallKind::Media(MediaCall::Denoising) => {
                         if let Some(interval) = latent.as_ref() {
@@ -2256,7 +2397,12 @@ impl Scheduler {
                 }
 
                 let phase = match call.code {
-                    CallKind::Media(MediaCall::TextEncoding) => "preparing",
+                    CallKind::Media(
+                        MediaCall::MediaReading
+                        | MediaCall::VisionEncoding
+                        | MediaCall::LatentEncoding
+                        | MediaCall::TextEncoding,
+                    ) => "preparing",
                     CallKind::Media(MediaCall::LatentPreparation)
                     | CallKind::Media(MediaCall::Denoising) => {
                         if state.denoising.is_complete() {

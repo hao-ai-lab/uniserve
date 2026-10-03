@@ -3,9 +3,14 @@
 import pytest
 import torch
 
-from uniserve_models.minimax_h3 import weight_config
+from tests.python.fixtures.h3 import base_config, fasth3_config
+from uniserve_models.minimax_h3 import weight_config as _weight_config
 
 pytestmark = pytest.mark.unit
+
+
+def weight_config(**choices):
+    return _weight_config(fasth3_config(), **choices)
 
 
 _TIERS = {
@@ -66,3 +71,19 @@ def test_default_precision_is_quality():
 def test_unsupported_component_formats(choices):
     with pytest.raises(ValueError, match=next(iter(choices))):
         weight_config(**choices)
+
+
+def test_every_denoiser_a_checkpoint_holds_takes_the_preset():
+    config = _weight_config(base_config(), preset="performance")
+    for component in ("denoiser", "reference_denoiser"):
+        layer = f"{component}.transformer.layers.0"
+        assert _format(config, f"{layer}.mlp") == "fp8"
+        assert (
+            config.dtypes[f"{component}.transformer.video_output"]
+            is torch.float32
+        )
+    # A text-only export names only the denoiser it holds.
+    assert not any(
+        path.startswith("reference_denoiser")
+        for path in _weight_config(fasth3_config()).dtypes
+    )

@@ -42,7 +42,11 @@ from uniserve_worker.transport.layout import (
     row_span,
     tensor_nbytes,
 )
-from uniserve_worker.transport.pool import TransferCapacity, TransferPool
+from uniserve_worker.transport.pool import (
+    ReadReservation,
+    TransferCapacity,
+    TransferPool,
+)
 from uniserve_worker.transport.shared_storage import (
     allocate_shared_storage,
     open_shared_storage,
@@ -197,7 +201,7 @@ class ShmTransport(Transport):
         acknowledgment_slot: int = 0,
         host_slots: Sequence[int] = (),
     ) -> None:
-        self._bytes = capacity
+        self.capacity = capacity
         # Slots of the ranks on this host: the only ones a segment named in
         # this host's namespace can reach.
         self._host_slots = frozenset(int(slot) for slot in host_slots)
@@ -282,7 +286,7 @@ class ShmTransport(Transport):
             shm.unlink()
         except FileNotFoundError:
             pass
-        self._bytes.release(nbytes)
+        self.capacity.release(nbytes)
 
     @staticmethod
     def _settled(source: _ShmSource) -> bool:
@@ -410,7 +414,7 @@ class ShmTransport(Transport):
         nbytes = tensor_nbytes(source)
         # Capacity acknowledged since the last sweep is reclaimed first.
         self._publications.reap()
-        self._bytes.acquire(nbytes)
+        self.capacity.acquire(nbytes)
 
         shm = None
         address = None
@@ -511,7 +515,7 @@ class ShmTransport(Transport):
             elif shm is not None:
                 self._free_segment(shm, nbytes, address)
             else:
-                self._bytes.release(nbytes)
+                self.capacity.release(nbytes)
             raise
 
     def _read_tensor(
@@ -567,6 +571,7 @@ class ShmTransport(Transport):
         device: torch.device,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
+        reservation: ReadReservation | None = None,
     ) -> TransferTicket:
         """Submit a read of a segment published on this node.
 
@@ -594,6 +599,7 @@ class ShmTransport(Transport):
             region,
             nbytes=locator.nbytes,
             destination=target,
+            reservation=reservation,
         )
 
     def borrow(

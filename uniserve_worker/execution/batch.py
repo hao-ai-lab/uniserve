@@ -100,11 +100,18 @@ class BatchState:
     storage_dependencies: tuple[Future[None], ...] = ()
     input_products: tuple[TensorPublication, ...] = ()
     kv_inputs: tuple[KvTransfer, ...] = ()
+    # Entries of ``input_products`` whose reads `prepare_inputs` has started;
+    # preparation refused for read tickets resumes at the next one.
+    inputs_started: int = 0
 
-    # Lifecycle flags from input submission through terminal delivery. A
-    # batch is ``complete`` once its retirement finishes or `Executor` records
-    # its terminal ``error``; after ``inputs_closed``, pending readiness
-    # callbacks no longer fire.
+    # Lifecycle flags from preparation through terminal delivery. A batch is
+    # ``prepared`` once its commands are applied and it is validated, and
+    # ``awaiting_reads`` while its preparation waits for read tickets to
+    # return. A batch is ``complete`` once its retirement finishes or
+    # `Executor` records its terminal ``error``; after ``inputs_closed``,
+    # pending readiness callbacks no longer fire.
+    prepared: bool = False
+    awaiting_reads: bool = False
     inputs_submitted: bool = False
     inputs_closed: bool = False
     launched: bool = False

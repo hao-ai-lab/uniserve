@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from uniserve.distributed import Communicator
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.nn.vae import LatentDecoder, LatentEncoder
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
@@ -46,15 +46,11 @@ class VideoEncoder(nn.Module):
         """Return the latent frames each unit produces, in unit order."""
         raise NotImplementedError
 
-    def output_layout(
-        self, num_frames: int, frame_size: image.Config
-    ) -> Mapping[str, OutputLayout]:
+    def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
         """Describe the complete latent rows of one video under ``video``."""
         raise NotImplementedError
 
-    def posterior_noise(
-        self, num_frames: int, frame_size: image.Config
-    ) -> torch.Tensor | None:
+    def posterior_noise(self, size: video.Config) -> torch.Tensor | None:
         """Return one video's complete NCTHW posterior draw, or None.
 
         None leaves the latent to the latent encoder's own posterior: its
@@ -124,13 +120,15 @@ class VideoEncoder(nn.Module):
 
         # One posterior draw per video size serves every unit of this call
         # that belongs to a video of that size.
-        draws: dict[tuple[int, image.Config], torch.Tensor | None] = {}
+        draws: dict[video.Config, torch.Tensor | None] = {}
         outputs = []
         for value, interval, count, unit in zip(
             pixels, frames, num_frames, units, strict=True
         ):
-            frame_size = image.Config(int(value.shape[1]), int(value.shape[2]))
-            layout = self.output_layout(count, frame_size)["video"]
+            size = video.Config(
+                count, image.Config(int(value.shape[1]), int(value.shape[2]))
+            )
+            layout = self.output_layout(size)["video"]
             windows = self.latent_slices(count)
             window = windows[unit]
             extent = window.stop - window.start
@@ -140,10 +138,9 @@ class VideoEncoder(nn.Module):
                 )
             rows_per_frame = layout.shape[0] // windows[-1].stop
 
-            key = (count, frame_size)
-            if key not in draws:
-                draws[key] = self.posterior_noise(count, frame_size)
-            noise = draws[key]
+            if size not in draws:
+                draws[size] = self.posterior_noise(size)
+            noise = draws[size]
             if noise is not None:
                 noise = noise[:, :, window].to(value.device)
 
@@ -257,89 +254,138 @@ class AudioEncoder(nn.Module):
 
 
 class VideoDecoder(nn.Module):
-    """Decode ordered latent windows.
+    """Decode a video's packed latent one reconstruction window at a time.
 
-    Describe their place in the native output. Subclasses define legal output
-    frame slices, native output layout and ``unpack_latents``: the
-    mathematical conversion from a complete packed latent to one decoder
-    input. Decoder inputs and scratch remain borrowed.
+    A video's size is its frame count and raster
+    (``uniserve.media.video.Config``). Its native output is cut at the legal
+    output frame slices of ``frame_slices``, and each slice is reconstructed
+    from one window of the packed latent into one native segment. Subclasses
+    define the slices, the native output layout, each slice's ``segment``,
+    the decoder input of a segment's window (``window_input``) and
+    ``unpack_latents``: the mathematical conversion from a complete packed
+    latent to one window's decoder input.
+
+    Only unpacking depends on the video's frame count. ``decode`` evaluates
+    unpacked windows, whose computation depends on their segment alone, so a
+    caller prepares decoding resources and graphs per segment rather than per
+    video size, and unpacks each window outside them. Decoder inputs and
+    scratch remain borrowed.
     """
 
-    def __init__(self, decoder: LatentDecoder, *, frame_size: image.Config):
+    def __init__(self, decoder: LatentDecoder):
         super().__init__()
-        self.decoder, self.frame_size = decoder, frame_size
+        self.decoder = decoder
 
     def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
         raise NotImplementedError
 
-    def output_layout(self, num_frames: int) -> Mapping[str, OutputLayout]:
+    def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
+        """Describe a video's native output: one segment per frame slice."""
+        raise NotImplementedError
+
+    def segment(self, size: video.Config, frames: slice) -> video.Config:
+        """Return the native frames and raster one frame slice decodes to.
+
+        Raises:
+            ValueError: ``frames`` is not a legal output frame slice of
+                ``size``.
+        """
+        raise NotImplementedError
+
+    def window_input(self, segment: video.Config) -> BufferConfig:
+        """Describe the decoder input of a window decoding to ``segment``."""
         raise NotImplementedError
 
     def unpack_latents(
-        self, latent, frames, num_frames, *, constants, workspace
-    ):
-        """Return the native latent window for one legal output frame slice."""
+        self,
+        latent: torch.Tensor,
+        frames: slice,
+        size: video.Config,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        """Write the decoder input of one legal output frame slice.
+
+        ``latent`` is the complete packed latent of a video of ``size`` and
+        ``out`` the window's input, laid out as ``window_input`` describes
+        for ``segment(size, frames)``. The conversion is ordered on the
+        caller's current stream.
+
+        Raises:
+            ValueError: ``latent`` is not a complete packed latent of
+                ``size``, or ``frames`` is not one of its legal slices.
+        """
         raise NotImplementedError
 
     @torch.inference_mode()
     def decode(
         self,
-        latents: tuple[torch.Tensor, ...],
+        windows: tuple[torch.Tensor, ...],
         *,
-        frames: tuple[slice, ...],
-        num_frames: tuple[int, ...],
-        constants: Mapping[str, torch.Tensor],
-        workspace: Mapping[str, torch.Tensor],
-    ) -> tuple[TensorOutput | None, ...]:
-        if (
-            not latents
-            or len(latents) != len(frames)
-            or len(latents) != len(num_frames)
-        ):
-            raise ValueError(
-                "video latents, frame slices and durations must align"
-            )
+        segments: tuple[video.Config, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        """Reconstruct unpacked windows into their native segments.
 
-        units = []
-        for interval, count in zip(frames, num_frames, strict=True):
-            legal = self.frame_slices(count)
-            if interval not in legal:
+        Each window is laid out as ``window_input`` describes for its
+        segment. Each result leads with the segment's unit axis of one,
+        which is one row of ``output_layout`` (``place`` describes where).
+
+        Raises:
+            ValueError: The windows and segments do not align, or a window
+                is not laid out for its segment.
+        """
+        if not windows or len(windows) != len(segments):
+            raise ValueError("video windows and segments must align")
+        for window, segment in zip(windows, segments, strict=True):
+            config = self.window_input(segment)
+            if (
+                tuple(window.shape) != tuple(config.shape)
+                or window.dtype != config.dtype
+            ):
                 raise ValueError(
-                    "video frame slice must select one complete "
-                    "reconstruction window"
+                    "a video window must be laid out for its segment"
                 )
-            units.append(legal.index(interval))
 
         outputs = []
-        for latent, interval, count, unit in zip(
-            latents, frames, num_frames, units, strict=True
-        ):
-            inputs = self.unpack_latents(
-                latent,
-                interval,
-                count,
-                constants=constants,
-                workspace=workspace,
-            )
-            decoded = self.decoder(inputs).unsqueeze(0)
+        for window in windows:
+            decoded = self.decoder(window).unsqueeze(0)
             # A decoder may return borrowed workspace. Preserve earlier results
             # across later numerical calls within this batch.
-            if len(latents) > 1:
+            if len(windows) > 1:
                 decoded = decoded.clone()
-            layout = self.output_layout(count)["video"]
-            outputs.append(
-                TensorOutput(
-                    decoded,
-                    OutputLayout(
-                        layout.shape,
-                        layout.dtype,
-                        (slice(unit, unit + 1), *layout.local_slice[1:]),
-                        variable_axes=layout.variable_axes,
-                        value_range=layout.value_range,
-                    ),
-                )
-            )
+            outputs.append(decoded)
         return tuple(outputs)
+
+    def place(
+        self, decoded: torch.Tensor, frames: slice, size: video.Config
+    ) -> TensorOutput:
+        """Describe one decoded segment's place in the output of ``size``.
+
+        ``decoded`` is ``decode``'s result for the window of ``frames``; the
+        returned output names its row of ``output_layout(size)``.
+
+        Raises:
+            ValueError: ``frames`` is not a legal output frame slice of
+                ``size``.
+        """
+        legal = self.frame_slices(size.num_frames)
+        if frames not in legal:
+            raise ValueError(
+                "video frame slice must select one complete reconstruction "
+                "window"
+            )
+        unit = legal.index(frames)
+        layout = self.output_layout(size)["video"]
+        return TensorOutput(
+            decoded,
+            OutputLayout(
+                layout.shape,
+                layout.dtype,
+                (slice(unit, unit + 1), *layout.local_slice[1:]),
+                variable_axes=layout.variable_axes,
+                value_range=layout.value_range,
+            ),
+        )
 
 
 class AudioDecoder(nn.Module):
@@ -491,18 +537,13 @@ class VideoPostprocessor(nn.Module):
     leading frames blend with the overlap its predecessor decoded, so ``units``
     orders those ranks as the units they hold and carries that overlap between
     them. Alone, a rank carries its own overlap forward, which is the serial
-    reconstruction.
+    reconstruction. A video's size is its frame count and raster
+    (``uniserve.media.video.Config``).
     """
 
     overlap_weights: torch.Tensor
 
-    def __init__(
-        self,
-        overlap_weights: torch.Tensor,
-        *,
-        frame_size: image.Config,
-        frame_rate: int,
-    ):
+    def __init__(self, overlap_weights: torch.Tensor, *, frame_rate: int):
         super().__init__()
         if type(frame_rate) is not int or frame_rate < 1:
             raise ValueError("video frame rate must be a positive integer")
@@ -520,7 +561,7 @@ class VideoPostprocessor(nn.Module):
         self.register_buffer(
             "overlap_weights", overlap_weights, persistent=False
         )
-        self.frame_size, self.frame_rate = frame_size, frame_rate
+        self.frame_rate = frame_rate
         # Rebound by the runtime to the ranks this component is placed on.
         self.units = Communicator()
 
@@ -533,7 +574,7 @@ class VideoPostprocessor(nn.Module):
         """
         raise NotImplementedError
 
-    def state_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
+    def state_buffers(self, size: video.Config) -> Mapping[str, BufferConfig]:
         """Describe the state carried between the rounds of one video.
 
         The state holds the decoded overlap a unit's successor blends with.
@@ -546,7 +587,7 @@ class VideoPostprocessor(nn.Module):
         segments: tuple[TensorOutput, ...],
         *,
         frames: tuple[slice, ...],
-        num_frames: tuple[int, ...],
+        sizes: tuple[video.Config, ...],
         state: Mapping[str, torch.Tensor],
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
@@ -561,11 +602,14 @@ class VideoPostprocessor(nn.Module):
         if (
             not segments
             or len(segments) != len(frames)
-            or len(segments) != len(num_frames)
+            or len(segments) != len(sizes)
+            or len({size.frame for size in sizes}) != 1
         ):
             raise ValueError(
-                "video segments, frame slices and durations must align"
+                "video segments, frame slices and sizes of one raster must "
+                "align"
             )
+        num_frames = tuple(size.num_frames for size in sizes)
         if (
             type(unit_count) is not int
             or not 0 <= self.units.rank < unit_count <= self.units.size
@@ -577,7 +621,7 @@ class VideoPostprocessor(nn.Module):
         overlap = retained
         pixels = workspace["rgb_frames"]
         mean, std = constants["pixel_mean"], constants["pixel_std"]
-        height, width = self.frame_size.height, self.frame_size.width
+        height, width = sizes[0].frame.height, sizes[0].frame.width
         extent = self.overlap_weights.numel()
         values, slices = [], []
         total_frames = 0
@@ -606,7 +650,7 @@ class VideoPostprocessor(nn.Module):
             ):
                 raise ValueError(
                     "video segments must have native NCTHW shape and the "
-                    "configured raster"
+                    "requested raster"
                 )
             body, successor = value[:, :, body_slice], value[:, :, next_slice]
             expected = body.shape[2] + (extent if interval.stop == count else 0)

@@ -220,7 +220,25 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
 fn accept_reported_endpoint(listener: &std::net::TcpListener) -> anyhow::Result<String> {
     use std::io::BufRead as _;
 
-    let (stream, _) = listener.accept()?;
+    // A worker that fails before registering never connects, so the wait
+    // for its registration is bounded like the read of its report.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    listener.set_nonblocking(true)?;
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "no rank registered within 60 seconds"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    listener.set_nonblocking(false)?;
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let mut line = String::new();
     std::io::BufReader::new(stream).read_line(&mut line)?;
@@ -924,6 +942,13 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             video_units: 1,
             num_inference_steps: 4,
             seed: 1000,
+            width: 1344,
+            height: 768,
+        },
+        uniserve_worker_ipc::VideoAdmission {
+            task: uniserve_core::VideoTask::T2va,
+            text_tags: vec![1],
+            conditions: Vec::new(),
         },
     )?;
     let value = TensorRef {
@@ -1572,13 +1597,19 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
             let prompt_token_ids = vec![100_000 + index as u32];
             let events = engine.submit(Request::Diffusion(DiffusionRequest {
                 request_id,
+                task: uniserve_core::VideoTask::T2va,
+                text_tags: vec![1; prompt_token_ids.len()],
                 prompt_token_ids,
+                conditions: Vec::new(),
+                media: Vec::new(),
                 priority: 0,
                 sampling: DiffusionSamplingParams {
                     num_frames: 22,
                     video_units: 3,
                     num_inference_steps: 4,
                     seed: index as u64,
+                    width: 1344,
+                    height: 768,
                 },
             }))?;
             requests.push((request_id, events));
@@ -2988,6 +3019,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
             ]
         }
     },
+    "deployment_components": ["model"],
     "supported_calls": null,
     "transfer_backends": "local",
     "publish_backends": "local",
@@ -3013,6 +3045,8 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "max_batch_tokens": 256,
     "max_model_len": 8192,
     "max_video_seconds": 15.0,
+    "max_condition_rows": 0,
+    "ffmpeg": "ffmpeg",
     "graph_policy": "off",
     "decode_graph_batch_sizes": null,
     "prefill_cuda_graph": false,

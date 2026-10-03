@@ -16,7 +16,7 @@ import torch
 from torch.nn import functional as F
 
 from uniserve.diffusion import normal_noise
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.model import AudioEncoder as BaseAudioEncoder
 from uniserve.model import VideoEncoder as BaseVideoEncoder
 from uniserve.nn.vae import DiagonalGaussian, LatentEncoder
@@ -131,12 +131,10 @@ class VideoEncoder(BaseVideoEncoder):
             for index in range(len(self.frame_slices(num_frames)))
         )
 
-    def output_layout(
-        self, num_frames: int, frame_size: image.Config
-    ) -> Mapping[str, OutputLayout]:
-        height, width = self._latent_size(frame_size)
+    def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
+        height, width = self._latent_size(size.frame)
         rows = (
-            self._latent_frames(num_frames)
+            self._latent_frames(size.num_frames)
             * (height // _PATCH)
             * (width // _PATCH)
         )
@@ -150,19 +148,17 @@ class VideoEncoder(BaseVideoEncoder):
             )
         }
 
-    def posterior_noise(
-        self, num_frames: int, frame_size: image.Config
-    ) -> torch.Tensor:
+    def posterior_noise(self, size: video.Config) -> torch.Tensor:
         # One standard normal FP32 draw of the complete latent from a fresh
         # host generator, which is the reference's draw; the shape fixes how
         # the generator's stream maps onto latent positions.
-        height, width = self._latent_size(frame_size)
+        height, width = self._latent_size(size.frame)
         draw = torch.empty(
             (
                 1,
                 1,
                 self.config.latent_channels,
-                self._latent_frames(num_frames),
+                self._latent_frames(size.num_frames),
                 height,
                 width,
             ),

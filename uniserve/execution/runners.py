@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from uniserve.diffusion import DenoisingStep, Schedule
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.model import (
     AudioDecoder,
     CausalLM,
@@ -236,27 +236,24 @@ class AudioRunner(ModelRunner[AudioDecoder, int]):
         )
 
 
-class VideoRunner(ModelRunner[VideoDecoder, int]):
-    """Decode video latent windows using prepared constants and workspace."""
+class VideoRunner(ModelRunner[VideoDecoder, video.Config]):
+    """Decode unpacked video windows at a prepared segment.
+
+    ``warmup`` prepares a segment (``VideoDecoder.segment``), which every
+    window decoded through the runner must have; ``VideoDecoder``'s
+    ``unpack_latents`` supplies each window from a complete packed latent.
+    """
 
     def decode(
         self,
-        latents: tuple[torch.Tensor, ...],
+        windows: tuple[torch.Tensor, ...],
         *,
-        frames: tuple[slice, ...],
-        num_frames: tuple[int, ...],
-    ) -> tuple[TensorOutput | None, ...]:
-        return self._run(
-            self.model.decode,
-            latents,
-            frames=frames,
-            num_frames=num_frames,
-            constants=self.context.constants,
-            workspace=self.context.workspace,
-        )
+        segments: tuple[video.Config, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        return self._run(self.model.decode, windows, segments=segments)
 
 
-class VideoProcessor(ModelRunner[VideoPostprocessor, int]):
+class VideoProcessor(ModelRunner[VideoPostprocessor, video.Config]):
     """Postprocess decoded video windows using caller-owned temporal state."""
 
     def forward(
@@ -264,14 +261,14 @@ class VideoProcessor(ModelRunner[VideoPostprocessor, int]):
         segments: tuple[TensorOutput, ...],
         *,
         frames: tuple[slice, ...],
-        num_frames: tuple[int, ...],
+        sizes: tuple[video.Config, ...],
         state: Mapping[str, torch.Tensor],
     ) -> tuple[TensorOutput, ...]:
         return self._run(
             self.model,
             segments,
             frames=frames,
-            num_frames=num_frames,
+            sizes=sizes,
             state=state,
             constants=self.context.constants,
             workspace=self.context.workspace,

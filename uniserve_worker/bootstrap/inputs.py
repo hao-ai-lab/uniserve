@@ -9,6 +9,7 @@ builder: ``ImageBuilder`` for image denoising and ``MediaBuilder`` for video.
 from torch import nn
 
 from uniserve.model import ImageDenoiser, VideoDenoiser, VideoPostprocessor
+from uniserve_worker.bootstrap.components import describe_components
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.model_executor.diffusion_inputs import ImageBuilder
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
@@ -44,6 +45,82 @@ def image_builder(model: nn.Module):
     return None if denoiser is None else ImageBuilder(denoiser)
 
 
+def video_denoiser(model: nn.Module, config: WorkerConfig):
+    """Find the video denoiser the deployment places.
+
+    A checkpoint may hold several video denoisers, one per task family; a
+    deployment places exactly one of them, and every worker of it serves
+    that one. With a single candidate it is the denoiser; with several, the
+    deployment's components (``config.deployment_components``) name the
+    placed one through their entry points.
+
+    Returns:
+        The placed denoiser, or ``None`` for a model without one.
+
+    Raises:
+        ValueError: The deployment places several of the model's video
+            denoisers, or none of several.
+    """
+    candidates = tuple(
+        dict.fromkeys(
+            module
+            for module in model.modules()
+            if isinstance(module, VideoDenoiser)
+        )
+    )
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+
+    declared = describe_components(model)
+    placed = tuple(
+        dict.fromkeys(
+            call.module
+            for name in config.deployment_components
+            for call in declared.get(name, ())
+            if any(call.module is candidate for candidate in candidates)
+        )
+    )
+    if len(placed) != 1:
+        names = sorted(
+            name
+            for name, calls in declared.items()
+            if any(
+                call.module is candidate
+                for call in calls
+                for candidate in candidates
+            )
+        )
+        raise ValueError(
+            "a deployment places exactly one of the model's video "
+            f"denoisers {names}; it places {len(placed)}"
+        )
+    return placed[0]
+
+
+# Video tasks whose request calls the worker executes: generation from the
+# prompt alone, from keyframes, and from references.
+EXECUTED_VIDEO_TASKS = frozenset({"t2va", "fl2va", "ref2va"})
+
+
+def executed_video_tasks(denoiser: VideoDenoiser) -> tuple[str, ...]:
+    """The denoiser's tasks the worker executes, in the denoiser's order."""
+    return tuple(
+        task for task in denoiser.tasks if task in EXECUTED_VIDEO_TASKS
+    )
+
+
+def condition_capacity(denoiser: VideoDenoiser, config: WorkerConfig) -> int:
+    """Packed condition rows a worker provisions for one request.
+
+    Only a conditioned task carries conditions, so a deployment whose
+    denoiser executes none provisions none, whatever ``max_condition_rows``
+    grants.
+    """
+    if not set(executed_video_tasks(denoiser)) - {"t2va"}:
+        return 0
+    return config.max_condition_rows
+
+
 def media_builder(model: nn.Module, config: WorkerConfig):
     """Instantiate the video input builder within the worker's frame budget.
 
@@ -61,7 +138,7 @@ def media_builder(model: nn.Module, config: WorkerConfig):
             ``VideoPostprocessor`` to supply its frame rate, or either
             capability is ambiguous.
     """
-    denoiser = capability(model, VideoDenoiser)
+    denoiser = video_denoiser(model, config)
     if denoiser is None:
         return None
 
@@ -82,4 +159,5 @@ def media_builder(model: nn.Module, config: WorkerConfig):
         if config.min_video_seconds is None
         else round(config.min_video_seconds * output.frame_rate),
         text_capacities=config.video_text_capacities,
+        condition_rows=condition_capacity(denoiser, config),
     )

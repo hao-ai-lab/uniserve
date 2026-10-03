@@ -55,7 +55,7 @@ from uniserve_worker.protocol.tensor import DType, StaticDim, TensorRef
 from uniserve_worker.protocol.transfer import TensorTransfer, WorkerEndpoint
 from uniserve_worker.storage.buffer_pool import BufferBinding, BufferPool
 from uniserve_worker.transport.exports import ExportLocations, release_exports
-from uniserve_worker.transport.fetch import fetch_tensor
+from uniserve_worker.transport.fetch import plan_reads, submit_reads
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.ticket import TransferTicket
 
@@ -2146,7 +2146,9 @@ class TensorStore:
                 metadata, shape, or dtype; if a resident shard's storage
                 cannot hold the full tensor or still has unretired
                 transfers; or if reservation fails. Errors from submitting
-                a fetch propagate unchanged. A failed call releases its
+                a fetch propagate unchanged, among them
+                `ReadBackpressureError` when too few read tickets are free,
+                in which case no read started. A failed call releases its
                 lease, cancels and closes its tickets, and abandons a record
                 it reserved.
         """
@@ -2273,16 +2275,22 @@ class TensorStore:
 
                 ticket.add_retirement_callback(reclaim)
 
-            # Fetch only the regions not already resident.
+            # Fetch only the regions not already resident, all of them or
+            # none: their reads take their tickets together.
             try:
-                for region in missing:
-                    fetch_tensor(
-                        tensor,
-                        destination[region],
-                        bindings=bindings,
-                        region=region,
-                        retain=retain,
-                    )
+                submit_reads(
+                    tuple(
+                        read
+                        for region in missing
+                        for read in plan_reads(
+                            tensor,
+                            destination[region],
+                            bindings=bindings,
+                            region=region,
+                        )
+                    ),
+                    retain=retain,
+                )
             except BaseException:
                 # Drop the lease and every reservation made for this attempt.
                 for ticket in tickets:

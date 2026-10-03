@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{RequestId, SharedMedia};
+use crate::{MediaSource, RequestId, SharedMedia, VideoCondition};
 use std::sync::Arc;
 
 /// Terminal cause for one generation request.
@@ -239,6 +239,46 @@ pub struct ArtifactEvent {
     pub media: Arc<SharedMedia>,
 }
 
+/// A video raster in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Canvas {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+/// A video-and-audio generation task, by its request name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoTask {
+    /// Text to video and audio.
+    T2va,
+    /// First and/or last keyframe to video and audio.
+    Fl2va,
+    /// Image, video and audio references to video and audio.
+    Ref2va,
+}
+
+impl VideoTask {
+    /// Every task, in canonical order.
+    pub const ALL: [Self; 3] = [Self::T2va, Self::Fl2va, Self::Ref2va];
+
+    /// The task's request name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::T2va => "t2va",
+            Self::Fl2va => "fl2va",
+            Self::Ref2va => "ref2va",
+        }
+    }
+
+    /// The task a request name denotes, if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|task| task.as_str() == name)
+    }
+}
+
 /// Effective diffusion controls, resolved once by model preprocessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionSamplingParams {
@@ -250,15 +290,32 @@ pub struct DiffusionSamplingParams {
     pub num_inference_steps: u32,
     /// Deterministic request-level noise seed.
     pub seed: u64,
+    /// Output raster width in pixels: the request's canvas.
+    pub width: u32,
+    /// Output raster height in pixels: the request's canvas.
+    pub height: u32,
 }
 
-/// Media request. Final media bytes are returned through shared storage.
+/// A video request. Final media bytes are returned through shared storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionRequest {
     /// Engine request identity.
     pub request_id: RequestId,
-    /// Tokenized media prompt.
+    /// The task the request runs.
+    pub task: VideoTask,
+    /// The conditioner's presentation (condition labels, vision placeholders
+    /// and the prompt), tokenized.
     pub prompt_token_ids: Vec<u32>,
+    /// The denoiser's AdaLN tag of each presentation token: 0 for a vision
+    /// token or vision marker, 1 for text.
+    pub text_tags: Vec<u8>,
+    /// The conditions in request order; empty for `t2va`.
+    pub conditions: Vec<VideoCondition>,
+    /// The shared-memory publication of each condition's media, in request
+    /// order; `conditions[i].source` names `media[i]`. The request holds
+    /// them, and so keeps their bytes readable, until the engine retires it.
+    #[serde(skip)]
+    pub media: Vec<Arc<MediaSource>>,
     /// Scheduler priority.
     pub priority: i32,
     /// Effective diffusion controls and model-preprocessed media unit count.
@@ -266,8 +323,14 @@ pub struct DiffusionRequest {
 }
 
 impl DiffusionRequest {
-    /// Checks that the prompt is nonempty, that the frame, media-unit, and
-    /// step counts are positive, and that the prompt token count fits in `u32`.
+    /// Checks the request's own consistency.
+    ///
+    /// The prompt is nonempty, its token count fits in `u32` and every token
+    /// has a tag; the frame, media-unit, and step counts and the canvas are
+    /// positive; `t2va` has no conditions, `fl2va` only keyframes and
+    /// `ref2va` at least one condition; every condition is consistent
+    /// ([`VideoCondition::validate`]) and its media is published in `media`
+    /// under its locator.
     ///
     /// The engine's media admission rejects a failing request with
     /// `RejectionKind::Invalid`.
@@ -275,15 +338,46 @@ impl DiffusionRequest {
         if self.prompt_token_ids.is_empty() {
             return Err(DiffusionRequestError::EmptyPromptTokens);
         }
+        if self.text_tags.len() != self.prompt_token_ids.len() {
+            return Err(DiffusionRequestError::TextTags);
+        }
 
         if self.sampling.num_frames == 0
             || self.sampling.video_units == 0
             || self.sampling.num_inference_steps == 0
+            || self.sampling.width == 0
+            || self.sampling.height == 0
             || self.prompt_token_ids.len() > u32::MAX as usize
         {
             return Err(DiffusionRequestError::InvalidSampling);
         }
 
+        let served = self.conditions.iter().all(|condition| match self.task {
+            VideoTask::T2va => false,
+            VideoTask::Fl2va => condition.role.is_keyframe(),
+            VideoTask::Ref2va => true,
+        });
+        if !served || (self.task != VideoTask::T2va && self.conditions.is_empty()) {
+            return Err(DiffusionRequestError::Conditions(
+                "the conditions do not fit the task",
+            ));
+        }
+        if self.media.len() != self.conditions.len()
+            || self
+                .media
+                .iter()
+                .zip(&self.conditions)
+                .any(|(media, condition)| media.locator() != condition.source)
+        {
+            return Err(DiffusionRequestError::Conditions(
+                "a condition's media is not published under its locator",
+            ));
+        }
+        for condition in &self.conditions {
+            condition
+                .validate()
+                .map_err(DiffusionRequestError::Conditions)?;
+        }
         Ok(())
     }
 }
@@ -294,10 +388,16 @@ pub enum DiffusionRequestError {
     /// The tokenized prompt contains no tokens.
     #[error("media prompt tokens must not be empty")]
     EmptyPromptTokens,
-    /// A frame, media-unit, or step count is zero, or the prompt token count
-    /// exceeds `u32::MAX`.
+    /// The presentation tags do not cover the prompt tokens one to one.
+    #[error("every media prompt token requires one tag")]
+    TextTags,
+    /// A frame, media-unit, or step count or a canvas side is zero, or the
+    /// prompt token count exceeds `u32::MAX`.
     #[error("diffusion parameters are invalid")]
     InvalidSampling,
+    /// The conditions do not fit the task or are inconsistent.
+    #[error("video conditions are invalid: {0}")]
+    Conditions(&'static str),
 }
 
 /// Immutable request payload selected before it enters the engine.

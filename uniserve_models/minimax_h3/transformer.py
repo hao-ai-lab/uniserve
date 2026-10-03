@@ -1,14 +1,15 @@
 """H3's modulated multimodal transformer and separate latent output heads.
 
-On the first pipeline stage, ``Denoiser.forward`` scatters refined text and
-projected latent rows into this rank's packed hidden shard; every stage then
+On the first pipeline stage, ``Denoiser.forward`` fills this rank's packed
+hidden shard with its prefix rows and projected latent rows; every stage then
 calls ``Transformer.forward`` once per solver step. Each
 ``TransformerLayer.forward_chunks`` yields ``(global row slice, rows)``
 chunks, so a layer's completed rows feed the next layer's attention
 projection before the whole shard is finished. Timestep conditioning comes
 from ``Modulation`` products that ``weights._prepare_modulation`` precomputes
-at load time for the fixed solver ladder; no timestep embedding runs per
-request.
+at load time for the fixed schedule; no timestep embedding runs per request.
+A parallel-decoding student's output projections are likewise fused per
+evaluation at load time (``StepProjection``).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from typing import cast
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from uniserve.distributed import DeviceMesh
 from uniserve.nn import (
@@ -31,30 +33,45 @@ from uniserve.nn import (
 )
 from uniserve.quantization import Quantizer
 
-from .attention import Attention
+from . import config as configs
+from .attention import Dense, RegionSparse, Sparse
 from .config import TransformerConfig
-from .inputs import AttentionInput
+from .inputs import AttentionInput, RegionInput, SequenceInput
 from .modulation import OutputNorm
 
 
 class TransformerLayer(nn.Module):
     """Apply modality-indexed attention and feed-forward residual updates."""
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        attention: Dense | Sparse | RegionSparse,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.rounding = config.rounding
         self.norm = nn.ModuleList(
             (
                 RMSNorm(config.hidden_size, config.norm_eps),
                 RMSNorm(config.hidden_size, config.norm_eps),
             )
         )
-        self.attention = Attention(config)
-        self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
+        self.attention = attention
+        self.mlp = GatedMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            rounding=config.rounding,
+        )
 
     @torch.inference_mode()
     def forward_chunks(
-        self, hidden, modulation, inputs: AttentionInput, *, workspace
+        self,
+        hidden,
+        modulation,
+        inputs: AttentionInput | SequenceInput | RegionInput,
+        *,
+        workspace,
     ):
         """Connect token-local residual updates to the following layer's projection.
 
@@ -65,7 +82,7 @@ class TransformerLayer(nn.Module):
                 ``Transformer.forward`` passes the first layer one chunk
                 covering the shard.
             modulation: This layer's products at the current step,
-                ``[2, 18 * hidden_size]``; see ``Transformer.modulation``.
+                ``[groups, 18 * hidden_size]``; see ``Transformer.modulation``.
             inputs: The attention input of this rank's token shard.
             workspace: ``modulation_indices``, rotary ``cos``/``sin`` and
                 this layer's attention scratch set.
@@ -102,9 +119,9 @@ class TransformerLayer(nn.Module):
         up = cast(ColumnParallelLinear, self.mlp.gate_up.projections["up"])
 
         # Six affine vectors: shift/scale/gate for attention and MLP, each
-        # [6, hidden] after the reshape. The six rows are the (video, text,
-        # audio) token groups under the video timestep, then under the audio
-        # timestep; ``indices`` selects one row per token.
+        # [3 * groups, hidden] after the reshape. Row ``3 * group + tag`` is
+        # the (video, text, audio) tag's products under the timestep group's
+        # value; ``indices`` selects one row per token.
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
             value.to(hidden.dtype)
             for value in modulation.reshape(-1, 6 * self.hidden_size).chunk(
@@ -131,6 +148,7 @@ class TransformerLayer(nn.Module):
                         indices[local],
                         eps=attention_norm.eps,
                         retain=hidden[local],
+                        rounding=self.rounding,
                     ),
                 )
 
@@ -168,6 +186,7 @@ class TransformerLayer(nn.Module):
                         scale_mlp,
                         selected,
                         eps=mlp_norm.eps,
+                        rounding=self.rounding,
                     )
                 )
                 normalized: torch.Tensor = quantizer.from_tensors(
@@ -185,9 +204,14 @@ class TransformerLayer(nn.Module):
                     scale_mlp,
                     selected,
                     eps=mlp_norm.eps,
+                    rounding=self.rounding,
                 )
             return functional.gated_residual(
-                residual, self.mlp(normalized), gate_mlp, selected
+                residual,
+                self.mlp(normalized),
+                gate_mlp,
+                selected,
+                rounding=self.rounding,
             )
 
         # Dynamic tensor-wide statistics (uncalibrated NVFP4, tensor-wide FP8)
@@ -209,7 +233,14 @@ class TransformerLayer(nn.Module):
         for interval, value in attended:
             yield interval, finish(interval, value)
 
-    def forward(self, hidden, modulation, inputs: AttentionInput, *, workspace):
+    def forward(
+        self,
+        hidden,
+        modulation,
+        inputs: AttentionInput | SequenceInput | RegionInput,
+        *,
+        workspace,
+    ):
         outputs = tuple(
             value
             for _, value in self.forward_chunks(
@@ -217,6 +248,42 @@ class TransformerLayer(nn.Module):
             )
         )
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+
+
+class StepProjection(nn.Module):
+    """Project rows with one fused output head per solver evaluation.
+
+    A parallel-decoding student predicts one head per fine-grid interval; an
+    evaluation applies its block's heads fused with their normalized
+    integration weights (``uniserve.diffusion.fuse_heads``). Loading fuses
+    every block once (``weights._prepare_heads``) into ``weight`` [steps,
+    out, in] and ``bias`` [steps, out], and a call gathers the step's head
+    on the device, so one captured evaluation serves every step.
+    """
+
+    weight: torch.Tensor
+    bias: torch.Tensor
+
+    def __init__(self, steps: int, in_features: int, out_features: int):
+        super().__init__()
+        # Placeholders the post-load hook replaces with the fused heads.
+        self.register_buffer(
+            "weight",
+            torch.empty(
+                (steps, out_features, in_features), dtype=torch.float32
+            ),
+        )
+        self.register_buffer(
+            "bias", torch.empty((steps, out_features), dtype=torch.float32)
+        )
+
+    def forward(self, x: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+        """Project FP32 ``x`` [rows, in] with the [1] int64 ``step``'s head."""
+        return F.linear(
+            x,
+            self.weight.index_select(0, step)[0],
+            self.bias.index_select(0, step)[0],
+        )
 
 
 class Transformer(nn.Module):
@@ -232,10 +299,33 @@ class Transformer(nn.Module):
     ``modulation`` is indexed by resident position.
     """
 
-    def __init__(self, config: TransformerConfig, *, num_steps: int = 4):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        *,
+        attention: configs.Attention,
+        entries: int,
+        steps: int,
+        groups: int,
+    ):
+        """Build the network.
+
+        Args:
+            config: The network dimensions.
+            attention: Dense or sparse attention for every layer.
+            entries: Distinct timestep values the schedule evaluates.
+            steps: Network evaluations of the schedule.
+            groups: Timestep groups a step reads (see ``Modulation``).
+        """
         super().__init__()
-        if type(num_steps) is not int or num_steps <= 0:
-            raise ValueError("H3 transformer requires a positive step count")
+        if any(
+            type(value) is not int or value <= 0
+            for value in (entries, steps, groups)
+        ):
+            raise ValueError(
+                "H3 transformer requires positive timestep entries, steps "
+                "and groups"
+            )
         self.config = config
         self.mesh = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0)
         self.video_input = Linear(
@@ -244,42 +334,63 @@ class Transformer(nn.Module):
         self.audio_input = Linear(
             config.audio_channels, config.hidden_size, dtype=torch.float32
         )
+
+        def kind() -> Dense | Sparse | RegionSparse:
+            if isinstance(attention, configs.DenseAttention):
+                return Dense(config)
+            if attention.reference_keep is None:
+                return Sparse(config, sparsity=attention.sparsity)
+            # The sparsity and reference keep rate are request tables of the
+            # region packing (``packing.region_tables``).
+            return RegionSparse(config, tile=attention.tile)
+
         self.layers = nn.ModuleDict(
             {
-                str(index): TransformerLayer(config)
+                str(index): TransformerLayer(config, kind())
                 for index in range(config.num_hidden_layers)
             }
         )
-        # Precomputed affine products of the checkpoint evaluation ladder:
-        # [step, layer, timestep (video, audio), 3 token groups x 6 vectors x
-        # hidden] per transformer layer, and [step, timestep, shift + scale]
-        # for the final output norm. The empty tensors are placeholders that
-        # the post-load hook weights._prepare_modulation replaces.
+        # Precomputed affine products of the schedule's distinct timesteps:
+        # [layer, entry, 3 token tags x 6 vectors x hidden] per transformer
+        # layer and [entry, shift + scale] for the final output norm, with
+        # the [step, group] entries each step reads. The empty tensors are
+        # placeholders that the post-load hook weights._prepare_modulation
+        # replaces.
         self.modulation = Modulation(
             torch.empty(
-                num_steps,
                 config.num_hidden_layers,
-                2,
+                entries,
                 18 * config.hidden_size,
                 dtype=torch.bfloat16,
             ),
-            torch.empty(
-                num_steps, 2, 2 * config.hidden_size, dtype=torch.bfloat16
-            ),
+            torch.empty(entries, 2 * config.hidden_size, dtype=torch.bfloat16),
+            torch.zeros((steps, groups), dtype=torch.int64),
         )
         self.output_norm = OutputNorm(config)
-        self.video_output = Linear(
-            config.hidden_size, config.video_channels * 4, dtype=torch.float32
-        )
-        self.audio_output = Linear(
-            config.hidden_size, config.audio_channels, dtype=torch.float32
-        )
+        self.video_output: Linear | StepProjection
+        self.audio_output: Linear | StepProjection
+        if config.output_heads == 1:
+            self.video_output = Linear(
+                config.hidden_size,
+                config.video_channels * 4,
+                dtype=torch.float32,
+            )
+            self.audio_output = Linear(
+                config.hidden_size, config.audio_channels, dtype=torch.float32
+            )
+        else:
+            self.video_output = StepProjection(
+                steps, config.hidden_size, config.video_channels * 4
+            )
+            self.audio_output = StepProjection(
+                steps, config.hidden_size, config.audio_channels
+            )
 
     @torch.inference_mode()
     def forward(
         self,
         hidden: torch.Tensor,
-        inputs: AttentionInput,
+        inputs: AttentionInput | SequenceInput | RegionInput,
         *,
         step: torch.Tensor,
         tables: Mapping[str, torch.Tensor],
@@ -290,7 +401,9 @@ class Transformer(nn.Module):
         ``step`` is the solver step's [1] int64 device index; the step's
         modulation products are gathered through it, so one captured
         evaluation serves every step. ``tables`` holds the per-row modulation
-        indices and the rotary ``cos``/``sin`` of every packed row.
+        indices and the rotary ``cos``/``sin`` of the rows the attention kind
+        reads (every packed row for sparse attention, the shard's rows for
+        dense attention).
 
         A stage after the first receives its input into ``hidden`` from the
         preceding stage. A stage before the last sends its output onward and
@@ -308,7 +421,7 @@ class Transformer(nn.Module):
             "sin": tables["sin"],
         }
         chunks = ((inputs.token_slice, hidden),)
-        # [resident layer, timestep, 18 * hidden] products of this step.
+        # [resident layer, group, 18 * hidden] products of this step.
         modulation = self.modulation(step)
         for index, layer in enumerate(self.layers.values()):
             layer = cast(TransformerLayer, layer)
@@ -338,7 +451,9 @@ class Transformer(nn.Module):
             pipeline.send(hidden, dst=pipeline.rank + 1)
             return ()
 
-        # The final pipeline stage projects each modality with its own head.
+        # The final pipeline stage projects each modality with its own head;
+        # the output norm reads the generated video and audio timesteps,
+        # groups 0 and 1.
         modulation = self.modulation.output(step)
         results = []
         for index, (indices, projection) in enumerate(
@@ -349,7 +464,10 @@ class Transformer(nn.Module):
         ):
             selected = hidden.index_select(0, indices)
             selected = self.output_norm(selected, modulation[index : index + 1])
-            results.append(
-                projection(selected.float(), output_dtype=torch.float32)
-            )
+            if isinstance(projection, StepProjection):
+                results.append(projection(selected.float(), step))
+            else:
+                results.append(
+                    projection(selected.float(), output_dtype=torch.float32)
+                )
         return tuple(results)

@@ -33,7 +33,7 @@ namespace uniserve.ipc;
 // ForwardMode, MediaCall, and TransferMode mirror the Rust enums of the same
 // names. Their leading `None` exists only to mark an unset CallKind tag.
 enum ForwardMode : ubyte { None, Prefill, Decode, Verify }
-enum MediaCall : ubyte { None, VisionEncoding, LatentEncoding, TextEncoding, LatentPreparation, Denoising, ImageDecoding, VideoDecoding, AudioDecoding, VideoEncoding, AudioEncoding, Muxing }
+enum MediaCall : ubyte { None, MediaReading, VisionEncoding, LatentEncoding, TextEncoding, LatentPreparation, Denoising, ImageDecoding, VideoDecoding, AudioDecoding, VideoEncoding, AudioEncoding, Muxing }
 enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
 
 /// Inline encoding of the Rust `CallKind` sum: exactly one of the three tags
@@ -184,6 +184,11 @@ table OutputInfo {
   /// Index of the one axis whose extent is known only on the device, or -1
   /// when every axis is static.
   dynamic_axis:int = -1;
+  /// Static axes holding a video request's canvas height and width, whose
+  /// extents are the largest admitted; -1 for a result without a raster.
+  /// Either both are set or neither.
+  height_axis:int = -1;
+  width_axis:int = -1;
 }
 
 table ComponentInfo {
@@ -193,6 +198,29 @@ table ComponentInfo {
   distribution:ComponentDistribution;
   units_per_rank:uint = 1;
   outputs:[OutputInfo];
+}
+
+/// A video raster in pixels.
+struct Canvas { width:uint; height:uint; }
+
+/// Whole tiles of `rows` rows a multi-region denoiser packs each condition
+/// into; a video's token grid is cut into tiles of `frames x height x width`
+/// tokens.
+struct ConditionTiles { rows:uint; frames:uint; height:uint; width:uint; }
+
+/// What a deployment's video denoiser serves: its tasks, its fixed schedule
+/// (sigma points including the clean endpoint, and the per-modality shifts)
+/// and the canvases and packed rows it accepts. An empty canvas list is the
+/// model's canvas rule; an absent capacity is unbounded by the checkpoint;
+/// absent condition tiles pack conditions densely, one row per token.
+table VideoDenoiserInfo {
+  tasks:[string];
+  schedule_points:uint;
+  video_shift:double;
+  audio_shift:double;
+  canvases:[Canvas];
+  max_sequence_rows:uint = null;
+  condition_tiles:ConditionTiles;
 }
 
 /// Binds a media call to the component that runs it; the decoder rejects a
@@ -236,6 +264,7 @@ table WorkerInfo {
   /// stub model; the engine refuses ranks or pools that report different
   /// values.
   checkpoint_identity:string;
+  video_denoiser:VideoDenoiserInfo;
 }
 
 // Request identities and call records.
@@ -470,6 +499,54 @@ table BatchCommandEnvelope { command:BatchCommand; }
 
 // Static request admission and physical run binding.
 
+// A video request's task, presentation tags and conditions, decoded into
+// `VideoAdmission` and its `uniserve_core::VideoCondition` values, which
+// carry the field semantics.
+
+enum VideoTask : ubyte { T2va, Fl2va, Ref2va }
+enum ConditionRole : ubyte { FirstFrame, LastFrame, Reference }
+
+/// A still image resized to `resized`, then the `size` window at (`left`,
+/// `top`) kept.
+struct ImageFit { resized:Canvas; left:uint; top:uint; size:Canvas; }
+/// A reference video's frames on the 24 fps timeline.
+struct VideoClip { canvas:Canvas; start_frame:uint; frames:uint; vae_frames:uint; }
+/// An audio track's native samples and their count at the model rate.
+struct AudioClip {
+  sample_rate:uint;
+  start_sample:ulong;
+  source_samples:ulong;
+  samples:ulong;
+}
+struct VisionGrid { t:uint; h:uint; w:uint; }
+
+table ConditionVision {
+  grid:VisionGrid;
+  tokens:uint;
+  frame_indices:[uint];
+}
+
+/// One condition. Its media is `image` alone (a keyframe or image
+/// reference), `video` with an optional soundtrack in `audio`, or `audio`
+/// alone (an audio reference); the decoder rejects any other combination.
+table VideoCondition {
+  role:ConditionRole;
+  source_name:string;
+  source_bytes:ulong;
+  image:ImageFit;
+  video:VideoClip;
+  audio:AudioClip;
+  vision:ConditionVision;
+  latent_units:[uint];
+  audio_rows:uint;
+}
+
+table VideoAdmission {
+  task:VideoTask;
+  text_tags:[ubyte];
+  conditions:[VideoCondition];
+}
+
 table ArRequestParams {
   sampling:SamplingParams;
   negative_token_ids:[uint];
@@ -482,6 +559,9 @@ table DiffusionSamplingParams {
   video_units:uint;
   num_inference_steps:uint;
   seed:ulong;
+  /// Output raster in pixels: the request's canvas.
+  width:uint;
+  height:uint;
 }
 
 table NewRequest {
@@ -494,6 +574,8 @@ table NewRequest {
   /// Number of input images the request carries; image preprocessing that
   /// divides a pixel budget among them reads it.
   input_images:uint;
+  /// Present exactly with `diffusion`.
+  video:VideoAdmission;
 }
 
 /// The payload of a Submit request, decoded into `Batch` and checked as a

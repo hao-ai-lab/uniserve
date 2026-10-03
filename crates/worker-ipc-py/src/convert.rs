@@ -38,15 +38,18 @@ use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
-use uniserve_core::{ImageParams, SamplingParams, TokenLogprob};
+use uniserve_core::{
+    AudioClip, Canvas, ConditionMedia, ConditionRole, ImageParams, SamplingParams, TokenLogprob,
+    VideoCondition,
+};
 use uniserve_worker_ipc::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
     BufferAllocation, BufferId, CachePageAllocation, Call, CallId, CallKind, CallStatus, DType,
     DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCallIdentity, ErrorCode,
     FeatureKind, FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput,
     NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication, TensorRef,
-    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, WorkerEndpoint,
-    WorkerRequest, WorkerResponse, WorkerResponseError,
+    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -154,6 +157,20 @@ impl RequestTypes {
         records.insert("GenerationParams", class(&module, "GenerationParams")?);
         records.insert("DiffusionParams", class(&module, "DiffusionParams")?);
         records.insert("TensorPublication", class(&module, "TensorPublication")?);
+        let module = py.import("uniserve_worker.protocol.video")?;
+        for name in [
+            "VideoAdmission",
+            "VideoCondition",
+            "MediaLocator",
+            "ImageFit",
+            "VideoClip",
+            "AudioClip",
+            "ConditionVision",
+        ] {
+            records.insert(name, class(&module, name)?);
+        }
+        let module = py.import("uniserve.media.image")?;
+        records.insert("Raster", class(&module, "Config")?);
         let module = py.import("uniserve_worker.protocol.call")?;
         records.insert("ImageParams", class(&module, "ImageParams")?);
         let module = py.import("uniserve.sampling")?;
@@ -816,7 +833,131 @@ fn admission_to_py<'py>(
             .map(|diffusion| diffusion_params_to_py(py, diffusion))
             .transpose()?,
     )?;
+    dict.set_item(
+        intern!(py, "video"),
+        admission
+            .video
+            .as_ref()
+            .map(|video| video_admission_to_py(py, video))
+            .transpose()?,
+    )?;
     construct(py, "NewRequest", &dict)
+}
+
+/// Converts a video request's task, presentation tags and conditions.
+fn video_admission_to_py<'py>(
+    py: Python<'py>,
+    video: &VideoAdmission,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "task"), video.task.as_str())?;
+    dict.set_item(
+        intern!(py, "text_tags"),
+        PyTuple::new(py, video.text_tags.iter().copied())?,
+    )?;
+    let conditions = video
+        .conditions
+        .iter()
+        .map(|condition| video_condition_to_py(py, condition))
+        .collect::<PyResult<Vec<_>>>()?;
+    dict.set_item(intern!(py, "conditions"), PyTuple::new(py, conditions)?)?;
+    construct(py, "VideoAdmission", &dict)
+}
+
+/// Converts a raster into the library's `image.Config`.
+fn raster_to_py<'py>(py: Python<'py>, canvas: Canvas) -> PyResult<Bound<'py, PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "height"), canvas.height)?;
+    dict.set_item(intern!(py, "width"), canvas.width)?;
+    construct(py, "Raster", &dict)
+}
+
+fn audio_clip_to_py<'py>(py: Python<'py>, clip: &AudioClip) -> PyResult<Bound<'py, PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "sample_rate"), clip.sample_rate)?;
+    dict.set_item(intern!(py, "start_sample"), clip.start_sample)?;
+    dict.set_item(intern!(py, "source_samples"), clip.source_samples)?;
+    dict.set_item(intern!(py, "samples"), clip.samples)?;
+    construct(py, "AudioClip", &dict)
+}
+
+/// Converts one condition. Its media becomes the worker record's `image`,
+/// `video` and `audio` fields: an image alone, a video with its optional
+/// soundtrack, or audio alone.
+fn video_condition_to_py<'py>(
+    py: Python<'py>,
+    condition: &VideoCondition,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dict = PyDict::new(py);
+    let role = match condition.role {
+        ConditionRole::FirstFrame => "first_frame",
+        ConditionRole::LastFrame => "last_frame",
+        ConditionRole::Reference => "reference",
+    };
+    dict.set_item(intern!(py, "role"), role)?;
+
+    let source = PyDict::new(py);
+    source.set_item(intern!(py, "name"), &condition.source.name)?;
+    source.set_item(intern!(py, "bytes"), condition.source.bytes)?;
+    dict.set_item(
+        intern!(py, "source"),
+        construct(py, "MediaLocator", &source)?,
+    )?;
+
+    let (image, video, audio) = match &condition.media {
+        ConditionMedia::Image(fit) => {
+            let fields = PyDict::new(py);
+            fields.set_item(intern!(py, "resized"), raster_to_py(py, fit.resized)?)?;
+            fields.set_item(intern!(py, "left"), fit.left)?;
+            fields.set_item(intern!(py, "top"), fit.top)?;
+            fields.set_item(intern!(py, "size"), raster_to_py(py, fit.size)?)?;
+            (Some(construct(py, "ImageFit", &fields)?), None, None)
+        }
+        ConditionMedia::Video { clip, soundtrack } => {
+            let fields = PyDict::new(py);
+            fields.set_item(intern!(py, "canvas"), raster_to_py(py, clip.canvas)?)?;
+            fields.set_item(intern!(py, "start_frame"), clip.start_frame)?;
+            fields.set_item(intern!(py, "frames"), clip.frames)?;
+            fields.set_item(intern!(py, "vae_frames"), clip.vae_frames)?;
+            (
+                None,
+                Some(construct(py, "VideoClip", &fields)?),
+                soundtrack
+                    .as_ref()
+                    .map(|track| audio_clip_to_py(py, track))
+                    .transpose()?,
+            )
+        }
+        ConditionMedia::Audio(clip) => (None, None, Some(audio_clip_to_py(py, clip)?)),
+    };
+    dict.set_item(intern!(py, "image"), image)?;
+    dict.set_item(intern!(py, "video"), video)?;
+    dict.set_item(intern!(py, "audio"), audio)?;
+
+    let vision = condition
+        .vision
+        .as_ref()
+        .map(|vision| -> PyResult<Bound<'py, PyAny>> {
+            let fields = PyDict::new(py);
+            fields.set_item(
+                intern!(py, "grid"),
+                PyTuple::new(py, [vision.grid.t, vision.grid.h, vision.grid.w])?,
+            )?;
+            fields.set_item(intern!(py, "tokens"), vision.tokens)?;
+            fields.set_item(
+                intern!(py, "frame_indices"),
+                u32_tuple(py, &vision.frame_indices)?,
+            )?;
+            construct(py, "ConditionVision", &fields)
+        })
+        .transpose()?;
+    dict.set_item(intern!(py, "vision"), vision)?;
+    dict.set_item(
+        intern!(py, "latent_units"),
+        u32_tuple(py, &condition.latent_units)?,
+    )?;
+    dict.set_item(intern!(py, "audio_rows"), condition.audio_rows)?;
+    construct(py, "VideoCondition", &dict)
 }
 
 /// Converts autoregressive admission parameters into a Python record.
@@ -848,6 +989,8 @@ fn diffusion_params_to_py<'py>(
         diffusion.num_inference_steps,
     )?;
     dict.set_item(intern!(py, "seed"), diffusion.seed)?;
+    dict.set_item(intern!(py, "width"), diffusion.width)?;
+    dict.set_item(intern!(py, "height"), diffusion.height)?;
     construct(py, "DiffusionParams", &dict)
 }
 
@@ -2089,6 +2232,13 @@ mod tests {
                 video_units: 3,
                 num_inference_steps: 4,
                 seed: 29,
+                width: 1344,
+                height: 768,
+            },
+            VideoAdmission {
+                task: uniserve_core::VideoTask::T2va,
+                text_tags: vec![1; 3],
+                conditions: Vec::new(),
             },
         )
         .unwrap();
