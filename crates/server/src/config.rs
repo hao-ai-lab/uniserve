@@ -64,6 +64,9 @@ pub struct EngineSettings {
     /// The prefill tokens still travel as their own batch and numerical call.
     /// `0` disables co-scheduling.
     pub mixed_prefill_tokens: usize,
+    /// Reuse and retain prompt KV prefixes across requests. Per-request cache
+    /// policy can further restrict this deployment-wide setting.
+    pub prefix_cache: bool,
     /// Waiting queue policy used by the scheduler.
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length override. `None` derives the limit from
@@ -100,6 +103,7 @@ impl Default for EngineSettings {
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
+            prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: 15.0,

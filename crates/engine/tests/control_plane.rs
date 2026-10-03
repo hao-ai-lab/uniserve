@@ -1280,65 +1280,70 @@ fn hybrid_groups_share_one_unit_pool() {
     assert!(retired, "the sliding group never retired a page");
 }
 
-/// Two sequential requests with the same prompt: the first publishes its full
-/// prompt blocks to the prefix cache, and the second reuses them.
+/// Deployment policy controls prefix reuse without changing generated tokens.
+/// Both requests ask to read and write prefixes; the disabled deployment must
+/// override that permission while preserving each request's active KV state.
 #[test]
-fn prefix_cache_reuses_shared_prompt() {
-    use std::sync::atomic::Ordering;
-    let mut sim = SimEngine::new();
-    sim.set_text_len(4);
-    let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
-    let stats = sched.stats_handle();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
+fn prefix_cache_configuration_controls_reuse() {
+    use uniserve_engine::{EngineConfig, EngineCore};
 
-    // 600 tokens span 9 full 64-token pages plus a partial page; the
-    // assertions below are lower bounds.
     let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
+    let mut outputs = Vec::new();
+    for enabled in [true, false] {
+        let mut sim = SimEngine::new();
+        sim.set_text_len(4);
+        let config = EngineConfig {
+            prefix_cache: enabled,
+            ..EngineConfig::sim("sim-model")
+        };
+        let engine = EngineCore::with_executor(config, Box::new(SimExecutor::new(sim))).unwrap();
+        let stats = engine.stats();
+        let mut replies = Vec::new();
 
-    let run_one = |rid: u64, handle: &EngineHandle| {
-        let mut erx = handle
-            .submit(generation_request(
-                RequestId(rid),
-                text_input(prompt.clone()),
-                SamplingParams::default(),
-                ImageParams::default(),
-                GenerationConstraint::UndOnly,
-                8,
-            ))
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut done = false;
-        while !done && Instant::now() < deadline {
-            match erx.try_recv() {
-                Ok(EngineCoreOutput::Finished { .. }) => done = true,
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
+        // The second request can reuse nine full pages from the first when
+        // caching is enabled. Page tails still require ordinary prefill.
+        for rid in 1..=2 {
+            let mut events = engine
+                .submit(uniserve_core::Request::Umm(generation_request(
+                    RequestId(rid),
+                    text_input(prompt.clone()),
+                    SamplingParams::default(),
+                    ImageParams::default(),
+                    GenerationConstraint::UndOnly,
+                    8,
+                )))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut tokens = Vec::new();
+            let mut finish = None;
+            while finish.is_none() && Instant::now() < deadline {
+                match events.try_recv() {
+                    Ok(EngineCoreOutput::TextToken { id, .. }) => tokens.push(id),
+                    Ok(EngineCoreOutput::Finished { reason, .. }) => finish = Some(reason),
+                    Ok(_) => {}
+                    Err(_) => thread::sleep(Duration::from_millis(1)),
+                }
             }
+            assert_eq!(finish, Some(FinishReason::Eos));
+            assert!(!tokens.is_empty());
+            replies.push(tokens);
         }
-        assert!(done, "req {rid} did not finish");
-    };
 
-    // Cold: req1 populates the prefix cache.
-    run_one(1, &handle);
-    assert!(
-        stats.kv_cache.pages_stored.load(Ordering::Relaxed) >= 2,
-        "req1 should cache >= 2 full prompt pages"
-    );
-    let hits_before = stats.prefix.hit_tokens.load(Ordering::Relaxed);
-
-    // Warm: req2 (same prompt) reuses the cached prefix.
-    run_one(2, &handle);
-    let hits_after = stats.prefix.hit_tokens.load(Ordering::Relaxed);
-    assert!(
-        hits_after - hits_before >= 512,
-        "req2 should reuse >= 512 cached prefix tokens (before={hits_before} after={hits_after})"
-    );
-
-    handle.shutdown();
-    let _ = jh.join();
+        let hits = stats.prefix.hit_tokens.load(Ordering::Relaxed);
+        if enabled {
+            assert!(hits >= 512, "the shared prompt did not reuse cached KV");
+        } else {
+            assert_eq!(hits, 0, "disabled prefix caching still reused KV");
+            assert_eq!(
+                stats.kv_cache.pages_stored.load(Ordering::Relaxed),
+                0,
+                "disabled prefix caching retained reusable pages"
+            );
+        }
+        outputs.push(replies);
+        engine.shutdown();
+    }
+    assert_eq!(outputs[0], outputs[1]);
 }
 
 /// Per-request `CachePolicy` governs prefix reuse: isolation keys partition the

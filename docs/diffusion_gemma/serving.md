@@ -30,6 +30,8 @@ Each independent replica owns its scheduler and KV cache. The frontend sends a r
 
 Startup loads weights, prepares native kernels, and captures execution graphs. Wait for serving readiness before sending measured traffic. Use `GET /health`, `GET /v1/models`, and `GET /metrics` for readiness, model identity, and serving counters. Keep the default native attention selection and graph policy for normal serving.
 
+Prefix caching is enabled by default. Add `--disable-prefix-cache` to recompute each request's prompt and avoid retaining reusable prompt KV pages across requests. Active requests still retain the KV state required for generation. The option applies to every data-parallel replica; it does not disable the separate image-encoder cache. Treat cache-on and cache-off measurements as distinct deployment configurations.
+
 ## Decision readout
 
 A decision request supplies one state and named questions. The model reads a scaffold containing masked answer slots in one denoising pass; it does not generate a text completion.

@@ -336,6 +336,9 @@ pub struct EngineConfig {
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as one mixed extend+decode forward. `0` disables mixing.
     pub mixed_prefill_tokens: usize,
+    /// Reuse and retain prompt KV prefixes across requests. Disabling this
+    /// does not remove the KV storage needed within an active request.
+    pub prefix_cache: bool,
     /// Waiting queue policy for admitting/scheduling requests.
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length reported to the frontend.
@@ -403,6 +406,7 @@ impl EngineConfig {
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
+            prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
             workers: vec![WorkerConfig::placed(
@@ -688,7 +692,7 @@ impl EngineCore {
         waker: CommandWaker,
     ) -> anyhow::Result<Self> {
         let ctrl = config.control_tokens();
-        let sched = Scheduler::with_model_limits(
+        let mut sched = Scheduler::with_model_limits(
             executor,
             ctrl,
             SchedulerConfig {
@@ -704,6 +708,7 @@ impl EngineCore {
             config.worker_process.model_dtype,
             config.generation_limits,
         )?;
+        sched.set_prefix_cache(config.prefix_cache);
         let info = sched.info().clone();
         let model_dtype = config.worker_process.model_dtype;
         let generation_limits = sched.generation_limits().clone();

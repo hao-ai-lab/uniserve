@@ -166,6 +166,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// Optional explicit KV token capacity override for the worker.
     #[arg(long = "max-total-tokens")]
     pub kv_token_capacity: Option<u64>,
+    /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
+    #[arg(long)]
+    pub disable_prefix_cache: bool,
     /// Response-ring slot capacity in bytes for the worker IPC transport.
     #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub resp_slot_cap: usize,
@@ -431,6 +434,7 @@ impl SharedRuntimeArgs {
                 .long_prefill_threshold
                 .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
             mixed_prefill_tokens: self.mixed_prefill_tokens,
+            prefix_cache: !self.disable_prefix_cache,
             scheduler_policy: self.scheduler_policy.into(),
             // `None` lets `build_state` derive the model's real context length;
             // an explicit `--max-model-len` overrides it.

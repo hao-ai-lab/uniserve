@@ -167,6 +167,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_num_seqs: config.engine.max_num_seqs,
         long_prefill_threshold: config.engine.long_prefill_threshold,
         mixed_prefill_tokens: config.engine.mixed_prefill_tokens,
+        prefix_cache: config.engine.prefix_cache,
         scheduler_policy: config.engine.scheduler_policy,
         max_model_len: effective_max_model_len,
         workers: config.engine.workers.clone(),
