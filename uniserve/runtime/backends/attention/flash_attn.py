@@ -33,6 +33,8 @@ class _FlashOperator(_Operator):
     def _validate_representation(self):
         if self.dtype not in {torch.float16, torch.bfloat16}:
             raise ValueError("FlashAttention requires FP16 or BF16 computation")
+        if self.window is not None:
+            raise ValueError("FlashAttention does not take history windows")
         if self.cache is not None and (
             isinstance(self.cache.key, QuantizedTensor)
             or self.cache.block_size % 256
@@ -59,6 +61,11 @@ class _FlashOperator(_Operator):
         if isinstance(batch, DenseInput) and batch.mask is not None:
             raise ValueError(
                 "this FlashAttention kernel does not implement dense masks"
+            )
+        if isinstance(batch, PagedInput) and batch.causal_values is not None:
+            raise ValueError(
+                "this FlashAttention kernel does not implement device "
+                "causality flags; use FlashAttention-4 for that representation"
             )
         self._validate(q, k, v, batch, out)
 
@@ -175,7 +182,15 @@ class Backend(_Backend):
     operator_class = _FlashOperator
 
     def workspace_buffers(
-        self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache
+        self,
+        *,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        size,
+        cache,
+        window=None,
     ):
         return {
             "lengths": BufferConfig((size.batch_size,), torch.int32),

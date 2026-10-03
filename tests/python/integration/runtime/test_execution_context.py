@@ -13,7 +13,7 @@ from torch import nn
 from uniserve.cache import Config, mha
 from uniserve.model import TextSize
 from uniserve.nn import Linear, MergedColumnParallelLinear
-from uniserve.nn.attention import Attention, PagedInput
+from uniserve.nn.attention import Attention, AttentionBatch, PagedInput
 from uniserve.quantization import Quantizer
 from uniserve.runtime import (
     CUDAGraph,
@@ -100,12 +100,18 @@ def test_device_lengths_drive_current_attention_values(
         output = torch.empty_like(query)
         graph = None
         try:
-            context.bind_attention(batch)
-            layer(query, key, value, batch, out=output)
+            context.bind_attention(AttentionBatch.single(batch))
+            layer(query, key, value, AttentionBatch.single(batch), out=output)
             if graphs:
                 graph = CUDAGraph(context=context)
                 graph.capture(
-                    lambda: layer(query, key, value, batch, out=output)
+                    lambda: layer(
+                        query,
+                        key,
+                        value,
+                        AttentionBatch.single(batch),
+                        out=output,
+                    )
                 )
             for counts in ((2, 3), (4, 1), (1, 4)):
                 changed = indices(counts)
@@ -113,11 +119,17 @@ def test_device_lengths_drive_current_attention_values(
                 batch.queries.offsets.copy_(changed.queries.offsets)
                 batch.write_indices.copy_(changed.write_indices)
                 value.mul_(0.75)
-                context.bind_attention(batch)
+                context.bind_attention(AttentionBatch.single(batch))
                 actual = (
                     graph.replay()
                     if graph
-                    else layer(query, key, value, batch, out=output)
+                    else layer(
+                        query,
+                        key,
+                        value,
+                        AttentionBatch.single(batch),
+                        out=output,
+                    )
                 )
                 expected = []
                 for q, k, v, flag in zip(
@@ -182,15 +194,21 @@ def test_nested_execution_contexts_keep_prefixes_independent():
             device="cpu",
         )
         one, two = torch.ones(1, 64), torch.full((1, 64), 2.0)
-        a.bind_attention(batch)
-        torch.testing.assert_close(module(one, batch), one)
+        a.bind_attention(AttentionBatch.single(batch))
+        torch.testing.assert_close(
+            module(one, AttentionBatch.single(batch)), one
+        )
         with ExecutionContext(module, cache=second, attention="torch") as b:
             b.prepare(TextSize(1, 1))
-            b.bind_attention(batch)
-            torch.testing.assert_close(module(two, batch), two)
+            b.bind_attention(AttentionBatch.single(batch))
+            torch.testing.assert_close(
+                module(two, AttentionBatch.single(batch)), two
+            )
         readonly = replace(batch, write_indices=None)
-        a.bind_attention(readonly)
-        torch.testing.assert_close(module(two, readonly), one)
+        a.bind_attention(AttentionBatch.single(readonly))
+        torch.testing.assert_close(
+            module(two, AttentionBatch.single(readonly)), one
+        )
         torch.testing.assert_close(first.state("attention").value[0, 0], one)
         torch.testing.assert_close(second.state("attention").value[0, 0], two)
 
@@ -279,7 +297,7 @@ def test_eager_attention_replans_changed_sequence_boundaries():
                 causal=True,
                 device=device,
             )
-            actual = layer(q, k, v, batch)
+            actual = layer(q, k, v, AttentionBatch.single(batch))
             expected = []
             for query, key, value in zip(
                 q.split(counts), k.split(counts), v.split(counts), strict=True
@@ -360,9 +378,12 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
         ExecutionContext(layer, cache=cache, attention=provider) as context,
     ):
         context.prepare(TextSize(5, 2))
-        context.bind_attention(batch)
+        context.bind_attention(AttentionBatch.single(batch))
         torch.testing.assert_close(
-            layer(q, k, v, batch), expected((4, 1)), rtol=2e-2, atol=2e-2
+            layer(q, k, v, AttentionBatch.single(batch)),
+            expected((4, 1)),
+            rtol=2e-2,
+            atol=2e-2,
         )
         for counts in ((2, 3), (1, 4)):
             # Columns change in place without another bind; the next call
@@ -372,7 +393,10 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
             batch.queries.offsets.copy_(changed.queries.offsets)
             batch.write_indices.copy_(changed.write_indices)
             torch.testing.assert_close(
-                layer(q, k, v, batch), expected(counts), rtol=2e-2, atol=2e-2
+                layer(q, k, v, AttentionBatch.single(batch)),
+                expected(counts),
+                rtol=2e-2,
+                atol=2e-2,
             )
 
 
