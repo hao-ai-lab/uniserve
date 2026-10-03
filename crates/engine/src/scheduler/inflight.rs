@@ -57,10 +57,18 @@ pub(super) struct PendingCompletion {
     pub(super) arrival_seq: u64,
 }
 
-/// Terminal event held until outstanding calls are reconciled.
+/// A request finish whose retirement waits until outstanding calls are
+/// reconciled.
+#[derive(Clone)]
 pub(super) struct PendingFinish {
     pub(super) reason: FinishReason,
     pub(super) stop_reason: Option<uniserve_core::StopReason>,
+    /// Whether the terminal `Finished` event is already published: a finish
+    /// decided by the request's own output is final once no decoder decision
+    /// is pending, since the calls still in flight are discarded
+    /// (`Scheduler::finish_after_inflight`). Retirement then publishes no
+    /// second terminal event, and the request publishes nothing more.
+    pub(super) terminal_published: bool,
 }
 
 /// One submitted batch remains owned until all results and command receipts arrive.

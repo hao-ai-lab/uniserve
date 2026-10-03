@@ -38,6 +38,12 @@ fn resolve_generation_limits(
     {
         available.insert(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
     }
+    // A canvas denoises over a prompt the same worker's prefill cached.
+    if supports(CallKind::Forward(ForwardMode::Prefill))
+        && supports(CallKind::Forward(ForwardMode::TokenDenoising))
+    {
+        available.insert(uniserve_core::GenerationFeatures::TOKEN_DENOISING);
+    }
     limits.features &= available;
 
     limits.max_latent_units = limits.max_latent_units.min(info.latent_capacity_units());
@@ -55,6 +61,25 @@ fn resolve_generation_limits(
         limits.encoder_cache_entries = 0;
     }
     limits
+}
+
+/// Largest number of request-pool rows a runtime keeps outside
+/// `max_num_seqs` (`flow_prefix_rows`). A launch sizes worker request pools
+/// before the loaded capabilities decide the actual reserve.
+pub(crate) const MAX_FLOW_PREFIX_ROWS: usize = 1;
+
+/// Request-pool rows the runtime keeps outside `max_num_seqs`.
+///
+/// A KV runtime with denoising keeps one row: a running request's
+/// multi-branch guidance prefix (`Scheduler::ensure_flow_prefix`) allocates
+/// its own row from the same request pool. Other runtimes keep none.
+pub(crate) fn flow_prefix_rows(info: &WorkerInfo) -> usize {
+    usize::from(
+        info.uses_kv()
+            && info
+                .supported_calls
+                .contains(&CallKind::Media(MediaCall::Denoising)),
+    )
 }
 
 impl Scheduler {
@@ -106,13 +131,17 @@ impl Scheduler {
     ) -> anyhow::Result<Self> {
         let info = executor.info().runtime_info()?;
 
-        // Latent preparation without text decode is diffusion-only; otherwise
-        // any denoising, vision-encoding, or latent-encoding capability makes
-        // the runtime unified multimodal; everything else is autoregressive.
+        // Without text decode, token-canvas denoising makes the runtime
+        // block-diffusion and latent preparation makes it diffusion-only;
+        // otherwise any denoising, vision-encoding, or latent-encoding
+        // capability makes the runtime unified multimodal; everything else is
+        // autoregressive.
         let calls = &info.supported_calls;
-        let family = if calls.contains(&CallKind::Media(MediaCall::LatentPreparation))
-            && !calls.contains(&CallKind::Forward(ForwardMode::Decode))
+        let decodes = calls.contains(&CallKind::Forward(ForwardMode::Decode));
+        let family = if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes
         {
+            RuntimeFamily::BlockDiffusion
+        } else if calls.contains(&CallKind::Media(MediaCall::LatentPreparation)) && !decodes {
             RuntimeFamily::Diffusion
         } else if calls.contains(&CallKind::Media(MediaCall::Denoising))
             || (calls.contains(&CallKind::Media(MediaCall::VisionEncoding))
@@ -139,6 +168,17 @@ impl Scheduler {
         // clamps them to the worker-reported capacities.
         let generation_limits = match family {
             RuntimeFamily::Umm => unbounded_umm_generation_limits(),
+            // Canvas readouts over prompts that may carry encoded images.
+            RuntimeFamily::BlockDiffusion => uniserve_core::GenerationLimits {
+                features: uniserve_core::GenerationFeatures::TOKEN_DENOISING
+                    | uniserve_core::GenerationFeatures::VISION_ENCODE,
+                latent_downsample: 1,
+                max_vit_grid_tokens: u32::MAX,
+                max_vision_feature_bytes: 256 << 20,
+                max_cfg_branches: 1,
+                encoder_cache_entries: 256,
+                ..Default::default()
+            },
             RuntimeFamily::Ar | RuntimeFamily::Diffusion => uniserve_core::GenerationLimits {
                 features: if family == RuntimeFamily::Ar {
                     uniserve_core::GenerationFeatures::UNDERSTANDING
@@ -206,25 +246,27 @@ impl Scheduler {
 
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
 
-        // KV runtimes with denoising keep one request slot outside
-        // `max_num_seqs`. A running request's multi-branch guidance prefix
-        // (`Scheduler::ensure_flow_prefix`) allocates its own slot from the
-        // same request pool. `set_max_num_seqs` applies the same reserve.
-        let flow_slot_reserve = usize::from(
-            info.uses_kv()
-                && info
-                    .supported_calls
-                    .contains(&CallKind::Media(MediaCall::Denoising)),
-        );
+        // The request pool also holds the rows the runtime keeps outside
+        // `max_num_seqs` (`flow_prefix_rows`); `set_max_num_seqs` applies the
+        // same reserve. `EngineCore::new` launches workers with enough rows
+        // and refuses a token runtime whose workers hold fewer, so this clamp
+        // lowers the limit only for a supplied executor or for workers that
+        // fit their request pools to device storage.
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
-            .saturating_sub(flow_slot_reserve)
+            .saturating_sub(flow_prefix_rows(&info))
             .max(1);
 
-        config.max_num_seqs = config
-            .max_num_seqs
-            .clamp(1, MAX_NUM_SEQS)
-            .min(main_request_capacity);
+        let requested_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
+        if requested_seqs > main_request_capacity {
+            tracing::warn!(
+                requested = requested_seqs,
+                request_rows = info.request_slots,
+                running = main_request_capacity,
+                "the workers' request rows lower the running-request limit"
+            );
+        }
+        config.max_num_seqs = requested_seqs.min(main_request_capacity);
         config.max_num_batched_tokens = config.max_num_batched_tokens.max(1).min(max_batch_tokens);
         if max_batch_calls > 0 {
             config.max_batch = config.max_batch.min(max_batch_calls.max(1));
@@ -324,18 +366,11 @@ impl Scheduler {
     ///
     /// Keeps the flow-prefix slot reserve applied at construction.
     pub fn set_max_num_seqs(&mut self, n: usize) {
-        let flow_slot_reserve = usize::from(
-            self.info.uses_kv()
-                && self
-                    .info
-                    .supported_calls
-                    .contains(&CallKind::Media(MediaCall::Denoising)),
-        );
         let capacity = self
             .storage
             .request_pool
             .capacity()
-            .saturating_sub(flow_slot_reserve)
+            .saturating_sub(flow_prefix_rows(&self.info))
             .max(1);
         self.config.max_num_seqs = n.clamp(1, capacity);
     }

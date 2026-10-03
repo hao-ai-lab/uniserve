@@ -149,5 +149,7 @@ fn generation_request(id: u64, constraint: GenerationConstraint) -> GenerationRe
         priority: 0,
         cache: Default::default(),
         image_generation: policy,
+        readout: Vec::new(),
+        canvas: None,
     }
 }

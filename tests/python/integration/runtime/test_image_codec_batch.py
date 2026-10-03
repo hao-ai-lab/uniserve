@@ -68,7 +68,6 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
             decode_predicates=torch.tensor([False, True, True, True]),
             max_calls=3,
             request_slots=3,
-            max_tokens=64,
             latent_capacity_units=16,
             table_widths=(2,),
             max_inflight=1,

@@ -87,6 +87,8 @@ fn main() {
             priority: 0,
             cache,
             image_generation: policy,
+            readout: Vec::new(),
+            canvas: None,
         };
         request
             .validate_resources(&limits)

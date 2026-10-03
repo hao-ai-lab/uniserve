@@ -4,7 +4,8 @@
 `Executor.poll` consumes its result, `submit` itself fails, or the worker
 closes. The execution modules fill it in stage order: `prepare_batch` and
 `prepare_inputs` record storage dependencies, input reservations and
-predicate captures; `reserve_outputs` binds one `PendingOutput` per call;
+predicate captures, and `image.reserve_images` the host preparation of
+inline input images; `reserve_outputs` binds one `PendingOutput` per call;
 `commit_batch` (or `execute_batch` on failure) records the final outputs.
 The `Executor` begins retiring the batch's commands at launch, materializes
 the outputs, and then completes that retirement. Readiness callbacks
@@ -26,6 +27,7 @@ import torch
 
 from uniserve.runtime.resources import close_resources
 from uniserve_worker.errors import WorkerError, invalid_descriptor
+from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.batch import Batch, TensorPublication
 from uniserve_worker.protocol.call import Call, CallStatus
@@ -103,6 +105,11 @@ class BatchState:
     # Entries of ``input_products`` whose reads `prepare_inputs` has started;
     # preparation refused for read tickets resumes at the next one.
     inputs_started: int = 0
+    # Host-lane tasks preparing the inline input images of this batch's
+    # encoder calls, by call id (`image.reserve_images`). Execution waits
+    # for them like the storage dependencies, and `close_inputs` cancels the
+    # ones still queued and drops every result.
+    image_tasks: dict[CallId, HostTask] = field(default_factory=dict)
 
     # Lifecycle flags from preparation through terminal delivery. A batch is
     # ``prepared`` once its commands are applied and it is validated, and
@@ -160,9 +167,10 @@ class BatchState:
     # Retirement of the batch's ``Finish`` and ``Free`` commands, recorded by
     # `Executor._retire_commands` and advanced by
     # `Executor._advance_retirement`. ``retirement_events`` fence the device
-    # writes each retirement stage submits, and ``retirement_cleaned`` is set
-    # once the stores have retired the closed requests and freed buffers (at
-    # once for a batch without such commands).
+    # work issued up to the batch's launch, including its request-state
+    # writes, and ``retirement_cleaned`` is set once the stores have retired
+    # the closed requests and freed buffers (at once for a batch without such
+    # commands).
     retirement_requests: frozenset[RequestKey] = frozenset()
     retirement_local_requests: frozenset[RequestKey] = frozenset()
     retirement_buffers: frozenset[BufferId] = frozenset()
@@ -302,14 +310,16 @@ class BatchState:
         """Check readiness without submitting inputs or running the model.
 
         True once inputs were submitted, every storage dependency, input
-        transfer and cache import is done, and completion predicates are
-        absent, already read, or sealed with their copies complete.
+        image preparation, input transfer and cache import is done, and
+        completion predicates are absent, already read, or sealed with their
+        copies complete.
         """
         return (
             self.inputs_submitted
             and all(
                 dependency.done() for dependency in self.storage_dependencies
             )
+            and all(task.ready() for task in self.image_tasks.values())
             and all(ticket.ready() for ticket in self.input_tickets())
             and all(
                 write.completion.done() for write in self.cache_imports.values()
@@ -370,18 +380,20 @@ class BatchState:
         """Wake the owner once physical dependencies permit its next step.
 
         Waits on the input transfer tickets, the storage dependencies, the
-        cache import completions and, once sealed, the predicate buffer's
-        completion. With no such dependency, ``callback`` runs synchronously
-        and unconditionally. Otherwise it runs at most once, when all of them
-        are complete, and not after `close_inputs`: synchronously when they
-        already are at registration, else on a thread that completes one.
-        The dependency set is captured now, so the owner re-checks
-        `inputs_ready` when woken and registers again if the batch is still
-        not ready.
+        input image preparations, the cache import completions and, once
+        sealed, the predicate buffer's completion. With no such dependency,
+        ``callback`` runs synchronously and unconditionally. Otherwise it
+        runs at most once, when all of them are complete, and not after
+        `close_inputs`: synchronously when they already are at registration,
+        else on a thread that completes one. The dependency set is captured
+        now, so the owner re-checks `inputs_ready` when woken and registers
+        again if the batch is still not ready.
         """
         tickets = tuple(self.input_tickets())
-        dependencies = self.storage_dependencies + tuple(
-            write.completion for write in self.cache_imports.values()
+        dependencies = (
+            self.storage_dependencies
+            + tuple(task.promise for task in self.image_tasks.values())
+            + tuple(write.completion for write in self.cache_imports.values())
         )
         if self.predicate_buffer is not None and self.predicates_sealed:
             dependencies += (self.predicate_buffer.completion_future(),)
@@ -466,6 +478,14 @@ class BatchState:
 
         self.inputs_closed = True
         actions: list[Callable[[], object]] = []
+
+        # A preparation still queued is withdrawn and returns its lane
+        # capacity; a running one finishes on its lane thread. Dropping the
+        # tasks releases their page-locked results, whose device copies the
+        # caching host allocator fences.
+        image_tasks = tuple(self.image_tasks.values())
+        self.image_tasks = {}
+        actions.extend(task.cancel for task in image_tasks)
 
         if self.latent_imports:
             assert latent_pool is not None
