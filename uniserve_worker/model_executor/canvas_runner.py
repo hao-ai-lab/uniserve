@@ -64,7 +64,12 @@ from uniserve.nn.attention import (
 )
 from uniserve.nn.moe import FusedMoE
 from uniserve.runtime.cuda_graph import CUDAGraphError
-from uniserve_worker.storage.canvas_slots import STEP_CONTINUED, STEP_SKIPPED
+from uniserve_worker.storage.canvas_slots import (
+    STEP_CONTINUED,
+    STEP_SKIPPED,
+    denoiser_fields,
+    step_rows,
+)
 
 from .cuda_graph import CUDAGraphRunner, GraphBucket
 from .graph_inputs import (
@@ -74,7 +79,8 @@ from .graph_inputs import (
     replay_hidden,
 )
 from .input_batch import CanvasStepInput, InputBatch, ReadoutInput
-from .model_runner import ModelRunner
+from .input_buffers import CanvasBuffers
+from .model_runner import ModelRunner, joining_experts
 from .output import ExecutionOutput
 
 # Canvas rows a captured graph holds: every count up to four, then steps of
@@ -101,6 +107,8 @@ class CanvasRunner(ModelRunner):
         mesh = self.model.backbone.mesh
         self.pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
         self.canvas_slots = None
+        self.sampler_workspace = None
+        self.step_rows = 0
         # Rows of one page of every cache group the KV unit pool holds, set
         # by ``ModelExecutor.bind``; None leaves canvases unbounded by it.
         self.pool_rows: int | None = None
@@ -110,9 +118,7 @@ class CanvasRunner(ModelRunner):
         # expert exchange once per step at the step's agreed capacity; a
         # rank-local tail replays graphs per slot bucket. Experts are
         # partitioned at loading, before the runner is built.
-        self.local_tail = self.context.experts is None or not tail_exchanges(
-            self.model
-        )
+        self.local_tail = not tail_exchanges(self.model, self.context.experts)
         # All readout graphs on this runner execute serially. The largest
         # capture owns their common per-token output, including EP variants.
         self._readout_state: tuple[torch.Tensor, ...] | None = None
@@ -151,7 +157,6 @@ class CanvasRunner(ModelRunner):
         if self.canvas_slots is not None:
             limit = min(
                 limit,
-                self.canvas_slots.max_rows,
                 self.canvas_slots.request_pool_size,
             )
         return tuple(rows for rows in CANVAS_ROW_BUCKETS if rows < limit) + (
@@ -196,6 +201,52 @@ class CanvasRunner(ModelRunner):
         """
         self.canvas_slots = slots
         self.input_buffers.bind_canvas_slots(slots)
+        # Banks persist by request; writable sampler scratch belongs to this
+        # runner so concurrent microbatches cannot overwrite one another.
+        self.step_rows = step_rows(
+            canvas_length=slots.canvas_length,
+            vocab_size=slots.vocab_size,
+            max_rows=min(self.max_canvases, slots.request_pool_size),
+        )
+        self.sampler_workspace = sampler.CanvasWorkspace.empty(
+            self.step_rows,
+            slots.canvas_length,
+            slots.vocab_size,
+            slots.hidden_size,
+            dtype=slots.banks["self_conditioning"].dtype,
+            device=self.device,
+        )
+
+    @staticmethod
+    def sampler_bytes(denoiser, *, max_rows, history_depth, device_type):
+        """Per-execution canvas staging and sampler workspace reservation."""
+        fields = denoiser_fields(denoiser)
+        length = fields.pop("tokens").length
+        vocab = fields.pop("vocab_size")
+        buffers = CanvasBuffers.sampler_buffers(
+            max_rows=max_rows,
+            canvas_length=length,
+            history_depth=history_depth,
+            **fields,
+        )
+        return sum(
+            config.nbytes for config in buffers.values()
+        ) + sampler.CanvasWorkspace.nbytes(
+            step_rows(
+                canvas_length=length, vocab_size=vocab, max_rows=max_rows
+            ),
+            length,
+            vocab,
+            fields["hidden_size"],
+            dtype=fields["dtype"],
+            device_type=device_type,
+        )
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self.sampler_workspace = None
 
     def batch_forward(self, batch, *, padded=False):
         """Denoise the staged canvases once and read or step them.
@@ -254,7 +305,7 @@ class CanvasRunner(ModelRunner):
 
         Rows at step zero start their canvas before the pass reads it. The
         head then projects the full canvases of at most
-        ``CanvasSlots.step_rows`` rows at a time, all sharing their sampler
+        ``step_rows`` rows at a time, all sharing their sampler
         constants, and the sampler steps them. The stepped state returns to
         the rows' slots.
 
@@ -294,7 +345,7 @@ class CanvasRunner(ModelRunner):
         results = torch.empty(
             (rows, 1 + length), dtype=torch.int64, device=hidden.device
         )
-        for start, stop in _runs(inputs.sampling, slots.step_rows):
+        for start, stop in _runs(inputs.sampling, self.step_rows):
             count = stop - start
             positions = count * length
             # The full canvases of this run, FP32 [count * canvas, vocab].
@@ -320,20 +371,21 @@ class CanvasRunner(ModelRunner):
                     count, length, device=hidden.device
                 ),
                 decision=decision,
-                workspace=_chunk_workspace(slots.workspace, positions),
+                workspace=_chunk_workspace(self.sampler_workspace, positions),
             )
             results[start:stop, 0] = decision.finished[:, 0]
             results[start:stop, 1:] = decision.tokens
 
-        # Skipped rows commit into the sentinel slot zero instead, which
-        # leaves their slots as the stopping step left them.
+        # The commit masks zero targets, keeping skipped request rows and
+        # shared padding storage untouched across concurrent microbatches.
         results[:, 0].masked_fill_(~active, STEP_SKIPPED)
         targets = torch.where(
             active, inputs.slots, torch.zeros_like(inputs.slots)
         )
-        slots.commit(targets, inputs.views)
-        slots.live.index_copy_(
-            0, targets, (results[:, 0] == STEP_CONTINUED).to(slots.live.dtype)
+        slots.commit(
+            targets,
+            inputs.views,
+            live=(results[:, 0] == STEP_CONTINUED).to(slots.live.dtype),
         )
         return tuple(results.unbind(0))
 
@@ -370,16 +422,16 @@ class CanvasRunner(ModelRunner):
             )
 
         slots = self.canvas_slots
-        if slots is None or slots.workspace is None:
+        if slots is None or self.sampler_workspace is None:
             return records
-        workspace = slots.workspace
+        workspace = self.sampler_workspace
         if workspace.weights.device.type != "cuda":
             return records
 
         from uniserve_kernels.diffusion import canvas as kernels
 
         table = self.model.backbone.embedding.weight[: slots.vocab_size]
-        for rows in range(1, slots.step_rows + 1):
+        for rows in range(1, self.step_rows + 1):
             positions = rows * slots.canvas_length
             chunk = _chunk_workspace(workspace, positions)
             algorithm = kernels.product_algorithm(
@@ -512,12 +564,25 @@ class CanvasRunner(ModelRunner):
         """
         if key[0] != "canvas":
             return super().capture_graph(key, execution, forward)
+
+        def attend(batch):
+            exchange = self.context.experts
+            if exchange is not None:
+                exchange.invoked.clear()
+            return self._attend_state(batch)
+
         graph = capture_hidden(
             self.context,
             execution,
-            self._attend_state,
+            attend,
             pools=self.pools,
             cache=self.cache,
+            # Expert-only peers execute a complete layer sequence during
+            # startup. Complete the eager warmup's tail, while the captured
+            # graph stops at attention for the live readout's selected slots.
+            warmup=lambda value: self.warm_experts(
+                joining_experts(attend, self.context), value
+            ),
         )
         # The tails read attend states of every readout bucket alike, so the
         # first readout bucket captured supplies their state layout.
@@ -639,7 +704,7 @@ class CanvasRunner(ModelRunner):
         return self._broadcast_readout(values, state, inputs)
 
 
-def tail_exchanges(model) -> bool:
+def tail_exchanges(model, exchange) -> bool:
     """Whether a token denoiser's readout tail exchanges tokens across ranks.
 
     The tail completes the final layer, the output norm and the head for a
@@ -651,9 +716,12 @@ def tail_exchanges(model) -> bool:
     ranks never join. Tensor-parallel collectives in the tail are joined
     alike by ranks that read the same slots, so they keep the tail local.
     """
+    if exchange is None:
+        return False
     final = next(reversed(model.backbone.layers.values()))
     return any(
-        isinstance(module, FusedMoE) and module.expert_group.size > 1
+        isinstance(module, FusedMoE)
+        and (exchange.attention_ranks or module.expert_group.size > 1)
         for module in final.modules()
     )
 

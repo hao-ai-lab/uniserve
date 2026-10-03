@@ -40,8 +40,10 @@ from tests.python.integration.runtime.test_prefill_graphs import (
     NATIVE_VISION,
     SM100,
 )
+from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.math import ceil_div
+from uniserve.nn.moe import FusedMoE
 from uniserve.runtime import PrefixCache
 from uniserve.runtime.process_groups import (
     Rendezvous,
@@ -103,19 +105,51 @@ SAMPLING = CanvasSampling(
 
 
 @contextmanager
-def _worker(root, units=UNITS, *, device="cuda:0", experts=None, graphs=True):
+def _worker(
+    root,
+    units=UNITS,
+    *,
+    device="cuda:0",
+    experts=None,
+    graphs=True,
+    split=None,
+    microbatches=1,
+):
     """Bind a DiffusionGemma worker with graphs generating ``SAMPLING``.
 
     The KV pool holds ``units`` units. Yields the executor, the unit pool's
     manager and the canvas state.
     """
     source = models.read_config(root)
+    expert_only = split is not None and split.rank > 0
+    paths = frozenset()
+    if split is not None:
+        with torch.device("meta"):
+            description = source.model_class(source.model)
+        paths = frozenset(
+            path
+            for path, module in description.named_modules()
+            if isinstance(module, FusedMoE)
+        )
+        experts = (
+            Communicator((1,), 0, "experts", torch.device(device))
+            if expert_only
+            else None
+        )
     model = models.load_model(
         source,
         device=device,
         weights=weights.Config(dtype=torch.bfloat16),
         experts=experts,
+        modules=paths if expert_only else None,
+        exclude_modules=paths
+        if split is not None and not expert_only
+        else frozenset(),
     ).model
+    if expert_only:
+        model = torch.nn.ModuleList(
+            module for module in model.modules() if isinstance(module, FusedMoE)
+        )
     config = WorkerConfig(
         device=device,
         model_dtype="bfloat16",
@@ -128,8 +162,32 @@ def _worker(root, units=UNITS, *, device="cuda:0", experts=None, graphs=True):
         decode_graph_batch_sizes=(1,),
         canvas_sampling=SAMPLING,
         graph_policy="auto" if graphs else "off",
+        role="experts" if expert_only else "model",
+        expert_exchange="alltoall" if split is None else "deepep",
+        expert_microbatches=microbatches,
     )
     processor = source.image_processor
+    runner = ModelExecutor(
+        model,
+        config,
+        image_processor=None if expert_only else processor,
+        expert_group=split,
+        attention_ranks=0 if split is None else 1,
+        bindings={} if expert_only else None,
+        entry_points={} if expert_only else None,
+    )
+    if expert_only:
+        try:
+            runner.configure_experts()
+            runner.capture(tokenizer=None, latents=None)
+            runner.complete_startup()
+            yield runner, None, None
+        except BaseException:
+            runner.close(aborted=True)
+            raise
+        else:
+            runner.close()
+        return
     cache = PrefixCache(
         model.text.cache_config,
         num_units=units,
@@ -142,7 +200,6 @@ def _worker(root, units=UNITS, *, device="cuda:0", experts=None, graphs=True):
         request_pool_size=SLOTS,
         table_width=64,
     )
-    runner = ModelExecutor(model, config, image_processor=processor)
     slots = None
     try:
         runner.configure_inputs(
@@ -164,7 +221,6 @@ def _worker(root, units=UNITS, *, device="cuda:0", experts=None, graphs=True):
         slots = CanvasSlots.for_denoiser(
             generating_denoiser(canvas_runner.model),
             request_pool_size=SLOTS,
-            max_rows=canvas_runner.max_canvases,
             sampling=SAMPLING,
             device=device,
         )
@@ -172,8 +228,12 @@ def _worker(root, units=UNITS, *, device="cuda:0", experts=None, graphs=True):
         runner.capture(tokenizer=None, latents=None)
         runner.complete_startup()
         yield runner, manager, slots
-    finally:
+    except BaseException:
+        runner.close(aborted=True)
+        raise
+    else:
         runner.close()
+    finally:
         if slots is not None:
             slots.close()
         manager.close()
@@ -423,6 +483,91 @@ def test_expert_peers_preserve_results_across_unequal_numerical_batches(
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     mp.spawn(_expert_reads, (tmp_path, port), nprocs=2, join=True)
+
+
+def _canvas_observations(runner, manager, slots):
+    """Read tails and advance resident canvases after the same prompt cache."""
+    _install(manager, 3)
+    prompt, readout, steps = _scenario(slots)
+    _run(runner, manager, prompt[:3], ForwardMode.PREFILL)
+    results = []
+    for count in (1, 3, 2):
+        results.append(
+            _values(
+                _run(
+                    runner,
+                    manager,
+                    tuple(readout[slot] for slot in range(1, count + 1)),
+                    ForwardMode.TOKEN_DENOISING,
+                )
+            )
+        )
+    repeated = replace(
+        readout[2],
+        slot_tokens=(0,) * 96,
+        candidate_offsets=tuple(range(0, 193, 2)),
+        candidate_ids=readout[2].candidate_ids[:2] * 96,
+    )
+    results.append(
+        _values(_run(runner, manager, (repeated,), ForwardMode.TOKEN_DENOISING))
+    )
+    for step in range(SAMPLING.max_steps):
+        results.append(
+            _values(
+                _run(
+                    runner,
+                    manager,
+                    tuple(steps[slot][step] for slot in (1, 2, 3)),
+                    ForwardMode.TOKEN_DENOISING,
+                )
+            )
+        )
+    return results
+
+
+@torch.inference_mode()
+def _split_canvases(rank, root, port):
+    device = torch.device("cuda", rank)
+    with initialize_process_groups(
+        rank=0,
+        local_rank=rank,
+        world_size=1,
+        device=device,
+        experts=(rank, 2, Rendezvous("127.0.0.1", port)),
+    ) as groups:
+        if rank == 0:
+            with _worker(root, device=device, graphs=False) as values:
+                expected = _canvas_observations(*values)
+        with _worker(
+            root,
+            device=device,
+            split=groups.experts,
+            microbatches=2,
+        ) as (runner, manager, slots):
+            if rank == 0:
+                observed = _canvas_observations(runner, manager, slots)
+                for actual_rows, expected_rows in zip(
+                    observed, expected, strict=True
+                ):
+                    for actual, wanted in zip(
+                        actual_rows, expected_rows, strict=True
+                    ):
+                        torch.testing.assert_close(
+                            actual, wanted, rtol=2e-2, atol=2e-2
+                        )
+            while not runner.experts.released:
+                runner.join_expert_step(leaving=True)
+
+
+@SM100
+def test_disaggregated_microbatches_preserve_readout_and_canvas_steps(tmp_path):
+    if torch.cuda.device_count() < 2:
+        pytest.fail("disaggregated canvas calls require two GPUs")
+    _checkpoint(tmp_path)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    mp.spawn(_split_canvases, (tmp_path, port), nprocs=2, join=True)
 
 
 @SM100

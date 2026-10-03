@@ -208,6 +208,7 @@ impl Default for WorkerProcessArgs {
             // One local rank running one component. A launch replaces this
             // with the components the model being served declared.
             components: crate::WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
+            role: crate::WorkerRole::Model,
             peers: Default::default(),
             stub: false,
             queue_depth: 2,
@@ -259,6 +260,7 @@ impl Default for WorkerProcessArgs {
             ffmpeg: "ffmpeg".into(),
             min_video_seconds: None,
             expert_parallel: None,
+            expert_microbatches: 1,
         }
     }
 }
@@ -443,14 +445,20 @@ impl WorkerProcessArgs {
             "expert_parallel".into(),
             match &self.expert_parallel {
                 Some(placement) => json!({
-                    "rank": placement.rank,
+                    "rank": placement.rank + rank,
                     "size": placement.size,
+                    "attention_ranks": placement.attention_ranks,
                     "address": placement.address,
                     "listen_fd": expert_listen_fd,
                     "exchange": placement.exchange,
                 }),
                 None => Value::Null,
             },
+        );
+        fields.insert("role".into(), json!(self.role));
+        fields.insert(
+            "expert_microbatches".into(),
+            json!(self.expert_microbatches),
         );
         fields.insert(
             "distributed_backend".into(),
@@ -1049,6 +1057,14 @@ impl RankProcess {
         self.startup_cancel = cancel;
     }
 
+    /// Aborts peers when an unfinished deployment is being dismantled.
+    /// Ready ranks have detached the flag, so ordinary shutdown is unaffected.
+    pub(crate) fn cancel_startup(&self) {
+        if let Some(cancel) = &self.startup_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Terminates a failed or cancelled rank and waits for process-owned resources to retire.
     ///
     /// Sends no shutdown request and discards outstanding and routed results.
@@ -1575,6 +1591,7 @@ impl Drop for RankProcess {
     /// another host is not followed to its exit, since no launcher registry
     /// is at hand.
     fn drop(&mut self) {
+        self.cancel_startup();
         close_ranks(std::slice::from_mut(self), None);
     }
 }

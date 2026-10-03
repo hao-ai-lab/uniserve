@@ -22,7 +22,7 @@ from typing import Any
 import torch
 from torch.utils import _pytree as pytree
 
-from uniserve.runtime import CUDAGraph, ExecutionContext
+from uniserve.runtime import CUDAGraph, ExecutionContext, Microbatches
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import BufferConfig
 from uniserve_worker.model_executor.graph_storage import GraphStorage
@@ -279,13 +279,25 @@ class CUDAGraphRunner:
     inputs: Inputs
 
     @classmethod
-    def capture(cls, context, inputs, call, *, pools, restore=None, warm=True):
+    def capture(
+        cls,
+        context,
+        inputs,
+        call,
+        *,
+        pools,
+        restore=None,
+        warm=True,
+        warmup=None,
+    ):
         """Warm and capture ``call(inputs)`` on ``context``.
 
         With ``warm``, an eager call first warms the kernel specializations
         and prepared resources that ``CUDAGraph.capture`` requires; a caller
         that has already run the same computation at the same shapes passes
-        ``warm=False``. ``restore``, when given, returns mutated state to its
+        ``warm=False``. ``warmup`` may complete numerical work outside a
+        partial graph, such as its remaining expert exchanges; by default
+        it runs ``call``. ``restore``, when given, returns mutated state to its
         pre-call contents after the warm call and again after capture, so
         preparation leaves live state unchanged. ``inputs`` become the
         graph's fixed input backing, retained by the runner.
@@ -293,7 +305,7 @@ class CUDAGraphRunner:
         if warm:
             with context.activate():
                 try:
-                    call(inputs)
+                    (call if warmup is None else warmup)(inputs)
                 finally:
                     if restore is not None:
                         restore()
@@ -372,9 +384,67 @@ class Execution:
         # ``share`` names another owner whose pools this one borrows; see
         # ``GraphStorage.reserve``.
         self.context = context
+        self.peers = (self,)
+        self.microbatches = None
         self.buckets: OrderedDict[object, GraphBucket] = OrderedDict()
         self.storage = storage if storage is not None else GraphStorage()
         self.pools = self.storage.reserve(self, devices, share=share)
+
+    def bind_microbatches(self, peers):
+        """Share one host rotation across independently prepared executions.
+
+        Each peer retains its own inputs, plans, graph pools and context.
+        The first peer owns the host threads; all peers borrow the rotation
+        for warmup, while serving starts it through the first peer.
+        """
+        peers = tuple(peers)
+        if not peers or peers[0] is not self:
+            raise ValueError("the first microbatch execution owns its rotation")
+        owner = Microbatches([peer.context for peer in peers])
+        for peer in peers:
+            peer.peers, peer.microbatches = peers, owner
+
+    def begin_expert_step(self, capacity):
+        for peer in self.peers:
+            peer.context.experts.begin(capacity)
+
+    def end_expert_step(self):
+        for peer in self.peers:
+            peer.context.experts.end()
+
+    def join_expert_step(self, capacity):
+        """Complete one empty step over every independent expert buffer."""
+        self.begin_expert_step(capacity)
+        try:
+            calls = [peer.context.join_expert_layers for peer in self.peers]
+            if self.microbatches is None:
+                with self.context.activate():
+                    calls[0]()
+            else:
+                self.microbatches(calls)
+        finally:
+            self.end_expert_step()
+
+    def warm_experts(self, call, value):
+        """Warm this execution while the other microbatches join empty.
+
+        Only this peer writes the scratch request's KV pages. All expert
+        buffers still participate, including a native persistent expert
+        launch that visits the complete microbatch sequence.
+        """
+        if self.microbatches is None:
+            return call(value)
+        for peer in self.peers:
+            peer.context.experts.invoked.clear()
+        results = self.microbatches(
+            [
+                (lambda: call(value))
+                if peer is self
+                else peer.context.join_expert_layers
+                for peer in self.peers
+            ]
+        )
+        return results[self.peers.index(self)]
 
     def close_bucket(self, key):
         """Retire one bucket, first synchronizing the context stream if any."""
@@ -394,7 +464,15 @@ class Execution:
         # Graphs close before the context whose resources they captured; the
         # pools are released from storage only after both.
         try:
-            close_resources(self.close_graphs, self.context.close)
+            close_resources(
+                self.close_graphs,
+                *(
+                    (self.microbatches.close,)
+                    if self.microbatches is not None and self.peers[0] is self
+                    else ()
+                ),
+                self.context.close,
+            )
         finally:
             self.storage.release(self)
             self.pools.clear()

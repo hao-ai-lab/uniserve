@@ -344,7 +344,7 @@ class ComponentConfig:
 
 
 def parse_components(
-    value: dict[str, object], world_size: int
+    value: dict[str, object], world_size: int, *, role: str = "model"
 ) -> tuple[tuple[str, ComponentConfig], ...]:
     """Parse model component placement supplied by the worker launcher.
 
@@ -359,6 +359,10 @@ def parse_components(
         ValueError: If the mapping is empty, an entry is malformed, or a rank
             lies outside the process world.
     """
+    if role == "experts":
+        if value:
+            raise ValueError("expert workers have no request components")
+        return ()
     if not value:
         raise ValueError("component configuration must not be empty")
 
@@ -440,14 +444,15 @@ class DataPlaneConfig:
 class ExpertParallelLaunch:
     """This replica's place in its deployment's expert-parallel world.
 
-    The world's ranks are the data-parallel replicas of one rank each, in
-    order: rank ``rank`` of ``size`` keeps its share of every routed-expert
-    layer and exchanges tokens with the others there. The world forms at
-    ``rendezvous``, whose store rank 0 serves on the socket it inherits.
+    ``rank`` is this physical rank in the union of ``size`` ranks. Leading
+    ``attention_ranks`` own attention and request state; remaining ranks
+    own experts. Zero selects colocated expert parallelism. The world forms
+    at ``rendezvous``, whose store rank 0 serves on its inherited socket.
     """
 
     rank: int
     size: int
+    attention_ranks: int
     rendezvous: Rendezvous
 
 
@@ -487,7 +492,21 @@ class WorkerProcessArgs:
             WorkerError: If execution settings that pass these checks violate
                 a ``WorkerConfig`` invariant.
         """
-        supported_calls = _parse_supported_calls(namespace.supported_calls)
+        role = str(getattr(namespace, "role", "model"))
+        supported_calls = (
+            frozenset()
+            if role == "experts"
+            else _parse_supported_calls(namespace.supported_calls)
+        )
+        expert_parallel = _expert_parallel(namespace)
+        if role == "experts" and (
+            expert_parallel is None
+            or not expert_parallel.attention_ranks
+            or expert_parallel.rank < expert_parallel.attention_ranks
+        ):
+            raise ValueError(
+                "expert workers require a disaggregated expert union"
+            )
         device = _normalize_device(namespace.device, option="--device")
         generation_device = _parse_mesh(
             str(namespace.mesh or ""),
@@ -564,9 +583,9 @@ class WorkerProcessArgs:
             load=_load_config(namespace),
             use_stub_model=use_stub_model,
             components=parse_components(
-                namespace.components, int(namespace.world_size)
+                namespace.components, int(namespace.world_size), role=role
             ),
-            expert_parallel=_expert_parallel(namespace),
+            expert_parallel=expert_parallel,
         )
 
 
@@ -881,11 +900,10 @@ def _expert_parallel(
     """Resolve the replica's expert-parallel world, when the launch names one.
 
     The descriptor's optional ``expert_parallel`` object carries ``rank``,
-    ``size``, the store ``address``, for rank 0 only the ``listen_fd`` of
-    the socket that rank serves the store on, and the expert access ``exchange``
-    (``alltoall``, ``megamoe`` or ``dwdp``, recorded in
-    ``WorkerConfig.expert_exchange``). A replica joins with its only rank,
-    so the group's own process world must be that one rank.
+    ``size``, leading ``attention_ranks``, the store ``address``, and for
+    rank 0 only the inherited ``listen_fd``. ``exchange`` selects the
+    transport in ``WorkerConfig``. Worker-local ranks are consecutive in
+    the union and keep their independent component meshes.
 
     Raises:
         ValueError: The object is malformed, the rank lies outside a world of
@@ -898,18 +916,19 @@ def _expert_parallel(
     if not isinstance(value, Mapping) or set(value) != {
         "rank",
         "size",
+        "attention_ranks",
         "address",
         "listen_fd",
         "exchange",
     }:
         raise ValueError(
-            "expert_parallel must carry rank, size, address, listen_fd and "
-            "exchange"
+            "expert_parallel must carry rank, size, attention_ranks, address, "
+            "listen_fd and exchange"
         )
-    if value["exchange"] not in ("alltoall", "megamoe", "dwdp"):
+    if value["exchange"] not in ("alltoall", "megamoe", "dwdp", "deepep"):
         raise ValueError(
             f"unknown expert exchange {value['exchange']!r}; expected "
-            "alltoall, megamoe or dwdp"
+            "alltoall, megamoe, dwdp or deepep"
         )
 
     rank, size = value["rank"], value["size"]
@@ -917,7 +936,26 @@ def _expert_parallel(
         raise ValueError("an expert-parallel world spans at least two ranks")
     if not 0 <= rank < size:
         raise ValueError("expert-parallel rank must satisfy 0 <= rank < size")
-    if int(namespace.world_size) != 1:
+    attention = value["attention_ranks"]
+    if type(attention) is not int or not 0 <= attention < size:
+        raise ValueError("attention ranks must leave at least one expert rank")
+    start = rank - int(namespace.rank)
+    stop = start + int(namespace.world_size)
+    if start < 0 or stop > size or start < attention < stop:
+        raise ValueError(
+            "worker ranks must fit within one role in the expert union"
+        )
+    if bool(attention) and (
+        value["exchange"] not in {"deepep", "megamoe"}
+        or (rank >= attention)
+        != (getattr(namespace, "role", "model") == "experts")
+    ):
+        raise ValueError(
+            "disaggregated role or expert exchange disagrees with placement"
+        )
+    if not attention and (
+        int(namespace.world_size) != 1 or value["exchange"] == "deepep"
+    ):
         raise ValueError(
             "an expert-parallel replica joins its world with its only rank"
         )
@@ -933,6 +971,7 @@ def _expert_parallel(
     return ExpertParallelLaunch(
         rank=rank,
         size=size,
+        attention_ranks=attention,
         rendezvous=Rendezvous(
             host=host,
             port=int(port),
