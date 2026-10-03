@@ -95,6 +95,30 @@ def test_dense_varlen_and_visible_attention_use_declared_ranges():
     torch.testing.assert_close(out, expected)
 
 
+def test_shared_visible_endpoint_bounds_every_query_of_its_sequence():
+    generator = torch.Generator().manual_seed(23)
+    q = torch.randn(5, 2, 4, generator=generator)
+    k, v = (torch.randn(5, 1, 4, generator=generator) for _ in range(2))
+    out = torch.empty_like(q)
+    queries = SequenceLengths.from_lengths((2, 3), device="cpu")
+    keys = SequenceLengths.from_lengths((3, 2), device="cpu")
+    # The second endpoint lies beyond its sequence's two keys.
+    ends = torch.tensor([[2], [5]], dtype=torch.int32)
+    batch = VisibleInput(queries, keys, ends, None, False, False)
+
+    _operator()(q, k, v, batch, scale=0.5, out=out)
+
+    # Both queries of the first sequence see its first two keys; every query
+    # of the second sees all of its keys.
+    expected = torch.cat(
+        (
+            _expected(q[:2], k[:2], v[:2]),
+            _expected(q[2:], k[3:], v[3:]),
+        )
+    )
+    torch.testing.assert_close(out, expected)
+
+
 @pytest.mark.parametrize("quantized", [False, True])
 def test_paged_attention_observes_updates_and_mutated_block_tables(quantized):
     config = mha.Config(1, 4, (0,), torch.float32)
