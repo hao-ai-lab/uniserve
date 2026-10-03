@@ -111,7 +111,7 @@ class EncoderRunner(ModelRunner):
 
     @torch.inference_mode()
     def capture_packed(self, *, max_images: int, dtype: torch.dtype) -> None:
-        """Capture the packed vision graph of every slot count at startup.
+        """Capture every packed vision slot count at startup, largest first.
 
         ``max_images`` is the most vision calls one batch carries and
         ``dtype`` the dtype images are staged in. Each graph's static input
@@ -140,7 +140,11 @@ class EncoderRunner(ModelRunner):
                 dtype=dtype,
                 device=self.device,
             )
-        for slots in capacities:
+        # Prepare the largest call first, as for token and canvas graphs.
+        # Smaller calls borrow its GEMM workspaces and capture-pool blocks;
+        # growing through the catalog would retain every earlier workspace
+        # because the captured kernels still address it.
+        for slots in reversed(capacities):
             pixels = buffer[: slots * encoder.max_patches]
             with self.graph_storage.allocate(self):
                 grids = torch.tensor(
@@ -209,8 +213,8 @@ class EncoderRunner(ModelRunner):
         capacity = encoder.max_patches
         assert capacity is not None
 
-        # The captured capacities are powers of two up to the largest, so
-        # the smallest one holding the images exists.
+        # Every slot count through the cap is captured, so selecting the
+        # smallest sufficient count adds no empty image slots.
         slots = min(count for count in self._packed if count >= len(images))
         graph = self._packed[slots]
         if any(
