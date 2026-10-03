@@ -2246,39 +2246,39 @@
     [
      [
       [
-       256,
-       128
+       128,
+       256
       ],
       [
-       2,
+       1,
        1
       ]
      ],
      [
       [
-       256,
-       128
+       128,
+       256
       ],
       [
-       2,
-       2
+       1,
+       1
       ]
      ]
     ]
    ],
    "median_ms": {
-    "uniform": 0.5188431978225708,
-    "shared": 0.3868896007537842
+    "uniform": 0.5402384042739867,
+    "shared": 0.40169920921325686
    },
    "default_median_ms": {
-    "uniform": 0.553108811378479,
-    "shared": 0.49394237995147705
+    "uniform": 0.5902879953384399,
+    "shared": 0.4348640203475952
    },
-   "candidates": 7,
+   "candidates": 15,
    "failed": 0,
    "mismatched": 0,
-   "measured_utc": "2026-09-27T06:20:06+00:00",
-   "rounds": 10
+   "measured_utc": "2026-10-03T04:52:42+00:00",
+   "rounds": 20
   },
   {
    "device": "NVIDIA GB200",
@@ -2475,6 +2475,55 @@
    "mismatched": 0,
    "measured_utc": "2026-09-27T06:20:06+00:00",
    "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 2688,
+   "tactic": [
+    [
+     [
+      [
+       256,
+       256
+      ],
+      [
+       2,
+       1
+      ]
+     ],
+     [
+      [
+       256,
+       256
+      ],
+      [
+       2,
+       1
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 0.3968511939048767,
+    "shared": 0.2748304009437561
+   },
+   "default_median_ms": {
+    "uniform": 0.42840640544891356,
+    "shared": 0.32555999755859377
+   },
+   "candidates": 15,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-10-03T04:52:42+00:00",
+   "rounds": 20
   }
  ]
 }

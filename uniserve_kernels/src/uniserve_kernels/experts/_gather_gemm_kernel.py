@@ -44,7 +44,7 @@ gate column pair and stores the product in BF16 at the permuted row.
 - ``B`` holds each expert's up rows followed by its gate rows. The
   kernel reads them in 64-row blocks interleaved as
   ``[up_0:64, gate_0:64, up_64:128, gate_64:128, ...]`` through a strided
-  TMA view, so one 128-row N tile holds matching up and gate columns and
+  TMA view, so each 128-column block holds matching up and gate columns and
   ``C`` is ``[M, N / 2]``.
 - Warp roles: epilogue (0-3), LDGSTS A (4-7), MMA (8), TMA B (9),
   scheduler (10), and with two-CTA MMA an A-arrival relay (11).
@@ -80,8 +80,9 @@ class GatherGroupedGemmKernel:
     """Gather grouped GEMM of routed tokens with gated activation (FC1).
 
     ``mma_tiler_mn`` is the MMA tile (M, N): M 128 runs one-CTA MMA, M 256
-    two-CTA MMA over a cluster pair; N is 128, one 64-row up block and its
-    gate block. The MoE sort's routing tile equals M. ``activation`` is
+    two-CTA MMA over a cluster pair; N is 128 or 256, one or two pairs of
+    64-column up and gate blocks. The MoE sort's routing tile equals M.
+    ``activation`` is
     ``"silu"`` (``silu(gate) * up``) or ``"gelu_tanh"``
     (``gelu_tanh(gate) * up``). ``topk`` converts the expanded
     (token, route) ids of ``token_id_mapping`` to token rows.

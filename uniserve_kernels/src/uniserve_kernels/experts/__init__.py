@@ -24,11 +24,14 @@ from typing import Any
 import torch
 
 #: (MMA tile M, N), cluster (M, N): the FC1 tactics. M 256 runs two-CTA MMA
-#: over a cluster pair; an N tile is 64 up rows and their 64 gate rows. The
-#: gathered A rows are loaded per CTA, so clusters never span N.
+#: over a cluster pair. N tiles hold one or two pairs of 64 up and gate
+#: columns; wider tiles reuse each input gather for twice as many outputs.
+#: Gathered A rows are loaded per CTA, so clusters never span N.
 GATHER_TACTICS = (
     ((128, 128), (1, 1)),
     ((256, 128), (2, 1)),
+    ((128, 256), (1, 1)),
+    ((256, 256), (2, 1)),
 )
 DEFAULT_GATHER_TACTIC = GATHER_TACTICS[0]
 

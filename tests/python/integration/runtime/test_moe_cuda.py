@@ -15,7 +15,9 @@ from uniserve.nn import functional
 from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import Quantizer, ScaleLayout
 from uniserve.runtime import CUDAStream, ExecutionContext
+from uniserve.runtime.backends import moe as moe_backends
 from uniserve.runtime.cuda_graph import CUDAGraph
+from uniserve.runtime.tensor_buffers import TensorBuffers
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -51,7 +53,7 @@ def _reference(hidden, up_gate, down, ids, weights, activation):
     for slot in range(ids.shape[1]):
         expert = ids[:, slot].long()
         projected = torch.einsum("th,toh->to", hidden, up_gate[expert])
-        up, gate = projected.split(INTERMEDIATE, dim=-1)
+        up, gate = projected.split(down.shape[-1], dim=-1)
         activated = (
             F.silu(gate)
             if activation == "silu"
@@ -99,7 +101,9 @@ def _replay_matches(
     torch.cuda.synchronize(DEVICE)
 
 
-def _positive_bf16(activation, generator, top_k=TOP_K):
+def _positive_bf16(
+    activation, generator, top_k=TOP_K, intermediate=INTERMEDIATE
+):
     """BF16 experts and hidden states of positive values.
 
     The operands are scaled so each projection stays near unit size.
@@ -107,7 +111,7 @@ def _positive_bf16(activation, generator, top_k=TOP_K):
     module = FusedMoE(
         EXPERTS,
         HIDDEN,
-        INTERMEDIATE,
+        intermediate,
         top_k=top_k,
         activation=activation,
         device=DEVICE,
@@ -115,7 +119,7 @@ def _positive_bf16(activation, generator, top_k=TOP_K):
     )
     for parameter, fan_in in (
         (module.up_gate.weight, HIDDEN),
-        (module.down.weight, INTERMEDIATE),
+        (module.down.weight, intermediate),
     ):
         parameter.copy_(
             (torch.rand(parameter.shape, generator=generator) + 0.125) / fan_in
@@ -186,6 +190,58 @@ def test_bf16_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
             for _ in range(16):
                 assert torch.equal(graph.replay(), first)
     torch.cuda.synchronize(DEVICE)
+
+
+@pytest.mark.parametrize("tile_m,cluster_m", [(128, 1), (256, 2)])
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@torch.inference_mode()
+def test_bf16_wide_tiles_preserve_partial_output_columns(
+    tile_m, cluster_m, activation
+):
+    """A partial final output tile remains correct after graph input changes."""
+    generator = torch.Generator().manual_seed(59)
+    module, hidden = _positive_bf16(activation, generator, intermediate=704)
+    ids, weights = _routes(generator)
+    provider = moe_backends.resolve("cutedsl", module=module, device=DEVICE)
+    size = TextSize(TOKENS, 1)
+    requirements = provider.workspace_buffers(module=module, size=size)
+    tactic = [
+        (((tile_m, 256), (cluster_m, 1)), ((tile_m, 128), (cluster_m, 1)))
+    ]
+
+    def expected():
+        return _reference(
+            hidden,
+            module.up_gate.weight,
+            module.down.weight,
+            ids,
+            weights,
+            activation,
+        )
+
+    with TensorBuffers.allocate(requirements, device=DEVICE) as buffers:
+        operator = provider.prepare(
+            module=module, size=size, workspace=buffers.view(requirements)
+        )
+        try:
+            actual = operator(hidden, ids, weights, tactic=tactic)
+            torch.testing.assert_close(
+                actual.double(), expected(), rtol=_gamma(4), atol=0
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                replayed = operator(hidden, ids, weights, tactic=tactic)
+            replacement_ids, replacement_weights = _routes(generator)
+            ids.copy_(replacement_ids)
+            weights.copy_(replacement_weights)
+            hidden.copy_(hidden.flip(0))
+            graph.replay()
+            torch.testing.assert_close(
+                replayed.double(), expected(), rtol=_gamma(4), atol=0
+            )
+            del graph
+        finally:
+            operator.close()
 
 
 @torch.inference_mode()
