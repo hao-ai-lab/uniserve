@@ -608,8 +608,10 @@ class StreamCommunication:
                     continue
                 group = communicator._require()
                 name = group.group_name
+                # A group can use Gloo for host coordination and NCCL for
+                # CUDA tensors. Bind the computation device's backend.
                 if (
-                    dist.get_backend(group) == "nccl"
+                    "cuda:nccl" in dist.get_backend_config(group).split(",")
                     and name not in self._communicators
                     and name not in created
                 ):

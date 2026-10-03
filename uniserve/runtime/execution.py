@@ -214,8 +214,16 @@ class ExecutionContext(Generic[SizeT]):
                 else torch.device("cpu")
             )
         )
+        # A source-only expert binding retains typed meta parameters. Their
+        # representation still governs empty participation, although the
+        # execution stream supplies the physical device.
+        representation = reference
+        if representation is None:
+            representation = next(module.parameters(), None)
         self._dtype = (
-            reference.dtype if reference is not None else torch.float32
+            representation.dtype
+            if representation is not None
+            else torch.float32
         )
         if stream is not None and stream.device != self._device:
             raise ValueError(

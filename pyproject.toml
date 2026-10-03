@@ -66,9 +66,16 @@ uniserve-eval = { path = "uniserve_eval", editable = true }
 
 [tool.uv]
 # The kernel package compiles its C++ and CUDA extensions against the
-# libraries installed in this environment, so uv builds it here, without
-# isolation, after installing every package that builds in isolation.
+# libraries installed in this environment, PyTorch and NCCL, so uv builds it
+# here, without isolation, after installing every package that builds in
+# isolation.
 no-build-isolation-package = ["uniserve-kernels"]
+
+# DeepEP's elastic transport uses the GIN request and traffic-class APIs
+# supplied by NCCL 2.30.4. Keep one NCCL runtime for PyTorch and DeepEP.
+override-dependencies = [
+    "nvidia-nccl-cu13==2.30.4; sys_platform == 'linux'",
+]
 
 [project.scripts]
 uniserve-worker = "uniserve_worker.main:main"
