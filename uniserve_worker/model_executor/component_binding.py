@@ -66,8 +66,11 @@ class ComponentBinding:
     calls: tuple[Call, ...] = ()
 
     def __post_init__(self) -> None:
+        # Component placement uses worker-local ranks, even when the worker
+        # is a subgroup of a larger expert communicator.
         if any(
-            rank not in self.process_group.ranks for rank in self.config.ranks
+            not 0 <= rank < self.process_group.size
+            for rank in self.config.ranks
         ):
             raise ValueError(
                 f"component {self.name} members lie outside its Worker"
@@ -93,7 +96,7 @@ class ComponentBinding:
     @property
     def owns(self) -> bool:
         """Whether this process executes the configured component."""
-        return self.process_group.global_rank in self.config.ranks
+        return self.process_group.rank in self.config.ranks
 
     @property
     def communicators(self) -> tuple[Communicator, ...]:
@@ -129,7 +132,7 @@ class ComponentBinding:
             return range(cursor, cursor + count)
 
         per_rank = config.units_per_rank
-        offset = config.ranks.index(self.process_group.global_rank) * per_rank
+        offset = config.ranks.index(self.process_group.rank) * per_rank
         # ``range`` is empty when the run's start lies at or past its stop.
         return range(cursor + offset, cursor + min(offset + per_rank, count))
 
