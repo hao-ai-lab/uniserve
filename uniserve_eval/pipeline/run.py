@@ -18,6 +18,8 @@ The bundle in the output directory contains:
   invalid bodies. A configured `video.media_dir` holds measured videos.
 - `media_index.jsonl` and `media_validity.jsonl`: original-output references,
   checksums, request identities, timing records, and validity checks.
+- `server_metrics.json`: each replica's `/metrics` exposition immediately
+  before and after the measured window, when available.
 - `summary.json` and `summary.md`: the validated summary, written only on the
   completion path.
 
@@ -39,12 +41,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
-import httpx
+import aiohttp
 import numpy as np
 
 from ..artifacts import ArtifactWriter
 from ..datasets import load_examples
 from ..load import GpuStorageSampler, WarmupFailure, run_load
+from ..server_metrics import scrape_metrics, window_summary
 from ..tasks import get_task
 from ..tasks.video import VideoTask
 from ..transport import send_request
@@ -108,6 +111,7 @@ async def run_point(
     sampler: GpuStorageSampler | None = None
     duration = 0.0
     phase = "measured"
+    metrics_before: dict[str, str | None] = {}
 
     # Empty streams and the preparing record make partial failures
     # inspectable with the same artifact names as completed points.
@@ -171,17 +175,16 @@ async def run_point(
         # makes a finite-rate arrival schedule reproducible.
         np.random.seed(point.load.seed)
 
-        # The connection pool is unbounded, so the only client-side limit on
-        # in-flight requests is `run_load`'s optional `max_concurrency`
-        # semaphore.
-        limits = httpx.Limits(
-            max_connections=None,
-            max_keepalive_connections=None,
-            keepalive_expiry=None,
-        )
-        async with httpx.AsyncClient(
-            timeout=timeout_s, limits=limits
-        ) as client:
+        # The connection pool is unbounded (`limit=0`), so the only
+        # client-side limit on in-flight requests is `run_load`'s optional
+        # `max_concurrency` semaphore. One aiohttp session with a total
+        # per-request timeout keeps transport connection limits separate
+        # from the workload's declared request concurrency.
+        connector = aiohttp.TCPConnector(limit=0)
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as session:
 
             async def submit(
                 example: Example, scheduled: float | None
@@ -207,7 +210,7 @@ async def run_point(
                 # waits on its chosen replica like on any queueing server.
                 with router.route() as base_url:
                     record = await send_request(
-                        client,
+                        session,
                         base_url,
                         request,
                         request_id=example.id,
@@ -230,6 +233,13 @@ async def run_point(
                 else:
                     records.append(record)
                 return record
+
+            async def snapshot_metrics() -> None:
+                """Scrape every replica before the measured window."""
+                for origin in router.base_urls:
+                    metrics_before[origin] = await scrape_metrics(
+                        session, origin
+                    )
 
             # Sampling spans excluded requests and the measured window.
             sampler = GpuStorageSampler()
@@ -271,6 +281,7 @@ async def run_point(
                     else point.load.warmup_requests,
                     warmup_rows=[] if priming_rows else warmup_rows,
                     inspect_warmup=inspect,
+                    before_measure=snapshot_metrics,
                 )
             finally:
                 sampler.stop()
@@ -286,9 +297,13 @@ async def run_point(
             inspect(records)
             inspect(priming_records)
 
-            # Provenance is fetched after the measured window closes.
+            # Counters and provenance are fetched after the measured window.
+            metrics_after = {
+                origin: await scrape_metrics(session, origin)
+                for origin in router.base_urls
+            }
             server_version = await _fetch_server_version(
-                client, router.base_urls[0]
+                session, router.base_urls[0]
             )
 
         summary = build_summary(
@@ -321,12 +336,30 @@ async def run_point(
             ),
         }
 
+        # The measured window's utilization of the GPUs the server was
+        # launched on, and the server counters the window advanced.
+        summary["gpu_utilization"] = sampler.window_utilization(
+            load_result.window_start,
+            load_result.window_end,
+            _launch_gpu_indices(launch_record),
+        )
+        summary["server_metrics"] = {
+            origin: window_summary(
+                metrics_before[origin], metrics_after[origin]
+            )
+            for origin in router.base_urls
+        }
+
         # The completed lifecycle record is written after every result
         # artifact so it acts as the bundle's commit marker.
         _write_records(writer, "warmup_requests.jsonl", warmup_records)
         _write_records(writer, "priming_requests.jsonl", priming_records)
         _write_records(writer, "requests.jsonl", records, point.video.media_dir)
         writer.write_jsonl("gpu_samples.jsonl", list(sampler.sample_records))
+        writer.write_json(
+            "server_metrics.json",
+            {"before": metrics_before, "after": metrics_after},
+        )
         writer.write_json("summary.json", summary)
         (output_path / "summary.md").write_text(
             render_markdown(summary), encoding="utf-8"
@@ -419,6 +452,26 @@ class ReplicaRouter:
             yield self.base_urls[index]
         finally:
             self.active[index] -= 1
+
+
+def _launch_gpu_indices(launch: dict[str, Any]) -> tuple[int, ...] | None:
+    """Return the GPU indices a launch selected with `CUDA_VISIBLE_DEVICES`.
+
+    The selector names `nvidia-smi` indices when it lists integers; a UUID
+    selector or none at all selects every sampled GPU (`None`).
+    """
+    environment = launch.get("environment")
+    selector = (
+        environment.get("CUDA_VISIBLE_DEVICES")
+        if isinstance(environment, dict)
+        else None
+    )
+    if not isinstance(selector, str) or not selector.strip():
+        return None
+    try:
+        return tuple(int(item) for item in selector.split(","))
+    except ValueError:
+        return None
 
 
 def _write_empty_streams(writer: ArtifactWriter) -> None:
@@ -556,7 +609,7 @@ def _run_state(
 
 
 async def _fetch_server_version(
-    client: httpx.AsyncClient, base_url: str
+    session: aiohttp.ClientSession, base_url: str
 ) -> dict[str, Any] | None:
     """Fetch optional server provenance without affecting benchmark completion.
 
@@ -566,15 +619,15 @@ async def _fetch_server_version(
         The response object, or None on a non-200 status, a body that is not
         a JSON object, or any `Exception` raised by the request or decoding.
     """  # noqa: E501
-    # The short per-call timeout overrides the client's request timeout.
+    # The short per-call timeout overrides the session's request timeout.
     try:
-        response = await client.get(
-            base_url.rstrip("/") + "/version", timeout=15.0
-        )
-        if response.status_code == 200 and isinstance(
-            payload := response.json(), dict
-        ):
-            return payload
+        async with session.get(
+            base_url.rstrip("/") + "/version",
+            timeout=aiohttp.ClientTimeout(total=15.0),
+        ) as response:
+            if response.status != 200:
+                return None
+            payload = await response.json(content_type=None)
     except Exception:
         return None
-    return None
+    return payload if isinstance(payload, dict) else None

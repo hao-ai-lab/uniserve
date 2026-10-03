@@ -2,7 +2,7 @@
 
 UniServe serves DiffusionGemma through decision readout at `/v1/systemone` and block-diffusion generation at `/v1/chat/completions`. Both use the same loaded model and prefix cache. The supported checkpoints are [Google's BF16 model](https://huggingface.co/google/diffusiongemma-26B-A4B-it) and [NVIDIA's NVFP4 model](https://huggingface.co/nvidia/diffusiongemma-26B-A4B-it-NVFP4). The NVFP4 kernels require a supported Blackwell GPU.
 
-See the [Python readout and DJev adapter examples](../../examples/diffusion_gemma/README.md) for library and HTTP integration.
+See the [Python readout and DJev adapter examples](../../examples/diffusion_gemma/README.md) for library and HTTP integration, the [four-GB200 performance comparison](performance.md) and [quality measurements](quality.md) for results at their stated source revisions. Those measurements do not certify the current integrated revision.
 
 ## Install and load
 
@@ -103,5 +103,48 @@ The checkpoint's generation configuration controls denoising steps, entropy acce
 `seed` selects the request's random stream. Independent replicas return the same response for the same isolated seeded request. Different batch compositions, including expert-parallel steps whose capacities depend on other ranks, can change floating-point rounding and the resulting response.
 
 ## Reproducible measurement
+
+Define the deployment and corpus in `profiles.toml` at the repository root. For example, this independent-request profile uses 128 rows from the System One JSONL corpus named by `UNISERVE_SYSTEMONE_DATASET` and the checkpoint named by `UNISERVE_DIFFUSION_GEMMA_MODEL`:
+
+```toml
+root = "."
+artifact_root = "artifacts/benchmark/decisions"
+
+[servers.diffusiongemma]
+host = "127.0.0.1"
+port = 18085
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_DIFFUSION_GEMMA_MODEL}", "--served-model-name", "diffusiongemma", "--host", "127.0.0.1", "--port", "18085", "--worker-python", ".venv/bin/python", "--max-model-len", "4096"]
+
+[servers.diffusiongemma.environment]
+CUDA_VISIBLE_DEVICES = "0"
+
+[benchmarks.decision-workload]
+server = "diffusiongemma"
+task = "systemone"
+model = "diffusiongemma"
+dataset = "systemone"
+dataset_path = "${UNISERVE_SYSTEMONE_DATASET}"
+endpoint = "/v1/systemone"
+
+[benchmarks.decision-workload.load]
+num_prompts = 128
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 42
+
+[benchmarks.decision-workload.metrics]
+questions_per_second = "higher"
+```
+
+Each JSONL row supplies a unique `id`, `state`, `questions`, and optional `images`; corpus `boolean` questions map to `noul`. Gold labels and teacher outputs remain evaluation metadata and are not sent to the model. Fix the corpus, deployment and load parameters before measurement, then resolve and execute that profile:
+
+```bash
+.venv/bin/uniserve-eval --config profiles.toml plan decision-workload
+.venv/bin/uniserve-eval --config profiles.toml run decision-workload
+```
+
+For a closed-loop decision workload, place a nonempty `session_id` on every System One JSONL row, set `request_rate = inf`, `warmup_requests = 0`, and `max_concurrency` to the number of sessions. Each session sends its next request only after the previous response. Use distinct evolving states while retaining the prefix reuse the real application permits. Fixed-count traces include each session's initial cold request and final completion.
 
 Record checkpoint revision, precision, topology, canvas length, candidate spellings, question layout, prefix-cache behavior, inputs, concurrency, and metric definitions. Run measurement points serially. A performance comparison with MCJev fast also needs to disclose its query-relative sliding canvas attention: UniServe follows HF DynamicCache semantics, with every canvas query attending to the same retained prefix and the complete canvas. Matching token IDs alone does not establish that these attention masks are equivalent. Compare task quality separately from latency and throughput.
