@@ -69,7 +69,11 @@ class Attention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.rotary = RotaryEmbedding(config.head_dim, theta=config.rope_theta)
+        self.rotary = RotaryEmbedding(
+            config.head_dim,
+            theta=config.rope_theta,
+            sections=config.mrope_sections,
+        )
 
     def forward(
         self,
@@ -77,13 +81,28 @@ class Attention(nn.Module):
         positions: torch.Tensor,
         attention: AttentionInput,
     ):
+        """Attend over packed tokens at their rotary ``positions``.
+
+        Positions are ``[tokens]``; a model with ``mrope_sections`` also
+        accepts ``[axes, tokens]`` multimodal coordinates, and its
+        one-dimensional positions place every axis at the same coordinate.
+        """
         # This unscaled recipe depends only on positions, so computing factors
         # does not require a host mirror of the attention lengths.
-        cos, sin = self.rotary(
-            positions.reshape(-1),
-            dtype=torch.float32,
-            sequence_length=positions.numel(),
-        )
+        if self.rotary.sections is None:
+            cos, sin = self.rotary(
+                positions.reshape(-1),
+                dtype=torch.float32,
+                sequence_length=positions.numel(),
+            )
+        else:
+            if positions.ndim == 1:
+                positions = positions.expand(len(self.rotary.sections), -1)
+            cos, sin = self.rotary(
+                positions,
+                dtype=torch.float32,
+                sequence_length=positions.shape[-1],
+            )
 
         # hidden: [tokens, hidden_size]; q/k/v: [tokens, TP-local heads,
         # head_dim]. Flattening the attended heads feeds the row-parallel

@@ -112,11 +112,17 @@ class TextInput:
 
 @dataclass(frozen=True, slots=True)
 class VisionInput:
-    """Per-sample images, either CHW rasters or packed patch rows with grids."""
+    """Per-sample images, either CHW rasters or packed patch rows with grids.
+
+    A packed sample's grid is its patch extent: ``(height, width)``, or
+    ``(time, height, width)`` for encoders whose patches also span frames.
+    ``grids`` holds it as a ``[1, axes]`` device tensor and ``grid_shapes``
+    as host integers; rasters derive both from their pixels.
+    """
 
     images: tuple[torch.Tensor, ...]
     grids: tuple[torch.Tensor | None, ...]
-    grid_shapes: tuple[tuple[int, int] | None, ...]
+    grid_shapes: tuple[tuple[int, ...] | None, ...]
 
     def __post_init__(self):
         if len(self.images) != len(self.grids) or len(self.images) != len(

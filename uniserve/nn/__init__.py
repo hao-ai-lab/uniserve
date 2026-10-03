@@ -30,7 +30,12 @@ from uniserve.nn.vae.layers import (
     Upsample,
 )
 from uniserve.nn.vae.patch import PatchAutoencoder, RGBDecoder
-from uniserve.nn.vision import MLPConnector, PatchEmbed, PositionEmbedding
+from uniserve.nn.vision import (
+    MLPConnector,
+    PatchEmbed,
+    PositionEmbedding,
+    TubeletEmbed,
+)
 
 __all__ = [
     "Attention",
@@ -59,6 +64,7 @@ __all__ = [
     "SiLUAndMul",
     "TimestepEmbedding",
     "TopK",
+    "TubeletEmbed",
     "Upsample",
     "VocabParallelEmbedding",
     "VocabParallelHead",
