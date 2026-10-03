@@ -1,0 +1,65 @@
+# FastVideo's OpenAI-compatible server for the FastH3 OmniRef PDD export on
+# one four-GPU GB200 host, the OmniRef baseline of uniserve_eval/minimax_h3.toml.
+# The evaluator profile names the model directory (--generator.model_path), a
+# composition of the export's transformer_ref, schedulers and inference
+# contract with the text encoder, processor, tokenizer and VAEs of its pinned
+# MiniMax-H3 base revision, as FastVideo's OmniRef example composes them.
+#
+# Engine: Ulysses sequence parallelism over the four GPUs with every component
+# resident: the DiT replicated rather than FSDP-sharded, no text encoder, image
+# encoder or VAE offload, and the VAE decode split across the ranks and
+# gathered. This is the fastest lossless configuration measured on 4xGB200:
+# FastVideo's documented four-GPU OmniRef run
+# (examples/inference/basic/basic_fasth3_omniref_pdd.py,
+# docs/inference/fasth3-distilled.md: FSDP, the text encoder and VAEs
+# offloaded) took 27.1 s for W4 and 44.1 s for W5, this one 17.5 s and 35.8 s
+# (exploratory, two requests each). Attention is the checkpoint's trained
+# policy, which the pipeline requires: VSA-H3 with sparsity 0.9 and 128-token
+# tiles, eager (tile 128 is not compiled).
+generator:
+  model_path: FastH3-OmniRef-DMPDD8-step1900
+  engine:
+    num_gpus: 4
+    execution_backend: mp
+    use_fsdp_inference: false
+    parallelism:
+      tp_size: 1
+      sp_size: 4
+    offload:
+      dit: false
+      dit_layerwise: false
+      text_encoder: false
+      image_encoder: false
+      vae: false
+      pin_cpu_memory: false
+    compile:
+      enabled: false
+      vae_enabled: false
+  pipeline:
+    workload_type: i2v
+    components:
+      override_pipeline_cls_name: MiniMaxH3Ref2VAModularPipeline
+    experimental:
+      attention_backend: VIDEO_SPARSE_ATTN_H3
+      VSA_sparsity: 0.9
+      VSA_tile_size: 128
+      inference_torch_compile: false
+      vae_parallel_decode: true
+      vae_parallel_decode_strategy: gather
+
+server:
+  host: 127.0.0.1
+  port: 18083
+  output_dir: /tmp/fastvideo-minimax-h3/outputs
+  served_model_name: MiniMax-H3
+
+# Requests state their canvas, frames, steps and seed; these defaults fix the
+# fields H3 requires but requests do not carry.
+default_request:
+  negative_prompt: ""
+  sampling:
+    fps: 24
+    guidance_scale: 1.0
+    batch_cfg: false
+  output:
+    return_frames: false
