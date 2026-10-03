@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""H3 video reconstruction with spatial tiling and fused residual arithmetic.
+"""H3 video VAE: causal CNN encoder and tiled ViT reconstruction.
 
 The decoder is a non-causal ViT: ``Transformer`` turns every latent voxel into
 one token, appends learned register tokens and one zero token, and expands
@@ -13,6 +13,11 @@ so the consuming fused kernel (residual update, Q/K normalization and RoPE,
 SwiGLU, or unpatchify) adds it, and the fused normalization before such a
 projection also returns the tensor-wide absmax that its input quantizer can
 reuse.
+
+The encoder is a causal 3D CNN: ``CausalCNN`` maps ImageNet-normalized
+pixels of one temporal clip to posterior moments, and ``Encoder`` adds the
+1x1x1 ``quant_conv`` and overlapping spatial tiles. ``encoding.VideoEncoder``
+partitions a video into clips and samples the posterior.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from typing import cast
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from uniserve.nn import functional
 from uniserve.nn.attention import Attention, DenseInput
@@ -42,8 +48,18 @@ from uniserve.nn.functional import (
 from uniserve.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
 from uniserve.nn.mlp import GatedMLP
 from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.vae import LatentDecoder, SpatialDecoder
+from uniserve.nn.vae import (
+    LatentDecoder,
+    LatentEncoder,
+    SpatialDecoder,
+    SpatialEncoder,
+)
 from uniserve.quantization import QuantizedTensor
+
+# The VAE's pixel convention: RGB over [0, 1], normalized per channel by the
+# ImageNet statistics, for both encoder input and decoder output.
+PIXEL_MEAN = (0.485, 0.456, 0.406)
+PIXEL_STD = (0.229, 0.224, 0.225)
 
 
 @dataclass(frozen=True, slots=True)
@@ -790,3 +806,306 @@ def assignments(model: Decoder | Model, reader):
             weights.Assignment(parameter, value, source_slice=region)
         )
     return tuple(assignments)
+
+
+class CausalConv3d(nn.Conv3d):
+    """Convolve NCTHW values with symmetric spatial, causal temporal padding.
+
+    ``spatial_padding`` pixels pad both sides of height and width in
+    ``spatial_padding_mode``. ``temporal_padding`` zero frames precede the
+    input and none follow it, so no output frame reads a later input frame.
+    ``forward`` pads (``functional.frame_pad``) and convolves; ``convolve``
+    takes input already padded by ``padding_extents``.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        *,
+        stride: int | tuple[int, int, int] = 1,
+        spatial_padding: int = 0,
+        temporal_padding: int = 0,
+        spatial_padding_mode: str = "reflect",
+    ):
+        super().__init__(
+            in_channels, out_channels, kernel_size, stride=stride, padding=0
+        )
+        self.spatial_padding = spatial_padding
+        self.temporal_padding = temporal_padding
+        self.spatial_padding_mode = spatial_padding_mode
+
+    @property
+    def padding_extents(self) -> tuple[int, int, int, int, int]:
+        """``(left, right, top, bottom, front)`` padding of the input."""
+        extent = self.spatial_padding
+        return (extent, extent, extent, extent, self.temporal_padding)
+
+    def convolve(self, padded: torch.Tensor) -> torch.Tensor:
+        """Convolve input that already carries this convolution's padding."""
+        return F.conv3d(padded, self.weight, self.bias, stride=self.stride)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        if self.spatial_padding or self.temporal_padding:
+            values = functional.frame_pad(
+                values, self.padding_extents, mode=self.spatial_padding_mode
+            )
+        return self.convolve(values)
+
+
+class FrameGroupNorm(nn.GroupNorm):
+    """Group-normalize every NCTHW frame on its own; frames never mix.
+
+    Returns the normalized values as a permuted view of the frame-folded
+    result; the causal convolution's padding (``functional.frame_pad``)
+    reads that view directly instead of a contiguous copy.
+    """
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        batch, channels, frames, height, width = values.shape
+        # Fold time into the batch: [batch * frames, channels, height, width].
+        folded = values.permute(0, 2, 1, 3, 4).reshape(
+            batch * frames, channels, height, width
+        )
+        normalized = super().forward(folded)
+        return normalized.view(batch, frames, channels, height, width).permute(
+            0, 2, 1, 3, 4
+        )
+
+
+class CausalBlock(nn.Module):
+    """Add two normalized causal convolutions to the projected input."""
+
+    def __init__(self, in_channels: int, out_channels: int, config: Config):
+        super().__init__()
+        self.norms = nn.ModuleList(
+            FrameGroupNorm(config.norm_num_groups, width, eps=config.norm_eps)
+            for width in (in_channels, out_channels)
+        )
+        self.convolutions = nn.ModuleList(
+            CausalConv3d(
+                width,
+                out_channels,
+                3,
+                spatial_padding=1,
+                temporal_padding=2,
+                spatial_padding_mode=config.spatial_padding_mode,
+            )
+            for width in (in_channels, out_channels)
+        )
+        self.shortcut = (
+            nn.Identity()
+            if in_channels == out_channels
+            else CausalConv3d(in_channels, out_channels, 1)
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        hidden = values
+        for norm, convolution in zip(
+            self.norms, self.convolutions, strict=True
+        ):
+            hidden = convolution(F.silu(norm(hidden)))
+        return self.shortcut(values) + hidden
+
+
+class CausalDownsample(nn.Module):
+    """Halve height and width and stride time with one causal convolution."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        temporal_stride: int,
+        spatial_stride: int,
+        spatial_padding_mode: str,
+    ):
+        super().__init__()
+        # The convolution pads space only on the bottom and right, which halves
+        # an extent exactly; no other spatial stride preserves the encoder's
+        # spatial compression.
+        if spatial_stride != 2:
+            raise ValueError("H3 video downsampling halves the spatial extent")
+        self.spatial_padding_mode = spatial_padding_mode
+        self.convolution = CausalConv3d(
+            channels,
+            channels,
+            3,
+            stride=(temporal_stride, spatial_stride, spatial_stride),
+            temporal_padding=2,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        # The bottom and right pad and the leading zero frames form the
+        # convolution's input in one pass.
+        padded = functional.frame_pad(
+            values,
+            (0, 1, 0, 1, self.convolution.temporal_padding),
+            mode=self.spatial_padding_mode,
+        )
+        return self.convolution.convolve(padded)
+
+
+class EncoderStage(nn.Module):
+    """Apply one encoder level's causal blocks, then its downsampling."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        temporal_factor: int,
+        spatial_factor: int,
+        config: Config,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            CausalBlock(
+                in_channels if index == 0 else out_channels,
+                out_channels,
+                config,
+            )
+            for index in range(config.layers_per_block)
+        )
+        self.downsample = (
+            CausalDownsample(
+                out_channels,
+                temporal_stride=temporal_factor,
+                spatial_stride=spatial_factor,
+                spatial_padding_mode=config.spatial_padding_mode,
+            )
+            if temporal_factor * spatial_factor > 1
+            else None
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            values = block(values)
+        return values if self.downsample is None else self.downsample(values)
+
+
+class CausalCNN(nn.Module):
+    """Map normalized NCTHW pixels to posterior moments of the latent.
+
+    A stride-``s`` causal level maps ``T`` frames to ``ceil(T / s)``, so one
+    17-frame clip becomes five latent frames and a single frame stays one.
+    Spatial levels halve height and width.
+    """
+
+    def __init__(self, config: Config):
+        super().__init__()
+        widths = config.block_out_channels
+        mode = config.spatial_padding_mode
+        self.input = CausalConv3d(
+            config.in_channels,
+            widths[0],
+            3,
+            spatial_padding=1,
+            temporal_padding=2,
+            spatial_padding_mode=mode,
+        )
+        self.stages = nn.ModuleList(
+            EncoderStage(
+                in_channels,
+                out_channels,
+                temporal_factor=temporal,
+                spatial_factor=spatial,
+                config=config,
+            )
+            for in_channels, out_channels, temporal, spatial in zip(
+                (widths[0], *widths[:-1]),
+                widths,
+                config.temporal_downsample_factors,
+                config.spatial_downsample_factors,
+                strict=True,
+            )
+        )
+        self.norm = FrameGroupNorm(
+            config.norm_num_groups, widths[-1], eps=config.norm_eps
+        )
+        # Mean and log-variance of every latent channel.
+        self.output = CausalConv3d(
+            widths[-1],
+            2 * config.latent_channels,
+            3,
+            spatial_padding=1,
+            temporal_padding=2,
+            spatial_padding_mode=mode,
+        )
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        hidden = self.input(pixels)
+        for stage in self.stages:
+            hidden = stage(hidden)
+        return self.output(F.silu(self.norm(hidden)))
+
+
+class Encoder(SpatialEncoder):
+    """Encode overlapping spatial tiles of one clip into posterior moments."""
+
+    encoder: CausalCNN
+
+    def __init__(self, config: Config):
+        # Tile extents and minimum overlaps are input pixels and match the
+        # native diffusers encoder's default tiling, with which the released
+        # model's conditioning latents were encoded.
+        super().__init__(
+            CausalCNN(config),
+            spatial_compression=config.spatial_compression,
+            tile_height=256,
+            tile_width=256,
+            overlap_height=64,
+            overlap_width=64,
+        )
+        self.config = config
+        self.quant_conv = nn.Conv3d(
+            2 * config.latent_channels, 2 * config.latent_channels, 1
+        )
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        return self.quant_conv(self.encoder(pixels))
+
+
+def _encoder_source(name: str) -> str:
+    """Return the native checkpoint name of one ``Encoder`` parameter."""
+    parts = name.split(".")
+    leaf = parts[-1]
+    if parts[0] == "quant_conv":
+        return name
+    if parts[1] == "input":
+        return f"encoder.conv_in.{leaf}"
+    if parts[1] == "norm":
+        return f"encoder.norm_out.{leaf}"
+    if parts[1] == "output":
+        return f"encoder.conv_out.{leaf}"
+    if parts[1] == "stages":
+        prefix = f"encoder.down_blocks.{parts[2]}."
+        if parts[3] == "downsample":
+            return prefix + f"downsamplers.0.conv.{leaf}"
+        block = prefix + f"resnets.{parts[4]}."
+        if parts[5] == "norms":
+            return block + f"norm{int(parts[6]) + 1}.{leaf}"
+        if parts[5] == "convolutions":
+            return block + f"conv{int(parts[6]) + 1}.{leaf}"
+        if parts[5] == "shortcut":
+            return block + f"conv_shortcut.{leaf}"
+    raise ValueError(f"unmapped video encoder weight {name!r}")
+
+
+def encoder_assignments(model: Encoder | LatentEncoder, reader):
+    """Map the native causal encoder and its ``quant_conv`` moment projection.
+
+    The checkpoint's ``encoder.*`` and ``quant_conv.*`` tensors become
+    resident; its decoder half belongs to ``assignments``.
+    """
+    from uniserve.loading import weights
+
+    encoder = model.encoder if isinstance(model, LatentEncoder) else model
+    available = frozenset(reader.names())
+    values = []
+    for name, parameter in encoder.named_parameters():
+        source = _encoder_source(name)
+        if source in available:
+            values.append(weights.Assignment(parameter, reader.get(source)))
+    return tuple(values)

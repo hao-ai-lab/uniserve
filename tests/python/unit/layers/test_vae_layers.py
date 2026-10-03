@@ -42,3 +42,43 @@ def test_diagonal_gaussian_disabled_returns_mean_and_halves_channels():
     out = reg(z)
     assert out.shape == mean.shape
     torch.testing.assert_close(out, mean)
+
+
+def test_diagonal_gaussian_scales_supplied_noise_by_clamped_deviation():
+    posterior = DiagonalGaussian(log_variance_range=(-30.0, 20.0))
+    mean = torch.tensor([0.5, -1.0, 2.0]).view(1, 3, 1)
+    log_variance = torch.tensor([-2.0, 40.0, -50.0]).view(1, 3, 1)
+    noise = torch.tensor([1.5, -0.5, 2.0]).view(1, 3, 1)
+
+    sample = posterior(torch.cat((mean, log_variance), dim=1), noise=noise)
+
+    bounded = torch.tensor([-2.0, 20.0, -30.0]).view(1, 3, 1)
+    expected = mean + torch.exp(0.5 * bounded) * noise
+    torch.testing.assert_close(sample, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="shape"):
+        posterior(torch.cat((mean, log_variance), dim=1), noise=noise[:, :2])
+
+
+def test_spatial_encoder_tiles_reproduce_a_local_encoding():
+    """Overlapping tiles of a blockwise encoder assemble its untiled output.
+
+    Every latent of an average pool reads only its own pixel block, so tiles
+    placed at their raster positions agree on every overlap and the blended
+    seams reproduce the whole-raster encoding.
+    """
+    from uniserve.nn.vae import SpatialEncoder
+
+    encoder = SpatialEncoder(
+        torch.nn.AvgPool2d(4),
+        spatial_compression=4,
+        tile_height=32,
+        tile_width=16,
+        overlap_height=8,
+        overlap_width=4,
+    )
+    pixels = torch.randn(2, 3, 72, 60)
+
+    tiled = encoder.encode(pixels, tiled=True)
+
+    assert tiled.shape == (2, 3, 18, 15)
+    torch.testing.assert_close(tiled, encoder.encode(pixels, tiled=False))
