@@ -24,10 +24,11 @@ from uniserve.nn.linear import (
     _padded_vocabulary,
     _vocabulary,
 )
+from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import QuantizedTensor
 
 from .distribution import Distribution
-from .mesh import DeviceMesh
+from .mesh import Communicator, DeviceMesh
 from .tokens import HeadExchange, kv_head_partition
 
 
@@ -80,6 +81,9 @@ def _communication_axes(module, mesh, attention):
         if isinstance(child, (Attention, VsaAttention, RegionAttention)):
             add(head)
             add(context)
+        if isinstance(child, FusedMoE):
+            # Tensor-parallel shards of I sum once after combining experts.
+            add("tp")
         if isinstance(child, (Linear, VocabParallelEmbedding)):
             # Quantization reduces statistics across each sharded dimension.
             for axis in tokens:
@@ -123,6 +127,98 @@ def communicators(module: nn.Module) -> tuple:
     return tuple(groups.values())
 
 
+def _partition_experts(module, mesh, group, attention) -> None:
+    """Keep this rank's interval of every expert's intermediate channels.
+
+    Each rank holds the same experts with ``I / tp`` of their up, gate and
+    down channels; ``up_gate`` keeps the local up rows followed by the local
+    gate rows, preserving the resident order.
+    """
+    bound = getattr(module, "_parallel_mesh", None)
+    if bound is not None:
+        if bound != mesh or module._attention_parallel != attention:
+            raise ValueError(
+                "a resident layer cannot change its mathematical partition"
+            )
+        return
+    intermediate = module.intermediate_size
+    if intermediate % group.size:
+        raise ValueError(
+            "expert intermediate channels must divide the tensor-parallel group"
+        )
+    if isinstance(module.up_gate.weight, QuantizedTensor):
+        raise ValueError("parallel binding must precede weight quantization")
+    width = intermediate // group.size
+    local = slice(group.rank * width, (group.rank + 1) * width)
+    if width != intermediate:
+        up_gate, down = module.up_gate.weight, module.down.weight
+        module.up_gate.weight = nn.Parameter(
+            torch.cat(
+                (
+                    up_gate[:, local],
+                    up_gate[
+                        :,
+                        intermediate + local.start : intermediate + local.stop,
+                    ],
+                ),
+                dim=1,
+            ),
+            requires_grad=False,
+        )
+        module.down.weight = nn.Parameter(
+            down[:, :, local].contiguous(), requires_grad=False
+        )
+        module.up_gate.out_features = 2 * width
+        module.down.in_features = width
+    module.intermediate_slice = local
+    module.group = group
+    module._parallel_mesh = mesh
+    module._attention_parallel = attention
+
+
+def partition_experts(model: nn.Module, group: Communicator) -> None:
+    """Shard every ``FusedMoE`` of ``model`` over the expert group ``group``.
+
+    Rank ``r`` of ``P`` keeps the contiguous global experts
+    ``[r * E / P, (r + 1) * E / P)`` of every layer, the placement the
+    FlashInfer and TensorRT-LLM all-to-all kernels route tokens by. Each
+    stacked weight keeps those experts only; routing still names global
+    experts. Binding happens on the meta skeleton, before weights load, so a
+    rank reads only its own experts' tensors.
+
+    Raises:
+        ValueError: A layer's expert count does not divide the group, the
+            layer is already tensor-parallel or expert-parallel, or its
+            weights are already quantized.
+    """
+    if group.size == 1:
+        return
+    for module in model.modules():
+        if not isinstance(module, FusedMoE):
+            continue
+        if module.expert_group.size > 1 or module.group.size > 1:
+            raise ValueError(
+                "an expert layer is partitioned over one group at a time"
+            )
+        if module.num_experts % group.size:
+            raise ValueError(
+                f"{module.num_experts} experts do not divide an expert group "
+                f"of {group.size} ranks"
+            )
+        if isinstance(module.up_gate.weight, QuantizedTensor):
+            raise ValueError("expert binding must precede weight quantization")
+
+        count = module.num_experts // group.size
+        local = slice(group.rank * count, (group.rank + 1) * count)
+        for linear in (module.up_gate, module.down):
+            linear.weight = nn.Parameter(
+                linear.weight[local].contiguous(), requires_grad=False
+            )
+            linear.num_experts = count
+        module.expert_slice = local
+        module.expert_group = group
+
+
 def _replicated_heads(mesh: DeviceMesh, heads: int) -> Distribution:
     """Factor TP into distinct KV heads and adjacent copies of each head."""
     index = mesh.axes.index("tp")
@@ -164,6 +260,7 @@ def parallelize_(
     mesh: DeviceMesh,
     *,
     attention: AttentionParallelConfig = AttentionParallelConfig(),
+    exclude: frozenset[nn.Module] = frozenset(),
 ) -> None:
     """Partition resident numerical parameters on an already bound mesh.
 
@@ -171,6 +268,9 @@ def parallelize_(
     partition remain identical objects. Rebinding to a different partition is
     rejected because discarded source values cannot be reconstructed locally.
     Attention axis names select token placements; TP owns matrix channels.
+    ``exclude`` leaves the named subtrees, including shared aliases, on their
+    own mathematical partition. In particular, remote experts do not inherit
+    the calling attention module's tensor-parallel reduction.
     """
     if mesh.rank not in mesh.ranks:
         raise ValueError("a nonparticipating rank cannot bind resident layers")
@@ -194,14 +294,14 @@ def parallelize_(
     # A surrounding denoiser's token partition does not partition those input
     # documents; each sequence coordinate receives the same refined features.
     modules = []
-    seen = set()
+    seen = {id(nested) for child in exclude for nested in child.modules()}
 
     def visit(child):
         if id(child) in seen:
             return
         seen.add(id(child))
         if child is not module and isinstance(child, Encoder):
-            parallelize_(child, mesh)
+            parallelize_(child, mesh, exclude=exclude)
             return
         modules.append(child)
         for nested in child.children():
@@ -258,6 +358,7 @@ def parallelize_(
             mesh.get_group(axes) for axes in requirements[child]
         )
     for child in modules:
+        # Vocabulary heads project only on the last pipeline stage.
         if (
             isinstance(child, CausalLM)
             and child.backbone._pipeline.rank != pipeline.size - 1
@@ -426,6 +527,9 @@ def parallelize_(
                 )
             child._parallel_mesh = mesh
             child._attention_parallel = attention
+            continue
+        if isinstance(child, FusedMoE):
+            _partition_experts(child, mesh, group, attention)
             continue
         if not isinstance(child, (Linear, VocabParallelEmbedding)):
             continue

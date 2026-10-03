@@ -16,6 +16,9 @@ from pathlib import Path
 
 from uniserve import loading
 from uniserve.loading import checkpoint
+from uniserve.nn.rope import RoPEScaling, YaRNScaling
+
+from ..rotary import read_rotary
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,19 +27,26 @@ class Config:
 
     Field names follow the checkpoint ``config.json`` keys that
     ``read_config`` reads. ``head_dim`` may differ from
-    ``hidden_size // num_attention_heads``. A zero ``num_experts`` builds a
-    dense ``GatedMLP`` of width ``intermediate_size`` in every layer; a
-    positive value builds an ``MoE`` in every layer, routing each token to
-    ``num_experts_per_tok`` experts of width ``moe_intermediate_size``.
-    ``mrope_sections`` gives the interleaved multimodal rotary widths of a
-    Qwen3-VL language model (``MRotaryEmbedding``'s ``sections``); Qwen3
-    checkpoints rotate one position axis and leave it None.
+    ``hidden_size // num_attention_heads``. ``rope_scaling`` is a typed
+    rotary recipe, None for plain rotary positions. ``mrope_sections`` gives
+    the interleaved multimodal rotary widths of a Qwen3-VL language model
+    (``MRotaryEmbedding``'s ``sections``); Qwen3 checkpoints rotate one
+    position axis and leave it None.
+
+    A zero ``num_experts`` builds a dense ``GatedMLP`` of width
+    ``intermediate_size`` in every layer (Qwen3). A positive value makes
+    layer ``i`` sparse when ``i`` is not in ``mlp_only_layers`` and
+    ``(i + 1) % decoder_sparse_step == 0`` (Qwen3-MoE): a sparse layer routes
+    each token to ``num_experts_per_tok`` experts of width
+    ``moe_intermediate_size`` gated by ``hidden_act``, and any other layer
+    keeps the dense MLP.
 
     Raises:
         ValueError: From ``__post_init__`` when a field has the wrong type or
             an invalid value, including odd ``head_dim``, query heads not
             divisible by KV heads, ``num_experts_per_tok`` above a nonzero
-            ``num_experts``, or an unsupported ``hidden_act``.
+            ``num_experts``, an unsupported ``hidden_act``, or an expert
+            activation no expert kernel implements.
     """
 
     vocab_size: int
@@ -49,12 +59,17 @@ class Config:
     hidden_act: str
     rms_norm_eps: float
     rope_theta: float
+    rope_scaling: RoPEScaling | None
     max_position_embeddings: int
     attention_bias: bool
     tie_word_embeddings: bool
     num_experts: int
     num_experts_per_tok: int
     moe_intermediate_size: int
+    # Whether the selected experts' softmax weights renormalize to one.
+    norm_topk_prob: bool
+    decoder_sparse_step: int
+    mlp_only_layers: tuple[int, ...]
     mrope_sections: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -69,6 +84,7 @@ class Config:
             "max_position_embeddings",
             "num_experts_per_tok",
             "moe_intermediate_size",
+            "decoder_sparse_step",
         ):
             value = getattr(self, name)
             if (
@@ -96,6 +112,24 @@ class Config:
                 "Qwen3 num_experts_per_tok must not exceed num_experts"
             )
 
+        if not isinstance(self.mlp_only_layers, tuple) or any(
+            not isinstance(layer, int)
+            or isinstance(layer, bool)
+            or not 0 <= layer < self.num_hidden_layers
+            for layer in self.mlp_only_layers
+        ):
+            raise ValueError(
+                "Qwen3 mlp_only_layers must be a tuple of layer indices"
+            )
+        # Only static recipes: positions alone determine their factors, as
+        # the decoder's rotary evaluation assumes.
+        if self.rope_scaling is not None and not isinstance(
+            self.rope_scaling, YaRNScaling
+        ):
+            raise ValueError(
+                "Qwen3 supports the default and YaRN rotary recipes"
+            )
+
         for name in ("rms_norm_eps", "rope_theta"):
             value = getattr(self, name)
             if (
@@ -106,7 +140,7 @@ class Config:
             ):
                 raise ValueError(f"Qwen3 {name} must be finite and positive")
 
-        for name in ("attention_bias", "tie_word_embeddings"):
+        for name in ("attention_bias", "tie_word_embeddings", "norm_topk_prob"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"Qwen3 {name} must be boolean")
 
@@ -137,6 +171,35 @@ class Config:
             raise ValueError(
                 f"unsupported Qwen3 hidden_act {self.hidden_act!r}"
             )
+        if self.num_experts and self.hidden_act not in _EXPERT_ACTIVATIONS:
+            raise ValueError(
+                f"Qwen3-MoE experts do not implement {self.hidden_act!r}; "
+                "expert kernels gate with SiLU or tanh-approximated GELU"
+            )
+
+    def sparse(self, layer: int) -> bool:
+        """Return whether ``layer`` routes tokens to experts."""
+        return (
+            self.num_experts > 0
+            and layer not in self.mlp_only_layers
+            and (layer + 1) % self.decoder_sparse_step == 0
+        )
+
+
+# ``hidden_act`` aliases and the expert gating each one names.
+_EXPERT_ACTIVATIONS = {
+    "silu": "silu",
+    "swish": "silu",
+    "silu_and_mul": "silu",
+    "swiglu": "silu",
+    "gelu_pytorch_tanh": "gelu_tanh",
+    "gelu_tanh": "gelu_tanh",
+}
+
+
+def expert_activation(hidden_act: str) -> str:
+    """Name the ``FusedMoE`` gating that ``hidden_act`` specifies."""
+    return _EXPERT_ACTIVATIONS[hidden_act]
 
 
 def _required_int(config: Mapping[str, object], name: str) -> int:
@@ -167,7 +230,11 @@ def _optional_int(
 
 def _number(config: Mapping[str, object], name: str, default: float) -> float:
     """Read a finite positive number with a default, rejecting booleans."""
-    raw = config.get(name, default)
+    return _positive_float(config.get(name, default), name)
+
+
+def _positive_float(raw: object, name: str) -> float:
+    """Validate one finite positive number, rejecting booleans."""
     if not isinstance(raw, (int, float)) or isinstance(raw, bool):
         raise ValueError(f"Qwen3 config field {name!r} must be numeric")
     value = float(raw)
@@ -204,6 +271,11 @@ def read_config(
 ) -> Config:
     """Normalize checkpoint metadata into immutable decoder configuration.
 
+    ``architectures`` selects the family: ``Qwen3ForCausalLM`` (dense,
+    ``model_type`` qwen3) or ``Qwen3MoeForCausalLM`` (``model_type``
+    qwen3_moe). Each family's absent fields take Transformers' defaults for
+    that family, so a field means the same here as in the reference.
+
     Args:
         root: Local checkpoint directory containing ``config.json``.
         io: Loading options of the package ``read_config`` contract; Qwen3
@@ -212,80 +284,209 @@ def read_config(
             Qwen3 declares none.
 
     Returns:
-        The validated ``Config``. Optional fields absent from the checkpoint
-        take this function's defaults.
+        The validated ``Config``.
 
     Raises:
-        ValueError: For invalid metadata, including a missing required
-            field, a field of the wrong type or value, a ``rope_parameters``
-            recipe other than ``default``, and disagreeing ``rope_theta``
-            locations.
+        ValueError: For invalid metadata, including an unknown or
+            inconsistent architecture and ``model_type``, a missing required
+            field, a field of the wrong type or value, conflicting aliases,
+            sliding-window attention, a rotary recipe other than default or
+            YaRN, a partial rotary width, and expert fields in a dense
+            checkpoint.
     """
     config = json.loads((root / "config.json").read_text())
 
-    rotary = config.get("rope_parameters") or {}
-    if not isinstance(rotary, Mapping):
-        raise ValueError("Qwen3 rope_parameters must be an object")
-    if rotary.get("rope_type", "default") != "default":
-        raise ValueError("Qwen3 requires the default rotary embedding recipe")
-    if "rope_theta" in rotary:
-        if (
-            "rope_theta" in config
-            and config["rope_theta"] != rotary["rope_theta"]
-        ):
-            raise ValueError(
-                "Qwen3 checkpoint has conflicting rope_theta aliases"
-            )
-        # Transformers may serialize rope_theta inside rope_parameters. The
-        # top-level key becomes the single normalized value Config receives.
-        config["rope_theta"] = rotary["rope_theta"]
+    # The dense and mixture-of-experts families parse the same keys with
+    # different defaults and meanings, so the checkpoint must say which one
+    # it is, consistently.
+    architectures = config.get("architectures")
+    if (
+        not isinstance(architectures, list)
+        or len(architectures) != 1
+        or architectures[0] not in _FAMILIES
+    ):
+        raise ValueError(
+            "Qwen3 checkpoint must declare exactly one of the architectures "
+            f"{sorted(_FAMILIES)}"
+        )
+    family = _FAMILIES[architectures[0]]
+    if config.get("model_type", family.model_type) != family.model_type:
+        raise ValueError(
+            f"{architectures[0]} checkpoint has model_type "
+            f"{config['model_type']!r}, not {family.model_type!r}"
+        )
 
-    # Without an explicit head_dim, hidden_size must split exactly across the
-    # query heads; an explicit head_dim may differ from that split.
     hidden_size = _required_int(config, "hidden_size")
     num_attention_heads = _required_int(config, "num_attention_heads")
-    if "head_dim" not in config and hidden_size % num_attention_heads:
-        raise ValueError(
-            "Qwen3 hidden_size must be divisible by num_attention_heads"
-        )
-    head_dim = _optional_int(
-        config,
-        "head_dim",
-        hidden_size // num_attention_heads,
-        minimum=1,
-    )
-    num_experts = _optional_int(config, "num_experts", 0, minimum=0)
-    num_experts_per_tok = _optional_int(
-        config, "num_experts_per_tok", 1, minimum=1
-    )
-    intermediate_size = _required_int(config, "intermediate_size")
+    num_hidden_layers = _required_int(config, "num_hidden_layers")
 
-    cfg = Config(
+    # A dense checkpoint without head_dim uses Transformers' fixed 128; the
+    # mixture-of-experts family derives it from the attention width.
+    if family.default_head_dim is None:
+        if "head_dim" not in config and hidden_size % num_attention_heads:
+            raise ValueError(
+                "Qwen3-MoE hidden_size must be divisible by num_attention_heads"
+            )
+        default_head_dim = hidden_size // num_attention_heads
+    else:
+        default_head_dim = family.default_head_dim
+    head_dim = _optional_int(config, "head_dim", default_head_dim, minimum=1)
+
+    # A dense checkpoint's explicit null KV head count means one KV head per
+    # query head (Qwen3Config.__post_init__). An absent count would take a
+    # fixed class default unrelated to the query heads, so it is required.
+    if family.experts is None and config.get("num_key_value_heads", 0) is None:
+        num_key_value_heads = num_attention_heads
+    else:
+        num_key_value_heads = _required_int(config, "num_key_value_heads")
+
+    # Sliding-window attention changes the visible keys: dense checkpoints
+    # window the layers from max_window_layers (or those layer_types marks),
+    # mixture-of-experts checkpoints window every layer. Neither is served.
+    if _boolean(config, "use_sliding_window", False):
+        raise ValueError(
+            f"{architectures[0]} sliding-window attention is not supported"
+        )
+    layer_types = config.get("layer_types")
+    if layer_types is not None and (
+        not isinstance(layer_types, list)
+        or any(kind != "full_attention" for kind in layer_types)
+    ):
+        raise ValueError(
+            "Qwen3 layer_types other than full_attention are not supported"
+        )
+
+    max_position_embeddings = _optional_int(
+        config, "max_position_embeddings", 32768, minimum=1
+    )
+    rotary = read_rotary(
+        config,
+        owner="Qwen3",
+        default_theta=10000.0,
+        default_original=max_position_embeddings,
+    )
+    if rotary.kind not in {"default", "yarn"}:
+        raise ValueError(
+            f"Qwen3 supports the default and YaRN rotary recipes, not "
+            f"{rotary.kind!r}"
+        )
+    # Transformers' default Qwen3 rotary ignores a partial factor, while
+    # its YaRN honors one; only full-width rotation has one meaning here.
+    if rotary.partial_rotary_factor != 1.0:
+        raise ValueError("Qwen3 rotary positions must span the full head")
+
+    intermediate_size = _required_int(config, "intermediate_size")
+    experts = family.experts
+    if experts is None:
+        # Dense checkpoints carry no expert fields; one here would mean a
+        # mislabeled mixture-of-experts checkpoint.
+        present = sorted(set(config) & _EXPERT_FIELDS)
+        if present:
+            raise ValueError(
+                f"Qwen3ForCausalLM checkpoint has expert fields {present}"
+            )
+        num_experts, num_experts_per_tok = 0, 1
+        moe_intermediate_size, norm_topk_prob = intermediate_size, False
+        decoder_sparse_step, mlp_only_layers = 1, ()
+    else:
+        # Transformers 5 serializes the expert count as num_local_experts;
+        # released checkpoints name it num_experts.
+        if "num_local_experts" in config:
+            if (
+                "num_experts" in config
+                and config["num_experts"] != config["num_local_experts"]
+            ):
+                raise ValueError(
+                    "Qwen3-MoE checkpoint has conflicting expert-count aliases"
+                )
+            config["num_experts"] = config["num_local_experts"]
+        num_experts = _optional_int(
+            config, "num_experts", experts.num_experts, minimum=0
+        )
+        num_experts_per_tok = _optional_int(
+            config,
+            "num_experts_per_tok",
+            experts.num_experts_per_tok,
+            minimum=1,
+        )
+        moe_intermediate_size = _optional_int(
+            config,
+            "moe_intermediate_size",
+            experts.moe_intermediate_size,
+            minimum=1,
+        )
+        norm_topk_prob = _boolean(config, "norm_topk_prob", False)
+        decoder_sparse_step = _optional_int(
+            config, "decoder_sparse_step", 1, minimum=1
+        )
+        raw_layers = config.get("mlp_only_layers") or []
+        if not isinstance(raw_layers, list):
+            raise ValueError("Qwen3-MoE mlp_only_layers must be a list")
+        mlp_only_layers = tuple(raw_layers)
+
+    return Config(
         vocab_size=_required_int(config, "vocab_size"),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        num_hidden_layers=_required_int(config, "num_hidden_layers"),
+        num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
-        num_key_value_heads=_required_int(config, "num_key_value_heads"),
+        num_key_value_heads=num_key_value_heads,
         head_dim=head_dim,
         hidden_act=_string(config, "hidden_act", "silu"),
         rms_norm_eps=_number(config, "rms_norm_eps", 1e-6),
-        rope_theta=_number(config, "rope_theta", 1_000_000.0),
-        max_position_embeddings=_optional_int(
-            config, "max_position_embeddings", 4096, minimum=1
-        ),
+        rope_theta=_positive_float(rotary.theta, "rope_theta"),
+        rope_scaling=rotary.scaling,
+        max_position_embeddings=max_position_embeddings,
         attention_bias=_boolean(config, "attention_bias", False),
         tie_word_embeddings=_boolean(config, "tie_word_embeddings", False),
         num_experts=num_experts,
         num_experts_per_tok=num_experts_per_tok,
-        moe_intermediate_size=_optional_int(
-            config,
-            "moe_intermediate_size",
-            intermediate_size,
-            minimum=1,
-        ),
+        moe_intermediate_size=moe_intermediate_size,
+        norm_topk_prob=norm_topk_prob,
+        decoder_sparse_step=decoder_sparse_step,
+        mlp_only_layers=mlp_only_layers,
     )
-    return cfg
+
+
+@dataclass(frozen=True, slots=True)
+class _Experts:
+    """Transformers' expert defaults for a checkpoint that omits them."""
+
+    num_experts: int
+    num_experts_per_tok: int
+    moe_intermediate_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Family:
+    """How one Qwen3 architecture interprets its ``config.json``.
+
+    ``default_head_dim`` is None when the head width derives from the
+    attention width; ``experts`` is None for dense checkpoints.
+    """
+
+    model_type: str
+    default_head_dim: int | None
+    experts: _Experts | None
+
+
+# Defaults follow Transformers' Qwen3Config and Qwen3MoeConfig.
+_FAMILIES = {
+    "Qwen3ForCausalLM": _Family("qwen3", 128, None),
+    "Qwen3MoeForCausalLM": _Family("qwen3_moe", None, _Experts(128, 8, 768)),
+}
+
+_EXPERT_FIELDS = frozenset(
+    {
+        "num_experts",
+        "num_local_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "norm_topk_prob",
+        "decoder_sparse_step",
+        "mlp_only_layers",
+    }
+)
 
 
 # Checkpoint sources whose tensor headers read_config needs before module

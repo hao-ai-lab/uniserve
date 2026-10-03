@@ -20,7 +20,13 @@ from uniserve.nn.linear import (
     VocabParallelHead,
     _coalesce,
 )
-from uniserve.quantization import QuantizationConfig, QuantizedTensor, Quantizer
+from uniserve.nn.moe import ExpertLinear, FusedMoE
+from uniserve.quantization import (
+    QuantizationConfig,
+    QuantizedTensor,
+    Quantizer,
+    ScaleLayout,
+)
 
 from . import checkpoint
 
@@ -60,6 +66,9 @@ class Assignment:
     Source slices select mathematical checkpoint branches. The loader applies
     a target layer's channel partition when a complete logical matrix is given.
     Target slices address resident storage. preserve_dtype keeps source dtype.
+    A target rectangle may carry extra leading axes of extent one, such as
+    one expert of a stacked ``[E, rows, columns]`` parameter receiving that
+    expert's ``[rows, columns]`` checkpoint matrix.
     """
 
     target: nn.Parameter
@@ -122,6 +131,18 @@ def _choice(path, mapping, default):
 
 def _full(shape):
     return tuple(slice(0, size) for size in shape)
+
+
+def _placed(device) -> torch.device:
+    """Name the device a tensor moved to ``device`` reports.
+
+    An unindexed CUDA device means the current one, which moved tensors
+    report with its index.
+    """
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
 
 
 def _source_names(weight):
@@ -218,6 +239,168 @@ def _fp8_fragments(shape, fragments, *, device, dtype):
     )
 
 
+def expert_assignments(
+    module: FusedMoE,
+    *,
+    up: tuple[checkpoint.Weight, int],
+    gate: tuple[checkpoint.Weight, int],
+    down: checkpoint.Weight,
+    expert: int | None = None,
+) -> tuple[Assignment, ...]:
+    """Assign complete checkpoint expert projections to a ``FusedMoE``.
+
+    ``up`` and ``gate`` name each ``[I, H]`` projection's checkpoint tensor
+    and the row where it starts inside that tensor, so a fused ``gate_up``
+    tensor serves both (gate at row 0, up at row ``I`` in the Transformers
+    layout). ``down`` is the ``[H, I]`` projection. With ``expert=None`` the
+    tensors are stacked ``[E, ...]`` over all experts; otherwise they are one
+    expert's matrices. The module's tensor-parallel interval of ``I`` selects
+    the resident rows: local up rows first, then local gate rows. Its
+    expert-parallel ``expert_slice`` selects the resident experts: a stacked
+    tensor contributes those experts only, and one expert outside the slice
+    assigns nothing.
+    """
+    local = module.intermediate_slice
+    width = local.stop - local.start
+    hidden = module.hidden_size
+    resident = module.expert_slice
+    if expert is None:
+        experts: tuple[slice, ...] = (resident,)
+        targets: tuple[slice, ...] = (slice(0, resident.stop - resident.start),)
+    else:
+        if not 0 <= expert < module.num_experts:
+            raise ValueError("expert index is outside the stacked experts")
+        if not resident.start <= expert < resident.stop:
+            return ()
+        experts = ()
+        offset = expert - resident.start
+        targets = (slice(offset, offset + 1),)
+
+    result = []
+    for (weight, offset), rows in (
+        (up, slice(0, width)),
+        (gate, slice(width, 2 * width)),
+    ):
+        result.append(
+            Assignment(
+                module.up_gate.weight,
+                weight,
+                source_slice=(
+                    *experts,
+                    slice(offset + local.start, offset + local.stop),
+                    slice(0, hidden),
+                ),
+                target_slice=(*targets, rows, slice(0, hidden)),
+            )
+        )
+    result.append(
+        Assignment(
+            module.down.weight,
+            down,
+            source_slice=(*experts, slice(0, hidden), local),
+            target_slice=(*targets, slice(0, hidden), slice(0, width)),
+        )
+    )
+    return tuple(result)
+
+
+def owner_path(loader, key) -> str:
+    """Name a parameter by its owning module for load errors."""
+    owner, name = loader._owners[key]
+    return f"{type(owner).__name__}.{name}"
+
+
+def _nvfp4_fragments(shape, fragments, *, device, dtype):
+    """Assemble NVFP4 encodings from checkpoint fragments without decoding.
+
+    A matrix ``[rows, columns]`` keeps one tensor scale, which every fragment
+    must share. A stacked expert tensor ``[E, rows, columns]`` keeps one
+    tensor scale per expert, which every fragment of that expert must share.
+    """
+    if len(shape) == 2:
+        stacked = _nvfp4_expert_fragments(
+            (1, *shape),
+            tuple(
+                ((slice(0, 1), *target), fragment)
+                for target, fragment in fragments
+            ),
+            device=device,
+            dtype=dtype,
+        )
+        fields = stacked.buffers()
+        return Quantizer("nvfp4").from_tensors(
+            {
+                "values": fields["values"].reshape(shape[0], -1),
+                "block_scale": fields["block_scale"],
+                "tensor_scale": fields["tensor_scale"].reshape(()),
+            },
+            shape=shape,
+            dtype=dtype,
+        )
+    return _nvfp4_expert_fragments(shape, fragments, device=device, dtype=dtype)
+
+
+def _nvfp4_expert_fragments(shape, fragments, *, device, dtype):
+    """Assemble stacked expert NVFP4 encodings without re-encoding values.
+
+    ``shape`` is the stacked ``[E, rows, columns]`` parameter. Each fragment
+    covers whole K16 column blocks of a row interval of one or more experts
+    and carries its checkpoint tensor scale; fragments of one expert must
+    agree on it, since the expert keeps a single tensor-scale domain. Block
+    scales keep their E4M3 bytes in a linear ``[E * rows, columns / 16]``
+    layout.
+    """
+    experts, rows, columns = shape
+    if columns % 16:
+        raise ValueError("NVFP4 expert columns must form whole K16 blocks")
+    values = torch.zeros(
+        (experts, rows, columns // 2), dtype=torch.uint8, device=device
+    )
+    block_scale = torch.zeros(
+        (experts, rows, columns // 16), dtype=torch.uint8, device=device
+    )
+    tensor_scale = torch.ones(experts, dtype=torch.float32, device=device)
+    assigned = torch.zeros(experts, dtype=torch.bool, device=device)
+
+    for target, fragment in fragments:
+        expert_axis, row_axis, column_axis = target
+        if column_axis.start % 16 or column_axis.stop % 16:
+            raise ValueError("NVFP4 expert fragments must keep K16 blocks")
+        count = expert_axis.stop - expert_axis.start
+        height = row_axis.stop - row_axis.start
+        fields = fragment.repack(scale_layout=ScaleLayout.LINEAR).buffers()
+        packed = slice(column_axis.start // 2, column_axis.stop // 2)
+        blocks = slice(column_axis.start // 16, column_axis.stop // 16)
+        values[expert_axis, row_axis, packed].copy_(
+            fields["values"].reshape(count, height, -1).to(device)
+        )
+        block_scale[expert_axis, row_axis, blocks].copy_(
+            fields["block_scale"].reshape(count, height, -1).to(device)
+        )
+
+        # Every fragment of an expert must carry that expert's tensor scale.
+        incoming = fields["tensor_scale"].to(device).reshape(-1).expand(count)
+        seen = assigned[expert_axis]
+        if seen.any() and not torch.equal(
+            tensor_scale[expert_axis][seen], incoming[seen]
+        ):
+            raise ValueError(
+                "NVFP4 fragments of one expert disagree on their tensor scale"
+            )
+        tensor_scale[expert_axis] = incoming
+        assigned[expert_axis] = True
+
+    return Quantizer("nvfp4").from_tensors(
+        {
+            "values": values,
+            "block_scale": block_scale.reshape(experts * rows, columns // 16),
+            "tensor_scale": tensor_scale,
+        },
+        shape=shape,
+        dtype=dtype,
+    )
+
+
 class _Loader:
     """Own readers and materialization.
 
@@ -303,7 +486,7 @@ class _Loader:
             )
             device = _choice(path, self.devices, self.device)
 
-            if isinstance(module, Linear):
+            if isinstance(module, (Linear, ExpertLinear)):
                 module.input_quantizer = (
                     None if quantization is None else quantization.activation
                 )
@@ -314,7 +497,7 @@ class _Loader:
                 key = id(parameter)
                 quantizer = (
                     quantization.weight
-                    if isinstance(module, Linear)
+                    if isinstance(module, (Linear, ExpertLinear))
                     and name == "weight"
                     and quantization is not None
                     else None
@@ -376,6 +559,15 @@ class _Loader:
             raise ValueError(
                 "checkpoint assignment rectangle exceeds its tensor"
             )
+        # A lower-rank source fills a target rectangle whose extra leading
+        # axes have extent one.
+        extra = len(target) - len(source)
+        if extra < 0 or any(
+            axis.stop - axis.start != 1 for axis in target[:extra]
+        ):
+            raise ValueError(
+                "checkpoint assignment adds only leading unit target axes"
+            )
 
         # A complete logical source narrows to the owner's bound partition;
         # explicit rectangles already address resident storage and pass through.
@@ -412,7 +604,7 @@ class _Loader:
                     for base, part in zip(source, local, strict=True)
                 )
 
-        if region_shape(source) != region_shape(target):
+        if region_shape(source) != region_shape(target)[extra:]:
             raise ValueError(
                 f"checkpoint assignment shape mismatch: "
                 f"{region_shape(source)} to {region_shape(target)}"
@@ -530,7 +722,6 @@ class _Loader:
                 self._used[module_mapping.source].update(
                     _source_names(assignment.source)
                 )
-            self._used[module_mapping.source].update(module_mapping.nonresident)
             self._mapping_assignments.append(assignments)
 
         # A selected capability can share a file with other declared mappings.
@@ -543,9 +734,16 @@ class _Loader:
                     self._used[module_mapping.source].update(
                         _source_names(assignment.source)
                     )
-                self._used[module_mapping.source].update(
-                    module_mapping.nonresident
-                )
+        # Nonresident declarations name logical weights. Their serialized
+        # encodings include scale fields just as resident assignments do;
+        # account for those fields without reading their payloads.
+        for module_mapping in (*self.mappings, *self.excluded):
+            reader = self._readers.get(module_mapping.source)
+            if reader is not None:
+                for name in set(reader.names()) & module_mapping.nonresident:
+                    self._used[module_mapping.source].update(
+                        _source_names(reader.get(name))
+                    )
         reports = self._reports()
         for report in reports:
             if report.missing or report.incomplete:
@@ -616,9 +814,11 @@ class _Loader:
         if preserved:
             dtype = preserved.pop()
 
-        complete = len(assignments) == 1 and self._regions[id(assignments[0])][
-            1
-        ] == _full(parameter.shape)
+        complete = (
+            len(assignments) == 1
+            and self._regions[id(assignments[0])][1] == _full(parameter.shape)
+            and len(self._regions[id(assignments[0])][0]) == parameter.ndim
+        )
         if complete:
             assignment = assignments[0]
             source, _ = self._regions[id(assignment)]
@@ -638,6 +838,33 @@ class _Loader:
                 value = _fp8_fragments(
                     parameter.shape, fragments, device=device, dtype=dtype
                 )
+            elif (
+                parameter.ndim in {2, 3}
+                and quantizer is not None
+                and quantizer.format == "nvfp4"
+                and all(
+                    isinstance(fragment, QuantizedTensor)
+                    and fragment.quantizer.format == "nvfp4"
+                    for _, fragment in fragments
+                )
+            ):
+                value = _nvfp4_fragments(
+                    tuple(parameter.shape),
+                    fragments,
+                    device=device,
+                    dtype=dtype,
+                )
+            elif quantizer is not None and any(
+                isinstance(fragment, QuantizedTensor)
+                for _, fragment in fragments
+            ):
+                # Decoding encoded fragments to re-encode them would replace
+                # the checkpoint's calibrated scales with derived ones.
+                raise ValueError(
+                    f"checkpoint fragments of {owner_path(self, key)} are "
+                    "encoded differently from its configured "
+                    f"{quantizer.format} representation"
+                )
             else:
                 value = torch.empty(
                     tuple(parameter.shape), device=device, dtype=dtype
@@ -645,7 +872,11 @@ class _Loader:
                 for target, fragment in fragments:
                     if isinstance(fragment, QuantizedTensor):
                         fragment = fragment.dequantize(dtype=dtype)
-                    value[target].copy_(fragment.to(device=device, dtype=dtype))
+                    value[target].copy_(
+                        fragment.reshape(region_shape(target)).to(
+                            device=device, dtype=dtype
+                        )
+                    )
 
         if key in self._padding and not isinstance(value, QuantizedTensor):
             value[self._padding[key]].zero_()
@@ -654,19 +885,47 @@ class _Loader:
             quantizer is not None
             and isinstance(value, QuantizedTensor)
             and quantizer.format == value.quantizer.format
-            and quantizer.format in {"fp8", "nvfp4"}
         ):
-            # Serialized FP8 and NVFP4 scales describe the checkpoint's
-            # complete statistical domain. Execution must not derive a
-            # rank-local replacement from already encoded values.
+            # Serialized scales describe the checkpoint's complete statistical
+            # domain. Execution must not derive a rank-local replacement from
+            # already encoded values.
             pass
+        elif quantizer is not None and isinstance(value, QuantizedTensor):
+            raise ValueError(
+                f"checkpoint tensor for {owner_path(self, key)} is "
+                f"{value.quantizer.format}, not the configured "
+                f"{quantizer.format} representation"
+            )
         elif quantizer is not None:
             owner, _ = self._owners[key]
+            if isinstance(owner, ExpertLinear) and quantizer.format != "mxfp8":
+                # Tensor-wide expert encodings require checkpoint statistics
+                # and calibrated activations. MXFP8 instead computes each K32
+                # block independently, and the encoder requires each local
+                # projection width to contain complete K32 blocks.
+                raise ValueError(
+                    f"{owner_path(self, key)} loads dense weights, but "
+                    f"{quantizer.format} experts load only from a checkpoint "
+                    "that stores them encoded with calibrated input scales"
+                )
             value = quantizer.quantize(
-                value, distribution=owner.weight_distribution
+                value,
+                distribution=None
+                if isinstance(owner, ExpertLinear)
+                else owner.weight_distribution,
             )
         elif isinstance(value, QuantizedTensor) and explicit:
             value = value.dequantize(dtype=dtype)
+
+        owner, _ = self._owners[key]
+        if (
+            isinstance(owner, ExpertLinear)
+            and isinstance(value, QuantizedTensor)
+            and value.quantizer.format == "nvfp4"
+        ):
+            # Expert block scales reside in the swizzled layout grouped
+            # expert kernels read; expert row blocks are whole 128-row tiles.
+            value = value.repack(scale_layout=ScaleLayout.SWIZZLED_128X4)
 
         # One resident Parameter object serves every module that shared the
         # original placeholder, preserving alias identity after the swap.
@@ -694,7 +953,7 @@ class _Loader:
         for path, module, name, buffer in buffers:
             if id(module) not in active:
                 continue
-            device = _choice(path, self.devices, self.device)
+            device = _placed(_choice(path, self.devices, self.device))
             if buffer.is_meta:
                 raise RuntimeError(
                     f"derived buffer {path}.{name} was not materialized by "
