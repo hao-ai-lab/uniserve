@@ -52,8 +52,8 @@ pub(crate) struct VideoJob {
     pub completed_at: Option<u64>,
     /// Set with `completed_at`, to `VIDEO_RETENTION` after it.
     pub expires_at: Option<u64>,
-    /// Requested duration in seconds, or the model default when the request
-    /// omits it.
+    /// Requested duration in seconds: the target's, or the length of the
+    /// reference soundtrack that sets it.
     pub seconds: f64,
     /// Duration in seconds of the frames the model generates, `num_frames`
     /// at the model's frame rate. It may exceed `seconds`, since the model
@@ -61,6 +61,8 @@ pub(crate) struct VideoJob {
     pub actual_seconds: f64,
     /// Frames the model generates for the requested duration.
     pub num_frames: u32,
+    /// The generated canvas, `WxH` in pixels.
+    pub size: String,
     pub status: &'static str,
     /// `queued`, then the phases the generation task reports from runtime
     /// events, then `completed` or `failed`.
@@ -68,7 +70,30 @@ pub(crate) struct VideoJob {
     /// Completed inference steps; set to `total_steps` on success.
     pub completed_steps: u32,
     pub total_steps: u32,
+    /// Seconds from scheduling until the runtime reported completion; set
+    /// on a successful finish.
+    pub inference_time_s: Option<f64>,
+    /// Seconds each generation phase lasted; set with `inference_time_s`.
+    pub stage_durations: Option<BTreeMap<String, f64>>,
     pub error: Option<VideoFailure>,
+}
+
+/// Server-observed wall time of one generation and of each of its phases.
+///
+/// A phase starts at its first report and ends where the next phase starts;
+/// the last one ends at completion. `encoding` starts when the engine
+/// schedules the request. Every later phase is the one the engine reports
+/// after a media call completes: `preparing` after the first encoding call,
+/// `denoising` once latent preparation completes, `decoding` once the last
+/// denoising step completes (covering video and audio decoding, their
+/// H.264/AAC encoding and muxing), and `finalizing` (artifact delivery)
+/// once the muxer completes.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GenerationTiming {
+    /// Seconds from scheduling to completion.
+    pub inference_time_s: f64,
+    /// Seconds per phase, keyed by phase name.
+    pub stage_durations: BTreeMap<String, f64>,
 }
 
 /// Failure reported on a `failed` job.
@@ -251,6 +276,7 @@ impl VideoJobs {
         self: &Arc<Self>,
         id: &str,
         result: Result<Arc<SharedMedia>, VideoFailure>,
+        timing: Option<GenerationTiming>,
     ) {
         let mut entries = self.entries();
 
@@ -285,6 +311,10 @@ impl VideoJobs {
                 job.record.status = "completed";
                 job.record.completed_steps = job.record.total_steps;
                 job.record.phase = "completed".to_owned();
+                if let Some(timing) = timing {
+                    job.record.inference_time_s = Some(timing.inference_time_s);
+                    job.record.stage_durations = Some(timing.stage_durations);
+                }
                 job.media = Some(media);
             }
             Err(error) => {
@@ -357,10 +387,13 @@ mod tests {
             seconds: 5.0,
             actual_seconds: 124.0 / 24.0,
             num_frames: 124,
+            size: "1344x768".to_owned(),
             status: "queued",
             phase: "queued".to_owned(),
             completed_steps: 0,
             total_steps: 4,
+            inference_time_s: None,
+            stage_durations: None,
             error: None,
         }
     }
@@ -403,6 +436,7 @@ mod tests {
                 code: "cancelled",
                 message: "cancelled".into(),
             }),
+            None,
         );
         assert!(jobs.get("video-a").is_none());
         assert!(jobs.list().is_empty());
@@ -433,6 +467,7 @@ mod tests {
                 code: "generation_failed",
                 message: "decoder failed".into(),
             }),
+            None,
         );
         let failed = jobs.get("video-0").unwrap();
         assert_eq!(failed.status, "failed");

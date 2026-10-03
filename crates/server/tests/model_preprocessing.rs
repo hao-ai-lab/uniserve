@@ -9,10 +9,15 @@ use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_core::{GenerationLimits, ImageIngestStep};
+use uniserve_engine::VideoDenoiserInfo;
+use uniserve_server::VideoMediaSettings;
+use uniserve_server::openai::VideoGenerationRequest;
 use uniserve_server::profile::assets::ResolvedModelFiles;
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use uniserve_server::profile::{ModelConfig, ModelDescription};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
+use uniserve_server::serving::video::VideoService;
+use uniserve_server::serving::video::plan::VisionConfig;
 use uniserve_server::serving::{InputProcessor, ServeRequestId};
 
 /// Base64 payload of a 1x1 PNG image.
@@ -36,6 +41,61 @@ const SPECIAL_TOKENS: &[&str] = &[
     "<answer>",
     "</answer>",
 ];
+
+/// What a released base denoiser reports in its handshake: text-to-video
+/// over every canvas of the canvas rule, on the 50-point schedule.
+fn base_denoiser() -> VideoDenoiserInfo {
+    VideoDenoiserInfo {
+        tasks: vec!["t2va".to_owned()],
+        schedule_points: 50,
+        video_shift: 12.0,
+        audio_shift: 3.0,
+        canvases: Vec::new(),
+        max_sequence_rows: None,
+        condition_tiles: None,
+    }
+}
+
+/// The video service of `denoiser` with a `max_video_seconds` capacity, the
+/// released checkpoint's Qwen3-VL processor geometry and the default media
+/// policy.
+fn video_service(
+    denoiser: VideoDenoiserInfo,
+    max_video_seconds: f64,
+    tokenizer: &DynTokenizer,
+) -> VideoService {
+    VideoService::new(
+        denoiser,
+        VisionConfig {
+            patch_size: 16,
+            temporal_patch_size: 2,
+            merge_size: 2,
+            image_min_pixels: 65_536,
+            image_max_pixels: 16_777_216,
+            video_min_pixels: 4_096,
+            video_max_pixels: 25_165_824,
+        },
+        max_video_seconds,
+        uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
+        &VideoMediaSettings::default(),
+        Arc::clone(tokenizer),
+    )
+    .unwrap()
+}
+
+/// A t2va request body with `fields` merged over a 5-second 16:9 target.
+fn video_request(fields: serde_json::Value) -> VideoGenerationRequest {
+    let mut body = serde_json::json!({
+        "model": "minimax_h3",
+        "prompt": "exact token sequence",
+        "task": "t2va",
+        "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
+    });
+    body.as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    serde_json::from_value(body).unwrap()
+}
 
 /// Resolves `description` over a synthetic checkpoint with worker limits that
 /// cover every generation feature; see `try_resolved_model`.
@@ -144,14 +204,9 @@ fn try_resolved_model(
     // is built by `ModelConfig::from_pipeline`, here with the server's default
     // 15-second maximum video duration.
     let config = match description {
-        ModelDescription::MiniMaxH3 => ModelConfig::from_pipeline(
-            description.id(),
-            description,
-            15.0,
-            uniserve_server::profile::video::VideoRasters::default(),
-            Some(4096),
-        )
-        .unwrap(),
+        ModelDescription::MiniMaxH3 => {
+            ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096)).unwrap()
+        }
         _ => tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
@@ -164,6 +219,8 @@ fn try_resolved_model(
             ))
             .unwrap(),
     };
+    let video = (description == ModelDescription::MiniMaxH3)
+        .then(|| video_service(base_denoiser(), 15.0, &tokenizer));
     let model = InputProcessor::new(
         config,
         Arc::clone(&tokenizer),
@@ -172,8 +229,8 @@ fn try_resolved_model(
             limits,
             sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 4096,
-            denoise_steps: 4,
         },
+        video,
         true,
     )?;
     Ok((directory, tokenizer, model))
@@ -356,33 +413,35 @@ fn bagel_places_the_input_image_between_surrounding_chat_text() {
     );
 }
 
-#[test]
-fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
+#[tokio::test]
+async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
     let (_directory, tokenizer, model) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let prompt = "exact token sequence";
-    let expected = tokenizer.encode(prompt, false).unwrap();
-    let request = |seconds: f64| {
-        model.preprocess_video_request(
-            &ServeRequestId::new("video"),
-            uniserve_server::openai::VideoGenerationRequest {
-                model: "minimax_h3".to_string(),
-                prompt: prompt.to_string(),
-                seconds: Some(seconds),
-                seed: 17,
-                resolution: None,
-                aspect_ratio: None,
-            },
-        )
+    let id = ServeRequestId::new("video");
+    let prepare = |fields: serde_json::Value| {
+        let request = video_request(fields);
+        let model = &model;
+        let id = &id;
+        async move { model.preprocess_video_request(id, &request).await }
     };
 
-    // The prompt is tokenized without chat framing. Five seconds are 120
-    // frames at 24 fps, which extend upward to the next count of the form
-    // `17n + 5`: 124 frames, decoded as seven 17-frame units plus a tail.
-    let accepted = request(5.0).unwrap();
-    assert_eq!(accepted.prompt_token_ids, expected);
-    assert_eq!(accepted.sampling.seed, 17);
-    assert_eq!(accepted.sampling.num_frames, 124);
-    assert_eq!(accepted.sampling.video_units, 7);
+    // The t2va presentation is the prompt tokenized without chat framing.
+    // The seed defaults to the reference's 42, and the denoiser evaluates
+    // the schedule's 49 intervals. Five seconds are 120 frames at 24 fps,
+    // which extend upward to the next count of the form `17n + 5`: 124
+    // frames, decoded as seven 17-frame units plus a tail.
+    let accepted = prepare(serde_json::json!({})).await.unwrap();
+    assert_eq!(
+        accepted.request.prompt_token_ids,
+        tokenizer.encode("exact token sequence", false).unwrap()
+    );
+    let sampling = accepted.request.sampling;
+    assert_eq!(sampling.seed, 42);
+    assert_eq!(sampling.num_inference_steps, 49);
+    assert_eq!((sampling.num_frames, sampling.video_units), (124, 7));
+    assert_eq!((sampling.width, sampling.height), (1344, 768));
+    assert_eq!(accepted.duration_seconds, 5.0);
+    let seeded = prepare(serde_json::json!({"seed": 17})).await.unwrap();
+    assert_eq!(seeded.request.sampling.seed, 17);
 
     // The admitted interval is [4, 15] seconds inclusive. Fractional
     // durations round half to even before alignment: 5.1875 s is 124.5
@@ -398,75 +457,149 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
         (14.0, 345),
         (15.0, 362),
     ] {
-        let sampling = request(seconds).unwrap().sampling;
+        let target = serde_json::json!({
+            "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": seconds}
+        });
+        let sampling = prepare(target).await.unwrap().request.sampling;
         assert_eq!(sampling.num_frames, frames, "{seconds} s");
         assert_eq!(sampling.video_units, (frames - 5) / 17, "{seconds} s");
     }
 
-    // Rejections: a model name other than the served one, a whitespace-only
-    // prompt, and a duration outside the finite [4, 15] second range.
-    let invalid = |model_name: &str, prompt: &str, seconds| {
-        model
-            .preprocess_video_request(
-                &ServeRequestId::new("video"),
-                uniserve_server::openai::VideoGenerationRequest {
-                    model: model_name.to_string(),
-                    prompt: prompt.to_string(),
-                    seconds: Some(seconds),
-                    seed: 17,
-                    resolution: None,
-                    aspect_ratio: None,
-                },
-            )
-            .unwrap_err()
-    };
+    // The canvas follows the named aspect ratio; `auto` is 16:9.
+    for (ratio, canvas) in [
+        ("auto", (1344, 768)),
+        ("21:9", (1536, 672)),
+        ("4:3", (1024, 768)),
+        ("1:1", (768, 768)),
+        ("3:4", (768, 1024)),
+        ("9:16", (768, 1344)),
+    ] {
+        let target = serde_json::json!({
+            "target": {"short_edge": 768, "aspect_ratio": ratio, "duration_seconds": 5.0}
+        });
+        let prepared = prepare(target).await.unwrap();
+        assert_eq!(
+            (prepared.canvas.width, prepared.canvas.height),
+            canvas,
+            "{ratio}"
+        );
+    }
+
+    // Fields that restate the served contract are accepted when they agree:
+    // the schedule's 50 sigma points and shifts, one output, the lossless
+    // quality, and the SGLang client's duration and canvas.
+    let restated = prepare(serde_json::json!({
+        "num_inference_steps": 50, "flow_shift": 12.0, "audio_flow_shift": 3.0,
+        "num_outputs_per_prompt": 1, "n": 1, "quality": "lossless",
+        "seconds": 5, "size": "1344x768", "width": 1344, "height": 768,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(restated.request, accepted.request);
+
+    // Each disagreement is refused and names its field.
+    for (fields, param) in [
+        (
+            serde_json::json!({"num_inference_steps": 9}),
+            "num_inference_steps",
+        ),
+        (serde_json::json!({"flow_shift": 10.0}), "flow_shift"),
+        (
+            serde_json::json!({"audio_flow_shift": 1.0}),
+            "audio_flow_shift",
+        ),
+        (
+            serde_json::json!({"num_outputs_per_prompt": 2}),
+            "num_outputs_per_prompt",
+        ),
+        (serde_json::json!({"n": 4}), "n"),
+        (serde_json::json!({"quality": "fast"}), "quality"),
+        (serde_json::json!({"seconds": 10}), "seconds"),
+        (serde_json::json!({"size": "768x1344"}), "size"),
+        (serde_json::json!({"width": 768}), "width"),
+        (serde_json::json!({"height": 1344}), "height"),
+        (serde_json::json!({"prompt": "  "}), "prompt"),
+        (serde_json::json!({"task": "fl2va"}), "task"),
+    ] {
+        let error = prepare(fields.clone()).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                uniserve_server::openai::ApiError::InvalidRequest { param: Some(name), .. }
+                    if name == param
+            ),
+            "{fields}: {error:?}"
+        );
+    }
+
+    // The target alone sets the duration and canvas: a t2va request needs a
+    // duration within the finite [4, 15] second range and the 768 short edge.
+    for target in [
+        serde_json::json!({"short_edge": 768, "aspect_ratio": "16:9"}),
+        serde_json::json!({"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 3.99}),
+        serde_json::json!({"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 15.01}),
+        serde_json::json!({"short_edge": 720, "aspect_ratio": "16:9", "duration_seconds": 5.0}),
+        serde_json::json!({"short_edge": 768, "aspect_ratio": "2:1", "duration_seconds": 5.0}),
+    ] {
+        let error = prepare(serde_json::json!({"target": target}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                uniserve_server::openai::ApiError::InvalidRequest { param: Some(name), .. }
+                    if name.starts_with("target.")
+            ),
+            "{target}: {error:?}"
+        );
+    }
+
     assert_eq!(
-        invalid("another-model", prompt, 5.0),
+        prepare(serde_json::json!({"model": "another-model"}))
+            .await
+            .unwrap_err(),
         uniserve_server::openai::ApiError::ModelNotFound {
             model: "another-model".to_string()
         },
     );
-    assert!(matches!(
-        invalid("minimax_h3", "  ", 5.0),
-        uniserve_server::openai::ApiError::InvalidRequest {
-            param: Some("prompt"),
-            ..
-        },
-    ));
-    for seconds in [0.0, -1.0, 1.0, 3.99, 15.01, 16.0, f64::NAN, f64::INFINITY] {
-        assert!(
-            matches!(
-                invalid("minimax_h3", prompt, seconds),
-                uniserve_server::openai::ApiError::InvalidRequest { .. },
-            ),
-            "{seconds} s"
-        );
-    }
 }
 
-/// A deployment capacity below 15 seconds bounds the admitted durations and
-/// is advertised next to the API's own range; a capacity outside [4, 15]
-/// seconds is refused when the model is loaded.
-#[test]
-fn video_duration_capacity_is_a_deployment_limit() {
+/// A FastH3 DMD deployment serves the training buckets its workers prepared,
+/// on the export's own schedule: other canvases are refused, and the
+/// capabilities report the canvases, the short edges and named ratios they
+/// serve, the schedule and the deployment's duration capacity.
+#[tokio::test]
+async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
+    let canvas = |width, height| uniserve_core::Canvas { width, height };
+    // 768p 16:9, then 480p 21:9 and 16:9.
+    let denoiser = VideoDenoiserInfo {
+        tasks: vec!["t2va".to_owned()],
+        schedule_points: 9,
+        video_shift: 10.0,
+        audio_shift: 3.0,
+        canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
+        max_sequence_rows: None,
+        condition_tiles: None,
+    };
     let processor = |max_video_seconds: f64| {
         let mut config = loaded.config().clone();
-        config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
-            max_video_seconds,
-            video_rasters: Default::default(),
-            num_inference_steps: 8,
-        };
+        config.parameters =
+            uniserve_server::profile::ModelParameters::MiniMaxH3 { max_video_seconds };
         InputProcessor::new(
             config,
-            std::sync::Arc::clone(&tokenizer),
+            Arc::clone(&tokenizer),
             None,
             uniserve_server::serving::WorkerCapabilities {
                 limits: runtime_limits(),
                 sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
                 max_model_tokens: 4096,
-                denoise_steps: 8,
             },
+            Some(video_service(
+                denoiser.clone(),
+                max_video_seconds,
+                &tokenizer,
+            )),
             true,
         )
     };
@@ -476,141 +609,116 @@ fn video_duration_capacity_is_a_deployment_limit() {
 
     let model = processor(10.0).unwrap();
     let capabilities = model.video_capabilities();
+    assert_eq!(capabilities["tasks"], serde_json::json!(["t2va"]));
     assert_eq!(capabilities["min_seconds"], 4.0);
     assert_eq!(capabilities["max_seconds"], 10.0);
     assert_eq!(capabilities["model_max_seconds"], 15.0);
     assert_eq!(capabilities["fps"], 24);
-    let id = ServeRequestId::new("capacity");
-    let (seconds, sampling) = model
-        .video_sampling(&id, Some(10.0), 3, None, None)
-        .unwrap();
-    assert_eq!((seconds, sampling.num_frames), (10.0, 243));
-    assert!(
-        model
-            .video_sampling(&id, Some(10.5), 3, None, None)
-            .is_err()
+    assert_eq!(
+        capabilities["canvas"]["canvases"],
+        serde_json::json!([
+            {"width": 1344, "height": 768},
+            {"width": 992, "height": 416},
+            {"width": 832, "height": 480},
+        ])
     );
-}
+    assert_eq!(
+        capabilities["canvas"]["short_edges"],
+        serde_json::json!([768, 480])
+    );
+    assert_eq!(
+        capabilities["canvas"]["aspect_ratios"],
+        serde_json::json!(["21:9", "16:9"])
+    );
+    assert_eq!(
+        capabilities["canvas"]["sizes"],
+        serde_json::json!({
+            "768": {"16:9": {"width": 1344, "height": 768}},
+            "480": {
+                "21:9": {"width": 992, "height": 416},
+                "16:9": {"width": 832, "height": 480},
+            },
+        })
+    );
+    assert_eq!(
+        capabilities["schedule"],
+        serde_json::json!({"num_inference_steps": 9, "flow_shift": 10.0, "audio_flow_shift": 3.0})
+    );
+    assert_eq!(capabilities["max_prompt_tokens"], 4096);
 
-/// A video request picks its output raster by resolution and aspect ratio
-/// from the deployment's provisioned product. The default deployment serves
-/// 768p 16:9 (1344x768, the default) and 9:16; one provisioning every trained
-/// bucket serves each at its trained size, and the capabilities advertise
-/// the product. Unprovisioned rasters are rejected before admission.
-#[test]
-fn video_resolution_and_aspect_ratio_select_the_output_raster() {
-    use uniserve_server::profile::omni::resolution::ResolutionName;
-    use uniserve_server::profile::video::{VIDEO_ASPECT_RATIOS, VideoRasters, VideoResolution};
+    let id = ServeRequestId::new("capacity");
+    let prepared = model
+        .preprocess_video_request(
+            &id,
+            &video_request(serde_json::json!({
+                "target": {"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 10.0}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.request.sampling.num_frames, 243);
+    assert_eq!(prepared.request.sampling.num_inference_steps, 8);
+    assert_eq!(prepared.canvas, canvas(1344, 768));
 
-    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let processor = |video_rasters: VideoRasters| {
-        let mut config = loaded.config().clone();
-        config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
-            max_video_seconds: 15.0,
-            video_rasters,
-            num_inference_steps: 8,
-        };
+    // A 480 short edge names the 480p training bucket of the ratio.
+    let narrow = model
+        .preprocess_video_request(
+            &id,
+            &video_request(serde_json::json!({
+                "target": {"short_edge": 480, "aspect_ratio": "21:9", "duration_seconds": 5.0}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(narrow.canvas, canvas(992, 416));
+    assert_eq!(
+        (
+            narrow.request.sampling.width,
+            narrow.request.sampling.height
+        ),
+        (992, 416)
+    );
+
+    // A duration beyond the capacity, an unprepared bucket at either short
+    // edge, and an unserved short edge are refused.
+    for target in [
+        serde_json::json!({"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 10.5}),
+        serde_json::json!({"short_edge": 768, "aspect_ratio": "9:16", "duration_seconds": 5.0}),
+        serde_json::json!({"short_edge": 768, "aspect_ratio": "21:9", "duration_seconds": 5.0}),
+        serde_json::json!({"short_edge": 480, "aspect_ratio": "1:1", "duration_seconds": 5.0}),
+        serde_json::json!({"short_edge": 720, "aspect_ratio": "16:9", "duration_seconds": 5.0}),
+    ] {
+        assert!(
+            model
+                .preprocess_video_request(
+                    &id,
+                    &video_request(serde_json::json!({"target": target}))
+                )
+                .await
+                .is_err(),
+            "{target}"
+        );
+    }
+
+    // Only a video checkpoint has a video service, and it needs one.
+    let mut config = loaded.config().clone();
+    config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
+        max_video_seconds: 10.0,
+    };
+    assert!(
         InputProcessor::new(
             config,
-            std::sync::Arc::clone(&tokenizer),
+            Arc::clone(&tokenizer),
             None,
             uniserve_server::serving::WorkerCapabilities {
                 limits: runtime_limits(),
-                sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
+                sampling_controls: Vec::new(),
                 max_model_tokens: 4096,
-                denoise_steps: 8,
             },
+            None,
             true,
         )
-        .unwrap()
-    };
-    let request = |model: &InputProcessor, resolution, aspect_ratio| {
-        model.preprocess_video_request(
-            &ServeRequestId::new("video"),
-            uniserve_server::openai::VideoGenerationRequest {
-                model: "minimax_h3".to_string(),
-                prompt: "a lighthouse at dusk".to_string(),
-                seconds: Some(5.0),
-                seed: 17,
-                resolution,
-                aspect_ratio,
-            },
-        )
-    };
-    let raster = |model: &InputProcessor, resolution, aspect_ratio| {
-        let sampling = request(model, resolution, aspect_ratio).unwrap().sampling;
-        // Every raster keeps the requested duration.
-        assert_eq!(sampling.num_frames, 124);
-        (sampling.width, sampling.height)
-    };
-
-    let default = processor(VideoRasters::default());
-    assert_eq!(raster(&default, None, None), (1344, 768));
-    assert_eq!(
-        raster(&default, None, Some(ResolutionName::Portrait9x16)),
-        (768, 1344)
-    );
-    assert!(request(&default, None, Some(ResolutionName::Square)).is_err());
-    assert!(request(&default, Some(VideoResolution::P480), None).is_err());
-    let capabilities = default.video_capabilities();
-    assert_eq!(capabilities["default_resolution"], "768p");
-    assert_eq!(capabilities["default_aspect_ratio"], "16:9");
-    assert_eq!(
-        (
-            capabilities["width"].clone(),
-            capabilities["height"].clone()
-        ),
-        (1344.into(), 768.into())
-    );
-    assert_eq!(capabilities["resolutions"], serde_json::json!(["768p"]));
-    assert_eq!(
-        capabilities["aspect_ratios"],
-        serde_json::json!(["16:9", "9:16"])
-    );
-    assert_eq!(capabilities["sizes"]["768p"]["9:16"]["width"], 768);
-    assert_eq!(capabilities["sizes"]["768p"]["9:16"]["height"], 1344);
-
-    let every = processor(VideoRasters::new(&VideoResolution::ALL, &VIDEO_ASPECT_RATIOS).unwrap());
-    let expected = [
-        (
-            VideoResolution::P768,
-            [
-                (1536, 672),
-                (1344, 768),
-                (1024, 768),
-                (768, 768),
-                (768, 1024),
-                (768, 1344),
-            ],
-        ),
-        (
-            VideoResolution::P480,
-            [
-                (992, 416),
-                (832, 480),
-                (640, 480),
-                (480, 480),
-                (480, 640),
-                (480, 832),
-            ],
-        ),
-    ];
-    for (resolution, sizes) in expected {
-        for (aspect_ratio, size) in VIDEO_ASPECT_RATIOS.into_iter().zip(sizes) {
-            assert_eq!(raster(&every, Some(resolution), Some(aspect_ratio)), size);
-            let advertised =
-                &every.video_capabilities()["sizes"][resolution.as_str()][aspect_ratio.as_str()];
-            assert_eq!(
-                (advertised["width"].clone(), advertised["height"].clone()),
-                (size.0.into(), size.1.into())
-            );
-        }
-    }
-    // The first configured resolution and aspect ratio are the defaults.
-    assert_eq!(raster(&every, None, None), (1536, 672));
-    assert_eq!(
-        raster(&every, Some(VideoResolution::P480), None),
-        (992, 416)
+        .is_err()
     );
 }
 
@@ -633,8 +741,8 @@ fn worker_context_capacity_limits_preprocessed_requests() {
             limits: runtime_limits(),
             sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 8,
-            denoise_steps: 0,
         },
+        None,
         true,
     )
     .unwrap();
@@ -927,50 +1035,4 @@ fn sampling_controls_have_the_same_meaning_across_token_models() {
             assert!(model.preprocess_text_request(input).is_err());
         }
     }
-}
-
-/// An omitted duration resolves to the default advertised by
-/// `video_capabilities` (the lesser of 5 seconds and the configured maximum,
-/// here 4.5 seconds) and yields the same sampling as requesting it explicitly.
-#[test]
-fn omitted_video_duration_uses_the_advertised_model_default() {
-    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let mut config = loaded.config().clone();
-    config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
-        max_video_seconds: 4.5,
-        video_rasters: Default::default(),
-        num_inference_steps: 4,
-    };
-    let model = InputProcessor::new(
-        config,
-        tokenizer,
-        None,
-        uniserve_server::serving::WorkerCapabilities {
-            limits: runtime_limits(),
-            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
-            max_model_tokens: 4096,
-            denoise_steps: 4,
-        },
-        true,
-    )
-    .unwrap();
-
-    let input: uniserve_server::openai::VideoGenerationRequest =
-        serde_json::from_value(serde_json::json!({
-            "model": "minimax_h3", "prompt": "a river"
-        }))
-        .unwrap();
-    assert_eq!(model.video_capabilities()["default_seconds"], 4.5);
-    let id = ServeRequestId::new("duration");
-    let implicit = model.preprocess_video_request(&id, input.clone()).unwrap();
-    let explicit = model
-        .preprocess_video_request(
-            &id,
-            uniserve_server::openai::VideoGenerationRequest {
-                seconds: Some(4.5),
-                ..input
-            },
-        )
-        .unwrap();
-    assert_eq!(implicit.sampling, explicit.sampling);
 }

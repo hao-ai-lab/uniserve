@@ -22,6 +22,8 @@ use crate::engine_client::EngineClient;
 use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::test_support::configured_tokenizer;
+use crate::serving::video::VideoService;
+use crate::serving::video::plan::VisionConfig;
 use crate::serving::{InputProcessor, ServedSamplingControl, ServingRuntime, WorkerCapabilities};
 
 /// Served model name the simulated state answers to.
@@ -32,8 +34,9 @@ pub(crate) const SERVED_MODEL: &str = "sim-model";
 ///
 /// The tokenizer is `serving::test_support::configured_tokenizer`, whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
-/// renders only the first message's content. A MiniMax H3 model runs four
-/// denoising steps on a diffusion runtime, as a video deployment does.
+/// renders only the first message's content. A MiniMax H3 model runs on a
+/// diffusion runtime with the video service of a four-step text-to-video
+/// denoiser (`sim_video_service`), as a video deployment does.
 pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
     let mut config = EngineConfig::sim(SERVED_MODEL);
     if matches!(parameters, ModelParameters::MiniMaxH3 { .. }) {
@@ -49,6 +52,12 @@ pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
         ChatTemplateContentFormatOption::String,
     )
     .unwrap();
+    let video = match &parameters {
+        ModelParameters::MiniMaxH3 { max_video_seconds } => {
+            Some(sim_video_service(*max_video_seconds))
+        }
+        _ => None,
+    };
     let processor = InputProcessor::new(
         ModelConfig {
             served_name: SERVED_MODEL.to_string(),
@@ -64,13 +73,44 @@ pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
             limits: client.generation_limits(),
             sampling_controls: ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 4096,
-            denoise_steps: 4,
         },
+        video,
         false,
     )
     .unwrap();
 
     AppState::new(ServingRuntime::new(processor, client, false))
+}
+
+/// The video service of a four-step text-to-video denoiser that generates
+/// every canvas of the canvas rule, with the released checkpoint's vision
+/// processor geometry and the default media policy.
+pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
+    VideoService::new(
+        uniserve_engine::VideoDenoiserInfo {
+            tasks: vec!["t2va".to_owned()],
+            schedule_points: 5,
+            video_shift: 12.0,
+            audio_shift: 3.0,
+            canvases: Vec::new(),
+            max_sequence_rows: None,
+            condition_tiles: None,
+        },
+        VisionConfig {
+            patch_size: 16,
+            temporal_patch_size: 2,
+            merge_size: 2,
+            image_min_pixels: 65_536,
+            image_max_pixels: 16_777_216,
+            video_min_pixels: 4_096,
+            video_max_pixels: 25_165_824,
+        },
+        max_video_seconds,
+        crate::EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
+        &crate::VideoMediaSettings::default(),
+        configured_tokenizer(),
+    )
+    .unwrap()
 }
 
 /// Sends `request` through `router` and returns the status, the headers, and

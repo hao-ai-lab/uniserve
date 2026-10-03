@@ -56,7 +56,7 @@ target/release/uniserve-dynamo-worker \
   --max-running-requests 2 --quantization-config '{"mode":"quality"}'
 ```
 
-The placement uses four-way Ulysses denoising and TP4 text encoding, distributes temporal decoder units across the GPUs, and starts four host video encoders plus a host muxer. Weights remain resident; the quality configuration retains BF16 text encoding and denoising with the configured FP16 VAE projections.
+The placement uses four-way Ulysses denoising and TP4 text encoding, distributes temporal decoder units across the GPUs, and starts four host video codec ranks plus a host muxer. Weights remain resident; the quality configuration retains BF16 text encoding and denoising with the configured FP16 VAE projections.
 
 This single-host setup uses file discovery; requests travel over Dynamo's default TCP request plane. Both processes must share the discovery directory, `/tmp/dynamo_store_kv` by default, and the same namespace.
 
@@ -100,6 +100,8 @@ PY
 ```
 
 Open `artifacts/dynamo/video.mp4` to play the generated video and soundtrack. FastH3 aligns the requested duration to its temporal layout, so the resulting clip can be slightly longer than requested.
+
+`size` selects one of the canvases the worker serves: those its `--video-resolutions` and `--video-aspect-ratios` prepare, as for `uniserve serve` (1344x768 and 768x1344 by default). Without `size` the worker generates the first of them. A client may instead name the canvas with top-level `resolution` (`768p` or `480p`) and `aspect_ratio` fields, which the frontend forwards to the worker; a `size` that disagrees with them is refused.
 
 The checkpoint determines the denoising schedule. `nvext.num_inference_steps` is optional; if supplied, it must match the checkpoint's eight steps. This integration supports text-to-video requests with completed responses; image input, streaming and guidance overrides are unsupported. Use `b64_json` to retrieve the MP4 directly, as above.
 
