@@ -69,6 +69,10 @@ uniserve serve "$OMNIREF_EXPORT" \
   --media-directory /srv/media
 ```
 
+### Two hosts
+
+`configs/minimax_h3/ulysses8-two-node.json` places the root's `denoiser` across two four-GPU hosts named `rank-0` and `rank-1`: eight-way Ulysses denoising, TP8 text encoding, and the VAE units distributed over all eight GPUs. Start the head on `rank-0` with `--host-identity rank-0` and the t2va or fl2va options above, then start `uniserve-host` on `rank-1` with `rank-0`'s address and the port the head logs, as the [FastH3 guide](../fast_h3/fast_h3.md#two-hosts) describes. The measured two-host deployment runs eagerly (`--graph-policy off`).
+
 ### Capacity options
 
 | Option | Meaning |
@@ -151,6 +155,10 @@ A reference request names its references in order; the prompt refers to them by 
 
 Unknown fields are refused, at every level. `GET /v1/capabilities` reports the served tasks, their condition rules, the canvases, the schedule, the duration and prompt limits, the condition capacity and the media policy.
 
+## Precision
+
+The default `--quantization-config`, `{"mode":"quality"}`, serves the checkpoint's own BF16 transformers and FP16 video decoder, the lossless path. The base checkpoint also accepts the `balanced`, `performance` and `maximum` presets and the per-component overrides the [FastH3 guide](../fast_h3/fast_h3.md#precision-and-graphs) lists; they quantize the video decoder (`balanced`), the denoiser MLPs (`performance`, `maximum`) and the text encoder (`maximum`), and need Blackwell. On W1 with four GB200s they take 36.2 s, 34.1 s and 33.0 s against `quality`'s 36.4 s (diagnostic runs, eight requests each). They are lossy: `balanced` changes only the decoded frames (34.6 dB PSNR against `quality` at the same seed), and the presets that quantize the denoiser change the generated sample itself, so their outputs diverge from `quality`'s; no quality acceptance has been established for them.
+
 ## Numerical behavior
 
 The base DiTs evaluate their block epilogues (modulation, gated residuals, rotary Q/K and SwiGLU gating) the way the diffusers reference does, rounding to BF16 after each operation; OmniRef follows FastVideo's eager arithmetic, which rounds the same way. Seeded draws follow each checkpoint's reference: a request draws its condition noise, then its video and audio noise, on the CPU from its seed. The Python library computes what a server computes on the same placement: given the server's capacity layout (`minimax_h3.generation.generate(..., layout=...)`), a single-GPU library generation equals a single-GPU server's.
@@ -190,6 +198,16 @@ Median latency in seconds on one four-GB200 host, every measured request valid:
 | FastH3 OmniRef, W5 | 19.52 | | | 35.94 |
 | FastH3 V2, W1 | 5.91 | | | |
 | FastH3 V2, W2 | 20.67 | | | |
+
+Median latency in seconds across two four-GB200 hosts (`gb200-8` and `sglang-gb200-8` suites; start `uniserve-host` on `rank-1` as in [Two hosts](#two-hosts), and SGLang's node rank 1 on `rank-1` with its head's command and `--node-rank 1`; `UNISERVE_MINIMAX_H3_HEAD_ADDRESS` names `rank-0`'s address):
+
+| Base checkpoint, workload | UniServe | SGLang |
+| --- | ---: | ---: |
+| W1 | 18.83 | 23.45 |
+| W2 | 104.13 | 116.35 |
+| W3 | 40.20 | 46.29 |
+
+UniServe serves `ulysses8-two-node.json` there, eagerly. SGLang runs its GB200 two-host cookbook recipe, Ulysses 4 within a host and ring attention of degree 2 across them, which selects FlashAttention. vLLM-Omni's diffusion worker cannot span hosts.
 
 UniServe serves `ulysses4.json` (W1 to W3) and `ulysses4-reference.json` (W4, W5) with the options in the profile. The baselines run their best lossless configuration measured on this hardware: SGLang its GB200 cookbook recipe (Ulysses 4, resident, cuDNN attention, eager); vLLM-Omni its four-GPU recipe (Ulysses 4, VAE patch parallelism 4, regional compile, TRTLLM attention), with the text encoder sharded over the four GPUs for reference requests; FastVideo the OmniRef export with every component resident. None runs a lossy path. The comparison differs from identical work in these disclosed ways:
 - vLLM-Omni keeps W4's 2560×1440 reference image at that size, 3,600 condition rows, where the other systems scale it to a 2048-pixel short edge, 7,296 rows, so its W4 does less work.
