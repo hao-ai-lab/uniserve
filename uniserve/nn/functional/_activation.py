@@ -1,8 +1,10 @@
 """Gated activations over packed or separate value and gate channels.
 
-Bias, activation and multiplication accumulate in FP32 before one rounding.
-Eligible CUDA calls use UniServe's kernels; every other call evaluates the
-same formula with tensor operations.
+Bias, activation and multiplication accumulate in FP32 before one rounding;
+``silu_and_mul`` also evaluates the ``Rounding.STEPWISE`` recipe, which
+rounds the activated gate before the product. Eligible CUDA calls use
+UniServe's kernels; every other call evaluates the same formula with tensor
+operations.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from torch.nn import functional as F
 
 from uniserve.quantization import QuantizedTensor
 
-from ._tensors import result
+from ._tensors import Rounding, result
 
 
 def _row_fp8(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -28,19 +30,38 @@ def _row_fp8(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return buffers["values"].reshape(values.shape), buffers["scale"]
 
 
+def _gated_silu(gate, value, rounding) -> torch.Tensor:
+    """Return FP32 ``silu(gate) * value`` under ``rounding``.
+
+    Stepwise rounding rounds the activated gate and the product to the
+    input dtype, so the FP32 result holds an activation-dtype value.
+    """
+    activated = F.silu(gate.float())
+    if rounding is Rounding.ONCE:
+        return activated * value.float()
+    activated = activated.to(gate.dtype).float()
+    return (activated * value.float()).to(gate.dtype).float()
+
+
 def silu_and_mul(
-    x: torch.Tensor, *, out: torch.Tensor | None = None
+    x: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    rounding: Rounding = Rounding.ONCE,
 ) -> torch.Tensor:
     """Apply SiLU to the first channel half and multiply by the second.
 
     ``x`` packs ``[gate, value]`` along its final axis. A row-scaled FP8
     ``QuantizedTensor`` output receives the encoded activation directly.
+    ``rounding`` selects whether the activated gate rounds to ``x.dtype``
+    before the product.
     """
     from uniserve_kernels import activation
 
     if x.ndim < 1 or x.shape[-1] % 2 or x.shape[-1] == 0:
         raise ValueError("gating requires equal channel halves")
     shape = (*x.shape[:-1], x.shape[-1] // 2)
+    stepwise = rounding is Rounding.STEPWISE
 
     if isinstance(out, QuantizedTensor):
         from uniserve.quantization import Quantizer
@@ -49,7 +70,7 @@ def silu_and_mul(
             raise ValueError("fused SiLU output requires row-scaled FP8")
         if x.ndim != 2:
             gate, value = x.chunk(2, dim=-1)
-            activated = F.silu(gate.float()) * value.float()
+            activated = _gated_silu(gate, value, rounding)
             # Axis zero of a higher-rank tensor retains that axis alone; it
             # must not silently become one separate scale per flattened row.
             encoded = out.quantizer.quantize(activated)
@@ -62,10 +83,10 @@ def silu_and_mul(
             scales = torch.empty(
                 (x.shape[0], 1), dtype=torch.float32, device=x.device
             )
-            activation.silu_and_mul_fp8(x, values, scales)
+            activation.silu_and_mul_fp8(x, values, scales, stepwise=stepwise)
         else:
             gate, value = x.chunk(2, dim=-1)
-            values, scales = _row_fp8(F.silu(gate.float()) * value.float())
+            values, scales = _row_fp8(_gated_silu(gate, value, rounding))
         encoded = out.quantizer.from_tensors(
             {"values": values, "scale": scales},
             shape=tuple(values.shape),
@@ -79,10 +100,10 @@ def silu_and_mul(
             if out is None or not out.is_contiguous()
             else out
         )
-        activation.silu_and_mul(x, target)
+        activation.silu_and_mul(x, target, stepwise=stepwise)
         return target if out is None else result(target, out)
     gate, value = x.chunk(2, dim=-1)
-    return result((F.silu(gate.float()) * value.float()).to(x.dtype), out)
+    return result(_gated_silu(gate, value, rounding).to(x.dtype), out)
 
 
 def gelu_and_mul(
