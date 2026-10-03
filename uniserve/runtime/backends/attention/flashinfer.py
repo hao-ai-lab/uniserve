@@ -779,6 +779,8 @@ class _FlashInfer(_Operator):
 
 
 class Backend(_Backend):
+    device_causality = True
+
     name = "flashinfer"
 
     operator_class = _FlashInfer

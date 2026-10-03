@@ -168,6 +168,70 @@ def test_device_lengths_drive_current_attention_values(
                 graph.close()
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] != 10,
+    reason="TensorRT-LLM attention requires an SM100 GPU",
+)
+@torch.inference_mode()
+def test_replay_binding_still_rejects_inputs_outside_the_captured_contract():
+    # Two layers read each of two cache tables through a provider whose
+    # kernels read every length on the device, so a replay's binding only
+    # checks the batch; those checks still guard every table.
+    device, dtype = "cuda:0", torch.bfloat16
+    names = ("a", "b", "c", "d")
+    module = nn.ModuleDict(
+        {
+            name: Attention(4, 2, 64 if name in "ab" else 128, cache_name=name)
+            for name in names
+        }
+    )
+    config = Config(
+        {
+            name: mha.Config(2, 64 if name in "ab" else 128, (0, 1), dtype)
+            for name in names
+        }
+    )
+    with (
+        PrefixCache(config, num_units=8, block_size=16, device=device) as cache,
+        ExecutionContext(module, cache=cache, attention="trtllm") as context,
+    ):
+        context.prepare(TextSize(5, 2))
+        tables = sorted({cache.table(name) for name in names})
+        assert len(tables) == 2
+
+        def batch(counts, scale=1):
+            # Each table pages at its group's page size; ``scale`` breaks
+            # that contract for the second table alone.
+            entries = {}
+            for number, table in enumerate(tables):
+                pages = cache.groups[cache.tables[table].group].page_tokens
+                paged = PagedInput.from_blocks(
+                    blocks=((1 + 2 * number,), (2 + 2 * number,)),
+                    query_lengths=counts,
+                    prefix_lengths=(0, 0),
+                    block_size=pages * (scale if number else 1),
+                    causal=True,
+                    device=device,
+                )
+                entries[table] = paged
+            first = entries[tables[0]]
+            entries = {
+                table: replace(
+                    entry, queries=first.queries, prefixes=first.prefixes
+                )
+                for table, entry in entries.items()
+            }
+            return AttentionBatch(entries, first.queries)
+
+        context.bind_attention(batch((2, 3)), replay=True)
+        with pytest.raises(ValueError, match="prepared token"):
+            context.bind_attention(batch((3, 3)), replay=True)
+        with pytest.raises(ValueError, match="block sizes differ"):
+            context.bind_attention(batch((2, 3), scale=2), replay=True)
+
+
 class _SelfAttention(nn.Module):
     def __init__(self, device="cpu", dtype=torch.float32):
         super().__init__()

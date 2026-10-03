@@ -4,10 +4,10 @@
 holds the stages of a round that contains numerical work. Per diffusion step
 offset, ``prepare_diffusion_step`` stages each open trajectory's guidance
 branches (running any missing branch prefixes first),
-``prepare_forward_rows`` builds the round's token, encoder, denoiser and
-image-decoder rows, ``forward_values`` runs them through
+``prepare_forward_rows`` builds the round's token, canvas, encoder, denoiser
+and image-decoder rows, ``forward_values`` runs them through
 ``ModelExecutor.forward``, ``publish_forward_values`` turns the values into
-samples, features, images or retained denoiser predictions, and
+samples, readouts, features, images or retained denoiser predictions, and
 ``integrate_predictions`` advances each solver and finishes a trajectory at
 its last step.
 
@@ -31,7 +31,7 @@ import torch
 from uniserve.diffusion import Branch
 from uniserve.tensors import OutputLayout
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import calls
+from uniserve_worker.execution import calls, canvas
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.output import PendingOutput, capture_samples
@@ -430,7 +430,8 @@ def prepare_forward_rows(
     Returns ``(index, row)`` pairs for the forward and the prepared encoder
     images by index. Only open trajectories run after the first step offset;
     every other call builds its row at offset 0. A trajectory contributes one
-    denoiser row per guidance branch, so an index can appear more than once.
+    denoiser row per guidance branch and a token-denoising call one row per
+    canvas, so an index can appear more than once.
     An image-decoding call without a latent input finishes here without a
     forward (``image.diffusion_finalize_frames``), and rows whose call
     finished during preparation are dropped from the result.
@@ -471,22 +472,55 @@ def prepare_forward_rows(
                 device=model_runner.call_devices(call)[1],
             )
             forward.extend((index, task) for task in rows)
+        elif (
+            call.kind is ForwardMode.TOKEN_DENOISING and call.canvas is not None
+        ):
+            forward.append(
+                (
+                    index,
+                    canvas.prepare_step(
+                        call,
+                        state=state,
+                        request_tables=request_tables,
+                        canvas_slots=model_runner.canvas_slots,
+                    ),
+                )
+            )
+        elif call.kind is ForwardMode.TOKEN_DENOISING:
+            forward.extend(
+                (index, task)
+                for task in canvas.prepare_rows(
+                    call, request_tables=request_tables, state=state
+                )
+            )
         elif isinstance(call.kind, ForwardMode):
             build_started = time.perf_counter_ns()
-            task = token.prepare_forward(
-                call,
-                tensor_store=tensor_store,
-                request_tables=request_tables,
-                model_runner=model_runner,
-                decode_state=decode_state,
-                state=state,
+            rows = (
+                token.prepare_context(
+                    call,
+                    tensor_store=tensor_store,
+                    request_tables=request_tables,
+                    model_runner=model_runner,
+                    state=state,
+                )
+                if token.writes_context(call)
+                else (
+                    token.prepare_forward(
+                        call,
+                        tensor_store=tensor_store,
+                        request_tables=request_tables,
+                        model_runner=model_runner,
+                        decode_state=decode_state,
+                        state=state,
+                    ),
+                )
             )
             record_component(
                 state.component_us,
                 "text_build_batch",
                 build_started,
             )
-            forward.append((index, task))
+            forward.extend((index, task) for task in rows)
         elif call.kind in {
             MediaCall.VISION_ENCODING,
             MediaCall.LATENT_ENCODING,
@@ -570,8 +604,11 @@ def publish_forward_values(
 
     Dispatches each forward value by its call: denoiser predictions are
     collected per trajectory index and returned for
-    ``integrate_predictions``; sequence rows become sampling candidates (or
-    finish directly when ``token.prepare_sampling`` returns an outcome);
+    ``integrate_predictions``; canvas readouts are collected per call and
+    published by ``canvas.publish``, and a batch's canvas steps together
+    by ``canvas.publish_steps``; sequence rows become sampling
+    candidates (or finish directly when ``token.prepare_sampling`` returns an
+    outcome);
     encoder values publish features; image-decoder values publish images.
     All sampling candidates are then sampled and published together.
 
@@ -582,6 +619,12 @@ def publish_forward_values(
     from uniserve_worker.execution import image, token
 
     predictions: dict[int, list[torch.Tensor]] = defaultdict(list)
+    readouts: dict[int, list[torch.Tensor]] = defaultdict(list)
+    contexts: dict[int, list[tuple[TokenRow, torch.Tensor, torch.Tensor]]] = (
+        defaultdict(list)
+    )
+    # Canvas steps publish together, in row order, as one block.
+    steps: list[tuple[int, torch.Tensor]] = []
     samples: list[SampleCandidate] = []
 
     for (index, task), numerical_result in zip(forward, values, strict=True):
@@ -592,6 +635,18 @@ def publish_forward_values(
         value, sampling_index, graph_sample, layout = numerical_result
         if index in trajectories:
             predictions[index].append(value)
+        elif (
+            call.kind is ForwardMode.TOKEN_DENOISING and call.canvas is not None
+        ):
+            steps.append((index, value))
+        elif call.kind is ForwardMode.TOKEN_DENOISING:
+            # Canvas rows of one call arrive in row order.
+            readouts[index].append(value)
+        elif token.writes_context(call):
+            # Commit a context once all its text and vision rows are ready.
+            # Publishing a row alone would hide the remaining segments.
+            assert isinstance(task, TokenRow)
+            contexts[index].append((task, value, sampling_index))
         elif isinstance(call.kind, ForwardMode):
             # A sequence call's row comes from token.prepare_forward.
             assert isinstance(task, (TokenRow, DiffusionRow))
@@ -648,6 +703,37 @@ def publish_forward_values(
                 tensor_store=tensor_store,
                 state=state,
             )
+
+    for index, rows in contexts.items():
+        selection = token.finish_context(
+            scheduled[index],
+            tuple(rows),
+            request_tables=request_tables,
+            decode_state=decode_state,
+            state=state,
+        )
+        if isinstance(selection, PendingOutput):
+            outcomes[index] = selection
+        else:
+            task, value, sampling = selection
+            samples.append((index, task, value, sampling, None))
+
+    stepped = canvas.publish_steps(
+        tuple((scheduled[index], value) for index, value in steps),
+        request_tables=request_tables,
+        state=state,
+        tensor_store=tensor_store,
+    )
+    for (index, _value), outcome in zip(steps, stepped, strict=True):
+        outcomes[index] = outcome
+
+    for index, rows in readouts.items():
+        outcomes[index] = canvas.publish(
+            scheduled[index],
+            rows,
+            request_tables=request_tables,
+            state=state,
+        )
 
     _publish_samples(
         samples,

@@ -719,7 +719,6 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
     store = TensorStore(
         capacity=1,
         byte_capacity=16,
-        entry_capacity=1,
         max_entry_bytes=reference.max_bytes,
         devices=(device,),
         buffer_pool=arena,

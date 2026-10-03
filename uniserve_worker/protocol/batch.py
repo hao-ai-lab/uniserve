@@ -21,6 +21,7 @@ through its constructor or `Batch.from_mapping`, both of which run
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -32,6 +33,7 @@ from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import call, identity, tensor, transfer
 from uniserve_worker.protocol.validation import (
     _bool,
+    _float,
     _map,
     _nonnegative,
     _seq,
@@ -188,6 +190,87 @@ def command_to_mapping(command: BatchCommand) -> dict[str, object]:
 
 
 @dataclass(frozen=True, slots=True)
+class CanvasSampling:
+    """Block-diffusion sampling of a request that generates in canvases.
+
+    A block of ``canvas_length`` tokens starts as random tokens and is
+    denoised for at most ``max_steps`` steps: each samples every position at
+    a temperature falling linearly from ``t_max`` to ``t_min``, accepts the
+    lowest-entropy samples within ``entropy_bound`` nats and renoises the
+    rest. A block stops early once its argmax canvas has held for
+    ``stability_threshold`` steps and its mean entropy is below
+    ``confidence_threshold`` nats. Draws follow the admitted sampling seed.
+    """
+
+    canvas_length: int
+    max_steps: int
+    entropy_bound: float
+    t_min: float
+    t_max: float
+    confidence_threshold: float
+    stability_threshold: int
+
+    def __post_init__(self) -> None:
+        """Require positive lengths and finite sampling values.
+
+        The sampler (``uniserve.diffusion.canvas.CanvasSampling``) checks
+        the values' domain when the worker runs the canvas.
+        """
+        if self.canvas_length < 1 or self.max_steps < 1:
+            raise invalid_descriptor(
+                "a canvas requires a positive length and step limit"
+            )
+        if not all(
+            math.isfinite(value)
+            for value in (
+                self.entropy_bound,
+                self.t_min,
+                self.t_max,
+                self.confidence_threshold,
+            )
+        ):
+            raise invalid_descriptor("canvas sampling values are not finite")
+        _nonnegative(self.stability_threshold, "canvas stability threshold")
+
+    @classmethod
+    def from_mapping(
+        cls, value: object, where: str = "canvas sampling"
+    ) -> CanvasSampling:
+        """Parse block-diffusion sampling parameters."""
+        data = _map(value, where)
+        return cls(
+            canvas_length=_uint(
+                data.get("canvas_length"), f"{where}.canvas_length"
+            ),
+            max_steps=_uint(data.get("max_steps"), f"{where}.max_steps"),
+            entropy_bound=_float(
+                data.get("entropy_bound"), f"{where}.entropy_bound"
+            ),
+            t_min=_float(data.get("t_min"), f"{where}.t_min"),
+            t_max=_float(data.get("t_max"), f"{where}.t_max"),
+            confidence_threshold=_float(
+                data.get("confidence_threshold"),
+                f"{where}.confidence_threshold",
+            ),
+            stability_threshold=_uint(
+                data.get("stability_threshold"), f"{where}.stability_threshold"
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Serialize block-diffusion sampling parameters."""
+        return {
+            "canvas_length": self.canvas_length,
+            "max_steps": self.max_steps,
+            "entropy_bound": self.entropy_bound,
+            "t_min": self.t_min,
+            "t_max": self.t_max,
+            "confidence_threshold": self.confidence_threshold,
+            "stability_threshold": self.stability_threshold,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class GenerationParams:
     """Sampling policy and token controls for autoregressive execution.
 
@@ -205,6 +288,8 @@ class GenerationParams:
     # prefix-cache hit, and `RequestPool.start` begins the request with this
     # many tokens visible and computed.
     initial_position: int = 0
+    # Block-diffusion sampling of a request generating in canvases.
+    canvas: CanvasSampling | None = None
 
     def __post_init__(self) -> None:
         """Require a nonnegative initial position and canonical stop tokens.
@@ -247,6 +332,11 @@ class GenerationParams:
             initial_position=_uint(
                 data.get("initial_position", 0), f"{where}.initial_position"
             ),
+            canvas=None
+            if data.get("canvas") is None
+            else CanvasSampling.from_mapping(
+                data.get("canvas"), f"{where}.canvas"
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -256,6 +346,7 @@ class GenerationParams:
             "negative_token_ids": list(self.negative_token_ids),
             "finish_token_ids": list(self.finish_token_ids),
             "initial_position": self.initial_position,
+            "canvas": None if self.canvas is None else self.canvas.to_mapping(),
         }
 
 

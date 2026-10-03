@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
-use uniserve_worker_ipc::{ForwardMode, MediaCall};
+use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall};
 
 use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
@@ -59,7 +59,6 @@ fn ctrl() -> SpecialTokenIds {
 #[test]
 fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     use uniserve_core::GenerationFeatures;
-    use uniserve_worker_ipc::CallKind;
 
     let image_path = vec![
         CallKind::Media(MediaCall::LatentPreparation),
@@ -240,6 +239,8 @@ fn generation_request(
         priority: 0,
         cache,
         image_generation: policy,
+        readout: Vec::new(),
+        canvas: None,
     };
     request
         .validate_resources(&limits)
@@ -594,6 +595,103 @@ fn scheduler_clamps_max_batch_to_worker_info() {
     let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
 
     assert_eq!(sched.config().max_batch, 3);
+}
+
+/// Serves eight concurrent eight-token generations on a simulator whose
+/// workers report `prefill` and `decode` call bounds (zero for none), and
+/// returns the call count of every prefill batch and every decode batch the
+/// scheduler submitted, after checking that every request finished.
+fn forward_batch_calls(prefill: u32, decode: u32) -> (Vec<usize>, Vec<usize>) {
+    let mut sim = SimEngine::new();
+    sim.mut_info_for_test().max_prefill_calls = prefill;
+    sim.mut_info_for_test().max_decode_calls = decode;
+    let mut executor = SimExecutor::new(sim);
+    let dispatched = executor.observe();
+    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let mut receivers = (1..=8u64)
+        .map(|id| {
+            handle
+                .submit(generation_request(
+                    RequestId(id),
+                    text_input(vec![1, 2, 3, 4, 5]),
+                    SamplingParams::default(),
+                    ImageParams::default(),
+                    GenerationConstraint::UndOnly,
+                    16,
+                ))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut finished = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while finished < receivers.len() && Instant::now() < deadline {
+        for receiver in &mut receivers {
+            while let Ok(event) = receiver.try_recv() {
+                if let EngineCoreOutput::Finished { reason, .. } = event {
+                    assert_ne!(reason, FinishReason::Error);
+                    finished += 1;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.shutdown();
+    let _ = jh.join();
+    assert_eq!(finished, receivers.len(), "every request finishes");
+
+    let (mut prefill_calls, mut decode_calls) = (Vec::new(), Vec::new());
+    for event in dispatched.try_iter() {
+        let BatchEvent::Submitted(batch) = event else {
+            continue;
+        };
+        match batch.requests.first().map(|(call, _)| call.code) {
+            Some(CallKind::Forward(ForwardMode::Prefill)) => {
+                prefill_calls.push(batch.requests.len())
+            }
+            Some(CallKind::Forward(ForwardMode::Decode)) => decode_calls.push(batch.requests.len()),
+            _ => {}
+        }
+    }
+    (prefill_calls, decode_calls)
+}
+
+/// Prefill batches hold at most the calls the workers' captured prefill
+/// graphs hold, while decode batches keep the worker's call bound: eight
+/// concurrent prompts prefill three at a time and still all finish, and their
+/// decode steps share batches wider than three.
+#[test]
+fn prefill_batches_hold_at_most_the_calls_prefill_graphs_hold() {
+    let (prefill_calls, decode_calls) = forward_batch_calls(3, 0);
+    assert!(
+        prefill_calls.iter().all(|&calls| calls <= 3),
+        "prefill batches {prefill_calls:?}"
+    );
+    assert_eq!(prefill_calls.iter().sum::<usize>(), 8);
+    assert!(
+        decode_calls.iter().any(|&calls| calls > 3),
+        "decode batches {decode_calls:?}"
+    );
+}
+
+/// Decode batches hold at most the calls the workers' captured decode graphs
+/// hold, while prefill batches keep the worker's call bound: eight concurrent
+/// generations decode three at a time and still all finish, and their
+/// prompts share batches wider than three.
+#[test]
+fn decode_batches_hold_at_most_the_calls_decode_graphs_hold() {
+    let (prefill_calls, decode_calls) = forward_batch_calls(0, 3);
+    assert!(
+        !decode_calls.is_empty() && decode_calls.iter().all(|&calls| calls <= 3),
+        "decode batches {decode_calls:?}"
+    );
+    assert!(
+        prefill_calls.iter().any(|&calls| calls > 3),
+        "prefill batches {prefill_calls:?}"
+    );
 }
 
 /// Single-worker results must be identical regardless of queue depth:
@@ -1134,12 +1232,20 @@ fn hybrid_groups_share_one_unit_pool() {
         "reused {reused} tokens"
     );
 
+    // A finished request's units retire until its workers acknowledge the
+    // queued finish, so the pool drains while the engine keeps running, not
+    // at the moment `Finished` is observed; shutdown would abort that ack.
+    let num_units = stats.kv_cache.num_units.load(Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut free_units = stats.kv_cache.free_units.load(Ordering::Relaxed);
+    while free_units != num_units && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+        free_units = stats.kv_cache.free_units.load(Ordering::Relaxed);
+    }
+    assert_eq!(free_units, num_units, "units did not return to the pool");
+
     handle.shutdown();
     let _ = jh.join();
-    assert_eq!(
-        stats.kv_cache.free_units.load(Ordering::Relaxed),
-        stats.kv_cache.num_units.load(Ordering::Relaxed)
-    );
 
     // Every declared table covers whole pages of its group from its start
     // page; the sliding group's tables move their start and never hold more
@@ -1174,65 +1280,70 @@ fn hybrid_groups_share_one_unit_pool() {
     assert!(retired, "the sliding group never retired a page");
 }
 
-/// Two sequential requests with the same prompt: the first publishes its full
-/// prompt blocks to the prefix cache, and the second reuses them.
+/// Deployment policy controls prefix reuse without changing generated tokens.
+/// Both requests ask to read and write prefixes; the disabled deployment must
+/// override that permission while preserving each request's active KV state.
 #[test]
-fn prefix_cache_reuses_shared_prompt() {
-    use std::sync::atomic::Ordering;
-    let mut sim = SimEngine::new();
-    sim.set_text_len(4);
-    let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
-    let stats = sched.stats_handle();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
+fn prefix_cache_configuration_controls_reuse() {
+    use uniserve_engine::{EngineConfig, EngineCore};
 
-    // 600 tokens span 9 full 64-token pages plus a partial page; the
-    // assertions below are lower bounds.
     let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
+    let mut outputs = Vec::new();
+    for enabled in [true, false] {
+        let mut sim = SimEngine::new();
+        sim.set_text_len(4);
+        let config = EngineConfig {
+            prefix_cache: enabled,
+            ..EngineConfig::sim("sim-model")
+        };
+        let engine = EngineCore::with_executor(config, Box::new(SimExecutor::new(sim))).unwrap();
+        let stats = engine.stats();
+        let mut replies = Vec::new();
 
-    let run_one = |rid: u64, handle: &EngineHandle| {
-        let mut erx = handle
-            .submit(generation_request(
-                RequestId(rid),
-                text_input(prompt.clone()),
-                SamplingParams::default(),
-                ImageParams::default(),
-                GenerationConstraint::UndOnly,
-                8,
-            ))
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut done = false;
-        while !done && Instant::now() < deadline {
-            match erx.try_recv() {
-                Ok(EngineCoreOutput::Finished { .. }) => done = true,
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(1)),
+        // The second request can reuse nine full pages from the first when
+        // caching is enabled. Page tails still require ordinary prefill.
+        for rid in 1..=2 {
+            let mut events = engine
+                .submit(uniserve_core::Request::Umm(generation_request(
+                    RequestId(rid),
+                    text_input(prompt.clone()),
+                    SamplingParams::default(),
+                    ImageParams::default(),
+                    GenerationConstraint::UndOnly,
+                    8,
+                )))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut tokens = Vec::new();
+            let mut finish = None;
+            while finish.is_none() && Instant::now() < deadline {
+                match events.try_recv() {
+                    Ok(EngineCoreOutput::TextToken { id, .. }) => tokens.push(id),
+                    Ok(EngineCoreOutput::Finished { reason, .. }) => finish = Some(reason),
+                    Ok(_) => {}
+                    Err(_) => thread::sleep(Duration::from_millis(1)),
+                }
             }
+            assert_eq!(finish, Some(FinishReason::Eos));
+            assert!(!tokens.is_empty());
+            replies.push(tokens);
         }
-        assert!(done, "req {rid} did not finish");
-    };
 
-    // Cold: req1 populates the prefix cache.
-    run_one(1, &handle);
-    assert!(
-        stats.kv_cache.pages_stored.load(Ordering::Relaxed) >= 2,
-        "req1 should cache >= 2 full prompt pages"
-    );
-    let hits_before = stats.prefix.hit_tokens.load(Ordering::Relaxed);
-
-    // Warm: req2 (same prompt) reuses the cached prefix.
-    run_one(2, &handle);
-    let hits_after = stats.prefix.hit_tokens.load(Ordering::Relaxed);
-    assert!(
-        hits_after - hits_before >= 512,
-        "req2 should reuse >= 512 cached prefix tokens (before={hits_before} after={hits_after})"
-    );
-
-    handle.shutdown();
-    let _ = jh.join();
+        let hits = stats.prefix.hit_tokens.load(Ordering::Relaxed);
+        if enabled {
+            assert!(hits >= 512, "the shared prompt did not reuse cached KV");
+        } else {
+            assert_eq!(hits, 0, "disabled prefix caching still reused KV");
+            assert_eq!(
+                stats.kv_cache.pages_stored.load(Ordering::Relaxed),
+                0,
+                "disabled prefix caching retained reusable pages"
+            );
+        }
+        outputs.push(replies);
+        engine.shutdown();
+    }
+    assert_eq!(outputs[0], outputs[1]);
 }
 
 /// Per-request `CachePolicy` governs prefix reuse: isolation keys partition the
@@ -1716,6 +1827,97 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     assert!(
         stats.encoder.cached.load(Ordering::Relaxed) >= 1,
         "input image was not encoded and retained in the encoder cache"
+    );
+}
+
+/// An input image with a latent encoder writes its latent block with a call
+/// of its own, which ends the context prefill before it; its vision block
+/// then joins the next context prefill, with the prompt tokens after it.
+#[test]
+fn a_latent_image_block_is_written_by_its_own_call() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(2);
+    let mut executor = SimExecutor::new(sim);
+    let boundary = executor.observe();
+    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let mut request = generation_request(
+        RequestId(95),
+        image_input(vec![1, 2], vec![3, 4], 0x95, 4, 5),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        4,
+    );
+    request.multimodal_inputs.images[0].encoders = vec![
+        ImageEncoderInput {
+            encoder: ImageIngestStep::VaeEncode,
+            num_kv_tokens: Some(6),
+            max_kv_tokens: None,
+        },
+        ImageEncoderInput {
+            encoder: ImageIngestStep::VitEncode,
+            num_kv_tokens: Some(5),
+            max_kv_tokens: None,
+        },
+    ];
+    let mut events = handle.submit(request).expect("submit request");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut finished = false;
+    while !finished && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(EngineCoreOutput::Finished { reason, .. }) => {
+                assert_ne!(reason, FinishReason::Error);
+                finished = true;
+            }
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = jh.join();
+    assert!(finished, "the latent-image request did not finish");
+
+    let calls: Vec<Call> = boundary
+        .try_iter()
+        .filter_map(|event| match event {
+            BatchEvent::Submitted(batch) => Some(batch),
+            BatchEvent::Resolved { .. } => None,
+        })
+        .flat_map(|batch| batch.requests.into_iter().map(|(call, _)| call))
+        .filter(|call| call.request_key.request_id == RequestId(95))
+        .collect();
+    let context: Vec<_> = calls
+        .iter()
+        .take_while(|call| call.code != CallKind::Forward(ForwardMode::Decode))
+        .collect();
+    assert_eq!(
+        context.iter().map(|call| call.code).collect::<Vec<_>>(),
+        vec![
+            CallKind::Forward(ForwardMode::Prefill),
+            CallKind::Media(MediaCall::LatentEncoding),
+            CallKind::Forward(ForwardMode::Prefill),
+            CallKind::Media(MediaCall::VisionEncoding),
+            CallKind::Forward(ForwardMode::Prefill),
+        ]
+    );
+    // The prompt before the image, alone.
+    assert_eq!(context[0].input_token_ids, vec![1, 2]);
+    assert!(context[0].vision_inputs.is_empty());
+    // The latent block's own extension.
+    assert_eq!(context[2].latent_feature_input, context[1].encoder_output);
+    assert!(context[2].input_token_ids.is_empty());
+    assert!(context[2].vision_inputs.is_empty());
+    // The vision block at the start of the context prefill that follows.
+    assert_eq!(context[4].input_token_ids, vec![3, 4]);
+    assert_eq!(context[4].vision_inputs.len(), 1);
+    assert_eq!(context[4].vision_inputs[0].offset, 0);
+    assert_eq!(
+        Some(context[4].vision_inputs[0].feature.clone()),
+        context[3].encoder_output
     );
 }
 

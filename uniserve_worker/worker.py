@@ -100,6 +100,10 @@ from uniserve_worker.protocol.worker_info import (
 from uniserve_worker.service import Service
 from uniserve_worker.storage.block_tables import BlockTables
 from uniserve_worker.storage.buffer_pool import BufferPool
+from uniserve_worker.storage.canvas_slots import (
+    CanvasSlots,
+    generating_denoiser,
+)
 from uniserve_worker.storage.decode_state import DecodeState
 from uniserve_worker.storage.kv_cache import KVCacheManager
 from uniserve_worker.storage.latent_pool import LatentPool
@@ -195,6 +199,13 @@ class Worker:
                 device=config.execution.device,
                 backend=config.distributed_backend,
                 rendezvous=config.rendezvous,
+                experts=None
+                if config.expert_parallel is None
+                else (
+                    config.expert_parallel.rank,
+                    config.expert_parallel.size,
+                    config.expert_parallel.rendezvous,
+                ),
             )
         except ValueError as error:
             # Public numerical resources report ordinary argument errors;
@@ -217,6 +228,7 @@ class Worker:
                 source=source,
                 description=description,
                 declarations=declarations,
+                experts=distributed.experts,
             )
 
             # Sampling broadcasts selected tokens over the `tp` group of the
@@ -634,7 +646,6 @@ class Worker:
             self.tensor_store = TensorStore(
                 capacity=arena.tensor_store,
                 byte_capacity=arena.device_product_bytes,
-                entry_capacity=int(info.encoder_cache_entries),
                 max_entry_bytes=max(1, int(info.encoder_entry_bytes)),
                 devices=owner_devices,
                 request_capacity=int(info.request_slots),
@@ -708,13 +719,35 @@ class Worker:
                     decode_predicates=self.decode_state.predicates,
                     max_calls=int(info.max_batch_calls),
                     request_slots=int(info.request_slots),
-                    max_tokens=int(info.max_batch_tokens),
                     latent_capacity_units=int(info.latent_capacity_units),
                     table_widths=graph_table_widths(
                         model, worker_config, self.kv_cache
                     ),
                     max_inflight=int(queue_depth),
                 )
+
+            # A rank whose token denoiser generates the deployment's canvases
+            # keeps every request slot's canvas resident between its steps.
+            self.canvas_slots = None
+            canvas_runner = runner.canvas_runner if owns_kv else None
+            denoiser = (
+                None
+                if canvas_runner is None
+                or worker_config.canvas_sampling is None
+                else generating_denoiser(canvas_runner.model)
+            )
+            if denoiser is not None:
+                assert canvas_runner is not None
+                assert worker_config.canvas_sampling is not None
+                self.canvas_slots = CanvasSlots.for_denoiser(
+                    denoiser,
+                    request_pool_size=int(info.request_slots),
+                    max_rows=canvas_runner.max_canvases,
+                    sampling=worker_config.canvas_sampling,
+                    device=canvas_runner.device,
+                )
+                startup.callback(self.canvas_slots.close)
+                runner.bind_canvas_slots(self.canvas_slots)
 
             # Only the muxer member that publishes the component's host
             # products (`WorkerInfo.output_rank`) holds a `MediaMux`; it

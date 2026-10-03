@@ -35,8 +35,8 @@ SOCKET_BIND_INTERFACE = "0.0.0.0"
 SOCKET_CHANNEL = "tcp"
 
 try:
+    from uniserve_worker._uniserve_ipc import DEBUG_BUILD, service_name
     from uniserve_worker._uniserve_ipc import Server as WorkerIpcEndpoint
-    from uniserve_worker._uniserve_ipc import service_name
 except (
     ImportError
 ) as exc:  # pragma: no cover - depends on the installed native extension.
@@ -44,6 +44,16 @@ except (
         "_uniserve_ipc is not installed; reinstall the package "
         "(pip install -e .) to build it."
     ) from exc
+
+# Every call and result crosses the IPC extension, so an unoptimized build
+# turns into host overhead on the serving path; a worker never runs one.
+if DEBUG_BUILD:  # pragma: no cover - depends on the installed native extension.
+    raise ImportError(
+        "_uniserve_ipc is a debug build; install a release build "
+        "(pip install -e ., or cargo build --release -p uniserve-ipc-py and "
+        "copy target/release/lib_uniserve_ipc.so to "
+        "uniserve_worker/_uniserve_ipc.<abi>.so)."
+    )
 
 
 def endpoint_name(config: WorkerProcessArgs) -> str:

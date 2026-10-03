@@ -98,6 +98,9 @@ struct RequestTypes {
     call_coordinates: Py<PyAny>,
     rng: Py<PyAny>,
     sampling_state: Py<PyAny>,
+    readout: Py<PyAny>,
+    canvas_step: Py<PyAny>,
+    vision_input: Py<PyAny>,
     block_table: Py<PyAny>,
     cache_unit_allocation: Py<PyAny>,
     start: Py<PyAny>,
@@ -155,6 +158,7 @@ impl RequestTypes {
         records.insert("BufferAllocation", class(&module, "BufferAllocation")?);
         records.insert("NewRequest", class(&module, "NewRequest")?);
         records.insert("GenerationParams", class(&module, "GenerationParams")?);
+        records.insert("CanvasSampling", class(&module, "CanvasSampling")?);
         records.insert("DiffusionParams", class(&module, "DiffusionParams")?);
         records.insert("TensorPublication", class(&module, "TensorPublication")?);
         let module = py.import("uniserve_worker.protocol.video")?;
@@ -211,6 +215,9 @@ impl RequestTypes {
             call_coordinates: class(&call, "CallCoordinates")?,
             rng: class(&call, "Rng")?,
             sampling_state: class(&call, "SamplingState")?,
+            readout: class(&call, "Readout")?,
+            canvas_step: class(&call, "CanvasStep")?,
+            vision_input: class(&call, "VisionInput")?,
             block_table: class(&batch, "BlockTable")?,
             cache_unit_allocation: class(&batch, "CacheUnitAllocation")?,
             start: class(&batch, "Start")?,
@@ -489,6 +496,38 @@ impl<'py> RequestConversion<'py> {
                 ))
             })
             .transpose()?;
+        let readout = call
+            .readout
+            .as_ref()
+            .map(|readout| {
+                self.types.readout.bind(py).call1((
+                    pyo3::types::PyTuple::new(py, &readout.slot_tokens)?,
+                    pyo3::types::PyTuple::new(py, &readout.candidate_offsets)?,
+                    pyo3::types::PyTuple::new(py, &readout.candidate_ids)?,
+                ))
+            })
+            .transpose()?;
+        let vision_inputs = call
+            .vision_inputs
+            .iter()
+            .map(|input| {
+                let feature = self.tensor_ref(&input.feature)?;
+                self.types
+                    .vision_input
+                    .bind(py)
+                    .call1((input.offset, feature))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let canvas = call
+            .canvas
+            .as_ref()
+            .map(|canvas| {
+                self.types
+                    .canvas_step
+                    .bind(py)
+                    .call1((canvas.block, canvas.step))
+            })
+            .transpose()?;
         let arguments = pyo3::types::PyTuple::new(
             py,
             [
@@ -510,11 +549,7 @@ impl<'py> RequestConversion<'py> {
                     .map(|tensor| self.tensor_ref(tensor))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                call.vision_input
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
+                pyo3::types::PyTuple::new(py, vision_inputs)?.into_any(),
                 call.latent_feature_input
                     .as_ref()
                     .map(|tensor| self.tensor_ref(tensor))
@@ -574,6 +609,12 @@ impl<'py> RequestConversion<'py> {
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
                 pyo3::types::PyTuple::new(py, &call.consumer_slots)?.into_any(),
+                readout
+                    .map(Bound::into_any)
+                    .unwrap_or_else(|| py.None().into_bound(py)),
+                canvas
+                    .map(Bound::into_any)
+                    .unwrap_or_else(|| py.None().into_bound(py)),
             ],
         )?;
         self.types.call.bind(py).call1(arguments)
@@ -975,7 +1016,36 @@ fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound
         u32_tuple(py, &ar.finish_token_ids)?,
     )?;
     dict.set_item(intern!(py, "initial_position"), ar.initial_position)?;
+    dict.set_item(
+        intern!(py, "canvas"),
+        ar.canvas
+            .as_ref()
+            .map(|canvas| canvas_sampling_to_py(py, canvas))
+            .transpose()?,
+    )?;
     construct(py, "GenerationParams", &dict)
+}
+
+/// Converts block-diffusion sampling parameters into the worker's record.
+fn canvas_sampling_to_py<'py>(
+    py: Python<'py>,
+    canvas: &uniserve_worker_ipc::CanvasSampling,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "canvas_length"), canvas.canvas_length)?;
+    dict.set_item(intern!(py, "max_steps"), canvas.max_steps)?;
+    dict.set_item(intern!(py, "entropy_bound"), canvas.entropy_bound)?;
+    dict.set_item(intern!(py, "t_min"), canvas.t_min)?;
+    dict.set_item(intern!(py, "t_max"), canvas.t_max)?;
+    dict.set_item(
+        intern!(py, "confidence_threshold"),
+        canvas.confidence_threshold,
+    )?;
+    dict.set_item(
+        intern!(py, "stability_threshold"),
+        canvas.stability_threshold,
+    )?;
+    construct(py, "CanvasSampling", &dict)
 }
 
 /// Converts diffusion admission parameters and resolved media geometry.
@@ -1583,6 +1653,11 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
             .ok()?
             .map(|position| token_logprobs_from_py(&position.ok()?))
             .collect::<Option<Vec<_>>>()?,
+        candidate_logprobs: get(dict, intern!(py, "candidate_logprobs"))?
+            .try_iter()
+            .ok()?
+            .map(|value| value.ok()?.extract::<f32>().ok())
+            .collect::<Option<Vec<_>>>()?,
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
         call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
         status,
@@ -2166,9 +2241,9 @@ mod tests {
     /// One submission per computation.
     ///
     /// A batch carries one computation through one component, so the native
-    /// conversion is exercised with a token call, a media call and a KV
-    /// transfer in three batches (batch ids 11, 12, and 13 under message ids
-    /// 9, 10, and 11) rather than one mixed submission.
+    /// conversion is exercised with a token call, a media call, a KV
+    /// transfer and a token-denoising readout in four batches (batch ids 11
+    /// to 14 under message ids 9 to 12) rather than one mixed submission.
     fn execute_requests() -> Vec<WorkerRequest> {
         let request_key = RequestKey::new(1, RequestId(2), 1);
         let admission = NewRequest::new(
@@ -2183,6 +2258,7 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
+                canvas: None,
             }),
             None,
             2,
@@ -2201,7 +2277,7 @@ mod tests {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
             token_output: Some(token),
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -2215,6 +2291,8 @@ mod tests {
             kv_input: None,
             kv_output: None,
             input_token_ids: vec![7, 8],
+            readout: None,
+            canvas: None,
             sampling_state: Some(uniserve_worker_ipc::SamplingState {
                 allowed_token_ids: Some(Vec::new()),
                 suppressed_token_ids: vec![3, 9],
@@ -2281,7 +2359,7 @@ mod tests {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
             token_output: None,
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -2295,6 +2373,8 @@ mod tests {
             kv_input: None,
             kv_output: None,
             input_token_ids: Vec::new(),
+            readout: None,
+            canvas: None,
             sampling_state: None,
             request_key: media_key,
             call_id: CallId::new(12, 0),
@@ -2330,7 +2410,7 @@ mod tests {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
             token_output: None,
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -2356,11 +2436,40 @@ mod tests {
             }),
             input_image: None,
             input_token_ids: Vec::new(),
+            readout: None,
+            canvas: None,
             sampling_state: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
             rng: None,
+        };
+        // A token-denoising readout of two canvas rows of two tokens over a
+        // request that already holds its prompt.
+        let readout_key = RequestKey::new(1, RequestId(5), 1);
+        let readout_call = Call {
+            request_key: readout_key,
+            call_id: CallId::new(14, 0),
+            code: CallKind::Forward(ForwardMode::TokenDenoising),
+            input_token_ids: vec![4, 9, 4, 1],
+            readout: Some(uniserve_worker_ipc::Readout {
+                slot_tokens: vec![0, 2],
+                candidate_offsets: vec![0, 2, 3],
+                candidate_ids: vec![31, 32, 33],
+            }),
+            bounds: Bounds {
+                max_tokens: 4,
+                ..Bounds::default()
+            },
+            token_output: None,
+            sampling_state: None,
+            ..kv_call.clone()
+        };
+        let readout_call = Call {
+            kv_input: None,
+            kv_output: None,
+            component: "model".into(),
+            ..readout_call
         };
         let mut token_batch = Batch::new(11, vec![admission], vec![call]);
         token_batch.block_tables = block_tables;
@@ -2373,7 +2482,16 @@ mod tests {
         let mut kv_batch = Batch::new(13, Vec::new(), vec![kv_call]);
         kv_batch.kv_inputs = vec![kv_publication(kv_source)];
 
-        [token_batch, media_batch, kv_batch]
+        let mut readout_batch = Batch::new(14, Vec::new(), vec![readout_call]);
+        readout_batch.forward = uniserve_worker_ipc::ForwardBatch {
+            call_indices: vec![0, 0],
+            request_pool_indices: vec![5, 5],
+            seq_lens: vec![9, 9],
+            query_lens: vec![2, 2],
+            write_kv: vec![false, false],
+        };
+
+        [token_batch, media_batch, kv_batch, readout_batch]
             .into_iter()
             .enumerate()
             .map(|(index, batch)| {
@@ -2418,6 +2536,7 @@ mod tests {
                 num_completed_steps: 0,
                 kv_computed_len: 2,
                 committed_tokens: vec![42],
+                candidate_logprobs: Vec::new(),
                 finish_flags: FinishFlags::default(),
                 media_output: None,
                 kv_output: None,
@@ -2445,15 +2564,27 @@ mod tests {
             output_index: 0,
             generation: 4,
         }));
+        // A readout completion reports its candidates' log-probabilities.
+        let mut readout = result.completions[0].clone();
+        readout.request_key = RequestKey::new(1, RequestId(5), 1);
+        readout.call_id = CallId::new(13, 2);
+        readout.code = CallKind::Forward(ForwardMode::TokenDenoising);
+        readout.committed_tokens.clear();
+        readout.sampled_logprob = None;
+        readout.top_logprobs.clear();
+        readout.prompt_logprobs.clear();
+        readout.product_generations.clear();
+        readout.candidate_logprobs = vec![-0.5, -2.25, -9.0];
         result.completions.push(publication);
+        result.completions.push(readout);
         response.set_call_id(Some(11));
         response
     }
 
     /// A minimal result for a batch whose values this test does not inspect.
     ///
-    /// Its message id maps batch ids 11 and 12 to the message ids 9 and 10
-    /// that `execute_requests` assigned.
+    /// Its message id maps batch ids 11, 12 and 14 to the message ids 9, 10
+    /// and 12 that `execute_requests` assigned.
     fn acknowledgement(py: Python<'_>, batch_id: u64) -> Bound<'_, PyAny> {
         let mut response = WorkerResponse::result(BatchOutput {
             batch_id,
@@ -2466,7 +2597,7 @@ mod tests {
         pythonize(py, &response).unwrap()
     }
 
-    /// Drives the three submit requests through a real `PyServer` and back.
+    /// Drives the four submit requests through a real `PyServer` and back.
     ///
     /// Each natively constructed batch must equal what the Python codec
     /// decodes from its own mapping, and the reply to the KV batch must decode
@@ -2499,8 +2630,9 @@ mod tests {
         let expected = result_response();
 
         Python::attach(|py| {
-            // Import both packages from this source tree; the kernel package
-            // keeps its modules below its own src directory.
+            // Import `uniserve_worker` and the `uniserve_kernels` package it
+            // loads from this repository's source tree; the kernels package
+            // keeps its modules under `uniserve_kernels/src`.
             let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
                 .canonicalize()
@@ -2635,6 +2767,34 @@ mod tests {
                             .respond(py, &acknowledgement(py, batch.batch_id))
                             .unwrap();
                     }
+                    // The readout call carries its canvas rows and slots.
+                    3 => {
+                        assert_eq!(
+                            call.getattr("input_token_ids")
+                                .unwrap()
+                                .extract::<Vec<u32>>()
+                                .unwrap(),
+                            vec![4, 9, 4, 1]
+                        );
+                        let readout = call.getattr("readout").unwrap();
+                        for (field, expected) in [
+                            ("slot_tokens", vec![0, 2]),
+                            ("candidate_offsets", vec![0, 2, 3]),
+                            ("candidate_ids", vec![31, 32, 33]),
+                        ] {
+                            assert_eq!(
+                                readout
+                                    .getattr(field)
+                                    .unwrap()
+                                    .extract::<Vec<u32>>()
+                                    .unwrap(),
+                                expected
+                            );
+                        }
+                        server
+                            .respond(py, &acknowledgement(py, batch.batch_id))
+                            .unwrap();
+                    }
                     // The KV install call reads the batch's imported
                     // publication; the reply relays its tensors back in a
                     // KV-publish completion.
@@ -2692,7 +2852,7 @@ mod tests {
         });
 
         let response = client
-            .recv_response_timeout(pending.last().unwrap(), Duration::from_secs(5))
+            .recv_response_timeout(&pending[2], Duration::from_secs(5))
             .unwrap()
             .expect("native result response");
         assert_eq!(response.decode_response().unwrap(), expected);

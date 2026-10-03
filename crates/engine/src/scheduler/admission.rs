@@ -54,6 +54,39 @@ impl Scheduler {
             });
             return;
         }
+        // A canvas pass holds whole rows, so every readout row must fit one
+        // scheduling step's token budget.
+        if let Some(row) = req
+            .readout
+            .iter()
+            .find(|row| row.token_ids.len() > self.config.max_num_batched_tokens)
+        {
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
+                message: format!(
+                    "a {}-token readout canvas exceeds the {}-token step budget",
+                    row.token_ids.len(),
+                    self.config.max_num_batched_tokens
+                ),
+            });
+            return;
+        }
+        // A canvas step and a block commit each spend a whole canvas of one
+        // scheduling step's token budget.
+        if let Some(canvas) = req
+            .canvas
+            .as_ref()
+            .filter(|canvas| canvas.canvas_length as usize > self.config.max_num_batched_tokens)
+        {
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
+                message: format!(
+                    "a {}-token generation canvas exceeds the {}-token step budget",
+                    canvas.canvas_length, self.config.max_num_batched_tokens
+                ),
+            });
+            return;
+        }
         if let Some(feature) = self.missing_required_feature(&req) {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 kind: RejectionKind::Invalid,
@@ -104,13 +137,15 @@ impl Scheduler {
             latest_token: None,
             speculative_chain_invalidated: false,
             // Every request starts in prefill. A request with context images
-            // prefills the text up to each image position, then encodes that
-            // image into the marker gap before continuing.
+            // encodes each image's blocks ahead of the context prefill that
+            // writes them into their marker gap with the text around them; a
+            // latent block is written by a call of its own.
             phase: Phase::Prefill,
             num_computed_prompt_tokens: 0,
             num_ingested_images: 0,
             image_encoder_index: 0,
             input_image_features: None,
+            context_features: Vec::new(),
             round_closing: false,
             logical_position: 0,
             kv_visible_len: 0,
@@ -140,9 +175,15 @@ impl Scheduler {
             replayable: true,
             encoder_cache_pins: Vec::new(),
             transient_encoder_products: Vec::new(),
+            readout_rows: 0,
+            readout_logprobs: Vec::with_capacity(req.readout_candidates()),
+            canvas_block: 0,
+            canvas_step: 0,
+            canvas_commit: Vec::new(),
             output: RequestOutput::new(event_tx),
             queued_at: now(),
             terminal_intent: super::TerminalIntent::None,
+            failure: None,
             req,
         };
         self.next_request_epoch = self.next_request_epoch.saturating_add(1);
@@ -684,15 +725,9 @@ impl Scheduler {
         &self,
         request: &GenerationRequest,
     ) -> Option<uniserve_core::GenerationFeatures> {
-        let context_steps = request
-            .multimodal_inputs
-            .images
-            .iter()
-            .flat_map(|image| image.encoders.iter().map(|input| input.encoder));
-        let needs = request
-            .image_generation
-            .required_features(request.constraint, context_steps);
-        self.generation_limits.covers(needs).err()
+        self.generation_limits
+            .covers(request.required_features())
+            .err()
     }
 
     /// Returns whether the worker tracks image-latent capacity.

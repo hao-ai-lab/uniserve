@@ -592,6 +592,10 @@ fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_store_u32, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_load_u32, m)?)?;
+    // Whether this extension was compiled with debug assertions, which an
+    // unoptimized (debug-profile) build has. The worker refuses to serve with
+    // such a build, since every call crosses this module.
+    m.add("DEBUG_BUILD", cfg!(debug_assertions))?;
     Ok(())
 }
 

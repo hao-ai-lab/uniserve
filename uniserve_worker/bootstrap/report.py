@@ -76,6 +76,7 @@ from uniserve_worker.config.execution import (
     graph_storage_budget_bytes,
 )
 from uniserve_worker.errors import unsupported_setup
+from uniserve_worker.model_executor.canvas_runner import canvas_staging_rows
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.model_executor.input_buffers import (
     TokenBufferConfig,
@@ -94,6 +95,10 @@ from uniserve_worker.protocol.worker_info import (
 )
 from uniserve_worker.storage.block_tables import BlockTables, GroupShape
 from uniserve_worker.storage.cache_imports import cache_transfer_workspace_bytes
+from uniserve_worker.storage.canvas_slots import (
+    CanvasSlots,
+    generating_denoiser,
+)
 from uniserve_worker.storage.decode_state import DecodeState
 
 __all__ = [
@@ -297,6 +302,12 @@ def build_worker_layout(
         fabric_handles=_exports_fabric_handles(worker_config.device),
         max_batch_calls=max_calls,
         max_batch_tokens=max_tokens,
+        max_prefill_calls=min(layout.info.max_prefill_calls, max_calls)
+        if layout.info.max_prefill_calls
+        else 0,
+        max_decode_calls=min(layout.info.max_decode_calls, max_calls)
+        if layout.info.max_decode_calls
+        else 0,
         components=tuple(
             ComponentInfo(name, entry, outputs.get(name, ()))
             for name, entry in components
@@ -381,9 +392,16 @@ def _token_worker_layout(
     )
 
     capacity = None
+    # Zero leaves prefill and decode calls bounded by the batch call bound
+    # alone, as when they run eagerly; captured graphs lower them below.
+    max_prefill_calls = max_decode_calls = 0
+    prefills_on_cuda = decodes_on_cuda = False
     unresolved_window = call_window(
         int(queue_depth), int(worker_config.max_batch_calls)
     )
+    # The scheduler's encoder cache retains up to ``encoder_cache_entries``
+    # features and places the next image's feature before it evicts the
+    # least recently used one, so the pool holds one feature beyond them.
     buffer_pool_bytes = (encoder_cache_entries + 1) * max(
         max_latent_feature_bytes, max_vision_feature_bytes
     )
@@ -446,11 +464,10 @@ def _token_worker_layout(
             and planes is not None
             and input_config is not None
         )
-        from uniserve_worker.config.execution import (
-            DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
-        )
         from uniserve_worker.model_executor.graph_inputs import (
-            select_prefill_captures,
+            decode_captures,
+            prefill_captures,
+            prefill_rows,
         )
         from uniserve_worker.protocol.call import ForwardMode, MediaCall
 
@@ -458,6 +475,11 @@ def _token_worker_layout(
         # this rank owns and each lane serving it, including the prefill row
         # widening for captured graphs. The worker-wide row and token bounds
         # are used here, so the reservation covers lanes with narrower bounds.
+        # The rows those prefill graphs hold bound every prefill call the
+        # engine forms.
+        max_rows = min(
+            worker_config.max_batch_calls, worker_config.max_request_pool_size
+        )
         staged = buffered_kinds(diffusion=flow is not None)
         for name, calls in describe_components(model).items():
             placement = None if bindings is None else bindings.get(name)
@@ -484,16 +506,27 @@ def _token_worker_layout(
                     if not selected:
                         continue
                     fields = input_config
-                    if ForwardMode.PREFILL in selected:
-                        captures = select_prefill_captures(
-                            worker_config.prefill_graph_token_sizes,
-                            DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
-                            max_rows=min(
-                                worker_config.max_batch_calls,
-                                worker_config.max_request_pool_size,
-                            ),
-                            max_tokens=input_config.max_tokens,
-                            visual=flow is not None,
+                    decodes_on_cuda |= (
+                        ForwardMode.DECODE in selected
+                        and torch.device(target).type == "cuda"
+                    )
+                    prefills_on_cuda |= (
+                        ForwardMode.PREFILL in selected
+                        and torch.device(target).type == "cuda"
+                    )
+                    if (
+                        ForwardMode.PREFILL in selected
+                        and torch.device(target).type == "cuda"
+                    ):
+                        captures = prefill_captures(
+                            worker_config,
+                            max_rows=max_rows,
+                            max_tokens=input_config.max_text_tokens,
+                            image_builder=flow is not None,
+                            feature_injection=image_processor is not None
+                            and image_processor.feature_injection is not None,
+                            # Mask variants share the same storage bounds.
+                            device_causality=True,
                         )
                         fields = (
                             replace(
@@ -506,11 +539,42 @@ def _token_worker_layout(
                             if captures
                             else fields
                         )
+                    elif (
+                        ForwardMode.TOKEN_DENOISING in selected
+                        and torch.device(target).type == "cuda"
+                        and worker_config.graph_policy != "off"
+                    ):
+                        # Canvas readout graphs stage padding sequences
+                        # beyond their canvases.
+                        fields = replace(
+                            fields,
+                            max_rows=canvas_staging_rows(fields.max_rows),
+                        )
                     _, allocation = call_buffer_config(
                         next(iter(selected)), fields
                     )
                     fixed_bytes[target] = fixed_bytes.get(target, 0) + sum(
                         field.nbytes for field in allocation.buffers().values()
+                    )
+
+                # A token denoiser that generates the deployment's canvases
+                # keeps every request slot's canvas resident, with one step
+                # chunk's sampler workspace.
+                denoiser = (
+                    generating_denoiser(call.module)
+                    if ForwardMode.TOKEN_DENOISING in kinds
+                    else None
+                )
+                sampling = worker_config.canvas_sampling
+                if denoiser is not None and sampling is not None:
+                    fixed_bytes[target] = fixed_bytes.get(
+                        target, 0
+                    ) + CanvasSlots.denoiser_bytes(
+                        denoiser,
+                        request_pool_size=worker_config.max_request_pool_size,
+                        max_rows=input_config.max_rows,
+                        history_depth=sampling.stability_threshold,
+                        device_type=torch.device(target).type,
                     )
 
         # Block tables, decode state and the KV import workspaces are charged
@@ -585,6 +649,38 @@ def _token_worker_layout(
             capacity_group.all_reduce(units, op="min")
             capacity = replace(capacity, num_units=int(units.item()))
 
+        # Prefill and decode calls on a CUDA device replay graphs whose rows'
+        # pages fit the granted pool. The rows the widest graphs hold bound
+        # every prefill and decode call the engine forms. The staging above
+        # was sized before the pool, for the rows of every configured bucket.
+        row_units = sum(group.units_per_page for group in planes.groups)
+        pool_rows = (capacity.num_units - 1) // row_units
+        if prefills_on_cuda:
+            max_prefill_calls = (
+                prefill_rows(
+                    prefill_captures(
+                        worker_config,
+                        max_rows=min(max_rows, pool_rows),
+                        max_tokens=input_config.max_text_tokens,
+                        image_builder=flow is not None,
+                        feature_injection=image_processor is not None
+                        and image_processor.feature_injection is not None,
+                        device_causality=True,
+                        pool=(page_shapes, capacity.num_units - 1),
+                    ),
+                    max_rows=min(max_rows, pool_rows),
+                )
+                or 0
+            )
+        if decodes_on_cuda:
+            sizes = decode_captures(
+                worker_config,
+                max_rows=max_rows,
+                row_units=row_units,
+                num_units=capacity.num_units,
+            )
+            max_decode_calls = max(sizes, default=0)
+
     # ``build_worker_layout`` replaces the supported calls and media routes
     # with the placement's narrowed values.
     supported = tuple(
@@ -599,6 +695,8 @@ def _token_worker_layout(
         supported_calls=supported,
         queue_depth=int(queue_depth),
         max_batch_calls=int(worker_config.max_batch_calls),
+        max_prefill_calls=max_prefill_calls,
+        max_decode_calls=max_decode_calls,
         max_batch_tokens=int(worker_config.max_batch_tokens),
         request_slots=int(worker_config.max_request_pool_size),
         kv_cache=(
