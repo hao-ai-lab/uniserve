@@ -199,6 +199,7 @@ impl Default for WorkerProcessArgs {
             launcher_timeout: std::time::Duration::from_secs(120),
             model: String::new(),
             checkpoint_identity: None,
+            base_model: None,
             ranks: vec![crate::WorkerRank {
                 node: "localhost".into(),
                 device: "cuda:0".into(),
@@ -247,6 +248,8 @@ impl Default for WorkerProcessArgs {
             flashinfer_disable_split_kv: false,
             max_model_len: 8192,
             max_video_seconds: 15.0,
+            max_condition_rows: 0,
+            ffmpeg: "ffmpeg".into(),
             min_video_seconds: None,
         }
     }
@@ -385,11 +388,24 @@ impl WorkerProcessArgs {
         if let Some(identity) = &self.checkpoint_identity {
             fields.insert("checkpoint_identity".into(), json!(identity));
         }
+        if let Some(base) = &self.base_model {
+            fields.insert("base_model".into(), json!(base));
+        }
         fields.insert("device".into(), json!(self.ranks[rank as usize].device));
         fields.insert("rank".into(), json!(rank));
         fields.insert("local_rank".into(), json!(self.host_slot(rank)?.0));
         fields.insert("world_size".into(), json!(self.world_size()));
         fields.insert("components".into(), serde_json::to_value(&self.components)?);
+        // Every component any group of the deployment places, so each rank
+        // resolves the capabilities the deployment as a whole selects, such
+        // as which of a checkpoint's denoisers it serves.
+        let deployment = self
+            .peers
+            .values()
+            .flat_map(|components| components.keys())
+            .chain(self.components.keys())
+            .collect::<std::collections::BTreeSet<_>>();
+        fields.insert("deployment_components".into(), json!(deployment));
         // Null lets the worker serve every capability group it implements.
         fields.insert(
             "supported_calls".into(),
@@ -453,6 +469,8 @@ impl WorkerProcessArgs {
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
         fields.insert("max_model_len".into(), json!(self.max_model_len));
         fields.insert("max_video_seconds".into(), json!(self.max_video_seconds));
+        fields.insert("max_condition_rows".into(), json!(self.max_condition_rows));
+        fields.insert("ffmpeg".into(), json!(self.ffmpeg));
         fields.insert("min_video_seconds".into(), json!(self.min_video_seconds));
         fields.insert("graph_policy".into(), json!(self.graph_policy));
         fields.insert(
@@ -1493,9 +1511,30 @@ impl Drop for RankProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaneConfig, allocator_environment};
+    use super::{LaneConfig, WorkerProcessArgs, allocator_environment};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+
+    /// A rank receives the operator's local base checkpoint under the key
+    /// the worker reads, and no key when the operator named none, so the
+    /// worker then reads the base from the Hugging Face cache.
+    #[test]
+    fn the_launch_descriptor_carries_a_named_base_checkpoint() {
+        let mut args = WorkerProcessArgs {
+            model: "/models/FastH3-OmniRef".into(),
+            ..WorkerProcessArgs::default()
+        };
+        let descriptor = args
+            .launch_descriptor(0, "127.0.0.1:1", None, None)
+            .expect("descriptor");
+        assert!(descriptor.get("base_model").is_none());
+
+        args.base_model = Some("/models/MiniMax-H3".into());
+        let descriptor = args
+            .launch_descriptor(0, "127.0.0.1:1", None, None)
+            .expect("descriptor");
+        assert_eq!(descriptor["base_model"], "/models/MiniMax-H3");
+    }
 
     /// `--lane` accepts only the fields the worker applies, so a misspelled
     /// optional limit fails at argument parsing instead of leaving the lane

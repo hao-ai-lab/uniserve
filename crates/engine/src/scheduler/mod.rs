@@ -22,6 +22,7 @@
 //! - `generation`: per-request generation state, call builders, and result
 //!   validation.
 //! - `denoising`: solver progress of one latent trajectory.
+//! - `graph`: the call graph of one video request.
 //! - `execution`: submission, completion application, video media scheduling,
 //!   and allocation reclamation.
 //! - `inflight`: submitted batches and calls, and request-local completion
@@ -43,7 +44,7 @@ pub use config::{
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulingPolicy,
 };
 use config::{MAX_NUM_SEQS, MAX_NUM_WAITING};
-pub(crate) use execution::consuming_calls;
+pub(crate) use execution::generation_consuming_calls;
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
@@ -58,6 +59,7 @@ mod control;
 mod denoising;
 mod execution;
 pub(crate) mod generation;
+pub(crate) mod graph;
 pub(crate) mod image_artifact;
 mod inflight;
 pub(crate) mod output;
@@ -107,6 +109,7 @@ use allocation::{
 };
 use denoising::{Denoising, LatentPlacement};
 use generation::RequestState;
+use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
 
@@ -249,10 +252,27 @@ impl FlowPrefixState {
 /// media path in `execution` rather than by `RequestState`.
 struct MediaFlowState {
     request: DiffusionRequest,
+    /// The calls the request runs and the products connecting them.
+    graph: VideoGraph,
     output: output::EventJournal,
     allocations: MediaAllocations,
+    /// Each product the request reserved, by its declared name, with the
+    /// component output it is reserved under.
+    reservations: HashMap<&'static str, (String, u32)>,
     /// Logical products mapped to their reserved component output and unit slice.
     buffer_bindings: HashMap<BufferId, (String, u32, u32)>,
+    /// The media reader's products, by name, once its call is scheduled.
+    condition_media: HashMap<&'static str, TensorRef>,
+    /// The vision encoder's token features, once its call is scheduled.
+    vision_features: Option<TensorRef>,
+    /// Visual condition units whose latent encoding is scheduled, and of
+    /// those, the units whose encoding completed.
+    scheduled_condition_units: u32,
+    encoded_condition_units: u32,
+    /// Each visual latent encoding round's rows, in unit order.
+    condition_video_latents: Vec<TensorRef>,
+    /// The audio latent encoding's rows, once its call is scheduled.
+    condition_audio_latents: Option<TensorRef>,
     conditioning: Option<TensorRef>,
     latents: Vec<TensorRef>,
     /// Decoded media units by the cursor of the round that produced them,
@@ -274,6 +294,8 @@ struct MediaFlowState {
     /// of the request's first scheduled call.
     admission: NewRequest,
     admission_state: WorkerRegistration,
+    media_reading_scheduled: bool,
+    vision_encoding_scheduled: bool,
     text_encoding_scheduled: bool,
     latent_preparation_scheduled: bool,
     /// Solver progress of the request's latent trajectory.
@@ -316,6 +338,8 @@ enum DiffusionTerminal {
 
 struct PendingMedia {
     request: DiffusionRequest,
+    /// The request's call graph, built when it was queued.
+    graph: VideoGraph,
     event_tx: EventTx,
     /// Unix timestamp at which the request entered the waiting queue.
     queued_at: f64,
@@ -506,7 +530,8 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
         | CallKind::Media(MediaCall::VideoDecoding)
         | CallKind::Media(MediaCall::LatentPreparation)
         | CallKind::Media(
-            MediaCall::VideoEncoding
+            MediaCall::MediaReading
+            | MediaCall::VideoEncoding
             | MediaCall::AudioEncoding
             | MediaCall::AudioDecoding
             | MediaCall::Muxing,

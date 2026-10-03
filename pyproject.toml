@@ -21,6 +21,10 @@ dependencies = [
     "huggingface_hub",
     "diffusers>=0.40",
     "av>=14",
+    # The media reader resamples condition audio with torchaudio's resampler,
+    # the one the reference pipelines use. The 2.11 resampler runs on the
+    # pinned torch through torch's own operators.
+    "torchaudio>=2.11,<2.12",
     # NVML's per-process device usage, which device storage grants charge.
     "nvidia-ml-py",
     # UniServe's own Triton, CuTe and native device kernels. The kernel

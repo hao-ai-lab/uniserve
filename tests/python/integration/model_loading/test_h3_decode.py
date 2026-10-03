@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve.media import image, video
+from tests.python.fixtures.h3 import WIDE
+from uniserve.media import video
 from uniserve.runtime import (
     ExecutionContext,
     TensorBuffers,
@@ -20,12 +21,13 @@ from uniserve.tensors import TensorOutput
 from uniserve_models import loading as models
 from uniserve_models.minimax_h3.packing import (
     audio_latent_frames,
-    build_packing,
+    tile_packing,
     video_latent_frames,
 )
 from uniserve_worker.bootstrap.distributed import initialize_components
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.execution.media import decode_video_unit
 from uniserve_worker.execution.model_executor import ModelExecutor
 
 pytestmark = [
@@ -88,7 +90,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
             # after another request has consumed the same reconstruction owner.
             # 107 frames is a count whose audio timeline rounds down.
             for frames in (39, 22, 39, 107):
-                output = video.Config(frames, image.Config(768, 1344))
+                size = video.Config(frames, WIDE)
                 count = video_latent_frames(frames)
                 native = (
                     torch.randn(
@@ -103,11 +105,8 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                     .permute(0, 2, 3, 5, 1, 4, 6)
                     .reshape(-1, 96)
                 )
-                packed = build_packing(
-                    num_text_tokens=64,
-                    num_frames=frames,
-                    height=768,
-                    width=1344,
+                packed = tile_packing(
+                    num_text_tokens=64, num_frames=frames, canvas=WIDE
                 )
                 latents = raster.index_select(
                     0, packed.video_raster_indices.to("cuda:0")
@@ -129,13 +128,8 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                                 .clone()
                             )
                         for _ in range(2):
-                            result = runner.run_module(
-                                "video_decoder",
-                                (latents,),
-                                method="decode",
-                                size=output,
-                                frames=(window,),
-                                sizes=(output,),
+                            result = decode_video_unit(
+                                runner, "video_decoder", latents, window, size
                             )
                             actual = result.values[0]
                             assert actual.dtype == torch.float16
@@ -143,7 +137,10 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                             torch.testing.assert_close(
                                 actual, expected, rtol=0, atol=0
                             )
-                            assert result.layouts[0].local_slice[0] == slice(
+                            placed = model.video_decoder.place(
+                                actual, window, size
+                            )
+                            assert placed.layout.local_slice[0] == slice(
                                 index, index + 1
                             )
                         retained.append((actual, expected))
@@ -211,10 +208,10 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
 
                 # A new timeline ignores overlap retained from prior requests.
                 state = storage.view(
-                    model.video_postprocessor.state_buffers(output)
+                    model.video_postprocessor.state_buffers(size)
                 )
                 state["video_overlap"].fill_(1)
-                layout = model.video_decoder.output_layout(output)["video"]
+                layout = model.video_decoder.output_layout(size)["video"]
                 pixel = torch.tensor(
                     [124, 116, 104], dtype=torch.uint8, device="cuda:0"
                 )
@@ -235,9 +232,9 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                         "video_decoder",
                         (TensorOutput(segment, segment_layout),),
                         method="forward",
-                        size=output,
+                        size=size,
                         frames=(window,),
-                        sizes=(output,),
+                        sizes=(size,),
                         state=state,
                     )
                     pixels = result.values[0]
@@ -263,13 +260,8 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
             torch.cuda.synchronize()
             with torch.cuda.stream(video_stream):
                 torch.cuda._sleep(2_000_000_000)
-                video_result = runner.run_module(
-                    "video_decoder",
-                    (latents,),
-                    method="decode",
-                    size=output,
-                    frames=(windows[0],),
-                    sizes=(output,),
+                video_result = decode_video_unit(
+                    runner, "video_decoder", latents, windows[0], size
                 )
                 video_done.record(video_stream)
             with torch.cuda.stream(audio_stream):

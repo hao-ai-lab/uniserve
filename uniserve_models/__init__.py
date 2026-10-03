@@ -7,9 +7,11 @@ read tensor headers through ``sources``, the loader's resolution of the
 sources ``config_sources`` names (downloaded for a Hub checkpoint, or
 header-only for a dummy Hub load); ``Model`` builds the module tree
 from that config; ``checkpoint_sources`` and ``checkpoint_mappings`` place
-checkpoint tensors into the tree; ``precisions`` names weight precision
-presets and ``checkpoint_precision`` is the base configuration for a
-calibrated ModelOpt checkpoint; ``entry_points`` declares the methods
+checkpoint tensors into the tree; ``precisions(config)`` names the weight
+precision presets of a configuration and ``checkpoint_precision(config)`` is
+its base configuration for a calibrated ModelOpt checkpoint; a package may
+also offer a ``weight_config(config, *, preset, **components)`` factory for
+per-component selections; ``entry_points`` declares the methods
 serving ranks may call; and ``image_processor`` and ``flow_prompt`` describe
 caller-side input preparation. Packages absent from that catalog serve other
 roles: ``siglip`` is a vision tower that other models compose, ``qwen3_vl``

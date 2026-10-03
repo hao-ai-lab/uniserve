@@ -32,7 +32,7 @@ use anyhow::Context;
 use uniserve_core::CommandWaker;
 use uniserve_worker_ipc::{
     BatchCommand, BufferAllocation, BufferId, Call, KvTransfer, NewRequest, RequestKey,
-    TensorPublication,
+    TensorPublication, TensorRef,
 };
 
 /// One worker's outstanding submission; returned calls leave this record.
@@ -147,6 +147,12 @@ enum Dispatch {
 struct BufferRoute {
     worker_index: usize,
     component: String,
+    /// The buffer is one of its producing call's declared `outputs`, which
+    /// a component publishes from its output ranks
+    /// (`ComponentConfig::publishes_on_every_rank`). Every member rank
+    /// holds its own copy of the call's other results: its device scalars,
+    /// encoder features, image, latents and KV.
+    declared_output: bool,
 }
 
 /// Dispatch targeted calls and track their independently completed results.
@@ -217,7 +223,7 @@ pub struct WorkerExecutor {
 ///
 /// Returns an empty map when the routing lacks a video decoding or a video
 /// encoding component.
-pub(crate) fn video_unit_encoders(
+pub(crate) fn video_unit_codecs(
     routing: &std::collections::BTreeMap<uniserve_worker_ipc::MediaCall, String>,
     placements: &[(
         &WorkerId,
@@ -286,7 +292,7 @@ pub(crate) fn video_unit_encoders(
         }
         anyhow::ensure!(
             !admissible.is_empty(),
-            "no video encoder keeps the media units of worker {decoder_worker} on their host, \
+            "no video codec keeps the media units of worker {decoder_worker} on their host, \
              where their encoder reads them through shared storage: {}",
             refusals.join("; ")
         );
@@ -303,7 +309,7 @@ impl WorkerExecutor {
     /// was initialized with transfer bindings other than `transfer`, a worker
     /// reports invalid capabilities, the workers loaded different models or
     /// checkpoints or expose different outputs for a replicated component, the
-    /// media routing or video encoder pairing is refused, a transfer edge names
+    /// media routing or video codec pairing is refused, a transfer edge names
     /// an unbound worker or rank, repeats a physical rank pair, or uses a
     /// mechanism an endpoint did not initialize or that cannot serve the edge's
     /// endpoints, or no runtime capacity view can be derived from the workers.
@@ -353,7 +359,7 @@ impl WorkerExecutor {
                 (id, ranks, components)
             })
             .collect::<Vec<_>>();
-        executor_info.video_encoders = video_unit_encoders(&media_routing, &placements)?;
+        executor_info.video_codecs = video_unit_codecs(&media_routing, &placements)?;
         for (_, worker) in &mut workers {
             worker.set_media_routing(media_routing.clone());
         }
@@ -892,9 +898,10 @@ impl WorkerExecutor {
     /// layouts, including when both components belong to this WorkerGroup.
     ///
     /// The caller has established that both run on the producer's worker.
-    /// Returns true for the producing component itself, or for two components
-    /// on the same single rank; false otherwise, including when either
-    /// component is not loaded on the worker.
+    /// Returns true for the producing component itself when each of its ranks
+    /// holds its own copy of the buffer, or for two components on the same
+    /// single rank; false otherwise, including when either component of a
+    /// pair is not loaded on the worker.
     fn shares_product_storage(&self, producer: &BufferRoute, consumer_entry: &str) -> bool {
         let entries = &self.workers[producer.worker_index].1.info().components;
         let source = entries
@@ -902,11 +909,18 @@ impl WorkerExecutor {
             .find(|entry| entry.name == producer.component);
         let destination = entries.iter().find(|entry| entry.name == consumer_entry);
         if producer.component == consumer_entry {
-            // A consumer call on the component that produced the product is aligned
-            // with the round that produced it: the same media units in the same
-            // order on the same ranks, so each rank consumes the shard it wrote
-            // and no rank needs another's.
-            return true;
+            // A consumer call on the component that produced the product runs on
+            // the same ranks, and each rank reads the copy it holds when every
+            // rank holds one. Every rank holds a call's own results beside its
+            // declared outputs. A declared output is written by every rank of a
+            // distributed component, whose round deals the same media units in
+            // the same order to the same ranks, and of a sequence-parallel one,
+            // whose ranks each write their shard; a tensor-parallel or pipelined
+            // component publishes it from its output ranks alone, so its other
+            // ranks read the product's publication. Without a description of
+            // the component, its ranks are taken to hold their own copies.
+            return !producer.declared_output
+                || source.is_none_or(|source| source.config.publishes_on_every_rank());
         }
         source
             .zip(destination)
@@ -1055,8 +1069,10 @@ impl WorkerExecutor {
         let readers = batch
             .requests
             .iter()
-            .filter(|(_, placement)| !placement.readers.is_empty())
-            .map(|(call, placement)| ((call.request_key, call.call_id), placement.readers.clone()))
+            .filter_map(|(call, placement)| {
+                let readers = placement.readers.clone()?;
+                Some(((call.request_key, call.call_id), readers))
+            })
             .collect();
         match self.workers[worker_index].1.submit_batch(wire, &readers) {
             Ok(()) => {}
@@ -1574,10 +1590,16 @@ impl Executor for WorkerExecutor {
                     "call targets unloaded component {}",
                     call.component
                 );
+                let declared = call
+                    .outputs
+                    .iter()
+                    .map(TensorRef::buffer_id)
+                    .collect::<HashSet<_>>();
                 for output in call.output_buffers() {
                     let route = BufferRoute {
                         worker_index: call_worker,
                         component: call.component.clone(),
+                        declared_output: declared.contains(&output),
                     };
                     if let Some(existing) = self.buffer_routes.get(&output) {
                         anyhow::ensure!(
@@ -1890,7 +1912,7 @@ impl Executor for WorkerExecutor {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::video_unit_encoders;
+    use super::video_unit_codecs;
     use crate::WorkerRank;
     use crate::executor::{ComponentConfig, WorkerId};
     use std::collections::BTreeMap;
@@ -1915,13 +1937,13 @@ mod placement_tests {
     fn routing() -> BTreeMap<MediaCall, String> {
         BTreeMap::from([
             (MediaCall::VideoDecoding, "video_decoder".to_owned()),
-            (MediaCall::VideoEncoding, "video_encoder".to_owned()),
+            (MediaCall::VideoEncoding, "video_codec".to_owned()),
         ])
     }
 
     #[test]
     fn a_decoded_unit_names_the_host_worker_ranks_that_read_it() {
-        // The decoder's product is read by the video encoder on the host
+        // The decoder's product is read by the video codec on the host
         // worker: the encoder rank dealt this decoder rank's position is
         // named, none of the decoder's own ranks, and the host worker's
         // slots follow the model worker's run. A consumer that is not
@@ -1932,7 +1954,7 @@ mod placement_tests {
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
         let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 2))]);
+            BTreeMap::from([("video_codec".to_owned(), distributed(vec![0, 1], 2))]);
         let peers = BTreeMap::from([
             ("host".to_owned(), host_components),
             ("model".to_owned(), model_components.clone()),
@@ -2048,7 +2070,7 @@ mod placement_tests {
 
     #[test]
     fn a_decoded_unit_names_only_the_encoder_on_its_route() {
-        // Two hosts each hold a video encoder worker. A request decoded on
+        // Two hosts each hold a video codec worker. A request decoded on
         // host 0's model worker is routed to host 0's encoder, so the unit
         // names that encoder's reading rank; host 1's encoder rank at the
         // same position never reads it.
@@ -2056,7 +2078,7 @@ mod placement_tests {
         use crate::worker::instance::media_consumer_slots;
 
         let model = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1], 1))]);
-        let encoder = || BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 1))]);
+        let encoder = || BTreeMap::from([("video_codec".to_owned(), distributed(vec![0, 1], 1))]);
         let peers = BTreeMap::from([
             ("encoder-0".to_owned(), encoder()),
             ("encoder-1".to_owned(), encoder()),
@@ -2066,8 +2088,7 @@ mod placement_tests {
         for worker in ["encoder-0", "encoder-1", "model-0"] {
             transfer.worker_ranks.insert(worker.to_owned(), 2);
         }
-        let routed =
-            BTreeMap::from([("video_encoder".to_owned(), WorkerId("encoder-0".to_owned()))]);
+        let routed = BTreeMap::from([("video_codec".to_owned(), WorkerId("encoder-0".to_owned()))]);
 
         let slots = media_consumer_slots(
             &[MediaCall::VideoEncoding],
@@ -2088,7 +2109,7 @@ mod placement_tests {
     fn pairing(
         placements: &[(&WorkerId, &[WorkerRank], &BTreeMap<String, ComponentConfig>)],
     ) -> anyhow::Result<BTreeMap<WorkerId, std::collections::BTreeSet<WorkerId>>> {
-        video_unit_encoders(&routing(), placements)
+        video_unit_codecs(&routing(), placements)
     }
 
     #[test]
@@ -2110,7 +2131,7 @@ mod placement_tests {
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
         let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
+            BTreeMap::from([("video_codec".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
         let pairings = pairing(&[
             (&model, &model_ranks, &model_components),
             (&host, &host_ranks, &host_components),
@@ -2140,7 +2161,7 @@ mod placement_tests {
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 2))]);
         let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed((0..8).collect(), 1))]);
+            BTreeMap::from([("video_codec".to_owned(), distributed((0..8).collect(), 1))]);
         pairing(&[
             (&model, &model_ranks, &model_components),
             (&host, &host_ranks, &host_components),
@@ -2163,12 +2184,21 @@ mod placement_tests {
 
     #[test]
     fn every_shipped_deployment_encodes_its_units_on_their_host() {
-        // Every FastH3 deployment file shipped in `configs/fast_h3/` must
-        // pass the placement checks the engine applies at startup, including
-        // the pairing of every decoding worker with an encoder on its host.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/fast_h3");
+        // Every video deployment file shipped in `configs/fast_h3/` and
+        // `configs/minimax_h3/` must pass the placement checks the engine
+        // applies at startup, including the pairing of every decoding worker
+        // with an encoder on its host.
+        for family in ["fast_h3", "minimax_h3"] {
+            check_shipped_deployments(family);
+        }
+    }
+
+    fn check_shipped_deployments(family: &str) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../configs")
+            .join(family);
         let mut checked = 0;
-        for entry in std::fs::read_dir(&root).expect("the FastH3 deployment directory exists") {
+        for entry in std::fs::read_dir(&root).expect("the deployment directory exists") {
             let path = entry.expect("readable entry").path();
             if path.extension().is_none_or(|extension| extension != "json") {
                 continue;
@@ -2196,7 +2226,7 @@ mod placement_tests {
             assert_eq!(pairings.len(), decoders, "{}", path.display());
             checked += 1;
         }
-        assert!(checked > 0, "no FastH3 deployment was checked");
+        assert!(checked > 0, "no {family} deployment was checked");
     }
 
     #[test]
@@ -2213,7 +2243,7 @@ mod placement_tests {
             (WorkerId("encoder-b".to_owned()), vec![rank("b", "cpu")]),
         ];
         let decoder = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0], 1))]);
-        let encoder = BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0], 1))]);
+        let encoder = BTreeMap::from([("video_codec".to_owned(), distributed(vec![0], 1))]);
         let placements = flows
             .iter()
             .map(|(id, ranks)| (id, ranks.as_slice(), &decoder))

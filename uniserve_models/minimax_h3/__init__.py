@@ -1,18 +1,24 @@
 """MiniMax H3 numerical models and checkpoint definitions.
 
-H3 generates a video with a stereo audio track from a text prompt. The
-package composes four independently placeable components (see
-``entry_points``): the Qwen text encoder, the denoiser with its token
-refiner, the video decoder with its RGB post-processor, and the audio
-decoder. ``read_config`` normalizes the checkpoint's JSON sidecars and
-``checkpoint_mappings`` maps its tensors onto the modules.
+H3 generates a video with a stereo audio track from a text prompt and
+optional image, video and audio conditions. The package composes
+independently placeable components (see ``entry_points``): the Qwen text
+encoder, one denoiser per DiT partition the checkpoint holds (each with its
+token refiner), the video decoder with its RGB post-processor, and the audio
+decoder. ``read_config`` recognizes the checkpoint layout and normalizes its
+JSON sidecars, ``base_checkpoint`` names the pinned base a component export
+draws its other components from, and ``checkpoint_mappings`` maps its
+tensors onto the modules.
 """
 
-from .attention import Attention
+from .attention import Dense, RegionSparse, Sparse
+from .checkpoint import base_checkpoint
 from .conditioning import Conditioner, RefinerBlock, TokenRefiner
 from .config import (
     Config,
-    DiffusionConfig,
+    DenoiserConfig,
+    DenseAttention,
+    SparseAttention,
     TransformerConfig,
     config_sources,
     read_config,
@@ -21,13 +27,19 @@ from .decoding import AudioDecoder, VideoDecoder
 from .denoiser import Denoiser
 from .encoder import TextEncoderConfig, text_encoder
 from .encoding import AudioEncoder, VideoEncoder
-from .inputs import AttentionInput, DenoiserInput, DenoiserSize
+from .inputs import (
+    AttentionInput,
+    DenoiserInput,
+    DenoiserSize,
+    RegionInput,
+    SequenceInput,
+)
 from .model import Model, entry_points
 from .modulation import OutputNorm, TimestepEmbedding
 from .output import VideoPostprocessor
-from .packing import Packing
+from .packing import DensePacking, RegionPacking, TilePacking
 from .precision import checkpoint_precision, precisions, weight_config
-from .transformer import Transformer, TransformerLayer
+from .transformer import StepProjection, Transformer, TransformerLayer
 from .weights import checkpoint_mappings, checkpoint_sources
 
 # The model loader reads these package attributes. H3 accepts no image inputs
@@ -37,16 +49,21 @@ image_processor = None
 flow_prompt = None
 
 __all__ = [
+    "base_checkpoint",
     "config_sources",
     "image_processor",
     "flow_prompt",
     "Model",
     "Config",
-    "Attention",
+    "Dense",
+    "RegionSparse",
+    "Sparse",
     "Conditioner",
     "RefinerBlock",
     "TokenRefiner",
-    "DiffusionConfig",
+    "DenoiserConfig",
+    "DenseAttention",
+    "SparseAttention",
     "TransformerConfig",
     "AudioDecoder",
     "AudioEncoder",
@@ -57,10 +74,15 @@ __all__ = [
     "AttentionInput",
     "DenoiserInput",
     "DenoiserSize",
+    "RegionInput",
+    "SequenceInput",
     "OutputNorm",
     "TimestepEmbedding",
     "VideoPostprocessor",
-    "Packing",
+    "DensePacking",
+    "RegionPacking",
+    "TilePacking",
+    "StepProjection",
     "Transformer",
     "TransformerLayer",
     "read_config",

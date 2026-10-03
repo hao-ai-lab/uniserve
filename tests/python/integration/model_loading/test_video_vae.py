@@ -79,7 +79,7 @@ def test_video_reconstruction_matches_independent_transformer_and_crop(
         )
 
     model = loading.load_model(
-        video_vae.Model,
+        lambda config: video_vae.Model(config, frame_size=image.Config(8, 12)),
         config,
         checkpoint=(
             checkpoint.Config().resolve(tmp_path, io=loading.Config()),

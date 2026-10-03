@@ -27,14 +27,24 @@ checkpoint_sources = (checkpoint.Config(name="primary"),)
 # Named presets that load_model accepts; a calibrated ModelOpt checkpoint
 # offers none. With no "default" entry, uniserve_models.loading.read_config
 # starts from "bf16".
-precisions = MappingProxyType(
+_PRECISIONS = MappingProxyType(
     {"bf16": weights.Config(), "fp16": weights.Config(dtype=torch.float16)}
 )
 
-# Base precision of a calibrated ModelOpt checkpoint: the loader adds the
-# calibrated quantization on top of it, and every module the checkpoint does
-# not store packed stays dense in this precision.
-checkpoint_precision = precisions["bf16"]
+
+def precisions(config: Config) -> Mapping[str, weights.Config]:
+    """Named presets ``load_model`` accepts for ``config``'s checkpoint."""
+    return _PRECISIONS
+
+
+def checkpoint_precision(config: Config) -> weights.Config:
+    """Base precision of a calibrated ModelOpt checkpoint.
+
+    The loader adds the calibrated quantization on top of it, and every
+    module the checkpoint does not store packed stays dense in this
+    precision.
+    """
+    return _PRECISIONS["bf16"]
 
 
 def parameter_sources(config: Config) -> Mapping[str, str]:

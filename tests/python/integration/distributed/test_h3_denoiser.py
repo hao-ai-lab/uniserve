@@ -3,8 +3,6 @@
 It also composes partitions and solver feedback.
 """
 
-from functools import partial
-
 import pytest
 import torch
 import torch.multiprocessing as mp
@@ -14,11 +12,11 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 from safetensors.torch import save_file
 from torch.nn import functional as F
 
+from tests.python.fixtures.h3 import WIDE, dmd_denoiser
 from uniserve import loading
 from uniserve.diffusion import DenoisingStep, normal_noise
 from uniserve.distributed import DeviceMesh, communication_axes
 from uniserve.loading import checkpoint, weights
-from uniserve.media import image
 from uniserve.model import LatentInput
 from uniserve.nn.attention import (
     AttentionParallelConfig,
@@ -36,7 +34,6 @@ from uniserve_models.minimax_h3 import (
     Denoiser,
     DenoiserInput,
     DenoiserSize,
-    DiffusionConfig,
     TransformerConfig,
 )
 from uniserve_models.minimax_h3.conditioning import (
@@ -48,9 +45,6 @@ from uniserve_worker.execution.request import RequestPool
 from uniserve_worker.storage.latent_pool import LatentPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
-
-# The landscape output raster.
-FRAME = image.Config(768, 1344)
 
 
 def _config():
@@ -71,7 +65,9 @@ def _config():
 
 
 def _mapping(model):
-    component = transformer_component(model.transformer, model.diffusion)
+    component = transformer_component(
+        model.transformer, model.config, "denoiser"
+    )
     pipeline = model.mesh.get_group("pp")
     if pipeline.rank:
         model.conditioner = None
@@ -153,15 +149,15 @@ def _run(rank, rendezvous, directory, source):
             ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank
         )
         with torch.device("meta"):
-            description = Denoiser(_config(), diffusion=DiffusionConfig())
+            description = Denoiser(dmd_denoiser(_config()))
         mesh = groups.bind(
             topology,
             device=device,
             axes=communication_axes(description, topology, attention=attention),
         )
         model = loading.load_model(
-            partial(Denoiser, diffusion=DiffusionConfig()),
-            _config(),
+            Denoiser,
+            dmd_denoiser(_config()),
             checkpoint=(
                 checkpoint.Config("denoiser").resolve(
                     directory, io=loading.Config()
@@ -185,7 +181,7 @@ def _run(rank, rendezvous, directory, source):
         ).model
         # The prompt fills 63 rows of one text tile; the call evaluates the
         # tile's layout with the prompt's own tables.
-        size = DenoiserSize(22, FRAME, 63)
+        size = model.make_size(22, 63, canvas=WIDE)
         layout = model.layout_size(size)
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
         stream.wait(torch.cuda.current_stream(device))
@@ -233,8 +229,8 @@ def _run(rank, rendezvous, directory, source):
                 for name, value in request.items():
                     value.copy_(staged[name])
                 features = torch.zeros(
-                    layout.num_text_tokens,
-                    model.config.hidden_size,
+                    model.text_condition_rows(layout),
+                    model.text_condition_width,
                     device=device,
                     dtype=torch.bfloat16,
                 )
@@ -389,15 +385,15 @@ def _load(groups, directory, device, topology=None, attention=None):
         )
     else:
         with torch.device("meta"):
-            description = Denoiser(_config(), diffusion=DiffusionConfig())
+            description = Denoiser(dmd_denoiser(_config()))
         mesh = groups.bind(
             topology,
             device=device,
             axes=communication_axes(description, topology, attention=attention),
         )
     return loading.load_model(
-        partial(Denoiser, diffusion=DiffusionConfig()),
-        _config(),
+        Denoiser,
+        dmd_denoiser(_config()),
         checkpoint=(
             checkpoint.Config("denoiser").resolve(
                 directory, io=loading.Config()
@@ -513,15 +509,13 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         rank=0, local_rank=0, world_size=1, device=device
     ) as groups:
         model = _load(groups, tmp_path, device)
-        factory = MediaBuilder(
-            model, frame_sizes=(FRAME,), max_frames=22, max_text_tokens=65
-        )
-        size = factory.size(22, FRAME, 63)
+        factory = MediaBuilder(model, max_frames=22, max_text_tokens=65)
+        size = factory.size(22, 63, WIDE)
         layout = factory.layout(size)
         matrices = {name: value.to(device) for name, value in source.items()}
         features = torch.zeros(
             size.num_text_tokens,
-            model.config.hidden_size,
+            model.text_condition_width,
             dtype=torch.bfloat16,
             device=device,
         )
@@ -652,13 +646,11 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
         rank=0, local_rank=0, world_size=1, device=device
     ) as groups:
         model = _load(groups, tmp_path, device)
-        factory = MediaBuilder(
-            model, frame_sizes=(FRAME,), max_frames=22, max_text_tokens=128
-        )
-        placeholder = factory.size(22, FRAME, 1)
+        factory = MediaBuilder(model, max_frames=22, max_text_tokens=128)
+        placeholder = factory.size(22, 1, WIDE)
         requests = {
-            1: factory.size(22, FRAME, 40),
-            2: factory.size(22, FRAME, 63),
+            1: factory.size(22, 40, WIDE),
+            2: factory.size(22, 63, WIDE),
         }
         layout = factory.layout(placeholder)
         assert {factory.layout(size) for size in requests.values()} == {layout}
@@ -666,7 +658,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
         features = {
             slot: torch.randn(
                 size.num_text_tokens,
-                model.config.hidden_size,
+                model.text_condition_width,
                 generator=generator,
             ).to(device, torch.bfloat16)
             for slot, size in requests.items()
@@ -739,7 +731,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                     seed=0,
                     features=torch.zeros(
                         1,
-                        model.config.hidden_size,
+                        model.text_condition_width,
                         dtype=torch.bfloat16,
                         device=device,
                     ),
@@ -803,31 +795,26 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
         model = _load(groups, tmp_path, device)
         exact = MediaBuilder(
             model,
-            frame_sizes=(FRAME,),
             max_frames=22,
             max_text_tokens=256,
             text_capacities=(64, 128, 256),
         )
         padded = MediaBuilder(
-            model,
-            frame_sizes=(FRAME,),
-            max_frames=22,
-            max_text_tokens=256,
-            text_capacities=(256,),
+            model, max_frames=22, max_text_tokens=256, text_capacities=(256,)
         )
-        requests = {1: exact.size(22, FRAME, 40), 2: exact.size(22, FRAME, 100)}
+        requests = {1: exact.size(22, 40, WIDE), 2: exact.size(22, 100, WIDE)}
         assert [exact.layout(size) for size in requests.values()] == [
-            DenoiserSize(22, FRAME, 64),
-            DenoiserSize(22, FRAME, 128),
+            DenoiserSize(22, WIDE, 64, 0),
+            DenoiserSize(22, WIDE, 128, 0),
         ]
         assert {padded.layout(size) for size in requests.values()} == {
-            DenoiserSize(22, FRAME, 256)
+            DenoiserSize(22, WIDE, 256, 0)
         }
         generator = torch.Generator().manual_seed(11)
         features = {
             slot: torch.randn(
                 size.num_text_tokens,
-                model.config.hidden_size,
+                model.text_condition_width,
                 generator=generator,
             ).to(device, torch.bfloat16)
             for slot, size in requests.items()
@@ -886,7 +873,7 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                 bank=pool.storage.bank,
             )
             try:
-                placeholder = padded.size(22, FRAME, 256)
+                placeholder = padded.size(22, 256, WIDE)
                 layout = padded.layout(placeholder)
                 views = pool.storage.tensors(1).view(
                     padded.buffers(placeholder)
@@ -901,7 +888,7 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                     seed=0,
                     features=torch.zeros(
                         256,
-                        model.config.hidden_size,
+                        model.text_condition_width,
                         dtype=torch.bfloat16,
                         device=device,
                     ),
@@ -981,14 +968,14 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
     )
     schedules = model.make_schedules(4, shift=None, device=device)
     for index, (frames, tokens, capacity) in enumerate(cases):
-        size = DenoiserSize(frames, FRAME, tokens)
+        size = model.make_size(frames, tokens, canvas=WIDE)
         generator = torch.Generator().manual_seed(60 + index)
         features = torch.randn(
-            tokens, model.config.hidden_size, generator=generator
+            tokens, model.text_condition_width, generator=generator
         ).to(device, torch.bfloat16)
         for name, layout in (
             ("smallest", model.layout_size(size)),
-            ("capacity", DenoiserSize(frames, FRAME, capacity)),
+            ("capacity", DenoiserSize(frames, WIDE, capacity, 0)),
         ):
             assert model.holds(layout, size)
             requirements = model.state_buffers(layout)
@@ -1034,8 +1021,8 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
                 # The prompt's features lead a text region of the layout's
                 # capacity; the rows past it are padding.
                 conditioning = torch.zeros(
-                    layout.num_text_tokens,
-                    model.config.hidden_size,
+                    model.text_condition_rows(layout),
+                    model.text_condition_width,
                     dtype=torch.bfloat16,
                     device=device,
                 )

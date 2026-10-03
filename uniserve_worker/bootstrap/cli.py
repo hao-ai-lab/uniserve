@@ -22,8 +22,8 @@ from uniserve_worker.config.deployment import WorkerProcessArgs
 
 # Keys ``read_launch_descriptor`` requires the descriptor to carry. A launch
 # that omits one is a contract violation rather than something to paper over
-# with a local default. Optional keys such as ``checkpoint_identity`` are
-# absent when the launcher has no value for them.
+# with a local default. Optional keys such as ``checkpoint_identity`` and
+# ``base_model`` are absent when the launcher has no value for them.
 REQUIRED_FIELDS = (
     "registration_address",
     "channel_transport",
@@ -39,6 +39,7 @@ REQUIRED_FIELDS = (
     "local_rank",
     "world_size",
     "components",
+    "deployment_components",
     "supported_calls",
     "transfer_backends",
     "publish_backends",
@@ -50,6 +51,8 @@ REQUIRED_FIELDS = (
     "max_batch_tokens",
     "max_model_len",
     "max_video_seconds",
+    "max_condition_rows",
+    "ffmpeg",
     "model_dtype",
     "quantization_config",
     "kv_memory_fraction",

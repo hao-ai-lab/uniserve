@@ -24,7 +24,6 @@ import torch
 from torch import nn
 
 from uniserve.loading import weights
-from uniserve.media import image
 from uniserve.model import (
     CausalLM,
     ComponentEntry,
@@ -37,6 +36,7 @@ from uniserve.nn.attention import (
     ContextParallelConfig,
     Ulysses,
 )
+from uniserve.nn.attention.vsa import BlockAttention
 from uniserve.nn.vae.patch import PatchAutoencoder
 from uniserve.processing import (
     FlowPrompt,
@@ -150,9 +150,11 @@ def prepare_worker_model(
     # modules this rank must read from the checkpoint. This first read selects
     # no modules, so it resolves no weight payload source.
     metadata = models.read_config(
-        launch.path, io=config.load, modules=frozenset()
+        launch.path,
+        io=config.load,
+        modules=frozenset(),
+        base=launch.base_model,
     )
-    metadata = _serve_frame_sizes(metadata, config.execution)
     with torch.device("meta"):
         model = metadata.model_class(metadata.model)
     declared = validate_components(
@@ -167,9 +169,8 @@ def prepare_worker_model(
         if config.execution.rank in component.ranks
         for call in declared[name]
     )
-    source = _serve_frame_sizes(
-        models.read_config(launch.path, io=config.load, modules=resident),
-        config.execution,
+    source = models.read_config(
+        launch.path, io=config.load, modules=resident, base=launch.base_model
     )
 
     # The host name is the ``node`` the rank's ``WorkerEndpoint`` reports, so
@@ -191,42 +192,6 @@ def prepare_worker_model(
         model,
         declared,
     )
-
-
-def _serve_frame_sizes(source, execution: WorkerConfig):
-    """Replace a video model's served output rasters with the deployment's.
-
-    ``execution.video_frame_sizes`` lists ``(height, width)`` rasters; empty
-    keeps the checkpoint configuration's own. The model's output
-    configuration validates the rasters it is given.
-
-    Raises:
-        WorkerError: With the invalid-descriptor code, when rasters are
-            given for a model without configurable output rasters or the
-            model refuses them.
-    """
-    if not execution.video_frame_sizes:
-        return source
-    output = getattr(source.model, "output", None)
-    if output is None or not hasattr(output, "frame_sizes"):
-        raise invalid_descriptor(
-            "video frame sizes require a model with configurable rasters"
-        )
-
-    try:
-        model = replace(
-            source.model,
-            output=replace(
-                output,
-                frame_sizes=tuple(
-                    image.Config(height, width)
-                    for height, width in execution.video_frame_sizes
-                ),
-            ),
-        )
-    except ValueError as error:
-        raise invalid_descriptor(str(error)) from error
-    return replace(source, model=model)
 
 
 def _weight_config(source, options, execution) -> weights.Config:
@@ -293,7 +258,9 @@ def _weight_config(source, options, execution) -> weights.Config:
                 "without component selectors"
             )
         result = factory(
-            preset="default" if selected is None else selected, **components
+            source.model,
+            preset="default" if selected is None else selected,
+            **components,
         )
     elif selected is None:
         result = source.weights
@@ -376,7 +343,9 @@ def load_worker_model(
     Otherwise each outermost declared module path of a meshed component is
     loaded on that component's mesh with its ``attention_parallel``
     partitioning. Capability methods are attached later, by
-    ``bind_components`` in ``ModelExecutor``.
+    ``bind_components`` in ``ModelExecutor``. A device that no installed VSA
+    provider serves for a resident sparse attention tile is refused with
+    ``UNSUPPORTED_SETUP`` before any weight loads.
     """
     if config.use_stub_model:
         from uniserve_models.stub import Model, image_processor
@@ -445,6 +414,16 @@ def load_worker_model(
             meshes[path] = binding.mesh
             attention[path] = attention_parallel(binding.config)
 
+    _require_sparse_tiles(
+        description,
+        {
+            call.path
+            for name in bindings
+            if not is_host_component(name)
+            for call in declarations.get(name, ())
+        },
+        config.execution.device,
+    )
     loaded = models.load_model(
         source,
         device=config.execution.device,
@@ -476,6 +455,37 @@ def load_worker_model(
         source.checkpoint_identity,
         source.entry_points,
     )
+
+
+def _require_sparse_tiles(
+    model: nn.Module, paths: set[str], device: str
+) -> None:
+    """Refuse a device that no installed VSA provider serves for a tile.
+
+    A resident sparse attention layer's tile size fixes the block kernel it
+    needs, and 128-row tiles have an SM100 (data-center Blackwell) kernel
+    only. Reading the meta-device ``model`` under the resident module
+    ``paths`` refuses such a deployment at startup, before any weight loads.
+
+    Raises:
+        WorkerError: With ``UNSUPPORTED_SETUP`` naming the tile size and the
+            device.
+    """
+    from uniserve.runtime.backends.attention import vsa as providers
+
+    tiles = sorted(
+        {
+            child.tile_size
+            for path in paths
+            for child in model.get_submodule(path).modules()
+            if isinstance(child, BlockAttention)
+        }
+    )
+    for tile in tiles:
+        try:
+            providers.resolve("auto", device=torch.device(device), tile=tile)
+        except RuntimeError as error:
+            raise unsupported_setup(str(error)) from error
 
 
 def _devices(

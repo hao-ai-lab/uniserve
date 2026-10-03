@@ -179,16 +179,32 @@ def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
 class OutputInfo:
     """A component's named tensor result, before request and storage binding.
 
-    `ComponentInfo.outputs` lists these for each loaded component.
+    `ComponentInfo.outputs` lists these for each loaded component. A result
+    laid out at a video request's raster names its ``(height, width)``
+    axes in ``raster_axes``; their extents in ``shape_bound`` are the largest
+    the worker admits, and the engine binds them to each request's canvas.
     """
 
     name: str
     dtype: DType
     shape_bound: ShapeBound
+    raster_axes: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise invalid_descriptor("tensor result must have a name")
+        if self.raster_axes is not None:
+            dims = self.shape_bound.dims
+            height, width = self.raster_axes
+            if height == width or any(
+                not 0 <= axis < len(dims)
+                or not isinstance(dims[axis], StaticDim)
+                for axis in (height, width)
+            ):
+                raise invalid_descriptor(
+                    "a tensor result's raster axes must be two distinct "
+                    "static axes"
+                )
 
     @property
     def max_bytes(self) -> int:
@@ -201,21 +217,35 @@ class OutputInfo:
     ) -> OutputInfo:
         """Parse a named result description with its dtype and shape bound."""
         data = _map(value, where)
+        raster = data.get("raster_axes")
         return cls(
             name=_str(data.get("name"), f"{where}.name"),
             dtype=DType(_str(data.get("dtype"), f"{where}.dtype")),
             shape_bound=ShapeBound.from_mapping(
                 data.get("shape_bound"), f"{where}.shape_bound"
             ),
+            raster_axes=None
+            if raster is None
+            else (
+                _uint(
+                    _map(raster, f"{where}.raster_axes").get("height"),
+                    f"{where}.raster_axes.height",
+                ),
+                _uint(raster.get("width"), f"{where}.raster_axes.width"),
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize the result description for IPC."""
-        return {
+        mapping: dict[str, object] = {
             "name": self.name,
             "dtype": self.dtype.value,
             "shape_bound": self.shape_bound.to_mapping(),
         }
+        if self.raster_axes is not None:
+            height, width = self.raster_axes
+            mapping["raster_axes"] = {"height": height, "width": width}
+        return mapping
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,9 +14,6 @@ from uniserve.tensors import OutputLayout, TensorOutput
 
 pytestmark = pytest.mark.unit
 
-# Eleven 2x3 frames.
-SIZE = video.Config(11, image.Config(2, 3))
-
 
 def test_video_windows_preserve_pixels_across_separate_calls():
     class ThreeFrameVideo(VideoPostprocessor):
@@ -24,9 +21,9 @@ def test_video_windows_preserve_pixels_across_separate_calls():
             return slice(0, 3), slice(4, 6)
 
     model = ThreeFrameVideo(
-        torch.tensor([0.0, 0.5], dtype=torch.float16),
-        frame_rate=24,
+        torch.tensor([0.0, 0.5], dtype=torch.float16), frame_rate=24
     )
+    size = video.Config(11, image.Config(2, 3))
     frames = (
         (1, 0, 0.5, 1, 0.25, 0.75),
         (1, 1, 0.5, 0, 1, 0),
@@ -75,7 +72,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         result = model(
             (segment,),
             frames=(window,),
-            sizes=(SIZE,),
+            sizes=(size,),
             state=state,
             constants=constants,
             workspace=scratch,
@@ -95,7 +92,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
     together = model(
         outputs,
         frames=windows,
-        sizes=(SIZE,) * 3,
+        sizes=(size, size, size),
         state=state,
         constants=constants,
         workspace=scratch,
@@ -118,7 +115,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         model(
             outputs[:2],
             frames=(windows[0], slice(4, 7)),
-            sizes=(SIZE,) * 2,
+            sizes=(size, size),
             state=state,
             constants=constants,
             workspace=scratch,

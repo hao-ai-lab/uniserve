@@ -1,9 +1,10 @@
-"""H3's trained four-evaluation rungs retain their materialization order."""
+"""H3's schedules match their checkpoints' contracts."""
 
 import pytest
 import torch
+from diffusers.schedulers.scheduling_minimax_h3 import MiniMaxH3Scheduler
 
-from uniserve_models.minimax_h3.config import DiffusionConfig, TransformerConfig
+from tests.python.fixtures.h3 import base_denoiser, dmd_denoiser
 from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.packing import audio_latent_frames
 
@@ -12,7 +13,7 @@ pytestmark = pytest.mark.unit
 
 def test_fixed_modality_endpoints():
     with torch.device("meta"):
-        model = Denoiser(TransformerConfig(), DiffusionConfig())
+        model = Denoiser(dmd_denoiser())
     schedules = model.make_schedules(4, shift=None, device="cpu")
     assert tuple(schedules) == ("video", "audio")
     for name, shift in (("video", 12.0), ("audio", 3.0)):
@@ -41,9 +42,25 @@ def test_fixed_modality_endpoints():
 )
 def test_rejects_untrained_schedule(steps, shift):
     with torch.device("meta"):
-        model = Denoiser(TransformerConfig(), DiffusionConfig())
+        model = Denoiser(dmd_denoiser())
     with pytest.raises(ValueError, match="evaluates the network 4 times"):
         model.make_schedules(steps, shift=shift, device="cpu")
+
+
+def test_released_grid_matches_the_reference_scheduler():
+    """The full-step schedule is the diffusers scheduler's, bit for bit."""
+    with torch.device("meta"):
+        model = Denoiser(base_denoiser())
+    schedules = model.make_schedules(49, shift=None, device="cpu")
+    for name, shift in (("video", 12.0), ("audio", 3.0)):
+        reference = MiniMaxH3Scheduler(shift=shift)
+        reference.set_timesteps(50, device="cpu")
+        torch.testing.assert_close(
+            schedules[name].sigmas, reference.sigmas, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            schedules[name].timesteps[:-1], reference.timesteps, rtol=0, atol=0
+        )
 
 
 # Nearest-integer audio latents per aligned frame count: 107 frames last

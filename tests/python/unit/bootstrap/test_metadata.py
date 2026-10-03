@@ -4,6 +4,7 @@ The values are supplied without model allocation.
 """
 
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -93,42 +94,57 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
 
 
 def test_h3_worker_advertises_bounded_media_products():
-    from uniserve_models.minimax_h3 import Config, Model
+    from tests.python.fixtures.h3 import fasth3_config
+    from uniserve_models.minimax_h3 import Model
     from uniserve_worker.bootstrap.components import (
         media_components,
         supported_calls,
     )
     from uniserve_worker.bootstrap.outputs import resolve_outputs
     from uniserve_worker.config.execution import WorkerConfig
-    from uniserve_worker.protocol.call import (
-        VIDEO_CALLS,
-        MediaCall,
-        TransferMode,
-    )
+    from uniserve_worker.protocol.call import MediaCall, TransferMode
 
     with torch.device("meta"):
-        model = Model(Config())
+        model = Model(fasth3_config())
+    # The deployment serves 768p 16:9 and 9:16.
     config = WorkerConfig(
         device="cpu",
         max_sequence_tokens=65,
         max_video_seconds=1.0,
         max_request_pool_size=2,
         min_request_pool_size=2,
+        video_frame_sizes=((768, 1344), (1344, 768)),
     )
     outputs = resolve_outputs(model, config)
     assert set(supported_calls(model)) == {
-        *VIDEO_CALLS,
+        MediaCall.MEDIA_READING,
+        MediaCall.VISION_ENCODING,
+        MediaCall.LATENT_ENCODING,
+        MediaCall.TEXT_ENCODING,
+        MediaCall.LATENT_PREPARATION,
+        MediaCall.DENOISING,
+        MediaCall.VIDEO_DECODING,
+        MediaCall.AUDIO_DECODING,
+        MediaCall.VIDEO_ENCODING,
+        MediaCall.AUDIO_ENCODING,
+        MediaCall.MUXING,
         TransferMode.TENSOR,
     }
     assert media_components(model) == {
+        # The conditioner's vision tower encodes the presentation's vision
+        # blocks; both condition encoders form one component.
+        MediaCall.VISION_ENCODING: "text_encoder",
+        MediaCall.LATENT_ENCODING: "latent_encoder",
         MediaCall.TEXT_ENCODING: "text_encoder",
         MediaCall.LATENT_PREPARATION: "denoiser",
         MediaCall.DENOISING: "denoiser",
         MediaCall.VIDEO_DECODING: "video_decoder",
         MediaCall.AUDIO_DECODING: "audio_decoder",
-        # The host components own no numerical method: the video encoder
-        # encodes the decoded media units and the muxer assembles them.
-        MediaCall.VIDEO_ENCODING: "video_encoder",
+        # The host components own no numerical method: the media reader
+        # decodes condition media, the video codec encodes the decoded media
+        # units and the muxer assembles them.
+        MediaCall.MEDIA_READING: "media_reader",
+        MediaCall.VIDEO_ENCODING: "video_codec",
         MediaCall.AUDIO_ENCODING: "muxer",
         MediaCall.MUXING: "muxer",
     }
@@ -136,21 +152,73 @@ def test_h3_worker_advertises_bounded_media_products():
         value.name: value for values in outputs.values() for value in values
     }
     # One second is covered by two native 17-frame windows and the final
-    # five-frame overlap. Each video latent frame contains 24x42 patch tokens.
+    # five-frame overlap. Each video latent frame contains 24x42 patch tokens
+    # at either canvas.
     expected = {
         "conditioning": (65, 5120),
         "video_latents": (12 * 24 * 42, 96),
         "audio_latents": (2 * 65, 32),
         # A decoding round's product is its RGB media units, one row per
-        # unit at the longest unit's frame count.
-        "video_units": (2, 22, 768, 1344, 3),
+        # unit at the longest unit's frame count, bounded in height and width
+        # by every served canvas.
+        "video_units": (2, 22, 1344, 1344, 3),
         "audio_samples": (52_000, 2),
     }
+    # A deployment without condition capacity declares no condition product.
     assert products.keys() == expected.keys() | {"encoded_units"}
     for name, shape in expected.items():
         assert (
             products[name].shape_bound.max_elements == torch.Size(shape).numel()
         )
+
+    # Only conditioned tasks carry conditions: this deployment executes
+    # text-to-video alone and provisions no condition product, whatever its
+    # condition capacity.
+    conditioned = replace(config, max_condition_rows=1000)
+    assert {
+        value.name
+        for values in resolve_outputs(model, conditioned).values()
+        for value in values
+    } == products.keys()
+
+    # With condition capacity, every condition product is bounded by the
+    # condition rows or the presentation. A condition encodes one frame or a
+    # generated frame count (22 or 39 here); at a 32-pixel raster each latent
+    # frame is one row, and 39 frames encode to 12 latent frames, the most
+    # pixels per row: 39 * 32 * 32 / 12 = 3328. An audio row is half a
+    # stereo latent frame. Each presented token is 2x2 merged patches of
+    # 3 x 2 x 16 x 16 values and one row of the embedding and three
+    # DeepStack features.
+    from uniserve_worker.bootstrap.components import describe_components
+    from uniserve_worker.bootstrap.inputs import media_builder
+    from uniserve_worker.model_executor.resources import (
+        condition_media_layouts,
+        output_layouts,
+    )
+
+    builder = media_builder(model, conditioned)
+    layouts = dict(
+        condition_media_layouts(
+            conditioned,
+            video_encoder=model.video_encoder,
+            audio_encoder=model.audio_encoder,
+            vision=model.text_encoder.vision,
+            frame_counts=(1, 22, 39),
+        )
+    )
+    calls = describe_components(model)
+    for call in (*calls["text_encoder"], *calls["latent_encoder"]):
+        layouts.update(output_layouts(conditioned, call, builder=builder))
+    rate = model.audio_encoder.latent_rate
+    for name, shape in {
+        "condition_pixels": (1000 * 3328, 3),
+        "condition_samples": (500 * rate, 2),
+        "vision_pixels": (4 * 65, 1536),
+        "features": (65, 4 * 5120),
+        "video": (1000, 96),
+        "audio": (1000, 32),
+    }.items():
+        assert layouts[name].shape == shape, name
 
     from uniserve_worker.bootstrap.report import build_worker_layout
 
@@ -278,6 +346,90 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     )
 
 
+def test_h3_media_units_follow_each_request_canvas():
+    """Decoded media units are laid out at each request's own canvas.
+
+    A worker serving several canvases declares the decoded units at its
+    largest height (9:16) and width (21:9) and names those raster axes,
+    which the engine binds to each request's canvas; the worker lays out
+    each request's units at that canvas. Encoded unit rows carry their own
+    length, so every request uses the declared row.
+    """
+    from tests.python.fixtures.h3 import base_config
+    from uniserve.distributed import Communicator, DeviceMesh
+    from uniserve_models.minimax_h3 import Model
+    from uniserve_worker.bootstrap.outputs import resolve_outputs
+    from uniserve_worker.config.deployment import (
+        ComponentConfig,
+        ParallelConfig,
+    )
+    from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.model_executor.component_binding import (
+        ComponentBinding,
+    )
+    from uniserve_worker.protocol.batch import DecodeRange, DiffusionParams
+    from uniserve_worker.protocol.identity import CallId, RequestKey
+    from uniserve_worker.protocol.tensor import StaticDim
+
+    with torch.device("meta"):
+        model = Model(base_config())
+    config = WorkerConfig(
+        device="cpu",
+        max_sequence_tokens=65,
+        max_video_seconds=5.0,
+        deployment_components=("denoiser", "video_decoder", "video_codec"),
+    )
+    products = {
+        value.name: value
+        for values in resolve_outputs(model, config).values()
+        for value in values
+    }
+    units = products["video_units"]
+    assert units.raster_axes == (2, 3)
+    assert units.shape_bound.dims[1:] == (
+        StaticDim(22),
+        StaticDim(1344),
+        StaticDim(1536),
+        StaticDim(3),
+    )
+    (row,) = products["encoded_units"].shape_bound.dims[1:]
+
+    # One rank decodes and encodes every unit of a round.
+    dimensions = ParallelConfig().dimensions
+    group = Communicator((0,), 0)
+    bindings = {
+        name: ComponentBinding(
+            name,
+            ComponentConfig((0,), distribution="temporal_units"),
+            group,
+            DeviceMesh(
+                ranks=(0,),
+                rank=0,
+                shape=tuple(size for _, size in dimensions),
+                axes=tuple(axis for axis, _ in dimensions),
+            ),
+            group.device,
+        )
+        for name in ("video_decoder", "video_codec")
+    }
+    runner = ModelExecutor(model, config, bindings=bindings)
+    try:
+        round_ = DecodeRange(
+            RequestKey(1, 0, 0), CallId(1, 0), cursor=0, max_units=1
+        )
+        for width, height in ((1536, 672), (1344, 768), (768, 1344)):
+            media = DiffusionParams(124, 7, 50, 1, width=width, height=height)
+            assert runner.output_layout(
+                "video_decoder", 0, media, round_, 10
+            ).shape == (1, 22, height, width, 3)
+            assert runner.output_layout(
+                "video_codec", 0, media, round_, 10
+            ).shape == (1, row.extent)
+    finally:
+        runner.close()
+
+
 @pytest.mark.parametrize(
     "seconds,frames", [(5.0, 124), (10.0, 243), (15.0, 362)]
 )
@@ -289,13 +441,14 @@ def test_h3_audio_product_holds_the_decoded_track(seconds, frames):
     duration is a fractional number of latent frames: longer at 124 frames,
     equal at 243 and shorter at 362.
     """
-    from uniserve_models.minimax_h3 import Config, Model
+    from tests.python.fixtures.h3 import fasth3_config
+    from uniserve_models.minimax_h3 import Model
     from uniserve_models.minimax_h3.packing import audio_latent_frames
     from uniserve_worker.bootstrap.outputs import resolve_outputs
     from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
-        model = Model(Config())
+        model = Model(fasth3_config())
     config = WorkerConfig(
         device="cpu",
         max_sequence_tokens=65,
@@ -320,13 +473,14 @@ def test_h3_video_capacity_rounds_half_frames_to_even():
     even, to 124 frames, which is already a complete temporal window;
     rounding away from zero would reach 125 and extend to 141 frames.
     """
-    from uniserve_models.minimax_h3 import Config, Model
+    from tests.python.fixtures.h3 import fasth3_config
+    from uniserve_models.minimax_h3 import Model
     from uniserve_models.minimax_h3.packing import video_latent_frames
     from uniserve_worker.bootstrap.outputs import resolve_outputs
     from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
-        model = Model(Config())
+        model = Model(fasth3_config())
     config = WorkerConfig(
         device="cpu",
         max_sequence_tokens=65,
