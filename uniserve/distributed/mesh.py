@@ -174,14 +174,22 @@ class Communicator:
         dim: int = 0,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Concatenate equal tensors in logical membership order."""
+        """Concatenate equal tensors in logical membership order.
+
+        A one-member group's concatenation is ``value`` itself: without
+        ``out`` the call returns ``value`` (no allocation, no copy), as
+        :meth:`all_reduce` returns its input, so the result may alias the
+        caller's tensor; with ``out`` it copies ``value`` into ``out``.
+        """
         dim = _dimension(value, dim)
+        if self.size == 1 and out is None:
+            return value
         shape = list(value.shape)
         shape[dim] *= self.size
         result = _destination(value, tuple(shape), out)
 
         if self.size == 1:
-            return result.copy_(value)
+            return result if result is value else result.copy_(value)
         if dim == 0 and result.is_contiguous():
             self.all_gather_into(result, value.contiguous())
             return result

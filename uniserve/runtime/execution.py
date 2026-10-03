@@ -28,6 +28,7 @@ from uniserve.nn.linear import (
     Linear,
     MergedColumnParallelLinear,
 )
+from uniserve.nn.moe import FusedMoE
 from uniserve.runtime._collectives import GatherPool
 from uniserve.runtime.communication import stream_collective_scope
 from uniserve.tensors import BufferConfig
@@ -35,6 +36,7 @@ from uniserve.tensors import BufferConfig
 from .bindings import capturing
 from .bindings.attention import AttentionBinding, ExchangeBuffers
 from .bindings.matmul import MatmulBinding
+from .bindings.moe import MoEBinding
 from .bindings.vsa import VsaBinding
 from .resources import streams_idle
 from .stream import CUDAStream
@@ -133,7 +135,9 @@ class ExecutionContext(Generic[SizeT]):
     every combination used by a graph must be exercised before capture.
     Callers retire graphs and asynchronous readers before preparing again or
     closing this owner. A new preparation replaces the previous capacity.
-    Weights and externally supplied buffers remain caller-owned.
+    Weights and externally supplied buffers remain caller-owned; preparing
+    a kernel may replace an encoded weight parameter with the same logical
+    tensor stored in the physical row order that kernel reads.
 
     ``stream`` is a borrowed :class:`CUDAStream`. Its communication owner
     holds the communicators, registered windows and window storage every
@@ -141,6 +145,11 @@ class ExecutionContext(Generic[SizeT]):
     ``scratch``, when given, is a borrowed :class:`Scratch` whose other
     borrowers run on the same stream; the caller closes it after every
     borrower retires. Without it the context owns a private one.
+
+    ``experts`` is a borrowed ``ExpertExchange`` the expert-parallel
+    ``FusedMoE`` layers exchange tokens through; its owner opens a step
+    around every forward and retires it after this context. ``weights`` is
+    borrowed expert storage whose owner outlives its contexts and graphs.
     """
 
     def __init__(
@@ -152,8 +161,11 @@ class ExecutionContext(Generic[SizeT]):
         attention="auto",
         vsa="auto",
         matmul="auto",
+        moe="auto",
         groups=None,
         scratch: Scratch | None = None,
+        experts=None,
+        weights=None,
     ):
         # Close releases the module; a closed context never executes again.
         self.module: nn.Module | None = module
@@ -166,6 +178,9 @@ class ExecutionContext(Generic[SizeT]):
             vsa,
             matmul,
         )
+        self._moe_backend = moe
+        self.experts = experts
+        self.weights = weights
 
         reference: torch.Tensor | None = next(
             (value for value in module.parameters() if not value.is_meta), None
@@ -205,6 +220,7 @@ class ExecutionContext(Generic[SizeT]):
         self._merged: dict[int | _binding.MergedKey, MatmulBinding] = {}
         self._attention: dict[int, AttentionBinding] = {}
         self._vsa: dict[int, VsaBinding] = {}
+        self._moe: dict[int, MoEBinding] = {}
         # VSA plans depend on numerical shapes, not on layer weights. Keep
         # one operator per signature across this context's serialized layers.
         self._vsa_operators = {}
@@ -272,6 +288,12 @@ class ExecutionContext(Generic[SizeT]):
                 "attention", {"scratch": shared}, device
             )["scratch"]
         return views
+
+    def _moe_workspace(self, requirements, device):
+        # Grouped-expert kernels consume their work areas within one call and
+        # write the combined output before returning, so every expert layer
+        # on this serialized context shares one backing.
+        return self.scratch("moe", requirements, device)
 
     def _vsa_buffers(self, slot, requirements, device):
         # Two projection slots permit one layer's output consumption to overlap
@@ -522,6 +544,20 @@ class ExecutionContext(Generic[SizeT]):
                             with pool.borrow(amount, device):
                                 pass
 
+                if isinstance(child, FusedMoE):
+                    moe_binding = MoEBinding(
+                        child,
+                        self._moe_backend,
+                        size if isinstance(size, TextSize) else None,
+                        device,
+                        self._moe_workspace,
+                        self.experts,
+                        self.weights,
+                    )
+                    self._moe[id(child)] = moe_binding
+                    if isinstance(size, TextSize):
+                        moe_binding.prepare(size)
+
                 if isinstance(child, BlockAttention):
                     self._vsa[id(child)] = VsaBinding(
                         self._vsa_backend,
@@ -631,6 +667,42 @@ class ExecutionContext(Generic[SizeT]):
         self._vsa_context[parallel] = buffers
         return buffers
 
+    def join_expert_layers(self) -> None:
+        """Join the open step at every expert layer its forward skipped.
+
+        Every rank of an expert group exchanges at every expert-parallel
+        layer of every step, in layer order, whether or not its forward
+        reached that layer: a prefill that stops after the final layer's
+        cache write skips the final expert layer, and a rank without work
+        reaches none. The skipped layers are the forward's tail, so joining
+        them afterwards keeps the layer order. A rank then exchanges with no
+        tokens of its own and still runs its experts over what it receives.
+        The caller runs this inside ``activate``.
+        """
+        exchange = self.experts
+        if exchange is None or not exchange.capacity:
+            return
+        invoked = exchange.invoked
+        pending = [
+            binding
+            for binding in self._moe.values()
+            if binding.exchange is exchange
+            and id(binding.module) not in invoked
+        ]
+        if not pending:
+            return
+        # The reached layers precede the skipped ones in module order.
+        order = list(self._moe.values())
+        if any(
+            id(binding.module) in invoked
+            for binding in order[order.index(pending[0]) :]
+        ):
+            raise RuntimeError(
+                "a forward skipped an expert layer before one it reached"
+            )
+        for binding in pending:
+            binding.join(binding.module.hidden_size, self._dtype)
+
     def bind_attention(self, batch):
         """Plan one call's attention metadata on every attention layer.
 
@@ -681,8 +753,11 @@ class ExecutionContext(Generic[SizeT]):
             _install(scope, _binding.merged_matmul, self._merged)
             _install(scope, _binding.attention, self._attention)
             _install(scope, _binding.vsa, self._vsa)
+            _install(scope, _binding.moe, self._moe)
             _install(scope, _binding.attention_storage, self._exchange)
             _install(scope, _binding.linear_chunks, self._chunks)
+            if self.weights is not None:
+                scope.enter_context(self.weights.activate())
             yield
 
     def _release(self):
@@ -696,6 +771,7 @@ class ExecutionContext(Generic[SizeT]):
             close_resources(
                 *(binding.close for binding in self._attention.values()),
                 *(binding.close for binding in self._vsa.values()),
+                *(binding.close for binding in self._moe.values()),
                 *(operator.close for operator in self._vsa_operators.values()),
                 *(
                     allocation.close
@@ -714,6 +790,7 @@ class ExecutionContext(Generic[SizeT]):
                 self._merged,
                 self._attention,
                 self._vsa,
+                self._moe,
                 self._vsa_operators,
                 self._vsa_output,
                 self._vsa_context,

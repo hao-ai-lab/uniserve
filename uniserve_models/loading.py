@@ -37,12 +37,13 @@ import torch
 from torch import nn
 
 from uniserve import loading
-from uniserve.distributed import DeviceMesh
+from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.loading import checkpoint
 from uniserve.loading import weights as weight_options
 from uniserve.model import ComponentEntry
 from uniserve.nn.attention import AttentionParallelConfig
 from uniserve.nn.linear import Linear
+from uniserve.nn.moe import ExpertLinear
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
 
@@ -136,6 +137,7 @@ class Config(Generic[ConfigT, ModelT]):
         flow_prompt: The package's classifier-free-guidance prompt framing,
             or ``None``.
         modules: Selected module paths; ``None`` selects the whole model.
+        exclude_modules: Subtrees excluded from that selection by identity.
         checkpoint_identity: Identity of the checkpoint, as defined by
             ``checkpoint_identity``. Every rank of one instance must load the
             same checkpoint, and the launching side derives the same value
@@ -156,6 +158,7 @@ class Config(Generic[ConfigT, ModelT]):
     flow_prompt: FlowPrompt | None
     modules: frozenset[str] | None
     checkpoint_identity: str
+    exclude_modules: frozenset[str] = frozenset()
 
     def __post_init__(self):
         # Freeze the caller's containers; ``ComponentEntry`` values are
@@ -168,6 +171,9 @@ class Config(Generic[ConfigT, ModelT]):
         )
         if self.modules is not None:
             object.__setattr__(self, "modules", frozenset(self.modules))
+        object.__setattr__(
+            self, "exclude_modules", frozenset(self.exclude_modules)
+        )
 
 
 def _json(path: Path) -> dict:
@@ -666,27 +672,6 @@ def _tokens(processor, root):
     return replace(processor, feature_injection=replace(injection, **updates))
 
 
-def _selection(model, modules):
-    """Return the ``id`` of every module under the selected paths.
-
-    ``None`` selects the whole model. Identity rather than path membership
-    lets a module shared under several paths count as selected through any
-    of them. A path that does not name a submodule raises ``ValueError``.
-    """
-    if modules is None:
-        return {id(child) for child in model.modules()}
-    try:
-        return {
-            id(child)
-            for path in modules
-            for child in model.get_submodule(path).modules()
-        }
-    except AttributeError as error:
-        raise ValueError(
-            "selected modules must be actual model module paths"
-        ) from error
-
-
 def _exclusions(model, declarations, sources, ignored, io):
     """Translate checkpoint exclusions through the same explicit assignments.
 
@@ -953,6 +938,12 @@ def _calibrated_quantization(
                             raise ValueError(
                                 f"{path} has conflicting activation calibration"
                             )
+                        if isinstance(paths[path], ExpertLinear):
+                            # Stacked experts share one activation encoding;
+                            # its static scale is the largest calibrated
+                            # expert scale, so no expert's input saturates.
+                            scales[path] = max(scales.get(path, 0.0), value)
+                            continue
                         if not isinstance(paths[path], Linear):
                             raise ValueError(
                                 f"ModelOpt weight {weight.name!r} maps onto "
@@ -1108,6 +1099,7 @@ def read_config(
     *,
     io: loading.Config = loading.Config(),
     modules: frozenset[str] | None = None,
+    exclude_modules: frozenset[str] = frozenset(),
     base: str | Path | None = None,
 ) -> Config:
     """Normalize one local or immutable Hub snapshot without materializing a
@@ -1126,6 +1118,8 @@ def read_config(
             safetensors headers (see ``_config_sources``).
         modules: Module paths to resolve sources for; ``None`` selects the
             whole model, and an empty set resolves no payload source.
+        exclude_modules: Subtrees to leave unmaterialized, including their
+            aliases. Their architecture metadata remains available.
         base: A local copy of the base checkpoint a component export pins
             (``Base``), verified against the pinned revision; without it the
             base comes from the Hub cache at that revision. The checkpoint
@@ -1220,18 +1214,20 @@ def read_config(
     )
     with torch.device("meta"):
         model = package.Model(model_config)
-    selected = _selection(model, modules)
+    selected = loading.select_modules(
+        model, modules, exclude_modules=exclude_modules
+    )
     declarations = package.checkpoint_mappings(model)
     parameters = {
         id(parameter)
         for module in model.modules()
-        if id(module) in selected
+        if module in selected
         for parameter in module.parameters(recurse=False)
     }
     source_names = {
         component.source
         for component in declarations
-        if id(component.module) in selected
+        if component.module in selected
         or any(
             id(parameter) in parameters
             and name in component.required | component.optional
@@ -1399,6 +1395,7 @@ def read_config(
         package.flow_prompt,
         modules,
         identity,
+        exclude_modules,
     )
 
 
@@ -1412,12 +1409,15 @@ def load_model(
     attention: Mapping[str, AttentionParallelConfig] | None = None,
     devices: Mapping[str, torch.device | str] | None = None,
     modules: frozenset[str] | None = None,
+    exclude_modules: frozenset[str] = frozenset(),
+    experts: Communicator | None = None,
 ) -> loading.Result[ModelT]:
     """Materialize the selected capability modules through the common loader.
 
     ``precision`` names one of ``config.precisions`` and ``weights`` supplies
     a weight configuration directly; with neither, ``config.weights``
     applies. ``modules`` may narrow ``config.modules`` but not widen it.
+    ``exclude_modules`` adds to the exclusions already resolved in ``config``.
     The remaining arguments pass through to ``uniserve.loading.load_model``.
 
     Raises:
@@ -1439,11 +1439,16 @@ def load_model(
     # A caller may narrow the resolved module selection but never widen it:
     # read_config fetched payloads only for the resolved selection.
     selected = config.modules if modules is None else modules
-    if config.modules is not None and selected is not None:
+    excluded = config.exclude_modules | frozenset(exclude_modules)
+    if config.modules is not None or config.exclude_modules:
         with torch.device("meta"):
             model = config.model_class(config.model)
-        if not _selection(model, selected).issubset(
-            _selection(model, config.modules)
+        if not loading.select_modules(
+            model, selected, exclude_modules=excluded
+        ).issubset(
+            loading.select_modules(
+                model, config.modules, exclude_modules=config.exclude_modules
+            )
         ):
             raise ValueError(
                 "load selection exceeds the modules resolved by read_config"
@@ -1461,4 +1466,6 @@ def load_model(
         attention=attention,
         devices=devices,
         modules=selected,
+        exclude_modules=excluded,
+        experts=experts,
     )
