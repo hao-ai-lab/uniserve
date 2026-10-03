@@ -17,6 +17,9 @@ pytestmark = pytest.mark.integration
 _SOURCE = textwrap.dedent("""
     #include <Python.h>
 
+    #define CONCAT_IMPL(a, b) a##b
+    #define CONCAT(a, b) CONCAT_IMPL(a, b)
+
     static PyObject* answer(PyObject*, PyObject*) {
       return PyLong_FromLong(42);
     }
@@ -30,15 +33,17 @@ _SOURCE = textwrap.dedent("""
         PyModuleDef_HEAD_INIT, "probe", nullptr, -1, methods,
     };
 
-    PyMODINIT_FUNC PyInit_probe() { return PyModule_Create(&definition); }
+    PyMODINIT_FUNC CONCAT(PyInit_, TORCH_EXTENSION_NAME)() {
+      return PyModule_Create(&definition);
+    }
 """)
 
 _LOAD = textwrap.dedent("""
     import sys
     from pathlib import Path
-    from uniserve_kernels import extension
+    from uniserve_kernels import jit
 
-    module = extension.load("probe", Path(sys.argv[1]), ["probe.cpp"])
+    module = jit.load("probe", [Path(sys.argv[1]) / "probe.cpp"])
     print(module.answer())
 """)
 
@@ -133,3 +138,41 @@ def test_load_completes_after_a_builder_is_killed_mid_build(tmp_path):
 
     assert loaded.returncode == 0, loaded.stdout + loaded.stderr
     assert loaded.stdout.strip() == "42"
+
+
+def test_loaded_extensions_follow_headers_and_build_flags(
+    tmp_path, monkeypatch
+):
+    from uniserve_kernels import jit
+
+    monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path / "extensions"))
+    sources = tmp_path / "sources"
+    left, right = sources / "left" / "value.h", sources / "right" / "value.h"
+    left.parent.mkdir(parents=True)
+    right.parent.mkdir(parents=True)
+    left.write_text("#define LEFT 20\n")
+    right.write_text("#define RIGHT 21\n")
+    source = sources / "probe.cpp"
+    source.write_text(
+        '#include "left/value.h"\n#include "right/value.h"\n'
+        + _SOURCE.replace(
+            "PyLong_FromLong(42)", "PyLong_FromLong(LEFT + RIGHT + OFFSET)"
+        )
+    )
+
+    def load(offset):
+        return jit.load(
+            "header_probe",
+            [source],
+            headers=[left, right],
+            source_root=sources,
+            include_dirs=["."],
+            cxx_flags=["-O2", f"-DOFFSET={offset}"],
+        )
+
+    first = load(1)
+    assert first.answer() == 42
+    left.write_text("#define LEFT 30\n")
+    assert load(1).answer() == 52
+    assert load(2).answer() == 53
+    assert first.answer() == 42
