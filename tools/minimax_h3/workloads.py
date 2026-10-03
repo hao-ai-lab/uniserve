@@ -176,6 +176,23 @@ WORKLOADS = {
             duration_seconds=5.0,
             seeds=(DEFAULT_SEED, OFFICIAL_SEED),
         ),
+        # The shortest and longest durations serving admits: 107 and 362
+        # frames. The diffusers pipeline rejects both by its duration check
+        # alone, which the reference generator lifts.
+        Workload(
+            name="t2va_16x9_4s",
+            task="t2va",
+            prompt="official:t2va",
+            aspect_ratio="16:9",
+            duration_seconds=4.0,
+        ),
+        Workload(
+            name="t2va_16x9_15s",
+            task="t2va",
+            prompt="official:t2va",
+            aspect_ratio="16:9",
+            duration_seconds=15.0,
+        ),
         # The official FL2VA request: first keyframe, 8 s, auto canvas.
         Workload(
             name="fl2va_first_8s",

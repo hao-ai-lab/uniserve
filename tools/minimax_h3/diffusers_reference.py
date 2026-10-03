@@ -91,13 +91,26 @@ NATIVE_DTYPES = {
     "audio_vae": torch.float32,
 }
 
-# DiT attention kernels. Both are PyTorch SDPA backends; the canonical
-# reference uses cuDNN, which is also what PyTorch's default SDPA dispatch
-# selects on SM100. The text encoder and the VAEs keep the default dispatch.
-ATTENTION_BACKENDS = {"cudnn": "_native_cudnn", "flash": "_native_flash"}
+# DiT attention kernels: the exact PyTorch SDPA backends that run the DiT's
+# shapes on SM100. The canonical reference uses cuDNN, which is also what
+# PyTorch's default SDPA dispatch selects there; flash and memory-efficient
+# are the alternative kernels of the acceptance protocol's valid
+# implementations. The text encoder and the VAEs keep the default dispatch.
+ATTENTION_BACKENDS = {
+    "cudnn": "_native_cudnn",
+    "flash": "_native_flash",
+    "efficient": "_native_efficient",
+}
 
 FPS = 24
 SHORT_EDGE = 768
+# Generated durations serving admits, as aligned frame counts: 4 s requests
+# align to 107 frames and 15 s requests to 362 (15.08 s). The diffusers
+# pipeline's own bounds (5 to 15 s of aligned frames) reject both ends,
+# while its numerical code is length-generic, so the reference lifts only
+# that check.
+MIN_FRAMES = 107
+MAX_FRAMES = 362
 MAX_PIXELS = 768 * 1344
 CANVAS_MULTIPLE = 32
 
@@ -397,6 +410,11 @@ def load_pipeline(task: str, checkpoint: Path, attention: str):
     from diffusers import ModularPipeline
 
     pipe = ModularPipeline.from_pretrained(str(checkpoint), workflow=task)
+    # Widen the duration check to the serving bounds; nothing else reads
+    # these properties.
+    pipeline_class = type(pipe)
+    pipeline_class.min_duration = property(lambda self: MIN_FRAMES / FPS)
+    pipeline_class.max_duration = property(lambda self: MAX_FRAMES / FPS)
     # The pipeline's blocks are already pruned to the workflow, so this loads
     # only the components the task uses (one of the two DiT partitions).
     pipe.load_components(

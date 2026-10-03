@@ -23,10 +23,11 @@ condition's, then the video's and the audio's), the retained conditioning
 initial samples, and the samples after the first step.
 
 How closely the model follows the diffusers reference is the model's own
-contract, characterized at the model level; each case prints the first
-step's deviation from the reference beside the reference's own deviation
-between two valid attention kernels (``envelopes/<workload>.json``) for
-information only.
+contract, judged by the trajectory acceptance rule
+(``tools/minimax_h3/acceptance.py``); each case prints the first step's
+prediction deviation from the reference beside the deviations of the
+reference's alternative attention kernels on the same inputs
+(``acceptance/<workload>/seed42/kernel_steps.json``) for information only.
 
 The cases need the released checkpoint (``UNISERVE_H3_MODEL``), the
 reference artifacts (``UNISERVE_MINIMAX_H3_REFERENCE``) and the FFmpeg build
@@ -487,12 +488,26 @@ def test_conditioned_request_computes_the_model_first_step(
         for name in denoiser.modalities:
             assert _equal(successor[name], request[name]), name
 
-    floors = json.loads((root / "envelopes" / f"{case}.json").read_text())
+    # The first Euler update is linear in the prediction from the shared
+    # initial samples, so the deviation of the sample increments is the
+    # deviation of the first predictions.
+    kernels = json.loads(
+        (
+            root / "acceptance" / case / f"seed{SEED}" / "kernel_steps.json"
+        ).read_text()
+    )
     with safe_open(run / "trajectory.safetensors", "pt") as handle:
         for name in denoiser.modalities:
             reference = handle.get_slice(f"{name}_samples")[0]
+            initial = first[name].cpu()
+            deviation = _rel(
+                successor[name].cpu() - initial, reference - initial
+            )
+            valid = max(
+                kernels[name]["flash"][0], kernels[name]["efficient"][0]
+            )
             print(
-                f"{case} {name} step 0 deviation from the reference "
-                f"{_rel(successor[name], reference):.3e}, reference kernel "
-                f"floor {floors[f'{name}_sample_rel_l2'][0]:.3e}"
+                f"{case} {name} step 0 prediction deviation from the reference "
+                f"{deviation:.3e}, the reference's alternative kernels "
+                f"{valid:.3e}"
             )
