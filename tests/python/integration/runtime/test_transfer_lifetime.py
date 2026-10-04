@@ -455,9 +455,10 @@ def test_cuda_vmm_rejects_a_changed_registered_view() -> None:
         event_pool.close()
 
 
-def test_local_read_keeps_its_producer_fence_after_publication_retirement() -> (
-    None
-):
+@pytest.mark.parametrize("ending", ("close", "drop"))
+def test_local_read_keeps_its_producer_fence_after_publication_retirement(
+    ending: str,
+) -> None:
     device = torch.device("cuda:0")
     events = EventPool()
     transport = make_transport(
@@ -482,12 +483,17 @@ def test_local_read_keeps_its_producer_fence_after_publication_retirement() -> (
         assert retirement is not None and not retirement.done()
         replacement = transport.publish(unrelated)
         with torch.cuda.stream(consumer):
-            value = retained.result(consumer).cpu()
-        retained.close()
+            value = retained.result(consumer).clone()
+        if ending == "close":
+            retained.close()
+        else:
+            del retained
         consumer.synchronize()
         events.reap()
         retirement.result(timeout=5)
-        assert torch.equal(value, torch.full((1024,), 7, dtype=torch.float32))
+        assert torch.equal(
+            value.cpu(), torch.full((1024,), 7, dtype=torch.float32)
+        )
     finally:
         if locator is not None:
             transport.release(locator)

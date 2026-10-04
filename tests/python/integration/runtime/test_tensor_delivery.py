@@ -582,7 +582,12 @@ def test_backends_share_the_rank_byte_budget_until_publications_retire() -> (
         events.close()
 
 
-def test_read_ticket_capacity_is_shared_across_backends() -> None:
+@pytest.mark.parametrize("ending", ("close", "drop"))
+def test_read_ticket_capacity_is_shared_across_backends(ending: str) -> None:
+    import gc
+
+    from uniserve_worker.transport.pool import ReadBackpressureError
+
     events = EventPool()
     transports = make_transports(
         ("local", "shm"),
@@ -594,14 +599,35 @@ def test_read_ticket_capacity_is_shared_across_backends() -> None:
     local = transports["local"].publish(source)
     shared = transports["shm"].publish(source)
     borrowed = transports["local"].fetch(local, device=torch.device("cpu"))
+    retired = threading.Event()
+    borrowed.add_retirement_callback(retired.set)
     destination = torch.full_like(source, -1)
     try:
-        with pytest.raises(WorkerError, match="ticket capacity is exhausted"):
+        with pytest.raises(
+            ReadBackpressureError, match="ticket capacity is exhausted"
+        ) as refused:
             transports["shm"].fetch(
                 shared, device=destination.device, destination=destination
             )
         assert bool(torch.all(destination == -1))
-        borrowed.close()
+        returned = threading.Event()
+        capacity = refused.value.capacity
+        capacity.notify_reads_returned(
+            returned.set, after=refused.value.returns
+        )
+        if ending == "close":
+            borrowed.close()
+        else:
+            borrowed = None
+            gc.collect()
+        assert retired.is_set() and returned.is_set()
+        # A return between refusal and notification registration is observed
+        # immediately; retrying the read never depends on a second return.
+        after_return = threading.Event()
+        capacity.notify_reads_returned(
+            after_return.set, after=refused.value.returns
+        )
+        assert after_return.is_set()
         _consume(
             (
                 transports["shm"].fetch(
@@ -611,7 +637,8 @@ def test_read_ticket_capacity_is_shared_across_backends() -> None:
         )
         torch.testing.assert_close(destination, source, rtol=0, atol=0)
     finally:
-        borrowed.close()
+        if borrowed is not None:
+            borrowed.close()
         for location in (local, shared):
             transports[location.backend].release(location)
         for transport in transports.values():

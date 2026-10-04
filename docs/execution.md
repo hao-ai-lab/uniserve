@@ -10,6 +10,8 @@ The native `TensorStore` owns values that pass between calls. A `Buffer` becomes
 
 An import shares resident coverage and fetches only missing regions into the reserved destination. Readers of an earlier shard keep that view while `TensorImport` coordinates the transfers needed by full-tensor consumers. Failed or cancelled imports retain their destinations until physical transfer completion. Request relays use bounded scalar lanes with fixed addresses; the store admits another call into a lane only after every value in that lane retires.
 
+Transport backends share a native `TransferCapacity` for bytes and read credits. A `ReadReservation` takes an entire fetch's credits before any read starts. The native `TransferPool` orders copies after both the producer fence and the submitting thread's destination stream. Its `TransferTicket` exposes consumable views before physical completion, so consumers can enqueue work behind the read fence. Cancellation revokes consumption; credit returns only after device access drains. Borrowed local views retain their source grant through every consumer stream. A failure to establish physical completion keeps the affected resources and credits occupied and surfaces through the pool and storage owners.
+
 ## Token and canvas calls
 
 Prefill, token decode and token denoising use separate homogeneous numerical calls. A prefill can write context without projecting logits or sampling. Readout canvases attend to that context without changing its KV entries; their candidate probabilities are normalized over the full vocabulary.

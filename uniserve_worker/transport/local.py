@@ -259,6 +259,7 @@ class LocalTransport(Transport):
             )
             source.readers += 1
 
+        borrowed_ticket = None
         try:
             if target is not None:
                 # Copy path: the pool ticket retires when the copy's physical
@@ -288,21 +289,28 @@ class LocalTransport(Transport):
             else:
                 reservation.use()
             try:
-                ticket = TransferTicket(owner._events)
+                ticket = TransferTicket(
+                    owner._events,
+                    release=lambda: self._finish_borrow(owner, source),
+                )
+                borrowed_ticket = ticket
                 if self._completion_wake is not None:
                     ticket.add_done_callback(self._completion_wake)
                     ticket.add_retirement_callback(self._completion_wake)
                 ticket._complete(tensor, event)
-                ticket._consumer_release = lambda: self._finish_borrow(
-                    owner, source
-                )
                 self._borrowed.add(ticket)
             except BaseException:
-                self.capacity.return_reads()
+                if borrowed_ticket is None:
+                    self.capacity.return_reads()
                 raise
             return ticket
         except BaseException:
-            owner._release_reader(source)
+            # Once a borrowed ticket owns the grant, its close path returns
+            # both source ownership and credit, including setup failure.
+            if borrowed_ticket is None:
+                owner._release_reader(source)
+            else:
+                borrowed_ticket.close()
             raise
 
     def _release_reader(self, source: _LocalSource) -> None:
