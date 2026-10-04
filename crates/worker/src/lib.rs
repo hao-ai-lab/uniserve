@@ -3,6 +3,7 @@
 mod block_tables;
 mod buffer;
 mod completion;
+pub mod cuda;
 mod error;
 mod executor;
 mod host;

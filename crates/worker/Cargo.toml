@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 crossbeam-channel.workspace = true
 indexmap.workspace = true
+libc.workspace = true
+libloading.workspace = true
 thiserror.workspace = true
 uniserve-core.workspace = true
 uniserve-worker-ipc.workspace = true
