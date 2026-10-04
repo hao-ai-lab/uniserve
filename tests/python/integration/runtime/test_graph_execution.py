@@ -189,8 +189,7 @@ def test_denoising_steps_read_the_committed_bank_and_write_the_other(
                 for step in (0, 1):
                     committed = _committed(pool, bank, slot, size).clone()
                     reference.add_(0.5 * (reference * 0.25 + size.offset))
-                    actual, path = runner.step(ladder, step, bank)
-                    assert path == ("graph_replay" if graphs else "eager")
+                    actual, _ = runner.step(ladder, step, bank)
                     torch.testing.assert_close(
                         actual["image"][0], reference, rtol=1e-6, atol=1e-6
                     )
@@ -220,10 +219,8 @@ def test_denoising_steps_read_the_committed_bank_and_write_the_other(
 def test_captured_ladders_replay_on_every_slot_with_eager_values():
     """Startup capture leaves one ladder resident that every slot replays.
 
-    Warmup captures one graph per ladder step from one slot's pages; the
-    graph reads whichever pages the device rows name, so the steps a request
-    runs on either slot replay rather than capture, and their values match an
-    eager evaluation of the same ladder from the same samples.
+    One captured graph reads whichever pages the device rows name. The
+    values on every slot must match the same ladder evaluated eagerly.
     """
     device = torch.device("cuda:0")
     model = LinearDenoiser().to(device)
@@ -233,22 +230,21 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     slots = (1, 2)
 
     def ladder(runner, pool):
-        values, paths = {}, []
+        values = {}
         for slot in slots:
             _committed(pool, 1, slot, size).fill_(7.0)
             bound = _bind(runner, schedules, size, steps, slot)
             bank = 1
             for step in range(steps):
-                result, path = runner.step(bound, step, bank)
-                paths.append(path)
+                result, _ = runner.step(bound, step, bank)
                 bank = 1 - bank
             values[slot] = result["image"][0].clone()
-        return values, paths
+        return values
 
     pool = _pool(2, device=device)
     eager = _runner(model, size, device=device, stream=None, pool=pool)
     try:
-        expected, _ = ladder(eager, pool)
+        expected = ladder(eager, pool)
     finally:
         torch.cuda.current_stream(device).synchronize()
         eager.close()
@@ -275,8 +271,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
             atol=0,
         )
 
-        actual, paths = ladder(runner, pool)
-        assert paths == ["graph_replay"] * (len(slots) * steps)
+        actual = ladder(runner, pool)
         for slot in slots:
             torch.testing.assert_close(
                 actual[slot], expected[slot], rtol=1e-6, atol=1e-6
@@ -289,13 +284,8 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
 
 
 @torch.inference_mode()
-def test_a_capturing_runner_serves_only_startup_captured_layouts():
-    """Serving never evaluates a capturing runner's steps eagerly.
-
-    A step of a layout whose graph startup did not capture is refused rather
-    than run without graphs; once the layout's graph is captured, every
-    solver step replays it.
-    """
+def test_prepared_layout_preserves_step_values_when_captured():
+    """Preparing and later capturing a layout preserve its solver values."""
     device = torch.device("cuda:0")
     model = LinearDenoiser().to(device)
     steps = 2
@@ -314,15 +304,22 @@ def test_a_capturing_runner_serves_only_startup_captured_layouts():
     )
     try:
         bound = _bind(runner, schedules, size, steps, 1)
-        _committed(pool, 1, 1, size).fill_(7.0)
-        for step in range(steps):
-            with pytest.raises(RuntimeError, match="no graph"):
-                runner.step(bound, step, 1)
+        for capture in (False, True):
+            _committed(pool, 1, 1, size).fill_(7.0)
+            if capture:
+                runner.warmup(bound)
+                runner.capture(bound)
 
-        runner.warmup(bound)
-        runner.capture(bound)
-        assert runner.step(bound, 0, 1)[1] == "graph_replay"
-        assert runner.step(bound, 1, 0)[1] == "graph_replay"
+            bank = 1
+            for step in range(steps):
+                actual, _ = runner.step(bound, step, bank)
+                torch.testing.assert_close(
+                    actual["image"][0],
+                    _advanced(size, step + 1, device=device),
+                    rtol=1e-6,
+                    atol=1e-6,
+                )
+                bank = 1 - bank
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()

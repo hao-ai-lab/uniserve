@@ -34,7 +34,7 @@ pub(crate) struct PendingOutput {
     code: CallKind,
     progress: RequestProgress,
     accepted: Option<RequestProgress>,
-    status: CallStatus,
+    pub(super) status: CallStatus,
     error_code: Option<ErrorCode>,
     buffer: Option<Py<OutputBuffer>>,
     row: usize,

@@ -1,6 +1,7 @@
 //! Python numerical backend for the shared native batch executor.
 
 mod commit;
+mod execute;
 mod output;
 mod prepare;
 mod retirement;
@@ -82,6 +83,27 @@ struct BatchState {
     propagate_errors: bool,
     output: Option<BatchOutput>,
     retirement: Retirement,
+}
+
+impl BatchState {
+    fn pending_outputs<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PendingOutput>>> {
+        self.numerical
+            .bind(py)
+            .getattr("outputs")?
+            .try_iter()?
+            .map(|output| output?.cast_into::<PendingOutput>().map_err(Into::into))
+            .collect()
+    }
+
+    fn record_execution(&self, py: Python<'_>, stats: &Bound<'_, PyAny>) -> PyResult<()> {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("execution_us", stats.get_item(0)?)?;
+        kwargs.set_item("stats", stats.get_item(1)?)?;
+        self.numerical
+            .bind(py)
+            .call_method("record_execution", (), Some(&kwargs))?;
+        Ok(())
+    }
 }
 
 impl PythonBackend {
