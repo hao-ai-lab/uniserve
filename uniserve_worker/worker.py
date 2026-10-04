@@ -130,7 +130,6 @@ class Worker:
     kv_cache: KVCacheManager | None
     block_tables: BlockTables | None
     latent_pool: LatentPool | None
-    _completion_wake: Callable[[], None] | None = None
 
     def __enter__(self) -> Self:
         """Enter the owning scope.
@@ -1043,7 +1042,6 @@ class Worker:
         `bind` registers the IPC endpoint's callbacks; passing ``None`` for
         both unregisters them.
         """
-        self._completion_wake = wake
         self.device_events.set_completion_wake(wake_on_stream)
         self.host_tasks.set_completion_wake(wake)
 

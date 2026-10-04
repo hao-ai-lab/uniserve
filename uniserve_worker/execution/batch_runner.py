@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
-from functools import partial
 from typing import TYPE_CHECKING
 
-from uniserve_worker._uniserve_ipc import CUDAEvent, Submission
+from uniserve_worker._uniserve_ipc import CUDAEvent
 from uniserve_worker.errors import (
     invalid_descriptor,
 )
@@ -29,7 +28,6 @@ from uniserve_worker.transport.exports import (
     release_exports,
     retiring_exports,
 )
-from uniserve_worker.transport.pool import ReadBackpressureError
 
 if TYPE_CHECKING:
     from uniserve_worker.worker import Worker
@@ -83,19 +81,6 @@ class BatchRunner:
         )
         if freed:
             self.release_buffers(freed)
-
-    def notify_ready(self, submission: Submission) -> None:
-        submission.notify_ready()
-        if self.worker._completion_wake is not None:
-            self.worker._completion_wake()
-
-    def await_inputs(self, state: BatchState, submission: Submission) -> None:
-        if not state.inputs.awaiting_reads:
-            state.inputs.on_ready(partial(self.notify_ready, submission))
-
-    def prepare_inputs(self, state: BatchState, submission: Submission) -> bool:
-        self.advance_inputs(state, submission)
-        return state.inputs.ready()
 
     def reap(self) -> None:
         self.worker.device_events.reap()
@@ -208,9 +193,10 @@ class BatchRunner:
             )
         )
 
-    def prepare(self, state: BatchState) -> None:
+    def prepare(self, state: BatchState) -> bool:
         """Apply the batch's commands, validate it and prepare its inputs.
 
+        Returns whether the prepared batch imports tensor or KV products.
         Raises ``invalid_descriptor`` for call kinds this worker cannot
         execute, and propagates validation and preparation failures.
         """
@@ -310,54 +296,24 @@ class BatchRunner:
             request_pool=self.worker.requests,
             model_runner=self.worker.runner,
         )
+        return bool(state.input_products or state.kv_inputs)
 
-    def advance_inputs(self, state: BatchState, submission: Submission) -> None:
-        """Submit ready physical reads and predicate copies.
+    def prepare_inputs(self, state: BatchState) -> None:
+        """Bind tensor views and submit copies into reserved destinations."""
+        prepare_inputs(
+            state,
+            kv_cache=self.worker.kv_cache,
+            tensor_store=self.worker.tensor_store,
+            latent_pool=self.worker.latent_pool,
+            output_pool=self.worker.output_pool,
+            request_tables=self.worker.block_tables,
+            request_pool=self.worker.requests,
+            model_runner=self.worker.runner,
+            transfer_backends=self.worker.transports,
+            config=self.worker.worker_config,
+        )
 
-        Does not launch a model. Input reads are submitted after every
-        storage dependency is done when the batch imports products or KV;
-        later calls only capture predicates. While too few read tickets are
-        free for the next import, the batch is marked ``awaiting_reads`` and
-        woken when one returns, and the next call resumes at that import.
-        """
-        if state.inputs.closed:
-            return
-        if state.inputs.submitted:
-            capture_predicates(state, self.worker.tensor_store)
-            return
-        # A destination remains unavailable until the previous physical reader
-        # retires. Dependencies with no import still gate model execution.
-        if (
-            state.input_products or state.kv_inputs
-        ) and not state.inputs.storage_ready():
-            return
-        if state.input_products or state.kv_inputs:
-            state.inputs.require_storage()
-
-        state.inputs.awaiting_reads = False
-        try:
-            prepare_inputs(
-                state,
-                kv_cache=self.worker.kv_cache,
-                tensor_store=self.worker.tensor_store,
-                latent_pool=self.worker.latent_pool,
-                output_pool=self.worker.output_pool,
-                request_tables=self.worker.block_tables,
-                request_pool=self.worker.requests,
-                model_runner=self.worker.runner,
-                transfer_backends=self.worker.transports,
-                config=self.worker.worker_config,
-            )
-        except ReadBackpressureError as error:
-            # Read tickets return as reads retire, independently of this
-            # batch, so the batch resumes once one does.
-            state.inputs.awaiting_reads = True
-            error.capacity.notify_reads_returned(
-                partial(self.notify_ready, submission),
-                after=error.returns,
-            )
-            return
-        state.inputs.submitted = True
+    def capture_predicates(self, state: BatchState) -> None:
         capture_predicates(state, self.worker.tensor_store)
 
     def begin_retirement(self, state: BatchState) -> None:

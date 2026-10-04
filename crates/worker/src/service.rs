@@ -65,6 +65,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
         info: WorkerInfo,
         experts: bool,
     ) -> Self {
+        executor.set_completion_wake(Some(endpoint.completion_wake()));
         Self {
             executor,
             endpoint,
@@ -245,5 +246,11 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
         self.executor
             .backend()
             .error(Error::Transport(error.to_string()))
+    }
+}
+
+impl<B: ServiceBackend> Drop for Service<'_, B> {
+    fn drop(&mut self) {
+        self.executor.set_completion_wake(None);
     }
 }

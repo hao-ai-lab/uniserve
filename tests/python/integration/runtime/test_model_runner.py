@@ -1700,19 +1700,29 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         worker.close()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm"))
 @pytest.mark.parametrize(
-    "dtype", (DType.BF16, DType.F32, DType.I32, DType.I64, DType.I16)
+    "backend,dtype,serving",
+    [
+        (backend, dtype, False)
+        for backend in ("local", "shm")
+        for dtype in (DType.BF16, DType.F32, DType.I32, DType.I64, DType.I16)
+    ]
+    + [("shm", DType.I64, True)],
 )
 def test_tensor_import_preserves_values_through_output_release(
+    worker_channel,
     backend: str,
     dtype: DType,
+    serving: bool,
 ) -> None:
+    from concurrent.futures import ThreadPoolExecutor
     from threading import Event
 
     from tests.python.fixtures.transport import make_transport
     from uniserve.runtime import EventPool
+    from uniserve_worker.protocol.output import BatchOutput
     from uniserve_worker.protocol.transfer import WorkerEndpoint
+    from uniserve_worker.transport.pool import ReadReservation
 
     events = EventPool()
     producer = make_transport(
@@ -1722,7 +1732,7 @@ def test_tensor_import_preserves_values_through_output_release(
         event_pool=events,
         source=WorkerEndpoint.local("text_encoder"),
     )
-    worker = execution_worker(transfer_backends=(backend,))
+    worker = execution_worker(transfer_backends=(backend,), queue_depth=2)
     admission = ar_params(97, block_ids=(0,))
     source = TensorRef(
         request_key=admission.request_key,
@@ -1773,17 +1783,49 @@ def test_tensor_import_preserves_values_through_output_release(
     )
     reader = None
     try:
-        prepared = worker.submit(
-            execution_batch(
-                batch_id=2,
-                admissions=(admission,),
-                calls=(call,),
-                input_products=(payload,),
-            )
+        batch = execution_batch(
+            batch_id=2,
+            admissions=(admission,),
+            calls=(call,),
+            input_products=(payload,),
         )
-        assert prepared is not None
-        prepared = finalized_report(worker, prepared)
-        report = prepared
+        if serving:
+            worker.warmup()
+        capacity = worker.transports[backend].capacity
+        with ReadReservation(capacity, capacity.ticket_capacity) as occupied:
+            if serving:
+                endpoint = worker_channel(
+                    (
+                        {
+                            "kind": "submit",
+                            "message_id": 1,
+                            "batch": stamp_batch(worker, batch),
+                        },
+                        {"kind": "info", "message_id": 2},
+                    )
+                )
+                worker.bind(endpoint.endpoint)
+                with ThreadPoolExecutor(max_workers=1) as threads:
+                    running = threads.submit(worker.run)
+                    try:
+                        # Info overtakes the waiting import. Returning its
+                        # read credits must wake the otherwise idle service.
+                        assert endpoint.receive()["kind"] == "info"
+                        assert endpoint.client.recv(0.05) is None
+                        occupied.close()
+                        response = endpoint.receive()
+                        assert response["kind"] == "result", response
+                        report = BatchOutput.from_mapping(response["result"])
+                    finally:
+                        occupied.close()
+                        endpoint.submit({"kind": "close", "message_id": 3})
+                        running.result(timeout=5)
+            else:
+                prepared = worker.submit(batch)
+                assert worker.poll(prepared) is None
+                occupied.close()
+                report = finalized_report(worker, prepared)
+
         assert report.completions[0].status is CallStatus.OK
         descriptor = report.products[0].value
 
