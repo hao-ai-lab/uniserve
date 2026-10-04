@@ -30,7 +30,7 @@ from itertools import groupby, repeat
 from typing import TYPE_CHECKING, Any
 
 from uniserve.profiling import profile_range
-from uniserve.runtime import EventPool
+from uniserve.runtime import CUDAEvent, EventPool
 from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
@@ -97,7 +97,7 @@ class _CudaSource:
     """
 
     tensor: torch.Tensor | tuple[torch.Tensor, ...]
-    event: torch.cuda.Event
+    event: CUDAEvent
     nbytes: int
     capacity: TransferCapacity
     handle: bytes
@@ -172,7 +172,7 @@ class CudaVmmTransport(Transport):
             tuple[
                 BaseException,
                 torch.Tensor | tuple[torch.Tensor, ...] | None,
-                torch.cuda.Event | None,
+                CUDAEvent | None,
                 torch.Tensor | tuple[torch.Tensor, ...] | None,
             ]
             | None
@@ -736,7 +736,7 @@ class CudaVmmTransport(Transport):
                     # otherwise the fence is an interprocess event of the
                     # producer's host.
                     if handle.ready_event_handle:
-                        event = torch.cuda.Event.from_ipc_handle(
+                        event = CUDAEvent.from_ipc_handle(
                             import_device, handle.ready_event_handle
                         )
 

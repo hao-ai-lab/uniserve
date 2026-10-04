@@ -7,9 +7,7 @@ from contextlib import AbstractContextManager, nullcontext
 from functools import partial
 from typing import TYPE_CHECKING
 
-import torch
-
-from uniserve_worker._uniserve_ipc import Submission
+from uniserve_worker._uniserve_ipc import CUDAEvent, Submission
 from uniserve_worker.errors import (
     invalid_descriptor,
 )
@@ -450,7 +448,7 @@ class BatchRunner:
             self._record_retirement_events() if closed else ()
         )
 
-    def _record_retirement_events(self) -> tuple[torch.cuda.Event, ...]:
+    def _record_retirement_events(self) -> tuple[CUDAEvent, ...]:
         """Record one tracked event per CUDA device in the buffer pool.
 
         When the Worker has a completion wake bound, each event schedules it

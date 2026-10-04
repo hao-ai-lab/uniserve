@@ -33,7 +33,11 @@ impl Execution {
         // A callback may raise after launching kernels. Record the fence on
         // both paths and retain the input until those kernels have drained.
         let event = if device.device_type as i32 == 2 {
-            Event::record(stream as usize).map(Some).map_err(failure)
+            let event = Event::new(device.device_id, false, false);
+            event
+                .record(stream as usize)
+                .map(|()| Some(event))
+                .map_err(failure)
         } else {
             Ok(None)
         };

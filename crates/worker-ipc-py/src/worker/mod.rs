@@ -6,6 +6,7 @@ mod block_tables;
 mod buffer;
 mod completion;
 mod error;
+mod events;
 mod executor;
 mod host;
 mod kv_cache;
@@ -22,6 +23,12 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<block_tables::GroupShape>()?;
     module.add_class::<block_tables::GroupTable>()?;
     module.add_class::<completion::Completion>()?;
+    module.add_class::<events::CUDAEvent>()?;
+    module.add_class::<events::EventPool>()?;
+    module.add(
+        "EventPoolError",
+        module.py().get_type::<events::EventPoolError>(),
+    )?;
     module.add_class::<host::HostLane>()?;
     module.add_class::<host::HostTask>()?;
     module.add_class::<kv_cache::KVCacheManager>()?;

@@ -22,7 +22,7 @@ from threading import RLock
 
 import torch
 
-from uniserve.runtime import EventPool
+from uniserve.runtime import CUDAEvent, EventPool
 from uniserve.runtime.device import canonical_device
 from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import WorkerError, WorkerErrorCode, resource_error
@@ -168,9 +168,9 @@ class OutputBuffer:
             tuple[int, int],
             dict[int, tuple[float, tuple[tuple[int, float, int], ...]]],
         ] = {}
-        self._start_events: dict[str, torch.cuda.Event] = {}
-        self._producer_events: dict[str, torch.cuda.Event] = {}
-        self._events: dict[str, torch.cuda.Event] = {}
+        self._start_events: dict[str, CUDAEvent] = {}
+        self._producer_events: dict[str, CUDAEvent] = {}
+        self._events: dict[str, CUDAEvent] = {}
 
         self._observed: set[int] = set()
         self._sealed = False
@@ -715,7 +715,7 @@ class OutputBuffer:
         else:
             self._defer_release()
 
-    def _all_events(self) -> tuple[torch.cuda.Event, ...]:
+    def _all_events(self) -> tuple[CUDAEvent, ...]:
         """Collect distinct device-copy events currently owned by the buffer."""
         return (
             *self._start_events.values(),

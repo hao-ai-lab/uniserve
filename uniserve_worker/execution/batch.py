@@ -25,7 +25,7 @@ from typing import cast
 import torch
 
 from uniserve.runtime.resources import close_resources
-from uniserve_worker._uniserve_ipc import Completion
+from uniserve_worker._uniserve_ipc import Completion, CUDAEvent
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
@@ -167,7 +167,7 @@ class BatchState:
     retirement_buffers: frozenset[BufferId] = frozenset()
     retained_buffers: frozenset[BufferId] = frozenset()
     retirement_exports: tuple[BufferId, ...] = ()
-    retirement_events: tuple[torch.cuda.Event, ...] = ()
+    retirement_events: tuple[CUDAEvent, ...] = ()
     retirement_cleaned: bool = False
 
     def __post_init__(self) -> None:

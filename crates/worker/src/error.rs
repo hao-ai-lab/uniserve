@@ -4,6 +4,8 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
+    Cuda(String),
+    #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
     State(&'static str),

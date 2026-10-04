@@ -5,6 +5,7 @@ use pyo3::types::PyDict;
 
 pub(super) fn native_error(py: Python<'_>, error: uniserve_worker::Error) -> PyErr {
     match error {
+        uniserve_worker::Error::Cuda(message) => pyo3::exceptions::PyRuntimeError::new_err(message),
         uniserve_worker::Error::Invalid(message) => invalid(py, message),
         uniserve_worker::Error::State(message) => {
             pyo3::exceptions::PyRuntimeError::new_err(message)
