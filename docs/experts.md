@@ -41,6 +41,8 @@ The runtime retains the model's logical expert ids, hidden widths and numerical 
 
 DeepEP uses the NCCL GIN API; the locked environment pins NCCL 2.30.4 for both PyTorch and the native transport. Split MegaMoE pads physical hidden and intermediate tiles to multiples of 512 and removes padding from returned rows. Padding preserves encoded values and scales. Native sources from the pinned FastAFD reference and their dependency licenses are packaged with `uniserve-kernels` and built through the shared content-addressed JIT owner. Kernel preparation completes before peers enter device communication waits.
 
+Expert correctness checks use the weighted equation on the actual encoded values and scales. Fused kernels and tensor-parallel reductions can round intermediate results differently, including resolving a later router tie differently. Quantized complete-model checks therefore follow the selected provider's autoregressive tokens and compare its eager and captured execution; they do not require identical routing or tokens across different kernel implementations. Transport identity, route weighting, finite outputs and resource lifetime remain required in every representation.
+
 ## Numerical microbatches
 
 `Microbatches` borrows an ordered sequence of `ExecutionContext` instances with distinct CUDA streams, scratch and expert exchanges on one device. Immutable model weights may be shared. Each invocation receives one ordinary numerical callable per context and returns results in the same order:
