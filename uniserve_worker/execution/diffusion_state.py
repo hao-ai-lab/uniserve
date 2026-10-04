@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from concurrent.futures import Future, wait
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,6 +12,7 @@ import torch
 from uniserve.diffusion import Branch, Guidance, Schedule
 from uniserve.model import ImageDenoiser
 from uniserve.processing import BranchSource
+from uniserve_worker.execution.host import HostTask
 from uniserve_worker.model_executor.diffusion_runner import Ladder
 
 
@@ -54,7 +55,7 @@ class SlotLadder:
 
     tensors: dict[str, Mapping[str, torch.Tensor]] = field(default_factory=dict)
     ladder: Ladder | None = None
-    staging: Future[None] | None = None
+    staging: HostTask[None] | None = None
 
 
 @dataclass(slots=True)
@@ -81,7 +82,10 @@ class DiffusionState:
         if self.slot is not None and self.slot.staging is not None:
             # A failed task may have written part of the destination; wait for
             # its actual exit without rethrowing its already reported error.
-            wait((self.slot.staging,))
+            try:
+                self.slot.staging.exception()
+            except CancelledError:
+                pass
             self.slot.staging = None
 
     @classmethod

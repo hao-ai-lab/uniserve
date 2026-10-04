@@ -113,7 +113,7 @@ def test_done_does_not_submit_and_failure_releases_capacity() -> None:
         pool.close()
 
 
-def test_queued_cancellation_keeps_capacity_until_dequeued() -> None:
+def test_queued_cancellation_returns_unused_capacity() -> None:
     pool = HostLane(max_inflight=2, workers=1)
     entered, finish, queued_ran, released = (Event() for _ in range(4))
 
@@ -129,9 +129,9 @@ def test_queued_cancellation_keeps_capacity_until_dequeued() -> None:
         assert queued.cancel()
         with pytest.raises(CancelledError):
             queued.result(timeout=0)
-        with pytest.raises(WorkerError, match="capacity is exhausted"):
-            pool.reserve()
-        assert not released.is_set()
+        assert released.is_set()
+        replacement = pool.reserve()
+        replacement.abandon()
     finally:
         finish.set()
         pool.close()
