@@ -127,7 +127,7 @@ impl Completion {
             .ok_or_else(|| PyTimeoutError::new_err("operation has not completed"))
     }
 
-    fn notify(slf: &Bound<'_, Self>, callbacks: Vec<Py<PyAny>>) {
+    pub(super) fn notify(slf: &Bound<'_, Self>, callbacks: Vec<Py<PyAny>>) {
         for callback in callbacks {
             if let Err(error) = callback.bind(slf.py()).call1((slf,)) {
                 error.write_unraisable(slf.py(), Some(callback.bind(slf.py())));
