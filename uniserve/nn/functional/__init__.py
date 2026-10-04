@@ -36,8 +36,10 @@ from ._norm import (
 )
 from ._patch import patchify, unpatchify, unpatchify_video_tokens
 from ._rope import apply_rotary, qk_bias_rms_norm_rope_, qk_norm_rope
+from ._tensors import Rounding
 
 __all__ = [
+    "Rounding",
     "add_rms_norm",
     "apply_rotary",
     "attention",
