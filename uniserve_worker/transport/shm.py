@@ -31,7 +31,7 @@ from uniserve_worker.protocol.transfer import (
     WorkerEndpoint,
 )
 from uniserve_worker.transport import segment
-from uniserve_worker.transport.endpoint import Publications, locator_digest
+from uniserve_worker.transport.endpoint import BufferRegistry
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     copy_pairs,
@@ -61,8 +61,8 @@ if TYPE_CHECKING:
 class _ShmSource:
     """Own a shared segment and any unfinished device-to-host publication.
 
-    The segment begins with the header of ``segment``: the publication's
-    digest, its readiness word and one acknowledgment word per instance rank.
+    The segment begins with a readiness word and one acknowledgment word
+    per instance rank.
     ``consumers`` are the slots whose words return the segment.
     """
 
@@ -133,16 +133,16 @@ class HostBorrow:
 def _shared_read(locator: Locator, slot: int, *, check=None):
     """Own a mapping and claim through its last read, including failure.
 
-    Opens the segment named by ``locator``, checks its digest, claims this
-    rank's ``slot`` and waits for readiness before yielding the mapping.
+    Opens the segment named by ``locator``, claims this rank's ``slot`` and
+    waits for readiness before yielding the mapping.
     Leaving the context, normally or by an exception, acknowledges a claimed
     slot and closes the mapping. ``check`` is forwarded to
     `segment.await_ready`.
 
     Raises:
         WorkerError: `invalid_descriptor` when ``locator`` is not a shared
-            storage locator, or its segment is missing or holds another
-            view; `resource_error` when the producer failed or readiness
+            storage locator, or its segment is missing; `resource_error`
+            when the producer failed or readiness
             timed out. Whatever ``check`` raises, and any other error opening
             the segment, propagates.
     """
@@ -155,16 +155,12 @@ def _shared_read(locator: Locator, slot: int, *, check=None):
         )
     except FileNotFoundError:
         raise invalid_descriptor(
-            "publication is retired, invalid, or belongs to another view"
+            "shared buffer is no longer available"
         ) from None
 
     header = memoryview(shm)
     claimed = False
     try:
-        if segment.digest(header) != locator_digest(locator):
-            raise invalid_descriptor(
-                "publication is retired, invalid, or belongs to another view"
-            )
         segment.claim(header, slot)
         claimed = True
         segment.await_ready(header, check=check)
@@ -183,8 +179,7 @@ def _shared_read(locator: Locator, slot: int, *, check=None):
 class ShmTransport(Transport):
     """Shared storage publication whose segment carries its own readiness.
 
-    A consumer opens the segment by name, checks the digest in its header
-    against the locator, waits on the readiness word and writes its own
+    A consumer opens the segment by name, waits on readiness and writes its own
     acknowledgment word once it has copied the payload out. The producer
     unlinks the segment once every named consumer has acknowledged, so a
     read needs no connection to the producing rank.
@@ -207,7 +202,7 @@ class ShmTransport(Transport):
         self._host_slots = frozenset(int(slot) for slot in host_slots)
         # `_reclaim` completes a retirement before returning, so `close` has
         # no in-flight reclamation to drain.
-        self._publications = Publications[_ShmSource](
+        self._buffers = BufferRegistry(
             capacity=256,
             reclaim=self._reclaim,
             drain=lambda source: None,
@@ -230,7 +225,7 @@ class ShmTransport(Transport):
         self._completion_wake: Any = None
         self._closed = False
         self._publication_worker = threading.Thread(
-            target=self._complete_publications,
+            target=self._complete_buffers,
             name="uniserve-shm-publication",
             daemon=True,
         )
@@ -243,7 +238,7 @@ class ShmTransport(Transport):
         )
 
     def endpoint(self) -> str:
-        return self._publications.name
+        return self._buffers.name
 
     def serves(self, consumers: Sequence[int]) -> bool:
         return not consumers or any(
@@ -253,7 +248,7 @@ class ShmTransport(Transport):
     def publication_retirement(
         self, locator: Locator
     ) -> concurrent.futures.Future[None]:
-        return self._publications.retirement(locator)
+        return self._buffers.retirement(locator)
 
     def set_completion_wake(self, wake: Any) -> None:
         self._completion_wake = wake
@@ -262,8 +257,7 @@ class ShmTransport(Transport):
     def _reclaim(
         self, source: _ShmSource, retirement: concurrent.futures.Future[None]
     ) -> None:
-        # Called by `Publications` under its lock, once the publication is
-        # retired, its producer has completed and it is settled.
+        # Producer completion and reader acknowledgments have both arrived.
         self._free_segment(source.shm, source.nbytes, source.registered)
         source.registered = None
         retirement.set_result(None)
@@ -301,10 +295,10 @@ class ShmTransport(Transport):
         return segment.settled(source.shm.buf, source.consumers)
 
     def reap(self) -> None:
-        self._publications.reap()
+        self._buffers.reap()
 
     def awaiting_acknowledgment(self) -> bool:
-        return self._publications.awaiting_acknowledgment()
+        return self._buffers.awaiting_acknowledgment()
 
     def _queue_publication(
         self, item: tuple[Locator, _ShmSource] | None
@@ -315,7 +309,7 @@ class ShmTransport(Transport):
         except BlockingIOError:
             pass
 
-    def _complete_publications(self) -> None:
+    def _complete_buffers(self) -> None:
         """Publish completed host bytes without waiting in the Worker thread.
 
         Runs on the publication thread. Each queued device publication's
@@ -373,7 +367,7 @@ class ShmTransport(Transport):
                         source.shm.buf,
                         segment.READY if failure is None else segment.FAILED,
                     )
-                    self._publications.complete(
+                    self._buffers.complete(
                         locator,
                         error=failure,
                         producer_completed=device_completed,
@@ -413,7 +407,7 @@ class ShmTransport(Transport):
         first = source[0] if isinstance(source, tuple) else source
         nbytes = tensor_nbytes(source)
         # Capacity acknowledged since the last sweep is reclaimed first.
-        self._publications.reap()
+        self._buffers.reap()
         self.capacity.acquire(nbytes)
 
         shm = None
@@ -446,10 +440,7 @@ class ShmTransport(Transport):
                 offset=offset,
                 device=str(first.device),
             )
-            # The header names the exact view this segment holds, so a
-            # consumer holding a locator for another view refuses it without
-            # asking this rank.
-            segment.initialize(buffer, locator_digest(locator))
+            segment.initialize(buffer)
             payload = buffer[segment.HEADER_BYTES :]
 
             packed = torch.frombuffer(payload, dtype=first.dtype).reshape(shape)
@@ -474,9 +465,7 @@ class ShmTransport(Transport):
                 signal,
                 address,
             )
-            self._publications.publish(
-                locator, publication, pending=first.is_cuda
-            )
+            self._buffers.register(locator, publication, pending=first.is_cuda)
             registered = True
 
             if first.is_cuda:
@@ -503,7 +492,7 @@ class ShmTransport(Transport):
             # the segment, its CUDA registration and its bytes are returned
             # here.
             if registered:
-                self._publications.release(locator)
+                self._buffers.release(locator)
                 if submitted:
                     # The segment stays mapped and registered until the copy
                     # into it has retired.
@@ -511,7 +500,7 @@ class ShmTransport(Transport):
                 if first.is_cuda:
                     assert buffer is not None
                     segment.set_state(buffer, segment.FAILED)
-                    self._publications.complete(locator)
+                    self._buffers.complete(locator)
             elif shm is not None:
                 self._free_segment(shm, nbytes, address)
             else:
@@ -649,12 +638,12 @@ class ShmTransport(Transport):
             raise invalid_descriptor(
                 "shared storage release requires a shared storage locator"
             )
-        return self._publications.release(locator)
+        return self._buffers.release(locator)
 
     def close(self) -> None:
         # Reads drain first, then the publication thread exits once every
         # pending device copy has signaled, and only then are the
-        # publications retired; `Publications.close` raises `resource_error`
+        # publications retired; `BufferRegistry.close` raises `resource_error`
         # when any source is still retained.
         try:
             self._reads.close()
@@ -665,4 +654,4 @@ class ShmTransport(Transport):
                 self._publication_control_rx.close()
                 self._publication_control_tx.close()
                 self._closed = True
-            self._publications.close()
+            self._buffers.close()

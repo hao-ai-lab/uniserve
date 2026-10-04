@@ -13,14 +13,16 @@
 //! Faults and delays are injected at the OS boundary:
 //! `/proc/thread-self/children` and `/proc/<pid>/cmdline` locate a rank
 //! process, `PausedProcess` stops, resumes or kills it with signals, and
-//! `SlowShmPublication` stands in for an external producer's segment in
-//! `/dev/shm`. These are Linux interfaces, and the file compiles only on Linux.
+//! `SlowShmPublication` supplies an external producer's POSIX segment.
+//! These are Linux interfaces, and the file compiles only on Linux.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::fs::{OpenOptions, remove_file};
-use std::os::unix::fs::FileExt;
+use std::ffi::CString;
+use std::fs::{File, remove_file};
+use std::os::fd::FromRawFd;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2279,7 +2281,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     };
     // The slow call's predicate is the external segment, which stays pending
     // until `SlowShmPublication::publish` runs.
-    let publication = SlowShmPublication::start()?;
+    let publication = SlowShmPublication::start(executor.info().endpoint.node.clone())?;
     slow.calls[0].predicate = Some(predicate.clone());
     slow.input_products.push(TensorPublication {
         product: predicate,
@@ -2410,7 +2412,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     // The ranks only read the external segment; it survives their close and
     // is removed when `publication` drops.
     executor.close()?;
-    assert!(publication.path.is_file());
+    assert_eq!(publication.file.metadata()?.nlink(), 1);
     Ok(())
 }
 
@@ -2943,86 +2945,64 @@ impl Drop for PausedProcess {
 
 /// An external shared-storage publisher the test controls.
 ///
-/// The segment carries what a consumer needs in its header: the digest of the
-/// locator that names it, and a readiness word the test writes after the
-/// payload. Until then a rank that reads it waits on that word.
+/// The reader waits on a readiness word, written after the payload.
 struct SlowShmPublication {
-    name: String,
+    name: CString,
     endpoint: String,
-    path: PathBuf,
+    node: String,
+    file: File,
     published: Arc<AtomicBool>,
 }
 
 /// Byte layout of a shared-storage publication's header, as the worker's
 /// `uniserve_worker.transport.segment` module lays it out.
 const SEGMENT_HEADER_BYTES: u64 = 512;
-const SEGMENT_STATE_OFFSET: u64 = 32;
+const SEGMENT_STATE_OFFSET: u64 = 0;
 const SEGMENT_READY: u32 = 1;
 
 impl SlowShmPublication {
-    fn start() -> anyhow::Result<Self> {
+    fn start(node: String) -> anyhow::Result<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let name = format!("uniserve-transfer-{}-{nonce}", std::process::id());
-        let path = Path::new("/dev/shm").join(&name);
         let endpoint = format!("{name}-readers");
+        let name = CString::new(format!("/{name}"))?;
+        // SAFETY: name is NUL-terminated; a successful call returns a fresh fd.
+        let descriptor = unsafe {
+            libc::shm_open(
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
         let publication = Self {
             name,
             endpoint,
-            path,
+            node,
+            // SAFETY: this File takes sole ownership of the descriptor.
+            file: unsafe { File::from_raw_fd(descriptor) },
             published: Arc::new(AtomicBool::new(false)),
         };
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&publication.path)?;
         // A one-byte payload after the header. The file starts zero-filled,
         // which leaves the readiness word pending and every acknowledgment
         // word unclaimed.
-        file.set_len(SEGMENT_HEADER_BYTES + 1)?;
-        // The header names the exact locator the rank will be handed, the way
-        // the worker's own publications do, so the rank accepts the segment.
-        file.write_all_at(&publication.digest()?, 0)?;
-        file.write_all_at(&[0], SEGMENT_HEADER_BYTES)?;
+        publication.file.set_len(SEGMENT_HEADER_BYTES + 1)?;
         Ok(publication)
-    }
-
-    /// The digest the worker computes over a locator: SHA-256 of its
-    /// canonical JSON, keys sorted, no whitespace.
-    fn digest(&self) -> anyhow::Result<[u8; 32]> {
-        use sha2::Digest as _;
-
-        let canonical = format!(
-            concat!(
-                "{{\"device\":\"cpu\",\"dtype\":\"uint8\",\"endpoint\":\"{endpoint}\",",
-                "\"name\":\"{name}\",\"nbytes\":1,\"offset\":[0],\"shape\":[1],",
-                "\"source\":{{\"address_space\":\"{address_space}\",",
-                "\"incarnation\":\"{incarnation}\",\"node\":\"{node}\",\"rank\":0,",
-                "\"worker_id\":\"publisher\"}},\"transport\":\"posix_shm\"}}"
-            ),
-            endpoint = self.endpoint,
-            name = self.name,
-            address_space = self.address_space(),
-            incarnation = self.endpoint,
-            node = self.node()?,
-        );
-        Ok(sha2::Sha256::digest(canonical.as_bytes()).into())
     }
 
     fn address_space(&self) -> String {
         format!("rust:{}", std::process::id())
     }
 
-    fn node(&self) -> anyhow::Result<String> {
-        Ok(std::fs::read_to_string("/etc/hostname")?.trim().to_owned())
-    }
-
     fn publish(&self) -> anyhow::Result<()> {
-        let file = OpenOptions::new().write(true).open(&self.path)?;
         // The payload lands before the readiness word; each write is a system
         // call, which orders them for a reader on another core.
-        file.write_all_at(&[1], SEGMENT_HEADER_BYTES)?;
-        file.write_all_at(&SEGMENT_READY.to_ne_bytes(), SEGMENT_STATE_OFFSET)?;
+        self.file.write_all_at(&[1], SEGMENT_HEADER_BYTES)?;
+        self.file
+            .write_all_at(&SEGMENT_READY.to_ne_bytes(), SEGMENT_STATE_OFFSET)?;
         self.published.store(true, Ordering::Release);
         Ok(())
     }
@@ -3038,13 +3018,13 @@ impl SlowShmPublication {
                     source: uniserve_worker_ipc::WorkerEndpoint {
                         worker_id: "publisher".into(),
                         rank: 0,
-                        node: self.node()?,
+                        node: self.node.clone(),
                         address_space: self.address_space(),
                         incarnation: self.endpoint.clone(),
                     },
                     transport: TransferTransport::PosixShm {
                         endpoint: self.endpoint.clone(),
-                        name: self.name.clone(),
+                        name: self.name.to_str()?.to_owned(),
                     },
                     nbytes: 1,
                     dtype: "uint8".to_owned(),
@@ -3059,7 +3039,10 @@ impl SlowShmPublication {
 
 impl Drop for SlowShmPublication {
     fn drop(&mut self) {
-        let _ = remove_file(&self.path);
+        // SAFETY: the name remains valid and identifies this fixture's segment.
+        unsafe {
+            libc::shm_unlink(self.name.as_ptr());
+        }
     }
 }
 

@@ -10,6 +10,7 @@ use pyo3::prelude::*;
 mod buffer;
 mod error;
 mod protocol;
+mod registry;
 mod request;
 mod storage;
 mod transfer;
@@ -18,6 +19,7 @@ mod transfer;
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<buffer::BufferBinding>()?;
     module.add_class::<buffer::BufferPool>()?;
+    module.add_class::<registry::BufferRegistry>()?;
     module.add_class::<request::Request>()?;
     module.add_class::<request::RequestPool>()?;
     module.add_class::<storage::Buffer>()?;

@@ -10,22 +10,25 @@ the owning instance through the process-wide `_endpoints` registry, so any
 from __future__ import annotations
 
 import concurrent.futures
-import threading
-import uuid
 import weakref
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from itertools import count
 from typing import TYPE_CHECKING, Any
 
 from uniserve import _slices
 from uniserve.runtime import EventPool
-from uniserve_worker.errors import invalid_descriptor, resource_error
+from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     LocalTransfer,
     Locator,
     WorkerEndpoint,
 )
-from uniserve_worker.transport.endpoint import _endpoint_lock, _endpoints
+from uniserve_worker.transport.endpoint import (
+    BufferRegistry,
+    _endpoint_lock,
+    _endpoints,
+)
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     dtype_name,
@@ -47,34 +50,10 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class _LocalSource:
-    """One registered publication and its reclamation state.
-
-    Attributes:
-        tensor: The detached published views.
-        event: Producer fence recorded at publication; None for a CPU source.
-        capacity: Budget the publication's bytes are reserved against.
-        locator: The exact locator the publication was registered under.
-        readers: Copies and borrowed views taken and not yet finished.
-        released: New reads are revoked, by `release` or `close`.
-        reclaiming: Hand-back has started; `retirement` completes once the
-            producer fence, if any, drains.
-        retirement: Completes when the bytes are returned to `capacity`.
-    """
+    """Detached tensor views and their producer fence, if on a device."""
 
     tensor: torch.Tensor | tuple[torch.Tensor, ...]
     event: torch.cuda.Event | None
-    capacity: TransferCapacity
-    locator: Locator
-    readers: int = 0
-    released: bool = False
-    reclaiming: bool = False
-    retirement: concurrent.futures.Future[None] = field(
-        default_factory=concurrent.futures.Future
-    )
-
-    def events_released(self) -> None:
-        self.capacity.release(tensor_nbytes(self.tensor))
-        self.retirement.set_result(None)
 
 
 class LocalTransport(Transport):
@@ -95,15 +74,20 @@ class LocalTransport(Transport):
     ) -> None:
         """Create a process-local tensor table with bounded retained bytes."""
         self.source = source or WorkerEndpoint.local()
-        self._table: dict[int, _LocalSource] = {}
         self._borrowed: weakref.WeakSet[TransferTicket] = weakref.WeakSet()
         self._events = event_pool
-        self._next = 0
+        self._next = count()
         self._completion_wake: Any = None
-        self._lock = threading.RLock()
-        self._endpoint = f"local:{uuid.uuid4().hex}"
+        self._buffers = BufferRegistry(
+            # Each buffer carries at least one byte, so the byte budget also
+            # bounds how many registrations can be retained.
+            capacity=capacity.capacity,
+            reclaim=self._reclaim,
+            drain=self._drain,
+            settled=lambda source: True,
+        )
         with _endpoint_lock:
-            _endpoints[self._endpoint] = self
+            _endpoints[self.endpoint()] = self
         self.capacity = capacity
         self._reads = TransferPool(
             workers=2,
@@ -114,7 +98,7 @@ class LocalTransport(Transport):
 
     def endpoint(self) -> str:
         """Expose the process-unique endpoint encoded into local locators."""
-        return self._endpoint
+        return self._buffers.name
 
     def publication_retirement(
         self, locator: Locator
@@ -123,25 +107,7 @@ class LocalTransport(Transport):
 
         Local copies and borrowed views use the same ownership.
         """
-        if locator.source != self.source:
-            raise invalid_descriptor(
-                "local publication belongs to another rank incarnation"
-            )
-        handle = locator.transport
-        if (
-            not isinstance(handle, LocalTransfer)
-            or handle.endpoint != self._endpoint
-        ):
-            raise invalid_descriptor(
-                "local publication belongs to another endpoint"
-            )
-        with self._lock:
-            source = self._table.get(handle.key)
-            if source is None or locator != source.locator:
-                raise invalid_descriptor(
-                    "local publication changed its registered view"
-                )
-            return source.retirement
+        return self._buffers.retirement(locator)
 
     def publish(
         self,
@@ -170,25 +136,23 @@ class LocalTransport(Transport):
             self._events.record(event, first.device)
             self._events.retain(event, first.device)
 
-        with self._lock:
-            # Drop table entries whose physical ownership already completed.
-            self._table = {
-                key: source
-                for key, source in self._table.items()
-                if not source.retirement.done()
-            }
-            key = self._next
-            self._next += 1
+        source = _LocalSource(t, event)
+        try:
             locator = Locator(
                 source=self.source,
-                transport=LocalTransfer(endpoint=self._endpoint, key=key),
+                transport=LocalTransfer(
+                    endpoint=self.endpoint(), key=next(self._next)
+                ),
                 nbytes=nbytes,
                 dtype=dtype_name(first.dtype),
                 shape=shape,
                 offset=offset,
                 device=str(first.device),
             )
-            self._table[key] = _LocalSource(t, event, self.capacity, locator)
+            self._buffers.register(locator, source)
+        except BaseException:
+            self._reclaim(source, concurrent.futures.Future())
+            raise
         return locator
 
     def set_completion_wake(self, wake: Any) -> None:
@@ -211,40 +175,22 @@ class LocalTransport(Transport):
         until consumer completion returns the source grant.
         """
         handle = locator.transport
-        if (
-            not isinstance(handle, LocalTransfer)
-            or locator.source.node != self.source.node
-            or locator.source.address_space != self.source.address_space
-        ):
-            raise invalid_descriptor(
-                "local locator belongs to another address space"
-            )
+        if not isinstance(handle, LocalTransfer):
+            raise invalid_descriptor("local read requires a local locator")
 
         with _endpoint_lock:
             owner = _endpoints.get(handle.endpoint)
-        if (
-            not isinstance(owner, LocalTransport)
-            or owner.source != locator.source
-        ):
-            raise invalid_descriptor(
-                "local publication belongs to another rank incarnation"
-            )
+        if not isinstance(owner, LocalTransport):
+            raise invalid_descriptor("local buffer has no live owner")
 
-        with owner._lock:
-            source = owner._table.get(handle.key)
-            if source is None or source.released:
-                raise invalid_descriptor(
-                    "local publication is no longer registered"
-                )
+        source = owner._buffers.acquire(locator)
+        borrowed_ticket = None
+        try:
             tensor, event = source.tensor, source.event
             first = tensor[0] if isinstance(tensor, tuple) else tensor
             if device != first.device:
                 raise invalid_descriptor(
                     "local binding requires the source device"
-                )
-            if locator != source.locator:
-                raise invalid_descriptor(
-                    "local locator changed its registered view"
                 )
             if region is not None:
                 if not _slices.within(region, locator.shape):
@@ -257,10 +203,7 @@ class LocalTransport(Transport):
                 if destination is None
                 else read_destination(locator, device, destination, region)
             )
-            source.readers += 1
 
-        borrowed_ticket = None
-        try:
             if target is not None:
                 # Copy path: the pool ticket retires when the copy's physical
                 # access ends, then the source's reader count drops.
@@ -274,7 +217,7 @@ class LocalTransport(Transport):
                     reservation=reservation,
                 )
                 ticket.add_retirement_callback(
-                    lambda: owner._release_reader(source)
+                    lambda: owner._buffers.release_reader(locator)
                 )
                 return ticket
 
@@ -291,7 +234,7 @@ class LocalTransport(Transport):
             try:
                 ticket = TransferTicket(
                     owner._events,
-                    release=lambda: self._finish_borrow(owner, source),
+                    release=lambda: self._finish_borrow(owner, locator),
                 )
                 borrowed_ticket = ticket
                 if self._completion_wake is not None:
@@ -308,34 +251,35 @@ class LocalTransport(Transport):
             # Once a borrowed ticket owns the grant, its close path returns
             # both source ownership and credit, including setup failure.
             if borrowed_ticket is None:
-                owner._release_reader(source)
+                owner._buffers.release_reader(locator)
             else:
                 borrowed_ticket.close()
             raise
 
-    def _release_reader(self, source: _LocalSource) -> None:
-        with self._lock:
-            source.readers -= 1
-            self._reclaim(source)
+    def _finish_borrow(self, owner: LocalTransport, locator: Locator) -> None:
+        try:
+            owner._buffers.release_reader(locator)
+        finally:
+            self.capacity.return_reads()
 
-    def _finish_borrow(
-        self, owner: LocalTransport, source: _LocalSource
+    def _reclaim(
+        self, source: _LocalSource, retirement: concurrent.futures.Future[None]
     ) -> None:
-        owner._release_reader(source)
-        self.capacity.return_reads()
+        def completed() -> None:
+            self.capacity.release(tensor_nbytes(source.tensor))
+            retirement.set_result(None)
 
-    def _reclaim(self, source: _LocalSource) -> None:
-        # A source is handed back once, after new reads were revoked and its
-        # last reader finished; a CPU source has no fence to wait on.
-        if not source.released or source.readers != 0 or source.reclaiming:
-            return
-        source.reclaiming = True
         if source.event is None:
-            source.events_released()
+            completed()
         else:
             self._events.defer_release(
-                (source.event,), source, completed=source.events_released
+                (source.event,), source, completed=completed
             )
+
+    def _drain(self, source: _LocalSource) -> None:
+        if source.event is not None:
+            source.event.synchronize()
+            self._events.reap()
 
     def release(
         self, locator: Locator
@@ -344,28 +288,11 @@ class LocalTransport(Transport):
 
         Existing copies and borrowed views are retained.
         """
-        if locator.source != self.source:
-            raise invalid_descriptor(
-                "local publication belongs to another rank incarnation"
-            )
-        handle = locator.transport
-        if (
-            not isinstance(handle, LocalTransfer)
-            or handle.endpoint != self._endpoint
-        ):
-            raise invalid_descriptor(
-                "local release belongs to another endpoint"
-            )
-        with self._lock:
-            source = self._table.get(handle.key)
-            if source is None:
-                return None
-            source.released = True
-            self._reclaim(source)
-            # A retirement waiting on the producer fence completes only when an
-            # `EventPool.reap` observes it, so the controller is woken once the
-            # fence completes.
-            if not source.retirement.done() and source.event is not None:
+        retirement = self._buffers.release(locator)
+        if retirement is not None and not retirement.done():
+            source = self._buffers.source(locator)
+            # Wake the controller when a pending producer fence can be reaped.
+            if source.event is not None:
                 self._events.schedule_completion_wake(
                     (
                         source.tensor[0]
@@ -374,7 +301,7 @@ class LocalTransport(Transport):
                     ).device,
                     source.event,
                 )
-            return source.retirement
+        return retirement
 
     def close(self) -> None:
         """Release every tensor registered under this local endpoint."""
@@ -383,22 +310,6 @@ class LocalTransport(Transport):
         finally:
             for ticket in tuple(self._borrowed):
                 ticket._drain_consumers()
-            with self._lock:
-                values = tuple(self._table.values())
-                for source in values:
-                    source.released = True
-                    self._reclaim(source)
-            # Drain each remaining fence. A source still unretired after that,
-            # such as one with a reader outstanding, raises `resource_error`.
-            for source in values:
-                if not source.retirement.done() and source.event is not None:
-                    source.event.synchronize()
-                    self._events.reap()
-                if not source.retirement.done():
-                    raise resource_error(
-                        "local source retains unfinished physical readers"
-                    )
-                source.retirement.result()
-            self._table.clear()
+            self._buffers.close()
             with _endpoint_lock:
-                _endpoints.pop(self._endpoint, None)
+                _endpoints.pop(self.endpoint(), None)
