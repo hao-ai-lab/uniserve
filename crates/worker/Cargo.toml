@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+crossbeam-channel.workspace = true
 indexmap.workspace = true
 thiserror.workspace = true
 uniserve-core.workspace = true

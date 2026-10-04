@@ -17,7 +17,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from uniserve.sampling import SamplingParams
-from uniserve_worker.execution.executor import Submission
+from uniserve_worker._uniserve_ipc import Submission
 
 if TYPE_CHECKING:
     from uniserve_worker.worker import Worker

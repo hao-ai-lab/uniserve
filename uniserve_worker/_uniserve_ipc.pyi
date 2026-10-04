@@ -25,6 +25,7 @@ from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.request import RequestProgress, RequestResult
 from uniserve_worker.protocol.batch import (
+    Batch,
     BatchCommand,
     BufferAllocation,
     LatentParams,
@@ -32,6 +33,7 @@ from uniserve_worker.protocol.batch import (
 )
 from uniserve_worker.protocol.call import Call, ImageParams
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
+from uniserve_worker.protocol.output import BatchOutput
 from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import (
     Locator,
@@ -43,12 +45,14 @@ from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
 from uniserve_worker.transport.interface import Transport
+from uniserve_worker.worker import Worker
 
 __all__ = [
     "Buffer",
     "BufferBinding",
     "BufferPool",
     "BufferRegistry",
+    "Executor",
     "LatentExport",
     "LatentImport",
     "LatentPool",
@@ -58,6 +62,7 @@ __all__ = [
     "ReadReservation",
     "Server",
     "StreamSignal",
+    "Submission",
     "TensorImport",
     "TensorRead",
     "TensorStore",
@@ -654,6 +659,32 @@ class BufferPool:
         shape: tuple[int, ...],
     ) -> BufferBinding: ...
     def release(self, binding: BufferBinding) -> None: ...
+    def close(self) -> None: ...
+
+@final
+class Submission:
+    """A native batch handle consumed by the executor that admitted it."""
+
+    @property
+    def batch_id(self) -> int: ...
+    def notify_ready(self) -> None: ...
+
+@final
+class Executor:
+    """Own admission, dependencies, collective order, and result delivery."""
+
+    def __new__(cls, worker: Worker) -> Self: ...
+    @property
+    def has_work(self) -> bool: ...
+    @property
+    def started(self) -> bool: ...
+    def submit(
+        self, batch: Batch, *, propagate_errors: bool = False
+    ) -> Submission: ...
+    def advance(self) -> bool: ...
+    def poll(self, submission: Submission) -> BatchOutput | None: ...
+    def reset(self) -> None: ...
+    def drop_request(self, request_id: int) -> None: ...
     def close(self) -> None: ...
 
 @final

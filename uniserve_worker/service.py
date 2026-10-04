@@ -22,8 +22,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from uniserve.profiling import profile_range
+from uniserve_worker._uniserve_ipc import Submission
 from uniserve_worker.errors import WorkerError, classify
-from uniserve_worker.execution.executor import Submission
 from uniserve_worker.profiling import record_failure, worker_range_name
 from uniserve_worker.protocol import messages
 from uniserve_worker.protocol.batch import Batch
@@ -105,7 +105,7 @@ class Service:
                     continue
 
                 if self._closing and not self._pending:
-                    if not self.worker.executor.inflight:
+                    if not self.worker.executor.has_work:
                         # An expert-parallel rank leaves only once every rank
                         # of its group is leaving, so none waits on it.
                         runner = self.worker.runner
@@ -140,7 +140,7 @@ class Service:
                 if experts and self.worker.runner.join_expert_step():
                     continue
 
-                if self._pending or self.worker.executor.inflight:
+                if self._pending or self.worker.executor.has_work:
                     # Work is outstanding: wait for a request or a completion
                     # wake (timeouts are in microseconds). Consumer
                     # acknowledgments are shared words with no wake, so sweep
@@ -217,7 +217,7 @@ class Service:
         """
         if not self.worker.requests.has_open_requests():
             return False
-        if self._pending or self.worker.executor.inflight:
+        if self._pending or self.worker.executor.has_work:
             return True
         if self._own_step_expired:
             return False

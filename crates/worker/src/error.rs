@@ -7,6 +7,10 @@ pub enum Error {
     Invalid(String),
     #[error("{0}")]
     State(&'static str),
+    #[error("{0}")]
+    Resource(&'static str),
+    #[error("{0}")]
+    Invariant(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
