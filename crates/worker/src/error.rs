@@ -10,6 +10,10 @@ pub enum Error {
     #[error("{0}")]
     Resource(&'static str),
     #[error("{0}")]
+    Unsupported(String),
+    #[error("asynchronous transfer ticket capacity is exhausted")]
+    ReadBackpressure { returns: u64 },
+    #[error("{0}")]
     Invariant(String),
 }
 

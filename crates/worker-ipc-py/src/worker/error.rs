@@ -10,6 +10,8 @@ pub(super) fn native_error(py: Python<'_>, error: uniserve_worker::Error) -> PyE
             pyo3::exceptions::PyRuntimeError::new_err(message)
         }
         uniserve_worker::Error::Resource(message) => resource(py, message),
+        uniserve_worker::Error::Unsupported(message) => unsupported(py, message),
+        error @ uniserve_worker::Error::ReadBackpressure { .. } => resource(py, error.to_string()),
         uniserve_worker::Error::Invariant(message) => invariant(py, message),
     }
 }

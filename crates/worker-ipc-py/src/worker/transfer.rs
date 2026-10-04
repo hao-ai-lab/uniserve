@@ -4,32 +4,24 @@
 //! return only after the backend stops accessing source and destination storage.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
+use uniserve_worker::{
+    ReadReservation as NativeReadReservation, TransferCapacity as NativeTransferCapacity,
+};
 
-use super::error::{invalid, invariant, resource, unsupported};
+use super::error::{invalid, invariant, native_error, resource};
 use super::host::{HostLane, HostTask, with_context};
 
-struct CapacityState {
-    used: u64,
-    reads_free: usize,
-    returns: u64,
-    waiters: Vec<Py<PyAny>>,
-}
-
-/// One rank's byte and read credits, shared by every transport mechanism.
+/// Python access to the rank's shared native transfer budget.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct TransferCapacity {
-    #[pyo3(get)]
-    capacity: u64,
-    #[pyo3(get)]
-    ticket_capacity: usize,
-    state: Mutex<CapacityState>,
+    inner: Arc<NativeTransferCapacity<Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -38,81 +30,52 @@ impl TransferCapacity {
     fn new(byte_capacity: i64, ticket_capacity: isize) -> PyResult<Self> {
         if byte_capacity < 1 || ticket_capacity < 1 {
             return Err(PyValueError::new_err(
-                "transfer byte capacity must be positive",
+                "transfer byte and read capacities must be positive",
             ));
         }
+
+        let inner = NativeTransferCapacity::new(
+            byte_capacity as u64,
+            ticket_capacity as usize,
+            notify_capacity,
+        )
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+
         Ok(Self {
-            capacity: byte_capacity as u64,
-            ticket_capacity: ticket_capacity as usize,
-            state: Mutex::new(CapacityState {
-                used: 0,
-                reads_free: ticket_capacity as usize,
-                returns: 0,
-                waiters: Vec::new(),
-            }),
+            inner: Arc::new(inner),
         })
     }
 
     #[getter]
-    fn used(&self, py: Python<'_>) -> PyResult<u64> {
-        Ok(self.lock(py)?.used)
+    fn capacity(&self) -> u64 {
+        self.inner.capacity()
     }
 
-    /// Reserve the entire fan-out before any physical read starts. A refusal
-    /// carries the return sequence so registration cannot miss a credit wake.
+    #[getter]
+    fn ticket_capacity(&self) -> usize {
+        self.inner.ticket_capacity()
+    }
+
+    #[getter]
+    fn used(&self) -> u64 {
+        self.inner.used()
+    }
+
     #[pyo3(signature = (count=1, *, message="asynchronous transfer ticket capacity is exhausted"))]
     fn take_reads(slf: Bound<'_, Self>, count: isize, message: &str) -> PyResult<()> {
-        let py = slf.py();
-        if count < 1 {
-            return Err(PyValueError::new_err(
-                "a read ticket reservation takes at least one",
-            ));
-        }
-        let owner = slf.get();
-        let count = count as usize;
-        if count > owner.ticket_capacity {
-            return Err(unsupported(
-                py,
-                format!(
-                    "a fetch of {count} reads exceeds the rank's {} read tickets",
-                    owner.ticket_capacity
-                ),
-            ));
-        }
-        let mut state = owner.lock(py)?;
-        if count > state.reads_free {
-            let returns = state.returns;
-            drop(state);
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("capacity", &slf)?;
-            kwargs.set_item("returns", returns)?;
-            return Err(PyErr::from_value(
-                py.import("uniserve_worker.transport.pool")?
-                    .getattr("ReadBackpressureError")?
-                    .call((message,), Some(&kwargs))?,
-            ));
-        }
-        state.reads_free -= count;
-        Ok(())
+        slf.get()
+            .inner
+            .take_reads(read_count(count)?)
+            .map_err(|error| Self::read_error(&slf, error, message))
     }
 
     #[pyo3(signature = (count=1))]
     fn return_reads(&self, py: Python<'_>, count: isize) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        if count < 0 || count as usize > self.ticket_capacity - state.reads_free {
-            return Err(PyRuntimeError::new_err(
-                "read ticket return exceeds the tickets taken",
-            ));
-        }
-        state.reads_free += count as usize;
-        state.returns = state
-            .returns
-            .checked_add(1)
-            .ok_or_else(|| invariant(py, "transfer credit return sequence exhausted"))?;
-        let callbacks = std::mem::take(&mut state.waiters);
-        drop(state);
-        notify(py, callbacks);
-        Ok(())
+        let count = usize::try_from(count)
+            .map_err(|_| PyRuntimeError::new_err("read ticket return exceeds the tickets taken"))?;
+        self.inner
+            .return_reads(count)
+            .map_err(|error| native_error(py, error))
     }
 
     #[pyo3(signature = (callback, *, after))]
@@ -122,119 +85,99 @@ impl TransferCapacity {
         callback: Py<PyAny>,
         after: u64,
     ) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        if state.returns == after {
-            state.waiters.push(callback);
-        } else {
-            drop(state);
+        if let Some(callback) = self.inner.notify_reads_returned(callback, after) {
             callback.bind(py).call0()?;
         }
         Ok(())
     }
 
     fn acquire(&self, py: Python<'_>, amount: i64) -> PyResult<()> {
-        if amount < 0 {
-            return Err(PyValueError::new_err(
-                "transfer byte reservation must not be negative",
-            ));
-        }
-        let mut state = self.lock(py)?;
-        let projected = state
-            .used
-            .checked_add(amount as u64)
-            .ok_or_else(|| resource(py, "transfer byte capacity is exhausted"))?;
-        if projected > self.capacity {
-            return Err(resource(
-                py,
-                format!(
-                    "transfer byte capacity is exhausted ({projected}>{})",
-                    self.capacity
-                ),
-            ));
-        }
-        state.used = projected;
-        Ok(())
+        let amount = u64::try_from(amount)
+            .map_err(|_| PyValueError::new_err("transfer byte reservation must not be negative"))?;
+        self.inner
+            .acquire(amount)
+            .map_err(|error| native_error(py, error))
     }
 
     fn release(&self, py: Python<'_>, amount: i64) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        if amount < 0 || amount as u64 > state.used {
-            return Err(PyRuntimeError::new_err(
-                "transfer byte release exceeds the live reservation",
-            ));
-        }
-        state.used -= amount as u64;
-        Ok(())
+        let amount = u64::try_from(amount).map_err(|_| {
+            PyRuntimeError::new_err("transfer byte release exceeds the live reservation")
+        })?;
+        self.inner
+            .release(amount)
+            .map_err(|error| native_error(py, error))
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        if let Some(state) = gc_lock(&self.state) {
-            for callback in &state.waiters {
+        self.inner.visit(|callbacks| {
+            for callback in callbacks {
                 visit.call(callback)?;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
 impl TransferCapacity {
-    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, CapacityState>> {
-        self.state
-            .lock_py_attached(py)
-            .map_err(|_| invariant(py, "transfer capacity lock is poisoned"))
+    fn read_error(
+        capacity: &Bound<'_, Self>,
+        error: uniserve_worker::Error,
+        message: &str,
+    ) -> PyErr {
+        let py = capacity.py();
+        let uniserve_worker::Error::ReadBackpressure { returns } = error else {
+            return native_error(py, error);
+        };
+
+        let converted = (|| -> PyResult<Bound<'_, PyAny>> {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("capacity", capacity)?;
+            kwargs.set_item("returns", returns)?;
+            py.import("uniserve_worker.transport.pool")?
+                .getattr("ReadBackpressureError")?
+                .call((message,), Some(&kwargs))
+        })();
+
+        match converted {
+            Ok(error) => PyErr::from_value(error),
+            Err(error) => error,
+        }
     }
 }
 
-/// A fetch takes all its read credits together, then transfers one credit to
-/// each submitted read. Closing returns only credits it has not handed off.
+/// The native reservation returns unused credits even without an interpreter.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct ReadReservation {
+    inner: NativeReadReservation<Py<PyAny>>,
     capacity: Py<TransferCapacity>,
-    unused: Mutex<usize>,
 }
 
 #[pymethods]
 impl ReadReservation {
     #[new]
     fn new(py: Python<'_>, capacity: Py<TransferCapacity>, count: isize) -> PyResult<Self> {
-        TransferCapacity::take_reads(
-            capacity.bind(py).clone(),
-            count,
-            "asynchronous transfer ticket capacity is exhausted",
-        )?;
-        Ok(Self {
-            capacity,
-            unused: Mutex::new(count as usize),
-        })
+        let inner =
+            NativeReadReservation::new(Arc::clone(&capacity.get().inner), read_count(count)?)
+                .map_err(|error| {
+                    TransferCapacity::read_error(
+                        capacity.bind(py),
+                        error,
+                        "asynchronous transfer ticket capacity is exhausted",
+                    )
+                })?;
+
+        Ok(Self { inner, capacity })
     }
 
     #[pyo3(name = "use")]
     fn use_read(&self, py: Python<'_>) -> PyResult<()> {
-        let mut unused = self
-            .unused
-            .lock_py_attached(py)
-            .map_err(|_| invariant(py, "read reservation lock is poisoned"))?;
-        if *unused == 0 {
-            return Err(PyRuntimeError::new_err(
-                "read reservation has no ticket left",
-            ));
-        }
-        *unused -= 1;
-        Ok(())
+        self.inner
+            .use_read()
+            .map_err(|error| native_error(py, error))
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let unused = {
-            let mut unused = self
-                .unused
-                .lock_py_attached(py)
-                .map_err(|_| invariant(py, "read reservation lock is poisoned"))?;
-            std::mem::take(&mut *unused)
-        };
-        if unused != 0 {
-            self.capacity.get().return_reads(py, unused as isize)?;
-        }
-        Ok(())
+        self.inner.close().map_err(|error| native_error(py, error))
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
@@ -251,19 +194,18 @@ impl ReadReservation {
     }
 }
 
-impl Drop for ReadReservation {
-    fn drop(&mut self) {
-        let unused = *self
-            .unused
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner());
-        if unused != 0 {
-            Python::try_attach(|py| {
-                if let Err(error) = self.capacity.get().return_reads(py, unused as isize) {
-                    error.write_unraisable(py, None);
-                }
-            });
-        }
+fn read_count(count: isize) -> PyResult<usize> {
+    if count < 1 {
+        return Err(PyValueError::new_err(
+            "a read ticket reservation takes at least one",
+        ));
+    }
+    Ok(count as usize)
+}
+
+fn notify_capacity(callbacks: Vec<Py<PyAny>>) {
+    if !callbacks.is_empty() {
+        Python::try_attach(|py| notify(py, callbacks));
     }
 }
 
@@ -749,7 +691,7 @@ impl TransferPool {
         name: &str,
         event_pool: Py<PyAny>,
     ) -> PyResult<Self> {
-        let limit = capacity.get().ticket_capacity;
+        let limit = capacity.get().ticket_capacity();
         let lane = HostLane::new(py, limit, workers.min(limit), name)?;
         Ok(Self {
             lane,
@@ -789,12 +731,10 @@ impl TransferPool {
             }
         }
         if let Some(reservation) = reservation {
-            if !reservation
-                .get()
-                .capacity
-                .bind(py)
-                .is(owner.capacity.bind(py))
-            {
+            if !Arc::ptr_eq(
+                reservation.get().inner.capacity(),
+                &owner.capacity.get().inner,
+            ) {
                 return Err(invalid(
                     py,
                     "read reservation belongs to another transfer capacity",
