@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyList;
 use pythonize::depythonize;
 use uniserve_worker_ipc::{BatchOutput, CallStatus, ErrorCode, RequestOutput};
 
@@ -12,7 +12,6 @@ use super::{BatchState, PythonBackend};
 use crate::convert;
 use crate::worker::error::native_error;
 use crate::worker::pending::{PendingOutput, request_output};
-use crate::worker::protocol::call_id;
 
 impl PythonBackend {
     pub(super) fn materialize(
@@ -81,7 +80,7 @@ impl PythonBackend {
         }
         let stats = numerical.getattr("stats")?;
         Ok(BatchOutput {
-            batch_id: batch.id,
+            batch_id: batch.plan.batch_id,
             completions,
             products,
             worker_exec_us: numerical.getattr("execution_us")?.extract()?,
@@ -106,29 +105,25 @@ impl PythonBackend {
             "InvariantViolation" | "FatalWorkerFailure" => ErrorCode::Internal,
             _ => ErrorCode::InvalidCall,
         };
-        let predecessors = batch.numerical.bind(py).getattr("predecessors")?;
-        let predecessors = predecessors
-            .cast::<PyDict>()?
-            .iter()
-            .filter(|(_, previous)| !previous.is_none())
-            .map(|(id, _)| call_id(&id))
-            .collect::<PyResult<HashSet<_>>>()?;
         let requests = self.requests.borrow(py);
         let completions = batch
+            .plan
             .calls
             .iter()
-            .map(|&(key, id, kind)| {
+            .zip(&batch.predecessors)
+            .map(|(call, predecessor)| {
+                let key = call.request_key;
                 // A failed first call has no accepted parent. A stale epoch must
                 // never report the progress of a replacement request slot.
                 let progress = requests
                     .pool
                     .peek(key.request_id.0)
-                    .filter(|request| request.key() == key && predecessors.contains(&id))
+                    .filter(|request| request.key() == key && predecessor.is_some())
                     .map(|request| request.progress())
                     .transpose()
                     .map_err(|error| native_error(py, error))?
                     .unwrap_or_default();
-                let mut output = request_output(key, id, kind, progress)?;
+                let mut output = request_output(key, call.call_id, call.code, progress)?;
                 output.status = CallStatus::Error;
                 output.error_code = Some(code);
                 Ok(output)

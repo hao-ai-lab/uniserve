@@ -818,10 +818,6 @@ class Worker:
         if self._closed:
             raise RuntimeError("worker is closed and cannot be reused")
 
-    def supports_computation(self, kind: CallKind) -> bool:
-        """Return whether this worker can execute this computation."""
-        return kind in self.info.supported_calls
-
     def warmup(self) -> None:
         """Prepare numerical execution once without serving requests.
 

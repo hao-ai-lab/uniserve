@@ -30,7 +30,6 @@ from uniserve_worker.execution.output import (
 from uniserve_worker.execution.request import RequestProgress, RequestResult
 from uniserve_worker.protocol.batch import (
     Batch,
-    BatchCommand,
     BufferAllocation,
     LatentParams,
     NewRequest,
@@ -105,7 +104,6 @@ __all__ = [
     "atomic_store_u32",
     "service_name",
     "validate_exports",
-    "retiring_exports",
     "release_exports",
 ]
 
@@ -116,13 +114,6 @@ def validate_exports(
     resident: dict[BufferId, ExportLocations],
     candidates: dict[BufferId, ExportLocations],
 ) -> None: ...
-def retiring_exports(
-    exports: dict[BufferId, ExportLocations],
-    *,
-    buffers: Iterable[BufferId] = (),
-    requests: Iterable[RequestKey] = (),
-    retained: Iterable[BufferId] = (),
-) -> tuple[BufferId, ...]: ...
 def release_exports(
     exports: dict[BufferId, ExportLocations], buffers: Iterable[BufferId]
 ) -> None: ...
@@ -1270,16 +1261,10 @@ class RequestPool:
     ) -> tuple[Request, ...]: ...
     def validate_pending(self, calls: Sequence[Call]) -> None: ...
     def add_pending(self, calls: Sequence[Call]) -> None: ...
-    def predecessors(
-        self, calls: Sequence[Call]
-    ) -> dict[CallId, CallId | None]: ...
     def apply_result(self, result: RequestResult) -> None: ...
     def cancel_calls(self, calls: Sequence[Call]) -> None: ...
     def start(self, admission: NewRequest) -> int | None: ...
     def finish(self, request_key: RequestKey) -> None: ...
-    def apply_commands(
-        self, commands: Sequence[BatchCommand]
-    ) -> tuple[int, ...]: ...
     def retirement_ready(self, request_key: RequestKey) -> bool: ...
     def drop(self, request_id: int) -> None: ...
     def retire(self, request_id: int) -> None:

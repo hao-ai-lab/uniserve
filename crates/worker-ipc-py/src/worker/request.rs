@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use uniserve_core::CallId;
 use uniserve_worker::{Request as NativeRequest, RequestPool as NativePool, RequestProgress};
-use uniserve_worker_ipc::{CallStatus, RequestKey};
+use uniserve_worker_ipc::{CallStatus, NewRequest, RequestKey};
 
 use super::error::{invalid, native_error};
 use super::protocol::{call_id, new_request, request_key};
@@ -258,31 +258,6 @@ impl RequestPool {
             .map_err(|error| native_error(py, error))
     }
 
-    fn predecessors<'py>(
-        &self,
-        py: Python<'py>,
-        calls: Vec<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let result = PyDict::new(py);
-        let call_type = py
-            .import("uniserve_worker.protocol.identity")?
-            .getattr("CallId")?;
-        for call in calls {
-            let key = request_key(&call.getattr("request_key")?)?;
-            let advances = call.getattr("advances_state")?.extract()?;
-            let predecessor = self
-                .pool
-                .predecessor(key, advances)
-                .map_err(|error| native_error(py, error))?;
-            let value = match predecessor {
-                Some(id) => call_type.call1((id.batch_id, id.request_index))?,
-                None => py.None().into_bound(py),
-            };
-            result.set_item(call.getattr("call_id")?, value)?;
-        }
-        Ok(result)
-    }
-
     fn apply_result(&mut self, py: Python<'_>, result: &Bound<'_, PyAny>) -> PyResult<()> {
         let key = request_key(&result.getattr("request_key")?)?;
         let id = call_id(&result.getattr("call_id")?)?;
@@ -314,60 +289,19 @@ impl RequestPool {
             .map_err(|error| native_error(py, error))
     }
 
-    fn start(&mut self, py: Python<'_>, admission: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
-        let parameters = new_request(admission)?;
-        let request_id = parameters.request_key.request_id.0;
-        let previous_slot = self.pool.peek(request_id).map(|request| request.slot());
-        let slot = self
-            .pool
-            .start(parameters)
-            .map_err(|error| native_error(py, error))?;
-        if let Some(slot) = slot {
-            if let Some(previous) = previous_slot {
-                self.views[previous] = None;
-            }
-            let request = Arc::clone(
-                self.pool
-                    .get(request_id)
-                    .map_err(|error| native_error(py, error))?,
-            );
-            self.views[slot] = Some(Py::new(
-                py,
-                Request {
-                    request,
-                    admission: admission.clone().unbind(),
-                    diffusion: None,
-                },
-            )?);
-        }
-        Ok(slot)
+    #[pyo3(name = "start")]
+    fn start_py(
+        &mut self,
+        py: Python<'_>,
+        admission: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<usize>> {
+        self.start(py, new_request(admission)?, admission)
     }
 
     fn finish(&mut self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<()> {
         self.pool
             .finish(request_key(key)?)
             .map_err(|error| native_error(py, error))
-    }
-
-    fn apply_commands<'py>(
-        &mut self,
-        py: Python<'py>,
-        commands: Vec<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyTuple>> {
-        let protocol = py.import("uniserve_worker.protocol.batch")?;
-        let start = protocol.getattr("Start")?;
-        let finish = protocol.getattr("Finish")?;
-        let mut slots = Vec::new();
-        for command in commands {
-            if command.is_instance(&start)? {
-                if let Some(slot) = self.start(py, &command.getattr("request")?)? {
-                    slots.push(slot);
-                }
-            } else if command.is_instance(&finish)? {
-                self.finish(py, &command.getattr("request_key")?)?;
-            }
-        }
-        PyTuple::new(py, slots)
     }
 
     fn retirement_ready(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -404,6 +338,42 @@ impl RequestPool {
     fn __clear__(&mut self) {
         self.views.iter_mut().for_each(|view| *view = None);
         self.pool.close();
+    }
+}
+
+impl RequestPool {
+    pub(super) fn start(
+        &mut self,
+        py: Python<'_>,
+        parameters: NewRequest,
+        admission: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<usize>> {
+        let request_id = parameters.request_key.request_id.0;
+        let previous_slot = self.pool.peek(request_id).map(|request| request.slot());
+        let slot = self
+            .pool
+            .start(parameters)
+            .map_err(|error| native_error(py, error))?;
+
+        if let Some(slot) = slot {
+            if let Some(previous) = previous_slot {
+                self.views[previous] = None;
+            }
+            let request = Arc::clone(
+                self.pool
+                    .get(request_id)
+                    .map_err(|error| native_error(py, error))?,
+            );
+            self.views[slot] = Some(Py::new(
+                py,
+                Request {
+                    request,
+                    admission: admission.clone().unbind(),
+                    diffusion: None,
+                },
+            )?);
+        }
+        Ok(slot)
     }
 }
 

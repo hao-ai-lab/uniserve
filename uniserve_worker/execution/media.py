@@ -44,14 +44,12 @@ from uniserve_worker.execution.diffusion_state import (
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.mux import AvMuxConfig
 from uniserve_worker.protocol.batch import (
-    Batch,
     DecodeRange,
     MediaTrack,
     NewRequest,
     TensorPublication,
 )
 from uniserve_worker.protocol.call import Call, CallStatus, MediaCall
-from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.storage.latent_pool import LatentUpdate
 
@@ -715,29 +713,6 @@ def decode_range(call: Call, *, state: BatchState) -> DecodeRange:
     return selected[0]
 
 
-def validate_batch(
-    batch: Batch,
-    *,
-    postprocessor: VideoPostprocessor | None,
-    predecessors: Mapping[CallId, CallId | None],
-) -> None:
-    """Validate video admission requirements before staging state.
-
-    Latent preparation opens a request's trajectory, so it must be the first
-    state-advancing call of its request: the call it follows is the admission
-    root, not an earlier step.
-    """
-    if postprocessor is None:
-        return
-    for call in batch.calls:
-        if call.kind is not MediaCall.LATENT_PREPARATION:
-            continue
-        if predecessors.get(call.call_id) != CallId(0, 0):
-            raise invalid_descriptor(
-                "video preparation does not follow its request root"
-            )
-
-
 def open_state(runner: ModelExecutor, size) -> DiffusionState:
     """Open a video request's diffusion state on the fixed schedule."""
     builder = runner.media_builder
@@ -1150,5 +1125,4 @@ __all__ = [
     "decode_range",
     "execute",
     "trajectory_params",
-    "validate_batch",
 ]

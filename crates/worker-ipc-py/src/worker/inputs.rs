@@ -374,7 +374,7 @@ impl BatchInputs {
         callback.get().__call__(py, &PyTuple::empty(py))
     }
 
-    fn close(
+    pub(super) fn close(
         slf: &Bound<'_, Self>,
         tensor_store: &TensorStore,
         latent_pool: Option<&Bound<'_, LatentPool>>,

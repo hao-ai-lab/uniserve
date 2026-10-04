@@ -25,7 +25,6 @@ from uniserve_worker.protocol.call import (
     CallStatus,
     ImageParams,
     MediaCall,
-    TransferMode,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.video import (
@@ -131,42 +130,6 @@ def test_conflicting_pending_calls_do_not_partially_commit():
             RequestResult(key, first.call_id, CallStatus.OK, None)
         )
         assert pool.retirement_ready(key)
-    finally:
-        pool.close()
-
-
-@pytest.mark.parametrize("commit_order", ((1, 2), (2, 1)))
-def test_predecessor_follows_committed_state_and_skips_independent_media(
-    commit_order,
-):
-    key = RequestKey(1, 7, 1)
-    pool = RequestPool(1)
-    try:
-        pool.start(
-            NewRequest(
-                key,
-                1,
-                diffusion=DiffusionParams(1, 1, 3, 0, 16, 16),
-                prompt_token_ids=(1,),
-                video=VideoAdmission(VideoTask.T2VA, (1,)),
-            )
-        )
-        first, second = (_call(key, batch) for batch in commit_order)
-        third = _call(key, 3)
-        copy = replace(third, kind=TransferMode.TENSOR)
-        assert pool.predecessors((first,)) == {first.call_id: CallId(0, 0)}
-
-        pool.add_pending((first, second))
-        assert pool.predecessors((third,)) == {third.call_id: second.call_id}
-        assert pool.predecessors((copy,)) == {copy.call_id: None}
-        pool.apply_result(
-            RequestResult(key, second.call_id, CallStatus.PREDICATED, None)
-        )
-        assert pool.predecessors((third,)) == {third.call_id: first.call_id}
-        pool.apply_result(
-            RequestResult(key, first.call_id, CallStatus.OK, None)
-        )
-        assert pool.predecessors((third,)) == {third.call_id: first.call_id}
     finally:
         pool.close()
 

@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use uniserve_core::{CallId, RequestId, SamplingParams};
+use uniserve_core::{CallId, DiffusionSamplingParams, RequestId, SamplingParams, VideoTask};
 use uniserve_worker::{RequestPool, RequestProgress};
-use uniserve_worker_ipc::{ArRequestParams, CallStatus, NewRequest, RequestKey};
+use uniserve_worker_ipc::{ArRequestParams, CallStatus, NewRequest, RequestKey, VideoAdmission};
 
 fn admission(id: u64, epoch: u64, slot: u32) -> NewRequest {
     NewRequest {
@@ -23,6 +23,45 @@ fn admission(id: u64, epoch: u64, slot: u32) -> NewRequest {
         prompt_token_ids: Vec::new(),
         input_images: 0,
     }
+}
+
+#[test]
+fn predecessors_follow_submission_order_and_skip_independent_work() -> uniserve_worker::Result<()> {
+    for order in [[1, 2], [2, 1]] {
+        let mut pool = RequestPool::new(1)?;
+        let request = NewRequest {
+            ar: None,
+            diffusion: Some(DiffusionSamplingParams {
+                num_frames: 1,
+                video_units: 1,
+                num_inference_steps: 3,
+                seed: 0,
+                width: 16,
+                height: 16,
+            }),
+            video: Some(VideoAdmission {
+                task: VideoTask::T2va,
+                text_tags: vec![1],
+                conditions: Vec::new(),
+            }),
+            prompt_token_ids: vec![1],
+            ..admission(7, 1, 1)
+        };
+        let key = request.request_key;
+        pool.start(request)?;
+        assert_eq!(pool.predecessor(key, true)?, Some(CallId::new(0, 0)));
+
+        let [first, second] = order.map(|batch| CallId::new(batch, 0));
+        pool.add_pending(&[(key, first, true), (key, second, true)])?;
+        assert_eq!(pool.predecessor(key, true)?, Some(second));
+        assert_eq!(pool.predecessor(key, false)?, None);
+
+        pool.apply_result(key, second, CallStatus::Predicated, None)?;
+        assert_eq!(pool.predecessor(key, true)?, Some(first));
+        pool.apply_result(key, first, CallStatus::Ok, None)?;
+        assert_eq!(pool.predecessor(key, true)?, Some(first));
+    }
+    Ok(())
 }
 
 #[test]
