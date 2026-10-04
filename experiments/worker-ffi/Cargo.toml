@@ -1,0 +1,20 @@
+[package]
+name = "uniserve-worker-ffi-experiment"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "uniserve_worker_ffi"
+crate-type = ["cdylib"]
+
+# The experiment is independent of the production extension and its build.
+[workspace]
+
+[dependencies]
+libloading = "0.8.9"
+tvm-ffi = { git = "https://github.com/apache/tvm-ffi", rev = "df463f9bd269867fc7f4d578d62d80cc2a11d004" }
+uniserve-worker-ipc = { path = "../../crates/worker-ipc" }
+
+[dev-dependencies]
+uniserve-core = { path = "../../crates/foundation/core" }
