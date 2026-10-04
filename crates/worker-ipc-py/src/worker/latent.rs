@@ -605,7 +605,7 @@ impl LatentPool {
     }
 
     /// Revoke exports while retaining pages through physical reader completion.
-    fn release_buffers(slf: Bound<'_, Self>, buffers: Vec<Py<PyAny>>) -> PyResult<()> {
+    pub(super) fn release_buffers(slf: Bound<'_, Self>, buffers: Vec<Py<PyAny>>) -> PyResult<()> {
         let py = slf.py();
         let ids = buffers
             .iter()
@@ -619,9 +619,7 @@ impl LatentPool {
 
         // Backend revocation may notify observers synchronously, so the pool
         // must be available while those callbacks run.
-        py.import("uniserve_worker.transport.exports")?
-            .getattr("release_exports")?
-            .call1((exports, buffers))?;
+        super::exports::release(exports.bind(py), &buffers)?;
         slf.borrow_mut().inner.reap();
         Ok(())
     }
@@ -779,31 +777,11 @@ impl LatentPool {
     /// Independent requests can continue using their own pages.
     fn retirement_ready(&mut self, py: Python<'_>, requests: Vec<Py<PyAny>>) -> PyResult<bool> {
         let requests = request_set(py, &requests)?;
-        for write in self.inner.imports() {
-            if requests.contains(&write.buffer.owner) {
-                for ticket in write.transfers() {
-                    ticket.owner.get().retirement_ready(py)?;
-                }
-            }
-        }
-        for source in self.inner.exports() {
-            if requests.contains(&source.buffer.owner) {
-                for completion in source.retirements() {
-                    if completion.done() {
-                        completion.owner.borrow(py).result(py, None)?;
-                    }
-                }
-            }
-        }
-
-        self.inner.reap();
-        Ok(self.inner.retirement_ready(&requests))
+        self.retirement_ready_for(py, &requests)
     }
 
     fn cancel_imports(&mut self, py: Python<'_>, requests: Vec<Py<PyAny>>) -> PyResult<()> {
-        cancel_transfers(py, self.inner.cancel_imports(&request_set(py, &requests)?))?;
-        self.inner.reap();
-        Ok(())
+        self.cancel_request_imports(py, &request_set(py, &requests)?)
     }
 
     /// Request cancellation retains page ownership through physical retirement.
@@ -1041,4 +1019,42 @@ fn lower_updates(
 
 fn backend(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     py.import("uniserve_worker.storage.latent_pool")
+}
+
+impl LatentPool {
+    pub(super) fn retirement_ready_for(
+        &mut self,
+        py: Python<'_>,
+        requests: &HashSet<RequestKey>,
+    ) -> PyResult<bool> {
+        for write in self.inner.imports() {
+            if requests.contains(&write.buffer.owner) {
+                for ticket in write.transfers() {
+                    ticket.owner.get().retirement_ready(py)?;
+                }
+            }
+        }
+        for source in self.inner.exports() {
+            if requests.contains(&source.buffer.owner) {
+                for completion in source.retirements() {
+                    if completion.done() {
+                        completion.owner.borrow(py).result(py, None)?;
+                    }
+                }
+            }
+        }
+
+        self.inner.reap();
+        Ok(self.inner.retirement_ready(requests))
+    }
+
+    pub(super) fn cancel_request_imports(
+        &mut self,
+        py: Python<'_>,
+        requests: &HashSet<RequestKey>,
+    ) -> PyResult<()> {
+        cancel_transfers(py, self.inner.cancel_imports(requests))?;
+        self.inner.reap();
+        Ok(())
+    }
 }

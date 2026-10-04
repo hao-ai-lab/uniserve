@@ -391,6 +391,51 @@ def test_retirement_waits_for_readers_without_delaying_other_results(
         worker.close()
 
 
+@pytest.mark.gpu
+def test_finish_acknowledges_stream_ordered_resets_without_waiting() -> None:
+    import torch
+
+    from tests.python.fixtures.cuda_stream import blocked_stream
+
+    with execution_worker(device="cuda:0") as worker:
+        admission = ar_params(90, block_ids=(0,))
+        call = token_call(
+            admission.request_key,
+            call_id=CallId(1, 0),
+            predecessor=root_parent(admission),
+            mode=ForwardMode.PREFILL,
+            tokens=(3, 4),
+        )
+        finalized_report(
+            worker,
+            worker.submit(
+                execution_batch(
+                    batch_id=1, admissions=(admission,), calls=(call,)
+                )
+            ),
+        )
+        read = worker.tensor_store.consume(
+            call.token_output, consumer_call_id=CallId(2, 0)
+        )
+        finished = worker.submit(
+            execution_batch(
+                batch_id=2, commands=(Finish(admission.request_key),)
+            )
+        )
+        assert worker.poll(finished) is None
+        worker.tensor_store.complete_reads((read,))
+
+        # The reader and Finish's fence precede this gate. Slot resets are
+        # enqueued behind it, as they would be behind later numerical work.
+        # Their ordering is sufficient for reuse after acknowledgment.
+        with blocked_stream("cuda:0") as later:
+            torch.cuda.current_stream("cuda:0").wait_stream(later)
+            worker.advance()
+            result = worker.poll(finished)
+            assert result is not None
+            assert result.batch_id == 2
+
+
 def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> (
     None
 ):

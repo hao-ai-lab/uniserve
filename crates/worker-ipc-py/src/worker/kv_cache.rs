@@ -156,15 +156,7 @@ impl KVCacheManager {
             .collect::<PyResult<_>>()?;
         let retained = buffer_set(retained)?;
 
-        for completion in self
-            .inner
-            .retirement_completions(&buffers, &requests, &retained)
-        {
-            if completion.done() {
-                completion.owner.borrow(py).result(py, None)?;
-            }
-        }
-        Ok(self.inner.retirement_ready(&buffers, &requests, &retained))
+        self.retirement_ready_for(py, &buffers, &requests, &retained)
     }
 
     fn require_retired(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -190,4 +182,24 @@ fn buffer_set(buffers: &Bound<'_, PyAny>) -> PyResult<HashSet<BufferId>> {
         .try_iter()?
         .map(|buffer| buffer_id(&buffer?))
         .collect()
+}
+
+impl KVCacheManager {
+    pub(super) fn retirement_ready_for(
+        &mut self,
+        py: Python<'_>,
+        buffers: &HashSet<BufferId>,
+        requests: &HashSet<RequestKey>,
+        retained: &HashSet<BufferId>,
+    ) -> PyResult<bool> {
+        for completion in self
+            .inner
+            .retirement_completions(buffers, requests, retained)
+        {
+            if completion.done() {
+                completion.owner.borrow(py).result(py, None)?;
+            }
+        }
+        Ok(self.inner.retirement_ready(buffers, requests, retained))
+    }
 }

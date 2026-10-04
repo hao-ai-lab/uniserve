@@ -1311,6 +1311,10 @@ pub(crate) fn buffer_id_to_py<'py>(
     RequestConversion::new(py)?.buffer_id(*buffer)
 }
 
+pub(crate) fn request_key_to_py(py: Python<'_>, key: RequestKey) -> PyResult<Bound<'_, PyAny>> {
+    RequestConversion::new(py)?.request_key(key)
+}
+
 /// Converts a product-family transfer handle into its typed Python record.
 fn transfer_handle_to_py<'py>(
     py: Python<'py>,

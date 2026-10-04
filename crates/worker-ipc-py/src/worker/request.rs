@@ -20,7 +20,7 @@ pub(crate) struct Request {
     #[pyo3(get)]
     admission: Py<PyAny>,
     #[pyo3(get, set)]
-    diffusion: Option<Py<PyAny>>,
+    pub(super) diffusion: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -140,7 +140,7 @@ impl Request {
 /// Bind the native pool to its Python numerical storage and slot views.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct RequestPool {
-    pool: NativePool,
+    pub(super) pool: NativePool,
     // Cached language views carry numerical state, never a second lifecycle.
     views: Vec<Option<Py<Request>>>,
     #[pyo3(get)]
@@ -199,7 +199,7 @@ impl RequestPool {
         Ok(())
     }
 
-    fn get(&self, py: Python<'_>, request_id: u64) -> PyResult<Py<Request>> {
+    pub(super) fn get(&self, py: Python<'_>, request_id: u64) -> PyResult<Py<Request>> {
         self.peek(py, request_id)
             .ok_or_else(|| invalid(py, format!("unknown request {request_id}")))
     }
@@ -393,7 +393,7 @@ impl RequestPool {
     }
 
     #[pyo3(name = "drop")]
-    fn drop_request(&mut self, request_id: u64) {
+    pub(super) fn drop_request(&mut self, request_id: u64) {
         if let Some(request) = self.pool.peek(request_id) {
             self.views[request.slot()] = None;
         }
@@ -401,7 +401,7 @@ impl RequestPool {
     }
 
     /// The execution owner drains numerical staging before retiring this slot.
-    fn retire(&mut self, py: Python<'_>, request_id: u64) -> PyResult<()> {
+    pub(super) fn retire(&mut self, py: Python<'_>, request_id: u64) -> PyResult<()> {
         self.pool
             .retire(request_id)
             .map_err(|error| native_error(py, error))?;

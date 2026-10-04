@@ -1231,9 +1231,7 @@ impl TensorStore {
     fn release_buffers(&self, py: Python<'_>, buffers: Bound<'_, PyAny>) -> PyResult<()> {
         let buffers = PyTuple::new(py, buffers.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
         let selected = buffer_ids(&buffers)?;
-        py.import("uniserve_worker.transport.exports")?
-            .getattr("release_exports")?
-            .call1((self.exports.bind(py), buffers))?;
+        super::exports::release_exports(self.exports.bind(py), buffers.as_any())?;
         let mut state = self.lock(py)?;
         let released = state.release_buffers(&selected);
         let released = released
@@ -1262,21 +1260,7 @@ impl TensorStore {
             .map(buffer_ids)
             .transpose()?
             .unwrap_or_default();
-        let mut state = self.lock(py)?;
-        let released = state
-            .release_requests(&requests, &retained)
-            .map_err(|error| native_error(py, error))?;
-        let released = released
-            .into_iter()
-            .filter_map(|key| state.buffers.get(&key).map(|buffer| buffer.clone_ref(py)))
-            .collect::<Vec<_>>();
-        drop(state);
-
-        for buffer in released {
-            self.retire_buffer(py, &buffer)?;
-        }
-        let mut state = self.lock(py)?;
-        self.reclaim(py, &mut state)
+        self.release_request_set(py, &requests, &retained)
     }
 
     #[pyo3(signature = (*, buffers, requests, retained=None))]
@@ -1294,29 +1278,7 @@ impl TensorStore {
             .map(buffer_ids)
             .transpose()?
             .unwrap_or_default();
-        let selected = |buffer: &NativeBuffer| {
-            buffers.contains(&buffer.id)
-                || (requests.contains(&buffer.id.owner) && !retained.contains(&buffer.id))
-        };
-        let mut state = self.lock(py)?;
-        for buffer in state.buffers.values() {
-            let value = lock(py, buffer);
-            if selected(&value) {
-                for ticket in &value.transfers {
-                    ticket.owner.get().retirement_ready(py)?;
-                }
-                for export in &value.exports {
-                    if export.done() {
-                        export.owner.borrow(py).result(py, None)?;
-                    }
-                }
-            }
-        }
-        self.reclaim(py, &mut state)?;
-        Ok(!state
-            .buffers
-            .values()
-            .any(|buffer| selected(&lock(py, buffer))))
+        self.retirement_ready_for(py, &buffers, &requests, &retained)
     }
 
     #[pyo3(signature = (bindings, *, request_slots=None, buffer_allocations=None, regions=None, shapes=None))]
@@ -2133,4 +2095,61 @@ fn import_read(py: Python<'_>, imported: &ImportHandle) -> PyResult<Py<TensorRea
             },
         },
     )
+}
+
+impl TensorStore {
+    pub(super) fn release_request_set(
+        &self,
+        py: Python<'_>,
+        requests: &HashSet<RequestKey>,
+        retained: &HashSet<BufferId>,
+    ) -> PyResult<()> {
+        let mut state = self.lock(py)?;
+        let released = state
+            .release_requests(requests, retained)
+            .map_err(|error| native_error(py, error))?;
+        let released = released
+            .into_iter()
+            .filter_map(|key| state.buffers.get(&key).map(|buffer| buffer.clone_ref(py)))
+            .collect::<Vec<_>>();
+        drop(state);
+
+        for buffer in released {
+            self.retire_buffer(py, &buffer)?;
+        }
+        let mut state = self.lock(py)?;
+        self.reclaim(py, &mut state)
+    }
+
+    pub(super) fn retirement_ready_for(
+        &self,
+        py: Python<'_>,
+        buffers: &HashSet<BufferId>,
+        requests: &HashSet<RequestKey>,
+        retained: &HashSet<BufferId>,
+    ) -> PyResult<bool> {
+        let selected = |buffer: &NativeBuffer| {
+            buffers.contains(&buffer.id)
+                || (requests.contains(&buffer.id.owner) && !retained.contains(&buffer.id))
+        };
+        let mut state = self.lock(py)?;
+        for buffer in state.buffers.values() {
+            let value = lock(py, buffer);
+            if selected(&value) {
+                for ticket in &value.transfers {
+                    ticket.owner.get().retirement_ready(py)?;
+                }
+                for export in &value.exports {
+                    if export.done() {
+                        export.owner.borrow(py).result(py, None)?;
+                    }
+                }
+            }
+        }
+        self.reclaim(py, &mut state)?;
+        Ok(!state
+            .buffers
+            .values()
+            .any(|buffer| selected(&lock(py, buffer))))
+    }
 }

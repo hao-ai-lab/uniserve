@@ -8,7 +8,7 @@ predicate captures, and `image.reserve_images` the host preparation of
 inline input images; `reserve_outputs` binds one `PendingOutput` per call;
 `commit_batch` (or `execute_batch` on failure) records the final outputs.
 The native executor owns admission, launch order, failure and delivery.
-The batch runner materializes outputs and retires their resources. Native
+The batch runner materializes outputs; Rust retires batch resources. Native
 `BatchInputs` retains input leases and notifies the executor when their
 physical dependencies become consumable.
 """
@@ -24,7 +24,7 @@ from typing import cast
 import torch
 
 from uniserve.runtime.resources import close_resources
-from uniserve_worker._uniserve_ipc import BatchInputs, CUDAEvent
+from uniserve_worker._uniserve_ipc import BatchInputs
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.batch import Batch, TensorPublication
@@ -33,7 +33,6 @@ from uniserve_worker.protocol.identity import (
     BufferId,
     CallId,
     CallIdentity,
-    RequestKey,
 )
 from uniserve_worker.protocol.output import (
     BatchOutput,
@@ -92,9 +91,6 @@ class BatchState:
     outputs: list[PendingOutput | RequestOutput | None] = field(
         default_factory=list
     )
-    # Whether every pending output has become its wire value. Retirement may
-    # still be outstanding after this, so it is distinct from ``complete``.
-    materialized: bool = False
 
     # Completion storage leased by `reserve_outputs`; `record_outputs` drops
     # this reference while the pending outputs keep their rows.
@@ -124,21 +120,6 @@ class BatchState:
     products: tuple[TensorPublication, ...] = ()
     stats: ForwardStats | None = None
     execution_us: int | None = None
-
-    # Retirement of the batch's ``Finish`` and ``Free`` commands, recorded by
-    # `BatchRunner.begin_retirement` and advanced by
-    # `BatchRunner.poll`. ``retirement_events`` fence the device
-    # work issued up to the batch's launch, including its request-state
-    # writes, and ``retirement_cleaned`` is set once the stores have retired
-    # the closed requests and freed buffers (at once for a batch without such
-    # commands).
-    retirement_requests: frozenset[RequestKey] = frozenset()
-    retirement_local_requests: frozenset[RequestKey] = frozenset()
-    retirement_buffers: frozenset[BufferId] = frozenset()
-    retained_buffers: frozenset[BufferId] = frozenset()
-    retirement_exports: tuple[BufferId, ...] = ()
-    retirement_events: tuple[CUDAEvent, ...] = ()
-    retirement_cleaned: bool = False
 
     def __post_init__(self) -> None:
         self.outputs = [None] * len(self.batch.calls)

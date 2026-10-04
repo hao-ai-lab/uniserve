@@ -1,5 +1,7 @@
 //! Python numerical backend for the shared native batch executor.
 
+mod retirement;
+
 use std::sync::Arc;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
@@ -15,11 +17,17 @@ use uniserve_worker_ipc::{
     Batch as BatchPlan, BatchOutput, RequestKind, WorkerInfo, WorkerResponseError,
 };
 
+use super::events::EventPool;
 use super::host::with_context;
 use super::inputs::BatchInputs;
+use super::kv_cache::KVCacheManager;
+use super::kv_import::KVImporter;
+use super::latent::LatentPool;
 use super::request::RequestPool;
+use super::storage::TensorStore;
 use super::transfer::TransferCapacity;
 use crate::{PyServer, convert};
+use retirement::Retirement;
 
 use super::error::native_error;
 
@@ -41,10 +49,18 @@ impl Submission {
 }
 
 struct PythonBackend {
+    worker: Py<PyAny>,
     runner: Py<PyAny>,
     batch_type: Py<PyAny>,
     read_backpressure: Py<PyType>,
     requests: Py<RequestPool>,
+    tensors: Py<TensorStore>,
+    latents: Option<Py<LatentPool>>,
+    cache: Option<Py<KVCacheManager>>,
+    cache_imports: Option<Py<KVImporter>>,
+    events: Py<EventPool>,
+    exports: Vec<Py<PyDict>>,
+    retirement_devices: Vec<Py<PyAny>>,
     model_runner: Py<PyAny>,
     transports: Vec<Py<PyAny>>,
     info: WorkerInfo,
@@ -55,6 +71,8 @@ struct BatchState {
     numerical: Py<PyAny>,
     inputs: Py<BatchInputs>,
     imports: bool,
+    materialized: bool,
+    retirement: Retirement,
 }
 
 impl PythonBackend {
@@ -62,6 +80,7 @@ impl PythonBackend {
         &self,
         py: Python<'_>,
         batch: &Bound<'_, PyAny>,
+        plan: &BatchPlan,
         propagate_errors: bool,
     ) -> PyResult<BatchState> {
         let kwargs = PyDict::new(py);
@@ -71,6 +90,8 @@ impl PythonBackend {
             inputs: numerical.getattr("inputs")?.extract()?,
             numerical: numerical.unbind(),
             imports: false,
+            materialized: false,
+            retirement: Retirement::new(plan),
         })
     }
 
@@ -239,17 +260,34 @@ impl Backend for PythonBackend {
     }
 
     fn begin_retirement(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
-        self.call("begin_retirement", batch).map(drop)
+        Python::attach(|py| {
+            batch
+                .retirement
+                .begin(py, self)
+                .map_err(|error| error.into_value(py))
+        })
     }
 
     fn poll(&mut self, batch: &mut Self::Batch) -> Result<(bool, bool), Self::Error> {
-        let progress = self.call("poll", batch)?;
-        Python::attach(|py| {
-            progress
-                .bind(py)
-                .extract::<(bool, bool)>()
+        let before = batch.materialized;
+        if !batch.materialized {
+            let ready = self.call("materialize", batch)?;
+            batch.materialized = Python::attach(|py| {
+                ready
+                    .extract::<bool>(py)
+                    .map_err(|error| error.into_value(py))
+            })?;
+        }
+        if !batch.materialized {
+            return Ok((false, false));
+        }
+        let retired = Python::attach(|py| {
+            batch
+                .retirement
+                .poll(py, self)
                 .map_err(|error| error.into_value(py))
-        })
+        })?;
+        Ok((batch.materialized != before, retired))
     }
 
     fn result(&mut self, batch: &mut Self::Batch) -> Result<Self::Output, Self::Error> {
@@ -264,15 +302,26 @@ impl Backend for PythonBackend {
     }
 
     fn close(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
-        self.call("close", batch).map(drop)
+        let deferred = Python::attach(|py| {
+            batch
+                .retirement
+                .close(py, self, &batch.numerical)
+                .map_err(|error| error.into_value(py))
+        });
+        let closed = self.call("close", batch).map(drop);
+        match (deferred, closed) {
+            (Err(mut error), Err(cleanup)) => {
+                self.note_cleanup(&mut error, cleanup);
+                Err(error)
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            _ => Ok(()),
+        }
     }
 
     fn reap(&mut self) -> Result<(), Self::Error> {
         Python::attach(|py| {
-            self.runner
-                .bind(py)
-                .call_method0("reap")
-                .map(drop)
+            self.reap_resources(py)
                 .map_err(|error| error.into_value(py))
         })
     }
@@ -288,7 +337,7 @@ impl ServiceBackend for PythonBackend {
                     .call1(("uniserve.worker.batch_decode",))?;
                 with_context(&range, || {
                     let batch = convert::batch_to_py(py, plan)?;
-                    self.batch_state(py, &batch, false)
+                    self.batch_state(py, &batch, plan, false)
                 })
             };
             build().map_err(|error: PyErr| error.into_value(py))
@@ -401,7 +450,36 @@ impl Executor {
             .import("uniserve_worker.execution.batch")?
             .getattr("BatchState")?
             .unbind();
+        let cache = worker.getattr("kv_cache")?;
+        let (cache_accesses, cache_imports) = if cache.is_none() {
+            (None, None)
+        } else {
+            (
+                Some(cache.getattr("_accesses")?.extract()?),
+                Some(cache.getattr("imports")?.extract()?),
+            )
+        };
+        let mut exports = Vec::new();
+        for name in ["tensor_store", "kv_cache", "latent_pool"] {
+            let store = worker.getattr(name)?;
+            if !store.is_none() {
+                exports.push(store.getattr("exports")?.extract()?);
+            }
+        }
+        let mut retirement_devices = Vec::new();
+        for device in worker
+            .getattr("buffer_pool")?
+            .getattr("devices")?
+            .try_iter()?
+        {
+            let device = device?;
+            if device.getattr("type")?.extract::<String>()? == "cuda" {
+                retirement_devices.push(device.unbind());
+            }
+        }
+
         let backend = PythonBackend {
+            worker: worker.clone().unbind(),
             runner: runner.unbind(),
             batch_type,
             read_backpressure: py
@@ -410,6 +488,13 @@ impl Executor {
                 .cast_into::<PyType>()?
                 .unbind(),
             requests: worker.getattr("requests")?.extract()?,
+            tensors: worker.getattr("tensor_store")?.extract()?,
+            latents: worker.getattr("latent_pool")?.extract()?,
+            cache: cache_accesses,
+            cache_imports,
+            events: worker.getattr("device_events")?.extract()?,
+            exports,
+            retirement_devices,
             model_runner: worker.getattr("runner")?.unbind(),
             transports: worker
                 .getattr("transports")?
@@ -437,7 +522,7 @@ impl Executor {
         let plan = convert::batch_from_py(&batch.call_method0("to_mapping")?)?;
         let state = executor
             .backend()
-            .batch_state(py, batch, propagate_errors)?;
+            .batch_state(py, batch, &plan, propagate_errors)?;
         let submission = executor
             .submit(Batch::from_plan(&plan, state), propagate_errors)
             .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))?;
@@ -503,11 +588,9 @@ impl Executor {
     }
 
     fn drop_request(&mut self, py: Python<'_>, request_id: u64) -> PyResult<()> {
-        self.executor_mut()?
-            .backend()
-            .runner
-            .bind(py)
-            .call_method1("drop_request", (request_id,))?;
+        let backend = self.executor_mut()?.backend();
+        backend.release_requests(py, &[request_id], &Default::default())?;
+        backend.requests.borrow_mut(py).drop_request(request_id);
         Ok(())
     }
 
@@ -522,10 +605,22 @@ impl Executor {
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(executor) = &self.executor {
+            visit.call(&executor.backend().worker)?;
             visit.call(&executor.backend().runner)?;
             visit.call(&executor.backend().batch_type)?;
             visit.call(&executor.backend().read_backpressure)?;
             visit.call(&executor.backend().requests)?;
+            visit.call(&executor.backend().tensors)?;
+            visit.call(&executor.backend().latents)?;
+            visit.call(&executor.backend().cache)?;
+            visit.call(&executor.backend().cache_imports)?;
+            visit.call(&executor.backend().events)?;
+            for directory in &executor.backend().exports {
+                visit.call(directory)?;
+            }
+            for device in &executor.backend().retirement_devices {
+                visit.call(device)?;
+            }
             visit.call(&executor.backend().model_runner)?;
             for transport in &executor.backend().transports {
                 visit.call(transport)?;
@@ -533,6 +628,7 @@ impl Executor {
             for (batch, error) in executor.batches() {
                 visit.call(&batch.numerical)?;
                 visit.call(&batch.inputs)?;
+                batch.retirement.traverse(&visit)?;
                 visit.call(error)?;
             }
         }
