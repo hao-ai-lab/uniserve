@@ -1,7 +1,7 @@
 """Worker startup information shared with the scheduler.
 
-A rank answers the engine's ``info`` request (`RequestKind.INFO`, served by
-`uniserve_worker.service`) with `WorkerInfo.to_mapping()`: its endpoint,
+A rank answers the engine's ``info`` request through the native service:
+`WorkerInfo.to_mapping()` supplies its endpoint,
 supported calls, scheduling bounds, KV and latent pool capacity, components,
 and transfer capabilities. The worker-ipc crate's `WorkerInfo` is the wire
 counterpart: the PyO3 extension converts the mapping into it, and its
@@ -33,31 +33,6 @@ from uniserve_worker.protocol.call import (
 )
 from uniserve_worker.protocol.tensor import OutputInfo
 from uniserve_worker.protocol.transfer import WorkerEndpoint
-
-
-class RequestKind(StrEnum):
-    """IPC request kinds a worker serves.
-
-    ``info`` asks for the startup description, ``submit`` carries a batch,
-    and ``close`` shuts the worker down.
-    """
-
-    INFO = "info"
-    SUBMIT = "submit"
-    CLOSE = "close"
-
-
-class ResponseKind(StrEnum):
-    """IPC response kinds a worker sends.
-
-    ``info`` carries the `WorkerInfo` mapping, ``result`` a batch result,
-    ``ok`` the acknowledgement of ``close``, and ``error`` a failure.
-    """
-
-    INFO = "info"
-    RESULT = "result"
-    OK = "ok"
-    ERROR = "error"
 
 
 class KvGroupKind(StrEnum):
@@ -832,7 +807,5 @@ __all__ = [
     "KVCacheInfo",
     "KvGroup",
     "KvGroupKind",
-    "RequestKind",
-    "ResponseKind",
     "WorkerInfo",
 ]

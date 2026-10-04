@@ -3,9 +3,8 @@
 A rank reports each submitted batch as one `BatchOutput`: a `RequestOutput`
 per call plus the tensor products successful calls published. The execution
 package builds these records once every call's output has materialized on the
-host; `messages.finalize_response` serializes them with `to_mapping` for the
-PyO3 transport (`crates/worker-ipc-py`), which decodes the mapping into the
-Rust `BatchOutput`.
+host. The numerical backend serializes them with `to_mapping` into the
+native `BatchOutput`; the Rust service sends the response directly.
 """
 
 from __future__ import annotations

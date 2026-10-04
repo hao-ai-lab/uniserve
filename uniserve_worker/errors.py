@@ -7,10 +7,9 @@ raises one directly through the constructors here, and `classify` maps any
 other exception onto the taxonomy where failures are caught (in `Service`,
 `Executor`, `ModelExecutor`, and `uniserve_worker.execution.step`).
 
-``WorkerError.to_mapping`` produces the IPC error response fields that
-`uniserve_worker.protocol.messages.error_response` sends to the engine, where
-the PyO3 extension decodes them into ``WorkerResponseError``. Those fields
-are scalars, short strings, and call identities, never tensors. `_POLICY`
+``WorkerError.to_mapping`` produces the ``WorkerResponseError`` fields that
+the native service sends to the engine. Those fields are scalars, short
+strings, and call identities, never tensors. `_POLICY`
 defines each code's default fatality and whether its log record carries a
 stack trace.
 """
@@ -152,19 +151,11 @@ class WorkerError(Exception):
         Exception.__init__(self, f"{self.code}: {self.message}")
 
     def to_mapping(self) -> dict[str, Any]:
-        """Serialize the fields of an IPC error response.
-
-        Returns:
-            A mapping with ``kind`` (always ``"error"``), ``code``,
-            ``message``, ``fatal``, ``phase``, ``route`` and ``calls``, each
-            call as its request key and call id mapping. `error_response`
-            drops ``kind`` in favor of the response envelope's own.
-        """
+        """Serialize the native error's code, message and affected calls."""
         # Only the fields of the Rust ``WorkerResponseError`` cross the IPC
         # boundary; richer context (req_id, call_id, call_kind, details)
         # stays in this process.
         return {
-            "kind": "error",
             "code": str(self.code),
             "message": self.message,
             "fatal": bool(self.fatal),

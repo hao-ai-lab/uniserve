@@ -1,35 +1,16 @@
-//! Typed conversion between worker IPC messages and the Python worker's
-//! protocol records.
+//! Conversion between native batches and public Python numerical records.
 //!
-//! This module converts submit requests into Python records and decodes
-//! result and error responses from Python, each in one call per message.
-//! Every other message kind uses the schema-derived serde representation
-//! (`pythonize_request` and `PyServer::respond` in the crate root choose the
-//! path).
+//! The service receives native request envelopes directly. This module builds
+//! the Python batches consumed by numerical execution and reads completed
+//! outputs back into native values. Direct submission uses the same batch
+//! representation.
 //!
-//! - Inbound, [`execute_request_to_py`] turns a decoded submit request into
-//!   `{kind, message_id, batch}`, where `batch` is a fully constructed
-//!   `uniserve_worker.protocol.batch.Batch`. Python classes and enum members
-//!   are resolved once per process (`RequestTypes`); outside `kv_inputs`,
-//!   each distinct request key, call id, and shape bound is constructed once
-//!   per batch (`RequestConversion`); and `batch_from_validated` assembles the
-//!   batch without running `Batch.__post_init__`.
-//! - Outbound, [`try_completion_response_from_py`] decodes the mappings the
-//!   worker's `to_mapping` methods emit. That encoding differs from the serde
-//!   form: for example `Locator.to_mapping` writes a plain `transport` string
-//!   beside flattened transport fields, whereas `TransferTransport`
-//!   deserializes only from its adjacently tagged `transport`/`value` form.
+//! Most mapping fields use serde. Python transfer locators flatten transport
+//! coordinates beside tensor metadata, so those fields share explicit
+//! conversion in both directions.
 //!
-//! The encoder constructs many records positionally, so its argument order is
-//! coupled to the field order of the Python dataclasses in
-//! `uniserve_worker.protocol` and to the parameters of `batch_from_validated`.
-//! The round-trip test at the bottom of this file checks that each native
-//! batch equals `Batch.from_mapping(batch.to_mapping())`.
-//!
-//! Decoding is strict: integers reject Python `bool`, strings must be `str`,
-//! byte payloads must be `bytes`, and sequences must be `list` (except the
-//! logprob iterables). Any mismatch rejects the whole response with one
-//! generic `ValueError` that does not name the offending field.
+//! Cached record constructors follow Python dataclass field order. An inbound
+//! batch is assembled after wire validation without repeating Batch's checks.
 
 use std::collections::{BTreeMap, HashMap};
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
@@ -38,6 +19,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
+use pythonize::{depythonize, pythonize};
 use uniserve_core::{
     AudioClip, Canvas, ConditionMedia, ConditionRole, ImageParams, SamplingParams, TokenLogprob,
     VideoCondition,
@@ -45,15 +27,72 @@ use uniserve_core::{
 use uniserve_worker_ipc::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
     BufferAllocation, BufferId, CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType,
-    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCallIdentity, ErrorCode,
-    FeatureKind, FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator,
-    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication,
-    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
-    WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
+    DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, FeatureKind,
+    FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaOutput,
+    NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, ShapeBound,
+    TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
+    TransferTransport, VideoAdmission, WorkerEndpoint, WorkerRequest, WorkerResponse,
 };
 
 #[cfg(test)]
 use uniserve_worker_ipc::Bounds;
+
+/// Read the public Python batch mapping, sharing locator decoding with outputs.
+pub(crate) fn batch_from_py(value: &Bound<'_, PyAny>) -> PyResult<Batch> {
+    let source = value.cast::<PyDict>()?;
+    let fields = source.copy()?;
+
+    // Python transfer records flatten their transport fields. The rest of a
+    // batch uses the native serde representation directly.
+    let products = value.get_item("input_products")?;
+    let imports = value.get_item("kv_inputs")?;
+    fields.set_item("input_products", PyList::empty(value.py()))?;
+    fields.set_item("kv_inputs", PyList::empty(value.py()))?;
+
+    let mut batch: Batch = depythonize(fields.as_any())?;
+    for product in products.try_iter()? {
+        batch.input_products.push(
+            tensor_publication_from_py(&product?)
+                .ok_or_else(|| PyValueError::new_err("invalid batch tensor product"))?,
+        );
+    }
+
+    for import in imports.try_iter()? {
+        batch.kv_inputs.push(
+            kv_transfer_from_py(&import?)
+                .ok_or_else(|| PyValueError::new_err("invalid batch KV transfer"))?,
+        );
+    }
+
+    Ok(batch)
+}
+
+/// Return the public Python response mapping with its flattened transfer records.
+pub(crate) fn response_to_py(py: Python<'_>, response: &WorkerResponse) -> PyResult<Py<PyAny>> {
+    let mapping = pythonize(py, response)?;
+    if let WorkerResponse::Result { result, .. } = response {
+        let output = mapping.get_item("result")?;
+        let mut records = RequestConversion::new(py)?;
+        let products = result
+            .products
+            .iter()
+            .map(|product| {
+                tensor_publication_to_py(py, product, &mut records)?.call_method0("to_mapping")
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        output.set_item("products", PyList::new(py, products)?)?;
+        let completions = output.get_item("completions")?;
+        for (index, completion) in result.completions.iter().enumerate() {
+            if let Some(transfer) = &completion.kv_output {
+                completions.get_item(index)?.set_item(
+                    "kv_output",
+                    kv_transfer_to_py(py, transfer)?.call_method0("to_mapping")?,
+                )?;
+            }
+        }
+    }
+    Ok(mapping.unbind())
+}
 
 /// Converts a submit [`WorkerRequest`] into the Python worker mapping.
 ///
@@ -679,7 +718,7 @@ impl<'py> RequestConversion<'py> {
 /// shared between calls, commands, input products, and the per-batch
 /// parameter records. `kv_inputs` are the exception: `kv_transfer_to_py`
 /// builds their buffer ids through `buffer_id_to_py`.
-fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>> {
     let mut native = RequestConversion::new(py)?;
 
     let calls = run
@@ -1341,102 +1380,29 @@ fn feature_kind_py<'py>(py: Python<'py>, kind: FeatureKind) -> &'py Bound<'py, P
     }
 }
 
-/// Decodes a Python result or error mapping with strict field typing.
-///
-/// Returns `None` for any other `kind`, which the caller decodes with the
-/// schema-derived converter. Fails with `ValueError` when the response is not
-/// a `dict`, has no `kind`, has a non-string `kind`, or is a result or error
-/// mapping that fails strict decoding; the last case carries no field detail.
-/// The semantic checks of `BatchOutput::validate` run afterwards, in
-/// `codec::encode_response` in the IPC crate, when the result is published.
-pub(crate) fn try_completion_response_from_py(
-    response: &Bound<'_, PyAny>,
-) -> PyResult<Option<WorkerResponse>> {
-    let py = response.py();
-    let dict = response
-        .cast::<PyDict>()
-        .map_err(|_| PyValueError::new_err("worker response must be a mapping"))?;
-    let kind = dict
-        .get_item(intern!(py, "kind"))?
-        .ok_or_else(|| PyValueError::new_err("worker response has no kind"))?;
-    let kind = kind
-        .extract::<String>()
-        .map_err(|_| PyValueError::new_err("worker response kind must be a string"))?;
-    match kind.as_str() {
-        "result" => decode_completion_response_from_py(response)
-            .map(Some)
-            .ok_or_else(|| PyValueError::new_err("invalid result worker response")),
-        "error" => decode_error_response_from_py(response)
-            .map(Some)
-            .ok_or_else(|| PyValueError::new_err("invalid error worker response")),
-        _ => Ok(None),
+/// Read a response using native envelopes and the Python tensor representation.
+pub(crate) fn response_from_py(response: &Bound<'_, PyAny>) -> PyResult<WorkerResponse> {
+    let kind: ResponseKind = depythonize(&response.get_item("kind")?)?;
+    if kind != ResponseKind::Result {
+        return depythonize(response).map_err(Into::into);
     }
-}
 
-/// Decodes a result response and rejects fields reserved for other variants.
-fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerResponse> {
-    let py = response.py();
-    let dict = response.cast::<PyDict>().ok()?;
-    let kind = str_field(dict, intern!(py, "kind"))?;
-    if kind.to_str().ok()? != "result" {
-        return None;
-    }
-    // Fields of the other response kinds must carry no data: `info` and the
-    // error fields below must be absent or `None`, and `calls` may also be an
-    // empty list.
-    for key in [intern!(py, "info")] {
-        if !absent_or_none(dict, key)? {
-            return None;
-        }
-    }
-    let report = run_result_from_py(&get(dict, intern!(py, "result"))?)?;
-    let identities = error_calls_from_py(dict)?;
-    if !identities.is_empty()
-        || opt_string(dict, intern!(py, "message"))?.is_some()
-        || opt_string(dict, intern!(py, "code"))?.is_some()
-        || opt_bool(dict, intern!(py, "fatal"))?.is_some()
-        || opt_string(dict, intern!(py, "phase"))?.is_some()
-        || opt_string(dict, intern!(py, "route"))?.is_some()
-    {
-        return None;
-    }
-    Some(WorkerResponse::Result {
-        message_id: opt_u64(dict, intern!(py, "message_id"))?,
-        result: report,
-    })
-}
-
-/// Decodes an error response and rejects success payloads.
-fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerResponse> {
-    let py = response.py();
-    let dict = response.cast::<PyDict>().ok()?;
-    if str_field(dict, intern!(py, "kind"))?.to_str().ok()? != "error" {
-        return None;
-    }
-    for key in [intern!(py, "info"), intern!(py, "result")] {
-        if !absent_or_none(dict, key)? {
-            return None;
-        }
-    }
-    let identities = error_calls_from_py(dict)?;
-    Some(WorkerResponse::Error {
-        message_id: opt_u64(dict, intern!(py, "message_id"))?,
-        error: WorkerResponseError {
-            message: string_of(&get(dict, intern!(py, "message"))?)?,
-            code: opt_string(dict, intern!(py, "code"))?,
-            fatal: bool_of(&get(dict, intern!(py, "fatal"))?)?,
-            phase: opt_string(dict, intern!(py, "phase"))?,
-            route: opt_string(dict, intern!(py, "route"))?,
-            calls: identities,
-        },
-    })
+    let message_id = response
+        .cast::<PyDict>()?
+        .get_item("message_id")?
+        .map(|value| value.extract::<Option<u64>>())
+        .transpose()?
+        .flatten();
+    let result = run_result_from_py(&response.get_item("result")?)
+        .ok_or_else(|| PyValueError::new_err("invalid worker batch output"))?;
+    Ok(WorkerResponse::Result { message_id, result })
 }
 
 /// Decodes a batch result, preserving completion and product order.
 ///
 /// `completions` and `products` must be lists; `forward_stats` may be absent
 /// or `None`, but when present every counter is required.
-fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
+pub(crate) fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
@@ -1882,35 +1848,6 @@ fn request_key_from_py(value: &Bound<'_, PyAny>) -> Option<RequestKey> {
     })
 }
 
-/// Decodes one request and call identity attached to an error.
-fn error_call_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorCallIdentity> {
-    let py = value.py();
-    let dict = value.cast::<PyDict>().ok()?;
-    Some(ErrorCallIdentity {
-        request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
-        call_id: computation_id_from_py(&get(dict, intern!(py, "call_id"))?)?,
-    })
-}
-
-/// Decodes an optional ordered list of call identities attached to an error.
-///
-/// An absent or `None` `calls` field decodes as an empty list.
-fn error_calls_from_py(dict: &Bound<'_, PyDict>) -> Option<Vec<ErrorCallIdentity>> {
-    let py = dict.py();
-    let Some(calls) = dict.get_item(intern!(py, "calls")).ok()? else {
-        return Some(Vec::new());
-    };
-    if calls.is_none() {
-        return Some(Vec::new());
-    }
-    let calls = calls.cast::<PyList>().ok()?;
-    let mut identities = Vec::with_capacity(calls.len());
-    for item in calls.iter() {
-        identities.push(error_call_from_py(&item)?);
-    }
-    Some(identities)
-}
-
 /// Returns a required mapping value, collapsing lookup errors and absence.
 fn get<'py>(dict: &Bound<'py, PyDict>, key: &Bound<'py, PyString>) -> Option<Bound<'py, PyAny>> {
     dict.get_item(key).ok().flatten()
@@ -2034,24 +1971,6 @@ fn opt_u64(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option
         None => Some(None),
         Some(value) if value.is_none() => Some(None),
         Some(value) => Some(Some(u64_of(&value)?)),
-    }
-}
-
-/// Decodes an absent, `None`, or strict boolean mapping field.
-fn opt_bool(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option<bool>> {
-    match dict.get_item(key).ok()? {
-        None => Some(None),
-        Some(value) if value.is_none() => Some(None),
-        Some(value) => Some(Some(bool_of(&value)?)),
-    }
-}
-
-/// Decodes an absent, `None`, or strict string mapping field.
-fn opt_string(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option<String>> {
-    match dict.get_item(key).ok()? {
-        None => Some(None),
-        Some(value) if value.is_none() => Some(None),
-        Some(value) => Some(Some(string_of(&value)?)),
     }
 }
 

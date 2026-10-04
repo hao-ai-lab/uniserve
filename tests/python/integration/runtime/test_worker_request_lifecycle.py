@@ -20,7 +20,6 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
-from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.batch import Finish, Free, NewRequest
 from uniserve_worker.protocol.call import (
@@ -292,7 +291,8 @@ def test_distinct_images_beyond_the_encoder_cache_budget_encode() -> None:
 
 
 @pytest.mark.parametrize("retirement", ("free", "finish"))
-def test_command_acknowledgement_waits_for_readers_without_delaying_other_results(  # noqa: E501
+def test_retirement_waits_for_readers_without_delaying_other_results(
+    worker_channel,
     retirement: str,
 ) -> None:
     worker = execution_worker(queue_depth=2)
@@ -358,27 +358,29 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
             calls=(later_call,),
         )
 
-        class Endpoint(QueuedWorkerIpc):
-            def respond(self, response):
-                super().respond(response)
-                if response.get("message_id") == 2:
-                    # The later batch owns no retired storage, so its result
-                    # must arrive while the first batch still waits.
-                    assert len(response["result"]["completions"]) == 1
-                    worker.tensor_store.complete_reads((read,))
-                elif response.get("message_id") == 1:
-                    assert len(response["result"]["completions"]) == 1
-                    self.submit({"kind": "close", "message_id": 3})
-
-        endpoint = Endpoint(
+        endpoint = worker_channel(
             (
                 {"kind": "submit", "batch": batch, "message_id": 1},
                 {"kind": "submit", "batch": later_run, "message_id": 2},
             )
         )
-        worker.bind(endpoint).run()
-        # The retiring batch answers after the reader retires, behind the
-        # independent batch it does not order.
+        from concurrent.futures import ThreadPoolExecutor
+
+        worker.bind(endpoint.endpoint)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            serving = executor.submit(worker.run)
+            try:
+                # The independent batch returns while the earlier result
+                # still retains a physical reader.
+                response = endpoint.receive()
+                assert response["message_id"] == 2
+                assert len(response["result"]["completions"]) == 1
+            finally:
+                worker.tensor_store.complete_reads((read,))
+                endpoint.submit({"kind": "close", "message_id": 3})
+                serving.result(timeout=10)
+
+        # Close waits for the retiring batch before acknowledgment.
         assert [response["message_id"] for response in endpoint.responses] == [
             2,
             1,

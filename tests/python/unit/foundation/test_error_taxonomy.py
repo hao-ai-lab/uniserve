@@ -127,7 +127,6 @@ def test_to_mapping_emits_canonical_error_context():
 
     snapshot = err.to_mapping()
 
-    assert snapshot["kind"] == "error"
     assert snapshot["code"] == "ResourceError"
     assert snapshot["message"] == "CUDA out of memory"
     assert snapshot["fatal"] is False

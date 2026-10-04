@@ -12,6 +12,7 @@ mod kv_cache;
 mod latent;
 mod registry;
 mod request;
+mod service;
 pub mod tensor;
 mod transfer;
 
@@ -26,4 +27,5 @@ pub use kv_cache::KVCacheManager;
 pub use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
 pub use registry::{BufferRegistry, RegisteredBuffer};
 pub use request::{Request, RequestPool, RequestProgress};
+pub use service::{Service, ServiceBackend};
 pub use transfer::{ReadReservation, TransferCapacity, TransferPool, TransferTicket};

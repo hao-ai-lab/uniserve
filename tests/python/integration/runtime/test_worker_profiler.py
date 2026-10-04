@@ -74,7 +74,7 @@ def test_worker_profiler_exports_only_the_selected_execution_window(tmp_path):
 
 
 def test_bound_worker_exports_the_executed_batch_in_its_window(
-    tmp_path, monkeypatch
+    worker_channel, tmp_path, monkeypatch
 ):
     from tests.python.fixtures.depth_one import (
         ar_params,
@@ -83,7 +83,6 @@ def test_bound_worker_exports_the_executed_batch_in_its_window(
         token_call,
     )
     from tests.python.fixtures.execution_worker import execution_worker
-    from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
     from uniserve_worker.protocol.call import ForwardMode
     from uniserve_worker.protocol.identity import CallId
 
@@ -104,15 +103,14 @@ def test_bound_worker_exports_the_executed_batch_in_its_window(
     )
     batch = execution_batch(batch_id=1, admissions=(admission,), calls=(call,))
 
-    class Endpoint(QueuedWorkerIpc):
-        def respond(self, response):
-            super().respond(response)
-            if response.get("message_id") == 1:
-                self.submit({"kind": "close", "message_id": 2})
-
-    endpoint = Endpoint(({"kind": "submit", "batch": batch, "message_id": 1},))
+    endpoint = worker_channel(
+        (
+            {"kind": "submit", "batch": batch, "message_id": 1},
+            {"kind": "close", "message_id": 2},
+        )
+    )
     try:
-        worker.bind(endpoint).run()
+        worker.bind(endpoint.endpoint).run()
     finally:
         worker.close()
 
