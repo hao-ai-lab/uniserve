@@ -1,69 +1,58 @@
-//! Physical backing for scheduler-placed buffers.
-//!
-//! Placement and overlap checks run in Rust. PyTorch creates the numerical
-//! views, retaining each arena's allocation. Consumers must finish device work
-//! and transport reads before returning a binding to this pool.
+//! PyTorch arenas and numerical views for the native physical buffer pool.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 use pyo3::types::{PyDict, PyTuple};
-use uniserve_worker_ipc::BufferId;
+use uniserve_worker::{BufferBinding as NativeBufferBinding, BufferPool as NativeBufferPool};
+use uniserve_worker_ipc::BufferAllocation;
 
-use super::error::{invalid, invariant};
+use super::error::{invalid, invariant, native_error};
 use super::protocol::buffer_id;
 
-/// A pool-issued tensor view of one physical byte range.
+/// A numerical view retaining the allocation of its native physical binding.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct BufferBinding {
-    id: BufferId,
+    binding: Arc<NativeBufferBinding>,
     #[pyo3(get)]
     buffer: Py<PyAny>,
-    #[pyo3(get)]
-    physical_offset: u64,
-    #[pyo3(get)]
-    physical_bytes: u64,
-    #[pyo3(get)]
-    binding_id: u64,
-    #[pyo3(get)]
-    device_name: String,
     #[pyo3(get)]
     tensor: Py<PyAny>,
 }
 
 #[pymethods]
 impl BufferBinding {
+    #[getter]
+    fn physical_offset(&self) -> u64 {
+        self.binding.physical_offset()
+    }
+
+    #[getter]
+    fn physical_bytes(&self) -> u64 {
+        self.binding.physical_bytes()
+    }
+
+    #[getter]
+    fn device_name(&self) -> &str {
+        self.binding.device()
+    }
+
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.buffer)?;
         visit.call(&self.tensor)
     }
 }
 
-struct Arena {
-    tensor: Py<PyAny>,
-    active: HashMap<BufferId, Py<BufferBinding>>,
-}
-
-/// Allocation state shared with asynchronous retirement callbacks.
-struct PoolState {
-    arenas: HashMap<String, Arena>,
-    next_binding_id: u64,
-}
-
-/// Fixed byte arenas with generation-safe release and nonoverlapping bindings.
+/// Fixed byte arenas with pool-issued views and nonoverlapping ranges.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct BufferPool {
     #[pyo3(get)]
-    byte_capacity: u64,
-    #[pyo3(get)]
-    compact: bool,
-    #[pyo3(get)]
     devices: Py<PyTuple>,
-    state: Mutex<PoolState>,
+    state: Mutex<NativeBufferPool<Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -76,12 +65,9 @@ impl BufferPool {
         devices: Vec<Bound<'_, PyAny>>,
         compact: bool,
     ) -> PyResult<Self> {
-        if byte_capacity < 0 {
-            return Err(PyValueError::new_err(
-                "persistent buffer capacity must not be negative",
-            ));
-        }
-        let byte_capacity = byte_capacity as u64;
+        let byte_capacity = u64::try_from(byte_capacity).map_err(|_| {
+            PyValueError::new_err("persistent buffer capacity must not be negative")
+        })?;
         let canonical = py
             .import("uniserve.runtime.device")?
             .getattr("canonical_device")?;
@@ -93,6 +79,7 @@ impl BufferPool {
         } else {
             devices
         };
+
         for device in devices {
             let device = canonical.call1((device,))?;
             let name = device.str()?.to_str()?.to_owned();
@@ -111,28 +98,29 @@ impl BufferPool {
             kwargs.set_item("dtype", torch.getattr("uint8")?)?;
             kwargs.set_item("device", &device)?;
             let tensor = empty.call(((byte_capacity,),), Some(&kwargs))?.unbind();
-            arenas.insert(
-                name,
-                Arena {
-                    tensor,
-                    active: HashMap::new(),
-                },
-            );
+
+            arenas.insert(name, tensor);
             normalized.push(device);
         }
+
         Ok(Self {
-            byte_capacity,
-            compact,
             devices: PyTuple::new(py, normalized)?.unbind(),
-            state: Mutex::new(PoolState {
-                arenas,
-                next_binding_id: 1,
-            }),
+            state: Mutex::new(NativeBufferPool::new(byte_capacity, compact, arenas)),
         })
     }
 
-    /// Bind a scheduler allocation to a typed view. Compact pools use the
-    /// first aligned physical gap; other pools preserve the scheduler offset.
+    #[getter]
+    fn byte_capacity(&self, py: Python<'_>) -> PyResult<u64> {
+        Ok(self.lock(py)?.byte_capacity())
+    }
+
+    #[getter]
+    fn compact(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(self.lock(py)?.compact())
+    }
+
+    /// Reserve the physical range and construct its numerical view under the
+    /// same owner lock. Failed view creation returns the range before retry.
     #[pyo3(signature = (reference, allocation, *, device, dtype, shape))]
     pub(crate) fn bind(
         &self,
@@ -153,6 +141,7 @@ impl BufferPool {
         if id != buffer_id(&reference.getattr("buffer_id")?)? {
             return Err(invalid(py, "buffer allocation does not name its output"));
         }
+
         let element_bytes = dtype.getattr("itemsize")?.extract::<u64>()?;
         let required = shape
             .iter()
@@ -164,121 +153,57 @@ impl BufferPool {
             })
             .filter(|&bytes| bytes > 0)
             .ok_or_else(|| invalid(py, "buffer tensor shape has an invalid byte extent"))?;
-        let allocation_bytes = allocation.getattr("bytes")?.extract::<u64>()?;
-        let offset = allocation.getattr("offset")?.extract::<u64>()?;
-        if required > allocation_bytes {
-            return Err(invalid(
-                py,
-                "buffer allocation is smaller than its output tensor",
-            ));
-        }
-        if !offset.is_multiple_of(element_bytes) {
-            return Err(invalid(
-                py,
-                "buffer allocation is not aligned for its output dtype",
-            ));
-        }
-        let extent = if self.compact {
-            align(required).ok_or_else(|| invalid(py, "buffer allocation byte extent overflows"))?
-        } else {
-            allocation_bytes
+        let allocation = BufferAllocation {
+            buffer: id,
+            bytes: allocation.getattr("bytes")?.extract()?,
+            offset: allocation.getattr("offset")?.extract()?,
         };
 
         let mut state = self.lock(py)?;
-        let arena = state
-            .arenas
-            .get(&device_name)
-            .ok_or_else(|| invalid(py, "buffer allocation names an undeclared worker device"))?;
-        if arena.active.contains_key(&id) {
-            return Err(invalid(py, "buffer allocation is already bound"));
-        }
-        let start = if self.compact {
-            self.compact_offset(py, arena, extent)?
-        } else {
-            offset
-        };
-        let end = start
-            .checked_add(extent)
-            .filter(|&end| end <= self.byte_capacity)
-            .ok_or_else(|| invalid(py, "buffer allocation exceeds the worker buffer pool"))?;
-        for active in arena.active.values() {
-            let active = active.get();
-            if start < active.physical_offset + active.physical_bytes
-                && active.physical_offset < end
-            {
-                return Err(invalid(
-                    py,
-                    "buffer allocation overlaps a live worker buffer",
-                ));
-            }
-        }
+        let (binding, arena) = state
+            .bind(allocation, &device_name, required, element_bytes)
+            .map_err(|error| native_error(py, error))?;
+        let created = (|| {
+            // Only the tensor's own bytes are viewed. Padding stays reserved
+            // until the store returns this binding after its readers retire.
+            let tensor = arena
+                .bind(py)
+                .call_method1("narrow", (0, binding.physical_offset(), required))?
+                .call_method1("view", (dtype,))?
+                .call_method1("reshape", (PyTuple::new(py, shape)?,))?
+                .unbind();
+            Py::new(
+                py,
+                BufferBinding {
+                    binding: Arc::clone(&binding),
+                    buffer: buffer.unbind(),
+                    tensor,
+                },
+            )
+        })();
 
-        // The tensor addresses only its own bytes. Any padding remains reserved
-        // in the active range until its binding is released.
-        let tensor = arena
-            .tensor
-            .bind(py)
-            .call_method1("narrow", (0, start, required))?
-            .call_method1("view", (dtype,))?
-            .call_method1("reshape", (PyTuple::new(py, shape)?,))?
-            .unbind();
-        let binding_id = state.next_binding_id;
-        let next_binding_id = binding_id
-            .checked_add(1)
-            .ok_or_else(|| invariant(py, "buffer binding generation exhausted"))?;
-        let binding = Py::new(
-            py,
-            BufferBinding {
-                id,
-                buffer: buffer.unbind(),
-                physical_offset: start,
-                physical_bytes: extent,
-                binding_id,
-                device_name: device_name.clone(),
-                tensor,
-            },
-        )?;
-        state
-            .arenas
-            .get_mut(&device_name)
-            .ok_or_else(|| invariant(py, "buffer arena disappeared during allocation"))?
-            .active
-            .insert(id, binding.clone_ref(py));
-        state.next_binding_id = next_binding_id;
-        Ok(binding)
+        if created.is_err() {
+            state
+                .release(&binding)
+                .map_err(|error| native_error(py, error))?;
+        }
+        created
     }
 
-    /// Release the exact pool-issued binding after every use has retired.
-    /// Stale bindings and bindings issued by another pool are rejected.
+    /// Release the current pool-issued binding after physical uses retire.
     pub(crate) fn release(
         &self,
         py: Python<'_>,
         binding: &Bound<'_, BufferBinding>,
     ) -> PyResult<()> {
-        let value = binding.get();
-        let mut state = self.lock(py)?;
-        let arena = state
-            .arenas
-            .get_mut(&value.device_name)
-            .ok_or_else(|| invariant(py, "stale persistent buffer binding"))?;
-        if !arena
-            .active
-            .get(&value.id)
-            .is_some_and(|active| active.bind(py).is(binding))
-        {
-            return Err(invariant(py, "stale persistent buffer binding"));
-        }
-        let released = arena.active.remove(&value.id);
-        drop(state);
-        drop(released);
-        Ok(())
+        self.lock(py)?
+            .release(&binding.get().binding)
+            .map_err(|error| native_error(py, error))
     }
 
-    /// Drop arenas after their device uses and remote readers have retired.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let arenas = std::mem::take(&mut self.lock(py)?.arenas);
-        // Tensor destruction may enter Python. Never hold the allocation lock
-        // while destroying a pool's numerical storage.
+        let arenas = self.lock(py)?.close();
+        // Tensor destruction can enter Python, so it follows unlocking.
         drop(arenas);
         Ok(())
     }
@@ -292,61 +217,18 @@ impl BufferPool {
             // GC must not wait for a thread that may need the interpreter.
             Err(TryLockError::WouldBlock) => return Ok(()),
         };
-        for arena in state.arenas.values() {
-            visit.call(&arena.tensor)?;
-            for binding in arena.active.values() {
-                visit.call(binding)?;
-            }
+
+        for arena in state.backings() {
+            visit.call(arena)?;
         }
         Ok(())
     }
 }
 
 impl BufferPool {
-    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, PoolState>> {
+    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, NativeBufferPool<Py<PyAny>>>> {
         self.state
             .lock_py_attached(py)
             .map_err(|_| invariant(py, "buffer pool allocation lock is poisoned"))
     }
-
-    fn compact_offset(&self, py: Python<'_>, arena: &Arena, extent: u64) -> PyResult<u64> {
-        let mut spans: Vec<_> = arena
-            .active
-            .values()
-            .map(|binding| {
-                let binding = binding.get();
-                (binding.physical_offset, binding.physical_bytes)
-            })
-            .collect();
-        spans.sort_unstable();
-        let mut cursor = 0;
-        for &(offset, bytes) in &spans {
-            if let Some(start) = align(cursor)
-                && start.checked_add(extent).is_some_and(|end| end <= offset)
-            {
-                return Ok(start);
-            }
-            cursor = cursor.max(offset + bytes);
-        }
-        let start = align(cursor).filter(|&start| {
-            start
-                .checked_add(extent)
-                .is_some_and(|end| end <= self.byte_capacity)
-        });
-        start.ok_or_else(|| {
-            invalid(
-                py,
-                format!(
-                    "physical buffer allocation exceeds the worker buffer pool: \
-                     {extent} bytes requested from {} bytes with live spans {spans:?}",
-                    self.byte_capacity,
-                ),
-            )
-        })
-    }
-}
-
-/// Match the 256-byte product alignment used by startup capacity accounting.
-fn align(bytes: u64) -> Option<u64> {
-    bytes.checked_add(255).map(|bytes| bytes / 256 * 256)
 }
