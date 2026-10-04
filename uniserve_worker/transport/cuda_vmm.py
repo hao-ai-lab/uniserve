@@ -788,12 +788,6 @@ class CudaVmmTransport(Transport):
             # acknowledgement. Physical ownership remains with the backend.
             ticket._fail(error)
             raise
-        finally:
-            # An undrained read keeps its mapping and fence through the
-            # ticket; a physically settled read drops them here.
-            if not ticket._unretired:
-                mapped = None
-                event = None
 
     def release(
         self, locator: Locator

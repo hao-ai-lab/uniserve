@@ -14,6 +14,27 @@ pub(crate) fn invalid(py: Python<'_>, message: impl Into<String>) -> PyErr {
     }
 }
 
+pub(crate) fn resource(py: Python<'_>, message: impl Into<String>) -> PyErr {
+    match py
+        .import("uniserve_worker.errors")
+        .and_then(|module| module.getattr("resource_error")?.call1((message.into(),)))
+    {
+        Ok(error) => PyErr::from_value(error),
+        Err(error) => error,
+    }
+}
+
+pub(crate) fn unsupported(py: Python<'_>, message: impl Into<String>) -> PyErr {
+    match py.import("uniserve_worker.errors").and_then(|module| {
+        module
+            .getattr("unsupported_setup")?
+            .call1((message.into(),))
+    }) {
+        Ok(error) => PyErr::from_value(error),
+        Err(error) => error,
+    }
+}
+
 pub(crate) fn invariant(py: Python<'_>, message: impl Into<String>) -> PyErr {
     let error = (|| {
         let module = py.import("uniserve_worker.errors")?;

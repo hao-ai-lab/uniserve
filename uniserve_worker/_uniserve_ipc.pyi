@@ -11,7 +11,7 @@ numerical execution. ``BufferPool`` binds scheduler-assigned storage and issues
 its numerical ``BufferBinding`` views.
 """
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future
 from types import TracebackType
 from typing import Any, Self, final
@@ -36,7 +36,6 @@ from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
 from uniserve_worker.transport.interface import Transport
-from uniserve_worker.transport.ticket import TransferTicket
 
 __all__ = [
     "Buffer",
@@ -44,15 +43,110 @@ __all__ = [
     "BufferPool",
     "Request",
     "RequestPool",
+    "ReadReservation",
     "Server",
     "StreamSignal",
     "TensorImport",
     "TensorRead",
     "TensorStore",
+    "TransferCapacity",
+    "TransferPool",
+    "TransferTicket",
     "atomic_load_u32",
     "atomic_store_u32",
     "service_name",
 ]
+
+@final
+class TransferCapacity:
+    """One rank's nonblocking byte and read credits shared by its backends."""
+
+    def __new__(cls, byte_capacity: int, ticket_capacity: int) -> Self: ...
+    @property
+    def capacity(self) -> int: ...
+    @property
+    def ticket_capacity(self) -> int: ...
+    @property
+    def used(self) -> int: ...
+    def take_reads(
+        self,
+        count: int = 1,
+        *,
+        message: str = "asynchronous transfer ticket capacity is exhausted",
+    ) -> None: ...
+    def return_reads(self, count: int = 1) -> None: ...
+    def notify_reads_returned(
+        self, callback: Callable[[], None], *, after: int
+    ) -> None: ...
+    def acquire(self, amount: int) -> None: ...
+    def release(self, amount: int) -> None: ...
+
+@final
+class ReadReservation:
+    """A fetch's read credits, handed off individually to submitted reads."""
+
+    def __new__(cls, capacity: TransferCapacity, count: int) -> Self: ...
+    def use(self) -> None: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(self, *args: object) -> None: ...
+
+@final
+class TransferTicket:
+    """A read's consumable views, failure, and physical retirement."""
+
+    def __new__(
+        cls, event_pool: EventPool, *, release: Callable[[], None] | None = None
+    ) -> Self: ...
+    def ready(self) -> bool: ...
+    def retired(self) -> bool: ...
+    def retirement_ready(self) -> bool: ...
+    def result(
+        self, stream: torch.cuda.Stream | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]: ...
+    def cancel(self) -> None: ...
+    def close(self) -> None: ...
+    def add_done_callback(self, callback: Callable[[], None]) -> None: ...
+    def add_retirement_callback(self, callback: Callable[[], None]) -> None: ...
+    def _require_active(self) -> None: ...
+    def _complete(
+        self,
+        value: torch.Tensor | tuple[torch.Tensor, ...],
+        event: torch.cuda.Event | None = None,
+    ) -> None: ...
+    def _fail(self, error: BaseException) -> bool: ...
+    def _drain_consumers(self) -> None: ...
+
+@final
+class TransferPool:
+    """Own bounded read submission, copy streams, and credit retirement."""
+
+    def __new__(
+        cls,
+        *,
+        workers: int,
+        capacity: TransferCapacity,
+        name: str,
+        event_pool: EventPool,
+    ) -> Self: ...
+    def set_completion_wake(self, wake: Callable[[], None] | None) -> None: ...
+    def submit(
+        self,
+        call: Callable[..., Any],
+        *args: Any,
+        nbytes: int,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        reservation: ReadReservation | None = None,
+    ) -> TransferTicket: ...
+    def copy(
+        self,
+        ticket: TransferTicket,
+        source: torch.Tensor | tuple[torch.Tensor, ...],
+        destination: torch.Tensor | tuple[torch.Tensor, ...],
+        producer: torch.cuda.Event | None = None,
+        acknowledgment: torch.Tensor | None = None,
+    ) -> None: ...
+    def close(self) -> None: ...
 
 @final
 class Buffer:

@@ -17,7 +17,7 @@ use uniserve_core::CallId;
 use uniserve_worker_ipc::{BufferId, RequestKey};
 
 use crate::buffer::{BufferBinding, BufferPool};
-use crate::error::{invalid, invariant};
+use crate::error::{invalid, invariant, resource};
 
 type BufferKey = (RequestKey, CallId, u16);
 type CallKey = (RequestKey, CallId);
@@ -2117,16 +2117,6 @@ fn create_buffer<'py>(
             released: false,
         },
     )
-}
-
-fn resource(py: Python<'_>, message: impl Into<String>) -> PyErr {
-    match py
-        .import("uniserve_worker.errors")
-        .and_then(|module| module.getattr("resource_error")?.call1((message.into(),)))
-    {
-        Ok(error) => PyErr::from_value(error),
-        Err(error) => error,
-    }
 }
 
 fn numerical(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
