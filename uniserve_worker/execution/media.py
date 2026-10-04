@@ -34,9 +34,9 @@ from uniserve.media import video
 from uniserve.model import AudioDecoder, VideoDecoder, VideoPostprocessor
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.tensors import TensorOutput, concatenate_views
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.diffusion_state import (
     DiffusionState,
     SlotLadder,

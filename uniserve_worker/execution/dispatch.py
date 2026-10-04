@@ -9,8 +9,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.forward import execute_forward
 from uniserve_worker.protocol.call import (
     Call,

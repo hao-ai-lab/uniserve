@@ -35,19 +35,18 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from uniserve.media import image as media_image
-from uniserve_worker._uniserve_ipc import Completion
+from uniserve_worker._uniserve_ipc import BatchState, Completion
 from uniserve_worker.errors import (
     invalid_descriptor,
     resource_error,
     unsupported_setup,
 )
 from uniserve_worker.execution import calls as calls
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.host_media import (
     BORROWED_INPUT_CALLS,
     encoded_unit_positions,
 )
-from uniserve_worker.execution.output import PendingOutput, create_outputs
+from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.batch import (
     Batch,
@@ -974,14 +973,6 @@ def reserve_outputs(
             # together: a failure before `state.bind_outputs` abandons any
             # acquired buffer here, and a later one is handled by
             # the native executor.
-            request_pool_indices = tuple(
-                int(
-                    request_pool.get(
-                        call.request_key.request_id
-                    ).request_pool_idx
-                )
-                for call in scheduled
-            )
             completion = output_pool.acquire(
                 len(scheduled),
                 token_capacity=_completion_words(scheduled),
@@ -993,19 +984,16 @@ def reserve_outputs(
                     )
                 ),
             )
-            candidates = create_outputs(
-                request_pool, scheduled, request_pool_indices, completion
+            state.bind_outputs(
+                request_pool,
+                completion,
+                started,
+                {identity[0].request_id for identity in predicated},
             )
         except BaseException:
             if completion is not None:
                 completion.abandon()
             raise
-
-        assert completion is not None
-        for request in candidates:
-            if calls.call_identity(request.call) in predicated:
-                request.status = CallStatus.PREDICATED
-        state.bind_outputs(candidates, completion, started)
 
         # Bind physical state in dependency order before publishing
         # transferred inputs.
@@ -1542,9 +1530,8 @@ def _bind_latent_inputs(
         tuple(int(params.latent_units) for _identity, params, _slot in rows),
         occupied=tuple(
             output.latent.staging
-            for output in state.outputs
-            if isinstance(output, PendingOutput)
-            and output.latent.staging is not None
+            for output in state.pending_outputs()
+            if output.latent.staging is not None
         ),
     )
 

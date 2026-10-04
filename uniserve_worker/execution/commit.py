@@ -14,7 +14,7 @@ from uniserve_worker.protocol.call import Call, CallStatus
 from uniserve_worker.sampling.result import sample_columns
 
 if TYPE_CHECKING:
-    from uniserve_worker.execution.batch import BatchState
+    from uniserve_worker._uniserve_ipc import BatchState
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.tensor_store import TensorStore
 

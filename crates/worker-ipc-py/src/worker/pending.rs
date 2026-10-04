@@ -7,15 +7,15 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use uniserve_core::{CallId, TokenLogprob};
 use uniserve_worker::RequestProgress;
 use uniserve_worker_ipc::{
-    CallKind, CallStatus, ErrorCode, RequestKey, RequestOutput, TimingCounters,
+    Call, CallKind, CallStatus, ErrorCode, RequestKey, RequestOutput, TimingCounters,
 };
 
 use crate::convert;
 
 use super::error::native_error;
 use super::host::HostTask;
+use super::latent::LatentUpdate;
 use super::output::OutputBuffer;
-use super::protocol::{call_id, request_key};
 use super::request::{Request, RequestPool, progress_from_py, progress_to_py};
 
 // Layouts produced by sampling_columns and the canvas step's device commit.
@@ -86,12 +86,11 @@ pub(crate) struct PendingOutput {
     pub(super) value: Option<RequestOutput>,
 }
 
-#[pymethods]
 impl PendingOutput {
-    #[new]
-    fn new(
+    pub(super) fn for_call(
         py: Python<'_>,
         call: Py<PyAny>,
+        plan: &Call,
         request: Py<Request>,
         buffer: Py<OutputBuffer>,
         row: usize,
@@ -102,22 +101,30 @@ impl PendingOutput {
             .request
             .progress()
             .map_err(|error| native_error(py, error))?;
-        let coordinates = call.bind(py).getattr("coordinates")?;
-        let update = py
-            .import("uniserve_worker._uniserve_ipc")?
-            .getattr("LatentUpdate")?
-            .call1((native_request.request.slot(),))?;
+        let coordinates = &plan.coordinates;
+        let update = Py::new(
+            py,
+            LatentUpdate::new(
+                native_request.request.slot() as i64,
+                None,
+                0,
+                0,
+                0,
+                0,
+                false,
+            ),
+        )?;
         drop(native_request);
 
         Ok(Self {
-            key: request_key(&call.bind(py).getattr("request_key")?)?,
-            id: call_id(&call.bind(py).getattr("call_id")?)?,
-            code: pythonize::depythonize(&call.bind(py).getattr("kind")?.getattr("value")?)?,
+            key: plan.request_key,
+            id: plan.call_id,
+            code: plan.code,
             progress: RequestProgress {
-                logical_position: coordinates.getattr("logical_position")?.extract()?,
-                flow_step: coordinates.getattr("flow_step")?.extract()?,
-                kv_visible_len: coordinates.getattr("kv_visible_len")?.extract()?,
-                kv_computed_len: coordinates.getattr("kv_computed_len")?.extract()?,
+                logical_position: u64::from(coordinates.logical_position),
+                flow_step: u64::from(coordinates.flow_step),
+                kv_visible_len: u64::from(coordinates.kv_visible_len),
+                kv_computed_len: u64::from(coordinates.kv_computed_len),
                 ..previous
             },
             accepted: None,
@@ -157,6 +164,21 @@ impl PendingOutput {
             reports_output: true,
             value: None,
         })
+    }
+}
+
+#[pymethods]
+impl PendingOutput {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        call: Py<PyAny>,
+        request: Py<Request>,
+        buffer: Py<OutputBuffer>,
+        row: usize,
+    ) -> PyResult<Self> {
+        let plan = pythonize::depythonize(&call.bind(py).call_method0("to_mapping")?)?;
+        Self::for_call(py, call, &plan, request, buffer, row)
     }
 
     #[getter]

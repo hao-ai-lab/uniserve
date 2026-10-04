@@ -36,7 +36,7 @@ impl LatentUpdate {
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (request_pool_idx, params=None, expected_generation=0, expected_step=0, generation=0, step=0, release=false))]
-    fn new(
+    pub(super) fn new(
         request_pool_idx: i64,
         params: Option<Py<PyAny>>,
         expected_generation: i64,

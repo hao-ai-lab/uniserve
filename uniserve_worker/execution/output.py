@@ -14,9 +14,7 @@ import torch
 
 from uniserve_worker._uniserve_ipc import PendingOutput
 from uniserve_worker.execution.host import HostTask
-from uniserve_worker.execution.request import RequestPool
 from uniserve_worker.protocol.batch import LatentParams
-from uniserve_worker.protocol.call import Call
 from uniserve_worker.protocol.identity import BufferId
 from uniserve_worker.protocol.output import MediaOutput
 from uniserve_worker.sampling.result import LogprobValues, SamplerRow
@@ -127,26 +125,6 @@ def logprob_entries(record: PendingOutput, span: tuple[int, int, int]) -> int:
     )
     local = rows.index(index)
     return 1 + counts[local] + len(requested_ids[local])
-
-
-def create_outputs(
-    requests: RequestPool,
-    calls: Sequence[Call],
-    request_pool_indices: Sequence[int],
-    buffer: OutputBuffer,
-) -> tuple[PendingOutput, ...]:
-    """Bind output rows to validated, admitted requests for one batch.
-
-    Row `i` of `buffer` belongs to `calls[i]`. Slot and identity validation is
-    done by `RequestPool.bind_calls`, whose errors propagate.
-    """
-    bindings = requests.bind_calls(calls, request_pool_indices)
-    return tuple(
-        PendingOutput(call, request, buffer, index)
-        for index, (call, request) in enumerate(
-            zip(calls, bindings, strict=True)
-        )
-    )
 
 
 @dataclass(slots=True)

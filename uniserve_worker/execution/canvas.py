@@ -25,9 +25,9 @@ import numpy as np
 import torch
 
 from uniserve.tensors import adjacent_view
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.model_executor.input_batch import (
     CanvasRow,

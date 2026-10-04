@@ -4,7 +4,6 @@ use std::collections::HashSet;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pythonize::depythonize;
 use uniserve_worker_ipc::{BatchOutput, CallStatus, ErrorCode, RequestOutput};
 
 use super::{BatchState, PythonBackend};
@@ -18,7 +17,7 @@ impl PythonBackend {
         py: Python<'_>,
         batch: &BatchState,
     ) -> PyResult<Option<BatchOutput>> {
-        let pending = batch.pending_outputs(py)?;
+        let pending = batch.pending_outputs(py);
         for output in &pending {
             PendingOutput::submit_host_tasks(output)?;
         }
@@ -51,17 +50,16 @@ impl PythonBackend {
         batch: &BatchState,
         completions: Vec<RequestOutput>,
     ) -> PyResult<BatchOutput> {
-        let numerical = batch.numerical.bind(py);
+        let products_view = batch.numerical.borrow(py).products.clone_ref(py);
         let successful = completions
             .iter()
             .filter(|value| value.status == CallStatus::Ok)
             .map(|value| (value.request_key, value.call_id))
             .collect::<HashSet<_>>();
         let mut products = Vec::new();
-        for product in numerical.getattr("products")?.try_iter()? {
-            let product =
-                convert::tensor_publication_from_py(&product?.call_method0("to_mapping")?)
-                    .ok_or_else(|| PyRuntimeError::new_err("invalid tensor output"))?;
+        for product in products_view.bind(py) {
+            let product = convert::tensor_publication_from_py(&product.call_method0("to_mapping")?)
+                .ok_or_else(|| PyRuntimeError::new_err("invalid tensor output"))?;
             if successful.contains(&(
                 product.product.request_key,
                 product.product.producer_call_id,
@@ -69,17 +67,12 @@ impl PythonBackend {
                 products.push(product);
             }
         }
-        let stats = numerical.getattr("stats")?;
         Ok(BatchOutput {
             batch_id: batch.plan.batch_id,
             completions,
             products,
-            worker_exec_us: numerical.getattr("execution_us")?.extract()?,
-            forward_stats: if stats.is_none() {
-                None
-            } else {
-                Some(depythonize(&stats.call_method0("to_mapping")?)?)
-            },
+            worker_exec_us: batch.execution_us,
+            forward_stats: batch.stats.clone(),
         })
     }
 

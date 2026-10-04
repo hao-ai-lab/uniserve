@@ -25,9 +25,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve import _slices
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls as calls
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.batch import TensorPublication
 from uniserve_worker.protocol.call import Call, TransferMode

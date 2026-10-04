@@ -177,7 +177,7 @@ impl BatchInputs {
 #[pymethods]
 impl BatchInputs {
     #[new]
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             inner: NativeInputs::default(),
         }
@@ -209,7 +209,7 @@ impl BatchInputs {
     }
 
     #[getter]
-    fn predicate(&self, py: Python<'_>) -> Option<Py<OutputBuffer>> {
+    pub(super) fn predicate(&self, py: Python<'_>) -> Option<Py<OutputBuffer>> {
         match &self.inner.predicate {
             Some(Dependency::Predicate(buffer)) => Some(buffer.clone_ref(py)),
             _ => None,
@@ -217,7 +217,7 @@ impl BatchInputs {
     }
 
     #[setter]
-    fn set_predicate(&mut self, buffer: Option<Py<OutputBuffer>>) {
+    pub(super) fn set_predicate(&mut self, buffer: Option<Py<OutputBuffer>>) {
         self.inner.predicate = buffer.map(Dependency::Predicate);
     }
 

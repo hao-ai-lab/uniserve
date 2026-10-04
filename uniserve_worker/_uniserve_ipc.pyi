@@ -42,10 +42,16 @@ from uniserve_worker.protocol.call import (
     ErrorCode,
     ImageParams,
 )
-from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
+from uniserve_worker.protocol.identity import (
+    BufferId,
+    CallId,
+    CallIdentity,
+    RequestKey,
+)
 from uniserve_worker.protocol.output import (
     BatchOutput,
     FinishFlags,
+    ForwardStats,
     RequestOutput,
 )
 from uniserve_worker.protocol.tensor import TensorRef
@@ -64,6 +70,7 @@ from uniserve_worker.worker import Worker
 
 __all__ = [
     "BatchInputs",
+    "BatchState",
     "BlockTables",
     "Buffer",
     "BufferBinding",
@@ -112,6 +119,47 @@ Args = ParamSpec("Args")
 def release_exports(
     exports: dict[BufferId, ExportLocations], buffers: Iterable[BufferId]
 ) -> None: ...
+
+@final
+class BatchState:
+    """Batch-owned input leases, output rows and borrowed numerical views.
+
+    The executor creates and retires each state. Numerical callbacks borrow
+    its resources without advancing execution or request progress.
+    """
+
+    batch: Batch
+    inputs: BatchInputs
+    predicate_entries: list[tuple[CallIdentity, tuple[int, int], int]]
+    predicate_transfers: tuple[tuple[CallIdentity, BufferId, int], ...]
+    input_products: tuple[TensorPublication, ...]
+    kv_inputs: tuple[KvTransfer, ...]
+    stream: torch.cuda.Stream | None
+    started_ns: int
+    forward_stats: list[ForwardStats]
+    component_us: dict[str, int]
+    forward_indices: dict[CallIdentity, tuple[int, ...]]
+    products: tuple[TensorPublication, ...]
+
+    @property
+    def batch_id(self) -> int: ...
+    @property
+    def route(self) -> str | None: ...
+    @property
+    def output_buffer(self) -> OutputBuffer: ...
+    def scope(self) -> AbstractContextManager[None]: ...
+    def bind_outputs(
+        self,
+        requests: RequestPool,
+        buffer: OutputBuffer,
+        started_ns: int,
+        predicated: set[int],
+    ) -> None:
+        """Bind all output rows atomically in scheduler call order."""
+    def pending_outputs(self) -> tuple[PendingOutput, ...]: ...
+    def pending_output(self, request_id: int) -> PendingOutput: ...
+    def predicate_values(self) -> dict[CallIdentity, bool]:
+        """Read completed U8 predicates once, retaining device predicates."""
 
 @final
 class BatchInputs:

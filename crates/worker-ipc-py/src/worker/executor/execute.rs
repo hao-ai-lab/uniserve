@@ -55,7 +55,7 @@ impl PythonBackend {
                 return Err(PyErr::from_value(classified));
             }
 
-            let bound_at: u64 = numerical.bind(py).getattr("started_ns")?.extract()?;
+            let bound_at = numerical.borrow(py).started_ns;
             let stats = runner.call_method1(
                 "execution_stats",
                 (
@@ -71,7 +71,7 @@ impl PythonBackend {
 
     fn execute_calls(&self, py: Python<'_>, batch: &BatchState) -> PyResult<()> {
         let active: Vec<_> = batch
-            .pending_outputs(py)?
+            .pending_outputs(py)
             .iter()
             .enumerate()
             .filter_map(|(index, output)| {

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
-from uniserve_worker.execution.batch import BatchState
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.execution.commit import (
     apply_decode_state,
     publish_predicates,
@@ -155,12 +155,4 @@ class BatchRunner:
             _forward_stats(state.forward_stats, state.component_us)
             if state.started_ns
             else ForwardStats(),
-        )
-
-    def close(self, state: BatchState) -> None:
-        """Release numerical owners while physical readers keep their leases."""
-        state.close(
-            self.worker.tensor_store,
-            self.worker.latent_pool,
-            self.worker.kv_cache,
         )
