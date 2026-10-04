@@ -162,12 +162,16 @@ def models(tmp_path_factory):
         num_hidden_layers=_TEXT["num_hidden_layers"],
         hidden_act="silu",
         rope_theta=5_000_000.0,
+        rope_scaling=None,
         attention_bias=False,
         tie_word_embeddings=False,
         num_experts=0,
         num_experts_per_tok=1,
         moe_intermediate_size=_TEXT["intermediate_size"],
         mrope_sections=_SECTIONS,
+        norm_topk_prob=False,
+        decoder_sparse_step=1,
+        mlp_only_layers=(),
     )
 
     def mapping(model):
