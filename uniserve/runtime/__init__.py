@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .cuda import CUDAError
     from .cuda_graph import CUDAGraph, CUDAGraphError
-    from .events import EventPool, EventPoolError
+    from .events import CUDAEvent, EventPool, EventPoolError
     from .execution import ExecutionContext, Scratch
     from .microbatches import Microbatches
     from .prefix_cache import PrefixCache
@@ -29,6 +29,7 @@ __all__ = [
     "Microbatches",
     "EventPool",
     "EventPoolError",
+    "CUDAEvent",
     "CUDAGraph",
     "CUDAGraphError",
     "CUDAError",
@@ -51,6 +52,7 @@ def __getattr__(name):
         "Microbatches": "microbatches",
         "EventPool": "events",
         "EventPoolError": "events",
+        "CUDAEvent": "events",
         "CUDAGraph": "cuda_graph",
         "CUDAGraphError": "cuda_graph",
         "CUDAError": "cuda",

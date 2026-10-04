@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use libloading::Library;
 use uniserve_worker_ipc::Wake;
@@ -12,9 +12,21 @@ use uniserve_worker_ipc::Wake;
 type Handle = *mut c_void;
 type Status = i32;
 
+const CUDA_ERROR_NOT_READY: Status = 600;
+const CU_EVENT_DISABLE_TIMING: u32 = 2;
+const CU_EVENT_INTERPROCESS: u32 = 4;
+
+#[repr(C)]
+struct IpcEventHandle {
+    reserved: [u8; 64],
+}
+
 struct Driver {
     _library: Library,
-    context: unsafe extern "C" fn(*mut Handle) -> Status,
+    init: unsafe extern "C" fn(u32) -> Status,
+    primary_retain: unsafe extern "C" fn(*mut Handle, i32) -> Status,
+    primary_release: unsafe extern "C" fn(i32) -> Status,
+    stream_context: unsafe extern "C" fn(Handle, *mut Handle) -> Status,
     push: unsafe extern "C" fn(Handle) -> Status,
     pop: unsafe extern "C" fn(*mut Handle) -> Status,
     create: unsafe extern "C" fn(*mut Handle, u32) -> Status,
@@ -23,6 +35,12 @@ struct Driver {
     synchronize: unsafe extern "C" fn(Handle) -> Status,
     wait: unsafe extern "C" fn(Handle, Handle, u32) -> Status,
     destroy: unsafe extern "C" fn(Handle) -> Status,
+    elapsed: unsafe extern "C" fn(*mut f32, Handle, Handle) -> Status,
+    export_event: unsafe extern "C" fn(*mut IpcEventHandle, Handle) -> Status,
+    import_event: unsafe extern "C" fn(*mut Handle, IpcEventHandle) -> Status,
+    create_stream: unsafe extern "C" fn(*mut Handle, u32) -> Status,
+    synchronize_stream: unsafe extern "C" fn(Handle) -> Status,
+    destroy_stream: unsafe extern "C" fn(Handle) -> Status,
     launch: unsafe extern "C" fn(Handle, unsafe extern "C" fn(Handle), Handle) -> Status,
 }
 
@@ -34,10 +52,7 @@ fn driver() -> Result<&'static Driver, String> {
             // installation path is involved; the library owns every loaded symbol.
             unsafe {
                 let library = Library::new("libcuda.so.1").map_err(|e| e.to_string())?;
-                Ok(Driver {
-                    context: *library
-                        .get(b"cuCtxGetCurrent\0")
-                        .map_err(|e| e.to_string())?,
+                let driver = Driver {
                     push: *library
                         .get(b"cuCtxPushCurrent_v2\0")
                         .map_err(|e| e.to_string())?,
@@ -59,8 +74,38 @@ fn driver() -> Result<&'static Driver, String> {
                     launch: *library
                         .get(b"cuLaunchHostFunc\0")
                         .map_err(|e| e.to_string())?,
+                    stream_context: *library
+                        .get(b"cuStreamGetCtx\0")
+                        .map_err(|e| e.to_string())?,
+                    elapsed: *library
+                        .get(b"cuEventElapsedTime\0")
+                        .map_err(|e| e.to_string())?,
+                    export_event: *library
+                        .get(b"cuIpcGetEventHandle\0")
+                        .map_err(|e| e.to_string())?,
+                    import_event: *library
+                        .get(b"cuIpcOpenEventHandle\0")
+                        .map_err(|e| e.to_string())?,
+                    create_stream: *library
+                        .get(b"cuStreamCreate\0")
+                        .map_err(|e| e.to_string())?,
+                    synchronize_stream: *library
+                        .get(b"cuStreamSynchronize\0")
+                        .map_err(|e| e.to_string())?,
+                    destroy_stream: *library
+                        .get(b"cuStreamDestroy_v2\0")
+                        .map_err(|e| e.to_string())?,
+                    init: *library.get(b"cuInit\0").map_err(|e| e.to_string())?,
+                    primary_retain: *library
+                        .get(b"cuDevicePrimaryCtxRetain\0")
+                        .map_err(|e| e.to_string())?,
+                    primary_release: *library
+                        .get(b"cuDevicePrimaryCtxRelease_v2\0")
+                        .map_err(|e| e.to_string())?,
                     _library: library,
-                })
+                };
+                check((driver.init)(0), "cuInit")?;
+                Ok(driver)
             }
         })
         .as_ref()
@@ -75,91 +120,303 @@ fn check(status: Status, operation: &str) -> Result<(), String> {
     }
 }
 
-/// An owned completion event recorded once on a borrowed CUDA stream.
-///
-/// The backend keeps the stream's context alive through this event's lifetime.
-/// Dropping the event releases its handle without waiting for device work;
-/// storage owners must observe completion before reusing the accessed memory.
-pub struct Event {
-    handle: Handle,
+fn in_context<T>(
     context: Handle,
+    operation: impl FnOnce(&Driver) -> Result<T, String>,
+) -> Result<T, String> {
+    let driver = driver()?;
+    // SAFETY: the backend keeps this borrowed context alive.
+    unsafe { check((driver.push)(context), "cuCtxPushCurrent")? };
+    let result = operation(driver);
+    let mut previous = std::ptr::null_mut();
+    unsafe { check((driver.pop)(&mut previous), "cuCtxPopCurrent")? };
+    result
 }
 
-impl Event {
-    /// Records a fence on the backend's current context and supplied stream.
-    pub fn record(stream: usize) -> Result<Self, String> {
-        let driver = driver()?;
-        let mut event = Self {
-            handle: std::ptr::null_mut(),
-            context: std::ptr::null_mut(),
-        };
+/// An owned CUDA event, allocated on its first recording.
+///
+/// The backend keeps the CUDA context alive. Queries, waits and destruction
+/// use the event handle directly, without changing the calling thread's context.
+pub struct Event {
+    device: i32,
+    timing: bool,
+    interprocess: bool,
+    handle: Mutex<Option<Arc<EventHandle>>>,
+}
 
-        // The backend has initialized the calling thread's context and
-        // submitted numerical work. This fence follows it on the same stream.
-        unsafe {
-            check((driver.context)(&mut event.context), "cuCtxGetCurrent")?;
-            // CU_EVENT_DISABLE_TIMING: this event only tracks completion.
-            check((driver.create)(&mut event.handle, 2), "cuEventCreate")?;
-            check(
-                (driver.record)(event.handle, stream as Handle),
-                "cuEventRecord",
-            )?;
+struct EventHandle {
+    raw: Handle,
+    context: Handle,
+    primary_device: Option<i32>,
+}
+
+// SAFETY: CUDA event handles can be used from multiple host threads. Arc keeps
+// the event alive during each driver operation; only Drop destroys the handle.
+// Context lifetime remains with the backend, and context changes are per-thread.
+unsafe impl Send for EventHandle {}
+unsafe impl Sync for EventHandle {}
+
+impl Event {
+    pub fn new(device: i32, timing: bool, interprocess: bool) -> Self {
+        Self {
+            device,
+            timing,
+            interprocess,
+            handle: Mutex::new(None),
         }
-        Ok(event)
     }
 
-    fn in_context<T>(
-        &self,
-        operation: impl FnOnce(&Driver) -> Result<T, String>,
-    ) -> Result<T, String> {
+    pub fn device(&self) -> i32 {
+        self.device
+    }
+
+    pub fn timing(&self) -> bool {
+        self.timing
+    }
+
+    pub fn interprocess(&self) -> bool {
+        self.interprocess
+    }
+
+    /// Records on a borrowed stream. The caller selects the device's current
+    /// context when passing a default stream; explicit streams identify theirs.
+    pub fn record(&self, stream: usize) -> Result<(), String> {
         let driver = driver()?;
+        let mut context = std::ptr::null_mut();
         unsafe {
-            check((driver.push)(self.context), "cuCtxPushCurrent")?;
+            check(
+                (driver.stream_context)(stream as Handle, &mut context),
+                "cuStreamGetCtx",
+            )?;
         }
-        let result = operation(driver);
-        let mut previous = std::ptr::null_mut();
-        let restored = unsafe { check((driver.pop)(&mut previous), "cuCtxPopCurrent") };
-        restored?;
-        result
+
+        let mut retained = self.handle.lock().unwrap_or_else(PoisonError::into_inner);
+        let event = match &mut *retained {
+            Some(event) if event.context == context => event,
+            slot => {
+                let mut flags = 0;
+                if !self.timing {
+                    flags |= CU_EVENT_DISABLE_TIMING;
+                }
+                if self.interprocess {
+                    flags |= CU_EVENT_INTERPROCESS;
+                }
+
+                let mut raw = std::ptr::null_mut();
+                in_context(context, |driver| unsafe {
+                    check((driver.create)(&mut raw, flags), "cuEventCreate")
+                })?;
+                slot.insert(Arc::new(EventHandle {
+                    raw,
+                    context,
+                    primary_device: None,
+                }))
+            }
+        };
+        unsafe {
+            check(
+                (driver.record)(event.raw, stream as Handle),
+                "cuEventRecord",
+            )
+        }
+    }
+
+    fn handle(&self) -> Option<Arc<EventHandle>> {
+        self.handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Queries completion without waiting; device failures remain errors.
     pub fn ready(&self) -> Result<bool, String> {
-        self.in_context(|driver| {
-            let status = unsafe { (driver.query)(self.handle) };
-            if status == 600 {
-                // CUDA_ERROR_NOT_READY
-                return Ok(false);
-            }
-            check(status, "cuEventQuery")?;
-            Ok(true)
-        })
+        let Some(event) = self.handle() else {
+            return Ok(true);
+        };
+        let status = unsafe { (driver()?.query)(event.raw) };
+        if status == CUDA_ERROR_NOT_READY {
+            return Ok(false);
+        }
+        check(status, "cuEventQuery")?;
+        Ok(true)
     }
 
     /// Waits on the host for this event alone.
     pub fn wait(&self) -> Result<(), String> {
-        self.in_context(|driver| unsafe {
-            check((driver.synchronize)(self.handle), "cuEventSynchronize")
-        })
+        let Some(event) = self.handle() else {
+            return Ok(());
+        };
+        unsafe { check((driver()?.synchronize)(event.raw), "cuEventSynchronize") }
     }
 
-    /// Orders a consumer stream after the work captured by this event.
+    /// Orders a consumer stream after the event's most recent recording.
     pub fn wait_on(&self, stream: usize) -> Result<(), String> {
-        self.in_context(|driver| unsafe {
+        let Some(event) = self.handle() else {
+            return Ok(());
+        };
+        unsafe {
             check(
-                (driver.wait)(stream as Handle, self.handle, 0),
+                (driver()?.wait)(stream as Handle, event.raw, 0),
                 "cuStreamWaitEvent",
             )
+        }
+    }
+
+    /// Returns milliseconds between recorded timing events, without host waiting.
+    pub fn elapsed_time(&self, end: &Self) -> Result<f32, String> {
+        let start = self
+            .handle()
+            .ok_or("CUDA timing event has not been recorded")?;
+        let end = end
+            .handle()
+            .ok_or("CUDA timing event has not been recorded")?;
+        let mut milliseconds = 0.0;
+        unsafe {
+            check(
+                (driver()?.elapsed)(&mut milliseconds, start.raw, end.raw),
+                "cuEventElapsedTime",
+            )?;
+        }
+        Ok(milliseconds)
+    }
+
+    pub fn ipc_handle(&self) -> Result<[u8; 64], String> {
+        let event = self
+            .handle()
+            .ok_or("CUDA IPC event has not been recorded")?;
+        let mut bytes = IpcEventHandle { reserved: [0; 64] };
+        unsafe {
+            check(
+                (driver()?.export_event)(&mut bytes, event.raw),
+                "cuIpcGetEventHandle",
+            )?
+        };
+        Ok(bytes.reserved)
+    }
+
+    /// Imports an event while retaining its device's primary context.
+    pub fn from_ipc_handle(device: i32, bytes: [u8; 64]) -> Result<Self, String> {
+        let context = primary_context(device)?;
+        let mut event = EventHandle {
+            raw: std::ptr::null_mut(),
+            context,
+            primary_device: Some(device),
+        };
+        in_context(context, |driver| unsafe {
+            check(
+                (driver.import_event)(&mut event.raw, IpcEventHandle { reserved: bytes }),
+                "cuIpcOpenEventHandle",
+            )
+        })?;
+        Ok(Self {
+            device,
+            timing: false,
+            interprocess: true,
+            handle: Mutex::new(Some(Arc::new(event))),
         })
     }
 }
 
-impl Drop for Event {
+impl Drop for EventHandle {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            let _ = self.in_context(|driver| unsafe {
-                check((driver.destroy)(self.handle), "cuEventDestroy")
-            });
+        if let Ok(driver) = driver() {
+            // CUDA defers physical destruction if the recorded work is pending.
+            if !self.raw.is_null() {
+                unsafe { (driver.destroy)(self.raw) };
+            }
+            if let Some(device) = self.primary_device {
+                unsafe { (driver.primary_release)(device) };
+            }
+        }
+    }
+}
+
+fn primary_context(device: i32) -> Result<Handle, String> {
+    let mut context = std::ptr::null_mut();
+    unsafe {
+        check(
+            (driver()?.primary_retain)(&mut context, device),
+            "cuDevicePrimaryCtxRetain",
+        )?;
+    }
+    Ok(context)
+}
+
+/// Selects a primary CUDA context for native operations on the calling thread.
+///
+/// CUDA runtime device selection can leave a fresh host thread without a
+/// current driver context. This guard binds it explicitly and restores the
+/// previous context on drop; it does not change PyTorch's stream selection.
+pub struct DeviceGuard {
+    device: i32,
+    // A context stack must be restored on the thread that selected it.
+    _context: Handle,
+}
+
+impl DeviceGuard {
+    pub fn new(device: i32) -> Result<Self, String> {
+        let context = primary_context(device)?;
+        let driver = driver()?;
+        let status = unsafe { (driver.push)(context) };
+        if status != 0 {
+            unsafe { (driver.primary_release)(device) };
+            check(status, "cuCtxPushCurrent")?;
+        }
+        Ok(Self {
+            device,
+            _context: context,
+        })
+    }
+}
+
+impl Drop for DeviceGuard {
+    fn drop(&mut self) {
+        if let Ok(driver) = driver() {
+            let mut previous = std::ptr::null_mut();
+            unsafe {
+                (driver.pop)(&mut previous);
+                (driver.primary_release)(self.device);
+            }
+        }
+    }
+}
+
+/// A nonblocking stream owned by the worker's completion notifier.
+pub struct Stream {
+    handle: Handle,
+}
+
+// SAFETY: the CUDA driver supports stream operations from multiple host threads.
+// Shared references retain the handle; destruction requires exclusive ownership.
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
+
+impl Stream {
+    /// Creates a stream in the backend's current device context.
+    pub fn new() -> Result<Self, String> {
+        let mut handle = std::ptr::null_mut();
+        unsafe { check((driver()?.create_stream)(&mut handle, 1), "cuStreamCreate")? };
+        Ok(Self { handle })
+    }
+
+    pub fn handle(&self) -> usize {
+        self.handle as usize
+    }
+
+    pub fn wait(&self) -> Result<(), String> {
+        unsafe {
+            check(
+                (driver()?.synchronize_stream)(self.handle),
+                "cuStreamSynchronize",
+            )
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if let Ok(driver) = driver() {
+            unsafe { (driver.destroy_stream)(self.handle) };
         }
     }
 }

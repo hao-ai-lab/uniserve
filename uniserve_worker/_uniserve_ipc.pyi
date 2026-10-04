@@ -18,7 +18,6 @@ from typing import Any, Generic, ParamSpec, Self, TypeVar, final
 
 import torch
 
-from uniserve.runtime import EventPool
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
@@ -53,6 +52,9 @@ __all__ = [
     "BufferPool",
     "BufferRegistry",
     "Completion",
+    "CUDAEvent",
+    "EventPool",
+    "EventPoolError",
     "Executor",
     "GroupShape",
     "GroupTable",
@@ -82,6 +84,59 @@ __all__ = [
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")
+
+class EventPoolError(RuntimeError):
+    """Invalid event lease ownership or stream ordering."""
+
+@final
+class CUDAEvent:
+    """A native CUDA event borrowed from a pool or imported through IPC."""
+
+    def query(self) -> bool: ...
+    def synchronize(self) -> None: ...
+    def wait(self, stream: torch.cuda.Stream | None = None) -> None: ...
+    def elapsed_time(self, end: CUDAEvent) -> float: ...
+    def ipc_handle(self) -> bytes: ...
+    @staticmethod
+    def from_ipc_handle(
+        device: torch.device | str, handle: bytes
+    ) -> CUDAEvent: ...
+
+@final
+class EventPool:
+    """Share event references until producers and deferred owners retire."""
+
+    def __new__(cls) -> Self: ...
+    def set_completion_wake(
+        self, wake_on_stream: Callable[[int], None] | None
+    ) -> None: ...
+    def schedule_completion_wake(
+        self, device: torch.device | str, event: CUDAEvent
+    ) -> None: ...
+    def acquire(
+        self,
+        device: torch.device | str,
+        *,
+        timing: bool = False,
+        interprocess: bool = False,
+    ) -> CUDAEvent: ...
+    def declare_stream(
+        self, event: CUDAEvent, device: torch.device | str
+    ) -> int: ...
+    def record(self, event: CUDAEvent, device: torch.device | str) -> int: ...
+    def retain(
+        self, event: CUDAEvent, device: torch.device | str, count: int = 1
+    ) -> None: ...
+    def release(self, event: CUDAEvent, count: int = 1) -> None: ...
+    def defer_release(
+        self,
+        events: Sequence[CUDAEvent],
+        owner: object,
+        *,
+        completed: Callable[[], None] | None = None,
+    ) -> None: ...
+    def reap(self) -> None: ...
+    def close(self) -> None: ...
 
 @final
 class HostLane:
@@ -307,7 +362,7 @@ class TransferTicket:
     def _complete(
         self,
         value: torch.Tensor | tuple[torch.Tensor, ...],
-        event: torch.cuda.Event | None = None,
+        event: CUDAEvent | None = None,
     ) -> None: ...
     def _fail(self, error: BaseException) -> bool: ...
     def _drain_consumers(self) -> None: ...
@@ -338,7 +393,7 @@ class TransferPool:
         ticket: TransferTicket,
         source: torch.Tensor | tuple[torch.Tensor, ...],
         destination: torch.Tensor | tuple[torch.Tensor, ...],
-        producer: torch.cuda.Event | None = None,
+        producer: CUDAEvent | None = None,
         acknowledgment: torch.Tensor | None = None,
     ) -> None: ...
     def close(self) -> None: ...
@@ -671,7 +726,7 @@ class TensorStore:
         write: Buffer,
         value: torch.Tensor,
         *,
-        producer_event: torch.cuda.Event | None = None,
+        producer_event: CUDAEvent | None = None,
         metadata: ImageMetadata | FeatureMetadata | None = None,
     ) -> torch.Tensor: ...
     def publish_writes(
@@ -679,14 +734,14 @@ class TensorStore:
         writes: tuple[Buffer, ...],
         values: torch.Tensor,
         *,
-        producer_event: torch.cuda.Event | None = None,
+        producer_event: CUDAEvent | None = None,
     ) -> tuple[torch.Tensor, ...]: ...
     def publish_scalar_write(
         self,
         write: Buffer,
         value: bool | int,
         *,
-        producer_event: torch.cuda.Event | None = None,
+        producer_event: CUDAEvent | None = None,
     ) -> torch.Tensor: ...
     def consume(
         self,

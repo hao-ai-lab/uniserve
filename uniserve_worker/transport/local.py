@@ -16,7 +16,7 @@ from itertools import count
 from typing import TYPE_CHECKING, Any
 
 from uniserve import _slices
-from uniserve.runtime import EventPool
+from uniserve.runtime import CUDAEvent, EventPool
 from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
@@ -53,7 +53,7 @@ class _LocalSource:
     """Detached tensor views and their producer fence, if on a device."""
 
     tensor: torch.Tensor | tuple[torch.Tensor, ...]
-    event: torch.cuda.Event | None
+    event: CUDAEvent | None
 
 
 class LocalTransport(Transport):
