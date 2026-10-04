@@ -98,4 +98,13 @@ def test_cancelled_streams_release_capacity_for_later_requests(served):
     # More new admissions than cancelled streams expose retained request
     # capacity while also exercising joins from temporarily idle peers.
     with ThreadPoolExecutor(8) as pool:
-        list(pool.map(lambda _: _secret(served, "ready"), range(8)))
+        results = list(
+            pool.map(
+                lambda _: _post(served, "Count from one to ten.", limit=8),
+                range(8),
+            )
+        )
+    assert len({result["id"] for result in results}) == len(results)
+    for result in results:
+        assert 1 <= result["usage"]["completion_tokens"] <= 8
+        assert result["choices"][0]["finish_reason"] in {"length", "stop"}
