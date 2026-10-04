@@ -26,4 +26,4 @@ pub use kv_cache::KVCacheManager;
 pub use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
 pub use registry::{BufferRegistry, RegisteredBuffer};
 pub use request::{Request, RequestPool, RequestProgress};
-pub use transfer::{ReadReservation, TransferCapacity, TransferTicket};
+pub use transfer::{ReadReservation, TransferCapacity, TransferPool, TransferTicket};

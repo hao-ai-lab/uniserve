@@ -1,9 +1,12 @@
 //! Transfer admission, readable results, and physical retirement.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
 
-use crate::{Completion, Error, Outcome, Result};
+use crate::cuda::{DeviceGuard, Event, Stream};
+use crate::{Completion, Error, EventPool, Outcome, Result};
 
 struct CapacityState<C> {
     used: u64,
@@ -189,6 +192,16 @@ impl<C> Drop for ReadReservation<C> {
     }
 }
 
+enum ReadAccess {
+    Copy {
+        handoff: Option<Arc<Event>>,
+    },
+    Borrowed {
+        streams: HashSet<(i32, usize)>,
+        events: Vec<Arc<Event>>,
+    },
+}
+
 /// A read's result and physical lifetime. The transport serializes mutations
 /// and dispatches returned callbacks after releasing its ownership lock.
 ///
@@ -198,7 +211,10 @@ pub struct TransferTicket<V, E, C> {
     value: Option<Arc<V>>,
     error: Option<Arc<E>>,
     cancelled: bool,
-    borrowed: bool,
+    access: ReadAccess,
+    producer: Option<Arc<Event>>,
+    copy_stream: Option<Arc<Stream>>,
+    source_ready: Option<Arc<Event>>,
     closed: bool,
     undrained: bool,
     callbacks: Vec<C>,
@@ -211,7 +227,17 @@ impl<V, E, C> TransferTicket<V, E, C> {
             value: None,
             error: None,
             cancelled: false,
-            borrowed,
+            access: if borrowed {
+                ReadAccess::Borrowed {
+                    streams: HashSet::new(),
+                    events: Vec::new(),
+                }
+            } else {
+                ReadAccess::Copy { handoff: None }
+            },
+            producer: None,
+            copy_stream: None,
+            source_ready: None,
             closed: false,
             undrained: false,
             callbacks: Vec::new(),
@@ -271,7 +297,8 @@ impl<V, E, C> TransferTicket<V, E, C> {
     }
 
     /// Expose a completed view without replacing an earlier error or result.
-    pub fn complete(&mut self, value: V) -> Vec<C> {
+    pub fn complete(&mut self, value: V, producer: Option<Arc<Event>>) -> Vec<C> {
+        self.producer = producer;
         if self.ready() {
             return Vec::new();
         }
@@ -306,7 +333,7 @@ impl<V, E, C> TransferTicket<V, E, C> {
     /// End borrowed consumption once. Copy destinations retain their ordinary
     /// value ownership and remain readable after close.
     pub fn close(&mut self) -> bool {
-        if !self.borrowed || self.closed {
+        if !matches!(self.access, ReadAccess::Borrowed { .. }) || self.closed {
             return false;
         }
 
@@ -314,10 +341,103 @@ impl<V, E, C> TransferTicket<V, E, C> {
         true
     }
 
+    /// Capture writes made before submission. Later work on the submitting
+    /// stream must not become a dependency of the transport copy.
+    pub fn prepare_copy<O>(
+        &mut self,
+        pool: &mut EventPool<O>,
+        device: i32,
+        stream: usize,
+    ) -> Result<()> {
+        let ReadAccess::Copy { handoff } = &mut self.access else {
+            return Err(Error::State("a borrowed transfer cannot copy into storage"));
+        };
+        let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
+        let event = pool.acquire(device, false, false)?;
+        pool.record(&event, device, stream)?;
+        pool.retain(&event, device, 1)?;
+        *handoff = Some(event);
+        Ok(())
+    }
+
+    /// Order a transport stream after the destination's submitting stream.
+    /// The caller selects the transport device context.
+    pub fn wait_for_copy(&self, stream: usize) -> Result<()> {
+        let ReadAccess::Copy { handoff } = &self.access else {
+            return Err(Error::State("a borrowed transfer cannot copy into storage"));
+        };
+        if let Some(event) = handoff {
+            event.wait_on(stream).map_err(Error::Cuda)?;
+        }
+        Ok(())
+    }
+
+    /// Order a borrowed numerical stream and remember its storage access.
+    /// The numerical backend separately records views with its allocator.
+    pub fn consume(&mut self, device: i32, stream: usize) -> Result<()> {
+        if let Some(producer) = &self.producer {
+            let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
+            producer.wait_on(stream).map_err(Error::Cuda)?;
+
+            if let ReadAccess::Borrowed { streams, .. } = &mut self.access {
+                streams.insert((device, stream));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn producer(&self) -> Option<&Arc<Event>> {
+        self.producer.as_ref()
+    }
+
+    /// Fence each consumer at the end of borrowed access. The caller transfers
+    /// these retained event references to deferred source release.
+    pub fn record_consumers<O>(&mut self, pool: &mut EventPool<O>) -> Result<()> {
+        if let ReadAccess::Borrowed { streams, events } = &mut self.access {
+            for &(device, stream) in streams.iter() {
+                let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
+                let event = pool.acquire(device, false, false)?;
+                pool.record(&event, device, stream)?;
+                pool.retain(&event, device, 1)?;
+                events.push(event);
+            }
+            streams.clear();
+        }
+        Ok(())
+    }
+
+    pub fn consumer_events(&self) -> &[Arc<Event>] {
+        match &self.access {
+            ReadAccess::Borrowed { events, .. } => events,
+            ReadAccess::Copy { .. } => &[],
+        }
+    }
+
+    pub fn release_consumers(&mut self) {
+        if let ReadAccess::Borrowed { events, .. } = &mut self.access {
+            events.clear();
+        }
+    }
+
+    /// Move this ticket's retained readiness fences to deferred release.
+    pub fn take_events(&mut self) -> Vec<Arc<Event>> {
+        let mut events: Vec<_> = self.producer.take().into_iter().collect();
+        if let ReadAccess::Copy { handoff } = &mut self.access {
+            events.extend(handoff.take());
+        }
+        events
+    }
+
     /// The backend could not drain device access. It must retain its backing
     /// allocations; neither cancellation nor result failure permits reuse.
-    pub fn mark_undrained(&mut self) {
+    pub fn mark_undrained(
+        &mut self,
+        stream: Option<Arc<Stream>>,
+        source_ready: Option<Arc<Event>>,
+    ) {
         self.undrained = true;
+        self.copy_stream = stream;
+        self.source_ready = source_ready;
     }
 
     pub fn retire(&self) -> Result<Vec<C>> {
@@ -342,5 +462,58 @@ impl<V, E, C> TransferTicket<V, E, C> {
     /// retirement observers are traced through their shared Completion.
     pub fn visit<R>(&self, visitor: impl FnOnce(Option<&V>, Option<&E>, &[C]) -> R) -> R {
         visitor(self.value(), self.error(), &self.callbacks)
+    }
+}
+
+/// A backend's copy streams and terminal transport failure. Host lanes execute
+/// reads; this pool retains accesses whose physical completion is unknown.
+pub struct TransferPool<E, T> {
+    streams: HashMap<(ThreadId, i32), Arc<Stream>>,
+    error: Option<E>,
+    unretired: Vec<T>,
+}
+
+impl<E, T> Default for TransferPool<E, T> {
+    fn default() -> Self {
+        Self {
+            streams: HashMap::new(),
+            error: None,
+            unretired: Vec::new(),
+        }
+    }
+}
+
+impl<E, T> TransferPool<E, T> {
+    pub fn stream(&mut self, device: i32) -> Result<Arc<Stream>> {
+        let key = (std::thread::current().id(), device);
+        if let Some(stream) = self.streams.get(&key) {
+            return Ok(Arc::clone(stream));
+        }
+
+        let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
+        let stream = Arc::new(Stream::new().map_err(Error::Cuda)?);
+        self.streams.insert(key, Arc::clone(&stream));
+        Ok(stream)
+    }
+
+    pub fn fail(&mut self, error: E, unretired: Option<T>) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+        self.unretired.extend(unretired);
+    }
+
+    pub fn error(&self) -> Option<&E> {
+        self.error.as_ref()
+    }
+
+    pub fn unretired(&self) -> &[T] {
+        &self.unretired
+    }
+
+    /// Called after the host lane joins. Undrained tickets remain retained even
+    /// when the transport reports its terminal failure to the caller.
+    pub fn close(&mut self) {
+        self.streams.clear();
     }
 }

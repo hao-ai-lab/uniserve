@@ -71,7 +71,7 @@ impl CUDAEvent {
     }
 }
 
-struct DeferredOwner {
+pub(crate) struct DeferredOwner {
     value: Py<PyAny>,
     completed: Option<Py<PyAny>>,
 }
@@ -107,18 +107,8 @@ impl EventPool {
         device: &Bound<'_, PyAny>,
         event: &CUDAEvent,
     ) -> PyResult<()> {
-        let wake = self.lock().wake.as_ref().map(|wake| wake.clone_ref(py));
-        let Some(wake) = wake else { return Ok(()) };
         let (_, device) = device_index(py, device)?;
-        let stream = {
-            let _device = DeviceGuard::new(device).map_err(PyRuntimeError::new_err)?;
-            self.lock()
-                .pool
-                .wake_stream(&event.inner, device)
-                .map_err(pool_error)?
-        };
-        wake.bind(py).call1((stream.handle(),))?;
-        Ok(())
+        self.wake_event(py, device, &event.inner)
     }
 
     #[pyo3(signature = (device, *, timing=false, interprocess=false))]
@@ -242,6 +232,34 @@ impl EventPool {
 }
 
 impl EventPool {
+    /// Compose native resource operations without dispatching Python callbacks.
+    /// Callers reap completed owners before taking their own ownership lock.
+    pub(crate) fn with_pool<T>(
+        &self,
+        operation: impl FnOnce(&mut NativeEventPool<DeferredOwner>) -> uniserve_worker::Result<T>,
+    ) -> PyResult<T> {
+        operation(&mut self.lock().pool).map_err(pool_error)
+    }
+
+    pub(crate) fn wake_event(
+        &self,
+        py: Python<'_>,
+        device: i32,
+        event: &Arc<Event>,
+    ) -> PyResult<()> {
+        let wake = self.lock().wake.as_ref().map(|wake| wake.clone_ref(py));
+        let Some(wake) = wake else { return Ok(()) };
+        let stream = {
+            let _device = DeviceGuard::new(device).map_err(PyRuntimeError::new_err)?;
+            self.lock()
+                .pool
+                .wake_stream(event, device)
+                .map_err(pool_error)?
+        };
+        wake.bind(py).call1((stream.handle(),))?;
+        Ok(())
+    }
+
     // Storage owners reap callbacks before taking their own lock, then use
     // these operations while composing native resource changes.
     pub(crate) fn acquire_event(
