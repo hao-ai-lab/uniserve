@@ -1704,7 +1704,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
 @pytest.mark.parametrize(
     "dtype", (DType.BF16, DType.F32, DType.I32, DType.I64, DType.I16)
 )
-def test_tensor_entry_input_preserves_values_through_output_release(
+def test_tensor_import_preserves_values_through_output_release(
     backend: str,
     dtype: DType,
 ) -> None:

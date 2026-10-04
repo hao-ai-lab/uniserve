@@ -90,12 +90,12 @@ class BatchRunner:
             self.worker._completion_wake()
 
     def await_inputs(self, state: BatchState, submission: Submission) -> None:
-        if not state.awaiting_reads:
-            state.on_dependencies_ready(partial(self.notify_ready, submission))
+        if not state.inputs.awaiting_reads:
+            state.inputs.on_ready(partial(self.notify_ready, submission))
 
     def prepare_inputs(self, state: BatchState, submission: Submission) -> bool:
         self.advance_inputs(state, submission)
-        return state.inputs_ready()
+        return state.inputs.ready()
 
     def reap(self) -> None:
         self.worker.device_events.reap()
@@ -303,7 +303,7 @@ class BatchRunner:
             request_pool=self.worker.requests,
         )
         # Inline input images are prepared on the host lane while this thread
-        # launches other batches; `inputs_ready` waits for them.
+        # launches other batches; `BatchInputs.ready` waits for them.
         reserve_images(
             state,
             host_tasks=self.worker.host_tasks,
@@ -320,22 +320,21 @@ class BatchRunner:
         free for the next import, the batch is marked ``awaiting_reads`` and
         woken when one returns, and the next call resumes at that import.
         """
-        if state.inputs_closed:
+        if state.inputs.closed:
             return
-        if state.inputs_submitted:
+        if state.inputs.submitted:
             capture_predicates(state, self.worker.tensor_store)
             return
         # A destination remains unavailable until the previous physical reader
         # retires. Dependencies with no import still gate model execution.
-        if (state.input_products or state.kv_inputs) and not all(
-            dependency.done() for dependency in state.storage_dependencies
-        ):
+        if (
+            state.input_products or state.kv_inputs
+        ) and not state.inputs.storage_ready():
             return
         if state.input_products or state.kv_inputs:
-            for dependency in state.storage_dependencies:
-                dependency.result()
+            state.inputs.require_storage()
 
-        state.awaiting_reads = False
+        state.inputs.awaiting_reads = False
         try:
             prepare_inputs(
                 state,
@@ -352,13 +351,13 @@ class BatchRunner:
         except ReadBackpressureError as error:
             # Read tickets return as reads retire, independently of this
             # batch, so the batch resumes once one does.
-            state.awaiting_reads = True
+            state.inputs.awaiting_reads = True
             error.capacity.notify_reads_returned(
                 partial(self.notify_ready, submission),
                 after=error.returns,
             )
             return
-        state.inputs_submitted = True
+        state.inputs.submitted = True
         capture_predicates(state, self.worker.tensor_store)
 
     def begin_retirement(self, state: BatchState) -> None:
@@ -577,33 +576,36 @@ class BatchRunner:
 
         Raises ``RuntimeError`` when the inputs were already consumed, or
         when they are not ready, in which case they stay open. Otherwise
-        ``BatchState.close_inputs`` runs after ``_execute_batch`` whether or
+        ``BatchInputs.close`` runs after ``_execute_batch`` whether or
         not it raises.
         """
-        if state.inputs_closed:
+        if state.inputs.closed:
             raise RuntimeError("batch inputs have already been consumed")
 
-        if not state.inputs_ready():
+        if not state.inputs.ready():
             raise RuntimeError("batch was observed before dependency readiness")
 
         try:
-            for dependency in state.storage_dependencies:
-                dependency.result()
+            state.inputs.require_storage()
             self._execute_batch(state)
         except BaseException as error:
             try:
-                state.close_inputs(
+                state.inputs.close(
                     self.worker.tensor_store,
                     self.worker.latent_pool,
-                    self.worker.kv_cache,
+                    None
+                    if self.worker.kv_cache is None
+                    else self.worker.kv_cache.imports,
                 )
             except BaseException as cleanup_error:
                 error.add_note(f"batch input cleanup failed: {cleanup_error!r}")
             raise
-        state.close_inputs(
+        state.inputs.close(
             self.worker.tensor_store,
             self.worker.latent_pool,
-            self.worker.kv_cache,
+            None
+            if self.worker.kv_cache is None
+            else self.worker.kv_cache.imports,
         )
 
     def release_buffers(self, buffers: Sequence[BufferId]) -> None:

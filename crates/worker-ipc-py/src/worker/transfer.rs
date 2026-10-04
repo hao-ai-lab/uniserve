@@ -273,7 +273,7 @@ impl TransferTicket {
         }
     }
 
-    fn ready(&self, py: Python<'_>) -> PyResult<bool> {
+    pub(crate) fn ready(&self, py: Python<'_>) -> PyResult<bool> {
         Ok(self.lock(py)?.ticket.ready())
     }
 
@@ -292,7 +292,7 @@ impl TransferTicket {
         })
     }
 
-    fn add_done_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+    pub(crate) fn add_done_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
         let immediate = self.lock(py)?.ticket.add_done_callback(callback);
         if let Some(callback) = immediate {
             notify(py, vec![callback]);

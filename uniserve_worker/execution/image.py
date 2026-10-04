@@ -164,9 +164,9 @@ def reserve_images(
     carrying an inline image payload takes one host-lane task, which
     decodes, resizes, normalizes and packs the image into page-locked
     memory (``prepare_host_image``) while the worker thread launches other
-    batches. The tasks are recorded in ``state.image_tasks``: execution
-    waits for them (``BatchState.inputs_ready``), ``prepare_features``
-    stages their results, and ``BatchState.close_inputs`` withdraws them.
+    batches. ``BatchInputs`` retains the tasks and waits for their results;
+    ``prepare_features`` stages those results, and closing the inputs
+    withdraws any task still queued.
 
     The engine charges every such call one task on the host lane of each
     rank of its component and holds the charge until the call's result
@@ -177,7 +177,7 @@ def reserve_images(
         WorkerError: ``invalid_descriptor`` when a call's request admitted no
             input images; a ``ResourceError`` when the lane has no capacity
             left. Tasks reserved before the failure stay in
-            ``state.image_tasks`` for ``close_inputs`` to withdraw.
+            ``BatchInputs`` for input cleanup to withdraw.
     """
     calls = tuple(
         call
@@ -192,7 +192,7 @@ def reserve_images(
         admission = request_pool.get(call.request_key.request_id).admission
         device = model_runner.call_devices(call)[1]
         task = host_tasks.reserve()
-        state.image_tasks[call.call_id] = task
+        state.inputs.add_image(call.call_id, task)
         task.configure(
             partial(
                 prepare_host_image,
@@ -263,7 +263,7 @@ def prepare_features(
             signed_unit=source_metadata.value_range == (-1.0, 1.0),
         )
     else:
-        task = state.image_tasks.get(call.call_id)
+        task = state.inputs.image(call.call_id)
         if task is None:
             raise RuntimeError("inline image encode has no host preparation")
         prepared = stage_image(task.result(), target_device)

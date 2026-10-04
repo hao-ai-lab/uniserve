@@ -243,6 +243,18 @@ impl DerefMut for TensorRead {
     }
 }
 
+impl TensorRead {
+    pub(crate) fn tickets(&self, py: Python<'_>) -> Vec<Py<TransferTicket>> {
+        self.imported.as_ref().map_or_else(Vec::new, |imported| {
+            lock(py, imported)
+                .tickets
+                .iter()
+                .map(|ticket| ticket.owner.clone_ref(py))
+                .collect()
+        })
+    }
+}
+
 #[pymethods]
 impl TensorRead {
     #[getter]
@@ -1073,7 +1085,7 @@ impl TensorStore {
     /// End leases only after fencing their consuming streams. Outputs of the
     /// consuming call can supply the fence; otherwise record one per device.
     #[pyo3(signature = (reads, *, device=None, after_writes=Vec::new()))]
-    fn complete_reads(
+    pub(crate) fn complete_reads(
         &self,
         py: Python<'_>,
         reads: Vec<Bound<'_, TensorRead>>,

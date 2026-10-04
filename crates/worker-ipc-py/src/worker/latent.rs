@@ -65,7 +65,7 @@ impl LatentUpdate {
 /// every physical read has ended. Imported values occupy bank zero.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct LatentImport {
-    inner: Arc<NativeLatentImport<TransferRef>>,
+    pub(super) inner: Arc<NativeLatentImport<TransferRef>>,
     #[pyo3(get)]
     product: Py<PyAny>,
     #[pyo3(get)]
@@ -761,7 +761,11 @@ impl LatentPool {
         Ok(())
     }
 
-    fn abandon_import(&mut self, py: Python<'_>, write: &Bound<'_, LatentImport>) -> PyResult<()> {
+    pub(crate) fn abandon_import(
+        &mut self,
+        py: Python<'_>,
+        write: &Bound<'_, LatentImport>,
+    ) -> PyResult<()> {
         let transfers = self
             .inner
             .abandon_import(&write.get().inner)

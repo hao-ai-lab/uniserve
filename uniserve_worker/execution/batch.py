@@ -8,26 +8,24 @@ predicate captures, and `image.reserve_images` the host preparation of
 inline input images; `reserve_outputs` binds one `PendingOutput` per call;
 `commit_batch` (or `execute_batch` on failure) records the final outputs.
 The native executor owns admission, launch order, failure and delivery.
-The batch runner materializes outputs and retires their resources. Its callbacks
-registered by `on_dependencies_ready` may run on a thread that completes a
-dependency rather than the worker thread.
+The batch runner materializes outputs and retires their resources. Native
+`BatchInputs` retains input leases and notifies the executor when their
+physical dependencies become consumable.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
-from threading import Lock
 from typing import cast
 
 import torch
 
 from uniserve.runtime.resources import close_resources
-from uniserve_worker._uniserve_ipc import Completion, CUDAEvent
+from uniserve_worker._uniserve_ipc import BatchInputs, CUDAEvent
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.batch import Batch, TensorPublication
 from uniserve_worker.protocol.call import Call, CallStatus
@@ -43,12 +41,10 @@ from uniserve_worker.protocol.output import (
     RequestOutput,
 )
 from uniserve_worker.protocol.transfer import KvTransfer
-from uniserve_worker.storage.cache_imports import KVImport
 from uniserve_worker.storage.kv_cache import KVCacheManager
-from uniserve_worker.storage.latent_pool import LatentImport, LatentPool
+from uniserve_worker.storage.latent_pool import LatentPool
 from uniserve_worker.storage.output import OutputBuffer
-from uniserve_worker.storage.tensor_store import TensorRead, TensorStore
-from uniserve_worker.transport.ticket import TransferTicket
+from uniserve_worker.storage.tensor_store import TensorStore
 
 
 @dataclass(slots=True)
@@ -71,50 +67,24 @@ class BatchState:
     # independent work.
     predecessors: dict[CallId, CallId | None] = field(default_factory=dict)
 
-    # Physical input reservations keyed by input buffer id, held until
-    # `close_inputs` completes the reads and abandons unadopted imports.
-    tensor_reads: dict[BufferId, TensorRead] = field(default_factory=dict)
-    latent_imports: dict[BufferId, LatentImport] = field(default_factory=dict)
-    cache_imports: dict[BufferId, KVImport] = field(default_factory=dict)
-    # Media inputs a host call reads in place from their producers' segments
-    # at execution; they are neither imported nor staged here.
-    borrowed_inputs: set[BufferId] = field(default_factory=set)
+    # Rust retains physical inputs, host preparations and their readiness.
+    inputs: BatchInputs = field(default_factory=BatchInputs)
 
     # Completion-valued (U8) predicates, one row each in a dedicated output
     # buffer. An entry is (call identity, captured (offset, count) span,
     # row). Transferred sources wait in ``predicate_transfers`` as
     # (identity, source buffer, row) until `capture_predicates` captures them
     # and seals the buffer; no capture is possible after sealing.
-    predicate_buffer: OutputBuffer | None = None
     predicate_entries: list[tuple[CallIdentity, tuple[int, int], int]] = field(
         default_factory=list
     )
     predicate_transfers: tuple[tuple[CallIdentity, BufferId, int], ...] = ()
-    predicates_sealed: bool = False
     # Cache filled by the first successful `predicate_values` read.
     _predicate_values: dict[CallIdentity, bool] | None = None
 
-    # Set by `prepare_batch`: futures that must complete before this batch
-    # writes its target latent, cache-page and KV storage (they gate
-    # execution even without imports), and the products and KV transfers it
-    # imports.
-    storage_dependencies: tuple[Completion, ...] = ()
+    # Numerical transfer descriptions consumed by input preparation.
     input_products: tuple[TensorPublication, ...] = ()
     kv_inputs: tuple[KvTransfer, ...] = ()
-    # Entries of ``input_products`` whose reads `prepare_inputs` has started;
-    # preparation refused for read tickets resumes at the next one.
-    inputs_started: int = 0
-    # Host-lane tasks preparing the inline input images of this batch's
-    # encoder calls, by call id (`image.reserve_images`). Execution waits
-    # for them like the storage dependencies, and `close_inputs` cancels the
-    # ones still queued and drops every result.
-    image_tasks: dict[CallId, HostTask] = field(default_factory=dict)
-
-    # Preparation waits for read tickets while ``awaiting_reads`` is set.
-    # Closing the numerical inputs suppresses their readiness callbacks.
-    awaiting_reads: bool = False
-    inputs_submitted: bool = False
-    inputs_closed: bool = False
 
     # Final values addressed by original call index: None until
     # `bind_outputs`, then a `PendingOutput`, then the materialized
@@ -278,31 +248,6 @@ class BatchState:
         calls = self.batch.calls
         return calls[0].kind.value if calls else None
 
-    def inputs_ready(self) -> bool:
-        """Check readiness without submitting inputs or running the model.
-
-        True once inputs were submitted, every storage dependency, input
-        image preparation, input transfer and cache import is done, and
-        completion predicates are absent, already read, or sealed with their
-        copies complete.
-        """
-        return (
-            self.inputs_submitted
-            and all(
-                dependency.done() for dependency in self.storage_dependencies
-            )
-            and all(task.done() for task in self.image_tasks.values())
-            and all(ticket.ready() for ticket in self.input_tickets())
-            and all(
-                write.completion.done() for write in self.cache_imports.values()
-            )
-            and (
-                self.predicate_buffer is None
-                or self._predicate_values is not None
-                or (self.predicates_sealed and self.predicate_buffer.ready())
-            )
-        )
-
     def predicate_values(self) -> dict[CallIdentity, bool]:
         """Read each completion predicate as a boolean, keyed by call.
 
@@ -318,11 +263,11 @@ class BatchState:
                 violation. The buffer is abandoned on any failure while
                 reading.
         """
-        buffer = self.predicate_buffer
-        if buffer is None:
-            return {}
         if self._predicate_values is not None:
             return self._predicate_values
+        buffer = self.inputs.predicate
+        if buffer is None:
+            return {}
         if not buffer.ready():
             raise RuntimeError(
                 "prepared predicates were observed before readiness"
@@ -345,154 +290,8 @@ class BatchState:
             raise
 
         self._predicate_values = values
+        self.inputs.predicate = None
         return values
-
-    def on_dependencies_ready(self, callback: Callable[[], None]) -> None:
-        """Wake the owner once physical dependencies permit its next step.
-
-        Waits on the input transfer tickets, the storage dependencies, the
-        input image preparations, the cache import completions and, once
-        sealed, the predicate buffer's completion. With no such dependency,
-        ``callback`` runs synchronously and unconditionally. Otherwise it
-        runs at most once, when all of them are complete, and not after
-        `close_inputs`: synchronously when they already are at registration,
-        else on a thread that completes one. The dependency set is captured
-        now, so the owner re-checks `inputs_ready` when woken and registers
-        again if the batch is still not ready.
-        """
-        tickets = tuple(self.input_tickets())
-        dependencies = (
-            self.storage_dependencies
-            + tuple(self.image_tasks.values())
-            + tuple(write.completion for write in self.cache_imports.values())
-        )
-        if self.predicate_buffer is not None and self.predicates_sealed:
-            dependencies += (self.predicate_buffer.completion(),)
-        if not tickets and not dependencies:
-            callback()
-            return
-
-        lock = Lock()
-        fired = False
-
-        # Done callbacks may run concurrently on different completing
-        # threads; the lock lets at most one of them invoke ``callback``.
-        def notify_if_ready() -> None:
-            nonlocal fired
-            if self.inputs_closed:
-                return
-            if not all(ticket.ready() for ticket in tickets) or not all(
-                dependency.done() for dependency in dependencies
-            ):
-                return
-            with lock:
-                if fired:
-                    return
-                fired = True
-            callback()
-
-        for ticket in tickets:
-            ticket.add_done_callback(notify_if_ready)
-
-        for dependency in dependencies:
-            dependency.add_done_callback(lambda _future: notify_if_ready())
-
-        notify_if_ready()
-
-    def input_tickets(self) -> Iterator[TransferTicket]:
-        """Borrow physical transfers from their actual storage reservations."""
-        for read in self.tensor_reads.values():
-            # `TensorStore.complete_reads` clears ``imported`` when a read
-            # completes and drops its shared import. A callback registered
-            # after synchronous execution must not revive that retired
-            # dependency.
-            if read.imported is not None:
-                yield from read.imported.tickets
-        for write in self.latent_imports.values():
-            yield from write.transfers
-
-    def input_ready(self, buffer: BufferId) -> bool:
-        """Query one reserved input without publishing or consuming it.
-
-        Inputs read in place and tensor reads without a pending import are
-        always ready. A buffer this batch has not reserved reports False.
-        """
-        if buffer in self.borrowed_inputs:
-            return True
-        if (read := self.tensor_reads.get(buffer)) is not None:
-            return read.imported is None or all(
-                ticket.ready() for ticket in read.imported.tickets
-            )
-        if (latent := self.latent_imports.get(buffer)) is not None:
-            return all(ticket.ready() for ticket in latent.transfers)
-        if (cache := self.cache_imports.get(buffer)) is not None:
-            return cache.completion.done()
-        return False
-
-    def close_inputs(
-        self,
-        tensor_store: TensorStore,
-        latent_pool: LatentPool | None,
-        kv_cache: KVCacheManager | None,
-    ) -> None:
-        """Release this submission's readers and unadopted destinations.
-
-        Runs once, whether after execution, on a preparation failure, or when
-        the batch is closed; later calls do nothing, even when an earlier
-        release raised. Every release is attempted, and the first failure is
-        raised with later ones noted. Shared tensor fills outlive cancellation
-        while another read retains them. Latent and cache owners retain
-        cancelled writes until retirement.
-        """
-        if self.inputs_closed:
-            return
-
-        self.inputs_closed = True
-        actions: list[Callable[[], object]] = []
-
-        # A preparation still queued is withdrawn and returns its lane
-        # capacity; a running one finishes on its lane thread. Dropping the
-        # tasks releases their page-locked results, whose device copies the
-        # caching host allocator fences.
-        image_tasks = tuple(self.image_tasks.values())
-        self.image_tasks = {}
-        actions.extend(task.cancel for task in image_tasks)
-
-        if self.latent_imports:
-            assert latent_pool is not None
-            actions.extend(
-                partial(latent_pool.abandon_import, write)
-                for write in self.latent_imports.values()
-                if not write.adopted
-            )
-
-        if self.cache_imports:
-            assert kv_cache is not None
-            actions.extend(
-                partial(kv_cache.imports.abandon, write)
-                for write in self.cache_imports.values()
-                if not write.released
-            )
-
-        # `predicate_values` observes every row it reads, so only an unread
-        # predicate buffer is abandoned here.
-        if self.predicate_buffer is not None and self._predicate_values is None:
-            actions.append(self.predicate_buffer.abandon)
-
-        if self.tensor_reads:
-            actions.append(
-                partial(
-                    tensor_store.complete_reads,
-                    tuple(self.tensor_reads.values()),
-                )
-            )
-
-        actions.extend(
-            ticket.close
-            for write in self.latent_imports.values()
-            for ticket in write.transfers
-        )
-        close_resources(*actions)
 
     def record_outputs(
         self,
@@ -610,7 +409,12 @@ class BatchState:
         noted.
         """
         actions: list[Callable[[], object]] = [
-            partial(self.close_inputs, tensor_store, latent_pool, kv_cache)
+            partial(
+                self.inputs.close,
+                tensor_store,
+                latent_pool,
+                None if kv_cache is None else kv_cache.imports,
+            )
         ]
         actions.extend(
             output.abandon
