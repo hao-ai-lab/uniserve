@@ -91,7 +91,7 @@ impl OutputBuffer {
             .unbind())
     }
 
-    fn seal(slf: &Bound<'_, Self>) -> PyResult<()> {
+    pub(super) fn seal(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let this = slf.get();
         let streams: Vec<_> = this

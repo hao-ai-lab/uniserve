@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import time
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
-from uniserve_worker.errors import WorkerError
 from uniserve_worker.execution.batch import BatchState
+from uniserve_worker.execution.commit import (
+    apply_decode_state,
+    publish_predicates,
+    validate_outputs,
+)
 from uniserve_worker.execution.image import reserve_images
 from uniserve_worker.execution.prepare import (
     capture_predicates,
     prepare_batch,
     prepare_inputs,
+    reserve_outputs,
 )
-from uniserve_worker.execution.step import execute_batch
+from uniserve_worker.execution.schedule import dispatch_batch
+from uniserve_worker.profiling import _forward_stats, record_component
+from uniserve_worker.protocol.output import ForwardStats
 
 if TYPE_CHECKING:
     from uniserve_worker.worker import Worker
@@ -70,46 +78,72 @@ class BatchRunner:
     def capture_predicates(self, state: BatchState) -> None:
         capture_predicates(state, self.worker.tensor_store)
 
-    def execute(self, state: BatchState) -> WorkerError | None:
-        """Launch numerical work with the prepared inputs and profiler scope.
-
-        Recoverable failures return their WorkerError for native result
-        assembly; fatal or explicitly propagated errors raise. The executor
-        releases input leases after this call, including on failure.
-        """
-        batch = state.batch
-        # Lifecycle-only batches issue no model step and do not advance the
-        # profiler's capture window.
-        step: AbstractContextManager[None]
-        if self.worker.profiler is not None and batch.calls:
-            first = batch.calls[0]
-            step = self.worker.profiler.step(
+    def profile_step(self, state: BatchState) -> AbstractContextManager[None]:
+        """Scope one numerical step without advancing on lifecycle batches."""
+        if self.worker.profiler is not None and state.batch.calls:
+            first = state.batch.calls[0]
+            return self.worker.profiler.step(
                 f"batch:{first.kind}:{first.component}"
             )
-        else:
-            step = nullcontext()
+        return nullcontext()
 
-        with step:
-            return execute_batch(
-                state,
-                propagate_errors=state.propagate_errors,
-                kv_cache=self.worker.kv_cache,
-                host_tasks=self.worker.host_tasks,
-                tensor_store=self.worker.tensor_store,
-                worker_info=self.worker.info,
-                latent_pool=self.worker.latent_pool,
-                media_mux=self.worker.media_mux,
-                output_pool=self.worker.output_pool,
-                publication_transports=self.worker.publication_transports,
-                request_tables=self.worker.block_tables,
-                request_pool=self.worker.requests,
-                model_runner=self.worker.runner,
-                decode_state=self.worker.decode_state,
-                sampling_group=self.worker.sampling_group,
-                tokenizer=self.worker.tokenizer,
-                transfer_backends=self.worker.transports,
-                config=self.worker.worker_config,
-            )
+    def reserve(self, state: BatchState) -> None:
+        reserve_outputs(
+            state.batch,
+            state.predicate_values(),
+            kv_cache=self.worker.kv_cache,
+            host_tasks=self.worker.host_tasks,
+            tensor_store=self.worker.tensor_store,
+            worker_info=self.worker.info,
+            latent_pool=self.worker.latent_pool,
+            output_pool=self.worker.output_pool,
+            request_tables=self.worker.block_tables,
+            request_pool=self.worker.requests,
+            model_runner=self.worker.runner,
+            config=self.worker.worker_config,
+            state=state,
+        )
+
+    def execute(self, state: BatchState) -> None:
+        """Launch homogeneous computation into the reserved output views."""
+        dispatch_batch(
+            kv_cache=self.worker.kv_cache,
+            tensor_store=self.worker.tensor_store,
+            worker_info=self.worker.info,
+            latent_pool=self.worker.latent_pool,
+            media_mux=self.worker.media_mux,
+            publication_transports=self.worker.publication_transports,
+            transports=self.worker.transports,
+            request_tables=self.worker.block_tables,
+            request_pool=self.worker.requests,
+            model_runner=self.worker.runner,
+            decode_state=self.worker.decode_state,
+            sampling_group=self.worker.sampling_group,
+            tokenizer=self.worker.tokenizer,
+            config=self.worker.worker_config,
+            state=state,
+        )
+
+    def prepare_outputs(self, state: BatchState) -> None:
+        """Write completion predicates and check numerical output bounds."""
+        publish_predicates(state=state, tensor_store=self.worker.tensor_store)
+        validate_outputs(state)
+
+    def apply_outputs(self, state: BatchState) -> None:
+        apply_decode_state(state=state, decode_state=self.worker.decode_state)
+
+    def execution_stats(
+        self, state: BatchState, started: int, commit_started: int | None
+    ) -> tuple[int, ForwardStats]:
+        """Snapshot timings before resource commit and device state updates."""
+        if commit_started is not None:
+            record_component(state.component_us, "commit_lane", commit_started)
+        return (
+            (time.perf_counter_ns() - started) // 1000,
+            _forward_stats(state.forward_stats, state.component_us)
+            if state.started_ns
+            else ForwardStats(),
+        )
 
     def close(self, state: BatchState) -> None:
         """Release numerical owners while physical readers keep their leases."""

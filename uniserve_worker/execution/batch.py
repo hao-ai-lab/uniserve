@@ -6,7 +6,7 @@ closes. The execution modules fill it in stage order: `prepare_batch` and
 `prepare_inputs` record storage dependencies, input reservations and
 predicate captures, and `image.reserve_images` the host preparation of
 inline input images; `reserve_outputs` binds one `PendingOutput` per call;
-`commit_batch` records published products and execution measurements.
+The native executor commits resources and records execution measurements.
 The native executor owns admission, launch order, failure, result assembly
 and delivery. Rust resolves outputs and retires batch resources. Native
 `BatchInputs` retains input leases and notifies the executor when their
@@ -56,7 +56,6 @@ class BatchState:
     """
 
     batch: Batch
-    propagate_errors: bool = False
     # Native request ordering exposed to numerical staging as a snapshot;
     # None denotes independent work without a state predecessor.
     predecessors: dict[CallId, CallId | None] = field(default_factory=dict)
@@ -90,21 +89,15 @@ class BatchState:
     # or None to run on the current stream; see `scope`.
     stream: torch.cuda.Stream | None = None
     # ``time.perf_counter_ns`` when `reserve_outputs` began binding outputs;
-    # `commit_batch` and the post-registration failure paths of
-    # `execute_batch` derive ``execution_us`` from it.
+    # Execution measurements include reservation and device launch.
     started_ns: int = 0
-    # Per-execution scratch that `record_execution` clears; `commit_batch`
+    # Per-execution scratch that `record_execution` clears; the runner
     # folds the forward stats and component timings into ``stats``.
     forward_stats: list[ForwardStats] = field(default_factory=list)
     component_us: dict[str, int] = field(default_factory=dict)
     forward_indices: dict[CallIdentity, tuple[int, ...]] = field(
         default_factory=dict
     )
-    # Set once `reserve_outputs` succeeds.
-    registered: bool = False
-    # Set by `commit_batch` once resource commits begin; from then on the
-    # batch cannot be discarded and a failure is fatal.
-    published: bool = False
     # Output index of each request's call. Looking up one request must not
     # scan the other calls of the batch.
     request_indexes: dict[int, int] = field(default_factory=dict)
@@ -126,8 +119,8 @@ class BatchState:
     def scope(self):
         """Return a context that makes the batch stream current.
 
-        `reserve_outputs`, `dispatch_batch`, `commit_batch` and
-        `discard_batch` enter it, so the device work and fences they enqueue
+        Numerical execution and native commit/cleanup enter this scope,
+        so the device work and fences they enqueue
         land on the batch stream; with no batch stream the context changes
         nothing.
         """
@@ -151,31 +144,8 @@ class BatchState:
         buffer: OutputBuffer,
         started_ns: int,
     ) -> None:
-        """Bind reserved outputs to call indexes before preparing resources.
-
-        ``outputs`` is aligned with ``batch.calls``. Indexes bound before a
-        failing one stay bound, and ``buffer`` is retained only on success.
-
-        Raises:
-            RuntimeError: An index already holds an output.
-            WorkerError: ``invalid_descriptor`` when an output's request key
-                and call id differ from its call's.
-            ValueError: ``outputs`` and the calls differ in length.
-        """
-        for index, (call, output) in enumerate(
-            zip(self.batch.calls, outputs, strict=True)
-        ):
-            if self.outputs[index] is not None:
-                raise RuntimeError("call output is already reserved")
-            if (output.request_key, output.call_id) != (
-                call.request_key,
-                call.call_id,
-            ):
-                raise invalid_descriptor(
-                    "reserved output does not match its call"
-                )
-            self.outputs[index] = output
-
+        """Retain the aligned output rows created by numerical reservation."""
+        self.outputs = list(outputs)
         self.buffer = buffer
         self.started_ns = started_ns
 

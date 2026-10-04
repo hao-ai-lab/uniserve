@@ -1,5 +1,6 @@
 //! Python numerical backend for the shared native batch executor.
 
+mod commit;
 mod output;
 mod prepare;
 mod retirement;
@@ -77,6 +78,8 @@ struct BatchState {
     numerical: Py<PyAny>,
     inputs: Py<BatchInputs>,
     imports: bool,
+    committed: bool,
+    propagate_errors: bool,
     output: Option<BatchOutput>,
     retirement: Retirement,
 }
@@ -89,15 +92,15 @@ impl PythonBackend {
         plan: &BatchPlan,
         propagate_errors: bool,
     ) -> PyResult<BatchState> {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("propagate_errors", propagate_errors)?;
-        let numerical = self.batch_type.bind(py).call((batch,), Some(&kwargs))?;
+        let numerical = self.batch_type.bind(py).call1((batch,))?;
         Ok(BatchState {
             plan: plan.clone(),
             predecessors: Vec::new(),
             inputs: numerical.getattr("inputs")?.extract()?,
             numerical: numerical.unbind(),
             imports: false,
+            committed: false,
+            propagate_errors,
             output: None,
             retirement: Retirement::new(plan),
         })

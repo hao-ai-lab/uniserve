@@ -259,7 +259,9 @@ fn transfer_from_py(value: &Bound<'_, PyAny>) -> PyResult<KvTransfer> {
         .ok_or_else(|| invalid(value.py(), "invalid KV transfer"))
 }
 
-fn publications_from_py(values: &Bound<'_, PyAny>) -> PyResult<Vec<(BufferId, KvTransfer)>> {
+pub(super) fn publications_from_py(
+    values: &Bound<'_, PyAny>,
+) -> PyResult<Vec<(BufferId, KvTransfer)>> {
     values
         .try_iter()?
         .map(|value| {
@@ -269,7 +271,7 @@ fn publications_from_py(values: &Bound<'_, PyAny>) -> PyResult<Vec<(BufferId, Kv
         .collect()
 }
 
-fn installations_from_py(
+pub(super) fn installations_from_py(
     values: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<(BufferId, BufferId, KvTransfer)>> {
     values
