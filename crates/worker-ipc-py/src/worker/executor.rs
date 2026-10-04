@@ -19,7 +19,7 @@ use uniserve_worker::{
     Submission as NativeSubmission,
 };
 use uniserve_worker_ipc::{
-    Batch as BatchPlan, BatchOutput, RequestKind, WorkerInfo, WorkerResponseError,
+    Batch as BatchPlan, BatchOutput, ForwardStats, RequestKind, WorkerInfo, WorkerResponseError,
 };
 
 use super::events::EventPool;
@@ -57,7 +57,6 @@ impl Submission {
 struct PythonBackend {
     worker: Py<PyAny>,
     runner: Py<PyAny>,
-    batch_type: Py<PyAny>,
     read_backpressure: Py<PyType>,
     requests: Py<RequestPool>,
     tensors: Py<TensorStore>,
@@ -74,34 +73,47 @@ struct PythonBackend {
 
 /// Numerical views and their native input owner, retained for one batch.
 struct BatchState {
-    plan: BatchPlan,
+    plan: Arc<BatchPlan>,
     predecessors: Vec<Option<CallId>>,
-    numerical: Py<PyAny>,
+    numerical: Py<super::batch::BatchState>,
     inputs: Py<BatchInputs>,
     imports: bool,
     committed: bool,
     propagate_errors: bool,
     output: Option<BatchOutput>,
+    execution_us: Option<u64>,
+    stats: Option<ForwardStats>,
     retirement: Retirement,
 }
 
 impl BatchState {
-    fn pending_outputs<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PendingOutput>>> {
+    fn pending_outputs<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PendingOutput>> {
         self.numerical
-            .bind(py)
-            .getattr("outputs")?
-            .try_iter()?
-            .map(|output| output?.cast_into::<PendingOutput>().map_err(Into::into))
+            .borrow(py)
+            .outputs
+            .iter()
+            .map(|output| output.bind(py).clone())
             .collect()
     }
 
-    fn record_execution(&self, py: Python<'_>, stats: &Bound<'_, PyAny>) -> PyResult<()> {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("execution_us", stats.get_item(0)?)?;
-        kwargs.set_item("stats", stats.get_item(1)?)?;
-        self.numerical
-            .bind(py)
-            .call_method("record_execution", (), Some(&kwargs))?;
+    fn record_execution(&mut self, py: Python<'_>, stats: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.execution_us = Some(stats.get_item(0)?.extract()?);
+        self.stats = Some(depythonize(
+            &stats.get_item(1)?.call_method0("to_mapping")?,
+        )?);
+        let (buffer, indices, forwards, components) = {
+            let mut numerical = self.numerical.borrow_mut(py);
+            (
+                numerical.buffer.take(),
+                numerical.forward_indices.clone_ref(py),
+                numerical.forward_stats.clone_ref(py),
+                numerical.component_us.clone_ref(py),
+            )
+        };
+        drop(buffer);
+        indices.bind(py).clear();
+        forwards.bind(py).call_method0("clear")?;
+        components.bind(py).clear();
         Ok(())
     }
 }
@@ -114,27 +126,25 @@ impl PythonBackend {
         plan: &BatchPlan,
         propagate_errors: bool,
     ) -> PyResult<BatchState> {
-        let numerical = self.batch_type.bind(py).call1((batch,))?;
+        let plan = Arc::new(plan.clone());
+        let numerical = Py::new(
+            py,
+            super::batch::BatchState::new(py, batch.clone().unbind(), Arc::clone(&plan))?,
+        )?;
+        let inputs = numerical.borrow(py).inputs.clone_ref(py);
+        let retirement = Retirement::new(&plan);
         Ok(BatchState {
-            plan: plan.clone(),
+            plan,
             predecessors: Vec::new(),
-            inputs: numerical.getattr("inputs")?.extract()?,
-            numerical: numerical.unbind(),
+            inputs,
+            numerical,
             imports: false,
             committed: false,
             propagate_errors,
             output: None,
-            retirement: Retirement::new(plan),
-        })
-    }
-
-    fn call(&self, method: &str, batch: &BatchState) -> Result<Py<PyAny>, Py<PyBaseException>> {
-        Python::attach(|py| {
-            self.runner
-                .bind(py)
-                .call_method1(method, (&batch.numerical,))
-                .map(Bound::unbind)
-                .map_err(|error| error.into_value(py))
+            execution_us: None,
+            stats: None,
+            retirement,
         })
     }
 
@@ -222,7 +232,7 @@ impl Backend for PythonBackend {
             let classify = || -> PyResult<_> {
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("context", context)?;
-                kwargs.set_item("route", batch.numerical.bind(py).getattr("route")?)?;
+                kwargs.set_item("route", batch.numerical.borrow(py).route())?;
                 py.import("uniserve_worker.errors")?
                     .getattr("classify")?
                     .call((error,), Some(&kwargs))?
@@ -346,14 +356,10 @@ impl Backend for PythonBackend {
         let deferred = Python::attach(|py| {
             if batch.output.is_none() {
                 let cancel = || -> PyResult<()> {
-                    for output in batch.numerical.bind(py).getattr("outputs")?.try_iter()? {
-                        let output = output?;
-                        if !output.is_none() {
-                            output
-                                .cast::<PendingOutput>()?
-                                .borrow()
-                                .cancel(py, &mut self.requests.borrow_mut(py))?;
-                        }
+                    for output in batch.pending_outputs(py) {
+                        output
+                            .borrow()
+                            .cancel(py, &mut self.requests.borrow_mut(py))?;
                     }
                     Ok(())
                 };
@@ -364,7 +370,15 @@ impl Backend for PythonBackend {
                 .close(py, self, &batch.numerical)
                 .map_err(|error| error.into_value(py))
         });
-        let closed = self.call("close", batch).map(drop);
+        let closed = Python::attach(|py| {
+            super::batch::BatchState::close(
+                batch.numerical.bind(py),
+                self.tensors.get(),
+                self.latents.as_ref().map(|pool| pool.bind(py)),
+                self.cache_imports.as_ref().map(|imports| imports.bind(py)),
+            )
+            .map_err(|error| error.into_value(py))
+        });
         match (deferred, closed) {
             (Err(mut error), Err(cleanup)) => {
                 self.note_cleanup(&mut error, cleanup);
@@ -491,10 +505,6 @@ impl Executor {
             .extract::<usize>()?
             > 1;
         let collective = runner.getattr("collective")?.extract()?;
-        let batch_type = py
-            .import("uniserve_worker.execution.batch")?
-            .getattr("BatchState")?
-            .unbind();
         let cache = worker.getattr("kv_cache")?;
         let (cache_manager, cache_imports) = if cache.is_none() {
             (None, None)
@@ -526,7 +536,6 @@ impl Executor {
         let backend = PythonBackend {
             worker: worker.clone().unbind(),
             runner: runner.unbind(),
-            batch_type,
             read_backpressure: py
                 .import("uniserve_worker.transport.pool")?
                 .getattr("ReadBackpressureError")?
@@ -654,7 +663,6 @@ impl Executor {
         if let Some(executor) = &self.executor {
             visit.call(&executor.backend().worker)?;
             visit.call(&executor.backend().runner)?;
-            visit.call(&executor.backend().batch_type)?;
             visit.call(&executor.backend().read_backpressure)?;
             visit.call(&executor.backend().requests)?;
             visit.call(&executor.backend().tensors)?;

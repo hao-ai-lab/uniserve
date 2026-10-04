@@ -210,12 +210,12 @@ impl Retirement {
         &mut self,
         py: Python<'_>,
         backend: &PythonBackend,
-        numerical: &Py<PyAny>,
+        numerical: &Py<super::super::batch::BatchState>,
     ) -> PyResult<()> {
         if !self.events.is_empty() {
             backend.events.borrow(py).defer_events(
                 self.events.clone(),
-                numerical.clone_ref(py),
+                numerical.clone_ref(py).into_any(),
                 None,
             )?;
             self.events.clear();

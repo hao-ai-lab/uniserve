@@ -28,9 +28,9 @@ import torch
 from uniserve.nn.rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import adjacent_view
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls, image
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.output import PendingOutput, capture_logprobs
 from uniserve_worker.model_executor.input_batch import InputRow, TokenRow
 from uniserve_worker.protocol.call import (

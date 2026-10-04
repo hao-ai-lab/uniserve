@@ -29,9 +29,9 @@ from uniserve.processing import (
     PatchTransform,
     PositionLayout,
 )
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls, transfer
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.codec import (

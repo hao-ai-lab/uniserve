@@ -44,7 +44,7 @@ from uniserve_worker.protocol.video import VideoAdmission
 from uniserve_worker.storage.tensor_store import device_product_storage
 
 if TYPE_CHECKING:
-    from uniserve_worker.execution.batch import BatchState
+    from uniserve_worker._uniserve_ipc import BatchState
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.output import PendingOutput
     from uniserve_worker.model_executor.component_binding import (

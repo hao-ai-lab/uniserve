@@ -4,7 +4,6 @@ use std::collections::{BTreeSet, HashSet};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use uniserve_core::CallId;
 use uniserve_worker_ipc::{BatchCommand, CallKind, MediaCall};
 
@@ -33,11 +32,8 @@ impl PythonBackend {
 
         // Install Starts before resolving predecessors. Even if a later Start
         // or its numerical noise preparation fails, reset all admitted slots.
-        let commands = batch
-            .numerical
-            .bind(py)
-            .getattr("batch")?
-            .getattr("commands")?;
+        let numerical_batch = batch.numerical.borrow(py).batch.clone_ref(py);
+        let commands = numerical_batch.bind(py).getattr("commands")?;
         let mut admitted = Vec::new();
         let started = (|| -> PyResult<()> {
             for (index, command) in batch.plan.commands.iter().enumerate() {
@@ -81,24 +77,6 @@ impl PythonBackend {
             .collect::<PyResult<_>>()?;
         drop(requests);
 
-        // Numerical staging consumes a snapshot; request ordering remains
-        // native and also determines input release and failed-call progress.
-        let call_type = py
-            .import("uniserve_worker.protocol.identity")?
-            .getattr("CallId")?;
-        let predecessors = PyDict::new(py);
-        for (call, previous) in batch.plan.calls.iter().zip(&batch.predecessors) {
-            let key = call_type.call1((call.call_id.batch_id, call.call_id.request_index))?;
-            let value = match previous {
-                Some(previous) => call_type.call1((previous.batch_id, previous.request_index))?,
-                None => py.None().into_bound(py),
-            };
-            predecessors.set_item(key, value)?;
-        }
-        batch
-            .numerical
-            .bind(py)
-            .setattr("predecessors", predecessors)?;
         self.validate_batch(py, batch)?;
 
         for command in &batch.plan.commands {

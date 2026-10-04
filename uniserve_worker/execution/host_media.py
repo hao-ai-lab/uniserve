@@ -23,9 +23,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.mux import (

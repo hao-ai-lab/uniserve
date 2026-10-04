@@ -28,9 +28,9 @@ import torch
 from uniserve.diffusion import Branch, Renorm
 from uniserve.media import image as media_image
 from uniserve.nn.rng import flow_noise_seed
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.diffusion_state import (
     DiffusionState,
     KVConditioning,

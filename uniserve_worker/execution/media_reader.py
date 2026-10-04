@@ -50,7 +50,7 @@ from uniserve_worker.protocol.call import CallStatus
 from uniserve_worker.protocol.output import FinishFlags
 
 if TYPE_CHECKING:
-    from uniserve_worker.execution.batch import BatchState
+    from uniserve_worker._uniserve_ipc import BatchState
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.output import PendingOutput
     from uniserve_worker.protocol.call import Call

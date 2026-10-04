@@ -18,13 +18,13 @@ use crate::worker::storage::{Buffer, TensorRead};
 impl PythonBackend {
     pub(super) fn commit_batch(&self, py: Python<'_>, batch: &mut BatchState) -> PyResult<()> {
         let numerical = batch.numerical.clone_ref(py);
-        let scope = numerical.bind(py).call_method0("scope")?;
-        with_context(&scope, || {
+        let scope = super::super::batch::BatchState::scope(numerical.bind(py))?;
+        with_context(scope.bind(py), || {
             let started: u64 = py
                 .import("time")?
                 .call_method0("perf_counter_ns")?
                 .extract()?;
-            let outputs = batch.pending_outputs(py)?;
+            let outputs = batch.pending_outputs(py);
             self.finish_reads(py, &outputs)?;
             self.runner
                 .bind(py)
@@ -51,8 +51,8 @@ impl PythonBackend {
                     "latent publication has no physical pool",
                 ));
             }
-            let buffer = numerical.bind(py).getattr("output_buffer")?;
-            OutputBuffer::seal(buffer.cast()?)?;
+            let buffer = numerical.borrow(py).output_buffer(py)?;
+            OutputBuffer::seal(buffer.bind(py))?;
 
             let products = PyList::empty(py);
             let publications = PyList::empty(py);
@@ -110,14 +110,11 @@ impl PythonBackend {
 
             // Keep execution/commit timings at their established sampling
             // point, before cross-resource preflight and device-state updates.
-            let stats = self.runner.bind(py).call_method1(
-                "execution_stats",
-                (
-                    &numerical,
-                    numerical.bind(py).getattr("started_ns")?,
-                    started,
-                ),
-            )?;
+            let started_ns = numerical.borrow(py).started_ns;
+            let stats = self
+                .runner
+                .bind(py)
+                .call_method1("execution_stats", (&numerical, started_ns, started))?;
             let publications = publications_from_py(publications.as_any())?;
             let installations = installations_from_py(installations.as_any())?;
             if let Some(cache) = &self.cache {
@@ -190,26 +187,28 @@ impl PythonBackend {
                 .pool
                 .add_pending(&calls)
                 .map_err(|error| native_error(py, error))?;
-            numerical
-                .bind(py)
-                .setattr("products", PyTuple::new(py, products.iter())?)?;
+            numerical.borrow_mut(py).products = PyTuple::new(py, products.iter())?.unbind();
             batch.record_execution(py, &stats)
         })
     }
 
     pub(super) fn discard_batch(&self, py: Python<'_>, batch: &BatchState) -> PyResult<()> {
         let numerical = batch.numerical.bind(py);
-        let buffer = numerical.getattr("buffer")?;
-        if buffer.is_none() {
+        let buffer = numerical
+            .borrow()
+            .buffer
+            .as_ref()
+            .map(|buffer| buffer.clone_ref(py));
+        let Some(buffer) = buffer else {
             // The numerical reservation owns allocation failures before it
             // binds outputs. There are no batch resources to retire yet.
             return Ok(());
-        }
-        let scope = numerical.call_method0("scope")?;
-        with_context(&scope, || {
-            let outputs = batch.pending_outputs(py)?;
+        };
+        let scope = super::super::batch::BatchState::scope(numerical)?;
+        with_context(scope.bind(py), || {
+            let outputs = batch.pending_outputs(py);
             self.finish_reads(py, &outputs)?;
-            let buffer = buffer.cast::<OutputBuffer>()?;
+            let buffer = buffer.bind(py);
             OutputBuffer::seal(buffer)?;
             for output in &outputs {
                 PendingOutput::abandon(output)?;

@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from uniserve.runtime import EventPoolError
 
 if TYPE_CHECKING:
-    from uniserve_worker.execution.batch import BatchState
+    from uniserve_worker._uniserve_ipc import BatchState
     from uniserve_worker.protocol.identity import CallId
 
 __all__ = [

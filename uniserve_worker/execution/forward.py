@@ -22,9 +22,9 @@ import torch
 
 from uniserve.diffusion import Branch
 from uniserve.tensors import OutputLayout
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import canvas
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.output import PendingOutput, capture_samples
 from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow

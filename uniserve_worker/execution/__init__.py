@@ -1,10 +1,8 @@
 """Batch execution on one worker rank.
 
-`Executor` (in `executor`) accepts each submitted `Batch`, tracks it as a
-`BatchState` (in `batch`), and drives it through validation and resource
-reservation (`prepare`), execution (`step`, `schedule` and the per-domain
-call modules), publication (`commit`), and output materialization
-(`output`) until `Executor.poll` delivers its result. `ModelExecutor` (in
-`model_executor`) owns the bound numerical capabilities, `RequestPool` (in
-`request`) the per-request state, and `host` the rank's host-task lane.
+The native `Executor` owns submission, request progression, resource commit
+and result delivery. Its `BatchState` retains inputs and output rows while
+`BatchRunner` prepares tensor views and dispatches homogeneous numerical
+calls. `ModelExecutor` binds computational capabilities to their resources;
+the native request pool, storage pools and host lane retain physical owners.
 """

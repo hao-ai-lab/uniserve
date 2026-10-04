@@ -2,6 +2,7 @@
 
 use pyo3::prelude::*;
 
+mod batch;
 mod block_tables;
 mod buffer;
 mod completion;
@@ -25,6 +26,7 @@ mod transfer;
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(exports::release_exports, module)?)?;
+    module.add_class::<batch::BatchState>()?;
     module.add_class::<block_tables::BlockTables>()?;
     module.add_class::<block_tables::GroupShape>()?;
     module.add_class::<block_tables::GroupTable>()?;
