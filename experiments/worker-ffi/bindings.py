@@ -21,6 +21,14 @@ class RequestPool(tvm_ffi.Object):
     """The production request lifecycle, shared with the numerical worker."""
 
 
+class HostLane(tvm_ffi.Object):
+    """The production native host executor, called through TVM-FFI."""
+
+
+class HostTask(tvm_ffi.Object):
+    """A native host result; numerical tensors remain inside the callback."""
+
+
 def load_library(filename: str) -> None:
     """Load the explicitly selected library and bind its reflected methods."""
     global _module
@@ -30,3 +38,5 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.Batch")(Batch)
     tvm_ffi.register_object("uniserve.ffi.WorkerRequest")(WorkerRequest)
     tvm_ffi.register_object("uniserve.ffi.RequestPool")(RequestPool)
+    tvm_ffi.register_object("uniserve.ffi.HostLane")(HostLane)
+    tvm_ffi.register_object("uniserve.ffi.HostTask")(HostTask)
