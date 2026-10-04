@@ -33,4 +33,4 @@ where = ["src"]
 include = ["uniserve_kernels*"]
 
 [tool.setuptools.package-data]
-uniserve_kernels = ["py.typed", "attention/vsa_native/csrc/*.cu", "attention/vsa_native/csrc/*.cuh", "attention/vsa_native/LICENSE", "peer_storage/csrc/*.cpp"]
+uniserve_kernels = ["py.typed", "csrc/*.cu", "attention/vsa_native/csrc/*.cu", "attention/vsa_native/csrc/*.cuh", "attention/vsa_native/LICENSE", "peer_storage/csrc/*.cpp"]
