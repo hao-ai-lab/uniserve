@@ -1,4 +1,4 @@
-"""Type stub for the native worker IPC extension built from worker-ipc-py.
+"""Type stub for the common native worker and IPC extension.
 
 ``Server`` is the rank's end of its channel to the engine: it receives the
 engine's requests and publishes the worker's responses over iceoryx2 shared
@@ -6,18 +6,105 @@ storage or a TCP socket. ``StreamSignal`` turns CUDA stream completion into a
 readable descriptor for selector loops. ``atomic_store_u32`` and
 ``atomic_load_u32`` order the header words of shared-storage segments, which
 ``uniserve_worker.transport.segment`` reads and writes across processes.
+``Request`` and ``RequestPool`` own the lifecycle shared by serving and direct
+numerical execution.
 """
 
+from collections.abc import Mapping, Sequence
 from types import TracebackType
 from typing import Any, Self, final
 
+import torch
+
+from uniserve.sampling import SamplingParams
+from uniserve.tensors import BufferConfig
+from uniserve_worker.execution.diffusion_state import DiffusionState
+from uniserve_worker.execution.request import RequestProgress, RequestResult
+from uniserve_worker.protocol.batch import BatchCommand, NewRequest
+from uniserve_worker.protocol.call import Call, ImageParams
+from uniserve_worker.protocol.identity import CallId, RequestKey
+from uniserve_worker.storage.request_slots import RequestSlots
+
 __all__ = [
+    "Request",
+    "RequestPool",
     "Server",
     "StreamSignal",
     "atomic_load_u32",
     "atomic_store_u32",
     "service_name",
 ]
+
+@final
+class Request:
+    """An admitted epoch whose lifecycle is mutated only by its request pool."""
+
+    @property
+    def request_id(self) -> int: ...
+    @property
+    def request_key(self) -> RequestKey: ...
+    @property
+    def request_pool_idx(self) -> int: ...
+    @property
+    def admission(self) -> NewRequest: ...
+    @property
+    def sampling(self) -> SamplingParams | None: ...
+    @property
+    def image(self) -> ImageParams | None: ...
+    @property
+    def negative_token_ids(self) -> tuple[int, ...]: ...
+    @property
+    def finish_token_ids(self) -> tuple[int, ...]: ...
+    @property
+    def accepted_progress(self) -> RequestProgress: ...
+    @property
+    def prompt_logits_ready(self) -> bool: ...
+    @property
+    def rng_counter(self) -> int: ...
+    @property
+    def closed(self) -> bool: ...
+    @property
+    def retired(self) -> bool: ...
+    diffusion: DiffusionState | None
+
+@final
+class RequestPool:
+    """Bind scheduler slots, order request calls, and retire drained state."""
+
+    def __new__(
+        cls,
+        max_request_pool_size: int,
+        *,
+        state_buffers: Mapping[str, BufferConfig] | None = None,
+        device: torch.device | str = "cpu",
+    ) -> Self: ...
+    @property
+    def max_request_pool_size(self) -> int: ...
+    @property
+    def storage(self) -> RequestSlots: ...
+    def close(self) -> None: ...
+    def get(self, request_id: int) -> Request: ...
+    def peek(self, request_id: int) -> Request | None: ...
+    def request_ids(self) -> tuple[int, ...]: ...
+    def has_open_requests(self) -> bool: ...
+    def bind_calls(
+        self, calls: Sequence[Call], request_pool_indices: Sequence[int]
+    ) -> tuple[Request, ...]: ...
+    def validate_pending(self, calls: Sequence[Call]) -> None: ...
+    def add_pending(self, calls: Sequence[Call]) -> None: ...
+    def predecessors(
+        self, calls: Sequence[Call]
+    ) -> dict[CallId, CallId | None]: ...
+    def apply_result(self, result: RequestResult) -> None: ...
+    def cancel_calls(self, calls: Sequence[Call]) -> None: ...
+    def start(self, admission: NewRequest) -> int | None: ...
+    def finish(self, request_key: RequestKey) -> None: ...
+    def apply_commands(
+        self, commands: Sequence[BatchCommand]
+    ) -> tuple[int, ...]: ...
+    def retirement_ready(self, request_key: RequestKey) -> bool: ...
+    def drop(self, request_id: int) -> None: ...
+    def retire(self, request_id: int) -> None: ...
 
 @final
 class Server:

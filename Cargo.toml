@@ -4,6 +4,7 @@ members = [
     "crates/foundation/*",
     "crates/worker-ipc",
     "crates/worker-ipc-py",
+    "crates/worker",
     "crates/engine",
     "crates/server",
     "crates/bin/uniserve",
@@ -23,6 +24,7 @@ uniserve-core = { path = "crates/foundation/core" }
 uniserve-observability = { path = "crates/foundation/observability" }
 uniserve-observability-derive = { path = "crates/foundation/observability-derive" }
 uniserve-worker-ipc = { path = "crates/worker-ipc" }
+uniserve-worker = { path = "crates/worker" }
 uniserve-engine = { path = "crates/engine" }
 uniserve-server = { path = "crates/server" }
 

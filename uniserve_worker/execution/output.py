@@ -29,10 +29,10 @@ import torch
 from uniserve.runtime.resources import close_resources
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.request import (
+    Request,
     RequestPool,
     RequestProgress,
     RequestResult,
-    RequestState,
 )
 from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.batch import LatentParams, TensorPublication
@@ -341,7 +341,7 @@ class PendingOutput:
     def __init__(
         self,
         call: Call,
-        request: RequestState,
+        request: Request,
         buffer: OutputBuffer,
         row: int,
     ) -> None:

@@ -62,7 +62,7 @@ if TYPE_CHECKING:
 
     from uniserve.runtime.tensor_buffers import TensorBuffers
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.execution.request import RequestPool, RequestState
+    from uniserve_worker.execution.request import Request, RequestPool
     from uniserve_worker.model_executor.output import ExecutionOutput
     from uniserve_worker.storage.tensor_store import TensorStore
     from uniserve_worker.transport.interface import Transport
@@ -750,7 +750,7 @@ def open_state(runner: ModelExecutor, size) -> DiffusionState:
     )
 
 
-def video_state(runner: ModelExecutor, request: RequestState) -> DiffusionState:
+def video_state(runner: ModelExecutor, request: Request) -> DiffusionState:
     """Return the admitted video request's state, creating it on first use."""
     size = video_shape(runner, request.admission)
     trajectory = request.diffusion
@@ -769,7 +769,7 @@ def video_state(runner: ModelExecutor, request: RequestState) -> DiffusionState:
 
 
 def begin_noise(
-    runner: ModelExecutor, request: RequestState, request_pool: RequestPool
+    runner: ModelExecutor, request: Request, request_pool: RequestPool
 ) -> None:
     """Stage an admitted video request's host inputs off the service thread.
 
