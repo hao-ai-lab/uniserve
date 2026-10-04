@@ -116,41 +116,42 @@ impl HostTask {
 
 #[repr(C)]
 #[derive(Object)]
-#[type_key = "uniserve.ffi.Batch"]
-pub struct BatchObj {
+#[type_key = "uniserve.ffi.Submission"]
+pub struct SubmissionObj {
     object: Object,
-    execution: Arc<Mutex<execution::Execution>>,
+    submission: Arc<uniserve_worker::Submission>,
+    batch: Arc<Mutex<execution::Batch>>,
 }
 
 #[derive(Clone, ObjectRef)]
-pub struct Batch {
-    data: ObjectArc<BatchObj>,
+pub struct Submission {
+    data: ObjectArc<SubmissionObj>,
 }
 
-impl Batch {
-    fn new(execution: Arc<Mutex<execution::Execution>>) -> Self {
+impl Submission {
+    fn new(
+        submission: Arc<uniserve_worker::Submission>,
+        batch: Arc<Mutex<execution::Batch>>,
+    ) -> Self {
         Self {
-            data: ObjectArc::new(BatchObj {
+            data: ObjectArc::new(SubmissionObj {
                 object: Object::new(),
-                execution,
+                submission,
+                batch,
             }),
         }
     }
 
-    fn result(&self) -> Result<Tensor> {
-        lock(&self.data.execution)?.result()
-    }
-
     fn retired(&self) -> Result<bool> {
-        lock(&self.data.execution)?.retired()
+        lock(&self.data.batch)?.retired()
     }
 
     fn wait(&self) -> Result<()> {
-        lock(&self.data.execution)?.wait()
+        lock(&self.data.batch)?.wait()
     }
 
     fn cancel(&self) -> Result<()> {
-        lock(&self.data.execution)?.cancel();
+        lock(&self.data.batch)?.cancel();
         Ok(())
     }
 }
@@ -178,8 +179,15 @@ impl Executor {
         })
     }
 
-    fn submit(&self, input: Tensor) -> Result<Batch> {
-        self.data.executor.submit(input).map(Batch::new)
+    fn submit(&self, batch_id: i64, input: Tensor) -> Result<Submission> {
+        self.data
+            .executor
+            .submit(batch_id, input)
+            .map(|(submission, batch)| Submission::new(submission, batch))
+    }
+
+    fn poll(&self, submission: &Submission) -> Result<Option<Tensor>> {
+        self.data.executor.poll(&submission.data.submission)
     }
 
     fn close(&self) -> Result<()> {
@@ -353,7 +361,7 @@ fn method<T: ObjectCore>(name: &str, function: Function, doc: &str) -> Result<()
 
 fn register() -> Result<()> {
     object::<ExecutorObj>();
-    object::<BatchObj>();
+    object::<SubmissionObj>();
     object::<WorkerRequestObj>();
     object::<RequestPoolObj>();
     object::<HostLaneObj>();
@@ -407,8 +415,15 @@ fn register() -> Result<()> {
     )?;
     method::<ExecutorObj>(
         "submit",
-        Function::from_typed(|owner: Executor, input: Tensor| owner.submit(input)),
+        Function::from_typed(|owner: Executor, batch_id: i64, input: Tensor| {
+            owner.submit(batch_id, input)
+        }),
         "Run a numerical callback and retain its asynchronous accesses.",
+    )?;
+    method::<ExecutorObj>(
+        "poll",
+        Function::from_typed(|owner: Executor, submission: Submission| owner.poll(&submission)),
+        "Deliver one completed result, or None while its GPU work is pending.",
     )?;
     method::<ExecutorObj>(
         "close",
@@ -416,24 +431,19 @@ fn register() -> Result<()> {
         "Drain retained work and release the callback.",
     )?;
 
-    method::<BatchObj>(
-        "result",
-        Function::from_typed(|batch: Batch| batch.result()),
-        "Return the tensor with its producer fence on the current FFI stream.",
-    )?;
-    method::<BatchObj>(
+    method::<SubmissionObj>(
         "retired",
-        Function::from_typed(|batch: Batch| batch.retired()),
+        Function::from_typed(|submission: Submission| submission.retired()),
         "Query physical completion without a host synchronization.",
     )?;
-    method::<BatchObj>(
+    method::<SubmissionObj>(
         "wait",
-        Function::from_typed(|batch: Batch| batch.wait()),
+        Function::from_typed(|submission: Submission| submission.wait()),
         "Wait for physical completion without calling Python.",
     )?;
-    method::<BatchObj>(
+    method::<SubmissionObj>(
         "cancel",
-        Function::from_typed(|batch: Batch| batch.cancel()),
+        Function::from_typed(|submission: Submission| submission.cancel()),
         "Revoke the result while retaining in-flight storage.",
     )?;
 
