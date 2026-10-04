@@ -246,12 +246,6 @@ impl RequestPool {
         PyTuple::new(py, views)
     }
 
-    fn validate_pending(&self, py: Python<'_>, calls: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
-        self.pool
-            .validate_pending(&pending_calls(calls)?)
-            .map_err(|error| native_error(py, error))
-    }
-
     fn add_pending(&mut self, py: Python<'_>, calls: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
         self.pool
             .add_pending(&pending_calls(calls)?)

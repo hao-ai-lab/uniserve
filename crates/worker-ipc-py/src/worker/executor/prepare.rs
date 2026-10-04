@@ -240,7 +240,7 @@ impl PythonBackend {
     pub(super) fn execute_batch<'py>(
         &self,
         py: Python<'py>,
-        batch: &BatchState,
+        batch: &mut BatchState,
     ) -> PyResult<Bound<'py, PyAny>> {
         if batch.inputs.borrow(py).closed() {
             return Err(PyRuntimeError::new_err(
@@ -255,10 +255,7 @@ impl PythonBackend {
 
         let executed = (|| {
             batch.inputs.borrow(py).require_storage(py)?;
-            let failure = self
-                .runner
-                .bind(py)
-                .call_method1("execute", (&batch.numerical,))?;
+            let failure = self.run_batch(py, batch)?;
             self.release_predecessors(py, batch, true)?;
 
             // Predicates outside the request's predecessor are consumed by

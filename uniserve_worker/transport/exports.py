@@ -3,9 +3,6 @@
 from uniserve_worker._uniserve_ipc import (
     release_exports as release_exports,
 )
-from uniserve_worker._uniserve_ipc import (
-    validate_exports as validate_exports,
-)
 from uniserve_worker.protocol.transfer import Locator
 from uniserve_worker.transport.interface import Transport
 

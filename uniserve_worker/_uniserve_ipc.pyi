@@ -103,17 +103,12 @@ __all__ = [
     "atomic_load_u32",
     "atomic_store_u32",
     "service_name",
-    "validate_exports",
     "release_exports",
 ]
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")
 
-def validate_exports(
-    resident: dict[BufferId, ExportLocations],
-    candidates: dict[BufferId, ExportLocations],
-) -> None: ...
 def release_exports(
     exports: dict[BufferId, ExportLocations], buffers: Iterable[BufferId]
 ) -> None: ...
@@ -190,7 +185,6 @@ class PendingOutput:
     producer_write: Buffer | None
     kv_output: KvTransfer | None
     products: tuple[TensorPublication, ...]
-    _reports_output: bool
 
     @property
     def request_key(self) -> RequestKey: ...
@@ -205,8 +199,6 @@ class PendingOutput:
     def ready(self) -> bool: ...
     def materialize(self) -> RequestOutput:
         """Resolve completed work once; retain accepted progress on failure."""
-    def release_execution_references(self) -> None:
-        """Drop borrowed views after their owning stores commit or discard."""
     def abandon(self) -> None:
         """Discard delivery while in-flight readers keep their storage."""
 
@@ -1259,7 +1251,6 @@ class RequestPool:
     def bind_calls(
         self, calls: Sequence[Call], request_pool_indices: Sequence[int]
     ) -> tuple[Request, ...]: ...
-    def validate_pending(self, calls: Sequence[Call]) -> None: ...
     def add_pending(self, calls: Sequence[Call]) -> None: ...
     def apply_result(self, result: RequestResult) -> None: ...
     def cancel_calls(self, calls: Sequence[Call]) -> None: ...

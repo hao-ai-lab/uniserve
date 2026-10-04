@@ -5,7 +5,7 @@ Every worker failure is represented as a `WorkerError` carrying a stable
 worker process is unsafe for further work and must be torn down). Worker code
 raises one directly through the constructors here, and `classify` maps any
 other exception onto the taxonomy where failures are caught (in `Service`,
-`Executor`, `ModelExecutor`, and `uniserve_worker.execution.step`).
+`Executor` and `ModelExecutor`).
 
 ``WorkerError.to_mapping`` produces the ``WorkerResponseError`` fields that
 the native service sends to the engine. Those fields are scalars, short
@@ -16,6 +16,8 @@ stack trace.
 
 from __future__ import annotations
 
+import logging
+import traceback
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -23,6 +25,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from uniserve.runtime import EventPoolError
 
 if TYPE_CHECKING:
+    from uniserve_worker.execution.batch import BatchState
     from uniserve_worker.protocol.identity import CallId
 
 __all__ = [
@@ -105,7 +108,7 @@ def should_capture_trace(code: WorkerErrorCode) -> bool:
     """Return whether an error of this class warrants a stack trace.
 
     `uniserve_worker.profiling.record_failure` and the batch failure log in
-    `uniserve_worker.execution.step` consult this to choose between logging
+    `classify_batch_failure` consult this to choose between logging
     with a traceback and a warning without one.
     """
     return _POLICY.get(code, _DEFAULT_POLICY).capture_trace
@@ -401,3 +404,89 @@ def classify(
     if code is WorkerErrorCode.RESOURCE_ERROR:
         return ResourceError(msg, **kw)
     return _make(code, msg, **kw)
+
+
+def classify_batch_failure(
+    error: BaseException,
+    *,
+    phase: str,
+    state: BatchState,
+    committed: bool,
+) -> WorkerError:
+    """Classify and log a batch failure using the executor's commit state.
+
+    A failure after resources become visible is fatal; earlier errors follow
+    the ordinary worker error policy.
+
+    An error built from any other exception carries the coordinates of every
+    call of the batch, plus request and call identity when the batch holds
+    exactly one call. Its route is the batch's call kind (`BatchState.route`).
+    ``classify`` returns an existing ``WorkerError`` itself and fills only
+    its None-valued fields, so a route the raiser set (a model forward's
+    mode), ``calls`` and ``fatal`` stay as raised.
+    """
+    scheduled = tuple(
+        (
+            int(call.request_key.engine_id),
+            int(call.request_key.request_id),
+            int(call.request_key.request_epoch),
+            call.call_id,
+        )
+        for call in state.batch.calls
+    )
+    if committed:
+        classified = WorkerError(
+            code=WorkerErrorCode.INVARIANT_VIOLATION,
+            message=f"batch publication failed after visibility began: {error}",
+            fatal=True,
+            phase="batch publication",
+            route=state.route,
+            calls=scheduled,
+        )
+    else:
+        sole = state.batch.calls[0] if len(state.batch.calls) == 1 else None
+        classified = classify(
+            error,
+            context=phase,
+            phase=phase,
+            calls=scheduled,
+            req_id=None if sole is None else int(sole.request_key.request_id),
+            call_id=None if sole is None else sole.call_id,
+            call_kind=None if sole is None else sole.kind.value,
+            route=state.route,
+        )
+    _log_failure(classified, cause=error)
+    return classified
+
+
+def _log_failure(
+    error: WorkerError,
+    *,
+    cause: BaseException | None = None,
+) -> None:
+    """Log a batch failure and clear the frames of its exception chain.
+
+    Error classes for which ``should_capture_trace`` holds log at error level
+    with the cause's traceback; the others log a warning without it.
+    """
+    capture_trace = should_capture_trace(error.code)
+    logger = logging.getLogger(__name__)
+    log = logger.error if capture_trace else logger.warning
+    log(
+        "batch failed: %s [code=%s route=%s calls=%s]",
+        error.message,
+        error.code,
+        error.route,
+        error.calls,
+        exc_info=(type(cause), cause, cause.__traceback__)
+        if capture_trace and cause is not None
+        else None,
+    )
+    # A queued log record may outlive the worker. Keep the traceback locations
+    # and exception chain, but do not let diagnostic frames retain borrowed
+    # staging tensors after their CUDA stream has been closed.
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        traceback.clear_frames(cause.__traceback__)
+        cause = cause.__cause__ or cause.__context__

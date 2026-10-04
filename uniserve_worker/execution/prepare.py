@@ -12,13 +12,13 @@ these stages, in order:
    destination, starts the physical fetch, and captures completion-valued
    predicates. Each later advance of the batch calls `capture_predicates`
    until the transferred predicate sources are ready.
-3. `reserve_outputs` runs from `uniserve_worker.execution.step` once inputs
+3. `reserve_outputs` runs under the native executor once inputs
    are ready. It creates the batch's `PendingOutput` records and completion
    buffer, then reserves host tasks, cache tables, latent staging, and device
    output writes, and publishes the transferred inputs into their stores.
 
-`prepare_inputs` and `reserve_outputs` release what they reserved when they
-fail partway.
+The native executor retires partially prepared resources through their
+owners when a stage fails.
 """
 
 from __future__ import annotations
@@ -43,7 +43,6 @@ from uniserve_worker.errors import (
 )
 from uniserve_worker.execution import calls as calls
 from uniserve_worker.execution.batch import BatchState
-from uniserve_worker.execution.commit import discard_batch
 from uniserve_worker.execution.host_media import (
     BORROWED_INPUT_CALLS,
     encoded_unit_positions,
@@ -85,7 +84,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.host import HostLane, HostTask
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
-    from uniserve_worker.media.mux import MediaMux
     from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -883,12 +881,10 @@ def reserve_outputs(
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
-    media_mux: MediaMux | None,
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
     model_runner: ModelExecutor,
-    transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
     """Bind one batch's outputs and execution resources before launch.
@@ -902,11 +898,22 @@ def reserve_outputs(
     Resources are bound in dependency order: the completion buffer and
     `PendingOutput` records, host-lane slots, cache block tables, latent
     staging, device output writes, then transferred inputs and predicates.
-    Sets `state.registered` on success. If creating the records fails after
-    the completion buffer is acquired, the buffer is abandoned; a failure
-    after the records are bound to `state` discards the batch through
-    `discard_batch`. The error propagates in both cases.
+    If creating the records fails, the local completion buffer is abandoned.
+    Once records are bound, the native executor owns failure cleanup.
     """
+    required_predicates = {
+        calls.call_identity(call)
+        for call in batch.calls
+        if call.predicate is not None
+        and call.predicate.dtype is DType.U8
+        and not calls.device_gated(call)
+    }
+    if required_predicates != set(predicate_values):
+        raise invalid_descriptor(
+            "completion-predicated calls require exact prepared "
+            "predicate values"
+        )
+
     scheduled = state.batch.calls
 
     # Predicated rows remain in aligned output/state tables but do not reserve
@@ -966,7 +973,7 @@ def reserve_outputs(
             # The completion buffer and the records bound to it are owned
             # together: a failure before `state.bind_outputs` abandons any
             # acquired buffer here, and a later one is handled by
-            # `discard_batch`.
+            # the native executor.
             request_pool_indices = tuple(
                 int(
                     request_pool.get(
@@ -1000,99 +1007,84 @@ def reserve_outputs(
                 request.status = CallStatus.PREDICATED
         state.bind_outputs(candidates, completion, started)
 
-        try:
-            # Bind physical state in dependency order before publishing
-            # transferred inputs.
-            _reserve_host_tasks(
-                active_calls,
-                host_tasks=host_tasks,
-                worker_info=worker_info,
-                config=config,
-                state=state,
+        # Bind physical state in dependency order before publishing
+        # transferred inputs.
+        _reserve_host_tasks(
+            active_calls,
+            host_tasks=host_tasks,
+            worker_info=worker_info,
+            config=config,
+            state=state,
+        )
+        if active_calls:
+            identities = {calls.call_identity(call) for call in active_calls}
+            has_forward = any(
+                calls.call_identity(batch.calls[index]) in identities
+                for index in batch.forward_call_indices
             )
-            if active_calls:
-                identities = {
-                    calls.call_identity(call) for call in active_calls
-                }
-                has_forward = any(
-                    calls.call_identity(batch.calls[index]) in identities
-                    for index in batch.forward_call_indices
-                )
 
-                if kv_cache is None or request_tables is None:
-                    if has_forward:
-                        raise unsupported_setup(
-                            "KV-free execution received cache forward rows"
-                        )
-                else:
-                    _bind_cache_tables(
-                        active_calls,
-                        kv_cache=kv_cache,
-                        request_tables=request_tables,
-                        state=state,
+            if kv_cache is None or request_tables is None:
+                if has_forward:
+                    raise unsupported_setup(
+                        "KV-free execution received cache forward rows"
                     )
-                _bind_latent_inputs(
+            else:
+                _bind_cache_tables(
                     active_calls,
-                    latent_pool=latent_pool,
-                    model_runner=model_runner,
+                    kv_cache=kv_cache,
+                    request_tables=request_tables,
                     state=state,
                 )
-            _reserve_outputs(
-                scheduled,
-                tensor_store=tensor_store,
-                model_runner=model_runner,
-                state=state,
-            )
-
-            # Only live calls consume inputs; predicated calls instead publish
-            # false into their completion and transition outputs
-            # (`_publish_predicated_outputs`).
-            active_inputs = {
-                reference
-                for call in active_calls
-                for reference in call.tensor_inputs()
-            }
-            active_inputs.update(
-                call.predicate
-                for call in active_calls
-                if call.predicate is not None
-            )
-            _stage_input_products(
-                tuple(
-                    payload
-                    for payload in input_products
-                    if payload.product in active_inputs
-                ),
-                kv_cache=kv_cache,
-                tensor_store=tensor_store,
-                latent_pool=latent_pool,
-                model_runner=model_runner,
-                state=state,
-            )
-            _consume_predicates(
+            _bind_latent_inputs(
                 active_calls,
-                tensor_store=tensor_store,
+                latent_pool=latent_pool,
                 model_runner=model_runner,
                 state=state,
             )
-            _publish_predicated_outputs(
-                scheduled,
-                tensor_store=tensor_store,
-                state=state,
-            )
-            state.registered = True
-            record_component(state.component_us, "open_lane", started)
-            return None
-        except BaseException:
-            discard_batch(
-                kv_cache=kv_cache,
-                tensor_store=tensor_store,
-                latent_pool=latent_pool,
-                media_mux=media_mux,
-                transfer_backends=transfer_backends,
-                state=state,
-            )
-            raise
+        _reserve_outputs(
+            scheduled,
+            tensor_store=tensor_store,
+            model_runner=model_runner,
+            state=state,
+        )
+
+        # Only live calls consume inputs; predicated calls instead publish
+        # false into their completion and transition outputs
+        # (`_publish_predicated_outputs`).
+        active_inputs = {
+            reference
+            for call in active_calls
+            for reference in call.tensor_inputs()
+        }
+        active_inputs.update(
+            call.predicate
+            for call in active_calls
+            if call.predicate is not None
+        )
+        _stage_input_products(
+            tuple(
+                payload
+                for payload in input_products
+                if payload.product in active_inputs
+            ),
+            kv_cache=kv_cache,
+            tensor_store=tensor_store,
+            latent_pool=latent_pool,
+            model_runner=model_runner,
+            state=state,
+        )
+        _consume_predicates(
+            active_calls,
+            tensor_store=tensor_store,
+            model_runner=model_runner,
+            state=state,
+        )
+        _publish_predicated_outputs(
+            scheduled,
+            tensor_store=tensor_store,
+            state=state,
+        )
+        record_component(state.component_us, "open_lane", started)
 
 
 def _completion_words(scheduled: tuple[Call, ...]) -> int:
@@ -1129,7 +1121,7 @@ def _reserve_host_tasks(
 
     The slots are stored in the call's `PendingOutput.host.tasks`. A failure
     abandons the current call's reservations; those of earlier calls stay
-    with their records for `discard_batch` to release.
+    with their records for the native executor to release.
     """
     for call in scheduled:
         if call.kind not in {
@@ -1299,7 +1291,7 @@ def _reserve_outputs(
     )
 
     # Record the bound writes before `reserve_features` can fail, so
-    # `discard_batch` abandons them with the rest of the batch.
+    # The native executor abandons them with the rest of the batch.
     for binding in bound_groups:
         for write in binding:
             request = state.pending_output(

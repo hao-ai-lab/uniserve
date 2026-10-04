@@ -8,13 +8,13 @@ producers have completed. A frontier containing model-forward work runs
 through the numerical helpers in ``forward``; any other frontier dispatches
 each call to its owning module (``transfer``, ``diffusion``, ``image``,
 ``media_reader``, ``conditions``, ``host_media`` or ``media``). Outcomes stay
-provisional until ``commit.commit_batch`` publishes them.
+provisional until the native executor commits them.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
@@ -71,13 +71,11 @@ def dispatch_batch(
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
     config: WorkerConfig,
-) -> tuple[PendingOutput, ...]:
-    """Execute the batch's active calls and align outcomes with its call order.
+) -> None:
+    """Execute active calls into the batch's reserved outputs.
 
     Calls whose output ``reserve_outputs`` marked ``CallStatus.PREDICATED``
-    are not executed; ``_predicated_outcome`` stages their outcome. The
-    returned tuple holds one outcome per call of ``state.batch.calls``, in
-    that order.
+    are not executed; ``_predicated_outcome`` stages their result.
 
     A failure raises and aborts the homogeneous batch; its owner discards all
     provisional outputs before reporting the error.
@@ -99,23 +97,17 @@ def dispatch_batch(
         ):
             state.output_buffer.begin_device(device)
 
-    outcomes: list[PendingOutput | None] = [None] * len(batch_calls)
     scheduled: list[Call] = []
-    locations: list[int] = []
-
-    for call_index, call in enumerate(batch_calls):
+    for call in batch_calls:
         if (
             state.pending_output(call.request_key.request_id).status
             is CallStatus.PREDICATED
         ):
-            outcomes[call_index] = _predicated_outcome(call, state=state)
-            continue
-        locations.append(call_index)
-        scheduled.append(call)
+            _predicated_outcome(call, state=state)
+        else:
+            scheduled.append(call)
 
-    # _execute_calls indexes outcomes by position in `scheduled`; `locations`
-    # maps each position back to its index in the batch.
-    completed = _execute_calls(
+    _execute_calls(
         tuple(scheduled),
         kv_cache=kv_cache,
         tensor_store=tensor_store,
@@ -133,12 +125,6 @@ def dispatch_batch(
         config=config,
         state=state,
     )
-
-    for index, outcome in completed.items():
-        outcomes[locations[index]] = outcome
-    if any(outcome is None for outcome in outcomes):
-        raise RuntimeError("successful batch did not resolve every call")
-    return tuple(cast(PendingOutput, outcome) for outcome in outcomes)
 
 
 def _execute_ready_actions(

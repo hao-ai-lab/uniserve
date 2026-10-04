@@ -231,9 +231,7 @@ def test_execution_failure_reports_the_call_kind_as_its_route(caplog) -> None:
     )
     with (
         execution_worker(queue_depth=1) as worker,
-        caplog.at_level(
-            logging.WARNING, logger="uniserve_worker.execution.step"
-        ),
+        caplog.at_level(logging.WARNING, logger="uniserve_worker.errors"),
     ):
         served = finalized_report(
             worker,

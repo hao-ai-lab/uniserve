@@ -9,8 +9,7 @@ media, diffusion and host-media call paths.
 Every tensor publication checks the physical tensor against the product's
 declared shape bound, dtype and byte size before exporting it. Publications made
 during execution record their locators on the call's ``PendingOutput``:
-``commit.commit_batch`` makes the exports visible and
-``commit.discard_batch`` releases the locators of a failed batch.
+The native executor commits the exports or releases them after a failed batch.
 ``publish_deferred_product`` runs after its call committed and registers and
 commits its export with ``TensorStore`` directly.
 """
@@ -18,7 +17,7 @@ commits its export with ``TensorStore`` directly.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING
@@ -688,19 +687,6 @@ def _representation_matches_product(
 
 
 __all__ = ["execute"]
-
-
-def _release_locators(
-    locators: Iterable[Locator], *, transfer_backends: Mapping[str, Transport]
-) -> None:
-    """Release transfer locators through the runtime transport owner.
-
-    Does nothing when no transport is configured.
-    """
-    if not transfer_backends:
-        return
-    for locator in locators:
-        transfer_backends[locator.backend].release(locator)
 
 
 def reserved_unit_rows(

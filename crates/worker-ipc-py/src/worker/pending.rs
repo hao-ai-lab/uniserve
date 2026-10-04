@@ -41,11 +41,11 @@ pub(crate) struct PendingOutput {
     #[pyo3(get)]
     call: Py<PyAny>,
     #[pyo3(get)]
-    request: Py<Request>,
+    pub(super) request: Py<Request>,
     #[pyo3(get)]
     token: Py<PyAny>,
     #[pyo3(get)]
-    latent: Py<PyAny>,
+    pub(super) latent: Py<PyAny>,
     #[pyo3(get)]
     host: Py<PyAny>,
     #[pyo3(get, set)]
@@ -53,21 +53,21 @@ pub(crate) struct PendingOutput {
     #[pyo3(get, set)]
     product_generations: Py<PyTuple>,
     #[pyo3(get)]
-    tensor_exports: Py<PyDict>,
+    pub(super) tensor_exports: Py<PyDict>,
     #[pyo3(get)]
-    cache_exports: Py<PyDict>,
+    pub(super) cache_exports: Py<PyDict>,
     #[pyo3(get)]
-    exported_locators: Py<PyList>,
+    pub(super) exported_locators: Py<PyList>,
     #[pyo3(get, set)]
-    cache_publication: Option<Py<PyAny>>,
+    pub(super) cache_publication: Option<Py<PyAny>>,
     #[pyo3(get, set)]
-    cache_installation: Option<Py<PyAny>>,
+    pub(super) cache_installation: Option<Py<PyAny>>,
     #[pyo3(get)]
-    device_reads: Py<PyList>,
+    pub(super) device_reads: Py<PyList>,
     #[pyo3(get)]
-    feature_reads: Py<PyList>,
+    pub(super) feature_reads: Py<PyList>,
     #[pyo3(get)]
-    writes: Py<PyList>,
+    pub(super) writes: Py<PyList>,
     #[pyo3(get, set)]
     predicate: Option<Py<PyAny>>,
     #[pyo3(get, set)]
@@ -77,13 +77,12 @@ pub(crate) struct PendingOutput {
     #[pyo3(get, set)]
     completion_write: Option<Py<PyAny>>,
     #[pyo3(get, set)]
-    producer_write: Option<Py<PyAny>>,
+    pub(super) producer_write: Option<Py<PyAny>>,
     #[pyo3(get, set)]
     kv_output: Option<Py<PyAny>>,
     #[pyo3(get, set)]
-    products: Py<PyTuple>,
-    #[pyo3(get, set)]
-    _reports_output: bool,
+    pub(super) products: Py<PyTuple>,
+    pub(super) reports_output: bool,
     pub(super) value: Option<RequestOutput>,
 }
 
@@ -155,7 +154,7 @@ impl PendingOutput {
             producer_write: None,
             kv_output: None,
             products: PyTuple::empty(py).unbind(),
-            _reports_output: true,
+            reports_output: true,
             value: None,
         })
     }
@@ -226,39 +225,6 @@ impl PendingOutput {
         self.buffer.as_ref().map(|buffer| buffer.clone_ref(py))
     }
 
-    fn release_execution_references(&mut self, py: Python<'_>) -> PyResult<()> {
-        self.writes.bind(py).call_method0("clear")?;
-        self.tensor_exports.bind(py).clear();
-        self.cache_exports.bind(py).clear();
-        self.exported_locators.bind(py).call_method0("clear")?;
-        self.cache_publication = None;
-        self.cache_installation = None;
-
-        let latent = self.latent.bind(py);
-        latent.getattr("exports")?.call_method0("clear")?;
-        latent.setattr("input_params", py.None())?;
-        latent.setattr("staging", py.None())?;
-        latent.setattr("imported", false)?;
-
-        self.predicate = None;
-        self.token_write = None;
-        self.transition_write = None;
-        self.completion_write = None;
-        self.producer_write = None;
-        let token = self.token.bind(py);
-        for field in [
-            "sampled",
-            "runtime_penalty_base",
-            "runtime_prompt_logits",
-            "runtime_cache_length",
-        ] {
-            token.setattr(field, py.None())?;
-        }
-        token.setattr("runtime_logical_position", 0)?;
-        token.setattr("runtime_sampling_position", 0)?;
-        Ok(())
-    }
-
     pub(super) fn ready(slf: &Bound<'_, Self>) -> PyResult<bool> {
         let py = slf.py();
         let (buffer, host) = {
@@ -286,7 +252,7 @@ impl PendingOutput {
         convert::request_output_to_py(slf.py(), slf.borrow().result()?)
     }
 
-    fn abandon(slf: &Bound<'_, Self>) -> PyResult<()> {
+    pub(super) fn abandon(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let (host, buffer, row) = {
             let mut this = slf.borrow_mut();
@@ -352,6 +318,39 @@ impl PendingOutput {
 }
 
 impl PendingOutput {
+    pub(super) fn release_execution_references(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.writes.bind(py).call_method0("clear")?;
+        self.tensor_exports.bind(py).clear();
+        self.cache_exports.bind(py).clear();
+        self.exported_locators.bind(py).call_method0("clear")?;
+        self.cache_publication = None;
+        self.cache_installation = None;
+
+        let latent = self.latent.bind(py);
+        latent.getattr("exports")?.call_method0("clear")?;
+        latent.setattr("input_params", py.None())?;
+        latent.setattr("staging", py.None())?;
+        latent.setattr("imported", false)?;
+
+        self.predicate = None;
+        self.token_write = None;
+        self.transition_write = None;
+        self.completion_write = None;
+        self.producer_write = None;
+        let token = self.token.bind(py);
+        for field in [
+            "sampled",
+            "runtime_penalty_base",
+            "runtime_prompt_logits",
+            "runtime_cache_length",
+        ] {
+            token.setattr(field, py.None())?;
+        }
+        token.setattr("runtime_logical_position", 0)?;
+        token.setattr("runtime_sampling_position", 0)?;
+        Ok(())
+    }
+
     pub(super) fn result(&self) -> PyResult<&RequestOutput> {
         self.value
             .as_ref()
@@ -384,7 +383,7 @@ impl PendingOutput {
                 this.token.clone_ref(py),
                 this.host.clone_ref(py),
                 this.buffer(py).ok_or_else(lost_buffer)?,
-                this._reports_output,
+                this.reports_output,
                 this.status,
                 this.error_code,
                 this.progress,

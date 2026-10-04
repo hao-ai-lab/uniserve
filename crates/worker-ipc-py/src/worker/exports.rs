@@ -10,7 +10,6 @@ use uniserve_worker_ipc::{BufferId, RequestKey};
 use super::protocol::buffer_id;
 use crate::convert;
 
-#[pyfunction]
 pub(super) fn validate_exports(
     resident: &Bound<'_, PyDict>,
     candidates: &Bound<'_, PyDict>,

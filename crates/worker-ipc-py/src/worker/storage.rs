@@ -1479,7 +1479,11 @@ impl TensorStore {
             .map_err(|error| native_error(py, error))
     }
 
-    fn validate_writes(&self, py: Python<'_>, writes: Vec<Bound<'_, Buffer>>) -> PyResult<()> {
+    pub(super) fn validate_writes(
+        &self,
+        py: Python<'_>,
+        writes: Vec<Bound<'_, Buffer>>,
+    ) -> PyResult<()> {
         let writes: Vec<_> = writes
             .iter()
             .map(|write| BufferHandle::new(write.clone().unbind()))
@@ -1490,7 +1494,11 @@ impl TensorStore {
             .map_err(|error| native_error(py, error))
     }
 
-    fn commit_writes(&self, py: Python<'_>, writes: Vec<Bound<'_, Buffer>>) -> PyResult<()> {
+    pub(super) fn commit_writes(
+        &self,
+        py: Python<'_>,
+        writes: Vec<Bound<'_, Buffer>>,
+    ) -> PyResult<()> {
         let writes: Vec<_> = writes
             .iter()
             .map(|write| BufferHandle::new(write.clone().unbind()))
@@ -1531,7 +1539,11 @@ impl TensorStore {
             .map_err(|error| native_error(py, error))
     }
 
-    fn abandon_writes(&self, py: Python<'_>, writes: Vec<Bound<'_, Buffer>>) -> PyResult<()> {
+    pub(super) fn abandon_writes(
+        &self,
+        py: Python<'_>,
+        writes: Vec<Bound<'_, Buffer>>,
+    ) -> PyResult<()> {
         let writes: Vec<_> = writes
             .iter()
             .map(|write| BufferHandle::new(write.clone().unbind()))

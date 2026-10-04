@@ -647,17 +647,12 @@ impl LatentPool {
 
     /// Check every trajectory update before committing any batch output.
     fn validate_updates(&mut self, py: Python<'_>, updates: Vec<Py<LatentUpdate>>) -> PyResult<()> {
-        self.inner.reap();
-        self.inner
-            .validate_updates(&lower_updates(py, &updates)?)
-            .map_err(|error| native_error(py, error))
+        self.validate(py, &lower_updates(py, &updates)?)
     }
 
     /// The executor applies the same updates without intervening pool changes.
     fn apply_updates(&mut self, py: Python<'_>, updates: Vec<Py<LatentUpdate>>) -> PyResult<()> {
-        cancel_transfers(py, self.inner.apply_updates(&lower_updates(py, &updates)?))?;
-        self.inner.reap();
-        Ok(())
+        self.apply(py, &lower_updates(py, &updates)?)
     }
 
     /// Assign destination pages in bank zero before any read starts. Padding is
@@ -775,7 +770,11 @@ impl LatentPool {
     }
 
     /// Request cancellation retains page ownership through physical retirement.
-    fn release_slots(&mut self, py: Python<'_>, request_pool_indices: Vec<i64>) -> PyResult<()> {
+    pub(super) fn release_slots(
+        &mut self,
+        py: Python<'_>,
+        request_pool_indices: Vec<i64>,
+    ) -> PyResult<()> {
         let transfers = self
             .inner
             .release_slots(&request_pool_indices)
@@ -854,6 +853,23 @@ impl LatentPool {
 }
 
 impl LatentPool {
+    pub(super) fn validate(
+        &mut self,
+        py: Python<'_>,
+        updates: &[NativeLatentUpdate],
+    ) -> PyResult<()> {
+        self.inner.reap();
+        self.inner
+            .validate_updates(updates)
+            .map_err(|error| native_error(py, error))
+    }
+
+    pub(super) fn apply(&mut self, py: Python<'_>, updates: &[NativeLatentUpdate]) -> PyResult<()> {
+        cancel_transfers(py, self.inner.apply_updates(updates))?;
+        self.inner.reap();
+        Ok(())
+    }
+
     /// Revoke exports while retaining pages through physical reader completion.
     pub(super) fn release_buffers(
         slf: &Bound<'_, Self>,
@@ -990,7 +1006,7 @@ fn request_set(py: Python<'_>, requests: &[Py<PyAny>]) -> PyResult<HashSet<Reque
         .collect()
 }
 
-fn lower_updates(
+pub(super) fn lower_updates(
     py: Python<'_>,
     updates: &[Py<LatentUpdate>],
 ) -> PyResult<Vec<NativeLatentUpdate>> {
