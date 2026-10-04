@@ -3,7 +3,7 @@
 Ownership runs through consumer completion.
 """
 
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import replace
 from threading import Event
 
@@ -1193,6 +1193,63 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
         with suppress(WorkerError):
             pool.close()
         events.close()
+
+
+@pytest.mark.parametrize("ending", ("failed", "cancelled"))
+def test_unknown_latent_reader_completion_retains_only_its_pages(
+    ending, latent_output
+) -> None:
+    pool = LatentPool(
+        request_pool_size=2,
+        num_pages=3,
+        page_units=4,
+        latent_width=4,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    product = TensorRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_call_id=CallId(1, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(4), StaticDim(4))),
+    )
+    source = pool.reserve_publication(
+        product, request_pool_idx=1, page_table=(1,), latent_units=4
+    )
+    retirement: Future[None] = Future()
+    pool.retain_publication(source, retirement)
+    if ending == "failed":
+        retirement.set_exception(RuntimeError("reader completion unknown"))
+        error = RuntimeError
+    else:
+        retirement.cancel()
+        error = CancelledError
+
+    pool.release_buffers((product.buffer_id,))
+    pool.release_slots((1,))
+    with pytest.raises(WorkerError) as held:
+        pool.initial_bank(2, (1,), latent_units=4)
+    assert held.value.code is WorkerErrorCode.INVALID_DESCRIPTOR
+    with pytest.raises(error):
+        pool.retirement_ready((product.request_key,))
+
+    # An independent trajectory can still commit and expose its values.
+    staging = pool.stage(((2,),), (4,))[0]
+    staging.value.fill_(7)
+    pool.initialize(2, staging, latent_units=4)
+    update = latent_output(2, (2,), 4, 16, 64)
+    pool.validate_updates((update,))
+    pool.apply_updates((update,))
+    actual = pool.gather_current(
+        2, staging, generation=1, step=0, latent_units=4, height=16, width=64
+    )
+    torch.testing.assert_close(actual, torch.full((4, 4), 7.0), rtol=0, atol=0)
+    assert pool.retirement_ready((update.params.request_key,))
+    with pytest.raises(WorkerError) as closing:
+        pool.close()
+    assert closing.value.code is WorkerErrorCode.RESOURCE_ERROR
 
 
 def test_latent_staging_preserves_live_trajectories(latent_output) -> None:

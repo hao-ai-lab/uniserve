@@ -13,6 +13,7 @@ its numerical ``BufferBinding`` views.
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future
+from contextlib import AbstractContextManager
 from types import TracebackType
 from typing import Any, Generic, Self, TypeVar, final
 
@@ -26,6 +27,7 @@ from uniserve_worker.execution.request import RequestProgress, RequestResult
 from uniserve_worker.protocol.batch import (
     BatchCommand,
     BufferAllocation,
+    LatentParams,
     NewRequest,
 )
 from uniserve_worker.protocol.call import Call, ImageParams
@@ -36,6 +38,7 @@ from uniserve_worker.protocol.transfer import (
     TensorTransfer,
     WorkerEndpoint,
 )
+from uniserve_worker.storage.latent_pool import LatentStaging
 from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
@@ -46,6 +49,10 @@ __all__ = [
     "BufferBinding",
     "BufferPool",
     "BufferRegistry",
+    "LatentExport",
+    "LatentImport",
+    "LatentPool",
+    "LatentUpdate",
     "Request",
     "RequestPool",
     "ReadReservation",
@@ -191,6 +198,227 @@ class TransferPool:
         producer: torch.cuda.Event | None = None,
         acknowledgment: torch.Tensor | None = None,
     ) -> None: ...
+    def close(self) -> None: ...
+
+@final
+class LatentUpdate:
+    """A batch's prepared trajectory commit or release."""
+
+    request_pool_idx: int
+    params: LatentParams | None
+    expected_generation: int
+    expected_step: int
+    generation: int
+    step: int
+    release: bool
+
+    def __new__(
+        cls,
+        request_pool_idx: int,
+        params: LatentParams | None = None,
+        expected_generation: int = 0,
+        expected_step: int = 0,
+        generation: int = 0,
+        step: int = 0,
+        release: bool = False,
+    ) -> Self: ...
+
+@final
+class LatentImport:
+    """Preassigned pages kept until their copies are adopted or abandoned."""
+
+    @property
+    def product(self) -> TensorRef: ...
+    @property
+    def request_pool_idx(self) -> int: ...
+    @property
+    def page_table(self) -> tuple[int, ...]: ...
+    @property
+    def spans(self) -> tuple[torch.Tensor, ...]: ...
+    @property
+    def transfers(self) -> tuple[TransferTicket, ...]: ...
+    @property
+    def adopted(self) -> bool: ...
+    @property
+    def released(self) -> bool: ...
+
+@final
+class LatentExport:
+    """An immutable page-bank version held by transport readers."""
+
+    @property
+    def buffer(self) -> BufferId: ...
+    @property
+    def request_pool_idx(self) -> int: ...
+    @property
+    def bank(self) -> int: ...
+    @property
+    def page_table(self) -> tuple[int, ...]: ...
+    @property
+    def spans(self) -> tuple[torch.Tensor, ...]: ...
+
+@final
+class LatentPool:
+    """Own latent backing, page assignments, and committed trajectories."""
+
+    def __new__(
+        cls,
+        *,
+        request_pool_size: int,
+        num_pages: int,
+        page_units: int,
+        latent_width: int,
+        dtype: torch.dtype,
+        device: torch.device | str,
+        staging: bool = True,
+    ) -> Self: ...
+    @property
+    def request_pool_size(self) -> int: ...
+    @property
+    def num_pages(self) -> int: ...
+    @property
+    def page_units(self) -> int: ...
+    @property
+    def latent_width(self) -> int: ...
+    @property
+    def capacity_units(self) -> int: ...
+    @property
+    def dtype(self) -> torch.dtype: ...
+    @property
+    def device(self) -> torch.device: ...
+    @property
+    def storage(self) -> torch.Tensor: ...
+    @property
+    def step_buffer(self) -> torch.Tensor: ...
+    @property
+    def page_table_buffer(self) -> torch.Tensor: ...
+    @property
+    def timesteps(self) -> torch.Tensor: ...
+    @property
+    def page_rows(self) -> torch.Tensor: ...
+    @property
+    def persistent_bytes(self) -> int: ...
+    @property
+    def exports(self) -> dict[BufferId, ExportLocations]: ...
+    def startup_values(
+        self, rows: int, units: int
+    ) -> AbstractContextManager[tuple[torch.Tensor, ...]]: ...
+    def _startup_staging(
+        self, rows: int, units: int
+    ) -> tuple[torch.Tensor, ...]: ...
+    def stage(
+        self,
+        page_tables: Sequence[Sequence[int]],
+        latent_units: Sequence[int],
+        *,
+        occupied: Sequence[LatentStaging] = (),
+    ) -> tuple[LatentStaging, ...]: ...
+    def initialize(
+        self,
+        request_pool_idx: int,
+        staging: LatentStaging,
+        *,
+        latent_units: int,
+    ) -> None: ...
+    def bank_view(
+        self, bank: int, page_table: Sequence[int]
+    ) -> torch.Tensor: ...
+    def initial_bank(
+        self,
+        request_pool_idx: int,
+        page_table: Sequence[int],
+        *,
+        latent_units: int,
+    ) -> int: ...
+    def step_banks(
+        self,
+        request_pool_idx: int,
+        page_table: Sequence[int],
+        *,
+        step: int,
+        generation: int,
+        latent_units: int,
+        height: int,
+        width: int,
+    ) -> tuple[int, int]: ...
+    def gather_current(
+        self,
+        request_pool_idx: int,
+        staging: LatentStaging,
+        *,
+        step: int,
+        generation: int,
+        latent_units: int,
+        height: int,
+        width: int,
+    ) -> torch.Tensor: ...
+    def write_inactive(
+        self,
+        request_pool_idx: int,
+        staging: LatentStaging,
+        *,
+        expected_step: int,
+        expected_generation: int,
+        latent_units: int,
+        height: int,
+        width: int,
+    ) -> None: ...
+    def reserve_publication(
+        self,
+        product: TensorRef,
+        *,
+        request_pool_idx: int,
+        page_table: Sequence[int],
+        latent_units: int,
+    ) -> LatentExport: ...
+    def reserve_current_publication(
+        self,
+        product: TensorRef,
+        *,
+        request_pool_idx: int,
+        page_table: Sequence[int],
+        generation: int,
+        step: int,
+        latent_units: int,
+        height: int,
+        width: int,
+    ) -> LatentExport: ...
+    def retain_publication(
+        self, source: LatentExport, retirement: Future[None]
+    ) -> None: ...
+    def release_buffers(self, buffers: Sequence[BufferId]) -> None: ...
+    def write_dependencies(
+        self, request_pool_idx: int, page_table: Sequence[int]
+    ) -> tuple[Future[None], ...]: ...
+    def stage_timestep(
+        self, request_pool_idx: int, value: float
+    ) -> torch.Tensor: ...
+    def validate_updates(self, updates: Sequence[LatentUpdate]) -> None: ...
+    def apply_updates(self, updates: Sequence[LatentUpdate]) -> None: ...
+    def reserve_import(
+        self,
+        product: TensorRef,
+        *,
+        request_pool_idx: int,
+        page_table: Sequence[int],
+        latent_units: int,
+    ) -> LatentImport: ...
+    def retain_transfer(
+        self, write: LatentImport, ticket: TransferTicket
+    ) -> None: ...
+    def adopt_import(
+        self,
+        write: LatentImport,
+        *,
+        generation: int,
+        step: int,
+        height: int,
+        width: int,
+    ) -> None: ...
+    def abandon_import(self, write: LatentImport) -> None: ...
+    def retirement_ready(self, requests: Sequence[RequestKey]) -> bool: ...
+    def cancel_imports(self, requests: Sequence[RequestKey]) -> None: ...
+    def release_slots(self, request_pool_indices: Sequence[int]) -> None: ...
     def close(self) -> None: ...
 
 @final

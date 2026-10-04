@@ -18,6 +18,7 @@ use uniserve_worker_ipc::{BufferId, RequestKey};
 
 use crate::buffer::{BufferBinding, BufferPool};
 use crate::error::{invalid, invariant, resource};
+use crate::transfer::retirement_succeeded;
 
 type BufferKey = (RequestKey, CallId, u16);
 type CallKey = (RequestKey, CallId);
@@ -181,9 +182,7 @@ impl Buffer {
         }
         for export in &self.exports {
             let export = export.bind(py);
-            if !export.call_method0("done")?.extract::<bool>()?
-                || !export.call_method0("exception")?.is_none()
-            {
+            if !retirement_succeeded(export)? {
                 return Ok(false);
             }
         }
@@ -1557,9 +1556,7 @@ impl TensorStore {
         let mut retained = Vec::new();
         for export in &value.exports {
             let future = export.bind(py);
-            if !future.call_method0("done")?.extract::<bool>()?
-                || !future.call_method0("exception")?.is_none()
-            {
+            if !retirement_succeeded(future)? {
                 retained.push(export.clone_ref(py));
             }
         }

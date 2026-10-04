@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 
 use crate::error::{invalid, invariant, resource};
+use crate::transfer::retirement_succeeded;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum BufferKey {
@@ -377,10 +378,7 @@ impl BufferRegistry {
         // it without permitting reuse after an unknown device completion.
         for (key, buffer) in &state.buffers {
             let future = buffer.retirement.bind(py);
-            if buffer.status == Status::Reclaiming
-                && future.call_method0("done")?.is_truthy()?
-                && future.call_method0("exception")?.is_none()
-            {
+            if buffer.status == Status::Reclaiming && retirement_succeeded(future)? {
                 finished.push(key.clone());
             }
         }

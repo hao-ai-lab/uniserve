@@ -14,6 +14,13 @@ use pyo3::types::{PyCFunction, PyDict, PyTuple};
 
 use crate::error::{invalid, invariant, resource, unsupported};
 
+/// Failed or cancelled retirement cannot authorize physical storage reuse.
+pub(crate) fn retirement_succeeded(future: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(future.call_method0("done")?.is_truthy()?
+        && !future.call_method0("cancelled")?.is_truthy()?
+        && future.call_method0("exception")?.is_none())
+}
+
 struct CapacityState {
     used: u64,
     reads_free: usize,
@@ -342,11 +349,11 @@ impl TransferTicket {
         Ok(self.lock(py)?.ready())
     }
 
-    fn retired(&self, py: Python<'_>) -> PyResult<bool> {
+    pub(crate) fn retired(&self, py: Python<'_>) -> PyResult<bool> {
         Ok(self.lock(py)?.retired)
     }
 
-    fn retirement_ready(&self, py: Python<'_>) -> PyResult<bool> {
+    pub(crate) fn retirement_ready(&self, py: Python<'_>) -> PyResult<bool> {
         let state = self.lock(py)?;
         if !state.unretired.is_empty() {
             let error = resource(py, "transfer physical completion is unknown");
@@ -380,7 +387,7 @@ impl TransferTicket {
         Ok(())
     }
 
-    fn cancel(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn cancel(&self, py: Python<'_>) -> PyResult<()> {
         let mut state = self.lock(py)?;
         let pending = !state.ready();
         state.cancelled = true;
@@ -421,7 +428,11 @@ impl TransferTicket {
     /// Return views without a host wait. CUDA consumption waits on the read
     /// fence and records every view on the consuming allocator stream.
     #[pyo3(signature = (stream=None))]
-    fn result(&self, py: Python<'_>, stream: Option<Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+    pub(crate) fn result(
+        &self,
+        py: Python<'_>,
+        stream: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         let mut state = self.lock(py)?;
         if !state.ready() {
             return Err(PyRuntimeError::new_err(
