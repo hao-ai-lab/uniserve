@@ -190,3 +190,67 @@ output_throughput = "higher"
     worker_python = command.index("--worker-python") + 1
     assert command[worker_python] == str(tree / ".venv/bin/python")
     assert plan["server_working_directory"] == str(tree)
+
+
+def _text_profile(tmp_path: Path, sampling: str) -> Path:
+    profile = tmp_path / "profile.toml"
+    profile.write_text(
+        f"""
+[servers.server]
+command = ["uniserve", "serve", "model"]
+port = 8000
+
+[benchmarks.point]
+server = "server"
+task = "text"
+model = "model"
+dataset = "jsonl"
+dataset_path = "rows.jsonl"
+
+[benchmarks.point.sampling]
+{sampling}
+
+[benchmarks.point.metrics]
+output_throughput = "higher"
+""",
+        encoding="utf-8",
+    )
+    return profile
+
+
+def test_server_sampling_resolves_to_a_request_without_controls(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        _text_profile(tmp_path, "server_sampling = true\nmax_tokens = 256")
+    )
+
+    sampling = config.benchmarks["point"].workload_dict()["sampling"]
+
+    assert sampling["temperature"] is None
+    assert sampling["top_p"] is None
+    assert sampling["ignore_eos"] is None
+    assert sampling["max_tokens"] == 256
+    assert "server_sampling" not in sampling
+
+
+def test_server_sampling_keeps_a_request_seed(tmp_path: Path) -> None:
+    config = load_config(
+        _text_profile(tmp_path, "server_sampling = true\nsampling_seed = 42")
+    )
+
+    sampling = config.benchmarks["point"].workload_dict()["sampling"]
+
+    assert sampling["sampling_seed"] == 42
+    assert sampling["temperature"] is None
+
+
+def test_server_sampling_rejects_a_token_control(tmp_path: Path) -> None:
+    profile = _text_profile(
+        tmp_path, "server_sampling = true\ntemperature = 0.0"
+    )
+
+    with pytest.raises(
+        ValueError, match="token-sampling controls: temperature"
+    ):
+        load_config(profile)
