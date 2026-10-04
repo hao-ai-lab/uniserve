@@ -5,8 +5,8 @@ batch's per-group unit tables in `Batch.block_tables`. `execution.prepare`
 validates the unit ids against `KVCacheManager` and installs the tables here,
 before the batch's forward calls read them. `BlockTables` holds the device
 copy that the decode input kernels (`model_executor._decode_inputs`) index by
-request slot, plus a host mirror used for change detection and for host-side
-lookups such as attention input construction (`model_executor.attention`).
+request slot, while Rust owns the host tables and change detection. Host-side
+lookups for attention input construction borrow those native tables.
 
 A cache group's logical page occupies ``units_per_page`` units, and the units
 at one position of every page form one numerical block table (see
@@ -18,7 +18,6 @@ holding the slot's units of pages ``start_page..`` at that position.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 import torch
 
@@ -26,86 +25,18 @@ from uniserve.runtime.device import async_tensor_h2d, fill_cpu_ints
 from uniserve.runtime.resources import close_resources
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
+from uniserve_worker._uniserve_ipc import (
+    BlockTables as NativeBlockTables,
+)
+from uniserve_worker._uniserve_ipc import (
+    GroupShape,
+    GroupTable,
+)
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.identity import RequestKey
 from uniserve_worker.storage.host_buffers import HostBuffers
 
 __all__ = ["BlockTables", "GroupShape", "GroupTable"]
-
-
-@dataclass(frozen=True, slots=True)
-class GroupShape:
-    """The page shape of one cache group, as block tables index it.
-
-    Attributes:
-        page_tokens: Tokens per logical page.
-        units_per_page: Units one logical page occupies; the group owns this
-            many consecutive numerical tables.
-        window: History tokens any reader of the group needs, or ``None``
-            for full attention.
-    """
-
-    page_tokens: int
-    units_per_page: int
-    window: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class GroupTable:
-    """One request slot's installed units of one cache group.
-
-    ``units`` holds the units of logical pages ``start_page..``, page-major;
-    ``allocated_tokens`` is the absolute token extent the table covers.
-    """
-
-    shape: GroupShape
-    start_page: int
-    units: tuple[int, ...]
-    allocated_tokens: int
-
-    @property
-    def end_page(self) -> int:
-        """Return the logical page after the last installed one."""
-        return self.start_page + len(self.units) // self.shape.units_per_page
-
-    def row(self, index: int) -> tuple[int, ...]:
-        """Return the units at page position ``index`` of every page."""
-        return self.units[index :: self.shape.units_per_page]
-
-    def spans(
-        self, start: int, length: int
-    ) -> tuple[tuple[int, int, int], ...]:
-        """Map an absolute token interval to ``(unit, offset, count)`` spans.
-
-        Every unit of each page the interval touches receives the page's
-        token offset and count, since each holds those tokens of its own
-        layers.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when the interval reaches a
-                retired page or lies past the installed pages.
-        """
-        page_tokens = self.shape.page_tokens
-        per_page = self.shape.units_per_page
-        if (
-            start < 0
-            or length < 0
-            or (length and start < self.start_page * page_tokens)
-            or start + length > self.end_page * page_tokens
-        ):
-            raise invalid_descriptor("KV token interval exceeds its unit table")
-        spans = []
-        while length:
-            page, offset = divmod(start, page_tokens)
-            count = min(length, page_tokens - offset)
-            first = (page - self.start_page) * per_page
-            spans.extend(
-                (unit, offset, count)
-                for unit in self.units[first : first + per_page]
-            )
-            start += count
-            length -= count
-        return tuple(spans)
 
 
 class BlockTables:
@@ -156,32 +87,14 @@ class BlockTables:
             WorkerError: ``invalid_descriptor`` when a dimension is below 1.
             ValueError: When ``staging_depth`` is below 1.
         """
-        # Alternative-prefix slots (for example CFG branch prefixes) owned by
-        # each exact request epoch; see `retain_prefix`.
-        self._prefix_slots: dict[RequestKey, set[int]] = {}
         self.groups = tuple(groups)
         self.request_pool_size = int(request_pool_size)
         self.width = int(width)
-        if (
-            not self.groups
-            or min(self.request_pool_size, self.width) < 1
-            or any(
-                min(group.page_tokens, group.units_per_page) < 1
-                for group in self.groups
-            )
-        ):
-            raise invalid_descriptor(
-                "request-to-token pool dimensions are invalid"
-            )
-
-        # Numerical tables, group-major: group g owns tables
-        # [first_table[g], first_table[g] + units_per_page).
-        self.first_table = []
-        count = 0
-        for group in self.groups:
-            self.first_table.append(count)
-            count += group.units_per_page
-        self.table_count = count
+        self._tables = NativeBlockTables(
+            self.groups, self.request_pool_size, self.width
+        )
+        self.first_table = self._tables.first_table
+        self.table_count = sum(group.units_per_page for group in self.groups)
 
         # One installation can touch every (slot, table) pair; the staging
         # tensors are sized for that worst case.
@@ -225,10 +138,6 @@ class BlockTables:
         self._row_staging = tensors["_row_staging"]
         self._index_staging = tensors["_index_staging"]
         self._value_staging = tensors["_value_staging"]
-
-        # Host mirrors of the device tables drive change detection in install.
-        self._host_tables: dict[tuple[int, int], GroupTable] = {}
-        self._host_alloced_lens: dict[int, int] = {}
 
         # Generation-safe pinned rings retain CPU sources until asynchronous
         # copies into the device staging tensors have completed.
@@ -322,76 +231,22 @@ class BlockTables:
             WorkerError: ``invalid_descriptor`` when any entry fails
                 validation.
         """
-        if not tables:
-            return
-        accepted: dict[tuple[int, int], GroupTable] = {}
-        for raw_slot, raw_group, raw_start, raw_units, raw_allocated in tables:
-            slot, group = int(raw_slot), int(raw_group)
-            if not 1 <= slot <= self.request_pool_size or not (
-                0 <= group < len(self.groups)
-            ):
-                raise invalid_descriptor("scheduler block table is invalid")
-            shape = self.groups[group]
-            table = GroupTable(
-                shape,
-                int(raw_start),
-                tuple(int(unit) for unit in raw_units),
-                int(raw_allocated),
-            )
-            pages, remainder = divmod(len(table.units), shape.units_per_page)
-            if (
-                table.start_page < 0
-                or remainder
-                or pages > self.width
-                or any(unit < 1 for unit in table.units)
-                or len(set(table.units)) != len(table.units)
-                or not 0 <= table.allocated_tokens
-                or table.allocated_tokens > table.end_page * shape.page_tokens
-                or (slot, group) in accepted
-            ):
-                raise invalid_descriptor("scheduler block table is invalid")
-            accepted[(slot, group)] = table
+        self._tables.install(tables, self._copy_tables)
 
-        # Collect the changed numerical rows and start pages; a group table
-        # changes all of its rows together.
-        rows: list[tuple[int, ...]] = []
-        row_tables: list[int] = []
-        row_slots: list[int] = []
-        start_groups: list[int] = []
-        start_slots: list[int] = []
-        start_values: list[int] = []
-        for (slot, group), table in accepted.items():
-            previous = self._host_tables.get((slot, group))
-            if previous is None or previous.units != table.units:
-                for position in range(table.shape.units_per_page):
-                    rows.append(table.row(position))
-                    row_tables.append(self.first_table[group] + position)
-                    row_slots.append(slot)
-            if previous is None or previous.start_page != table.start_page:
-                start_groups.append(group)
-                start_slots.append(slot)
-                start_values.append(table.start_page)
-
-        # A slot's allocated length is the extent every installed group
-        # covers after this update.
-        mirror = dict(self._host_tables)
-        mirror.update(accepted)
-        updated = {slot for slot, _ in accepted}
-        lengths: dict[int, int] = {}
-        for (slot, _), table in mirror.items():
-            if slot in updated:
-                lengths[slot] = min(
-                    lengths.get(slot, table.allocated_tokens),
-                    table.allocated_tokens,
-                )
-        allocated = {
-            slot: length
-            for slot, length in lengths.items()
-            if self._host_alloced_lens.get(slot) != length
-        }
-
+    def _copy_tables(
+        self,
+        rows: Sequence[Sequence[int]],
+        row_tables: Sequence[int],
+        row_slots: Sequence[int],
+        start_groups: Sequence[int],
+        start_slots: Sequence[int],
+        start_values: Sequence[int],
+        length_slots: Sequence[int],
+        length_values: Sequence[int],
+    ) -> None:
+        """Stage the changed native rows on the caller's current stream."""
         non_blocking = self.unit_tables.device.type == "cuda"
-        if rows or start_values or allocated:
+        if rows or start_values or length_slots:
             # Every index set of one installation shares one pinned
             # generation, so a batch does not consume several ring slots.
             # The device reads only each index row's leading entries, so the
@@ -402,11 +257,9 @@ class BlockTables:
             fill_cpu_ints(index_host[1, : len(rows)], row_slots)
             fill_cpu_ints(index_host[2, : len(start_values)], start_groups)
             fill_cpu_ints(index_host[3, : len(start_values)], start_slots)
-            fill_cpu_ints(index_host[4, : len(allocated)], tuple(allocated))
+            fill_cpu_ints(index_host[4, : len(length_slots)], length_slots)
             fill_cpu_ints(value_host[0, : len(start_values)], start_values)
-            fill_cpu_ints(
-                value_host[1, : len(allocated)], tuple(allocated.values())
-            )
+            fill_cpu_ints(value_host[1, : len(length_slots)], length_values)
             self._index_staging.copy_(index_host, non_blocking=non_blocking)
             self._value_staging.copy_(value_host, non_blocking=non_blocking)
             self._index_host.record_copy(index_slot)
@@ -441,35 +294,20 @@ class BlockTables:
                 self._index_staging[3, : len(start_values)],
             ] = self._value_staging[0, : len(start_values)]
 
-        if allocated:
+        if length_slots:
             self.alloced_lens.index_copy_(
                 0,
-                self._index_staging[4, : len(allocated)],
-                self._value_staging[1, : len(allocated)],
+                self._index_staging[4, : len(length_slots)],
+                self._value_staging[1, : len(length_slots)],
             )
 
-        # Mirror the accepted installation on the host.
-        self._host_tables.update(accepted)
-        self._host_alloced_lens.update(lengths)
-
     def table(self, request_pool_idx: int, group_id: int) -> GroupTable:
-        """Return the installed table of one request slot and cache group.
-
-        Reads the host mirror; no device access.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when no table is installed.
-        """
-        try:
-            return self._host_tables[(int(request_pool_idx), int(group_id))]
-        except KeyError:
-            raise invalid_descriptor(
-                "request slot has no installed block table"
-            ) from None
+        """Read one installed native table without accessing the device."""
+        return self._tables.table(request_pool_idx, group_id)
 
     def allocated_length(self, request_pool_idx: int) -> int:
         """Return the tokens every installed group of a slot covers, or 0."""
-        return self._host_alloced_lens.get(int(request_pool_idx), 0)
+        return self._tables.allocated_length(request_pool_idx)
 
     def set_verified(self, slots: torch.Tensor, lengths: torch.Tensor) -> None:
         """Update verified cache lengths without changing unit tables.
@@ -515,9 +353,7 @@ class BlockTables:
             self._index_host.close,
             self._value_host.close,
         )
-        self._prefix_slots.clear()
-        self._host_tables.clear()
-        self._host_alloced_lens.clear()
+        self._tables.clear()
 
     def retain_prefix(self, request_key: RequestKey, slot: int) -> None:
         """Record that a request epoch uses another slot as a prefix row.
@@ -526,7 +362,7 @@ class BlockTables:
         from the request's own slot, such as a CFG branch prefix. The slot is
         cleared by `release_prefixes` for the same `RequestKey`.
         """
-        self._prefix_slots.setdefault(request_key, set()).add(int(slot))
+        self._tables.retain_prefix(request_key, slot)
 
     def release_prefixes(
         self, request_key: RequestKey, slots: Sequence[int] | None = None
@@ -541,12 +377,7 @@ class BlockTables:
             WorkerError: ``invalid_descriptor`` when a slot is outside
                 ``[1, request_pool_size]``; nothing is cleared then.
         """
-        tracked = self._prefix_slots.get(request_key, set())
-        selected = tuple(tracked) if slots is None else tuple(slots)
-        self.release(selected)
-        tracked.difference_update(selected)
-        if not tracked:
-            self._prefix_slots.pop(request_key, None)
+        self._tables.release_prefixes(request_key, self._clear_slots, slots)
 
     def release(self, slots: Sequence[int]) -> None:
         """Clear selected request slots for reuse by the scheduler.
@@ -560,13 +391,11 @@ class BlockTables:
             WorkerError: ``invalid_descriptor`` when a slot is outside
                 ``[1, request_pool_size]``.
         """
-        values = tuple(dict.fromkeys(int(slot) for slot in slots))
+        self._tables.release(slots, self._clear_slots)
+
+    def _clear_slots(self, values: Sequence[int]) -> None:
         if not values:
             return
-        if any(slot < 1 or slot > self.request_pool_size for slot in values):
-            raise invalid_descriptor(
-                "released request slot is outside capacity"
-            )
 
         # Requests finish in bursts while later batches are already queued.
         # A fresh pinned source per release never waits for them, where a
@@ -580,10 +409,3 @@ class BlockTables:
         self.start_pages.index_fill_(1, indices, 0)
         self.verified_lengths.index_fill_(0, indices, 0)
         self.alloced_lens.index_fill_(0, indices, 0)
-
-        selected = set(values)
-        for identity in tuple(self._host_tables):
-            if identity[0] in selected:
-                del self._host_tables[identity]
-        for slot in selected:
-            self._host_alloced_lens.pop(slot, None)

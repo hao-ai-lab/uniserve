@@ -48,11 +48,14 @@ from uniserve_worker.transport.interface import Transport
 from uniserve_worker.worker import Worker
 
 __all__ = [
+    "BlockTables",
     "Buffer",
     "BufferBinding",
     "BufferPool",
     "BufferRegistry",
     "Executor",
+    "GroupShape",
+    "GroupTable",
     "LatentExport",
     "LatentImport",
     "LatentPool",
@@ -660,6 +663,70 @@ class BufferPool:
     ) -> BufferBinding: ...
     def release(self, binding: BufferBinding) -> None: ...
     def close(self) -> None: ...
+
+@final
+class GroupShape:
+    def __new__(
+        cls, page_tokens: int, units_per_page: int, window: int | None = None
+    ) -> Self: ...
+    @property
+    def page_tokens(self) -> int: ...
+    @property
+    def units_per_page(self) -> int: ...
+    @property
+    def window(self) -> int | None: ...
+
+@final
+class GroupTable:
+    def __new__(
+        cls,
+        shape: GroupShape,
+        start_page: int,
+        units: Sequence[int],
+        allocated_tokens: int,
+    ) -> Self: ...
+    @property
+    def shape(self) -> GroupShape: ...
+    @property
+    def start_page(self) -> int: ...
+    @property
+    def end_page(self) -> int: ...
+    @property
+    def units(self) -> tuple[int, ...]: ...
+    @property
+    def allocated_tokens(self) -> int: ...
+    def row(self, index: int) -> tuple[int, ...]: ...
+    def spans(
+        self, start: int, length: int
+    ) -> tuple[tuple[int, int, int], ...]: ...
+
+@final
+class BlockTables:
+    """Own host KV page tables; copy callbacks borrow numerical updates."""
+
+    def __new__(
+        cls, groups: Sequence[GroupShape], request_pool_size: int, width: int
+    ) -> Self: ...
+    @property
+    def first_table(self) -> tuple[int, ...]: ...
+    def install(
+        self,
+        tables: Sequence[tuple[int, int, int, Sequence[int], int]],
+        copy: Callable[..., None],
+    ) -> None: ...
+    def table(self, request_pool_idx: int, group_id: int) -> GroupTable: ...
+    def allocated_length(self, request_pool_idx: int) -> int: ...
+    def retain_prefix(self, request: RequestKey, slot: int) -> None: ...
+    def release_prefixes(
+        self,
+        request: RequestKey,
+        copy: Callable[[Sequence[int]], None],
+        slots: Sequence[int] | None = None,
+    ) -> None: ...
+    def release(
+        self, slots: Sequence[int], copy: Callable[[Sequence[int]], None]
+    ) -> None: ...
+    def clear(self) -> None: ...
 
 @final
 class Submission:
