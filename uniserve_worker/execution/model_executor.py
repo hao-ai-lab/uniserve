@@ -327,6 +327,7 @@ class ModelExecutor:
         # step by replaying the captured join of the step's capacity
         # (``JoinGraphs``), which startup captures after the runners' graphs.
         self._expert_joins = None
+        self._microbatch_joins = []
         self._expert_execution = None
         self._expert_executions = ()
         # A standalone denoiser's component, binding and call, the request
@@ -1977,6 +1978,24 @@ class ModelExecutor:
             for peer in entry.peers:
                 peer.expert_joins = self._expert_joins
 
+        if not self._expert_runners or runner.microbatches is None:
+            return
+        # Empty and populated microbatches use the same execution mode.
+        # The complete join above warms every peer at every capacity. Each
+        # independent join now captures in that peer's own allocation pool,
+        # so it can overlap a populated peer without sharing its scratch.
+        for index, peer in enumerate(runner.peers):
+            joins = JoinGraphs(
+                peer.context,
+                peer.context.experts,
+                exchange.capacities,
+                pools=peer.pools,
+                warm=False,
+            )
+            self._microbatch_joins.append(joins)
+            for entry in self._expert_runners:
+                entry.peers[index].microbatch_joins = joins
+
     def complete_startup(self):
         """Seal startup: check captured-graph storage budgets and stream grants.
 
@@ -2126,6 +2145,8 @@ class ModelExecutor:
         joins, self._expert_joins = self._expert_joins, None
         if joins is not None:
             actions.append(joins.close)
+        microbatch_joins, self._microbatch_joins = self._microbatch_joins, []
+        actions.extend(joins.close for joins in microbatch_joins)
         close_resources(*actions)
 
     def close(self, *, aborted: bool = False):

@@ -50,6 +50,8 @@ For a dense Qwen3-MoE checkpoint, `--quantization-config '{"mode":"mxfp8-experts
 
 Each expert step agrees its numerical capability and transfer capacity across ranks. A tensor-parallel source starts only when all its members have the same forward ready. Idle sources join with no tokens, and graph padding has no route weight or request progress. Cooperative yields inside the bound expert operation overlap dispatch and computation while ordinary model methods retain their sequential numerical meaning. Split MegaMoE uses one persistent expert launch for the complete layer and microbatch sequence.
 
+With graphs enabled, an empty microbatch replays its captured expert participation at the agreed capacity. Its graph uses the same stream and private allocation pool as that microbatch's populated forwards. Replicas may have different empty microbatches, including during their first prefill; every microbatch still participates in the complete expert-layer sequence.
+
 ## Lifetime and verification
 
 Queued decode successors use the existing request and device-continuation machinery. Cancellation retires request storage after its readers finish. Normal shutdown asks every participating group to leave before retiring collective resources. A terminal loss in a shared expert communicator fails all dependent worker groups; they cannot restart one member into the existing communicator.
