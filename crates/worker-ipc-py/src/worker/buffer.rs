@@ -17,11 +17,11 @@ use super::protocol::buffer_id;
 /// A numerical view retaining the allocation of its native physical binding.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct BufferBinding {
-    binding: Arc<NativeBufferBinding>,
+    pub(crate) binding: Arc<NativeBufferBinding>,
     #[pyo3(get)]
     buffer: Py<PyAny>,
     #[pyo3(get)]
-    tensor: Py<PyAny>,
+    pub(crate) tensor: Py<PyAny>,
 }
 
 #[pymethods]
@@ -110,7 +110,7 @@ impl BufferPool {
     }
 
     #[getter]
-    fn byte_capacity(&self, py: Python<'_>) -> PyResult<u64> {
+    pub(crate) fn byte_capacity(&self, py: Python<'_>) -> PyResult<u64> {
         Ok(self.lock(py)?.byte_capacity())
     }
 
@@ -196,9 +196,7 @@ impl BufferPool {
         py: Python<'_>,
         binding: &Bound<'_, BufferBinding>,
     ) -> PyResult<()> {
-        self.lock(py)?
-            .release(&binding.get().binding)
-            .map_err(|error| native_error(py, error))
+        self.release_binding(py, &binding.get().binding)
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -226,6 +224,16 @@ impl BufferPool {
 }
 
 impl BufferPool {
+    pub(crate) fn release_binding(
+        &self,
+        py: Python<'_>,
+        binding: &Arc<NativeBufferBinding>,
+    ) -> PyResult<()> {
+        self.lock(py)?
+            .release(binding)
+            .map_err(|error| native_error(py, error))
+    }
+
     fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, NativeBufferPool<Py<PyAny>>>> {
         self.state
             .lock_py_attached(py)

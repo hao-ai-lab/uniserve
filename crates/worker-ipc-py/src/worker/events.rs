@@ -32,7 +32,7 @@ impl CUDAEvent {
     }
 
     #[pyo3(signature = (stream=None))]
-    fn wait(&self, py: Python<'_>, stream: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    pub(crate) fn wait(&self, py: Python<'_>, stream: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         let current;
         let stream = match stream {
             Some(stream) => stream,
@@ -90,7 +90,7 @@ pub(crate) struct EventPool {
 #[pymethods]
 impl EventPool {
     #[new]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(PoolState::default()),
         }
@@ -101,7 +101,7 @@ impl EventPool {
         drop(previous);
     }
 
-    fn schedule_completion_wake(
+    pub(crate) fn schedule_completion_wake(
         &self,
         py: Python<'_>,
         device: &Bound<'_, PyAny>,
@@ -122,24 +122,18 @@ impl EventPool {
     }
 
     #[pyo3(signature = (device, *, timing=false, interprocess=false))]
-    fn acquire(
+    pub(crate) fn acquire(
         &self,
         py: Python<'_>,
         device: &Bound<'_, PyAny>,
         timing: bool,
         interprocess: bool,
     ) -> PyResult<CUDAEvent> {
-        let (_, device) = device_index(py, device)?;
         self.reap(py)?;
-        let inner = self
-            .lock()
-            .pool
-            .acquire(device, timing, interprocess)
-            .map_err(pool_error)?;
-        Ok(CUDAEvent { inner })
+        self.acquire_event(py, device, timing, interprocess)
     }
 
-    fn declare_stream(
+    pub(crate) fn declare_stream(
         &self,
         py: Python<'_>,
         event: &CUDAEvent,
@@ -153,7 +147,7 @@ impl EventPool {
             .map_err(pool_error)
     }
 
-    fn record(
+    pub(crate) fn record(
         &self,
         py: Python<'_>,
         event: &CUDAEvent,
@@ -169,7 +163,7 @@ impl EventPool {
     }
 
     #[pyo3(signature = (event, device, count=1))]
-    fn retain(
+    pub(crate) fn retain(
         &self,
         py: Python<'_>,
         event: &CUDAEvent,
@@ -184,7 +178,7 @@ impl EventPool {
     }
 
     #[pyo3(signature = (event, count=1))]
-    fn release(&self, event: &CUDAEvent, count: usize) -> PyResult<()> {
+    pub(crate) fn release(&self, event: &CUDAEvent, count: usize) -> PyResult<()> {
         self.lock()
             .pool
             .release(&event.inner, count)
@@ -203,22 +197,11 @@ impl EventPool {
             .iter()
             .map(|event| Arc::clone(&event.borrow(py).inner))
             .collect();
-        let unused = self
-            .lock()
-            .pool
-            .defer_release(
-                events,
-                DeferredOwner {
-                    value: owner,
-                    completed,
-                },
-            )
-            .map_err(pool_error)?;
-        drop(unused);
+        self.defer_events(events, owner, completed)?;
         self.reap(py)
     }
 
-    fn reap(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn reap(&self, py: Python<'_>) -> PyResult<()> {
         let (owners, result) = self.lock().pool.reap();
         let callbacks = notify(py, owners);
         result.map_err(pool_error)?;
@@ -259,6 +242,45 @@ impl EventPool {
 }
 
 impl EventPool {
+    // Storage owners reap callbacks before taking their own lock, then use
+    // these operations while composing native resource changes.
+    pub(crate) fn acquire_event(
+        &self,
+        py: Python<'_>,
+        device: &Bound<'_, PyAny>,
+        timing: bool,
+        interprocess: bool,
+    ) -> PyResult<CUDAEvent> {
+        let (_, device) = device_index(py, device)?;
+        let inner = self
+            .lock()
+            .pool
+            .acquire(device, timing, interprocess)
+            .map_err(pool_error)?;
+        Ok(CUDAEvent { inner })
+    }
+
+    pub(crate) fn defer_events(
+        &self,
+        events: Vec<Arc<Event>>,
+        owner: Py<PyAny>,
+        completed: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let unused = self
+            .lock()
+            .pool
+            .defer_release(
+                events,
+                DeferredOwner {
+                    value: owner,
+                    completed,
+                },
+            )
+            .map_err(pool_error)?;
+        drop(unused);
+        Ok(())
+    }
+
     fn lock(&self) -> MutexGuard<'_, PoolState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }

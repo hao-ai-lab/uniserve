@@ -478,10 +478,10 @@ def publish_product(
         )
 
     if encoder_write is not None:
-        retain = partial(tensor_store.retain_publication, encoder_write)
+        retain = partial(tensor_store.retain_export, encoder_write)
     else:
         assert device_write is not None
-        retain = partial(tensor_store.retain_publication, device_write)
+        retain = partial(tensor_store.retain_export, device_write)
 
     locations = publish_tensor(
         transports,
@@ -576,7 +576,7 @@ def publish_deferred_product(
                 publish_tensor(
                     publication_transports,
                     value[view],
-                    retain=partial(tensor_store.retain_publication, write),
+                    retain=partial(tensor_store.retain_export, write),
                     offset=tuple(
                         a + b
                         for a, b in zip(
