@@ -7,7 +7,7 @@
 //! `atomic_store_u32` / `atomic_load_u32` accessors for shared-storage segment
 //! header words. The hand-written stub `uniserve_worker/_uniserve_ipc.pyi`
 //! describes the same Python surface and must stay consistent with it.
-//! Request lifecycle objects are implemented by `uniserve-worker` and
+//! Request lifecycle and physical buffer pools are implemented by `uniserve-worker` and
 //! registered here so serving and direct Python calls use one native runtime.
 //!
 //! # Boundary conversions

@@ -7,7 +7,8 @@ readable descriptor for selector loops. ``atomic_store_u32`` and
 ``atomic_load_u32`` order the header words of shared-storage segments, which
 ``uniserve_worker.transport.segment`` reads and writes across processes.
 ``Request`` and ``RequestPool`` own the lifecycle shared by serving and direct
-numerical execution.
+numerical execution. ``BufferPool`` binds scheduler-assigned storage and issues
+its numerical ``BufferBinding`` views.
 """
 
 from collections.abc import Mapping, Sequence
@@ -20,12 +21,19 @@ from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.request import RequestProgress, RequestResult
-from uniserve_worker.protocol.batch import BatchCommand, NewRequest
+from uniserve_worker.protocol.batch import (
+    BatchCommand,
+    BufferAllocation,
+    NewRequest,
+)
 from uniserve_worker.protocol.call import Call, ImageParams
-from uniserve_worker.protocol.identity import CallId, RequestKey
+from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
+from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.storage.request_slots import RequestSlots
 
 __all__ = [
+    "BufferBinding",
+    "BufferPool",
     "Request",
     "RequestPool",
     "Server",
@@ -34,6 +42,52 @@ __all__ = [
     "atomic_store_u32",
     "service_name",
 ]
+
+@final
+class BufferBinding:
+    """A pool-issued tensor view of a reserved physical byte range."""
+
+    @property
+    def buffer(self) -> BufferId: ...
+    @property
+    def physical_offset(self) -> int: ...
+    @property
+    def physical_bytes(self) -> int: ...
+    @property
+    def binding_id(self) -> int: ...
+    @property
+    def device_name(self) -> str: ...
+    @property
+    def tensor(self) -> torch.Tensor: ...
+
+@final
+class BufferPool:
+    """Back scheduler-assigned buffers with nonoverlapping device views."""
+
+    def __new__(
+        cls,
+        *,
+        byte_capacity: int,
+        devices: tuple[torch.device | str, ...],
+        compact: bool = False,
+    ) -> Self: ...
+    @property
+    def byte_capacity(self) -> int: ...
+    @property
+    def compact(self) -> bool: ...
+    @property
+    def devices(self) -> tuple[torch.device, ...]: ...
+    def bind(
+        self,
+        reference: TensorRef,
+        allocation: BufferAllocation,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+    ) -> BufferBinding: ...
+    def release(self, binding: BufferBinding) -> None: ...
+    def close(self) -> None: ...
 
 @final
 class Request:

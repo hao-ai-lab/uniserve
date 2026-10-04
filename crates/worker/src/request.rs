@@ -12,8 +12,11 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
-use uniserve_core::{CallId, RequestId};
+use uniserve_core::CallId;
 use uniserve_worker_ipc::RequestKey;
+
+use crate::error::invalid;
+use crate::protocol::{call_id, request_key};
 
 /// One admitted request epoch, including its borrowed numerical state.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
@@ -578,31 +581,5 @@ impl RequestPool {
             pending.push((request, id, advances));
         }
         Ok(pending)
-    }
-}
-
-fn request_key(value: &Bound<'_, PyAny>) -> PyResult<RequestKey> {
-    Ok(RequestKey::new(
-        value.getattr("engine_id")?.extract()?,
-        RequestId(value.getattr("request_id")?.extract()?),
-        value.getattr("request_epoch")?.extract()?,
-    ))
-}
-
-fn call_id(value: &Bound<'_, PyAny>) -> PyResult<CallId> {
-    Ok(CallId::new(
-        value.getattr("batch_id")?.extract()?,
-        value.getattr("request_index")?.extract()?,
-    ))
-}
-
-fn invalid(py: Python<'_>, message: impl Into<String>) -> PyErr {
-    match py.import("uniserve_worker.errors").and_then(|module| {
-        module
-            .getattr("invalid_descriptor")?
-            .call1((message.into(),))
-    }) {
-        Ok(error) => PyErr::from_value(error),
-        Err(error) => error,
     }
 }
