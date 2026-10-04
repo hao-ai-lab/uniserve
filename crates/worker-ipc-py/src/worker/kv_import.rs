@@ -191,7 +191,7 @@ impl KVImporter {
                 })
             })
             .collect();
-        let accesses = pool.bind(py).getattr("_accesses")?.extract()?;
+        let accesses = pool.bind(py).getattr("_manager")?.extract()?;
         Ok(Self {
             inner: NativeImporter::new(workspaces),
             pool,

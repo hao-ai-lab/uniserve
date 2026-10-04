@@ -316,10 +316,9 @@ impl PythonBackend {
             }
         }
 
-        let cache = worker.getattr("kv_cache")?;
-        if !cache.is_none() {
+        if let Some(cache) = &self.cache {
             for id in ids {
-                cache.call_method1("drop", (*id,))?;
+                cache.borrow_mut(py).inner.drop_request(*id);
             }
         }
         let tables = worker.getattr("block_tables")?;

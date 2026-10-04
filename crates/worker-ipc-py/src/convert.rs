@@ -2049,7 +2049,10 @@ fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
 
 /// Converts a KV publication imported by a batch into a Python `KvTransfer`
 /// record.
-fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn kv_transfer_to_py<'py>(
+    py: Python<'py>,
+    transfer: &KvTransfer,
+) -> PyResult<Bound<'py, PyAny>> {
     let KvTransfer {
         groups,
         source,

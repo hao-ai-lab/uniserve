@@ -159,7 +159,7 @@ class KVCacheManager:
         # Transport locations of committed exports, updated by the batch
         # commit; publication intervals retained under their buffers.
         self.exports: dict[BufferId, ExportLocations] = {}
-        self._accesses = NativeKVCacheManager()
+        self._manager = NativeKVCacheManager()
 
         self.block_tables = BlockTables(
             groups=self.shapes,
@@ -170,19 +170,6 @@ class KVCacheManager:
             device=cache.device,
             staging_depth=staging_depth,
         )
-
-        # Semantic directory, changed by ``apply_publications``,
-        # ``release_calls`` and ``drop`` and cleared by ``close``. Base maps
-        # hold the latest ``(source buffer, published extent)`` per
-        # ``(request, destination)``: ``_destination_bases`` for what this
-        # rank published and ``_installed_bases`` for what it installed.
-        self._publications: dict[BufferId, KvTransfer] = {}
-        self._destination_bases: dict[
-            tuple[RequestKey, str], tuple[BufferId, int]
-        ] = {}
-        self._installed_bases: dict[
-            tuple[RequestKey, str], tuple[BufferId, int]
-        ] = {}
 
         self.imports = KVImporter(self, capacity=import_capacity)
 
@@ -248,7 +235,7 @@ class KVCacheManager:
     @property
     def has_pending_accesses(self) -> bool:
         """Whether model execution or transfer still retains cache units."""
-        return self._accesses.has_pending_accesses
+        return self._manager.has_pending_accesses
 
     def retain_execution(
         self,
@@ -267,7 +254,7 @@ class KVCacheManager:
         if length <= start:
             return
         self.validate_units(table.units)
-        self._accesses.retain_execution(
+        self._manager.retain_execution(
             request, table.spans(start, length - start), completion
         )
 
@@ -279,7 +266,7 @@ class KVCacheManager:
 
     def require_reusable(self, ranges: Sequence[tuple[int, int, int]]) -> None:
         """Reject reuse while any model or transfer still accesses the spans."""
-        self._accesses.require_reusable(ranges)
+        self._manager.require_reusable(ranges)
 
     def reserve_export(
         self, buffer: BufferId, ranges: Sequence[tuple[int, int, int]]
@@ -290,19 +277,19 @@ class KVCacheManager:
         retirement through retain_export and revoke it through
         release_buffers even if publication fails.
         """
-        self._accesses.reserve_export(buffer, ranges)
+        self._manager.reserve_export(buffer, ranges)
         return buffer
 
     def retain_export(self, buffer: BufferId, retirement: Completion) -> None:
         """Retain the exported interval until its transport retires."""
-        self._accesses.retain_export(buffer, retirement)
+        self._manager.retain_export(buffer, retirement)
 
     def release_buffers(self, buffers: Iterable[BufferId]) -> None:
         """Revoke new readers and preserve every pending physical access."""
         selected = tuple(buffers)
         release_exports(self.exports, selected)
         self.imports.release(selected)
-        self._accesses.release_exports(selected)
+        self._manager.release_exports(selected)
 
     def retirement_ready(
         self,
@@ -316,13 +303,13 @@ class KVCacheManager:
         Buffer release waits for its transfers. Request retirement also
         waits for that request's model accesses and excludes retained buffers.
         """
-        return self._accesses.retirement_ready(buffers, requests, retained)
+        return self._manager.retirement_ready(buffers, requests, retained)
 
     def write_dependencies(
         self, ranges: Sequence[tuple[int, int, int]]
     ) -> tuple[Completion, ...]:
         """Return physical completions of every overlapping access."""
-        return self._accesses.write_dependencies(ranges)
+        return self._manager.write_dependencies(ranges)
 
     def require_writable(
         self, table: GroupTable, *, start: int, length: int
@@ -332,8 +319,8 @@ class KVCacheManager:
         The runner orders model accesses on its stream. Transfers use other
         streams or processes, so their ranges must retire before a write.
         """
-        if self._accesses.has_transfers:
-            self._accesses.require_writable(table.spans(start, length))
+        if self._manager.has_transfers:
+            self._manager.require_writable(table.spans(start, length))
 
     def close(self) -> None:
         """Drain imports and exports before releasing the backing cache.
@@ -342,15 +329,13 @@ class KVCacheManager:
         resource error. The caller must retain it through worker shutdown.
         """
         self.imports.stop()
-        self.release_buffers(self._accesses.exported_buffers())
+        self.release_buffers(self._manager.exported_buffers())
         self.imports.require_retired()
-        self._accesses.require_retired()
+        self._manager.require_retired()
 
         self.exports.clear()
         self.block_tables.close()
-        self._publications.clear()
-        self._destination_bases.clear()
-        self._installed_bases.clear()
+        self._manager.clear_resident()
         self.cache.close()
 
     def validate_group(self, group: int) -> int:
@@ -477,7 +462,7 @@ class KVCacheManager:
                 failure propagates after every exported locator and the
                 reservation are released.
         """
-        installed = self._destination_bases.get((buffer.owner, destination))
+        installed = self._manager.destination_base(buffer.owner, destination)
         base, base_extent = (None, 0) if installed is None else installed
 
         visible = int(visible_length)
@@ -701,16 +686,14 @@ class KVCacheManager:
         Raises:
             WorkerError: ``invalid_descriptor`` when none is resident.
         """
-        try:
-            return self._publications[buffer]
-        except KeyError:
-            raise invalid_descriptor(
-                "KV publication buffer is not resident"
-            ) from None
+        resident = self.resident(buffer)
+        if resident is None:
+            raise invalid_descriptor("KV publication buffer is not resident")
+        return resident
 
     def resident(self, buffer: BufferId) -> KvTransfer | None:
         """Look up a resident KV publication; absence is not an error."""
-        return self._publications.get(buffer)
+        return self._manager.resident(buffer)
 
     def validate_conditioning(
         self,
@@ -768,16 +751,7 @@ class KVCacheManager:
         Raises:
             WorkerError: ``invalid_descriptor`` when either check fails.
         """
-        installed = self._installed_bases.get(
-            (publication.source.owner, publication.destination)
-        )
-        if publication.base is None:
-            if installed is not None or publication.base_extent != 0:
-                raise invalid_descriptor("KV installation base is invalid")
-        elif installed != (publication.base, publication.base_extent):
-            raise invalid_descriptor(
-                "KV installation base does not match destination"
-            )
+        self._manager.validate_install(publication)
         if not publication.groups:
             return
         if len(publication.groups) != len(self.shapes):
@@ -955,72 +929,7 @@ class KVCacheManager:
                 not match its transfer, a resident buffer names another
                 transfer, or a base is not the current one.
         """
-        # Transaction-local views start from resident state, so the batch is
-        # validated as one consistent step.
-        publications_by_buffer: dict[BufferId, KvTransfer] = {}
-        destination_bases: dict[
-            tuple[RequestKey, str], tuple[BufferId, int]
-        ] = {}
-        installed_bases: dict[tuple[RequestKey, str], tuple[BufferId, int]] = {}
-
-        for buffer, publication in publications:
-            if buffer != publication.source:
-                raise invalid_descriptor(
-                    "KV publication buffer identity is invalid"
-                )
-            existing = publications_by_buffer.get(
-                buffer, self._publications.get(buffer)
-            )
-            if existing is not None and existing != publication:
-                raise invalid_descriptor(
-                    "KV publication conflicts with its buffer identity"
-                )
-            destination_key = (buffer.owner, publication.destination)
-            current = destination_bases.get(
-                destination_key, self._destination_bases.get(destination_key)
-            )
-            expected = (
-                None
-                if publication.base is None
-                else (publication.base, publication.base_extent)
-            )
-            if current != expected:
-                raise invalid_descriptor(
-                    "KV publication base changed before publication"
-                )
-            publications_by_buffer[buffer] = publication
-            destination_bases[destination_key] = (
-                publication.source,
-                publication.published_extent,
-            )
-
-        for source, installed_buffer, publication in installations:
-            if (
-                source != publication.source
-                or installed_buffer.owner != source.owner
-            ):
-                raise invalid_descriptor(
-                    "installed KV buffer identity is invalid"
-                )
-            destination_key = (installed_buffer.owner, publication.destination)
-            current = installed_bases.get(
-                destination_key, self._installed_bases.get(destination_key)
-            )
-            expected = (
-                None
-                if publication.base is None
-                else (publication.base, publication.base_extent)
-            )
-            if current != expected:
-                raise invalid_descriptor(
-                    "KV installation base changed before publication"
-                )
-            publications_by_buffer[source] = publication
-            publications_by_buffer[installed_buffer] = publication
-            installed_bases[destination_key] = (
-                publication.source,
-                publication.published_extent,
-            )
+        self._manager.validate_publications(publications, installations)
 
     def apply_publications(
         self,
@@ -1033,24 +942,7 @@ class KVCacheManager:
         owner and must not mutate this directory between preflight and
         application.
         """
-        for buffer, publication in publications:
-            self._publications[buffer] = publication
-            self._destination_bases[(buffer.owner, publication.destination)] = (
-                publication.source,
-                publication.published_extent,
-            )
-
-        # An installation is resident under both its source identity and
-        # the local installed identity.
-        for source, installed_buffer, publication in installations:
-            self._publications[source] = publication
-            self._publications[installed_buffer] = publication
-            self._installed_bases[
-                (installed_buffer.owner, publication.destination)
-            ] = (
-                publication.source,
-                publication.published_extent,
-            )
+        self._manager.apply_publications(publications, installations)
 
     def release_calls(
         self, releases: Sequence[tuple[RequestKey, CallId]]
@@ -1063,32 +955,11 @@ class KVCacheManager:
         references may have no local registration; removing their semantic
         record does not release a remote publisher's storage.
         """
-        identities = {(key, call_id) for key, call_id in releases}
-        publications_by_buffer = tuple(
-            buffer
-            for buffer in self._publications
-            if (buffer.owner, buffer.producer_call_id) in identities
-        )
-        for buffer in publications_by_buffer:
-            del self._publications[buffer]
-        return publications_by_buffer
+        return self._manager.release_calls(releases)
 
     def drop(self, request_id: int) -> None:
         """Forget every resident publication and lineage base of a request.
 
         Physical registrations are retired separately by their owners.
         """
-        selected = tuple(
-            buffer
-            for buffer in self._publications
-            if int(buffer.owner.request_id) == int(request_id)
-        )
-        for buffer in selected:
-            del self._publications[buffer]
-        for table in (self._destination_bases, self._installed_bases):
-            for key in tuple(
-                key
-                for key in table
-                if int(key[0].request_id) == int(request_id)
-            ):
-                del table[key]
+        self._manager.drop_request(request_id)
