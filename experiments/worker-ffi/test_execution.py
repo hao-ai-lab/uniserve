@@ -19,12 +19,12 @@ def test_ordinary_torch_model(device):
     expected = model(values)
     executor = Executor(tvm_ffi.convert_func(model, tensor_cls=torch.Tensor), 2)
     try:
-        batch = executor.submit(values)
+        batch = executor.submit(1, values)
         del values, model
-        actual = torch.from_dlpack(batch.result())
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         batch.wait()
         assert batch.retired()
+        actual = torch.from_dlpack(executor.poll(batch))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     finally:
         executor.close()
 
@@ -36,8 +36,8 @@ def test_strided_tensor_keeps_shared_storage():
         tvm_ffi.convert_func(torch.nn.Identity(), tensor_cls=torch.Tensor), 1
     )
     try:
-        batch = executor.submit(view)
-        actual = torch.from_dlpack(batch.result())
+        batch = executor.submit(1, view)
+        actual = torch.from_dlpack(executor.poll(batch))
         actual.add_(3)
         torch.testing.assert_close(view, actual, rtol=0, atol=0)
         assert actual.stride() == view.stride()
@@ -53,6 +53,86 @@ def test_strided_tensor_keeps_shared_storage():
                 ],
                 dtype=torch.float32,
             ),
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        executor.close()
+
+
+def test_completed_results_hold_capacity_until_consumed():
+    executor = Executor(
+        tvm_ffi.convert_func(torch.nn.Identity(), tensor_cls=torch.Tensor), 1
+    )
+    try:
+        first = executor.submit(17, torch.tensor([2.0]))
+        assert first.retired()
+        with pytest.raises(RuntimeError, match="queue is full"):
+            executor.submit(18, torch.tensor([3.0]))
+
+        torch.testing.assert_close(
+            torch.from_dlpack(executor.poll(first)),
+            torch.tensor([2.0]),
+            rtol=0,
+            atol=0,
+        )
+        with pytest.raises(RuntimeError, match="no longer owned"):
+            executor.poll(first)
+
+        # Refusing admission leaves this batch number available to retry.
+        second = executor.submit(18, torch.tensor([3.0]))
+        torch.testing.assert_close(
+            torch.from_dlpack(executor.poll(second)),
+            torch.tensor([3.0]),
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        executor.close()
+
+
+@torch.inference_mode()
+def test_ready_result_does_not_wait_for_another_batch():
+    stream = torch.cuda.Stream()
+
+    def forward(value):
+        if value.is_cuda:
+            torch.cuda._sleep(2_000_000_000)
+        return value + 7
+
+    executor = Executor(
+        tvm_ffi.convert_func(forward, tensor_cls=torch.Tensor), 2
+    )
+    values = torch.ones(16, device="cuda")
+    try:
+        with torch.cuda.stream(stream), tvm_ffi.use_torch_stream(stream):
+            warmup = executor.submit(1, values)
+            warmup.wait()
+            executor.poll(warmup)
+            pending = executor.submit(2, values)
+
+        entered = Event()
+
+        def wait_for_pending():
+            entered.set()
+            pending.wait()
+
+        with ThreadPoolExecutor(max_workers=1) as waiter:
+            waiting = waiter.submit(wait_for_pending)
+            assert entered.wait(5)
+            ready = executor.submit(3, torch.tensor([2.0]))
+            torch.testing.assert_close(
+                torch.from_dlpack(executor.poll(ready)),
+                torch.tensor([9.0]),
+                rtol=0,
+                atol=0,
+            )
+            assert executor.poll(pending) is None
+            waiting.result(timeout=5)
+
+        torch.testing.assert_close(
+            torch.from_dlpack(executor.poll(pending)).cpu(),
+            torch.full((16,), 8.0),
             rtol=0,
             atol=0,
         )
@@ -77,22 +157,26 @@ def test_cancelled_batch_holds_capacity_until_cuda_finishes():
         with torch.cuda.stream(producer), tvm_ffi.use_torch_stream(producer):
             # Prepare allocator blocks and CUDA kernels before requiring a
             # submission to return with device work still pending.
-            executor.submit(values).wait()
-            batch = executor.submit(values)
+            warmup = executor.submit(1, values)
+            warmup.wait()
+            executor.poll(warmup)
+            batch = executor.submit(2, values)
             assert not batch.retired()
             batch.cancel()
-            with pytest.raises(RuntimeError, match="cancelled"):
-                batch.result()
-            with pytest.raises(RuntimeError, match="capacity"):
-                executor.submit(values)
+            assert executor.poll(batch) is None
+            with pytest.raises(RuntimeError, match="queue is full"):
+                executor.submit(3, values)
 
         batch.wait()
         assert batch.retired()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            executor.poll(batch)
         with torch.cuda.stream(producer), tvm_ffi.use_torch_stream(producer):
-            successor = executor.submit(values)
+            successor = executor.submit(3, values)
         del values
+        successor.wait()
         with torch.cuda.stream(consumer), tvm_ffi.use_torch_stream(consumer):
-            result = torch.from_dlpack(successor.result())
+            result = torch.from_dlpack(executor.poll(successor))
             actual = (result * 2).cpu()
         torch.testing.assert_close(
             actual, torch.full((4096,), 20.0), rtol=0, atol=0
@@ -117,12 +201,13 @@ def test_callback_failure_preserves_cuda_retirement():
         with torch.cuda.stream(stream), tvm_ffi.use_torch_stream(stream):
             values.add_(0)
             stream.synchronize()
-            batch = executor.submit(values)
-            with pytest.raises(ValueError, match="numerical callback failed"):
-                batch.result()
+            batch = executor.submit(1, values)
+            assert executor.poll(batch) is None
             assert not batch.retired()
         batch.wait()
         assert batch.retired()
+        with pytest.raises(ValueError, match="numerical callback failed"):
+            executor.poll(batch)
         torch.testing.assert_close(
             values.cpu(), torch.full((16,), 6.0), rtol=0, atol=0
         )
@@ -130,17 +215,55 @@ def test_callback_failure_preserves_cuda_retirement():
         executor.close()
 
 
-def test_close_preserves_results_and_rejects_submission():
+def test_close_preserves_delivered_results_and_rejects_submission():
     executor = Executor(
         tvm_ffi.convert_func(torch.nn.Identity(), tensor_cls=torch.Tensor), 1
     )
-    batch = executor.submit(torch.tensor([2.0]))
+    batch = executor.submit(1, torch.tensor([2.0]))
+    result = executor.poll(batch)
     executor.close()
     torch.testing.assert_close(
-        torch.from_dlpack(batch.result()), torch.tensor([2.0]), rtol=0, atol=0
+        torch.from_dlpack(result), torch.tensor([2.0]), rtol=0, atol=0
     )
     with pytest.raises(RuntimeError, match="closed"):
-        executor.submit(torch.tensor([3.0]))
+        executor.submit(2, torch.tensor([3.0]))
+
+
+@pytest.mark.parametrize("release", ("close", "drop"))
+@torch.inference_mode()
+def test_executor_retirement_drains_outstanding_gpu_work(release):
+    stream = torch.cuda.Stream()
+
+    def forward(value):
+        torch.cuda._sleep(2_000_000_000)
+        return value.add_(5)
+
+    executor = Executor(
+        tvm_ffi.convert_func(forward, tensor_cls=torch.Tensor), 1
+    )
+    values = torch.zeros(16, device="cuda")
+    try:
+        with torch.cuda.stream(stream), tvm_ffi.use_torch_stream(stream):
+            warmup = executor.submit(1, values)
+            warmup.wait()
+            executor.poll(warmup)
+            values.zero_()
+            pending = executor.submit(2, values)
+            assert not pending.retired()
+
+        if release == "close":
+            executor.close()
+        else:
+            del executor
+
+        assert pending.retired()
+        torch.testing.assert_close(
+            values.cpu(), torch.full((16,), 5.0), rtol=0, atol=0
+        )
+    finally:
+        if release == "close":
+            executor.close()
+        stream.synchronize()
 
 
 def test_concurrent_submission_preserves_the_active_callback():
@@ -157,15 +280,15 @@ def test_concurrent_submission_preserves_the_active_callback():
         tvm_ffi.convert_func(forward, tensor_cls=torch.Tensor), 2
     )
     with ThreadPoolExecutor(max_workers=1) as thread:
-        pending = thread.submit(executor.submit, torch.tensor([4.0]))
+        pending = thread.submit(executor.submit, 1, torch.tensor([4.0]))
         try:
             assert entered.wait(5)
-            with pytest.raises(RuntimeError, match="already submitting"):
-                executor.submit(torch.tensor([8.0]))
+            with pytest.raises(RuntimeError, match="busy"):
+                executor.submit(2, torch.tensor([8.0]))
             released.set()
             batch = pending.result(timeout=5)
             torch.testing.assert_close(
-                torch.from_dlpack(batch.result()),
+                torch.from_dlpack(executor.poll(batch)),
                 torch.tensor([7.0]),
                 rtol=0,
                 atol=0,

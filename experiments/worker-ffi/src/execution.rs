@@ -1,9 +1,11 @@
-//! Batch ownership and completion, with no Python object or Future access.
+//! Numerical callbacks and tensor lifetime for the shared worker executor.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tvm_ffi::{Error, Function, Result, Tensor, RUNTIME_ERROR};
 use uniserve_worker::cuda::Event;
+use uniserve_worker::{Backend, Batch as ScheduledBatch, Executor as NativeExecutor, Submission};
 
 pub fn failure(message: impl AsRef<str>) -> Error {
     Error::new(RUNTIME_ERROR, message.as_ref(), "")
@@ -15,38 +17,43 @@ pub fn lock<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
         .map_err(|_| failure("execution state is poisoned"))
 }
 
-pub struct Execution {
+/// Tensor references and the fence covering one numerical invocation.
+pub struct Batch {
     input: Option<Tensor>,
-    output: Result<Tensor>,
-    event: Result<Option<Event>>,
+    output: Option<Result<Tensor>>,
+    event: Result<Option<Arc<Event>>>,
     cancelled: bool,
 }
 
-impl Execution {
-    pub fn run(forward: &Function, input: Tensor) -> Self {
+impl Batch {
+    fn new(input: Tensor) -> Self {
+        Self {
+            input: Some(input),
+            output: None,
+            event: Ok(None),
+            cancelled: false,
+        }
+    }
+
+    fn run(&mut self, forward: &Function) {
+        let input = self.input.as_ref().expect("unexecuted batch input");
         let device = input.device();
         let stream = unsafe {
             tvm_ffi::tvm_ffi_sys::TVMFFIEnvGetStream(device.device_type as i32, device.device_id)
         };
-        let output = forward.call_tuple((&input,)).and_then(Tensor::try_from);
+        self.output = Some(forward.call_tuple((input,)).and_then(Tensor::try_from));
 
-        // A callback may raise after launching kernels. Record the fence on
-        // both paths and retain the input until those kernels have drained.
-        let event = if device.device_type as i32 == 2 {
+        // A callback may fail after launching kernels. Both outcomes retain
+        // their inputs until the submitting stream has finished those accesses.
+        self.event = if device.device_type as i32 == 2 {
             let event = Event::new(device.device_id, false, false);
             event
                 .record(stream as usize)
-                .map(|()| Some(event))
+                .map(|()| Some(Arc::new(event)))
                 .map_err(failure)
         } else {
             Ok(None)
         };
-        Self {
-            input: Some(input),
-            output,
-            event,
-            cancelled: false,
-        }
     }
 
     pub fn cancel(&mut self) {
@@ -61,136 +68,210 @@ impl Execution {
         }
     }
 
-    pub fn wait(&self) -> Result<()> {
-        match &self.event {
-            Ok(Some(event)) => event.wait().map_err(failure),
-            Ok(None) => Ok(()),
-            Err(error) => Err(error.clone()),
-        }
+    pub fn wait(batch: &Mutex<Self>) -> Result<()> {
+        // Waiting must not hold the batch lock: another caller may query or
+        // cancel it while the executor delivers an independent result.
+        let event = lock(batch)?.event.clone();
+        wait(event)
     }
 
-    pub fn result(&self) -> Result<Tensor> {
+    fn result(&mut self) -> Result<Tensor> {
+        // The executor delivers results only after poll observed completion.
+        // Release the fence here so normal delivery needs no host wait.
+        self.event = Ok(None);
         if self.cancelled {
             return Err(failure("batch was cancelled"));
         }
-        let output = self.output.as_ref().map_err(Clone::clone)?;
-        if let Some(event) = self.event.as_ref().map_err(Clone::clone)? {
-            let device = output.device();
-            let stream = unsafe {
-                tvm_ffi::tvm_ffi_sys::TVMFFIEnvGetStream(
-                    device.device_type as i32,
-                    device.device_id,
-                )
-            };
-            if device.device_type as i32 == 1 {
-                event.wait().map_err(failure)?;
-            } else {
-                event.wait_on(stream as usize).map_err(failure)?;
-            }
-        }
-        Ok(output.clone())
+
+        self.output.take().expect("completed numerical batch")
     }
 }
 
-impl Drop for Execution {
+impl Drop for Batch {
     fn drop(&mut self) {
-        // The executor normally reaps completed work. Dropping its last owner
-        // early drains only this batch, without calling Python while waiting.
-        // Unknown physical completion must not return DLPack storage for reuse.
-        if self.wait().is_err() {
+        if wait(self.event.clone()).is_err() {
+            // Unknown physical completion cannot return DLPack storage for reuse.
             std::mem::forget(self.input.take());
-            let output = std::mem::replace(&mut self.output, Err(failure("completion unknown")));
-            std::mem::forget(output);
+            std::mem::forget(self.output.take());
         }
+    }
+}
+
+struct NumericalBackend {
+    forward: Function,
+}
+
+impl Backend for NumericalBackend {
+    type Batch = Arc<Mutex<Batch>>;
+    type Output = Tensor;
+    type Error = Error;
+
+    fn error(&self, error: uniserve_worker::Error) -> Error {
+        failure(error.to_string())
+    }
+
+    fn classify(&self, error: Error, _batch: &Self::Batch, _context: &str) -> Error {
+        error
+    }
+
+    fn note_cleanup(&self, error: &mut Error, cleanup: Error) {
+        let message = format!(
+            "{}\nBatch cleanup also failed: {}",
+            error.message(),
+            cleanup.message()
+        );
+        *error = Error::new(error.kind(), &message, error.backtrace());
+    }
+
+    // This backend borrows an already prepared tensor. It has no request
+    // commands, external input transfers or deferred storage retirement.
+    fn admit(&mut self, _batch: &mut Self::Batch) -> Result<()> {
+        Ok(())
+    }
+
+    fn prepare(&mut self, _batch: &mut Self::Batch) -> Result<()> {
+        Ok(())
+    }
+
+    fn prepare_inputs(
+        &mut self,
+        _batch: &mut Self::Batch,
+        _submission: &Arc<Submission>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn await_inputs(
+        &mut self,
+        _batch: &mut Self::Batch,
+        _submission: &Arc<Submission>,
+    ) -> Result<()> {
+        unreachable!("numerical inputs are supplied at submission")
+    }
+
+    fn execute(&mut self, batch: &mut Self::Batch) -> Result<()> {
+        lock(batch)?.run(&self.forward);
+        Ok(())
+    }
+
+    fn begin_retirement(&mut self, _batch: &mut Self::Batch) -> Result<()> {
+        Ok(())
+    }
+
+    fn poll(&mut self, batch: &mut Self::Batch) -> Result<(bool, bool)> {
+        Ok((false, lock(batch)?.retired()?))
+    }
+
+    fn result(&mut self, batch: &mut Self::Batch) -> Result<Tensor> {
+        lock(batch)?.result()
+    }
+
+    fn close(&mut self, batch: &mut Self::Batch) -> Result<()> {
+        Batch::wait(batch)?;
+        let tensors = {
+            let mut batch = lock(batch)?;
+            batch.event = Ok(None);
+            (batch.input.take(), batch.output.take())
+        };
+
+        // DLPack owners may have foreign destructors; release them unlocked.
+        drop(tensors);
+        Ok(())
+    }
+
+    fn reap(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
 pub struct Executor {
-    capacity: usize,
-    state: Mutex<ExecutorState>,
-    submitting: Mutex<()>,
-}
-
-struct ExecutorState {
-    forward: Option<Function>,
-    active: Vec<Arc<Mutex<Execution>>>,
+    executor: Mutex<Option<NativeExecutor<NumericalBackend>>>,
 }
 
 impl Executor {
     pub fn new(forward: Function, capacity: i64) -> Result<Self> {
-        if capacity < 1 {
-            return Err(failure("execution capacity must be positive"));
-        }
+        let capacity = usize::try_from(capacity).map_err(|error| failure(error.to_string()))?;
+        let backend = NumericalBackend { forward };
+        let executor = NativeExecutor::new(backend, capacity, false, false)?;
+
         Ok(Self {
-            capacity: capacity as usize,
-            state: Mutex::new(ExecutorState {
-                forward: Some(forward),
-                active: Vec::new(),
-            }),
-            submitting: Mutex::new(()),
+            executor: Mutex::new(Some(executor)),
         })
     }
 
-    pub fn submit(&self, input: Tensor) -> Result<Arc<Mutex<Execution>>> {
-        // A numerical callback may invoke the public API again. It cannot
-        // recursively use the same runner's workspace during a forward.
-        let _submitting = self
-            .submitting
-            .try_lock()
-            .map_err(|_| failure("executor is already submitting"))?;
-        self.reap()?;
-        let forward = {
-            let state = lock(&self.state)?;
-            if state.active.len() >= self.capacity {
-                return Err(failure("execution capacity is occupied"));
-            }
-            state
-                .forward
-                .clone()
-                .ok_or_else(|| failure("executor is closed"))?
-        };
+    /// The submitting thread owns numerical execution. Recursive callbacks and
+    /// concurrent callers must not borrow its workspace during another call.
+    fn borrow(&self) -> Result<MutexGuard<'_, Option<NativeExecutor<NumericalBackend>>>> {
+        self.executor.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => failure("executor is busy"),
+            std::sync::TryLockError::Poisoned(_) => failure("executor state is poisoned"),
+        })
+    }
+
+    pub fn submit(&self, id: i64, input: Tensor) -> Result<(Arc<Submission>, Arc<Mutex<Batch>>)> {
+        let id = u64::try_from(id).map_err(|error| failure(error.to_string()))?;
+        let mut owner = self.borrow()?;
+        let executor = owner
+            .as_mut()
+            .ok_or_else(|| failure("executor is closed"))?;
         if !matches!(input.device().device_type as i32, 1 | 2) {
             return Err(failure("numerical execution requires CPU or CUDA tensors"));
         }
 
-        // FFI objects can be released by different Python threads, so their
-        // shared owner needs atomic refcounts. The upstream tensor handle is
-        // not Send; keep that restriction for Rust tasks instead of asserting
-        // thread safety for arbitrary foreign tensor allocators.
+        // Foreign references can be released by different Python threads. Keep
+        // atomic ownership without adding Send/Sync to the SDK's tensor handle.
         #[allow(clippy::arc_with_non_send_sync)]
-        let batch = Arc::new(Mutex::new(Execution::run(&forward, input)));
-        lock(&self.state)?.active.push(batch.clone());
-        Ok(batch)
+        let batch = Arc::new(Mutex::new(Batch::new(input)));
+        let scheduled =
+            ScheduledBatch::new(id, None, HashSet::new(), HashSet::new(), batch.clone());
+        let submission = executor.submit(scheduled, false)?;
+        Ok((submission, batch))
     }
 
-    pub fn reap(&self) -> Result<()> {
-        let mut state = lock(&self.state)?;
-        let active = &mut state.active;
-        let mut index = 0;
-        while index < active.len() {
-            if lock(&active[index])?.retired()? {
-                active.swap_remove(index);
-            } else {
-                index += 1;
-            }
-        }
-        Ok(())
+    pub fn poll(&self, submission: &Arc<Submission>) -> Result<Option<Tensor>> {
+        let mut owner = self.borrow()?;
+        let executor = owner
+            .as_mut()
+            .ok_or_else(|| failure("executor is closed"))?;
+        executor.advance()?;
+        executor.poll(submission)
     }
 
     pub fn close(&self) -> Result<()> {
-        let _submitting = self
-            .submitting
-            .try_lock()
-            .map_err(|_| failure("executor is already submitting"))?;
-        let (active, forward) = {
-            let mut state = lock(&self.state)?;
-            for batch in &state.active {
-                lock(batch)?.wait()?;
-            }
-            (std::mem::take(&mut state.active), state.forward.take())
-        };
-        drop(active);
-        drop(forward);
+        let executor = self.borrow()?.take();
+        if let Some(executor) = executor {
+            drain(executor)?;
+        }
         Ok(())
     }
+}
+
+impl Drop for Executor {
+    fn drop(&mut self) {
+        let owner = self
+            .executor
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(executor) = owner.take() {
+            let _ = drain(executor);
+        }
+    }
+}
+
+fn wait(event: Result<Option<Arc<Event>>>) -> Result<()> {
+    if let Some(event) = event? {
+        if !event.ready().map_err(failure)? {
+            event.wait().map_err(failure)?;
+        }
+    }
+    Ok(())
+}
+
+fn drain(mut executor: NativeExecutor<NumericalBackend>) -> Result<()> {
+    let result = executor.close();
+    if result.is_err() {
+        // The callable may retain model weights still accessed by the GPU.
+        std::mem::forget(executor);
+    }
+    result
 }

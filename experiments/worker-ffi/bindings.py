@@ -9,8 +9,8 @@ class Executor(tvm_ffi.Object):
     """Bounded numerical execution; methods and state are defined in Rust."""
 
 
-class Batch(tvm_ffi.Object):
-    """A result whose tensor backing survives asynchronous device execution."""
+class Submission(tvm_ffi.Object):
+    """An executor submission retaining its outstanding numerical accesses."""
 
 
 class WorkerRequest(tvm_ffi.Object):
@@ -35,7 +35,7 @@ def load_library(filename: str) -> None:
     _module = tvm_ffi.load_module(filename)
     _module.register()
     tvm_ffi.register_object("uniserve.ffi.Executor")(Executor)
-    tvm_ffi.register_object("uniserve.ffi.Batch")(Batch)
+    tvm_ffi.register_object("uniserve.ffi.Submission")(Submission)
     tvm_ffi.register_object("uniserve.ffi.WorkerRequest")(WorkerRequest)
     tvm_ffi.register_object("uniserve.ffi.RequestPool")(RequestPool)
     tvm_ffi.register_object("uniserve.ffi.HostLane")(HostLane)
