@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from .inputs import TextInput
-from .logits import Logits, VocabShard
+from .logits import Logits, project_logits
 from .transformer import TransformerDecoder
 
 
@@ -29,20 +29,39 @@ class CausalLM(nn.Module):
         return self.backbone.embed_input_ids(input_ids)
 
     def forward(self, inputs: TextInput) -> torch.Tensor:
-        hidden = None
-        if self.backbone._pipeline.rank == 0:
-            hidden = self.embed_input_ids(inputs.input_ids.reshape(-1))
-            if inputs.embeddings is not None:
-                replacement = inputs.embeddings
-                hidden = torch.where(
-                    replacement.mask.reshape(-1, 1),
-                    replacement.values.to(hidden.dtype),
-                    hidden,
-                )
-
         return self.backbone(
-            hidden, inputs.positions, inputs.attention, routes=inputs.routes
+            self._embeddings(inputs),
+            inputs.positions,
+            inputs.attention,
+            routes=inputs.routes,
         )
+
+    def fill_cache(self, inputs: TextInput) -> None:
+        """Write the K/V cache of ``inputs`` without evaluating any output.
+
+        The cache holds exactly what ``forward`` writes; the final layer
+        stops at its cache write (``TransformerDecoder.fill_cache``).
+        """
+        self.backbone.fill_cache(
+            self._embeddings(inputs),
+            inputs.positions,
+            inputs.attention,
+            routes=inputs.routes,
+        )
+
+    def _embeddings(self, inputs: TextInput) -> torch.Tensor | None:
+        """Token embeddings with any replacement, on the first stage."""
+        if self.backbone._pipeline.rank != 0:
+            return None
+        hidden = self.embed_input_ids(inputs.input_ids.reshape(-1))
+        if inputs.embeddings is not None:
+            replacement = inputs.embeddings
+            hidden = torch.where(
+                replacement.mask.reshape(-1, 1),
+                replacement.values.to(hidden.dtype),
+                hidden,
+            )
+        return hidden
 
     def compute_logits(
         self, hidden: torch.Tensor, *, token_indices: torch.Tensor
@@ -55,20 +74,8 @@ class CausalLM(nn.Module):
         pipeline = self.backbone._pipeline
         if pipeline.rank != pipeline.size - 1:
             return None
-        if hidden.ndim != 2 or token_indices.ndim != 1:
-            raise ValueError(
-                "logits require packed hidden rows and one-dimensional token "
-                "indices"
-            )
-        if token_indices.dtype not in {torch.int32, torch.int64}:
-            raise ValueError("token indices must be integers")
 
         # The last stage retains the head, which exposes its vocabulary shard.
         head = self.lm_head
         assert head is not None
-        vocab = head.vocab
-        if not isinstance(vocab, VocabShard):
-            raise TypeError("the vocabulary head must expose a VocabShard")
-
-        selected = hidden.index_select(0, token_indices)
-        return Logits(head(selected), vocab)
+        return project_logits(head, hidden, token_indices)

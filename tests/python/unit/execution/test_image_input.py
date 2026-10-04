@@ -9,15 +9,23 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+from transformers.models.gemma4.image_processing_gemma4 import (
+    Gemma4ImageProcessor,
+)
 
+from tests.python.fixtures.model_metadata import (
+    diffusion_gemma_metadata,
+    read_diffusion_gemma,
+)
 from uniserve.diffusion import NoiseScale
 from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
+    PixelBounds,
     StrideResize,
     TowerTransform,
 )
-from uniserve_models import bagel, siglip
+from uniserve_models import bagel, diffusion_gemma, siglip
 from uniserve_models import sensenova_u1 as u1
 from uniserve_models.bagel import vae
 from uniserve_models.sensenova_u1 import flow, vision
@@ -38,6 +46,10 @@ _BAGEL_RESIZE_CASES = json.loads(
 )["cases"]
 _SENSENOVA_RESIZE_CASES = json.loads(
     (_FIXTURES / "sensenova_image_resize.json").read_text()
+)["cases"]
+# Soft-token counts shared with the server's prompt planner tests.
+_DIFFUSION_GEMMA_TOKEN_CASES = json.loads(
+    (_FIXTURES / "diffusion_gemma_image_tokens.json").read_text()
 )["cases"]
 
 
@@ -60,7 +72,7 @@ def test_encoded_pixels_match_channel_normalization(
     encoded = io.BytesIO()
     image.save(encoded, format="PNG")
     transform = (
-        PatchTransform(4, 1.0, 24 * 32, 24 * 32, normalization)
+        PatchTransform(4, 1, PixelBounds(24 * 32, 24 * 32), normalization)
         if patches
         else TowerTransform(StrideResize(32, 24, 1, 24 * 32), normalization)
     )
@@ -262,3 +274,130 @@ def test_sensenova_generated_images_keep_the_single_image_bound():
     )
 
     assert result.grid_shape == (72, 128)
+
+
+def _png(image: Image.Image) -> str:
+    """Return an image as a base64 PNG payload, which decodes losslessly."""
+    encoded = io.BytesIO()
+    image.save(encoded, format="PNG")
+    return base64.b64encode(encoded.getvalue()).decode()
+
+
+def _diffusion_gemma_processor(root) -> ImageProcessor:
+    """Build the image processor DiffusionGemma declares for its checkpoint."""
+    return diffusion_gemma.image_processor(
+        read_diffusion_gemma(root, diffusion_gemma_metadata())
+    )
+
+
+@pytest.mark.parametrize(
+    "height,width,mode",
+    (
+        (480, 640, "RGB"),
+        (1080, 1920, "RGB"),
+        (224, 224, "RGB"),
+        (1, 1, "RGB"),
+        (672, 960, "RGB"),
+        (1600, 90, "RGB"),
+        (10, 8000, "RGB"),
+        (8000, 10, "RGB"),
+        (300, 200, "RGBA"),
+        (333, 777, "L"),
+    ),
+    ids=lambda value: str(value),
+)
+def test_gemma4_staging_matches_the_transformers_processor(
+    tmp_path, height, width, mode
+):
+    # Random bytes exercise every filter tap; 672x960 already fills the
+    # patch budget exactly, 1x1 upsamples, and the 10x8000 extremes take the
+    # one-pooled-row path. RGBA keeps random alpha to cover transparency.
+    generator = np.random.default_rng(height * 7919 + width)
+    channels = {"RGB": 3, "RGBA": 4, "L": 1}[mode]
+    raw = generator.integers(0, 256, (height, width, channels), dtype=np.uint8)
+    image = Image.fromarray(raw[..., 0] if mode == "L" else raw, mode=mode)
+    payload = _png(image)
+
+    result = prepare_image(
+        _diffusion_gemma_processor(tmp_path),
+        MediaCall.VISION_ENCODING,
+        payload,
+        device=torch.device("cpu"),
+        input_images=1,
+    )
+
+    # The reference receives the decoded file as Transformers callers pass
+    # it, and converts it to RGB itself.
+    reference = Gemma4ImageProcessor(
+        patch_size=16, max_soft_tokens=280, pooling_kernel_size=3
+    )
+    decoded = Image.open(io.BytesIO(base64.b64decode(payload)))
+    expected = reference(images=[decoded], return_tensors="pt")
+
+    count = int(result.pixels.shape[0])
+    assert (result.height, result.width) == (height, width)
+    torch.testing.assert_close(
+        result.pixels, expected["pixel_values"][0, :count], rtol=0, atol=0
+    )
+    # Rows follow the staged grid in raster order, which is where the
+    # reference places its (column, row) patch positions.
+    rows, columns = result.grid_shape
+    assert result.grid.tolist() == [[rows, columns]]
+    y, x = torch.meshgrid(
+        torch.arange(rows), torch.arange(columns), indexing="ij"
+    )
+    assert torch.equal(
+        torch.stack((x, y), dim=-1).reshape(-1, 2),
+        expected["image_position_ids"][0, :count],
+    )
+    assert (expected["image_position_ids"][0, count:] == -1).all()
+    assert count // 9 == int(expected["num_soft_tokens_per_image"][0])
+
+
+@pytest.mark.parametrize(
+    "case",
+    _DIFFUSION_GEMMA_TOKEN_CASES,
+    ids=lambda case: f"{case['width']}x{case['height']}",
+)
+def test_gemma4_staged_soft_tokens_match_the_server_planner(tmp_path, case):
+    image = Image.new("RGB", (case["width"], case["height"]), (90, 120, 150))
+
+    result = prepare_image(
+        _diffusion_gemma_processor(tmp_path),
+        MediaCall.VISION_ENCODING,
+        _png(image),
+        device=torch.device("cpu"),
+        input_images=2,
+    )
+
+    # 16-pixel patches, pooled 3x3 into one soft token each by the tower.
+    rows, columns = result.grid_shape
+    assert result.pixels.shape[0] == rows * columns
+    assert rows * columns // 9 == case["soft_tokens"]
+
+
+@pytest.mark.parametrize("alpha", ("white", "drop"))
+def test_alpha_policy_sets_the_color_of_transparent_pixels(alpha):
+    # Opaque pixels keep their color under both policies; fully transparent
+    # ones become white or keep their stored color.
+    raw = np.zeros((24, 32, 4), dtype=np.uint8)
+    raw[..., :3] = (10, 20, 30)
+    raw[:, :16, 3] = 255
+    processor = ImageProcessor(
+        vit=TowerTransform(StrideResize(32, 24, 1, 24 * 32), "signed_unit"),
+        staging_dtype=torch.float32,
+        alpha=alpha,
+    )
+
+    result = prepare_image(
+        processor,
+        MediaCall.VISION_ENCODING,
+        _png(Image.fromarray(raw, mode="RGBA")),
+        device=torch.device("cpu"),
+        input_images=1,
+    )
+
+    stored = torch.tensor([10, 20, 30]).float() / 255 * 2 - 1
+    transparent = torch.ones(3) if alpha == "white" else stored
+    torch.testing.assert_close(result.pixels[:, 0, 0], stored)
+    torch.testing.assert_close(result.pixels[:, 0, 31], transparent)

@@ -199,7 +199,7 @@ def vision_tokens(model: nn.Module, processor: ImageProcessor | None) -> int:
         return 0
     transform = processor.vit
     pixels = (
-        transform.max_pixels
+        transform.pixel_bound()
         if isinstance(transform, PatchTransform)
         else min(transform.resize.max_pixels, transform.resize.max_size**2)
     )
