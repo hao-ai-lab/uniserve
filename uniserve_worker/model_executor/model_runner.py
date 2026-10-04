@@ -131,6 +131,7 @@ class ModelRunner(Execution, ABC):
         self.expert_step = False
         self.expert_order = 0
         self.expert_joins = None
+        self.microbatch_joins = None
 
     @abstractmethod
     def batch_forward(
@@ -333,12 +334,14 @@ class ModelRunner(Execution, ABC):
             exchange = self.context.experts if self.expert_step else None
             if exchange is None or exchange.capacity:
                 return forward(batch)
-            exchange.begin(exchange.max_tokens)
+            exchange.warmup(exchange.max_tokens)
+            self.begin_expert_step(exchange.max_tokens)
             try:
-                result = forward(batch)
-                self.context.join_expert_layers()
+                result = self.warm_experts(
+                    joining_experts(forward, self.context), batch
+                )
             finally:
-                exchange.end()
+                self.end_expert_step()
             return result
 
     @torch.inference_mode()
@@ -411,7 +414,8 @@ class ModelRunner(Execution, ABC):
         try:
             for capacity in capacities:
                 if exchange is not None:
-                    exchange.begin(capacity)
+                    exchange.warmup(capacity)
+                    self.begin_expert_step(capacity)
                 try:
                     bucket.graphs[capacity] = self.capture_graph(
                         key,
@@ -425,7 +429,7 @@ class ModelRunner(Execution, ABC):
                     )
                 finally:
                     if exchange is not None:
-                        exchange.end()
+                        self.end_expert_step()
                 self.graph_storage.check()
         except BaseException as error:
             error.add_note(
@@ -458,6 +462,7 @@ class ModelRunner(Execution, ABC):
             pools=self.pools,
             cache=self.cache,
             predicates=self.decode_predicates,
+            warmup=self.warm_experts,
         )
 
     def replay_graph(self, key, execution, batch, *, borrow):
@@ -520,25 +525,7 @@ class ModelRunner(Execution, ABC):
         tokens = self.expert_tokens(batch)
         if selected is not None:
             tokens = max(tokens, self.graph_tokens(selected[0]))
-        while True:
-            with profile_range("uniserve.expert.agree"):
-                capacity = exchange.agree(tokens, kind=self.expert_order)
-            if exchange.kind == self.expert_order:
-                break
-            # Keep this capability's staged input intact while a peer's
-            # different capability runs. The join uses only expert backing,
-            # never this runner's attention, sampling or input buffers.
-            with profile_range(
-                f"uniserve.expert.step tokens=0 capacity={capacity}"
-            ):
-                if self.expert_joins is not None:
-                    self.expert_joins.replay(capacity)
-                else:
-                    exchange.begin(capacity)
-                    try:
-                        self.context.join_expert_layers()
-                    finally:
-                        exchange.end()
+        capacity = self._agree_expert_step(tokens)
         exchange.begin(capacity)
         try:
             # Query tokens describe this rank's input, before graph padding;
@@ -557,6 +544,89 @@ class ModelRunner(Execution, ABC):
         finally:
             exchange.end()
         return result
+
+    def _agree_expert_step(self, tokens):
+        """Keep pending input while other source groups advance."""
+        exchange = self.context.experts
+        while True:
+            with profile_range("uniserve.expert.agree"):
+                capacity = exchange.agree(tokens, kind=self.expert_order)
+            if not capacity:
+                continue
+            if exchange.active:
+                return capacity
+            # Keep this capability's staged input intact while a peer's
+            # different capability runs. The join uses only expert backing,
+            # never this runner's attention, sampling or input buffers.
+            with profile_range(
+                f"uniserve.expert.step tokens=0 capacity={capacity}"
+            ):
+                if self.expert_joins is not None:
+                    self.expert_joins.replay(capacity)
+                else:
+                    self.join_expert_step(capacity)
+
+    @torch.inference_mode()
+    def run_microbatches(self, batches, *, eligible, borrow_output=False):
+        """Evaluate independently staged whole-row batches in one expert step.
+
+        Every peer selects its own numerical graph. The transfer capacity
+        holds the largest selected extent; an empty peer only participates
+        in the expert layers. The rotation joins every stream before results
+        are concatenated, preserving request and sampling row order.
+        """
+        if self.microbatches is None or len(batches) != len(self.peers):
+            raise ValueError("microbatch inputs must match prepared peers")
+        with self.context.activate():
+            selected = [
+                None
+                if batch is None
+                else peer.select_graph_shape(batch, eligible=eligible)
+                for peer, batch in zip(self.peers, batches, strict=True)
+            ]
+            tokens = max(
+                max(
+                    peer.expert_tokens(batch),
+                    0 if shape is None else peer.graph_tokens(shape[0]),
+                )
+                for peer, batch, shape in zip(
+                    self.peers, batches, selected, strict=True
+                )
+                if batch is not None
+            )
+            capacity = self._agree_expert_step(tokens)
+            self.begin_expert_step(capacity)
+            try:
+
+                def run(peer, batch, shape):
+                    result = None
+                    if batch is None and peer.microbatch_joins is not None:
+                        peer.microbatch_joins.replay(capacity)
+                        return None
+                    if batch is not None:
+                        result = peer._run_forward(
+                            batch,
+                            peer.batch_forward,
+                            selected=shape,
+                            borrow_output=borrow_output,
+                        )
+                        result.validate_for(batch)
+                    peer.context.join_expert_layers()
+                    return result
+
+                outputs = self.microbatches(
+                    [
+                        partial(run, peer, batch, shape)
+                        for peer, batch, shape in zip(
+                            self.peers, batches, selected, strict=True
+                        )
+                    ]
+                )
+                return ExecutionOutput.combine(
+                    output for output in outputs if output is not None
+                )
+            finally:
+                self.end_expert_step()
 
     def _run_forward(self, batch, forward, *, selected, borrow_output=False):
         if selected is None:

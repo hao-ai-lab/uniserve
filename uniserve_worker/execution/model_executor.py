@@ -219,8 +219,11 @@ class ModelExecutor:
         image_processor=None,
         flow_prompt=None,
         max_inflight=1,
+        expert_group=None,
+        attention_ranks=0,
     ):
         self.model, self.worker_config = model, worker_config
+        self.expert_group, self.attention_ranks = expert_group, attention_ranks
         self._event_slots = max_inflight + 1
         self.attention = attention_backend(
             attention or worker_config.attention_backend or "auto",
@@ -247,7 +250,9 @@ class ModelExecutor:
                 canonical_device(worker_config.device),
                 worker_config.rank,
             )
-            group = Communicator((rank,), 0, device=device)
+            group = Communicator(
+                tuple(range(worker_config.world_size)), rank, device=device
+            )
             bindings = {}
             for name, calls in self._declarations.items():
                 temporal = any(
@@ -273,14 +278,14 @@ class ModelExecutor:
         bind_components(model, self.bindings, declarations=self._declarations)
         # A host rank holds components with no numerical method: it warms
         # nothing up and captures nothing, and its model is a description.
-        self.numerical = any(
+        self.numerical = worker_config.role == "experts" or any(
             binding.calls for binding in self.bindings.values()
         )
         self.state_buffers = media_state_buffers(
             self.bindings, self.media_builder
         )
 
-        self.entries: dict[tuple[str, str, str | None], ModelRunner] = {}
+        self.entries: dict[tuple[str, str, str | None, int], ModelRunner] = {}
         self._forward_calls: dict[tuple[str, CallKind], ModelRunner] = {}
         self._module_calls = {}
         self._call_kinds = {}
@@ -310,12 +315,17 @@ class ModelExecutor:
         # ``configure_inputs`` builds; ``None`` without such layers. The
         # runners stepping through it are registered at capture.
         self.experts = None
+        self._expert_exchanges = ()
+        self._microbatch_streams = []
         self.expert_weights = None
         self._expert_runners: list[ModelRunner] = []
         # With graphs, a rank without a forward of its own joins each expert
         # step by replaying the captured join of the step's capacity
         # (``JoinGraphs``), which startup captures after the runners' graphs.
         self._expert_joins = None
+        self._microbatch_joins = []
+        self._expert_execution = None
+        self._expert_executions = ()
         # A standalone denoiser's component, binding and call, the request
         # bank and latent pool its ladders gather through, and the one
         # runner that serves every layout the media builder admits.
@@ -1012,7 +1022,8 @@ class ModelExecutor:
         runner = self.canvas_runner
         if runner is None:
             raise RuntimeError("this rank runs no token denoising")
-        runner.bind_canvas_slots(slots)
+        for peer in runner.peers:
+            peer.bind_canvas_slots(slots)
         self.canvas_slots = slots
 
     @property
@@ -1145,7 +1156,7 @@ class ModelExecutor:
         binding = self.bindings.get(entry)
         if (
             binding is not None
-            and binding.process_group.global_rank not in binding.output_ranks
+            and binding.process_group.rank not in binding.output_ranks
         ):
             return None
 
@@ -1291,7 +1302,7 @@ class ModelExecutor:
                     "DWDP weight buffers require one execution lane"
                 )
             self.expert_weights = WeightPrefetch(self.model)
-        self.experts = self._expert_exchange(input_config.max_tokens)
+        self._configure_exchanges(input_config.max_tokens)
 
         # A decode or prefill row, and the request of every canvas a call
         # reads, holds at least one page of every cache group, so the pool's
@@ -1361,15 +1372,23 @@ class ModelExecutor:
                 & {MediaCall.LATENT_ENCODING, MediaCall.IMAGE_DECODING}
                 else placement.device
             )
+            runner_class = self._runner_types[id(call)]
+            token_runner = issubclass(runner_class, (TextRunner, CanvasRunner))
             streams = [
-                (lane, stream)
+                (lane, stream, 0)
                 for lane, stream in self._lane_streams
                 if stream.device == target
             ]
+            if token_runner and self.experts is not None:
+                streams.extend(
+                    (streams[0][0], stream, index)
+                    for index, stream in enumerate(self._microbatch_streams, 1)
+                )
             # One runner per stream on the target device whose lane covers
             # some of the entry's kinds (a full-device stream covers all);
             # with no stream there, as on a CPU device, one runner without.
-            for lane, stream in streams or ((None, None),):
+            peers = []
+            for lane, stream, microbatch in streams or ((None, None, 0),):
                 kinds = (
                     entry_kinds
                     if lane is None
@@ -1487,7 +1506,9 @@ class ModelExecutor:
                             stream=stream,
                             groups=call.groups,
                             derive_host_lengths=False,
-                            experts=self.experts,
+                            experts=self._expert_exchanges[microbatch]
+                            if self.experts is not None
+                            else None,
                             weights=self.expert_weights,
                         )
                         # Text staging counts canonical tokens. Spatial codecs
@@ -1498,10 +1519,6 @@ class ModelExecutor:
                             TextSize(fields.max_tokens, fields.max_rows)
                             if reads_cache
                             else None
-                        )
-                        runner_class = self._runner_types[id(call)]
-                        token_runner = issubclass(
-                            runner_class, (TextRunner, CanvasRunner)
                         )
                         pool_key = (str(target), id(stream))
                         entry = runner_class(
@@ -1551,8 +1568,14 @@ class ModelExecutor:
                     raise
 
                 self.entries[
-                    (name, path, None if lane is None else lane.lane_id)
+                    (
+                        name,
+                        path,
+                        None if lane is None else lane.lane_id,
+                        microbatch,
+                    )
                 ] = entry
+                peers.append(entry)
                 self.decode_shapes[entry], self.prefill_shapes[entry] = (
                     decode,
                     prefill,
@@ -1565,11 +1588,62 @@ class ModelExecutor:
 
                 for kind in kinds:
                     key = (name, kind)
+                    if microbatch:
+                        continue
                     if key in self._forward_calls:
                         raise ValueError(
                             f"computation {key} has multiple lane bindings"
                         )
                     self._forward_calls[key] = entry
+            if token_runner and self.worker_config.expert_microbatches > 1:
+                peers[0].bind_microbatches(peers)
+
+    def _configure_exchanges(self, max_tokens):
+        """Allocate a distinct expert buffer and stream per microbatch."""
+        self.experts = self._expert_exchange(max_tokens)
+        if self.experts is None:
+            if self.worker_config.expert_microbatches != 1:
+                raise ValueError("microbatch execution requires routed experts")
+            return
+        exchanges = [self.experts]
+        stream = self._lane_streams[0][1]
+        for _ in range(1, self.worker_config.expert_microbatches):
+            exchanges.append(self._expert_exchange(max_tokens))
+            self._microbatch_streams.append(stream.fork())
+        self._expert_exchanges = tuple(exchanges)
+
+    def configure_experts(self):
+        """Prepare an expert-only context using the worker's normal owners."""
+        from uniserve_worker.model_executor.cuda_graph import Execution
+
+        config = self.worker_config
+        self._initialize_streams(event_slots=self._event_slots)
+        self._configure_exchanges(config.max_batch_tokens)
+        if self.experts is None:
+            raise ValueError("expert workers require an expert exchange")
+        peers = []
+        for stream, exchange in zip(
+            (self._lane_streams[0][1], *self._microbatch_streams),
+            self._expert_exchanges,
+            strict=True,
+        ):
+            context = ExecutionContext(
+                self.model, stream=stream, experts=exchange
+            )
+            entry = Execution(
+                context,
+                storage=self.graph_storage,
+                devices=()
+                if config.graph_policy == "off"
+                else (stream.device,),
+            )
+            peers.append(entry)
+            self._expert_executions = tuple(peers)
+            with self.graph_storage.allocate(entry):
+                context.prepare(TextSize(exchange.max_tokens, 1))
+        self._expert_execution = peers[0]
+        if len(peers) > 1:
+            peers[0].bind_microbatches(peers)
 
     def _expert_exchange(self, max_tokens):
         """Build the worker's all-to-all exchange for expert-parallel layers.
@@ -1595,20 +1669,23 @@ class ModelExecutor:
         layers = [
             module
             for module in self.model.modules()
-            if isinstance(module, FusedMoE) and module.expert_group.size > 1
+            if isinstance(module, FusedMoE)
+            and (self.attention_ranks or module.expert_group.size > 1)
         ]
         if not layers:
             return None
         first = layers[0]
         shape = (
-            first.expert_group,
+            self.expert_group if self.attention_ranks else first.expert_group,
             first.num_experts,
             first.top_k,
             first.hidden_size,
         )
         if any(
             (
-                layer.expert_group,
+                self.expert_group
+                if self.attention_ranks
+                else layer.expert_group,
                 layer.num_experts,
                 layer.top_k,
                 layer.hidden_size,
@@ -1624,13 +1701,32 @@ class ModelExecutor:
             raise ValueError(
                 "an expert-parallel worker runs its forwards on one lane"
             )
+        if self.attention_ranks:
+            # The source's numerical staging includes graph padding and
+            # multimodal rows, which expert-only ranks do not allocate.
+            # Borrow that bound before allocating collective workspaces.
+            capacity = torch.tensor(max_tokens, dtype=torch.int64)
+            torch.distributed.broadcast(
+                capacity,
+                src=self.expert_group.ranks[0],
+                group=self.expert_group._require(),
+            )
+            max_tokens = int(capacity.item())
+        source_group = None
+        if self.attention_ranks and self.worker_config.role != "experts":
+            first_rank = self.expert_group.rank - self.worker_config.rank
+            source_group = self.expert_group.ranks[
+                first_rank : first_rank + self.worker_config.world_size
+            ]
         return ExpertExchange(
-            first.expert_group,
+            self.expert_group if self.attention_ranks else first.expert_group,
             max_tokens=max_tokens,
             top_k=first.top_k,
             num_experts=first.num_experts,
             hidden_size=first.hidden_size,
-            device=first.up_gate.weight.device,
+            device=canonical_device(self.worker_config.device),
+            attention_ranks=self.attention_ranks,
+            source_group=source_group,
             transport=self.worker_config.expert_exchange,
             intermediate_size=first.intermediate_size,
             activation=first.activation,
@@ -1651,26 +1747,37 @@ class ModelExecutor:
             return
         self._expert_runners = []
         for entry in self.entries.values():
+            if entry.peers[0] is not entry:
+                continue
             if entry.context.experts is not exchange or not (
                 {ForwardMode.PREFILL, ForwardMode.TOKEN_DENOISING}
                 & set(entry.call_kinds)
             ):
                 continue
-            entry.expert_step = True
-            entry.expert_order = len(self._expert_runners)
+            for peer in entry.peers:
+                peer.expert_step = True
+                peer.expert_order = len(self._expert_runners)
             self._expert_runners.append(entry)
 
         # Warmup executes collectives too. Equal transfer catalogs alone do
         # not establish that peers capture the same local numerical calls.
         plan = (
             exchange.capacities,
+            self.worker_config.expert_microbatches,
             tuple(entry.capture_plan() for entry in self._expert_runners),
         )
         plans = [None] * exchange.group.size
         torch.distributed.all_gather_object(
             plans, plan, group=exchange.group._require()
         )
-        if any(other != plan for other in plans):
+        sources = (
+            plans[: exchange.attention_ranks]
+            if exchange.attention_ranks
+            else plans
+        )
+        if any(other != sources[0] for other in sources) or any(
+            other[:2] != sources[0][:2] for other in plans
+        ):
             raise RuntimeError(
                 f"expert-parallel ranks have different capture plans: {plans}"
             )
@@ -1685,16 +1792,18 @@ class ModelExecutor:
         an exchange nothing happens.
         """
         exchange = self.experts
-        if exchange is None or not self._expert_runners:
+        if exchange is None or not (
+            self._expert_runners or self._expert_execution
+        ):
             return False
         with profile_range("uniserve.expert.agree"):
             capacity = exchange.agree(0, leaving=leaving)
         if not capacity:
             return False
-        runner = self._expert_runners[0]
-        context, stream = runner.context, runner.context.stream
+        runner = self._expert_execution or self._expert_runners[0]
+        stream = runner.context.stream
         if stream is not None:
-            stream.wait(torch.cuda.current_stream(runner.device))
+            stream.wait(torch.cuda.current_stream(stream.device))
         try:
             with (
                 torch.inference_mode(),
@@ -1708,15 +1817,10 @@ class ModelExecutor:
                     self._expert_joins.replay(capacity)
                 else:
                     # Without graphs every step, joins included, is eager.
-                    with context.activate():
-                        exchange.begin(capacity)
-                        try:
-                            context.join_expert_layers()
-                        finally:
-                            exchange.end()
+                    runner.join_expert_step(capacity)
         finally:
             if stream is not None:
-                torch.cuda.current_stream(runner.device).wait_stream(
+                torch.cuda.current_stream(stream.device).wait_stream(
                     stream.stream
                 )
         return True
@@ -1783,6 +1887,14 @@ class ModelExecutor:
         )
 
         self._bind_expert_steps()
+        if self._expert_execution is not None:
+            # Model ranks publish each actual eager call before graph
+            # capture. Expert ranks need only the layer sequence and capacity.
+            while capacity := self.experts.warmup():
+                self._expert_execution.join_expert_step(capacity)
+            self._capture_expert_joins()
+            self.synchronize()
+            return
         for phase in ("prefill", "decode", "canvas", "flow"):
             for entry in self.entries.values():
                 forward = entry.batch_forward
@@ -1816,6 +1928,8 @@ class ModelExecutor:
 
                     prepare_flow(self, entry, latents, tokenizer)
         prepare_images(self, latents)
+        if self.experts is not None and self.attention_ranks:
+            self.experts.warmup(0)
         self._capture_expert_joins()
         self.synchronize()
 
@@ -1835,9 +1949,11 @@ class ModelExecutor:
         from uniserve.runtime.expert_exchange import JoinGraphs
 
         exchange = self.experts
-        if exchange is None or not self._expert_runners:
+        if exchange is None or not (
+            self._expert_runners or self._expert_execution
+        ):
             return
-        runner = self._expert_runners[0]
+        runner = self._expert_execution or self._expert_runners[0]
         if not runner.pools:
             return
         self._expert_joins = JoinGraphs(
@@ -1845,9 +1961,29 @@ class ModelExecutor:
             exchange,
             exchange.capacities,
             pools=runner.pools,
+            step=runner.join_expert_step,
         )
         for entry in self._expert_runners:
-            entry.expert_joins = self._expert_joins
+            for peer in entry.peers:
+                peer.expert_joins = self._expert_joins
+
+        if not self._expert_runners or runner.microbatches is None:
+            return
+        # Empty and populated microbatches use the same execution mode.
+        # The complete join above warms every peer at every capacity. Each
+        # independent join now captures in that peer's own allocation pool,
+        # so it can overlap a populated peer without sharing its scratch.
+        for index, peer in enumerate(runner.peers):
+            joins = JoinGraphs(
+                peer.context,
+                peer.context.experts,
+                exchange.capacities,
+                pools=peer.pools,
+                warm=False,
+            )
+            self._microbatch_joins.append(joins)
+            for entry in self._expert_runners:
+                entry.peers[index].microbatch_joins = joins
 
     def complete_startup(self):
         """Seal startup: check captured-graph storage budgets and stream grants.
@@ -1956,6 +2092,7 @@ class ModelExecutor:
         """
         streams = [self._preparation_stream]
         streams.extend(stream.stream for _, stream in self._lane_streams)
+        streams.extend(stream.stream for stream in self._microbatch_streams)
         streams.extend(
             stream.stream for stream in self._module_streams.values()
         )
@@ -1997,6 +2134,8 @@ class ModelExecutor:
         joins, self._expert_joins = self._expert_joins, None
         if joins is not None:
             actions.append(joins.close)
+        microbatch_joins, self._microbatch_joins = self._microbatch_joins, []
+        actions.extend(joins.close for joins in microbatch_joins)
         close_resources(*actions)
 
     def close(self, *, aborted: bool = False):
@@ -2029,6 +2168,7 @@ class ModelExecutor:
                     partial(owner.close, aborted=True)
                     for owner in (
                         *self._module_streams.values(),
+                        *self._microbatch_streams,
                         *(owner for _, owner in self._lane_streams),
                     )
                 )
@@ -2047,6 +2187,8 @@ class ModelExecutor:
             actions.append(entry.close)
         if self.expert_weights is not None:
             actions.append(self.expert_weights.close)
+        actions.extend(entry.close for entry in self._expert_executions)
+        actions.extend(exchange.close for exchange in self._expert_exchanges)
 
         # Each stream retires the communicators every context on it shared,
         # then its native resources. Streams close in reverse creation order
@@ -2055,6 +2197,9 @@ class ModelExecutor:
         actions.extend(
             stream.close
             for stream in reversed(tuple(self._module_streams.values()))
+        )
+        actions.extend(
+            stream.close for stream in reversed(self._microbatch_streams)
         )
         actions.extend(
             stream.close for _, stream in reversed(self._lane_streams)
@@ -2070,6 +2215,9 @@ class ModelExecutor:
             self.graph_storage.close()
             self._module_streams.clear()
             self._lane_streams.clear()
+            self._microbatch_streams.clear()
+            self._expert_exchanges = ()
+            self._expert_executions = ()
 
     def prepare_text_tokens(self, tokens: tuple[int, ...]) -> torch.Tensor:
         """Prepare the text encoder's input using its own reusable backing."""
@@ -2337,14 +2485,38 @@ class ModelExecutor:
                     else torch.cuda.stream(lane_runtime.stream)
                 )
                 with stream_context:
-                    batch = entry.prepare_inputs(
-                        tasks,
-                        forward_mode=forward_mode,
-                        cache=cache,
-                        tables=tables,
-                        states=states,
+                    if entry.microbatches is not None:
+                        # Partitioning does not enlarge the worker's public
+                        # batch admission bounds.
+                        buffers.validate_rows(tasks)
+                    batches = []
+                    count = len(entry.peers)
+                    for index, peer in enumerate(entry.peers):
+                        # Whole request rows preserve causal attention and
+                        # give simultaneous microbatches disjoint KV writes.
+                        first = index * len(tasks) // count
+                        last = (index + 1) * len(tasks) // count
+                        batches.append(
+                            None
+                            if first == last
+                            else peer.prepare_inputs(
+                                tasks[first:last],
+                                forward_mode=forward_mode,
+                                cache=cache,
+                                tables=tables,
+                                states=states,
+                            )
+                        )
+                    populated = [
+                        batch for batch in batches if batch is not None
+                    ]
+                    request_pool_indices = (
+                        populated[0].request_pool_indices
+                        if count == 1
+                        else torch.cat(
+                            [batch.request_pool_indices for batch in populated]
+                        )
                     )
-                    request_pool_indices = batch.request_pool_indices
             except Exception as error:
                 # Join staging copies already submitted to the lane before
                 # reporting, as for execution failures below.
@@ -2360,19 +2532,27 @@ class ModelExecutor:
                 # Only a uniform single-token last-logits decode may borrow the
                 # graph's output storage; mixed rows receive owned values.
                 with torch.inference_mode():
-                    output = entry.run_batch(
-                        batch,
-                        entry.batch_forward,
-                        eligible=graph_eligible,
-                        borrow_output=all(
-                            isinstance(task, TokenRow)
-                            and task.query_tokens == 1
-                            and task.selection is TokenSelection.LAST_LOGITS
-                            for task in tasks
-                        ),
+                    borrow_output = all(
+                        isinstance(task, TokenRow)
+                        and task.query_tokens == 1
+                        and task.selection is TokenSelection.LAST_LOGITS
+                        for task in tasks
                     )
+                    if entry.microbatches is None:
+                        output = entry.run_batch(
+                            populated[0],
+                            entry.batch_forward,
+                            eligible=graph_eligible,
+                            borrow_output=borrow_output,
+                        )
+                        output.validate_for(populated[0])
+                    else:
+                        output = entry.run_microbatches(
+                            batches,
+                            eligible=graph_eligible,
+                            borrow_output=borrow_output,
+                        )
 
-                output.validate_for(batch)
                 _validate_outputs(output.values, tasks, target)
 
                 output_event = (
@@ -2386,7 +2566,11 @@ class ModelExecutor:
                 # The mode's token counter counts the query tokens the group
                 # computed; encoder and decoder groups have none and report
                 # only their call and time.
-                tokens = batch.query_tokens
+                tokens = (
+                    None
+                    if any(batch.query_tokens is None for batch in populated)
+                    else sum(batch.query_tokens for batch in populated)
+                )
                 stats = replace(
                     output.stats,
                     mode_counts={forward_mode.value: 1},
