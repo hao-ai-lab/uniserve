@@ -9527,6 +9527,7 @@ dependencies = [
  "pyo3",
  "pythonize",
  "uniserve-core",
+ "uniserve-worker",
  "uniserve-worker-ipc",
 ]
 
@@ -9594,6 +9595,16 @@ dependencies = [
  "uuid",
  "validator",
  "winnow 1.0.3",
+]
+
+[[package]]
+name = "uniserve-worker"
+version = "0.2.0"
+dependencies = [
+ "indexmap 2.14.0",
+ "pyo3",
+ "uniserve-core",
+ "uniserve-worker-ipc",
 ]
 
 [[package]]

@@ -1,6 +1,8 @@
 # Execution
 
-UniServe schedules requests in Rust and executes numerical calls in Python workers. Models expose computational capabilities through ordinary modules; the worker binds their attention, matrix multiplication and expert layers to execution resources. Request identities, KV allocations, sampling state, streams and CUDA graphs belong to the engine and worker.
+UniServe schedules requests in Rust and executes numerical calls through a Python and PyTorch backend. Models expose computational capabilities through ordinary modules; the worker binds their attention, matrix multiplication and expert layers to execution resources. Request identities, KV allocations, sampling state, streams and CUDA graphs belong to the engine and worker.
+
+The worker's native `RequestPool` binds each admitted request epoch to the engine-assigned slot. It tracks pending calls, accepts progress without allowing late results to roll it back, and rejects stale epochs after slot reuse. A `Request` retains numerical state for its observers until the executor drains its work and the pool retires it. Direct Python callers and serving share this lifecycle through the same native extension.
 
 ## Token and canvas calls
 

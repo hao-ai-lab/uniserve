@@ -1,4 +1,4 @@
-//! Python bindings for a rank's end of its worker channel.
+//! Native worker objects and bindings for a rank's end of its worker channel.
 //!
 //! The `_uniserve_ipc` extension module exposes `Server`, which owns the
 //! rank's `RankServer` (iceoryx2 shared storage for a rank on the head's
@@ -7,6 +7,8 @@
 //! `atomic_store_u32` / `atomic_load_u32` accessors for shared-storage segment
 //! header words. The hand-written stub `uniserve_worker/_uniserve_ipc.pyi`
 //! describes the same Python surface and must stay consistent with it.
+//! Request lifecycle objects are implemented by `uniserve-worker` and
+//! registered here so serving and direct Python calls use one native runtime.
 //!
 //! # Boundary conversions
 //!
@@ -587,6 +589,7 @@ fn atomic_load_u32(buffer: PyBuffer<u8>, offset: usize) -> PyResult<u32> {
 #[pymodule]
 /// Registers the worker IPC Python extension module.
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    uniserve_worker::register(m)?;
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;

@@ -1,0 +1,14 @@
+[package]
+name = "uniserve-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+indexmap.workspace = true
+pyo3.workspace = true
+uniserve-core.workspace = true
+uniserve-worker-ipc.workspace = true
+
+[lints]
+workspace = true

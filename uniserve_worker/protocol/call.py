@@ -166,7 +166,7 @@ class DrawLayout(StrEnum):
 # `CallKind::advances_state`. `RequestPool.predecessors` chains a request's
 # calls from its latest state-advancing call (on the media path only
 # state-advancing calls join the chain), and `RequestPool.apply_result` moves
-# the request's `state_call_id` only on an OK result of one of these.
+# the request's accepted state predecessor only on an OK result of one of these.
 _STATE_ADVANCING_WORK = frozenset(
     {
         *ForwardMode,
