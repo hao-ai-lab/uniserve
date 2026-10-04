@@ -11,6 +11,7 @@ mod buffer;
 mod error;
 mod protocol;
 mod request;
+mod storage;
 
 /// Register the worker objects in the common native extension.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -18,5 +19,9 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<buffer::BufferPool>()?;
     module.add_class::<request::Request>()?;
     module.add_class::<request::RequestPool>()?;
+    module.add_class::<storage::Buffer>()?;
+    module.add_class::<storage::TensorRead>()?;
+    module.add_class::<storage::TensorImport>()?;
+    module.add_class::<storage::TensorStore>()?;
     Ok(())
 }

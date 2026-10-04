@@ -11,12 +11,14 @@ numerical execution. ``BufferPool`` binds scheduler-assigned storage and issues
 its numerical ``BufferBinding`` views.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import Future
 from types import TracebackType
 from typing import Any, Self, final
 
 import torch
 
+from uniserve.runtime import EventPool
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
@@ -29,19 +31,217 @@ from uniserve_worker.protocol.batch import (
 from uniserve_worker.protocol.call import Call, ImageParams
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.tensor import TensorRef
+from uniserve_worker.protocol.transfer import TensorTransfer, WorkerEndpoint
 from uniserve_worker.storage.request_slots import RequestSlots
+from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
+from uniserve_worker.transport.exports import ExportLocations
+from uniserve_worker.transport.interface import Transport
+from uniserve_worker.transport.ticket import TransferTicket
 
 __all__ = [
+    "Buffer",
     "BufferBinding",
     "BufferPool",
     "Request",
     "RequestPool",
     "Server",
     "StreamSignal",
+    "TensorImport",
+    "TensorRead",
+    "TensorStore",
     "atomic_load_u32",
     "atomic_store_u32",
     "service_name",
 ]
+
+@final
+class Buffer:
+    """An allocation-backed value owned and mutated by its tensor store."""
+
+    @property
+    def reference(self) -> TensorRef: ...
+    @property
+    def tensor(self) -> torch.Tensor: ...
+    @property
+    def logical_shape(self) -> tuple[int, ...]: ...
+    @property
+    def region(self) -> tuple[slice, ...] | None: ...
+    @property
+    def metadata(self) -> ImageMetadata | FeatureMetadata | None: ...
+    @property
+    def producer_recorded(self) -> bool: ...
+    @property
+    def feature(self) -> bool: ...
+
+@final
+class TensorRead:
+    """A read lease retaining the tensor view acquired from its buffer."""
+
+    @property
+    def tensor(self) -> torch.Tensor: ...
+    @property
+    def region(self) -> tuple[slice, ...] | None: ...
+    @property
+    def metadata(self) -> ImageMetadata | FeatureMetadata | None: ...
+    @property
+    def imported(self) -> TensorImport | None: ...
+
+@final
+class TensorImport:
+    """The transfers filling missing regions for one or more read leases."""
+
+    @property
+    def tickets(self) -> tuple[TransferTicket, ...]: ...
+
+@final
+class TensorStore:
+    """Own buffer visibility, import coordination, and physical retirement."""
+
+    def __new__(
+        cls,
+        *,
+        capacity: int = 0,
+        byte_capacity: int | None = None,
+        max_entry_bytes: int = 1,
+        devices: tuple[torch.device | str, ...] = (),
+        request_capacity: int = 0,
+        relay_depth: int = 0,
+        buffer_pool: BufferPool,
+        event_pool: EventPool | None = None,
+    ) -> Self: ...
+    @property
+    def capacity(self) -> int: ...
+    @property
+    def byte_capacity(self) -> int: ...
+    @property
+    def max_entry_bytes(self) -> int: ...
+    @property
+    def devices(self) -> tuple[torch.device, ...]: ...
+    @property
+    def request_capacity(self) -> int: ...
+    @property
+    def relay_depth(self) -> int: ...
+    @property
+    def buffer_pool(self) -> BufferPool: ...
+    @property
+    def event_pool(self) -> EventPool: ...
+    @property
+    def exports(self) -> dict[BufferId, ExportLocations]: ...
+    def bind_outputs(
+        self,
+        bindings: tuple[tuple[TensorRef, torch.device | str], ...],
+        *,
+        request_slots: Mapping[RequestKey, int] | None = None,
+        buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
+        regions: Mapping[TensorRef, tuple[slice, ...]] | None = None,
+        shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
+    ) -> tuple[Buffer, ...]: ...
+    def reserve_features(
+        self,
+        bindings: tuple[tuple[TensorRef, torch.device | str], ...],
+        *,
+        buffer_allocations: Mapping[BufferId, BufferAllocation],
+        regions: Mapping[TensorRef, tuple[slice, ...]] | None = None,
+        shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
+    ) -> tuple[Buffer, ...]: ...
+    def bind_output_groups(
+        self,
+        groups: tuple[tuple[tuple[TensorRef, torch.device | str], ...], ...],
+        *,
+        request_slots: Mapping[RequestKey, int] | None = None,
+        buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
+        regions: Mapping[TensorRef, tuple[slice, ...]] | None = None,
+        shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
+    ) -> tuple[tuple[Buffer, ...], ...]: ...
+    def producer_write_views(
+        self, writes: tuple[Buffer, ...]
+    ) -> tuple[torch.Tensor, ...]: ...
+    def publish_write(
+        self,
+        write: Buffer,
+        value: torch.Tensor,
+        *,
+        producer_event: torch.cuda.Event | None = None,
+        metadata: ImageMetadata | FeatureMetadata | None = None,
+    ) -> torch.Tensor: ...
+    def publish_writes(
+        self,
+        writes: tuple[Buffer, ...],
+        values: torch.Tensor,
+        *,
+        producer_event: torch.cuda.Event | None = None,
+    ) -> tuple[torch.Tensor, ...]: ...
+    def publish_scalar_write(
+        self,
+        write: Buffer,
+        value: bool | int,
+        *,
+        producer_event: torch.cuda.Event | None = None,
+    ) -> torch.Tensor: ...
+    def consume(
+        self,
+        reference: TensorRef,
+        *,
+        consumer_call_id: CallId,
+        device: torch.device | str | None = None,
+    ) -> TensorRead: ...
+    def consume_batch(
+        self,
+        requests: tuple[
+            tuple[TensorRef, CallId, torch.device | str | None], ...
+        ],
+        *,
+        device: torch.device | str | None = None,
+    ) -> tuple[TensorRead, ...]: ...
+    def complete_reads(
+        self,
+        reads: tuple[TensorRead, ...],
+        *,
+        device: torch.device | str | None = None,
+        after_writes: tuple[Buffer, ...] = (),
+    ) -> None: ...
+    def import_tensor(
+        self,
+        reference: TensorRef,
+        tensor: TensorTransfer,
+        *,
+        device: torch.device | str,
+        bindings: Mapping[tuple[WorkerEndpoint, str], Transport],
+        request_slots: Mapping[RequestKey, int],
+        buffer_allocations: Mapping[BufferId, BufferAllocation],
+        metadata: ImageMetadata | FeatureMetadata | None = None,
+    ) -> TensorRead: ...
+    def wait_import(self, read: TensorRead) -> None: ...
+    def complete_import(self, read: TensorRead) -> None: ...
+    def defer_write(self, write: Buffer) -> None: ...
+    def validate_writes(self, writes: tuple[Buffer, ...]) -> None: ...
+    def commit_writes(self, writes: tuple[Buffer, ...]) -> None: ...
+    def retain_publication(
+        self, write: Buffer, retirement: Future[None]
+    ) -> None: ...
+    def retain_transfer(
+        self, write: Buffer, ticket: TransferTicket
+    ) -> None: ...
+    def abandon_writes(self, writes: tuple[Buffer, ...]) -> None: ...
+    def release_calls(
+        self, releases: Iterable[tuple[RequestKey, CallId]]
+    ) -> None: ...
+    def release_buffers(self, buffers: Iterable[BufferId]) -> None: ...
+    def release_requests(
+        self,
+        requests: Iterable[RequestKey],
+        *,
+        retained: frozenset[BufferId] = frozenset(),
+    ) -> None: ...
+    def retirement_ready(
+        self,
+        *,
+        buffers: frozenset[BufferId],
+        requests: frozenset[RequestKey],
+        retained: frozenset[BufferId] = frozenset(),
+    ) -> bool: ...
+    def resident_bytes(self, device: torch.device | str) -> int: ...
+    def close(self) -> None: ...
 
 @final
 class BufferBinding:

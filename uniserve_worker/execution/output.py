@@ -50,7 +50,7 @@ from uniserve_worker.sampling.result import LogprobValues, SamplerRow
 from uniserve_worker.storage.canvas_slots import STEP_SKIPPED, STEP_STOPPED
 from uniserve_worker.storage.latent_pool import LatentStaging, LatentUpdate
 from uniserve_worker.storage.output import OutputBuffer
-from uniserve_worker.storage.tensor_store import TensorRead, TensorRecord
+from uniserve_worker.storage.tensor_store import Buffer, TensorRead
 from uniserve_worker.transport.exports import ExportLocations
 
 logger = logging.getLogger(__name__)
@@ -383,12 +383,12 @@ class PendingOutput:
         ) = None
         self.device_reads: list[TensorRead] = []
         self.feature_reads: list[TensorRead] = []
-        self.writes: list[TensorRecord] = []
+        self.writes: list[Buffer] = []
         self.predicate: tuple[torch.Tensor, bool] | None = None
-        self.token_write: TensorRecord | None = None
-        self.transition_write: TensorRecord | None = None
-        self.completion_write: TensorRecord | None = None
-        self.producer_write: TensorRecord | None = None
+        self.token_write: Buffer | None = None
+        self.transition_write: Buffer | None = None
+        self.completion_write: Buffer | None = None
+        self.producer_write: Buffer | None = None
 
         self.kv_output: KvTransfer | None = None
         # When host tasks produce a product's bytes, `products` is empty at
