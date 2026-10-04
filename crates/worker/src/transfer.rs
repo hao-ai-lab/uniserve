@@ -1,9 +1,9 @@
-//! Rank-wide storage and read budgets shared by transport backends.
+//! Transfer admission, readable results, and physical retirement.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::{Error, Result};
+use crate::{Completion, Error, Outcome, Result};
 
 struct CapacityState<C> {
     used: u64,
@@ -186,5 +186,161 @@ impl<C> Drop for ReadReservation<C> {
         if let Err(error) = self.close() {
             eprintln!("Failed to return unused read credits: {error}");
         }
+    }
+}
+
+/// A read's result and physical lifetime. The transport serializes mutations
+/// and dispatches returned callbacks after releasing its ownership lock.
+///
+/// A consumable view can be followed by a device failure, so result readiness
+/// is separate from the one-shot physical retirement completion.
+pub struct TransferTicket<V, E, C> {
+    value: Option<Arc<V>>,
+    error: Option<Arc<E>>,
+    cancelled: bool,
+    borrowed: bool,
+    closed: bool,
+    undrained: bool,
+    callbacks: Vec<C>,
+    pub retirement: Arc<Completion<E, C>>,
+}
+
+impl<V, E, C> TransferTicket<V, E, C> {
+    pub fn new(borrowed: bool) -> Self {
+        Self {
+            value: None,
+            error: None,
+            cancelled: false,
+            borrowed,
+            closed: false,
+            undrained: false,
+            callbacks: Vec::new(),
+            retirement: Arc::new(Completion::default()),
+        }
+    }
+
+    pub fn ready(&self) -> bool {
+        self.value.is_some() || self.error.is_some()
+    }
+
+    pub fn retired(&self) -> bool {
+        self.retirement.succeeded()
+    }
+
+    pub fn undrained(&self) -> bool {
+        self.undrained
+    }
+
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+
+    pub fn retirement_ready(&self) -> Result<bool> {
+        if self.undrained {
+            return Err(Error::Resource("transfer physical completion is unknown"));
+        }
+
+        Ok(self.retired())
+    }
+
+    pub fn add_done_callback(&mut self, callback: C) -> Option<C> {
+        if self.ready() {
+            return Some(callback);
+        }
+
+        self.callbacks.push(callback);
+        None
+    }
+
+    /// Cancellation revokes consumption, but does not end a submitted access.
+    pub fn cancel(&mut self, error: E) -> Vec<C> {
+        self.cancelled = true;
+        if self.error.is_none() {
+            self.error = Some(Arc::new(error));
+        }
+
+        std::mem::take(&mut self.callbacks)
+    }
+
+    pub fn cancellation_error(&self) -> Option<Arc<E>> {
+        if self.cancelled {
+            self.error.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Expose a completed view without replacing an earlier error or result.
+    pub fn complete(&mut self, value: V) -> Vec<C> {
+        if self.ready() {
+            return Vec::new();
+        }
+
+        self.value = Some(Arc::new(value));
+        std::mem::take(&mut self.callbacks)
+    }
+
+    /// Return whether consumers could already have observed a successful view.
+    /// Such a failure also invalidates the transport pool, not just this read.
+    pub fn fail(&mut self, error: E) -> (bool, Vec<C>) {
+        let late = self.value.is_some();
+        self.error = Some(Arc::new(error));
+        (late, std::mem::take(&mut self.callbacks))
+    }
+
+    pub fn result(&self) -> Result<Outcome<E, Arc<V>>> {
+        if let Some(error) = &self.error {
+            return Ok(Outcome::Failed(Arc::clone(error)));
+        }
+
+        let value = self.value.as_ref().ok_or(Error::State(
+            "transfer ticket was observed before readiness",
+        ))?;
+        if self.closed {
+            return Err(Error::State("transfer consumption has already closed"));
+        }
+
+        Ok(Outcome::Success(Arc::clone(value)))
+    }
+
+    /// End borrowed consumption once. Copy destinations retain their ordinary
+    /// value ownership and remain readable after close.
+    pub fn close(&mut self) -> bool {
+        if !self.borrowed || self.closed {
+            return false;
+        }
+
+        self.closed = true;
+        true
+    }
+
+    /// The backend could not drain device access. It must retain its backing
+    /// allocations; neither cancellation nor result failure permits reuse.
+    pub fn mark_undrained(&mut self) {
+        self.undrained = true;
+    }
+
+    pub fn retire(&self) -> Result<Vec<C>> {
+        if self.undrained {
+            return Err(Error::Invariant(
+                "transfer cannot retire with unknown physical completion".into(),
+            ));
+        }
+
+        self.retirement.complete(Ok(()))
+    }
+
+    pub fn value(&self) -> Option<&V> {
+        self.value.as_deref()
+    }
+
+    pub fn error(&self) -> Option<&E> {
+        self.error.as_deref()
+    }
+
+    /// Trace result references and pending readiness observers. Physical
+    /// retirement observers are traced through their shared Completion.
+    pub fn visit<R>(&self, visitor: impl FnOnce(Option<&V>, Option<&E>, &[C]) -> R) -> R {
+        visitor(self.value(), self.error(), &self.callbacks)
     }
 }

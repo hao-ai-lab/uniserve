@@ -3,7 +3,7 @@
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 
-use uniserve_worker::{Error, ReadReservation, TransferCapacity};
+use uniserve_worker::{Error, Outcome, ReadReservation, TransferCapacity, TransferTicket};
 
 type Callback = Box<dyn FnOnce() + Send>;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -138,5 +138,96 @@ fn closing_a_reservation_racing_submission_returns_each_unused_credit_once() -> 
     capacity.return_reads(submitted)?;
     capacity.take_reads(8)?;
     capacity.return_reads(8)?;
+    Ok(())
+}
+
+#[test]
+fn cancelling_a_read_does_not_return_its_physical_credit() -> TestResult {
+    let capacity = Arc::new(TransferCapacity::new(8, 1, notify)?);
+    capacity.take_reads(1)?;
+    let mut ticket = TransferTicket::<Vec<u8>, &str, Callback>::new(false);
+    let (tx, rx) = mpsc::channel();
+    ticket.add_done_callback(Box::new(move || {
+        let _ = tx.send(());
+    }));
+
+    let released = Arc::clone(&capacity);
+    ticket.retirement.subscribe(Box::new(move || {
+        released
+            .return_reads(1)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }));
+    notify(ticket.cancel("read cancelled"));
+    rx.recv()?;
+    notify(ticket.complete(vec![1, 2, 3]));
+    assert!(matches!(ticket.result()?, Outcome::Failed(error) if *error == "read cancelled"));
+    assert!(ticket.cancellation_error().is_some());
+    assert!(!ticket.retirement_ready()?);
+    assert!(matches!(
+        capacity.take_reads(1),
+        Err(Error::ReadBackpressure { .. })
+    ));
+
+    notify(ticket.retire()?);
+    assert!(ticket.retirement_ready()?);
+    capacity.take_reads(1)?;
+    capacity.return_reads(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_late_read_failure_preserves_observed_views_but_prevents_more_consumption() -> TestResult {
+    let mut ticket = TransferTicket::<Vec<u8>, &str, Callback>::new(false);
+    let (tx, rx) = mpsc::channel();
+    ticket.add_done_callback(Box::new(move || {
+        let _ = tx.send(());
+    }));
+    notify(ticket.complete(vec![1, 2, 3]));
+    rx.recv()?;
+    let Outcome::Success(value) = ticket.result()? else {
+        panic!("completed read has no value");
+    };
+
+    let (late, callbacks) = ticket.fail("device copy failed");
+    notify(callbacks);
+    assert!(late);
+    assert_eq!(*value, [1, 2, 3]);
+    assert!(matches!(ticket.result()?, Outcome::Failed(error) if *error == "device copy failed"));
+    assert!(ticket.add_done_callback(Box::new(|| {})).is_some());
+
+    ticket.mark_undrained();
+    assert!(ticket.retirement_ready().is_err());
+    assert!(ticket.retire().is_err());
+    assert!(!ticket.retirement.done());
+    notify(ticket.cancel("read cancelled"));
+    assert_eq!(
+        ticket.cancellation_error().as_deref(),
+        Some(&"device copy failed")
+    );
+    assert!(!ticket.retired());
+    Ok(())
+}
+
+#[test]
+fn borrowed_consumption_closes_before_its_shared_retirement_completes() -> TestResult {
+    let mut borrowed = TransferTicket::<Vec<u8>, &str, Callback>::new(true);
+    assert!(borrowed.result().is_err());
+    notify(borrowed.complete(vec![1]));
+    assert!(borrowed.close());
+    assert!(!borrowed.close());
+    assert!(borrowed.result().is_err());
+    assert!(!borrowed.retirement_ready()?);
+
+    let retirement = Arc::clone(&borrowed.retirement);
+    drop(borrowed);
+    // A transport can finish the consumer fences after the ticket is dropped.
+    notify(retirement.complete(Ok(()))?);
+    assert!(retirement.succeeded());
+    assert!(retirement.subscribe(Box::new(|| {})).is_some());
+
+    let mut copied = TransferTicket::<Vec<u8>, &str, Callback>::new(false);
+    notify(copied.complete(vec![1]));
+    assert!(!copied.close());
+    assert!(matches!(copied.result()?, Outcome::Success(value) if *value == [1]));
     Ok(())
 }

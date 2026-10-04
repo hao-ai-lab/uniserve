@@ -12,7 +12,8 @@ use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use uniserve_worker::{
-    ReadReservation as NativeReadReservation, TransferCapacity as NativeTransferCapacity,
+    Outcome, ReadReservation as NativeReadReservation, TransferCapacity as NativeTransferCapacity,
+    TransferTicket as NativeTransferTicket,
 };
 
 use super::error::{invalid, invariant, native_error, resource};
@@ -217,27 +218,15 @@ enum ReadAccess {
         release: Option<Py<PyAny>>,
         streams: HashMap<u64, Py<PyAny>>,
         events: Vec<Py<PyAny>>,
-        closed: bool,
     },
 }
 
 struct TicketState {
-    value: Option<Py<PyAny>>,
-    error: Option<Py<PyAny>>,
+    ticket: NativeTransferTicket<Py<PyAny>, Py<PyAny>, Py<PyAny>>,
     event: Option<Py<PyAny>>,
-    cancelled: bool,
-    retired: bool,
-    unretired: Vec<Py<PyAny>>,
+    retained: Vec<Py<PyAny>>,
     work: Option<Py<HostTask>>,
     access: ReadAccess,
-    done_callbacks: Vec<Py<PyAny>>,
-    retirement_callbacks: Vec<Py<PyAny>>,
-}
-
-impl TicketState {
-    fn ready(&self) -> bool {
-        self.value.is_some() || self.error.is_some()
-    }
 }
 
 /// One read's stream readiness and physical retirement. Cancellation revokes
@@ -253,12 +242,12 @@ impl TransferTicket {
     #[new]
     #[pyo3(signature = (event_pool, *, release=None))]
     fn new(event_pool: Py<PyAny>, release: Option<Py<PyAny>>) -> Self {
+        let ticket = NativeTransferTicket::new(release.is_some());
         let access = match release {
             Some(release) => ReadAccess::Borrowed {
                 release: Some(release),
                 streams: HashMap::new(),
                 events: Vec::new(),
-                closed: false,
             },
             None => ReadAccess::Copy {
                 destination_stream: None,
@@ -267,78 +256,56 @@ impl TransferTicket {
         Self {
             events: event_pool,
             state: Mutex::new(TicketState {
-                value: None,
-                error: None,
+                ticket,
                 event: None,
-                cancelled: false,
-                retired: false,
-                unretired: Vec::new(),
+                retained: Vec::new(),
                 work: None,
                 access,
-                done_callbacks: Vec::new(),
-                retirement_callbacks: Vec::new(),
             }),
         }
     }
 
     fn ready(&self, py: Python<'_>) -> PyResult<bool> {
-        Ok(self.lock(py)?.ready())
+        Ok(self.lock(py)?.ticket.ready())
     }
 
     pub(crate) fn retired(&self, py: Python<'_>) -> PyResult<bool> {
-        Ok(self.lock(py)?.retired)
+        Ok(self.lock(py)?.ticket.retired())
     }
 
     pub(crate) fn retirement_ready(&self, py: Python<'_>) -> PyResult<bool> {
         let state = self.lock(py)?;
-        if !state.unretired.is_empty() {
-            let error = resource(py, "transfer physical completion is unknown");
-            if let Some(cause) = &state.error {
+        state.ticket.retirement_ready().map_err(|error| {
+            let error = native_error(py, error);
+            if let Some(cause) = state.ticket.error() {
                 error.set_cause(py, Some(PyErr::from_value(cause.bind(py).clone())));
             }
-            return Err(error);
-        }
-        Ok(state.retired)
+            error
+        })
     }
 
     fn add_done_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        if state.ready() {
-            drop(state);
+        let immediate = self.lock(py)?.ticket.add_done_callback(callback);
+        if let Some(callback) = immediate {
             notify(py, vec![callback]);
-        } else {
-            state.done_callbacks.push(callback);
         }
         Ok(())
     }
 
     fn add_retirement_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        if state.retired {
-            drop(state);
+        let immediate = self.lock(py)?.ticket.retirement.subscribe(callback);
+        if let Some(callback) = immediate {
             notify(py, vec![callback]);
-        } else {
-            state.retirement_callbacks.push(callback);
         }
         Ok(())
     }
 
     pub(crate) fn cancel(&self, py: Python<'_>) -> PyResult<()> {
+        let error = resource(py, "transfer read was cancelled")
+            .into_value(py)
+            .into_any();
         let mut state = self.lock(py)?;
-        let pending = !state.ready();
-        state.cancelled = true;
-        if state.error.is_none() {
-            state.error = Some(
-                resource(py, "transfer read was cancelled")
-                    .into_value(py)
-                    .into_any(),
-            );
-        }
-        let callbacks = if pending {
-            std::mem::take(&mut state.done_callbacks)
-        } else {
-            Vec::new()
-        };
+        let callbacks = state.ticket.cancel(error);
         let work = state.work.as_ref().map(|work| work.clone_ref(py));
         drop(state);
         notify(py, callbacks);
@@ -350,13 +317,8 @@ impl TransferTicket {
 
     #[pyo3(name = "_require_active")]
     fn require_active(&self, py: Python<'_>) -> PyResult<()> {
-        let state = self.lock(py)?;
-        if state.cancelled {
-            return Err(state
-                .error
-                .as_ref()
-                .map(|error| PyErr::from_value(error.bind(py).clone()))
-                .unwrap_or_else(|| invariant(py, "cancelled transfer has no error")));
+        if let Some(error) = self.lock(py)?.ticket.cancellation_error() {
+            return Err(PyErr::from_value(error.bind(py).clone()));
         }
         Ok(())
     }
@@ -370,24 +332,15 @@ impl TransferTicket {
         stream: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let mut state = self.lock(py)?;
-        if !state.ready() {
-            return Err(PyRuntimeError::new_err(
-                "transfer ticket was observed before readiness",
-            ));
-        }
-        if let Some(error) = &state.error {
-            return Err(PyErr::from_value(error.bind(py).clone()));
-        }
-        if matches!(state.access, ReadAccess::Borrowed { closed: true, .. }) {
-            return Err(PyRuntimeError::new_err(
-                "transfer consumption has already closed",
-            ));
-        }
-        let value = state
-            .value
-            .as_ref()
-            .ok_or_else(|| invariant(py, "ready transfer has no views"))?
-            .clone_ref(py);
+        let value = match state
+            .ticket
+            .result()
+            .map_err(|error| native_error(py, error))?
+        {
+            Outcome::Success(value) => value.clone_ref(py),
+            Outcome::Failed(error) => return Err(PyErr::from_value(error.bind(py).clone())),
+            Outcome::Cancelled => unreachable!("transfer cancellation retains its error"),
+        };
         if let Some(event) = &state.event {
             let spans = tensor_spans(value.bind(py))?;
             let device = spans[0].getattr("device")?;
@@ -422,20 +375,15 @@ impl TransferTicket {
         let owner = slf.get();
         let streams = {
             let mut state = owner.lock(py)?;
-            match &mut state.access {
-                ReadAccess::Borrowed {
-                    streams,
-                    release: Some(_),
-                    closed,
-                    ..
-                } if !*closed => {
-                    *closed = true;
-                    streams
-                        .values()
-                        .map(|stream| stream.clone_ref(py))
-                        .collect::<Vec<_>>()
-                }
-                _ => return Ok(()),
+            if !state.ticket.close() {
+                return Ok(());
+            }
+            match &state.access {
+                ReadAccess::Borrowed { streams, .. } => streams
+                    .values()
+                    .map(|stream| stream.clone_ref(py))
+                    .collect::<Vec<_>>(),
+                _ => unreachable!("only borrowed reads close their consumption"),
             }
         };
         let events = record_consumers(py, &owner.events, streams)?;
@@ -511,12 +459,7 @@ impl TransferTicket {
                 .call_method1("retain", (&event, device))?;
             state.event = Some(event);
         }
-        let callbacks = if !state.ready() {
-            state.value = Some(value);
-            std::mem::take(&mut state.done_callbacks)
-        } else {
-            Vec::new()
-        };
+        let callbacks = state.ticket.complete(value);
         drop(state);
         notify(py, callbacks);
         Ok(())
@@ -525,13 +468,7 @@ impl TransferTicket {
     #[pyo3(name = "_fail")]
     fn fail(&self, py: Python<'_>, error: Py<PyAny>) -> PyResult<bool> {
         let mut state = self.lock(py)?;
-        let late = state.value.is_some();
-        let callbacks = if !state.ready() {
-            std::mem::take(&mut state.done_callbacks)
-        } else {
-            Vec::new()
-        };
-        state.error = Some(error);
+        let (late, callbacks) = state.ticket.fail(error);
         drop(state);
         notify(py, callbacks);
         Ok(late)
@@ -540,16 +477,23 @@ impl TransferTicket {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.events)?;
         if let Some(state) = gc_lock(&self.state) {
-            visit.call(&state.value)?;
-            visit.call(&state.error)?;
+            state.ticket.visit(|value, error, callbacks| {
+                visit.call(value)?;
+                visit.call(error)?;
+                for callback in callbacks {
+                    visit.call(callback)?;
+                }
+                Ok(())
+            })?;
+            state.ticket.retirement.visit(|_, callbacks| {
+                for callback in callbacks {
+                    visit.call(callback)?;
+                }
+                Ok(())
+            })?;
             visit.call(&state.event)?;
             visit.call(&state.work)?;
-            for value in state
-                .unretired
-                .iter()
-                .chain(&state.done_callbacks)
-                .chain(&state.retirement_callbacks)
-            {
+            for value in &state.retained {
                 visit.call(value)?;
             }
             match &state.access {
@@ -579,16 +523,11 @@ impl TransferTicket {
     }
 
     fn retire(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        if state.retired || !state.unretired.is_empty() {
-            return Err(invariant(
-                py,
-                "transfer cannot retire twice or with unknown physical completion",
-            ));
-        }
-        state.retired = true;
-        let callbacks = std::mem::take(&mut state.retirement_callbacks);
-        drop(state);
+        let callbacks = self
+            .lock(py)?
+            .ticket
+            .retire()
+            .map_err(|error| native_error(py, error))?;
         notify(py, callbacks);
         Ok(())
     }
@@ -606,21 +545,25 @@ impl Drop for TransferTicket {
                 // Its completion callback keeps the source grant and views
                 // until every consumer fence finishes, without resurrecting it.
                 if let ReadAccess::Borrowed {
-                    release,
-                    streams,
-                    closed: false,
-                    ..
+                    release, streams, ..
                 } = &mut state.access
+                    && !state.ticket.closed()
                     && let Some(release) = release.take()
                 {
                     let streams = std::mem::take(streams).into_values().collect();
                     let events = record_consumers(py, &self.events, streams)?;
-                    let callbacks = std::mem::take(&mut state.retirement_callbacks);
                     if events.is_empty() {
                         release.bind(py).call0()?;
-                        notify(py, callbacks);
+                        notify(
+                            py,
+                            state
+                                .ticket
+                                .retire()
+                                .map_err(|error| native_error(py, error))?,
+                        );
                     } else {
-                        let retained = Mutex::new(Some((release, callbacks)));
+                        let retained = Mutex::new(Some(release));
+                        let retirement = Arc::clone(&state.ticket.retirement);
                         let complete = PyCFunction::new_closure(
                             py,
                             None,
@@ -633,8 +576,11 @@ impl Drop for TransferTicket {
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner())
                                     .take();
-                                if let Some((release, callbacks)) = completion {
+                                if let Some(release) = completion {
                                     release.bind(py).call0()?;
+                                    let callbacks = retirement
+                                        .complete(Ok(()))
+                                        .map_err(|error| native_error(py, error))?;
                                     notify(py, callbacks);
                                 }
                                 Ok(())
@@ -644,7 +590,7 @@ impl Drop for TransferTicket {
                         kwargs.set_item("completed", complete)?;
                         self.events.bind(py).call_method(
                             "defer_release",
-                            (PyTuple::new(py, events)?, &state.value),
+                            (PyTuple::new(py, events)?, state.ticket.value()),
                             Some(&kwargs),
                         )?;
                     }
@@ -652,7 +598,7 @@ impl Drop for TransferTicket {
                 if let Some(event) = state.event.take() {
                     self.events
                         .bind(py)
-                        .call_method1("defer_release", ((event,), &state.value))?;
+                        .call_method1("defer_release", ((event,), state.ticket.value()))?;
                 }
                 Ok(())
             })();
@@ -931,11 +877,12 @@ impl TransferPool {
             // Unknown physical completion is not cancellation. Retain every
             // allocation and fence, and leave its byte/read credits occupied.
             let mut state = ticket.get().lock(py)?;
+            state.ticket.mark_undrained();
             state
-                .unretired
+                .retained
                 .extend([source.unbind(), destination.unbind(), stream]);
-            state.unretired.extend(producer.map(Bound::unbind));
-            state.unretired.extend(completed);
+            state.retained.extend(producer.map(Bound::unbind));
+            state.retained.extend(completed);
             if let Err(cause) = copied {
                 error.set_cause(py, Some(cause));
             }
@@ -1010,7 +957,7 @@ impl TransferPool {
         let undrained = {
             let mut state = ticket.get().lock(py)?;
             state.work = None;
-            !state.unretired.is_empty()
+            state.ticket.undrained()
         };
         let error = if work.cancelled() {
             Some(resource(py, "transfer read was cancelled before submission").into_value(py))
