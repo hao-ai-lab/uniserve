@@ -31,13 +31,7 @@ from uniserve_worker.execution.commit import commit_batch, discard_batch
 from uniserve_worker.execution.prepare import reserve_outputs
 from uniserve_worker.execution.schedule import dispatch_batch
 from uniserve_worker.profiling import _forward_stats
-from uniserve_worker.protocol.call import CallStatus, ErrorCode
-from uniserve_worker.protocol.output import (
-    FinishFlags,
-    ForwardStats,
-    RequestOutput,
-    TimingCounters,
-)
+from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.protocol.tensor import DType
 
 if TYPE_CHECKING:
@@ -62,24 +56,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _completion_error_code(code: WorkerErrorCode) -> ErrorCode:
-    """Map internal failure classes to their completion-wire error codes.
-
-    Every class without its own case, including descriptor, setup, input and
-    scheduler errors, maps to ``ErrorCode.INVALID_CALL``.
-    """
-    if code == WorkerErrorCode.RESOURCE_ERROR:
-        return ErrorCode.RESOURCE_EXHAUSTED
-    if code == WorkerErrorCode.COMPUTE_ERROR:
-        return ErrorCode.COMPUTE_ERROR
-    if code in {
-        WorkerErrorCode.INVARIANT_VIOLATION,
-        WorkerErrorCode.FATAL_WORKER_FAILURE,
-    }:
-        return ErrorCode.INTERNAL
-    return ErrorCode.INVALID_CALL
-
-
 def execute_batch(
     state: BatchState,
     *,
@@ -100,7 +76,7 @@ def execute_batch(
     tokenizer: PreTrainedTokenizerBase | None,
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
-) -> None:
+) -> WorkerError | None:
     """Reserve, execute and commit one prepared batch.
 
     The caller must have observed ``state.inputs.ready()``; a batch whose
@@ -109,10 +85,10 @@ def execute_batch(
     ``invalid_descriptor`` is raised. A batch without calls is only marked
     launched and records no outputs.
 
-    On success the batch's outputs are recorded by ``commit_batch``. On a
-    nonfatal failure every call receives an error output through
-    ``_error_outputs`` and the function returns normally, so the worker keeps
-    serving. With ``propagate_errors`` (as warmup submits) or a fatal
+    On success the batch's outputs are recorded by ``commit_batch``. A
+    nonfatal failure returns the classified error to the native executor,
+    which reports each call's accepted progress without advancing it.
+    With ``propagate_errors`` (as warmup submits) or a fatal
     classification, the classified ``WorkerError`` is raised instead.
     Provisional resources are released before either outcome unless the batch
     had already begun publication.
@@ -140,7 +116,7 @@ def execute_batch(
         )
 
     if not batch.calls:
-        return
+        return None
 
     # reserve_outputs releases what it bound before re-raising (see its
     # docstring), so this failure path only classifies and reports.
@@ -173,14 +149,11 @@ def execute_batch(
 
         # state.started_ns is set only by BatchState.bind_outputs, which a
         # registration failure may precede, so this path times from `started`.
-        _error_outputs(
-            state,
-            classified,
-            started,
-            forward_stats=ForwardStats(),
-            request_pool=request_pool,
+        state.record_execution(
+            execution_us=(time.perf_counter_ns() - started) // 1000,
+            stats=ForwardStats(),
         )
-        return
+        return classified
 
     try:
         outcomes = dispatch_batch(
@@ -223,17 +196,14 @@ def execute_batch(
         if propagate_errors or classified.fatal:
             raise classified
 
-        _error_outputs(
-            state,
-            classified,
-            state.started_ns,
-            forward_stats=_forward_stats(
+        state.record_execution(
+            execution_us=(time.perf_counter_ns() - state.started_ns) // 1000,
+            stats=_forward_stats(
                 state.forward_stats,
                 state.component_us,
             ),
-            request_pool=request_pool,
         )
-        return
+        return classified
 
     try:
         commit_batch(
@@ -277,16 +247,16 @@ def execute_batch(
         if propagate_errors or classified.fatal:
             raise classified
 
-        _error_outputs(
-            state,
-            classified,
-            state.started_ns,
-            forward_stats=_forward_stats(
+        state.record_execution(
+            execution_us=(time.perf_counter_ns() - state.started_ns) // 1000,
+            stats=_forward_stats(
                 state.forward_stats,
                 state.component_us,
             ),
-            request_pool=request_pool,
         )
+        return classified
+
+    return None
 
 
 def _classify_failure(
@@ -392,62 +362,3 @@ def _log_failure(
         seen.add(id(cause))
         traceback.clear_frames(cause.__traceback__)
         cause = cause.__cause__ or cause.__context__
-
-
-def _error_outputs(
-    state: BatchState,
-    error: WorkerError,
-    started: int,
-    *,
-    forward_stats: ForwardStats,
-    request_pool: RequestPool,
-) -> None:
-    """Record an error output for every call without accepting progress.
-
-    Each output reports the request's already accepted progress, or zero
-    coordinates when the call has no predecessor or the request pool no
-    longer holds the call's exact request key.
-    """
-    completion_code = _completion_error_code(error.code)
-    records: list[RequestOutput] = []
-    for call in state.batch.calls:
-        # Report accepted coordinates only for the matching admitted epoch;
-        # a stale descriptor cannot observe a replacement request slot.
-        request = request_pool.peek(call.request_key.request_id)
-        if (
-            request is None
-            or request.request_key != call.request_key
-            or state.predecessor(call) is None
-        ):
-            runtime = None
-        else:
-            runtime = request.accepted_progress
-
-        placeholder = RequestOutput(
-            request_key=call.request_key,
-            call_id=call.call_id,
-            status=CallStatus.ERROR,
-            product_generations=(),
-            error_code=completion_code,
-            timing_counters=TimingCounters(),
-            kind=call.kind,
-            position=(0 if runtime is None else int(runtime.logical_position)),
-            kv_visible_len=(
-                0 if runtime is None else int(runtime.kv_visible_len)
-            ),
-            kv_computed_len=(
-                0 if runtime is None else int(runtime.kv_computed_len)
-            ),
-            num_completed_steps=(
-                0 if runtime is None else int(runtime.flow_step)
-            ),
-            committed_tokens=(),
-            finish_flags=FinishFlags(),
-        )
-        records.append(placeholder)
-
-    state.record_outputs(
-        tuple(records),
-        execution_us=(time.perf_counter_ns() - started) // 1000,
-        stats=forward_stats,
-    )

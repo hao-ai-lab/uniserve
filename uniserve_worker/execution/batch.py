@@ -6,9 +6,9 @@ closes. The execution modules fill it in stage order: `prepare_batch` and
 `prepare_inputs` record storage dependencies, input reservations and
 predicate captures, and `image.reserve_images` the host preparation of
 inline input images; `reserve_outputs` binds one `PendingOutput` per call;
-`commit_batch` (or `execute_batch` on failure) records the final outputs.
-The native executor owns admission, launch order, failure and delivery.
-The batch runner materializes outputs; Rust retires batch resources. Native
+`commit_batch` records published products and execution measurements.
+The native executor owns admission, launch order, failure, result assembly
+and delivery. Rust resolves outputs and retires batch resources. Native
 `BatchInputs` retains input leases and notifies the executor when their
 physical dependencies become consumable.
 """
@@ -28,17 +28,13 @@ from uniserve_worker._uniserve_ipc import BatchInputs
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.batch import Batch, TensorPublication
-from uniserve_worker.protocol.call import Call, CallStatus
+from uniserve_worker.protocol.call import Call
 from uniserve_worker.protocol.identity import (
     BufferId,
     CallId,
     CallIdentity,
 )
-from uniserve_worker.protocol.output import (
-    BatchOutput,
-    ForwardStats,
-    RequestOutput,
-)
+from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.protocol.transfer import KvTransfer
 from uniserve_worker.storage.kv_cache import KVCacheManager
 from uniserve_worker.storage.latent_pool import LatentPool
@@ -85,14 +81,10 @@ class BatchState:
     input_products: tuple[TensorPublication, ...] = ()
     kv_inputs: tuple[KvTransfer, ...] = ()
 
-    # Final values addressed by original call index: None until
-    # `bind_outputs`, then a `PendingOutput`, then the materialized
-    # `RequestOutput`.
-    outputs: list[PendingOutput | RequestOutput | None] = field(
-        default_factory=list
-    )
+    # Output owners addressed by original call index, bound by reserve_outputs.
+    outputs: list[PendingOutput | None] = field(default_factory=list)
 
-    # Completion storage leased by `reserve_outputs`; `record_outputs` drops
+    # Completion storage leased by `reserve_outputs`; `record_execution` drops
     # this reference while the pending outputs keep their rows.
     buffer: OutputBuffer | None = None
     # The first active call's capability stream (`ModelExecutor.call_stream`),
@@ -102,7 +94,7 @@ class BatchState:
     # `commit_batch` and the post-registration failure paths of
     # `execute_batch` derive ``execution_us`` from it.
     started_ns: int = 0
-    # Per-execution scratch that `record_outputs` clears; `commit_batch`
+    # Per-execution scratch that `record_execution` clears; `commit_batch`
     # folds the forward stats and component timings into ``stats``.
     forward_stats: list[ForwardStats] = field(default_factory=list)
     component_us: dict[str, int] = field(default_factory=dict)
@@ -148,7 +140,7 @@ class BatchState:
         """Borrow completion storage during execution, before publication.
 
         Raises:
-            RuntimeError: Before `bind_outputs` or after `record_outputs`.
+            RuntimeError: Before `bind_outputs` or after `record_execution`.
         """
         if self.buffer is None:
             raise RuntimeError("batch has no reserved output buffer")
@@ -192,10 +184,10 @@ class BatchState:
         """Borrow every call's `PendingOutput`, in call order.
 
         Raises:
-            RuntimeError: Any output is unbound or already materialized.
+            RuntimeError: Any output is unbound.
         """
         values = tuple(self.outputs)
-        if any(not isinstance(value, PendingOutput) for value in values):
+        if any(value is None for value in values):
             raise RuntimeError("batch has no reserved pending outputs")
         return cast(tuple[PendingOutput, ...], values)
 
@@ -205,13 +197,13 @@ class BatchState:
         Raises:
             WorkerError: ``invalid_descriptor`` when no call of the batch
                 belongs to ``request_id``.
-            RuntimeError: That call's output is unbound or materialized.
+            RuntimeError: That call's output is unbound.
         """
         index = self.request_indexes.get(int(request_id))
         if index is None:
             raise invalid_descriptor(f"batch has no request {request_id}")
         value = self.outputs[index]
-        if not isinstance(value, PendingOutput):
+        if value is None:
             raise RuntimeError("request has no reserved pending output")
         return value
 
@@ -274,108 +266,16 @@ class BatchState:
         self.inputs.predicate = None
         return values
 
-    def record_outputs(
-        self,
-        outputs: tuple[PendingOutput | RequestOutput, ...],
-        *,
-        products: tuple[TensorPublication, ...] = (),
-        execution_us: int,
-        stats: ForwardStats,
+    def record_execution(
+        self, *, execution_us: int, stats: ForwardStats
     ) -> None:
-        """Record the batch's final call outputs, products and statistics.
-
-        Called once per batch, by `commit_batch` for a published batch or by
-        `execute_batch` with error completions. ``outputs`` is aligned with
-        ``batch.calls``, and a `PendingOutput` must be the one reserved at its
-        index. Clears the output buffer reference and the per-execution
-        scratch. Outputs stored before a failure stay stored.
-
-        Raises:
-            RuntimeError: Outputs were already recorded, or a pending output
-                replaces a different reserved one.
-            WorkerError: ``invalid_descriptor`` when an output or product does
-                not belong to a call of this batch.
-            ValueError: ``outputs`` and the calls differ in length.
-        """
-        if self.stats is not None:
-            raise RuntimeError("batch was published more than once")
-
-        for index, (call, output) in enumerate(
-            zip(self.batch.calls, outputs, strict=True)
-        ):
-            previous = self.outputs[index]
-            if (
-                isinstance(output, PendingOutput)
-                and previous is not None
-                and previous is not output
-            ):
-                raise RuntimeError("result replaced another reserved output")
-            if (output.request_key, output.call_id) != (
-                call.request_key,
-                call.call_id,
-            ):
-                raise invalid_descriptor(
-                    "result does not match its submitted call"
-                )
-            self.outputs[index] = output
-
-        identities = {
-            (output.request_key, output.call_id) for output in outputs
-        }
-        if any(
-            (value.product.request_key, value.product.producer_call_id)
-            not in identities
-            for value in products
-        ):
-            raise invalid_descriptor("product does not belong to its batch")
-
-        self.products = products
+        """Keep execution measurements and release numerical scratch."""
         self.stats = stats
         self.execution_us = execution_us
         self.buffer = None
         self.forward_indices.clear()
         self.forward_stats.clear()
         self.component_us.clear()
-
-    def result(self) -> BatchOutput:
-        """Build the materialized batch result for native delivery.
-
-        A batch is one numerical call on one component, so every call it
-        carries completes together and its retirement is already applied.
-        Only products of calls that completed with `CallStatus.OK` are
-        reported.
-
-        Raises:
-            RuntimeError: An output is not yet materialized.
-        """
-        values: list[RequestOutput] = []
-        for value in self.outputs:
-            if not isinstance(value, RequestOutput):
-                raise RuntimeError(
-                    "batch delivery encountered an unmaterialized output"
-                )
-            values.append(value)
-
-        successful = {
-            (value.request_key, value.call_id)
-            for value in values
-            if value.status is CallStatus.OK
-        }
-
-        # A batch without calls carries only lifecycle commands and records
-        # no completion, so it reports no execution statistics.
-        return BatchOutput(
-            batch_id=self.batch_id,
-            completions=tuple(values),
-            products=tuple(
-                value
-                for value in self.products
-                if (value.product.request_key, value.product.producer_call_id)
-                in successful
-            ),
-            worker_exec_us=self.execution_us,
-            forward_stats=self.stats,
-        )
 
     def close(
         self,
@@ -398,8 +298,6 @@ class BatchState:
             )
         ]
         actions.extend(
-            output.abandon
-            for output in self.outputs
-            if isinstance(output, PendingOutput)
+            output.abandon for output in self.outputs if output is not None
         )
         close_resources(*actions)

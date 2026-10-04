@@ -69,29 +69,61 @@ pub(crate) fn batch_from_py(value: &Bound<'_, PyAny>) -> PyResult<Batch> {
 
 /// Return the public Python response mapping with its flattened transfer records.
 pub(crate) fn response_to_py(py: Python<'_>, response: &WorkerResponse) -> PyResult<Py<PyAny>> {
-    let mapping = pythonize(py, response)?;
-    if let WorkerResponse::Result { result, .. } = response {
-        let output = mapping.get_item("result")?;
-        let mut records = RequestConversion::new(py)?;
-        let products = result
-            .products
-            .iter()
-            .map(|product| {
-                tensor_publication_to_py(py, product, &mut records)?.call_method0("to_mapping")
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        output.set_item("products", PyList::new(py, products)?)?;
-        let completions = output.get_item("completions")?;
-        for (index, completion) in result.completions.iter().enumerate() {
-            if let Some(transfer) = &completion.kv_output {
-                completions.get_item(index)?.set_item(
-                    "kv_output",
-                    kv_transfer_to_py(py, transfer)?.call_method0("to_mapping")?,
-                )?;
-            }
+    if let WorkerResponse::Result { message_id, result } = response {
+        let mapping = PyDict::new(py);
+        mapping.set_item("kind", "result")?;
+        mapping.set_item("message_id", message_id)?;
+        mapping.set_item("result", batch_output_mapping(py, result)?)?;
+        return Ok(mapping.into_any().unbind());
+    }
+    pythonize(py, response)
+        .map(Bound::unbind)
+        .map_err(Into::into)
+}
+
+fn batch_output_mapping<'py>(py: Python<'py>, result: &BatchOutput) -> PyResult<Bound<'py, PyAny>> {
+    let output = pythonize(py, result)?;
+    let mut records = RequestConversion::new(py)?;
+    let products = result
+        .products
+        .iter()
+        .map(|product| {
+            tensor_publication_to_py(py, product, &mut records)?.call_method0("to_mapping")
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    output.set_item("products", PyList::new(py, products)?)?;
+    let completions = output.get_item("completions")?;
+    for (index, completion) in result.completions.iter().enumerate() {
+        if let Some(transfer) = &completion.kv_output {
+            completions.get_item(index)?.set_item(
+                "kv_output",
+                kv_transfer_to_py(py, transfer)?.call_method0("to_mapping")?,
+            )?;
         }
     }
-    Ok(mapping.unbind())
+    Ok(output)
+}
+
+/// Construct a Python view only for a direct caller consuming the result.
+pub(crate) fn batch_output_to_py(py: Python<'_>, output: &BatchOutput) -> PyResult<Py<PyAny>> {
+    py.import("uniserve_worker.protocol.output")?
+        .getattr("BatchOutput")?
+        .call_method1("from_mapping", (batch_output_mapping(py, output)?,))
+        .map(Bound::unbind)
+}
+
+pub(crate) fn request_output_to_py(py: Python<'_>, output: &RequestOutput) -> PyResult<Py<PyAny>> {
+    let mapping = pythonize(py, output)?;
+    if let Some(transfer) = &output.kv_output {
+        mapping.set_item(
+            "kv_output",
+            kv_transfer_to_py(py, transfer)?.call_method0("to_mapping")?,
+        )?;
+    }
+    py.import("uniserve_worker.protocol.output")?
+        .getattr("RequestOutput")?
+        .call_method1("from_mapping", (mapping,))
+        .map(Bound::unbind)
 }
 
 /// Converts a submit [`WorkerRequest`] into the Python worker mapping.
@@ -1660,7 +1692,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
 
 /// Decodes a tensor publication: the product reference and its transfer
 /// handle, given as `{"kind": ..., "value": {...}}`.
-fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<TensorPublication> {
+pub(crate) fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<TensorPublication> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
@@ -2072,7 +2104,7 @@ fn kv_group_transfer_to_py<'py>(
 /// Each tensor is checked by `tensor_transfer_from_py`. `KvTransfer::validate`
 /// runs later, through `RequestOutput::validate`, when the result is
 /// published.
-fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
+pub(crate) fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
     let py = value.py();
     let payload = value.cast::<PyDict>().ok()?;
     let raw_groups = get(payload, intern!(py, "groups"))?;

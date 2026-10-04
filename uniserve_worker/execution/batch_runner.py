@@ -6,13 +6,10 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
-from uniserve_worker.errors import (
-    invalid_descriptor,
-)
+from uniserve_worker.errors import WorkerError, invalid_descriptor
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.image import reserve_images
 from uniserve_worker.execution.media import begin_noise
-from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.prepare import (
     capture_predicates,
     prepare_batch,
@@ -77,7 +74,7 @@ class BatchRunner:
         if freed:
             self.release_buffers(freed)
 
-    def _execute_batch(self, state: BatchState) -> None:
+    def _execute_batch(self, state: BatchState) -> WorkerError | None:
         """Launch a prepared batch and release what its launch consumed.
 
         The native executor begins command retirement after this returns.
@@ -97,7 +94,7 @@ class BatchRunner:
             step = nullcontext()
 
         with step:
-            execute_batch(
+            failure = execute_batch(
                 state,
                 propagate_errors=state.propagate_errors,
                 kv_cache=self.worker.kv_cache,
@@ -141,6 +138,8 @@ class BatchRunner:
                 and predicate.producer_call_id != state.predecessor(call)
             )
         )
+
+        return failure
 
     def prepare(self, state: BatchState) -> bool:
         """Apply the batch's commands, validate it and prepare its inputs.
@@ -266,27 +265,14 @@ class BatchRunner:
         capture_predicates(state, self.worker.tensor_store)
 
     def close(self, state: BatchState) -> None:
-        """Release an owned batch whose result is consumed or abandoned.
-
-        Calls whose outputs were never materialized are cancelled in the
-        ``RequestPool``, which closes their requests. ``BatchState.close``
-        abandons inputs and outputs while physical readers keep their leases.
-        """
-        pending = tuple(
-            output
-            for output in state.outputs
-            if isinstance(output, PendingOutput)
-        )
-        self.worker.requests.cancel_calls(
-            tuple(output.call for output in pending)
-        )
+        """Release numerical owners while physical readers keep their leases."""
         state.close(
             self.worker.tensor_store,
             self.worker.latent_pool,
             self.worker.kv_cache,
         )
 
-    def execute(self, state: BatchState) -> None:
+    def execute(self, state: BatchState) -> WorkerError | None:
         """Launch a batch whose inputs are ready, then close its inputs.
 
         Raises ``RuntimeError`` when the inputs were already consumed, or
@@ -302,7 +288,7 @@ class BatchRunner:
 
         try:
             state.inputs.require_storage()
-            self._execute_batch(state)
+            failure = self._execute_batch(state)
         except BaseException as error:
             try:
                 state.inputs.close(
@@ -322,6 +308,8 @@ class BatchRunner:
             if self.worker.kv_cache is None
             else self.worker.kv_cache.imports,
         )
+
+        return failure
 
     def release_buffers(self, buffers: Sequence[BufferId]) -> None:
         """Revoke new reads of ``buffers`` in every store.

@@ -19,9 +19,8 @@ const OWN_STEP_WAIT: Duration = Duration::from_millis(8);
 
 /// Numerical values and resource observations needed by the rank service.
 /// Request correlation, admission, polling and shutdown remain in Service.
-pub trait ServiceBackend: Backend {
+pub trait ServiceBackend: Backend<Output = BatchOutput> {
     fn batch(&self, plan: &BatchPlan) -> Result<Self::Batch, Self::Error>;
-    fn output(&self, output: Self::Output) -> Result<BatchOutput, Self::Error>;
     fn response_error(
         &self,
         kind: RequestKind,
@@ -192,11 +191,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
                     submission,
                 } => {
                     let message_id = *message_id;
-                    let result = self.executor.poll(submission).and_then(|output| {
-                        output
-                            .map(|output| self.executor.backend().output(output))
-                            .transpose()
-                    });
+                    let result = self.executor.poll(submission);
                     match result {
                         Ok(Some(result)) => WorkerResponse::Result { message_id, result },
                         Ok(None) => continue,
