@@ -3,6 +3,8 @@
 Ownership runs through consumer completion.
 """
 
+import gc
+import weakref
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import replace
 from threading import Event
@@ -458,7 +460,7 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
     buffers = BufferPool(byte_capacity=16, devices=("cpu",))
     store = (
         TensorStore(
-            max_entry_bytes=16,
+            max_feature_bytes=16,
             devices=("cpu",),
             buffer_pool=buffers,
             event_pool=events,
@@ -530,6 +532,56 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
         store.close()
         buffers.close()
         events.close()
+
+
+def test_shared_tensor_reads_survive_collection_and_release_cycles() -> None:
+    buffers = BufferPool(byte_capacity=16, devices=("cpu",))
+    store = TensorStore(capacity=1, buffer_pool=buffers)
+    reference = TensorRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_call_id=CallId(1, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(4),)),
+    )
+    value = torch.arange(4, dtype=torch.float32)
+
+    try:
+        writes = store.bind_outputs(
+            ((reference, "cpu"),),
+            buffer_allocations={
+                reference.buffer_id: BufferAllocation(
+                    reference.buffer_id, 0, 16
+                )
+            },
+        )
+        store.publish_write(writes[0], value)
+        store.commit_writes(writes)
+        reads = tuple(
+            store.consume(reference, consumer_call_id=CallId(batch, 0))
+            for batch in (2, 3)
+        )
+        observed = tuple(weakref.ref(read.tensor) for read in reads)
+        for read in reads:
+            read.tensor.consumer = read
+        del read
+
+        store.release_buffers((reference.buffer_id,))
+        del writes
+        gc.collect()
+        for read in reads:
+            torch.testing.assert_close(read.tensor, value, rtol=0, atol=0)
+        del read
+
+        store.complete_reads(reads)
+        del reads
+        gc.collect()
+        assert all(view() is None for view in observed)
+    finally:
+        store.close()
+        buffers.close()
+        store.event_pool.close()
 
 
 def test_a_retired_segment_no_consumer_began_reading_returns_at_once() -> None:

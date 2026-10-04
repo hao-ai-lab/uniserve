@@ -246,6 +246,13 @@ pub(crate) struct TransferRef {
 }
 
 impl TransferRef {
+    pub(crate) fn clone_ref(&self, py: Python<'_>) -> Self {
+        Self {
+            owner: self.owner.clone_ref(py),
+            retirement: Arc::clone(&self.retirement),
+        }
+    }
+
     pub(crate) fn new(py: Python<'_>, owner: Py<TransferTicket>) -> PyResult<Self> {
         let retirement = Arc::clone(&owner.get().lock(py)?.ticket.retirement);
         Ok(Self { owner, retirement })
@@ -393,7 +400,7 @@ impl TransferTicket {
 
     /// Borrowed storage stays granted until every observed consumer stream
     /// completes. Copy reads keep their ordinary destination tensor ownership.
-    fn close(slf: Bound<'_, Self>) -> PyResult<()> {
+    pub(crate) fn close(slf: Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let owner = slf.get();
         let streams = {

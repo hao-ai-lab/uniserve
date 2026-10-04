@@ -13,6 +13,7 @@ import threading
 import pytest
 import torch
 
+from tests.python.fixtures.cuda_stream import blocked_stream
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
 from uniserve_worker.errors import WorkerError
@@ -32,6 +33,52 @@ from uniserve_worker.transport import make_transports
 from uniserve_worker.transport.fetch import fetch_tensor
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+
+def test_tensor_store_allows_event_callback_reentry() -> None:
+    device = torch.device("cuda:0")
+    events = EventPool()
+    buffers = BufferPool(byte_capacity=16, devices=(device,))
+    store = TensorStore(capacity=1, buffer_pool=buffers, event_pool=events)
+    reference = TensorRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_call_id=CallId(1, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(4),)),
+    )
+    value = torch.arange(4, dtype=torch.float32, device=device)
+    observed = []
+
+    try:
+        writes = store.bind_outputs(
+            ((reference, device),),
+            buffer_allocations={
+                reference.buffer_id: BufferAllocation(
+                    reference.buffer_id, 0, 16
+                )
+            },
+        )
+        with blocked_stream(device) as producer, torch.cuda.stream(producer):
+            event = events.acquire(device)
+            events.retain(event, device)
+            events.record(event, device)
+            events.defer_release(
+                (event,),
+                value,
+                completed=lambda: observed.append(store.resident_bytes(device)),
+            )
+        event.synchronize()
+
+        store.publish_write(writes[0], value)
+        events.reap()
+        assert observed == [0]
+        torch.testing.assert_close(writes[0].tensor, value, rtol=0, atol=0)
+    finally:
+        events.close()
+        store.close()
+        buffers.close()
 
 
 def _consume(tickets) -> None:
@@ -131,7 +178,7 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
             location = producer.publish(
                 physical, offset=tuple(axis.start for axis in region)
             )
-            store.retain_publication(
+            store.retain_export(
                 write, producer.publication_retirement(location)
             )
             locations.append(location)
@@ -746,7 +793,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
     store = TensorStore(
         capacity=1,
         byte_capacity=16,
-        max_entry_bytes=reference.max_bytes,
+        max_feature_bytes=reference.max_bytes,
         devices=(device,),
         buffer_pool=arena,
         event_pool=events,

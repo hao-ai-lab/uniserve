@@ -318,7 +318,7 @@ def publish_features(
         locations = publish_tensor(
             publication_transports,
             resident,
-            retain=partial(tensor_store.retain_publication, write),
+            retain=partial(tensor_store.retain_export, write),
             consumers=call.consumer_slots,
         )
         request.exported_locators.extend(locations)

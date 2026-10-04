@@ -12,6 +12,7 @@ mod kv_cache;
 mod latent;
 mod registry;
 mod request;
+pub mod tensor;
 mod transfer;
 
 pub use block_tables::{BlockTableUpdate, BlockTables, GroupShape, GroupTable};
