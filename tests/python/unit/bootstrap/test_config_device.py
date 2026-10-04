@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tests.python.fixtures.launch import worker_args
-from uniserve_worker.protocol.call import ForwardMode, MediaCall
+from uniserve_worker.protocol.call import CALL_KINDS, ForwardMode, MediaCall
 
 pytestmark = pytest.mark.unit
 
@@ -224,3 +224,10 @@ def test_launch_capabilities_select_concrete_computations(
         supported_calls=selector,
     )
     assert config.supported_calls == expected
+
+
+def test_a_launch_without_a_selector_serves_every_call_kind(tmp_path):
+    # The launching side narrows capabilities only when it has a reason to,
+    # so a worker it does not narrow accepts every call kind it implements.
+    config = worker_args(tmp_path, max_batch_tokens=8192)
+    assert config.supported_calls == frozenset(CALL_KINDS)

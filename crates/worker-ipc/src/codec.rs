@@ -48,8 +48,12 @@ use crate::{
     ForwardStats, KvCacheInfo, KvTransfer, LatentParams, Locator, MediaCall, MediaOutput,
     NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng, SamplingState,
     ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
-    TransferMode, TransferTransport, WorkerEndpoint, WorkerInfo, WorkerRequest, WorkerResponse,
-    WorkerResponseError,
+    TransferMode, TransferTransport, VideoAdmission, WorkerEndpoint, WorkerInfo, WorkerRequest,
+    WorkerResponse, WorkerResponseError,
+};
+use uniserve_core::{
+    AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
+    VideoCondition, VideoTask, VisionGrid,
 };
 
 /// Result type returned by FlatBuffers codec calls.
@@ -448,9 +452,114 @@ fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewReques
             .diffusion()
             .map(diffusion_params_from_table)
             .transpose()?,
+        video: admission
+            .video()
+            .map(video_admission_from_table)
+            .transpose()?,
     };
     admission.validate()?;
     Ok(admission)
+}
+
+/// Decodes a video request's task, tags and conditions;
+/// `NewRequest::validate` checks them against the admission.
+fn video_admission_from_table(table: fbs::VideoAdmission<'_>) -> CodecResult<VideoAdmission> {
+    let task = match table.task() {
+        fbs::VideoTask::T2va => VideoTask::T2va,
+        fbs::VideoTask::Fl2va => VideoTask::Fl2va,
+        fbs::VideoTask::Ref2va => VideoTask::Ref2va,
+        other => codec_bail!("unknown video task {}", other.0),
+    };
+    Ok(VideoAdmission {
+        task,
+        text_tags: table
+            .text_tags()
+            .map(|tags| tags.iter().collect())
+            .unwrap_or_default(),
+        conditions: table
+            .conditions()
+            .map(|conditions| conditions.iter().map(video_condition_from_table).collect())
+            .transpose()?
+            .unwrap_or_default(),
+    })
+}
+
+fn canvas_from_fb(canvas: &fbs::Canvas) -> uniserve_core::Canvas {
+    uniserve_core::Canvas {
+        width: canvas.width(),
+        height: canvas.height(),
+    }
+}
+
+fn audio_clip_from_fb(clip: &fbs::AudioClip) -> AudioClip {
+    AudioClip {
+        sample_rate: clip.sample_rate(),
+        start_sample: clip.start_sample(),
+        source_samples: clip.source_samples(),
+        samples: clip.samples(),
+    }
+}
+
+/// Decodes one condition, rejecting a media combination no condition has.
+fn video_condition_from_table(table: fbs::VideoCondition<'_>) -> CodecResult<VideoCondition> {
+    let role = match table.role() {
+        fbs::ConditionRole::FirstFrame => ConditionRole::FirstFrame,
+        fbs::ConditionRole::LastFrame => ConditionRole::LastFrame,
+        fbs::ConditionRole::Reference => ConditionRole::Reference,
+        other => codec_bail!("unknown condition role {}", other.0),
+    };
+    let audio = table.audio().map(audio_clip_from_fb);
+    let media = match (table.image(), table.video(), audio) {
+        (Some(fit), None, None) => ConditionMedia::Image(ImageFit {
+            resized: canvas_from_fb(fit.resized()),
+            left: fit.left(),
+            top: fit.top(),
+            size: canvas_from_fb(fit.size()),
+        }),
+        (None, Some(clip), soundtrack) => ConditionMedia::Video {
+            clip: VideoClip {
+                canvas: canvas_from_fb(clip.canvas()),
+                start_frame: clip.start_frame(),
+                frames: clip.frames(),
+                vae_frames: clip.vae_frames(),
+            },
+            soundtrack,
+        },
+        (None, None, Some(clip)) => ConditionMedia::Audio(clip),
+        _ => codec_bail!("a video condition carries an invalid media combination"),
+    };
+    let vision = table.vision().map(|vision| {
+        let grid = vision.grid().copied().unwrap_or_default();
+        ConditionVision {
+            grid: VisionGrid {
+                t: grid.t(),
+                h: grid.h(),
+                w: grid.w(),
+            },
+            tokens: vision.tokens(),
+            frame_indices: vision
+                .frame_indices()
+                .map(|indices| indices.iter().collect())
+                .unwrap_or_default(),
+        }
+    });
+    Ok(VideoCondition {
+        role,
+        source: MediaLocator {
+            name: table
+                .source_name()
+                .context("a video condition has no media locator")?
+                .to_owned(),
+            bytes: table.source_bytes(),
+        },
+        media,
+        vision,
+        latent_units: table
+            .latent_units()
+            .map(|units| units.iter().collect())
+            .unwrap_or_default(),
+        audio_rows: table.audio_rows(),
+    })
 }
 
 /// Decodes autoregressive admission parameters, including sampling state.
@@ -473,6 +582,36 @@ fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRe
     })
 }
 
+/// Decodes a video denoiser's declaration; `WorkerInfo::validate` checks it.
+fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoDenoiserInfo {
+    crate::VideoDenoiserInfo {
+        tasks: table
+            .tasks()
+            .map(|tasks| tasks.iter().map(str::to_owned).collect())
+            .unwrap_or_default(),
+        schedule_points: table.schedule_points(),
+        video_shift: table.video_shift(),
+        audio_shift: table.audio_shift(),
+        canvases: table
+            .canvases()
+            .map(|canvases| {
+                canvases
+                    .iter()
+                    .map(|canvas| uniserve_core::Canvas {
+                        width: canvas.width(),
+                        height: canvas.height(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        max_sequence_rows: table.max_sequence_rows(),
+        condition_tiles: table.condition_tiles().map(|tiles| crate::ConditionTiles {
+            rows: tiles.rows(),
+            video: [tiles.frames(), tiles.height(), tiles.width()],
+        }),
+    }
+}
+
 /// Decodes diffusion admission parameters; `NewRequest::validate` checks the
 /// frame, unit, and step counts.
 fn diffusion_params_from_table(
@@ -483,6 +622,8 @@ fn diffusion_params_from_table(
         video_units: admission.video_units(),
         num_inference_steps: admission.num_inference_steps(),
         seed: admission.seed(),
+        width: admission.width(),
+        height: admission.height(),
     })
 }
 
@@ -772,6 +913,21 @@ fn shape_bound_from_parts(
     })
 }
 
+/// Decodes a result's raster axes: both indices set, or both -1 for a result
+/// without a raster. Their range is left to `OutputInfo::validate`.
+fn raster_axes_from_fb(height: i32, width: i32) -> CodecResult<Option<crate::RasterAxes>> {
+    match (u32::try_from(height), u32::try_from(width)) {
+        (Ok(height), Ok(width)) => Ok(Some(crate::RasterAxes { height, width })),
+        _ => {
+            codec_ensure!(
+                height == -1 && width == -1,
+                "a tensor result names one raster axis without the other"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Decodes a role-independent tensor identity and its bounded capacity.
 fn tensor_ref_from_table(reference: fbs::TensorRef<'_>) -> CodecResult<TensorRef> {
     let id = buffer_id_from_table(reference.id())?;
@@ -1011,6 +1167,10 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                                             output.extents(),
                                             output.dynamic_axis(),
                                         )?,
+                                        raster_axes: raster_axes_from_fb(
+                                            output.height_axis(),
+                                            output.width_axis(),
+                                        )?,
                                     })
                                 })
                                 .collect::<CodecResult<Vec<_>>>()?,
@@ -1056,6 +1216,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             components
         },
         num_inference_steps: info.num_inference_steps(),
+        video_denoiser: info.video_denoiser().map(video_denoiser_from_table),
     };
     info.validate()?;
     Ok(info)
@@ -1422,6 +1583,7 @@ fn forward_mode_from_fb(value: fbs::ForwardMode) -> CodecResult<ForwardMode> {
 
 fn media_call_to_fb(value: MediaCall) -> fbs::MediaCall {
     match value {
+        MediaCall::MediaReading => fbs::MediaCall::MediaReading,
         MediaCall::VisionEncoding => fbs::MediaCall::VisionEncoding,
         MediaCall::LatentEncoding => fbs::MediaCall::LatentEncoding,
         MediaCall::TextEncoding => fbs::MediaCall::TextEncoding,
@@ -1438,6 +1600,7 @@ fn media_call_to_fb(value: MediaCall) -> fbs::MediaCall {
 
 fn media_call_from_fb(value: fbs::MediaCall) -> CodecResult<MediaCall> {
     Ok(match value {
+        fbs::MediaCall::MediaReading => MediaCall::MediaReading,
         fbs::MediaCall::VisionEncoding => MediaCall::VisionEncoding,
         fbs::MediaCall::LatentEncoding => MediaCall::LatentEncoding,
         fbs::MediaCall::TextEncoding => MediaCall::TextEncoding,

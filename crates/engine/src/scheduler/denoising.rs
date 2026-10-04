@@ -20,9 +20,8 @@ pub(crate) struct LatentPlacement {
     /// Latent units the trajectory occupies in those pages, in the
     /// model-defined unit the worker sizes pages by (`latent_page_units`).
     pub(crate) latent_units: u32,
-    /// Raster height: the requested image height in pixels for image
-    /// generation, the extent `Scheduler::video_raster` reads from the video
-    /// decoder's declared output for video.
+    /// Raster height in pixels: the requested image height for image
+    /// generation, the request's canvas height for video.
     pub(crate) height: u32,
     /// Raster width, from the same source as `height`.
     pub(crate) width: u32,

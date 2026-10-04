@@ -554,7 +554,11 @@ impl InputProcessor {
         }
         Ok(uniserve_core::DiffusionRequest {
             request_id: uniserve_core::RequestId(0),
+            task: uniserve_core::VideoTask::T2va,
+            text_tags: vec![1; prompt_token_ids.len()],
             prompt_token_ids,
+            conditions: Vec::new(),
+            media: Vec::new(),
             priority: 0,
             sampling,
         })
@@ -607,6 +611,9 @@ impl InputProcessor {
                 video_units,
                 num_inference_steps: *num_inference_steps,
                 seed,
+                // FastH3's text-only API serves its trained 16:9 canvas.
+                width: 1344,
+                height: 768,
             },
         ))
     }

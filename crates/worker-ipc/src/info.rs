@@ -138,13 +138,43 @@ pub struct OutputInfo {
     /// Upper bound on the result's shape, used to size storage before the
     /// actual shape is known.
     pub shape_bound: ShapeBound,
+    /// The axes holding a video request's raster, for a result laid out at
+    /// the request's canvas. Their extents in `shape_bound` are the largest
+    /// height and width the worker admits; a request binds them to its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raster_axes: Option<RasterAxes>,
+}
+
+/// The two axes of a result that hold a video request's raster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RasterAxes {
+    /// Axis holding the canvas height in pixels.
+    pub height: u32,
+    /// Axis holding the canvas width in pixels.
+    pub width: u32,
 }
 
 impl OutputInfo {
     /// Validate the logical representation advertised to allocation and routing.
+    ///
+    /// Raster axes must be two distinct static axes of the bound.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(!self.name.is_empty(), "tensor result must have a name");
         self.shape_bound.validate()?;
+        if let Some(raster) = self.raster_axes {
+            let is_static = |axis: u32| {
+                matches!(
+                    self.shape_bound.dims.get(axis as usize),
+                    Some(DimBound::Static(_))
+                )
+            };
+            ensure_valid!(
+                raster.height != raster.width
+                    && is_static(raster.height)
+                    && is_static(raster.width),
+                "a tensor result's raster axes must be two distinct static axes"
+            );
+        }
         Ok(())
     }
 }
@@ -183,6 +213,112 @@ impl WorkerEndpoint {
 /// no checkpoint identity because it loads no checkpoint.
 const STUB_MODEL_PREFIX: &str = "uniserve_models.stub";
 
+/// Whole-tile condition packing of a multi-region video denoiser.
+///
+/// Each condition occupies whole tiles of `rows` rows: its audio rows fill
+/// tiles of their own, then an image's rows fill tiles, while a video's
+/// `(latent frames, height, width)` token grid is cut into tiles of `video`
+/// tokens along those axes, each tile taking `rows` rows however few tokens
+/// it holds. A condition's packed rows are its tile count times `rows`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConditionTiles {
+    /// Rows of one tile.
+    pub rows: u32,
+    /// Tokens of one video tile along latent frames, height and width; their
+    /// product is `rows`.
+    pub video: [u32; 3],
+}
+
+impl ConditionTiles {
+    /// Packed rows of a condition with `audio_rows` audio rows and either
+    /// `image_rows` image rows or a video token grid `(frames, height,
+    /// width)`.
+    pub fn rows(&self, audio_rows: u32, image_rows: u32, video_grid: Option<[u32; 3]>) -> u64 {
+        let tiles = |count: u32, size: u32| u64::from(count.div_ceil(size));
+        let visual = match video_grid {
+            Some(grid) => grid
+                .iter()
+                .zip(self.video)
+                .map(|(&extent, size)| tiles(extent, size))
+                .product(),
+            None => tiles(image_rows, self.rows),
+        };
+        (tiles(audio_rows, self.rows) + visual) * u64::from(self.rows)
+    }
+}
+
+/// What the video denoiser a deployment places serves.
+///
+/// The denoiser fixes its schedule, so requests may only restate it; the
+/// tasks, canvases, condition packing and sequence capacity bound what
+/// admission accepts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoDenoiserInfo {
+    /// Task names the denoiser serves, in canonical order.
+    pub tasks: Vec<String>,
+    /// Sigma points of the fixed schedule, the clean endpoint included: one
+    /// more than the network evaluations (`WorkerInfo::num_inference_steps`).
+    pub schedule_points: u32,
+    /// Shift of the video schedule.
+    pub video_shift: f64,
+    /// Shift of the audio schedule.
+    pub audio_shift: f64,
+    /// The only canvases the denoiser generates; empty when it generates
+    /// every canvas of the model's canvas rule.
+    #[serde(default)]
+    pub canvases: Vec<uniserve_core::Canvas>,
+    /// The checkpoint's packed sequence capacity in rows, when it has one.
+    #[serde(default)]
+    pub max_sequence_rows: Option<u32>,
+    /// How the denoiser packs condition rows: in whole tiles for a
+    /// multi-region denoiser, or densely, one row per condition token, when
+    /// absent.
+    #[serde(default)]
+    pub condition_tiles: Option<ConditionTiles>,
+}
+
+impl VideoDenoiserInfo {
+    /// Checks that tasks are named once each, the schedule has an endpoint
+    /// and positive finite shifts, every canvas and the capacity are
+    /// positive, and condition tiles are video tiles of their row count.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            !self.tasks.is_empty()
+                && self.tasks.iter().all(|task| !task.is_empty())
+                && self.tasks.iter().collect::<HashSet<_>>().len() == self.tasks.len(),
+            "a video denoiser names each of its tasks once"
+        );
+        ensure_valid!(
+            self.schedule_points >= 2
+                && [self.video_shift, self.audio_shift]
+                    .iter()
+                    .all(|shift| shift.is_finite() && *shift > 0.0),
+            "a video denoiser schedule needs points and positive shifts"
+        );
+        ensure_valid!(
+            self.canvases
+                .iter()
+                .all(|canvas| canvas.width > 0 && canvas.height > 0)
+                && self.max_sequence_rows != Some(0),
+            "a video denoiser declares an empty canvas or sequence capacity"
+        );
+        ensure_valid!(
+            self.condition_tiles.is_none_or(|tiles| {
+                tiles.rows > 0
+                    && tiles.video.iter().all(|&size| size > 0)
+                    && tiles
+                        .video
+                        .iter()
+                        .map(|&size| u64::from(size))
+                        .product::<u64>()
+                        == u64::from(tiles.rows)
+            }),
+            "a video denoiser's condition tiles are not video tiles of their rows"
+        );
+        Ok(())
+    }
+}
+
 /// Post-load worker geometry, limits, supported work, and model identity.
 ///
 /// [`WorkerInfo::validate`] checks only internal consistency. The engine's
@@ -198,6 +334,9 @@ pub struct WorkerInfo {
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
     /// Effective number of diffusion predictions advertised by the loaded model.
     pub num_inference_steps: u32,
+    /// What the deployment's video denoiser serves, when the model has one.
+    #[serde(default)]
+    pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
     /// Rank-local primary compute device used to bind physical transfer edges.
@@ -392,6 +531,13 @@ impl WorkerInfo {
             }),
             "a media call names no component this worker serves"
         );
+        if let Some(video) = &self.video_denoiser {
+            video.validate()?;
+            ensure_valid!(
+                video.schedule_points == self.num_inference_steps + 1,
+                "a video denoiser's schedule points disagree with its evaluations"
+            );
+        }
         ensure_valid!(
             self.max_batch_calls > 0
                 && self.max_batch_tokens > 0
@@ -454,6 +600,7 @@ impl Default for WorkerInfo {
             model_name: "model".to_owned(),
             media_components: Default::default(),
             num_inference_steps: 0,
+            video_denoiser: None,
             fabric_handles: false,
             endpoint: WorkerEndpoint {
                 worker_id: "worker".into(),

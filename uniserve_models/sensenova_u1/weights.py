@@ -10,6 +10,7 @@ pipeline rank and declares the checkpoint names of the others nonresident.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -220,9 +221,18 @@ def checkpoint_mappings(model: Model):
     return tuple(components)
 
 
-precisions = MappingProxyType({"bf16": weights.Config()})
+_PRECISIONS = MappingProxyType({"bf16": weights.Config()})
 
-# Base precision for a calibrated ModelOpt checkpoint:
-# ``uniserve_models.loading`` overlays the calibrated quantization, and every
-# other module stays BF16.
-checkpoint_precision = precisions["bf16"]
+
+def precisions(config) -> Mapping[str, weights.Config]:
+    """Named presets ``load_model`` accepts for ``config``'s checkpoint."""
+    return _PRECISIONS
+
+
+def checkpoint_precision(config) -> weights.Config:
+    """Base precision for a calibrated ModelOpt checkpoint.
+
+    ``uniserve_models.loading`` overlays the calibrated quantization, and
+    every other module stays BF16.
+    """
+    return _PRECISIONS["bf16"]

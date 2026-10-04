@@ -104,7 +104,7 @@
       { "node": "localhost", "device": "cpu" }
     ],
     "components": {
-      "video_encoder": {
+      "video_codec": {
         "ranks": [0, 1, 2, 3],
         "parallel_config": {},
         "distribution": "temporal_units",
@@ -122,7 +122,7 @@
       { "node": "localhost", "device": "cpu" }
     ],
     "components": {
-      "video_encoder": {
+      "video_codec": {
         "ranks": [0, 1, 2, 3],
         "parallel_config": {},
         "distribution": "temporal_units",

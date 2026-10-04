@@ -28,7 +28,11 @@ from uniserve_worker.transport.layout import (
     resolve_dtype,
     tensor_nbytes,
 )
-from uniserve_worker.transport.pool import TransferCapacity, TransferPool
+from uniserve_worker.transport.pool import (
+    ReadReservation,
+    TransferCapacity,
+    TransferPool,
+)
 from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
@@ -64,7 +68,7 @@ class ChannelTransport(Transport):
         source: WorkerEndpoint | None = None,
         host_slots: Sequence[int] = (),
     ) -> None:
-        self._bytes = capacity
+        self.capacity = capacity
         self._events = event_pool
         self.source = source or WorkerEndpoint.local()
         # Slots of the ranks on this host, which shared storage reaches; the
@@ -117,7 +121,7 @@ class ChannelTransport(Transport):
         spans = source if isinstance(source, tuple) else (source,)
         first = spans[0]
         nbytes = tensor_nbytes(source)
-        self._bytes.acquire(nbytes)
+        self.capacity.acquire(nbytes)
         try:
             # One contiguous host buffer in physical tensor order. A device
             # product is staged through it, which is the same crossing a host
@@ -163,7 +167,7 @@ class ChannelTransport(Transport):
         finally:
             # The staging buffer is the only thing this rank held: the bytes
             # are in the locator by now, and the source is its own again.
-            self._bytes.release(nbytes)
+            self.capacity.release(nbytes)
 
     def fetch(
         self,
@@ -172,6 +176,7 @@ class ChannelTransport(Transport):
         device: torch.device,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
+        reservation: ReadReservation | None = None,
     ) -> TransferTicket:
         """Copy the locator's own bytes into a reserved destination."""
         import torch
@@ -207,6 +212,7 @@ class ChannelTransport(Transport):
             None,
             nbytes=locator.nbytes,
             destination=target,
+            reservation=reservation,
         )
 
     def release(

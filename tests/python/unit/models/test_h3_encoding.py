@@ -9,7 +9,7 @@ from. Audio conditions are encoded whole as channel-major stereo rows.
 import pytest
 import torch
 
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve_models.minimax_h3 import audio_vae, video_vae
 from uniserve_models.minimax_h3.encoding import AudioEncoder, VideoEncoder
 from uniserve_models.minimax_h3.packing import video_latent_frames
@@ -57,9 +57,9 @@ def test_video_units_partition_frames_and_latent_frames(num_frames):
 @pytest.mark.parametrize("num_frames", (1, 39))
 def test_video_rows_are_denoiser_patch_tokens(num_frames, height, width):
     encoder = _video_encoder()
-    layout = encoder.output_layout(num_frames, image.Config(height, width))[
-        "video"
-    ]
+    layout = encoder.output_layout(
+        video.Config(num_frames, image.Config(height, width))
+    )["video"]
 
     frames = encoder.latent_slices(num_frames)[-1].stop
     assert layout.shape == (frames * (height // 32) * (width // 32), 96)
