@@ -24,6 +24,8 @@ Transport backends share a native `TransferCapacity` for bytes and read credits.
 
 The native `TransferPool` uses host tasks bounded by that read budget and orders copies after both the producer fence and the submitting thread's destination stream. Its `TransferTicket` exposes consumable views before physical completion, so consumers can enqueue work behind the read fence. Cancelling a queued read returns its unused credits immediately; an executing read returns them only after device access drains. Borrowed local views retain their source grant through every consumer stream. A failure to establish physical completion keeps the affected resources and credits occupied and surfaces through the pool and storage owners.
 
+`TransferTicket` keeps result readiness, cancellation, borrowed-view closure and physical retirement in the independent worker core. A late device failure prevents further consumption even if a view was previously exposed; its existing consumers still retain that view. Physical retirement uses the shared native `Completion`, and its observers can outlive the ticket while consumer fences finish. The binding supplies tensor views and device operations without duplicating ticket state.
+
 Local, shared-memory and CUDA VMM transports retain their source buffers in the native `BufferRegistry`. Releasing a buffer revokes further reads; its retirement waits for producer completion and outstanding readers. Backend callbacks perform the physical reclamation outside the registry lock, allowing completion observers to submit more work. CUDA VMM separates the original source from its exported pool chunk: the source retires after its copy finishes, while remote acknowledgment words govern chunk reuse.
 
 ## Token and canvas calls

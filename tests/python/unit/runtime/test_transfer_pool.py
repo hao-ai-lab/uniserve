@@ -9,9 +9,60 @@ import torch
 
 from uniserve.runtime import EventPool
 from uniserve_worker.errors import WorkerError
-from uniserve_worker.transport.pool import TransferCapacity, TransferPool
+from uniserve_worker.transport.pool import (
+    ReadBackpressureError,
+    TransferCapacity,
+    TransferPool,
+)
 
 pytestmark = pytest.mark.unit
+
+
+def test_cancelled_consumption_keeps_credits_until_the_running_read_finishes():
+    events = EventPool()
+    capacity = TransferCapacity(4, 1)
+    pool = TransferPool(
+        workers=1,
+        capacity=capacity,
+        name="transfer-retirement",
+        event_pool=events,
+    )
+    source = torch.tensor([7.0])
+    destination = torch.zeros_like(source)
+    visible, release = Event(), Event()
+
+    def copy_then_wait(ticket):
+        pool.copy(ticket, source, destination)
+        visible.set()
+        assert release.wait(5), "running read was never released"
+
+    try:
+        ticket = pool.submit(copy_then_wait, nbytes=4, destination=destination)
+        assert visible.wait(5), "read never produced its view"
+        observed = []
+        ticket.add_done_callback(lambda: observed.append(ticket.result()))
+        assert torch.equal(observed[0], source)
+
+        ticket.cancel()
+        assert ticket.ready() and not ticket.retirement_ready()
+        with pytest.raises(WorkerError, match="cancelled"):
+            ticket.result()
+        with pytest.raises(ReadBackpressureError):
+            capacity.take_reads()
+        assert capacity.used == 4
+
+        release.set()
+        pool.close()
+        assert ticket.retirement_ready()
+        assert capacity.used == 0
+        capacity.take_reads()
+        capacity.return_reads()
+        with pytest.raises(WorkerError, match="cancelled"):
+            ticket.result()
+    finally:
+        release.set()
+        pool.close()
+        events.close()
 
 
 def test_queued_cancellation_returns_credit_without_waiting_for_another_read():
