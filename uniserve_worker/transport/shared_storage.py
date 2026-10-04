@@ -3,9 +3,8 @@
 A producer creates a POSIX shared-memory segment with
 `allocate_shared_storage` (used by `ShmTransport` and `media.storage`), and
 a reader on the same host maps it by name with `open_shared_storage`, which
-resolves the name with `shm_open`. `allocate_shared_storage` reserves the
-new segment's pages through its path under `/dev/shm`, where
-`multiprocessing.shared_memory` places segments on Linux.
+resolves the name with `shm_open`. Both operations use POSIX segment names;
+the mount path of the shared-memory filesystem is not needed.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ def allocate_shared_storage(size: int) -> shared_memory.SharedMemory:
 
     storage = shared_memory.SharedMemory(create=True, size=size)
     try:
-        descriptor = os.open(f"/dev/shm/{storage.name}", os.O_RDWR)
+        descriptor = _open_descriptor(storage.name)
         try:
             os.posix_fallocate(descriptor, 0, size)
         finally:
@@ -48,6 +47,16 @@ def allocate_shared_storage(size: int) -> shared_memory.SharedMemory:
 
 _SHM_LIBC = ctypes.CDLL(None, use_errno=True)
 _SHM_LIBC.shm_open.restype = ctypes.c_int
+_SHM_LIBC.shm_open.argtypes = (ctypes.c_char_p, ctypes.c_int, ctypes.c_uint)
+
+
+def _open_descriptor(name: str) -> int:
+    canonical_name = name if name.startswith("/") else f"/{name}"
+    descriptor = _SHM_LIBC.shm_open(canonical_name.encode(), os.O_RDWR, 0)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), canonical_name)
+    return descriptor
 
 
 def open_shared_storage(name: str, size: int) -> mmap.mmap:
@@ -64,11 +73,7 @@ def open_shared_storage(name: str, size: int) -> mmap.mmap:
             publication.
         ValueError: When `size` exceeds the segment's size.
     """
-    canonical_name = name if name.startswith("/") else f"/{name}"
-    descriptor = _SHM_LIBC.shm_open(canonical_name.encode(), os.O_RDWR)
-    if descriptor < 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), canonical_name)
+    descriptor = _open_descriptor(name)
     try:
         return mmap.mmap(
             descriptor,

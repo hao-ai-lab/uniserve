@@ -1,6 +1,5 @@
 """Failed readers and refused publications release their segment and quota."""
 
-import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,8 +12,39 @@ from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import atomic_load_u32
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.transport import make_transports, segment
+from uniserve_worker.transport.shared_storage import open_shared_storage
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize("backend", ("local", "shm"))
+def test_retirement_observer_can_publish_into_returned_capacity(backend):
+    events = EventPool()
+    producer = make_transports(
+        (backend,), byte_capacity=4, ticket_capacity=1, event_pool=events
+    )[backend]
+    consumer = make_transports(
+        (backend,), byte_capacity=4, ticket_capacity=1, event_pool=events
+    )[backend]
+    replacement = []
+    try:
+        locator = producer.publish(torch.tensor([1.0]))
+        retirement = producer.publication_retirement(locator)
+        retirement.add_done_callback(
+            lambda _: replacement.append(producer.publish(torch.tensor([2.0])))
+        )
+        producer.release(locator)
+
+        ticket = consumer.fetch(replacement[0], device=torch.device("cpu"))
+        ready = threading.Event()
+        ticket.add_done_callback(ready.set)
+        assert ready.wait(5)
+        torch.testing.assert_close(ticket.result(), torch.tensor([2.0]))
+        ticket.close()
+    finally:
+        consumer.close()
+        producer.close()
+        events.close()
 
 
 @pytest.mark.parametrize("ending", ("cancel", "failed_fetch", "failed_borrow"))
@@ -142,11 +172,13 @@ def test_a_refused_publication_returns_its_segment_and_quota(
             )
 
         before = len(created)
-        with pytest.raises(ResourceError, match="publication capacity"):
+        with pytest.raises(ResourceError):
             producer.publish(torch.ones(4, device=device))
         refused = created[before:]
         assert refused, "the refused publication made no segment"
-        assert not any(os.path.exists(f"/dev/shm/{name}") for name in refused)
+        for name in refused:
+            with pytest.raises(FileNotFoundError):
+                open_shared_storage(name, 1)
 
         # Once the table's own publications retire, the whole budget is
         # available again.

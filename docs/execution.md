@@ -12,6 +12,8 @@ An import shares resident coverage and fetches only missing regions into the res
 
 Transport backends share a native `TransferCapacity` for bytes and read credits. A `ReadReservation` takes an entire fetch's credits before any read starts. The native `TransferPool` orders copies after both the producer fence and the submitting thread's destination stream. Its `TransferTicket` exposes consumable views before physical completion, so consumers can enqueue work behind the read fence. Cancellation revokes consumption; credit returns only after device access drains. Borrowed local views retain their source grant through every consumer stream. A failure to establish physical completion keeps the affected resources and credits occupied and surfaces through the pool and storage owners.
 
+Local, shared-memory and CUDA VMM transports retain their source buffers in the native `BufferRegistry`. Releasing a buffer revokes further reads; its retirement waits for producer completion and outstanding readers. Backend callbacks perform the physical reclamation outside the registry lock, allowing completion observers to submit more work. CUDA VMM separates the original source from its exported pool chunk: the source retires after its copy finishes, while remote acknowledgment words govern chunk reuse.
+
 ## Token and canvas calls
 
 Prefill, token decode and token denoising use separate homogeneous numerical calls. A prefill can write context without projecting logits or sampling. Readout canvases attend to that context without changing its KV entries; their candidate probabilities are normalized over the full vocabulary.

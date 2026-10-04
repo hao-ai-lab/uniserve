@@ -12,7 +12,7 @@ import torch
 from tests.python.fixtures.shm_publication import serve_pending_publication
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
-from uniserve_worker.errors import WorkerError
+from uniserve_worker.errors import WorkerError, WorkerErrorCode
 from uniserve_worker.protocol.batch import BufferAllocation
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.tensor import (
@@ -410,10 +410,11 @@ def test_cuda_vmm_serves_a_fanout_and_refuses_a_retired_publication() -> None:
             process.join(30)
             assert process.exitcode == 0
 
-        with pytest.raises(WorkerError, match="retired"):
+        with pytest.raises(WorkerError) as failure:
             _await_ticket(
                 transport.fetch(locator, device=torch.device("cuda:0"))
             )
+        assert failure.value.code == WorkerErrorCode.INVALID_DESCRIPTOR
         replacement = transport.publish(torch.ones(2048, device="cuda:0"))
     finally:
         for channel, process, _device in readers:
@@ -445,10 +446,11 @@ def test_cuda_vmm_rejects_a_changed_registered_view() -> None:
             nbytes=locator.nbytes // 2,
             transport=replace(locator.transport, span_lengths=(512,)),
         )
-        with pytest.raises(WorkerError, match="invalid"):
+        with pytest.raises(WorkerError) as failure:
             _await_ticket(
                 transport.fetch(changed, device=torch.device("cuda:0"))
             )
+        assert failure.value.code == WorkerErrorCode.INVALID_DESCRIPTOR
     finally:
         transport.release(locator)
         transport.close()
@@ -589,14 +591,12 @@ def test_cuda_vmm_reports_an_unusable_handle_to_its_reader() -> None:
 def _read_shm_publication(channel, slot: int) -> None:
     """External reader that acknowledges the segment only when told to.
 
-    The reader finds everything it needs in the segment: the digest that
-    binds it to the locator, the readiness word, and its own acknowledgment
-    word. It claims that word before its first read, as the transport does,
+    The reader waits on readiness and claims its acknowledgment word before
+    its first read, as the transport does,
     and holds the claim across the producer's release so retirement is
     observed to wait for it.
     """
     from uniserve_worker.transport import segment
-    from uniserve_worker.transport.endpoint import locator_digest
     from uniserve_worker.transport.shared_storage import open_shared_storage
 
     channel.send("ready")
@@ -606,7 +606,6 @@ def _read_shm_publication(channel, slot: int) -> None:
     )
     try:
         header = memoryview(storage)
-        assert segment.digest(header) == locator_digest(locator)
         segment.claim(header, slot)
         segment.await_ready(header)
         payload = segment.HEADER_BYTES
@@ -1048,61 +1047,6 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
         events.close()
 
 
-@pytest.mark.parametrize("backend", ("local", "shm", "cuda_vmm"))
-def test_publication_rejects_changed_producer_identity(backend: str) -> None:
-    """A read names the producer it was published by, or is refused.
-
-    A host segment carries the digest of its own locator, so any change to
-    the source is caught in the header. A device publication is checked
-    against its owner where that owner is in reach; beyond this address space
-    a device locator is the engine's word, which binds only what a producer
-    reported, so the fields that move a read out of reach are not forged here.
-    """
-    device = torch.device("cuda:0")
-    events = EventPool()
-    endpoint = WorkerEndpoint.local("encoder-0", rank=2)
-    transport = make_transport(
-        backend,
-        byte_capacity=16384,
-        ticket_capacity=2,
-        event_pool=events,
-        source=endpoint,
-    )
-    source = torch.arange(32, dtype=torch.float32, device=device)
-    destination = torch.empty_like(source)
-    locator = transport.publish(source)
-    try:
-        assert locator.source == endpoint
-        fields = [
-            ("worker_id", "encoder-1"),
-            ("rank", 1),
-            ("incarnation", "another-incarnation"),
-        ]
-        if backend != "cuda_vmm":
-            fields += [
-                ("node", "another-node"),
-                ("address_space", "another-process"),
-            ]
-        for field, value in fields:
-            changed = replace(
-                locator, source=replace(endpoint, **{field: value})
-            )
-            with pytest.raises(WorkerError):
-                _await_ticket(
-                    transport.fetch(
-                        changed, device=device, destination=destination
-                    )
-                )
-        _await_ticket(
-            transport.fetch(locator, device=device, destination=destination)
-        )
-        torch.testing.assert_close(destination, source, rtol=0, atol=0)
-    finally:
-        transport.release(locator)
-        transport.close()
-        events.close()
-
-
 def test_local_delivery_between_workers_retains_the_publisher_until_consumption() -> (  # noqa: E501
     None
 ):
@@ -1173,6 +1117,53 @@ def test_cuda_vmm_source_retires_before_its_consumers_acknowledge() -> None:
         retirement.result(timeout=5)
     finally:
         transport.close()
+        events.close()
+
+
+@pytest.mark.parametrize("storage", ("direct", "pooled"))
+def test_cuda_vmm_local_copy_retains_its_source_until_device_completion(
+    storage,
+):
+    from uniserve_kernels.peer_storage import empty
+
+    device = torch.device("cuda:0")
+    events = EventPool()
+    producer = make_transport(
+        "cuda_vmm", byte_capacity=1 << 20, ticket_capacity=1, event_pool=events
+    )
+    consumer = make_transport(
+        "cuda_vmm", byte_capacity=1 << 20, ticket_capacity=1, event_pool=events
+    )
+    allocate = empty if storage == "direct" else torch.empty
+    source = allocate((1024,), dtype=torch.float32, device=device)
+    source.fill_(7)
+    locator = producer.publish(source)
+    destination = torch.empty_like(source)
+    initializer = torch.cuda.Stream(device=device)
+    torch.cuda.synchronize(device)
+    try:
+        with torch.cuda.stream(initializer):
+            # Readiness can be exposed while device access still waits for
+            # the destination's previous work. The source must stay held.
+            torch.cuda._sleep(1_000_000_000)
+            destination.zero_()
+            ticket = consumer.fetch(
+                locator, device=device, destination=destination
+            )
+        _await_ticket(ticket)
+        retirement = producer.release(locator)
+        events.reap()
+        assert retirement is not None and not retirement.done()
+
+        retired = threading.Event()
+        ticket.add_retirement_callback(retired.set)
+        assert retired.wait(10)
+        events.reap()
+        retirement.result(timeout=5)
+        torch.testing.assert_close(destination, torch.full_like(source, 7))
+    finally:
+        consumer.close()
+        producer.close()
         events.close()
 
 

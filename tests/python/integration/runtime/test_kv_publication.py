@@ -44,7 +44,6 @@ from uniserve_worker.protocol.transfer import (
     PosixShmTransfer,
 )
 from uniserve_worker.transport import segment
-from uniserve_worker.transport.endpoint import locator_digest
 from uniserve_worker.transport.shared_storage import open_shared_storage
 
 pytestmark = pytest.mark.integration
@@ -70,9 +69,7 @@ def _map_locations(publication: KvTransfer, locate) -> KvTransfer:
 def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
     """Copy a ready publication into a segment whose readiness the test holds.
 
-    The copy carries the digest of the locator that names it, so the reading
-    rank accepts it as the publication it was handed, and stays pending until
-    the test announces it.
+    The reader stays pending until the test announces readiness in the header.
     """
     assert isinstance(locator.transport, PosixShmTransfer)
     source = open_shared_storage(
@@ -92,7 +89,7 @@ def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
     gated = replace(
         locator, transport=replace(locator.transport, name=storage.name)
     )
-    segment.initialize(storage.buf, locator_digest(gated))
+    segment.initialize(storage.buf)
     storage.buf[segment.HEADER_BYTES : segment.HEADER_BYTES + len(data)] = data
     return gated, storage
 

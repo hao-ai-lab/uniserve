@@ -14,7 +14,7 @@ its numerical ``BufferBinding`` views.
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future
 from types import TracebackType
-from typing import Any, Self, final
+from typing import Any, Generic, Self, TypeVar, final
 
 import torch
 
@@ -31,7 +31,11 @@ from uniserve_worker.protocol.batch import (
 from uniserve_worker.protocol.call import Call, ImageParams
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.tensor import TensorRef
-from uniserve_worker.protocol.transfer import TensorTransfer, WorkerEndpoint
+from uniserve_worker.protocol.transfer import (
+    Locator,
+    TensorTransfer,
+    WorkerEndpoint,
+)
 from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
@@ -41,6 +45,7 @@ __all__ = [
     "Buffer",
     "BufferBinding",
     "BufferPool",
+    "BufferRegistry",
     "Request",
     "RequestPool",
     "ReadReservation",
@@ -56,6 +61,46 @@ __all__ = [
     "atomic_store_u32",
     "service_name",
 ]
+
+Source = TypeVar("Source")
+
+@final
+class BufferRegistry(Generic[Source]):
+    """Retain registered storage until its producer and readers finish.
+
+    Reclaim hands the source back and completes its retirement future. Drain
+    waits for an in-flight reclamation at shutdown. Settled inspects backend
+    acknowledgments; it must not mutate the registry or invoke observers.
+    """
+
+    def __new__(
+        cls,
+        *,
+        capacity: int,
+        reclaim: Callable[[Source, Future[None]], None],
+        drain: Callable[[Source], None],
+        settled: Callable[[Source], bool],
+    ) -> Self: ...
+    @property
+    def name(self) -> str: ...
+    def register(
+        self, locator: Locator, source: Source, *, pending: bool = False
+    ) -> None: ...
+    def source(self, locator: Locator) -> Source: ...
+    def acquire(self, locator: Locator) -> Source: ...
+    def release_reader(self, locator: Locator) -> None: ...
+    def complete(
+        self,
+        locator: Locator,
+        *,
+        error: BaseException | None = None,
+        producer_completed: bool = True,
+    ) -> None: ...
+    def release(self, locator: Locator) -> Future[None] | None: ...
+    def retirement(self, locator: Locator) -> Future[None]: ...
+    def awaiting_acknowledgment(self) -> bool: ...
+    def reap(self) -> None: ...
+    def close(self) -> None: ...
 
 @final
 class TransferCapacity:

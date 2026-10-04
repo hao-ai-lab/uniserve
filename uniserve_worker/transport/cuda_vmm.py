@@ -43,7 +43,7 @@ from uniserve_worker.protocol.transfer import (
 from uniserve_worker.transport import descriptor_grants, vmm_pool
 from uniserve_worker.transport.descriptor_grants import DescriptorGrants
 from uniserve_worker.transport.endpoint import (
-    Publications,
+    BufferRegistry,
     _endpoint_lock,
     _endpoints,
 )
@@ -114,17 +114,8 @@ class _CudaSource:
     publication_id: str = ""
 
     def events_released(self) -> None:
-        # A fabric handle is bytes the publication carried and this rank owns
-        # nothing. A descriptor is an open file of this process, and a direct
-        # export's belongs to the publication: the engine retires a
-        # publication only once no named reader is still reading it, so the
-        # grant and the descriptor end here together.
-        #
-        # A chunk's descriptor belongs to its pool, and a chunk outlives its
-        # source by design -- the source was copied into it and is released
-        # while consumers are still reading. Withdrawing that grant here would
-        # refuse a reader that has not imported yet, so it is withdrawn where
-        # the chunk returns to the pool instead.
+        # Direct exports own their descriptor and end its grant here. A pool
+        # chunk keeps its grant until remote readers finish with the chunk.
         if (
             self.grants is not None
             and self.publication_id
@@ -133,10 +124,9 @@ class _CudaSource:
             self.grants.release(self.publication_id)
             os.close(int.from_bytes(self.handle, sys.byteorder))
 
-        # This ends the source's lifetime, not the chunk's. A pool publication
-        # was copied into its chunk, so the source is the producer's to reuse
-        # as soon as its own fence drains, however long consumers keep reading
-        # the chunk. The chunk returns separately, once they acknowledge it.
+        # The copy fence ends access to the original views. Remote readers
+        # retain only the exported chunk, whose acknowledgments are swept later.
+        self.copied_source = None
         self.capacity.release(self.nbytes)
         if self.retirement is not None:
             self.retirement.set_result(None)
@@ -211,13 +201,13 @@ class CudaVmmTransport(Transport):
         self._largest_payload = 0
         self._synchronize_seconds = 0.0
         self._longest_synchronize = 0.0
-        # Publications whose fence has drained but whose consumers have not all
-        # acknowledged. Their chunks are held until reap() finds them settled.
-        self._unacknowledged: list[_CudaSource] = []
+        # Retain chunks still read by remote consumers until reap() observes
+        # their acknowledgments, independently of the original source fence.
+        self._unacknowledged: dict[str, _CudaSource] = {}
         # A source is released when its own fence drains: a pool publication
         # was copied into its chunk, and the chunk is what waits for the
         # consumers, swept separately in reap().
-        self._publications = Publications[_CudaSource](
+        self._buffers = BufferRegistry(
             capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
@@ -238,7 +228,7 @@ class CudaVmmTransport(Transport):
             _endpoints[self.endpoint()] = self
 
     def endpoint(self) -> str:
-        return self._publications.name
+        return self._buffers.name
 
     def _descriptor_grants(self) -> DescriptorGrants:
         """Bind this address space's grant socket on first use."""
@@ -249,7 +239,7 @@ class CudaVmmTransport(Transport):
     def publication_retirement(
         self, locator: Locator
     ) -> concurrent.futures.Future[None]:
-        return self._publications.retirement(locator)
+        return self._buffers.retirement(locator)
 
     def set_completion_wake(self, wake: Any) -> None:
         self._reads.set_completion_wake(wake)
@@ -278,7 +268,7 @@ class CudaVmmTransport(Transport):
                 # so by writing its word rather than by closing a connection.
                 # Holding the chunk until then does not hold the source: that
                 # was copied into the chunk and is released below.
-                self._unacknowledged.append(source)
+                self._unacknowledged[source.publication_id] = source
             else:
                 # No other rank reads this product, so nothing can be waiting.
                 self._release_chunk(source)
@@ -296,11 +286,7 @@ class CudaVmmTransport(Transport):
         """
         import torch
 
-        held = [
-            source
-            for source in self._unacknowledged
-            if source.pool is not None and source.chunk is not None
-        ]
+        held = list(self._unacknowledged.values())
         if not held:
             return
         # Every held chunk's words are read in one transfer. Asking each chunk
@@ -315,16 +301,15 @@ class CudaVmmTransport(Transport):
             torch.cat(watched).cpu().split([len(words) for words in watched])
         )
 
-        waiting = []
         for source, words in zip(held, observed, strict=True):
             # A chunk returns once no named consumer is still reading it: one
             # that never claimed its word holds nothing, which is how a
             # product whose consuming call was never submitted retires.
             if bool((words != vmm_pool.CLAIMED).all()):
                 self._release_chunk(source)
-            else:
-                waiting.append(source)
-        self._unacknowledged = waiting
+                # Read completions may add other chunks while the GPU query
+                # runs. Remove only the chunks this sweep observed as settled.
+                self._unacknowledged.pop(source.publication_id)
 
     def awaiting_acknowledgment(self) -> bool:
         return bool(self._unacknowledged)
@@ -332,7 +317,7 @@ class CudaVmmTransport(Transport):
     def _drain(self, source: _CudaSource) -> None:
         """Block until the producer fence completes, then release the source.
 
-        `Publications.close` calls this for a reclamation still in flight;
+        `BufferRegistry.close` calls this for a reclamation still in flight;
         `EventPool.reap` runs `_CudaSource.events_released`.
         """
         source.event.synchronize()
@@ -532,7 +517,7 @@ class CudaVmmTransport(Transport):
                 offset=offset,
                 device=str(first.device),
             )
-            self._publications.publish(locator, publication)
+            self._buffers.register(locator, publication)
             return locator
         except BaseException:
             if publication is not None:
@@ -646,15 +631,13 @@ class CudaVmmTransport(Transport):
                     # and producer fence directly; no IPC mapping is needed.
                     with _endpoint_lock:
                         owner = _endpoints.get(handle.endpoint)
-                    if (
-                        not isinstance(owner, CudaVmmTransport)
-                        or owner.source != locator.source
-                    ):
+                    if not isinstance(owner, CudaVmmTransport):
                         raise invalid_descriptor(
                             "CUDA publication has no live local owner"
                         )
-                    publication = owner._publications.source(
-                        locator, reading=True
+                    publication = owner._buffers.acquire(locator)
+                    ticket.add_retirement_callback(
+                        lambda: owner._buffers.release_reader(locator)
                     )
                     mapped = publication.tensor
                     event = publication.event
@@ -796,11 +779,11 @@ class CudaVmmTransport(Transport):
             raise invalid_descriptor(
                 "CUDA VMM release requires a CUDA VMM locator"
             )
-        retirement = self._publications.release(locator)
+        retirement = self._buffers.release(locator)
         # Retirement completes when the producer fence drains, which only an
         # `EventPool.reap` observes, so the controller is woken for it.
         if retirement is not None and not retirement.done():
-            source = self._publications.source(locator)
+            source = self._buffers.source(locator)
             self._events.schedule_completion_wake(
                 (
                     source.tensor[0]
@@ -830,7 +813,7 @@ class CudaVmmTransport(Transport):
         try:
             self._reads.close()
         finally:
-            self._publications.close()
+            self._buffers.close()
             # Consumers of this rank's remaining chunks are gone with it, so
             # their acknowledgments will never arrive. The pools are released
             # whole, which is what closing the transport means for them.
