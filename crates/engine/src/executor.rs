@@ -250,47 +250,27 @@ impl ExecutorInfo {
                     || info.video_denoiser == merged.video_denoiser),
             "workers disagree on the deployment's video denoiser"
         );
-        // Every KV stage must agree on layout. Capacity is the narrowest pool
-        // because a request may traverse all routed KV stages, and the
-        // per-token footprint is the largest any of them reports.
+        // Every KV stage must agree on its groups' retention policies and page
+        // shapes. Capacity is the narrowest pool because a request may
+        // traverse all routed KV stages with one set of unit ids, and the
+        // per-unit footprint is the largest any of them reports
+        // (`KvCacheInfo::merge`).
         if let Some(first_index) = kv_indices.first().copied() {
-            let first = &self.workers[first_index].1;
-            let first_kv = first
+            let mut kv_cache = self.workers[first_index]
+                .1
                 .kv_cache
-                .as_ref()
+                .clone()
                 .context("executor routes KV work to a pool without a KV cache")?;
             for index in kv_indices.iter().copied().skip(1) {
-                let other = &self.workers[index].1;
-                let other_kv = other
+                let other = self.workers[index]
+                    .1
                     .kv_cache
                     .as_ref()
                     .context("executor routes KV work to a pool without a KV cache")?;
-                anyhow::ensure!(
-                    other_kv.block_size == first_kv.block_size,
-                    "executor KV pools disagree on block size"
-                );
-                anyhow::ensure!(
-                    other_kv.total_layers == first_kv.total_layers
-                        && other_kv.total_kv_heads == first_kv.total_kv_heads
-                        && other_kv.head_dim == first_kv.head_dim
-                        && other_kv.dtype == first_kv.dtype
-                        && other_kv.groups == first_kv.groups,
-                    "executor KV pools expose incompatible cache layouts"
-                );
+                kv_cache = kv_cache
+                    .merge(other)
+                    .context("executor KV pools expose incompatible cache layouts")?;
             }
-            let mut kv_cache = first_kv.clone();
-            kv_cache.num_blocks = kv_indices
-                .iter()
-                .filter_map(|index| self.workers[*index].1.kv_cache.as_ref())
-                .map(|config| config.num_blocks)
-                .min()
-                .unwrap_or(first_kv.num_blocks);
-            kv_cache.bytes_per_token = kv_indices
-                .iter()
-                .filter_map(|index| self.workers[*index].1.kv_cache.as_ref())
-                .map(|config| config.bytes_per_token)
-                .max()
-                .unwrap_or(first_kv.bytes_per_token);
             merged.kv_cache = Some(kv_cache);
         } else {
             merged.kv_cache = None;
@@ -1033,7 +1013,7 @@ impl TransferConfig {
         }
         for publication in kv_inputs.iter_mut() {
             let mut bound = true;
-            for tensor in &mut publication.tensors {
+            for tensor in publication.tensors_mut() {
                 bound &= self.bind_locations(tensor, destination);
             }
             if !bound {

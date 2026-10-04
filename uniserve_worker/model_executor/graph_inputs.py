@@ -161,39 +161,44 @@ def bind_attention(static, live):
     """Pair captured addresses with the current host sequence metadata.
 
     ``static`` and ``live`` are ``AttentionBatch`` values over the same
-    tables. Returns ``static`` with its device tensors unchanged and every
-    table's host query and prefix lengths taken from ``live``, for
-    ``ExecutionContext.bind_attention`` planning before a replay.
+    tables and rows. Returns ``static`` with its device tensors unchanged
+    and every table's host query and prefix lengths and host start pages
+    taken from ``live``, for ``ExecutionContext.bind_attention`` planning
+    before a replay.
     """
     queries = replace(static.queries, host=live.queries.host)
-    return AttentionBatch(
-        {
-            table: replace(
-                entry,
-                queries=queries,
-                prefixes=replace(
-                    entry.prefixes, host=live.entries[table].prefixes.host
-                ),
+    entries = {}
+    for table, entry in static.entries.items():
+        current = live.entries[table]
+        blocks = entry.block_table
+        if blocks.start_page is not None:
+            blocks = replace(
+                blocks, start_page_host=current.block_table.start_page_host
             )
-            for table, entry in static.entries.items()
-        },
-        queries,
-    )
+        entries[table] = replace(
+            entry,
+            queries=queries,
+            prefixes=replace(entry.prefixes, host=current.prefixes.host),
+            block_table=blocks,
+        )
+    return AttentionBatch(entries, queries)
 
 
-def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
+def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
     """Choose a bucket with the call's attention and output semantics.
 
     Returns:
-        ``(rows, tokens, width, decode)`` for ``pad_text``, where ``width``
-        is the block-table width to stage (at least ``context_blocks``). A
+        ``(rows, tokens, widths, decode)`` for ``pad_text``, where
+        ``widths[t]`` is the width to stage for numerical table ``t``: at
+        least its staged width and its ``table_widths`` floor. A
         single-token causal decode batch selecting last logits uses the
         first configured decode size at least its row count, with
         ``tokens == rows``. Any other batch, or a decode batch no decode size
         fits, uses the smallest prefill shape, by rows then tokens, with more
         rows than the batch and at least its token count. None when the
-        input is not paged text, rows mix causality or output selection, a
-        row has no query token, or no configured shape fits.
+        input is not paged text over tables ``0..n-1``, rows mix causality or
+        output selection, a row has no query token, or no configured shape
+        fits.
 
     Raises:
         ValueError: If the attention input has no host query lengths.
@@ -204,10 +209,17 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
         for entry in inputs.attention.entries.values()
     ):
         return None
+    if set(inputs.attention.entries) != set(
+        range(len(inputs.attention.entries))
+    ):
+        return None
 
     # Tables share the query domain and causality; they differ only in their
-    # pages, so the widest table sets the staged width.
-    entries = tuple(inputs.attention.entries.values())
+    # pages.
+    entries = tuple(
+        inputs.attention.entries[table]
+        for table in range(len(inputs.attention.entries))
+    )
     attention = entries[0]
     selection = batch.token_selections[0]
     causal = attention.causal[0]
@@ -221,9 +233,12 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
     if any(length < 1 for length in queries):
         return None
 
-    width = max(
-        context_blocks,
-        *(entry.block_table.indices.shape[1] for entry in entries),
+    widths = tuple(
+        max(
+            table_widths[table] if table < len(table_widths) else 1,
+            entry.block_table.indices.shape[1],
+        )
+        for table, entry in enumerate(entries)
     )
     if (
         batch.forward_mode is ForwardMode.DECODE
@@ -235,7 +250,7 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
             (value for value in decode_sizes if value >= batch.row_count), None
         )
         if rows is not None:
-            return rows, rows, width, True
+            return rows, rows, widths, True
 
     shapes = tuple(
         shape
@@ -248,7 +263,7 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
     shape = min(
         shapes, key=lambda value: (value.row_bucket, value.token_bucket)
     )
-    return shape.row_bucket, shape.token_bucket, width, False
+    return shape.row_bucket, shape.token_bucket, widths, False
 
 
 def _fixed_view(tensor, shape):
@@ -277,12 +292,14 @@ def _fixed_view(tensor, shape):
     )
 
 
-def pad_text(batch, rows, tokens, width, decode):
+def pad_text(batch, rows, tokens, widths, decode):
     """Borrow a fixed bucket and make padding inert, including cache writes.
 
-    Physical block zero is valid storage. Padding queries read disposable values
-    but never write a block: their write indices are -1 and their results are
-    discarded. Prefill padding belongs to one additional numerical sequence.
+    Physical unit zero is valid storage. Padding queries read disposable
+    values but never write a unit: their write indices are -1, their start
+    pages zero, and their results are discarded. Prefill padding belongs to
+    one additional numerical sequence. ``widths[t]`` is the staged width of
+    numerical table ``t``.
 
     The batch's tensors must be views of the runner's fixed staging: padding
     is written in place past the live extents, and the returned batch views
@@ -301,7 +318,7 @@ def pad_text(batch, rows, tokens, width, decode):
     if not padding and not extra:
         # The staged lengths and offsets already describe the whole bucket.
         # Only page-table capacity can differ from the captured view.
-        return widen_prefix(batch, width)
+        return widen_prefix(batch, widths)
 
     # Padding tokens belong to one additional inert sequence; any further
     # padding rows are empty sequences.
@@ -338,8 +355,16 @@ def pad_text(batch, rows, tokens, width, decode):
 
     entries = {}
     for number, entry in attention.entries.items():
-        table = _fixed_view(entry.block_table.indices, (rows, width))
+        blocks = entry.block_table
+        table = _fixed_view(blocks.indices, (rows, widths[number]))
         table[live_rows:].zero_()
+        start = blocks.start_page
+        start_host = blocks.start_page_host
+        if start is not None:
+            start = _fixed_view(start, (rows,))
+            start[live_rows:].zero_()
+            if start_host is not None:
+                start_host = start_host + (0,) * extra
 
         prefix = _fixed_view(entry.prefixes.values, (rows,))
         prefix[live_rows:].zero_()
@@ -358,7 +383,7 @@ def pad_text(batch, rows, tokens, width, decode):
                 values=prefix,
                 offsets=prefix_offsets,
             ),
-            BlockTable(table, entry.block_table.block_size),
+            BlockTable(table, blocks.block_size, start, start_host),
             writes,
             (causal,) * rows,
         )
@@ -394,8 +419,12 @@ def pad_text(batch, rows, tokens, width, decode):
     )
 
 
-def widen_prefix(batch, width):
-    """Borrow fixed table capacity while retaining live prefix lengths."""
+def widen_prefix(batch, widths):
+    """Borrow fixed table capacity while retaining live prefix lengths.
+
+    ``widths[t]`` is the width numerical table ``t`` widens to; start pages
+    and host metadata are kept.
+    """
     attention = getattr(batch.inputs, "attention", None)
     if attention is None or not all(
         isinstance(entry, (PagedInput, SegmentedInput))
@@ -404,11 +433,12 @@ def widen_prefix(batch, width):
         return batch
     entries = {}
     for number, entry in attention.entries.items():
+        width = widths[number]
         if entry.block_table.indices.shape[1] > width:
             raise ValueError("prefix table exceeds its configured graph width")
         table = _fixed_view(entry.block_table.indices, (batch.row_count, width))
         entries[number] = replace(
-            entry, block_table=BlockTable(table, entry.block_table.block_size)
+            entry, block_table=replace(entry.block_table, indices=table)
         )
     return replace(
         batch,

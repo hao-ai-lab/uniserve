@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -19,6 +20,21 @@ from uniserve.nn.attention import (
 from uniserve.nn.functional import add_rms_norm
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.routing import RoutedTensor, RouteSpan
+
+
+@dataclass(frozen=True, slots=True)
+class CacheLayer:
+    """Logical K/V geometry of one cache layer, before any partitioning.
+
+    ``window`` is the layer's attention history bound (``None`` reads the
+    whole history), and ``num_kv_heads`` counts every KV head of the
+    architecture. Cache layers that agree on all three share one KV cache
+    group of the unit pool.
+    """
+
+    window: int | None
+    num_kv_heads: int
+    head_dim: int
 
 
 class TransformerDecoder(nn.Module):
@@ -57,14 +73,20 @@ class TransformerDecoder(nn.Module):
         self._tokens = Communicator()
         self.hidden_size = embedding.embedding_dim
         self.vocab_size = embedding.num_embeddings
-        # Logical cache identities survive pipeline pruning. Resource owners
-        # use this order to describe global K/V transfers without retaining
+        # Logical cache identities and geometry survive pipeline pruning.
+        # Resource owners use this order to describe global K/V transfers,
+        # including each cache group's complete layer axis, without retaining
         # parameters or modules belonging to another pipeline stage.
-        self.cache_names = tuple(
-            child.cache_name
+        cached = tuple(
+            child
             for layer in layers.values()
             for child in layer.modules()
             if isinstance(child, Attention) and child.cache_name is not None
+        )
+        self.cache_names = tuple(child.cache_name for child in cached)
+        self.cache_layers = tuple(
+            CacheLayer(child.window, child.num_kv_heads, child.head_dim)
+            for child in cached
         )
         if default_route is not None and (
             not isinstance(norm, nn.ModuleDict) or default_route not in norm
@@ -91,6 +113,7 @@ class TransformerDecoder(nn.Module):
                         child.head_dim,
                         child.head_indices,
                         dtype,
+                        window=child.window,
                     )
         return cache.Config(result)
 

@@ -51,6 +51,13 @@ from .input_batch import InputBatch
 from .output import ExecutionOutput
 
 
+def _masked_starts(table):
+    """Mask a table's host start pages for graph keying; device views stay."""
+    if table.start_page_host is None:
+        return table
+    return replace(table, start_page_host=(0,) * len(table.start_page_host))
+
+
 class ModelRunner(Execution, ABC):
     """Own one bound numerical capability on a borrowed execution-lane stream.
 
@@ -88,7 +95,9 @@ class ModelRunner(Execution, ABC):
         self.rank = rank
         self.decode_shapes: tuple[int, ...] = ()
         self.prefill_shapes: tuple[PrefillShape, ...] = ()
-        self.decode_context_blocks = 0
+        # Graph widths of every numerical block table; see
+        # ``bootstrap.capacity.graph_table_widths``.
+        self.table_widths: tuple[int, ...] = ()
         self._startup_complete = False
 
     @abstractmethod
@@ -125,13 +134,14 @@ class ModelRunner(Execution, ABC):
 
         # Only token and denoising batches reach this point: ``ModelExecutor``
         # marks only those eligible, and startup captures only those. Their
-        # attention staging provides ``max_blocks_per_row``.
-        execution = widen_prefix(batch, self.input_buffers.max_blocks_per_row)
+        # attention staging provides each table's ``table_widths``.
+        execution = widen_prefix(batch, self.input_buffers.table_widths)
         attention = getattr(execution.inputs, "attention", None)
 
         # ``input_signature`` keys non-tensor leaves by value. Masking host
-        # prefix lengths lets calls that differ only in cached prefix length
-        # share one graph; ``replay_batch`` rebinds the live host lengths.
+        # prefix lengths and start pages lets calls that differ only in
+        # cached prefix length share one graph; ``replay_batch`` rebinds the
+        # live host values.
         keyed = execution
         if attention is not None and all(
             isinstance(entry, (PagedInput, SegmentedInput))
@@ -151,6 +161,7 @@ class ModelRunner(Execution, ABC):
                                     if entry.prefixes.host is None
                                     else (0,) * len(entry.prefixes.host),
                                 ),
+                                block_table=_masked_starts(entry.block_table),
                             )
                             for table, entry in attention.entries.items()
                         },

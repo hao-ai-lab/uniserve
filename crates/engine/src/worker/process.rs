@@ -214,7 +214,7 @@ impl Default for WorkerProcessArgs {
             req_slot_cap: 1 << 20,
             resp_slot_cap: 8 << 20,
             kv_token_capacity: None,
-            block_size: 64,
+            block_size: None,
             max_batch_calls: 128,
             max_batch_tokens: 16_384,
             attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,

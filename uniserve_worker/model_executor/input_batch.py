@@ -89,8 +89,6 @@ class AttentionRow(InputRow):
     positions: torch.Tensor | None = None
     # Cached prefix length in tokens that the query follows.
     seq_len: int = 0
-    # KV cache group whose block table locates the row's pages.
-    group_id: int = 0
     write_kv: bool = False
     causal: bool = True
 

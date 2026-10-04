@@ -74,7 +74,7 @@ def test_native_attention_matches_declared_visibility(
     )
     cache_layout = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
     with PrefixCache(
-        cache_layout, num_blocks=4, block_size=16, device=device
+        cache_layout, num_units=4, block_size=16, device=device
     ) as cache:
         state = cache.state("attention")
         state.write((0,), start=0, key=k[:2], value=v[:2])
@@ -150,7 +150,7 @@ def test_paged_replay_reads_changed_causal_flags(provider):
     )
     with PrefixCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
-        num_blocks=4,
+        num_units=4,
         block_size=16,
         device=device,
     ) as cache:
@@ -231,7 +231,7 @@ def test_segmented_graph_keeps_nonfinite_values_within_their_sequence():
     with (
         PrefixCache(
             Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
-            num_blocks=2,
+            num_units=2,
             block_size=16,
             device=device,
         ) as cache,
@@ -283,7 +283,7 @@ def test_native_paged_replay_reads_changed_block_table_and_writes_slot_zero(
     )
     with PrefixCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
-        num_blocks=3,
+        num_units=3,
         block_size=16,
         device=device,
     ) as cache:
@@ -374,7 +374,7 @@ def test_native_paged_output_views_preserve_values_on_replay(
         out = torch.empty_like(q)
     with PrefixCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
-        num_blocks=2,
+        num_units=2,
         block_size=16,
         device=device,
     ) as cache:
@@ -448,7 +448,7 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
     )
     with PrefixCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
-        num_blocks=4,
+        num_units=4,
         block_size=16,
         device=device,
     ) as cache:
@@ -553,7 +553,7 @@ def test_visible_paged_replay_uses_changed_endpoints(provider, paged_keys):
     )
     with PrefixCache(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
-        num_blocks=17,
+        num_units=17,
         block_size=16,
         device=device,
     ) as cache:
@@ -842,7 +842,7 @@ def test_native_history_window_matches_portable_reference(
         "window": window,
     }
     with PrefixCache(
-        layout, num_blocks=16, block_size=block_size, device=device
+        layout, num_units=16, block_size=block_size, device=device
     ) as cache:
         state = cache.state("attention")
         for row, prefix in zip(blocks, prefixes, strict=True):

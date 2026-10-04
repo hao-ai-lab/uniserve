@@ -21,13 +21,18 @@ from .state import StateConfig, _blocks, block_spans, decode_region
 class Config(StateConfig):
     """Local K/V heads with explicit global head identities.
 
-    Also carries the compute dtype.
+    Also carries the compute dtype and the history ``window`` its readers
+    need: ``None`` retains the whole history, and a token count lets a cache
+    owner retire pages entirely before ``q - window`` for every remaining
+    reader at position ``q``, as ``uniserve.nn.attention.Attention``
+    documents for its window.
     """
 
     num_kv_heads: int
     head_dim: int
     head_indices: tuple[int, ...]
     compute_dtype: torch.dtype
+    window: int | None = None
     indexing: ClassVar[Literal["tokens"]] = "tokens"
 
     def __post_init__(self) -> None:
@@ -36,6 +41,10 @@ class Config(StateConfig):
             for size in (self.num_kv_heads, self.head_dim)
         ):
             raise ValueError("K/V head dimensions must be positive")
+        if self.window is not None and (
+            type(self.window) is not int or self.window < 0
+        ):
+            raise ValueError("K/V history windows must be token counts")
         if (
             not isinstance(self.head_indices, tuple)
             or not self.head_indices

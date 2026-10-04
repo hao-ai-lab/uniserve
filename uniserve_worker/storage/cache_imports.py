@@ -1,7 +1,8 @@
 """Bounded physical KV imports and explicit page-representation conversion.
 
-A KV import installs a published KV extent (`KvTransfer`) into pages of this
-worker's cache that the scheduler has assigned.
+A KV import installs a published KV extent (`KvTransfer`) into units of this
+worker's cache that the scheduler has assigned, group by group: each group's
+carried tokens land in the pages of that group's destination table.
 `KVCacheManager.prepare_install` validates the destination and calls
 `CacheImports.reserve`, which claims the destination token ranges and runs
 the copy on a dedicated `HostLane`. `KVCacheManager.install` later hands the
@@ -36,61 +37,80 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.cache import block_spans, mha
+from uniserve.cache import mha
 from uniserve.cache.state import decode_region
 from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.protocol.identity import BufferId, RequestKey
-from uniserve_worker.protocol.transfer import KvTransfer, TensorTransfer
+from uniserve_worker.protocol.transfer import (
+    KvGroupTransfer,
+    KvTransfer,
+    TensorTransfer,
+)
 from uniserve_worker.transport.fetch import fetch_tensor
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
+    from uniserve_worker.storage.block_tables import GroupTable
     from uniserve_worker.storage.kv_cache import KVCacheManager
 
 
 def cache_transfer_workspace_bytes(
     *,
-    num_layers: int,
-    page_size: int,
-    num_kv_heads: int,
-    head_dim: int,
+    page_elements: int,
+    page_scales: int,
     capacity: int,
 ) -> int:
     """Return the startup bytes for every bounded import workspace.
 
     Startup memory accounting (`bootstrap.report`) reserves this amount, so it
     must match the `TransferBuffer` allocation in `CacheImports.__init__`.
-    Each import thread has two raw pages (one per K/V field) large enough for
-    float64 elements, one FP32 conversion page, and an FP32 scale buffer of
-    ``[page_size, 2, num_layers, num_kv_heads]``: a destination span touches
-    at most one source page per token and one source scale group per head.
-    The tail of a raw page serves as rounding scratch while it holds an FP8
-    input. No prefix-sized conversion allocation is needed.
+    ``page_elements`` is the largest ``page_tokens * layers * kv_heads *
+    head_dim`` of any cache group and ``page_scales`` the largest
+    ``page_tokens * layers * kv_heads``. Each import thread has two raw pages
+    (one per K/V field) large enough for float64 elements, one FP32
+    conversion page, and an FP32 scale buffer of ``[page_tokens, 2, layers,
+    kv_heads]``: a destination span touches at most one source page per
+    token and one source scale group per head. The tail of a raw page serves
+    as rounding scratch while it holds an FP8 input. No prefix-sized
+    conversion allocation is needed.
     """
     workers = min(4, int(capacity))
-    elements = (
-        int(page_size) * int(num_layers) * int(num_kv_heads) * int(head_dim)
-    )
-    scales = 2 * int(page_size) * int(num_layers) * int(num_kv_heads)
     # 20 bytes per element: two raw float64 pages (2 x 8) plus one FP32
-    # conversion page (4). Scale entries are FP32 (4 bytes each).
-    return workers * (20 * elements + 4 * scales)
+    # conversion page (4). Scale entries are FP32 (4 bytes each), two per
+    # token, layer and head.
+    return workers * (20 * int(page_elements) + 8 * int(page_scales))
+
+
+def import_page_sizes(pool: KVCacheManager) -> tuple[int, int]:
+    """Return the largest group page's elements and scale entries.
+
+    The pair sizes `cache_transfer_workspace_bytes` for ``pool``: elements
+    are ``page_tokens * layers * kv_heads * head_dim`` and scale entries
+    ``page_tokens * layers * kv_heads``, each the largest over the groups.
+    """
+    elements = scales = 0
+    for group in pool.cache.groups:
+        rows = group.page_tokens * len(group.layers) * group.num_kv_heads
+        elements = max(elements, rows * group.head_dim)
+        scales = max(scales, rows)
+    return elements, scales
 
 
 @dataclass(slots=True)
 class CacheImport:
     """A scheduler-owned KV destination retained through physical input access.
 
-    ``ranges`` maps each destination page to the ``(offset, count)`` token
-    range the import writes: the published suffix span, or the whole page
-    for ``initialized_pages``, which the import zeroes before copying.
+    ``tables`` holds the destination's table of every cache group.
+    ``ranges`` maps each destination unit to the ``(offset, count)`` token
+    range the import writes: each group's carried span, or the whole unit
+    for ``initialized_units``, which the import resets before copying.
     ``completion`` is the copy task's future, resolved at reservation when
-    there is nothing to copy or zero. ``retirement`` resolves once the import
-    is adopted or abandoned and all of its physical access has finished;
-    until then the import stays registered and
+    there is nothing to copy or reset. ``retirement`` resolves once the
+    import is adopted or abandoned and all of its physical access has
+    finished; until then the import stays registered and
     `KVCacheManager.require_writable` rejects writes overlapping its
     ``ranges``. ``cancelled`` marks abandonment; ``released`` marks adoption
     or abandonment.
@@ -101,8 +121,8 @@ class CacheImport:
     """
 
     request_pool_idx: int
-    pages: tuple[int, ...]
-    initialized_pages: tuple[int, ...]
+    tables: tuple[GroupTable, ...]
+    initialized_units: tuple[int, ...]
     publication: KvTransfer
     ranges: dict[int, tuple[int, int]]
     completion: Future[None] = field(default_factory=Future)
@@ -119,13 +139,14 @@ class CacheImport:
 class TransferBuffer:
     """One physical import worker's fixed page buffers and device stream.
 
-    With ``elements`` the element count of one KV page
-    (``block_size * layers * kv_heads * head_dim``), ``raw`` is uint8
+    With ``elements`` the element count of the largest group page (``page
+    tokens * layers * kv_heads * head_dim``) and ``scales`` its scale
+    entries (``page tokens * layers * kv_heads``), ``raw`` is uint8
     ``[2, elements * 8]``: one staging page per K/V field, sized for float64
-    source elements. ``values`` is FP32
-    ``[block_size, layers, kv_heads, head_dim]``, the conversion page.
-    ``scales`` is FP32 ``[block_size, 2, layers, kv_heads]`` and holds the
-    source scale rows of one span. ``stream`` is None off CUDA.
+    source elements. ``values`` is a flat FP32 ``[elements]`` conversion
+    page and ``scales`` a flat FP32 ``[2 * scales]`` buffer for the source
+    scale rows of one span; each group views them in its own shape.
+    ``stream`` is None off CUDA.
     """
 
     raw: torch.Tensor
@@ -153,20 +174,9 @@ class CacheImports:
         workers = min(4, int(capacity))
         self._tasks = HostLane(max_inflight=capacity, workers=workers)
 
-        # One conversion page holds a full KV page:
-        # [tokens, layers, heads, dim].
-        shape = (
-            pool.info.block_size,
-            pool.info.num_layers,
-            pool.info.num_kv_heads,
-            pool.info.head_dim,
-        )
-        elements = (
-            pool.info.block_size
-            * pool.info.num_layers
-            * pool.info.num_kv_heads
-            * pool.info.head_dim
-        )
+        # One conversion page holds the largest group's full page, which
+        # every group views as its [tokens, layers, heads, dim].
+        elements, scale_entries = import_page_sizes(pool)
 
         # Idle workspaces. A task leases one in `_acquire`; `_reclaim` returns
         # it only after the task's physical access has retired.
@@ -176,16 +186,11 @@ class CacheImports:
                 raw=torch.empty(
                     (2, elements * 8), dtype=torch.uint8, device=device
                 ),
-                values=torch.empty(shape, dtype=torch.float32, device=device),
+                values=torch.empty(
+                    elements, dtype=torch.float32, device=device
+                ),
                 scales=torch.empty(
-                    (
-                        pool.info.block_size,
-                        2,
-                        pool.info.num_layers,
-                        pool.info.num_kv_heads,
-                    ),
-                    dtype=torch.float32,
-                    device=device,
+                    2 * scale_entries, dtype=torch.float32, device=device
                 ),
                 stream=torch.cuda.Stream(device=device)
                 if device.type == "cuda"
@@ -233,56 +238,55 @@ class CacheImports:
         publication: KvTransfer,
         *,
         request_pool_idx: int,
-        pages: tuple[int, ...],
-        initialized_pages: tuple[int, ...],
+        tables: tuple[GroupTable, ...],
+        initialized_units: tuple[int, ...],
         transports: Mapping[str, Transport],
     ) -> CacheImport:
         """Reserve exact destination ranges before any host or device read.
 
         Checks with `KVCacheManager.require_reusable` that each destination
         range is free, registers the import, and submits its copy to the
-        import lane. An import with no tensors and no pages to initialize
+        import lane. An import with no tensors and no units to reset
         completes immediately without using lane capacity. The caller
-        (`KVCacheManager.prepare_install`) has already validated the pages
+        (`KVCacheManager.prepare_install`) has already validated the units
         against the pool and, when the import extends an installed base,
-        against the request's installed base pages.
+        against the request's installed base units.
 
         Raises:
             ResourceError: When a destination range is still in use, or the
                 import lane is closed or has no capacity.
-            WorkerError: ``invalid_descriptor`` when the pages are invalid,
-                this is closed, or the publication source already has a
-                registered import.
+            WorkerError: ``invalid_descriptor`` when a group interval exceeds
+                its destination table, this is closed, or the publication
+                source already has a registered import.
         """
-        # Destination token ranges: the published suffix within its pages,
-        # plus every page this import initializes, which it zeroes whole.
-        suffix = publication.published_extent - publication.base_extent
-        ranges = {
-            page: (offset, count)
-            for page, offset, count in block_spans(
-                pages,
-                publication.base_extent,
-                suffix,
-                block_size=self.pool.info.block_size,
-            )
-        }
+        # Destination token ranges: each group's carried span within its
+        # units, plus every unit this import resets, which it resets whole.
+        ranges: dict[int, tuple[int, int]] = {}
+        for table, group in zip(tables, publication.groups, strict=False):
+            for unit, offset, count in table.spans(
+                group.start, publication.published_extent - group.start
+            ):
+                ranges[unit] = (offset, count)
         ranges.update(
-            (page, (0, self.pool.info.block_size)) for page in initialized_pages
+            (unit, (offset, count))
+            for unit, offset, count in self.pool.unit_spans(initialized_units)
         )
-        for page, (offset, count) in ranges.items():
-            self.pool.require_reusable(
-                (page,), group=publication.group_id, start=offset, length=count
+        self.pool.require_reusable(
+            tuple(
+                (unit, offset, count)
+                for unit, (offset, count) in ranges.items()
             )
+        )
 
         reservation = (
             self._tasks.reserve()
-            if publication.tensors or initialized_pages
+            if publication.tensors or initialized_units
             else None
         )
         write = CacheImport(
             request_pool_idx,
-            pages,
-            initialized_pages,
+            tables,
+            initialized_units,
             publication,
             ranges,
         )
@@ -520,10 +524,10 @@ class CacheImports:
     ) -> None:
         """Run one import on an import thread.
 
-        Leases a workspace, zeroes ``initialized_pages``, then copies the
-        published suffix through the direct or converted path. On every exit
-        it attempts to drain the workspace stream and then records the task
-        as finished for `_reclaim`.
+        Leases a workspace, resets ``initialized_units``, then copies each
+        group's carried tokens through the direct or converted path. On every
+        exit it attempts to drain the workspace stream and then records the
+        task as finished for `_reclaim`.
         """
         workspace = None
         stream_finished = True
@@ -536,53 +540,26 @@ class CacheImports:
             )
             with context:
                 self._require_active(write)
-                if write.initialized_pages:
-                    for name in self.pool.layers:
-                        self.pool.cache.zero_blocks(
-                            name, write.initialized_pages
-                        )
+                if write.initialized_units:
+                    self.pool.cache.zero_units(write.initialized_units)
                 if workspace.stream is not None:
                     # Backend copy streams must not race initialization of the
-                    # reserved pages. This host wait belongs to the bounded
+                    # reserved units. This host wait belongs to the bounded
                     # import worker, never to the request execution loop.
                     workspace.stream.synchronize()
 
                 publication = write.publication
-                if not publication.tensors:
-                    return
-
-                # The direct path needs an identical page representation. For
-                # FP8 the page scales must also transfer unchanged: equal page
-                # sizes, a page-aligned base, the same compute dtype, and all
-                # of this rank's heads in one source scale group, because each
-                # destination page holds one scale per layer and K/V field.
-                same_format = (
-                    publication.tensors[0].dtype == self.pool.info.dtype
-                )
-                direct = same_format and (
-                    self.pool.info.dtype != "float8_e4m3fn"
-                    or (
-                        publication.page_size == self.pool.info.block_size
-                        # A partial installed page owns its destination scale.
-                        # Its base may have arrived through another TP layout.
-                        and publication.base_extent % self.pool.info.block_size
-                        == 0
-                        and publication.compute_dtype
-                        == str(self.pool.compute_dtype).removeprefix("torch.")
-                        and self.pool.info.kv_head_offset
-                        // publication.scale_head_size
-                        == (
-                            self.pool.info.kv_head_offset
-                            + self.pool.info.num_kv_heads
-                            - 1
+                for index, group in enumerate(publication.groups):
+                    if not group.tensors:
+                        continue
+                    if self._direct(publication, group, index):
+                        self._copy_direct(
+                            write, index, group, transports, workspace
                         )
-                        // publication.scale_head_size
-                    )
-                )
-                if direct:
-                    self._copy_direct(write, transports, workspace)
-                else:
-                    self._copy_converted(write, transports, workspace)
+                    else:
+                        self._copy_converted(
+                            write, index, group, transports, workspace
+                        )
         finally:
             try:
                 if workspace is not None and workspace.stream is not None:
@@ -598,34 +575,77 @@ class CacheImports:
                     write._stream_finished = stream_finished
                     self._reclaim(write)
 
+    def _direct(
+        self, publication: KvTransfer, group: KvGroupTransfer, index: int
+    ) -> bool:
+        """Whether a group's source bytes can land in destination units as is.
+
+        The direct path needs an identical page representation. For FP8 the
+        page scales must also transfer unchanged: equal page sizes, a
+        page-aligned carried interval, the same compute dtype, and all of
+        this rank's heads in one source scale group, because each
+        destination unit holds one scale per column and K/V field.
+        """
+        info = self.pool.info
+        advertised = info.groups[index]
+        if group.tensors[0].dtype != info.dtype:
+            return False
+        if info.dtype != "float8_e4m3fn":
+            return True
+        page_tokens = self.pool.shapes[index].page_tokens
+        return (
+            group.page_tokens == page_tokens
+            # A partial installed page owns its destination scale. Its base
+            # may have arrived through another TP layout.
+            and group.start % page_tokens == 0
+            and publication.compute_dtype
+            == str(self.pool.compute_dtypes[index]).removeprefix("torch.")
+            and advertised.kv_head_offset // group.scale_head_size
+            == (advertised.kv_head_offset + advertised.num_kv_heads - 1)
+            // group.scale_head_size
+        )
+
     def _copy_direct(
         self,
         write: CacheImport,
+        index: int,
+        group: KvGroupTransfer,
         transports: Mapping[str, Transport],
         workspace: TransferBuffer,
     ) -> None:
-        """Fetch source values, and FP8 scales, straight into cache pages.
+        """Fetch one group's source values, and FP8 scales, into its units.
 
-        The fetch region selects this worker's layers and KV heads by their
-        global offsets (``layer_offset``, ``kv_head_offset``) on the
-        publication's layer and head axes.
+        The fetch region selects each of this worker's layers and KV heads
+        by their offsets on the publication's group layer and head axes.
         """
         publication = write.publication
-        suffix = publication.published_extent - publication.base_extent
-        spans = block_spans(
-            write.pages,
-            publication.base_extent,
-            suffix,
-            self.pool.info.block_size,
-        )
-        info = self.pool.info
+        table = write.tables[index]
+        carried = publication.published_extent - group.start
+        advertised = self.pool.info.groups[index]
+        axis = self.pool.axes[index]
+        cache_group = self.pool.cache.groups[index]
+        columns = self.pool.cache.planes.columns
+        page_tokens = table.shape.page_tokens
+        # Pages the carried tokens touch, as (absolute page, offset, count).
+        pages = []
+        position = group.start
+        while position < publication.published_extent:
+            page, offset = divmod(position, page_tokens)
+            count = min(
+                publication.published_extent - position, page_tokens - offset
+            )
+            pages.append((page, offset, count))
+            position += count
 
-        # ``layer`` indexes the publication's global layer axis.
-        for layer, name in enumerate(self.pool.layers, info.layer_offset):
+        # ``layer`` indexes the publication's group layer axis.
+        for column_index, name in enumerate(cache_group.layers):
+            row = column_index // columns
+            units = table.row(row)
+            layer = axis.offset + column_index
             # Limit physical reads to one layer, independent of model depth.
             tickets: list[TransferTicket] = []
             state = self.pool.cache.state(name)
-            for index, tensor_name in enumerate(("key", "value")):
+            for field_index, tensor_name in enumerate(("key", "value")):
                 tensor = state.tensors[tensor_name]
                 values = (
                     tensor.buffers()["values"]
@@ -635,43 +655,52 @@ class CacheImports:
                 # Each span view is [tokens, 1, kv heads, head dim]: the
                 # unsqueezed axis matches the single-layer fetch region.
                 destination = tuple(
-                    values[page, offset : offset + count].unsqueeze(1)
-                    for page, offset, count in spans
+                    values[
+                        units[page - table.start_page], offset : offset + count
+                    ].unsqueeze(1)
+                    for page, offset, count in pages
                 )
                 tickets.extend(
                     self._fetch(
                         write,
-                        publication.tensors[index],
+                        group.tensors[field_index],
                         destination,
                         transports,
                         region=(
-                            slice(0, suffix),
+                            slice(0, carried),
                             slice(layer, layer + 1),
                             slice(
-                                info.kv_head_offset,
-                                info.kv_head_offset + info.num_kv_heads,
+                                advertised.kv_head_offset,
+                                advertised.kv_head_offset
+                                + advertised.num_kv_heads,
                             ),
-                            slice(0, info.head_dim),
+                            slice(0, advertised.head_dim),
                         ),
                     )
                 )
                 if isinstance(tensor, QuantizedTensor):
-                    # Page-aligned bases and equal page sizes make source page
-                    # ``i`` of the suffix destination span ``i``.
+                    # Page-aligned intervals and equal page sizes make source
+                    # page ``i`` of the carried tokens destination span ``i``.
                     scales = tensor.buffers()["scale"]
                     destination = tuple(
-                        scales[page : page + 1] for page, _, _ in spans
+                        scales[
+                            units[page - table.start_page] : units[
+                                page - table.start_page
+                            ]
+                            + 1
+                        ]
+                        for page, _, _ in pages
                     )
-                    head = info.kv_head_offset // publication.scale_head_size
+                    head = advertised.kv_head_offset // group.scale_head_size
                     tickets.extend(
                         self._fetch(
                             write,
-                            publication.tensors[2],
+                            group.tensors[2],
                             destination,
                             transports,
                             region=(
-                                slice(0, len(spans)),
-                                slice(index, index + 1),
+                                slice(0, len(pages)),
+                                slice(field_index, field_index + 1),
                                 slice(layer, layer + 1),
                                 slice(head, head + 1),
                             ),
@@ -681,51 +710,61 @@ class CacheImports:
             for ticket in tickets:
                 ticket.close()
 
-        # Mark the pages initialized only while the import is still active.
+        # Mark the units initialized only while the import is still active.
         self._require_active(write)
-        pages = tuple(page for page, _, _ in spans)
-        for name in self.pool.layers:
-            self.pool.cache.mark_initialized(
-                name, pages, fields=("key", "value")
+        self.pool.cache.mark_initialized(
+            tuple(
+                unit
+                for page, _, _ in pages
+                for unit in table.units[
+                    (page - table.start_page) * table.shape.units_per_page : (
+                        page - table.start_page + 1
+                    )
+                    * table.shape.units_per_page
+                ]
             )
+        )
 
     def _copy_converted(
         self,
         write: CacheImport,
+        index: int,
+        group: KvGroupTransfer,
         transports: Mapping[str, Transport],
         workspace: TransferBuffer,
     ) -> None:
-        """Copy the suffix span by span through the conversion workspace.
+        """Copy one group's tokens span by span through the conversion page.
 
-        For each destination span, fetches the source K/V tokens of this
+        For each destination page span, fetches the source K/V tokens of this
         worker's shard into ``workspace.raw``. FP8 sources are decoded per
         source page and scale head group into ``workspace.values``; other
         sources are copied as fetched. Each layer is then written through
         `mha.State.copy_region`, which applies the destination encoding.
         """
         publication = write.publication
-        start = publication.base_extent
-        suffix = publication.published_extent - start
-        dtype = getattr(torch, publication.tensors[0].dtype)
+        table = write.tables[index]
+        start = group.start
+        carried = publication.published_extent - start
+        advertised = self.pool.info.groups[index]
+        axis = self.pool.axes[index]
+        cache_group = self.pool.cache.groups[index]
+        columns = self.pool.cache.planes.columns
+        page_tokens = table.shape.page_tokens
+        num_layers = len(cache_group.layers)
+        num_heads = advertised.num_kv_heads
+        head_dim = advertised.head_dim
+        dtype = getattr(torch, group.tensors[0].dtype)
         quantized = dtype is torch.float8_e4m3fn
-        trailing = (
-            self.pool.info.num_layers,
-            self.pool.info.num_kv_heads,
-            self.pool.info.head_dim,
-        )
+        trailing = (num_layers, num_heads, head_dim)
         itemsize = workspace.raw.view(dtype).element_size()
-        # Tokens of the suffix already copied.
+        # Tokens of the carried interval already copied.
         logical = 0
 
-        for page, offset, count in block_spans(
-            write.pages, start, suffix, block_size=self.pool.info.block_size
-        ):
-            elements = (
-                count
-                * self.pool.info.num_layers
-                * self.pool.info.num_kv_heads
-                * self.pool.info.head_dim
-            )
+        while logical < carried:
+            position = start + logical
+            page, offset = divmod(position, page_tokens)
+            count = min(carried - logical, page_tokens - offset)
+            elements = count * num_layers * num_heads * head_dim
             # Raw staging views per K/V field: [tokens, layers, kv heads, dim].
             raw = tuple(
                 workspace.raw[field, : elements * itemsize]
@@ -735,14 +774,9 @@ class CacheImports:
             )
             # Fetch this span's tokens and this worker's layer/head shard.
             region = tuple(
-                slice(start, start + extent)
-                for start, extent in zip(
-                    (
-                        logical,
-                        self.pool.info.layer_offset,
-                        self.pool.info.kv_head_offset,
-                        0,
-                    ),
+                slice(first, first + extent)
+                for first, extent in zip(
+                    (logical, axis.offset, advertised.kv_head_offset, 0),
                     (count, *trailing),
                     strict=True,
                 )
@@ -750,7 +784,7 @@ class CacheImports:
             tickets = tuple(
                 ticket
                 for tensor, destination in zip(
-                    publication.tensors[:2], raw, strict=True
+                    group.tensors[:2], raw, strict=True
                 )
                 for ticket in self._fetch(
                     write, tensor, destination, transports, region=region
@@ -758,41 +792,34 @@ class CacheImports:
             )
 
             # Token offset of this span within its first source page.
-            source_offset = (start + logical) % publication.page_size
+            source_offset = position % group.page_tokens
             if quantized:
-                head_start = (
-                    self.pool.info.kv_head_offset // publication.scale_head_size
-                )
+                head_start = advertised.kv_head_offset // group.scale_head_size
                 head_end = (
-                    self.pool.info.kv_head_offset
-                    + self.pool.info.num_kv_heads
-                    - 1
-                ) // publication.scale_head_size + 1
+                    advertised.kv_head_offset + num_heads - 1
+                ) // group.scale_head_size + 1
                 # Source scale rows cover the publication pages this span
                 # touches, counted from the source page holding the first
-                # suffix token.
+                # carried token.
                 scale_start = (
-                    start + logical
-                ) // publication.page_size - start // publication.page_size
+                    position // group.page_tokens - start // group.page_tokens
+                )
                 scale_count = (
-                    source_offset + count + publication.page_size - 1
-                ) // publication.page_size
+                    source_offset + count + group.page_tokens - 1
+                ) // group.page_tokens
+                scales = workspace.scales[
+                    : scale_count * 2 * num_layers * (head_end - head_start)
+                ].view(scale_count, 2, num_layers, head_end - head_start)
                 tickets += self._fetch(
                     write,
-                    publication.tensors[2],
-                    workspace.scales[
-                        :scale_count, :, :, : head_end - head_start
-                    ],
+                    group.tensors[2],
+                    scales,
                     transports,
                     region=(
                         slice(scale_start, scale_start + scale_count),
                         slice(0, 2),
-                        slice(
-                            self.pool.info.layer_offset,
-                            self.pool.info.layer_offset
-                            + self.pool.info.num_layers,
-                        ),
-                        slice(head_start, head_start + head_end - head_start),
+                        slice(axis.offset, axis.offset + num_layers),
+                        slice(head_start, head_end),
                     ),
                 )
 
@@ -801,7 +828,7 @@ class CacheImports:
             for field_index, source in enumerate(raw):
                 values = source
                 if quantized:
-                    values = workspace.values[:count]
+                    values = workspace.values[:elements].view(count, *trailing)
                     # Intersect source scale pages and head groups here; the
                     # numerical cache library owns decoding and rounding.
                     compute_dtype = getattr(torch, publication.compute_dtype)
@@ -817,23 +844,22 @@ class CacheImports:
                     )
                     # Walk source pages (one scale row each) and, within each,
                     # this worker's heads grouped by source scale group.
-                    position, scale_index, token_offset = 0, 0, source_offset
-                    while position < count:
+                    cursor, scale_index, token_offset = 0, 0, source_offset
+                    while cursor < count:
                         length = min(
-                            publication.page_size - token_offset,
-                            count - position,
+                            group.page_tokens - token_offset, count - cursor
                         )
-                        head, group = 0, 0
-                        while head < self.pool.info.num_kv_heads:
+                        head, head_group = 0, 0
+                        while head < num_heads:
                             heads = min(
-                                publication.scale_head_size
-                                - (self.pool.info.kv_head_offset + head)
-                                % publication.scale_head_size,
-                                self.pool.info.num_kv_heads - head,
+                                group.scale_head_size
+                                - (advertised.kv_head_offset + head)
+                                % group.scale_head_size,
+                                num_heads - head,
                             )
-                            for layer in range(self.pool.info.num_layers):
+                            for layer in range(num_layers):
                                 page_region = (
-                                    slice(position, position + length),
+                                    slice(cursor, cursor + length),
                                     layer,
                                     slice(head, head + heads),
                                 )
@@ -841,11 +867,11 @@ class CacheImports:
                                 numerical = Quantizer("fp8").from_tensors(
                                     {
                                         "values": encoded,
-                                        "scale": workspace.scales[
+                                        "scale": scales[
                                             scale_index,
                                             field_index,
                                             layer,
-                                            group,
+                                            head_group,
                                         ].reshape(()),
                                     },
                                     shape=tuple(encoded.shape),
@@ -863,24 +889,25 @@ class CacheImports:
                                     },
                                 )
                             head += heads
-                            group += 1
-                        position += length
+                            head_group += 1
+                        cursor += length
                         scale_index += 1
                         token_offset = 0
 
-                # Store the converted tokens into the destination page by layer.
-                for layer, name in enumerate(self.pool.layers):
-                    trailing_slice = (
-                        slice(0, self.pool.info.num_kv_heads),
-                        slice(0, self.pool.info.head_dim),
-                    )
+                # Store the converted tokens into each layer's unit of the
+                # destination page.
+                for column_index, name in enumerate(cache_group.layers):
+                    unit = table.row(column_index // columns)[
+                        page - table.start_page
+                    ]
+                    trailing_slice = (slice(0, num_heads), slice(0, head_dim))
                     # The cache manager admits only MHA state layers.
                     state = self.pool.cache.state(name)
                     assert isinstance(state, mha.State)
                     state.copy_region(
-                        values[:, layer],
+                        values[:, column_index],
                         field=("key", "value")[field_index],
-                        block=page,
+                        block=unit,
                         source_slice=(slice(0, count), *trailing_slice),
                         target_slice=(
                             slice(offset, offset + count),

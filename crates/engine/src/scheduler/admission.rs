@@ -10,8 +10,10 @@
 //! storage allow. A head that does not fit yet blocks the requests behind it
 //! in its queue, and running requests are never preempted to make room.
 //!
-//! A token request reserves a request row and one KV table per group; its
-//! prefill worker is recorded in `Placement::affinity`. A media request
+//! A token request reserves a request row and one KV table per cache group;
+//! every group draws units from one pool, so admission compares the sum of
+//! the groups' unit demand with the free units. Its prefill worker is
+//! recorded in `Placement::affinity`. A media request
 //! reserves a request row and every declared result buffer on each worker of
 //! its route.
 
@@ -89,9 +91,6 @@ impl Scheduler {
             });
             return;
         }
-        // Worst-case KV in blocks; `admit` reserves it only for requests with
-        // `reserve_worstcase` set.
-        let worst = max_kv_tokens.div_ceil(self.info.kv_block_size() as usize);
         // Multimodal requests reserve their configured bounded KV envelope at
         // admission so excess concurrency queues instead of exhausting KV.
         let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
@@ -127,11 +126,13 @@ impl Scheduler {
             feedback_source: None,
             feedback_features: None,
             worker_registered: false,
-            num_kv_blocks_sent: 0,
+            num_kv_units_sent: 0,
             reserve_worstcase,
-            max_reserved_kv_blocks: worst,
-            prefix_block_hashes: Vec::new(),
-            prefix_cached: false,
+            // `admit` reserves the units of this worst-case extent only for
+            // requests with `reserve_worstcase` set.
+            max_reserved_kv_tokens: max_kv_tokens,
+            prefix_page_hashes: Vec::new(),
+            prefix_published: Vec::new(),
             generated_token_ids: Vec::new(),
             round_token_ids: Vec::new(),
             text_tokens_since_image: 0,
@@ -755,10 +756,10 @@ impl Scheduler {
             self.storage.request_pool.free(request_slot);
             return false;
         };
-        let new_pages = kv
+        let new_units = kv
             .tables
             .iter()
-            .map(|table| (table.group_id() as u32, table.page_ids()))
+            .map(|table| (table.group_id() as u32, table.unit_ids()))
             .collect();
         let allocations = RequestAllocations {
             request_slot,
@@ -772,7 +773,7 @@ impl Scheduler {
         };
         state.flow_prefix = Some(FlowPrefixState {
             allocations,
-            new_pages,
+            new_units,
             diffusion_finalized: false,
         });
         true
@@ -837,16 +838,16 @@ impl Scheduler {
     /// Requests configured for worst-case reservation acquire their full KV capacity here,
     /// keeping that capacity resident for the request lifetime.
     ///
-    /// A worst-case request is admitted when free KV blocks cover
-    /// `max_reserved_kv_blocks` and its encoder-cache entries fit the budget;
-    /// any other request needs only the blocks of its first prefill chunk
-    /// beyond its cached prefix. A head that can never fit the total KV
+    /// A worst-case request is admitted when the free KV units cover the
+    /// units of `max_reserved_kv_tokens` in every group and its
+    /// encoder-cache entries fit the budget; any other request needs only
+    /// the units of its first prefill chunk beyond its cached prefix, summed
+    /// over every cache group. A head that can never fit the total KV
     /// capacity is rejected with `RejectionKind::Invalid`. Admission stops
     /// when the queue is empty, `max_num_seqs` is reached, no request row is
     /// free, the head does not fit yet or finds no ready prefill worker, or a
     /// scheduler invariant breaks.
     pub(super) fn admit(&mut self) {
-        let bs = self.info.kv_block_size() as usize;
         loop {
             if self.running_request_count() >= self.config.max_num_seqs
                 || self.storage.request_pool.is_empty()
@@ -856,16 +857,23 @@ impl Scheduler {
             let Some(head) = self.waiting.front() else {
                 break;
             };
+            // Submission rejects token requests when the worker has no KV
+            // cache, so a queued one always finds it.
+            let Some(cache) = self.storage.cache() else {
+                self.invariant_broken("a queued token request has a KV cache");
+                break;
+            };
 
             if head.reserve_worstcase {
-                let need = head.max_reserved_kv_blocks;
+                let tokens = head.max_reserved_kv_tokens;
+                let need = cache.coordinator.units_for_tokens(tokens);
                 let encoder_entries = head.req.num_encoder_cache_entries();
                 let encoder_ok = self
                     .storage
                     .reserved_encoder_entries
                     .saturating_add(encoder_entries)
                     <= self.storage.encoder_cache.budget();
-                if need > self.storage.usable_blocks() {
+                if need > self.storage.usable_units() {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
@@ -875,7 +883,7 @@ impl Scheduler {
                     });
                     continue;
                 }
-                if self.storage.free_blocks() >= need && encoder_ok {
+                if self.storage.free_units() >= need && encoder_ok {
                     let Some((target, _)) = self.prefill_target(head) else {
                         break;
                     };
@@ -892,49 +900,41 @@ impl Scheduler {
                     };
                     let id = st.req.request_id;
                     self.admit_running(st, target, reservation);
-                    // Grow the tables to the whole worst case now, so later
-                    // admissions cannot take these blocks. The result is not
-                    // checked here; when an image branch opens,
+                    // Grow the tables to the whole worst case now, from token
+                    // zero, so later admissions cannot take these units. The
+                    // result is not checked here; when an image branch opens,
                     // `promote_gen_branch_reservation` finishes the request
-                    // with an error if its first table holds fewer than
-                    // `need` blocks.
-                    self.ensure_request_capacity(id, need * bs);
-                    self.storage.reserved_blocks += need;
+                    // with an error if a table covers fewer than `tokens`
+                    // tokens.
+                    self.ensure_request_capacity(id, 0, tokens);
+                    self.storage.reserved_units += need;
                     continue;
                 }
             } else {
                 let n = head.req.prompt_token_ids.len();
-                // Submission rejects token requests when the worker has no KV
-                // cache, so a queued one always finds it.
-                let Some(cache) = self.storage.cache() else {
-                    self.invariant_broken("a queued token request has a KV cache");
-                    break;
-                };
-                let text_usable_blocks = (0..cache.block_pool.num_groups())
-                    .map(|group| cache.block_pool.group_capacity(group))
-                    .min()
-                    .unwrap_or_default();
                 let Some((target, prefix_hit)) = self.prefill_target(head) else {
                     break;
                 };
 
-                // Blocks the first prefill chunk needs beyond the cached
-                // prefix. The chunk is bounded by `long_prefill_threshold` and
-                // `max_num_batched_tokens` and holds at least one token.
-                let cached_prefix_blocks = prefix_hit.cached_blocks;
-                let cached_prefix_blocks = cached_prefix_blocks.min(n.div_ceil(bs));
-                let cached_prefix_tokens = cached_prefix_blocks.saturating_mul(bs);
-                let uncached_remaining = n.saturating_sub(cached_prefix_tokens);
-                let first_uncached_chunk = uncached_remaining
-                    .min(self.config.long_prefill_threshold)
+                // Units the first prefill chunk needs beyond the cached
+                // prefix. The chunk is bounded by `long_prefill_threshold`
+                // and `max_num_batched_tokens` and holds at least one token.
+                let chunk_limit = self
+                    .config
+                    .long_prefill_threshold
                     .min(self.config.max_num_batched_tokens)
                     .max(1);
-                let first_chunk_blocks = cached_prefix_tokens
-                    .saturating_add(first_uncached_chunk)
-                    .div_ceil(bs)
-                    .saturating_sub(cached_prefix_blocks);
-                // The prompt alone must fit the smallest group's capacity.
-                if n > text_usable_blocks * bs {
+                let cached_tokens = prefix_hit.cached_tokens.min(n);
+                let first_chunk = n.saturating_sub(cached_tokens).min(chunk_limit).max(1);
+                let first_chunk_units = cache
+                    .coordinator
+                    .units_after_prefix(cached_tokens, cached_tokens + first_chunk);
+
+                // The prompt alone must fit the pool: every full-attention page
+                // and each sliding-window group's pages of one chunk.
+                if cache.coordinator.min_units_for_prompt(n, chunk_limit)
+                    > self.storage.usable_units()
+                {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
@@ -945,20 +945,14 @@ impl Scheduler {
                     continue;
                 }
 
-                // A hit page that is currently unreferenced counts as free
-                // until acquisition takes it, so it is subtracted from each
-                // group's free pages.
-                let capacity_available = prefix_hit.cached_free_blocks.len()
-                    == cache.block_pool.num_groups()
-                    && prefix_hit.cached_free_blocks.iter().enumerate().all(
-                        |(group, cached_free)| {
-                            cache
-                                .block_pool
-                                .free_blocks_in_group(group)
-                                .saturating_sub(*cached_free)
-                                >= first_chunk_blocks
-                        },
-                    );
+                // Hit pages that are currently unreferenced count as free
+                // until acquisition takes them, so they are subtracted from
+                // the free units.
+                let capacity_available = self
+                    .storage
+                    .free_units()
+                    .saturating_sub(prefix_hit.cached_free_units)
+                    >= first_chunk_units;
                 if capacity_available {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
@@ -977,7 +971,7 @@ impl Scheduler {
             }
 
             // The head does not fit yet. Resident requests keep their physical
-            // KV pages and are never preempted or relocated to make room, and
+            // KV units and are never preempted or relocated to make room, and
             // later requests do not bypass the head, so admission waits for
             // capacity to free.
             break;
@@ -1154,7 +1148,8 @@ pub(super) struct AdmissionReservation {
     kv: KvAllocation,
 }
 
-/// Acquires a complete cross-group prefix hit and records cache accounting on the request.
+/// Acquires the longest prefix every cache group can reuse and records cache
+/// accounting on the request.
 ///
 /// Fails, acquiring nothing, when the request holds no block tables or its
 /// tables do not match the pool's KV groups.
@@ -1169,13 +1164,13 @@ fn acquire_cached_prefix(
     let has_context_images = state.has_context_images();
     let cache_read = state.req.cache.read;
     let isolation_key = state.req.cache.isolation_key;
-    let tables = state
-        .block_tables_mut()
+    let allocation = state
+        .kv_mut()
         .ok_or("an admitted request holds its block tables")?;
     let hit = coordinator
         .acquire_prefix(
             pool,
-            tables,
+            allocation,
             &prompt,
             cache_read,
             has_context_images,
@@ -1184,33 +1179,34 @@ fn acquire_cached_prefix(
         )
         .ok_or("an admitted request's block tables cover every KV group")?;
 
-    // Queries count the blocks eligible for lookup under the same rule as
-    // `prefix_lookup_limit` in `kv`: a block-aligned prompt's last block is
-    // never reused, so prefill computes at least one token.
-    let block_size = pool.block_size();
-    let full_blocks = prompt.len() / block_size;
-    let query_blocks = if prompt.len().is_multiple_of(block_size) {
-        full_blocks.saturating_sub(1)
-    } else {
-        full_blocks
-    };
+    // Queries count the tokens eligible for reuse under the same rule as the
+    // prefix selection: a multiple of the largest page size that leaves at
+    // least one prompt token to compute, so prefill produces logits.
+    let step = coordinator
+        .groups()
+        .iter()
+        .map(|group| group.page_tokens)
+        .max()
+        .unwrap_or(1);
+    let query_tokens = prompt.len().saturating_sub(1) / step * step;
     stats
         .prefix
-        .queries
-        .fetch_add(query_blocks as u64, Ordering::Relaxed);
-    stats
-        .prefix
-        .hits
-        .fetch_add(hit.cached_blocks as u64, Ordering::Relaxed);
+        .query_tokens
+        .fetch_add(query_tokens as u64, Ordering::Relaxed);
     stats
         .prefix
         .hit_tokens
-        .fetch_add((hit.cached_blocks * block_size) as u64, Ordering::Relaxed);
+        .fetch_add(hit.cached_tokens as u64, Ordering::Relaxed);
 
     // The reused tokens are already in KV, so every prompt and KV cursor
-    // starts past them.
-    state.prefix_block_hashes = hit.block_hashes;
-    state.num_computed_prompt_tokens = (hit.cached_blocks * block_size) as u32;
+    // starts past them, and their pages are already published.
+    state.prefix_published = coordinator
+        .groups()
+        .iter()
+        .map(|group| hit.cached_tokens / group.page_tokens)
+        .collect();
+    state.prefix_page_hashes = hit.page_hashes;
+    state.num_computed_prompt_tokens = hit.cached_tokens as u32;
     state.logical_position = state.num_computed_prompt_tokens;
     state.kv_visible_len = state.num_computed_prompt_tokens;
     state.kv_computed_len = state.num_computed_prompt_tokens;

@@ -1,0 +1,15 @@
+# Paged KV ownership
+
+`PrefixCache` owns equally sized allocation units shared by all resident attention layers. Layers with the same history window and KV page shape form a cache group. A group's logical page occupies one or more units; each unit contains columns of key and value planes. Layers read borrowed `mha.State` views through the table assigned by the pool. Models declare dimensions and visibility, while the runtime owns allocations and physical addresses.
+
+`plan_units` derives group pages, columns, tables and storage bytes from the model's cache configuration. `num_units` measures physical allocation capacity; it is distinct from the number of logical pages and tokens of any group. A serving owner reserves unit zero for graph padding. Direct library storage treats every unit as ordinary addressable memory.
+
+The worker resolves an unset `--page-size` to the largest power of two up to 64 whose resulting group pages every resident attention reader supports. Ranks agree on the smallest supported base size. An explicit value remains the operator's choice and unsupported combinations fail during preparation. Groups with smaller token rows hold proportionally more tokens per page; their page sizes need not equal the base size.
+
+The engine allocates units and advances each group's logical page interval independently. Windowed groups can retire pages outside their history bound while full-attention groups retain the sequence. Request tables carry absolute start pages, preserving token positions when old pages retire. Admission charges the units required by every group, and transfer descriptors identify each group's layers, heads and token intervals.
+
+`KVCacheManager` retains execution accesses, publications and imports until their asynchronous readers retire. Writers must satisfy those dependencies before changing an overlapping token interval; cancelled or failed completion alone does not authorize reuse. Transfers preserve each group's interval and publication lineage, including partial final pages and different pipeline or head partitions.
+
+Recycling resets the state a subsequent writer reads, including FP8 initialization flags and scales. Payload bytes may remain when every group's representation keeps them finite and visibility excludes unwritten positions. Pools containing different storage element types clear recycled payloads because reinterpreting stale bytes may produce nonfinite values. Explicit `zero_units` clears payloads and metadata regardless of representation.
+
+Serving attention uses staged host mirrors of sequence lengths and start pages. Worker execution contexts disable deriving those mirrors from device tensors and reject a missing mirror when a selected provider needs it. Direct Python callers may allow derivation outside capture. These obligations accompany the [attention input contract](attention.md).

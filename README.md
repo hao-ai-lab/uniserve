@@ -101,6 +101,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--host-identity` | `localhost` | This host's name in a multi-host deployment file |
 | `--max-video-seconds` | `15` | Longest admitted clip, from 4 to 15 seconds |
 | `--max-model-len` | `16384` | Longest admitted prompt, in tokens |
+| `--page-size` | Chosen by the worker | Base KV page size; the largest power of two up to 64 supported by every cache group's attention readers. See [paged KV ownership](docs/cache.md). |
 | `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities that startup prepares |
 | `--max-running-requests` | `128`, clamped to the deployment's request slots | Concurrently resident requests |
 | `--mem-fraction-static` | `0.70` | Each worker rank's share of its device's storage |

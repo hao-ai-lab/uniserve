@@ -21,7 +21,7 @@ agrees on it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -48,6 +48,7 @@ from uniserve.runtime.device import (
     process_device_bytes,
 )
 from uniserve.tensors import BufferConfig
+from uniserve_worker.bootstrap.cache import plan_cache, table_widths
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import (
     capability,
@@ -89,10 +90,9 @@ _REQUEST_RELAY_ROW_BYTES = 18
 # ``TensorStore`` with ``relay_depth = max_unresolved_calls + 1`` to match.
 _REQUEST_RELAY_RETIREMENT_LANES = 1
 
-DEFAULT_NUM_BLOCKS_FALLBACK = 4096
+DEFAULT_NUM_UNITS_FALLBACK = 4096
 DEFAULT_MAX_BATCH_OPS = 1024
 DEFAULT_MAX_REQUEST_POOL_SIZE = 128
-DEFAULT_BLOCK_SIZE = 64
 
 
 def input_buffer_config(
@@ -170,13 +170,16 @@ def input_buffer_config(
             )
         )
 
+    # Text and diffusion use separate homogeneous calls on this lane.
+    call_tokens = max(text_tokens, flow_tokens)
     return TokenBufferConfig(
         max_rows=max_rows * branches,
-        # Text and diffusion use separate homogeneous calls on this lane.
-        max_tokens=max(text_tokens, flow_tokens),
+        max_tokens=call_tokens,
         max_text_tokens=text_tokens,
-        max_blocks_per_row=max(
-            1, ceil_div(config.max_sequence_tokens, config.block_size)
+        table_widths=table_widths(
+            plan_cache(text, config),
+            max_sequence_tokens=config.max_sequence_tokens,
+            max_query_tokens=call_tokens,
         ),
         hidden_size=text.backbone.hidden_size,
         embedding_dtype=getattr(
@@ -376,19 +379,15 @@ def local_product_storage_bytes(
 
 @dataclass(frozen=True)
 class RuntimeKVCapacity:
-    """Resolved KV token and page capacity within the physical budget.
+    """Resolved KV unit capacity within the physical budget.
 
     Attributes:
-        block_size: Tokens per KV page.
-        bytes_per_token: Physical bytes one token occupies on this rank.
-        token_capacity: ``num_blocks * block_size``.
-        num_blocks: Pages in the pool.
+        unit_bytes: Physical bytes one unit occupies on this rank.
+        num_units: Units in the pool, including the unit-zero sentinel.
     """
 
-    block_size: int
-    bytes_per_token: int
-    token_capacity: int
-    num_blocks: int
+    unit_bytes: int
+    num_units: int
 
 
 def latent_trajectory_bytes(
@@ -683,14 +682,14 @@ def model_arena_capacity(
     *,
     queue_depth: int,
     completion_payload_bytes: int,
-    num_blocks: int,
+    num_units: int,
     request_pool_size: int,
     num_latent_pages: int,
     latent_page_units: int,
     latent_width: int,
     max_latent_feature_bytes: int,
     max_vision_feature_bytes: int,
-    bytes_per_token: int,
+    unit_bytes: int,
     bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> ArenaCapacity:
@@ -746,7 +745,6 @@ def model_arena_capacity(
         )
 
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
-    block_size = int(worker_config.block_size)
     flow = image_builder(model)
 
     latent_pool_bytes = 0
@@ -776,7 +774,7 @@ def model_arena_capacity(
     # Every ticket is budgeted for the largest single transfer: the whole KV
     # pool, one image's latent trajectory, or one latent or vision feature.
     max_transfer_bytes = max(
-        int(num_blocks) * block_size * int(bytes_per_token),
+        int(num_units) * int(unit_bytes),
         latent_transfer_bytes,
         int(max_latent_feature_bytes),
         int(max_vision_feature_bytes),
@@ -819,36 +817,16 @@ def model_arena_capacity(
     )
 
 
-def derive_num_blocks(
-    block_size: int,
-    kv_token_capacity: int | None,
-    *,
-    default_blocks: int | None = None,
-    floor: int = 1,
-) -> int:
-    """Derive the KV block count from token capacity and block size.
+def units_for_tokens(pages: Sequence[tuple[int, int]], tokens: int) -> int:
+    """Return the units whole pages of ``tokens`` tokens occupy in every group.
 
-    When ``kv_token_capacity`` is unset or non-positive, ``default_blocks`` (or
-    :data:`DEFAULT_NUM_BLOCKS_FALLBACK`) is used; otherwise the token count is
-    rounded down to whole blocks. The result is at least ``floor`` (default
-    1).
-
-    Raises:
-        ValueError: ``block_size`` is not positive.
+    ``pages`` holds each group's ``(page_tokens, units_per_page)``; each group
+    counts the whole pages ``tokens`` fills, rounded down.
     """
-    block = int(block_size)
-    if block <= 0:
-        raise ValueError("block_size must be positive")
-    min_blocks = max(1, int(floor))
-    if kv_token_capacity is None or int(kv_token_capacity) <= 0:
-        blocks = (
-            DEFAULT_NUM_BLOCKS_FALLBACK
-            if default_blocks is None
-            else int(default_blocks)
-        )
-    else:
-        blocks = int(kv_token_capacity) // block
-    return max(min_blocks, blocks)
+    return sum(
+        int(tokens) // int(page_tokens) * int(units_per_page)
+        for page_tokens, units_per_page in pages
+    )
 
 
 def device_total_bytes(device: str | torch.device) -> int:
@@ -866,58 +844,61 @@ def device_total_bytes(device: str | torch.device) -> int:
 
 def derive_runtime_kv_capacity(
     *,
-    block_size: int,
+    pages: Sequence[tuple[int, int]],
     kv_token_capacity: int | None,
-    bytes_per_token: int,
+    unit_bytes: int,
     device: Any = None,
     available_bytes: int | None = None,
     floor: int = 1,
-    default_blocks: int | None = None,
+    default_units: int | None = None,
     resident_copies: int = 1,
-    co_resident_blocks: int = 0,
+    co_resident_units: int = 0,
 ) -> RuntimeKVCapacity:
-    """Size one KV pool from explicit tokens or a host-owned byte grant.
+    """Size one KV unit pool from explicit tokens or a host-owned byte grant.
 
-    The page count comes from the first source present:
+    ``pages`` holds each cache group's ``(page_tokens, units_per_page)``. The
+    unit count, which includes the unit-zero sentinel, comes from the first
+    source present:
 
-    - ``kv_token_capacity``, rounded down to whole pages (at least
-      ``floor``);
-    - ``available_bytes``: the whole pages the grant holds, less
-      ``co_resident_blocks`` pages of other fixed allocations, divided among
+    - ``kv_token_capacity``: the units whole pages of that many tokens
+      occupy in every group;
+    - ``available_bytes``: the whole units the grant holds, less
+      ``co_resident_units`` units of other fixed allocations, divided among
       ``resident_copies`` pools;
-    - without a device or on one other than CUDA, ``default_blocks`` or
-      ``DEFAULT_NUM_BLOCKS_FALLBACK``.
+    - without a device or on one other than CUDA, ``default_units`` or
+      ``DEFAULT_NUM_UNITS_FALLBACK``.
 
+    The pool holds at least ``floor`` units and at least the sentinel plus
+    one page of every group, the least any request can be admitted with.
     Automatic CUDA sizing requires a granted budget. Whenever a grant is
-    given, the resulting pools and co-resident pages must fit it.
+    given, the resulting pools and co-resident units must fit it.
 
     Raises:
         ValueError: A dimension is out of range, ``kv_token_capacity`` or
-            ``available_bytes`` is invalid, a grant yields fewer than
-            ``floor`` pages or is exceeded, or a CUDA device has no grant.
+            ``available_bytes`` is invalid, a grant yields fewer than the
+            minimum units or is exceeded, or a CUDA device has no grant.
     """
-    block = int(block_size)
-    token_bytes = int(bytes_per_token)
+    size = int(unit_bytes)
     if (
-        block < 1
-        or token_bytes < 1
+        not pages
+        or any(min(shape) < 1 for shape in pages)
+        or size < 1
         or floor < 1
         or resident_copies < 1
-        or co_resident_blocks < 0
+        or co_resident_units < 0
     ):
         raise ValueError("KV capacity dimensions must be positive")
     if available_bytes is not None and available_bytes < 0:
         raise ValueError("KV storage grant must not be negative")
+    minimum = max(int(floor), 1 + sum(int(per_page) for _, per_page in pages))
 
     if kv_token_capacity is not None:
         if kv_token_capacity <= 0:
             raise ValueError("configured KV token capacity must be positive")
-        blocks = derive_num_blocks(block, kv_token_capacity, floor=floor)
+        units = max(minimum, units_for_tokens(pages, kv_token_capacity))
     elif available_bytes is not None:
-        blocks = (
-            available_bytes // (block * token_bytes) - co_resident_blocks
-        ) // resident_copies
-        if blocks < floor:
+        units = (available_bytes // size - co_resident_units) // resident_copies
+        if units < minimum:
             raise ValueError(
                 "device storage grant cannot hold the required KV pool"
             )
@@ -926,44 +907,41 @@ def derive_runtime_kv_capacity(
             "automatic CUDA KV sizing requires a host storage grant"
         )
     else:
-        blocks = derive_num_blocks(
-            block, None, default_blocks=default_blocks, floor=floor
+        units = max(
+            minimum,
+            DEFAULT_NUM_UNITS_FALLBACK
+            if default_units is None
+            else int(default_units),
         )
 
     if (
         available_bytes is not None
-        and (resident_copies * blocks + co_resident_blocks)
-        * block
-        * token_bytes
+        and (resident_copies * units + co_resident_units) * size
         > available_bytes
     ):
         raise ValueError(
             "configured KV storage exceeds the device storage grant"
         )
 
-    return RuntimeKVCapacity(
-        block_size=block,
-        bytes_per_token=token_bytes,
-        token_capacity=blocks * block,
-        num_blocks=blocks,
-    )
+    return RuntimeKVCapacity(unit_bytes=size, num_units=units)
 
 
 __all__ = [
     "ArenaCapacity",
-    "DEFAULT_BLOCK_SIZE",
     "DEFAULT_MAX_BATCH_OPS",
     "DEFAULT_MAX_REQUEST_POOL_SIZE",
-    "DEFAULT_NUM_BLOCKS_FALLBACK",
+    "DEFAULT_NUM_UNITS_FALLBACK",
     "RuntimeKVCapacity",
     "derive_runtime_kv_capacity",
     "device_total_bytes",
+    "graph_table_widths",
     "LatentPoolPlan",
     "latent_pool_capacity_bytes",
     "latent_pool_plan",
     "latent_trajectory_bytes",
     "model_arena_capacity",
     "call_window",
+    "units_for_tokens",
 ]
 
 
@@ -1066,27 +1044,37 @@ def resolve_request_capacity(
     return worker_config
 
 
-def decode_context_blocks(
+def graph_table_widths(
     model: nn.Module, worker_config: WorkerConfig, pool: KVCacheManager | None
-) -> int:
-    """Return the max paged-decode context blocks supported by this worker.
+) -> tuple[int, ...]:
+    """Return the column width every captured graph stages per block table.
 
-    Zero without a ``CausalLM``, a KV pool, or a positive
+    A full-attention table spans the longest sequence, capped at the pages
+    its group can draw from the pool; a sliding-window table spans the pages
+    a window of history and one call's queries intersect. Every captured
+    text graph uses these widths, so graph shapes vary only in rows and
+    tokens. Empty without a ``CausalLM``, a KV pool, or a positive
     ``max_sequence_tokens``.
     """
-    if capability(model, CausalLM) is None:
-        return 0
-    max_tokens = worker_config.max_sequence_tokens
-    if max_tokens < 1:
-        return 0
-    blocks = (max_tokens + int(worker_config.block_size) - 1) // int(
-        worker_config.block_size
+    if capability(model, CausalLM) is None or pool is None:
+        return ()
+    if worker_config.max_sequence_tokens < 1:
+        return ()
+    widths = table_widths(
+        pool.cache.planes,
+        max_sequence_tokens=worker_config.max_sequence_tokens,
+        max_query_tokens=worker_config.max_batch_tokens,
     )
-    if pool is None:
-        return 0
-    # Page 0 is the KV pool's padding sentinel, so one sequence can use at
-    # most all remaining pages.
-    return min(blocks, max(0, int(pool.info.num_blocks) - 1))
+    # Unit 0 is the pool's padding sentinel, so one group's table can hold
+    # at most every remaining unit, a whole page at a time.
+    limits = tuple(
+        max(1, (int(pool.info.num_units) - 1) // group.units_per_page)
+        for group in pool.cache.groups
+        for _ in range(group.units_per_page)
+    )
+    return tuple(
+        min(width, limit) for width, limit in zip(widths, limits, strict=True)
+    )
 
 
 def check_startup_storage(

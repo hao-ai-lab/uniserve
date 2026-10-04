@@ -6,7 +6,7 @@ Columns supplied by device producers are preserved too.
 import pytest
 import torch
 
-from uniserve.nn.attention import PagedInput
+from uniserve.nn.attention import AttentionBatch, PagedInput
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import (
     TokenBufferConfig,
@@ -41,20 +41,22 @@ def test_token_positions_preserve_row_order_across_source_devices(
             zip(devices, (5, 9), (17, 23), strict=True)
         )
     )
-    attention = PagedInput.from_blocks(
-        blocks=((0,), (1,)),
-        query_lengths=(1, 1),
-        prefix_lengths=(0, 0),
-        block_size=4,
-        causal=True,
-        device="cpu",
+    attention = AttentionBatch.single(
+        PagedInput.from_blocks(
+            blocks=((0,), (1,)),
+            query_lengths=(1, 1),
+            prefix_lengths=(0, 0),
+            block_size=4,
+            causal=True,
+            device="cpu",
+        )
     )
     buffers = TokenBuffers(
         config=TokenBufferConfig(
             max_rows=2,
             max_tokens=2,
             max_text_tokens=2,
-            max_blocks_per_row=1,
+            table_widths=(1,),
             hidden_size=0,
         ),
         device="cuda:0",
@@ -106,20 +108,22 @@ def test_mixed_forward_reads_current_continuation_in_row_order(
         (continuation, prefix) if continuation_first else (prefix, continuation)
     )
     query_lens = (1, 2) if continuation_first else (2, 1)
-    attention = PagedInput.from_blocks(
-        blocks=((0,), (1,)),
-        query_lengths=query_lens,
-        prefix_lengths=(0, 0),
-        block_size=4,
-        causal=True,
-        device="cpu",
+    attention = AttentionBatch.single(
+        PagedInput.from_blocks(
+            blocks=((0,), (1,)),
+            query_lengths=query_lens,
+            prefix_lengths=(0, 0),
+            block_size=4,
+            causal=True,
+            device="cpu",
+        )
     )
     buffers = TokenBuffers(
         config=TokenBufferConfig(
             max_rows=2,
             max_tokens=3,
             max_text_tokens=3,
-            max_blocks_per_row=1,
+            table_widths=(1,),
             hidden_size=0,
         ),
         device="cuda:0",
@@ -176,7 +180,7 @@ def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls()
         page_size=4,
         device="cuda:0",
         request_pool_size=2,
-        max_blocks_per_request=2,
+        table_width=2,
     )
     states = DecodeState(
         request_pool_size=2,
@@ -189,7 +193,7 @@ def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls()
             max_rows=2,
             max_tokens=2,
             max_text_tokens=2,
-            max_blocks_per_row=2,
+            table_widths=(2,),
             hidden_size=0,
         ),
         device="cuda:0",
@@ -197,7 +201,7 @@ def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls()
     slots = torch.tensor([1, 2], device="cuda:0")
     enabled = torch.ones(2, dtype=torch.bool, device="cuda:0")
     try:
-        pool.block_tables.install(((1, 0, (1, 3), 8), (2, 0, (2,), 4)))
+        pool.block_tables.install(((1, 0, 0, (1, 3), 8), (2, 0, 0, (2,), 4)))
         for iteration, order in enumerate(((1, 2), (2, 1))):
             lengths = (5 + iteration, 2 + iteration)
             pool.block_tables.set_verified(
