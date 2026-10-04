@@ -644,7 +644,7 @@ def publish_latent_transfer(
 
     Returns no product unless a transport other than ``local`` is configured
     and this rank is the component's output rank. Otherwise the written bank
-    is reserved through ``LatentPool.reserve_publication`` and published by
+    is reserved through ``LatentPool.reserve_export`` and published by
     ``transfer.publish_latent_source``.
     """
     params = row.latent.input_params
@@ -658,7 +658,7 @@ def publish_latent_transfer(
         return ()
 
     pool = latent_pool
-    source = pool.reserve_publication(
+    source = pool.reserve_export(
         product,
         request_pool_idx=row.request.request_pool_idx,
         page_table=params.page_table,

@@ -4,6 +4,7 @@
 //! return only after the backend stops accessing source and destination storage.
 
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
@@ -235,6 +236,28 @@ struct TicketState {
 pub(crate) struct TransferTicket {
     events: Py<PyAny>,
     state: Mutex<TicketState>,
+}
+
+/// Retain the transport object while native storage owners inspect physical
+/// completion without entering Python or the ticket's numerical state lock.
+pub(crate) struct TransferRef {
+    pub(crate) owner: Py<TransferTicket>,
+    retirement: Arc<uniserve_worker::Completion<Py<PyAny>, Py<PyAny>>>,
+}
+
+impl TransferRef {
+    pub(crate) fn new(py: Python<'_>, owner: Py<TransferTicket>) -> PyResult<Self> {
+        let retirement = Arc::clone(&owner.get().lock(py)?.ticket.retirement);
+        Ok(Self { owner, retirement })
+    }
+}
+
+impl Deref for TransferRef {
+    type Target = uniserve_worker::Completion<Py<PyAny>, Py<PyAny>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.retirement
+    }
 }
 
 #[pymethods]
