@@ -265,7 +265,7 @@ def publish_steps(
     state: BatchState,
     request_tables: BlockTables | None,
     tensor_store: TensorStore,
-) -> tuple[PendingOutput, ...]:
+) -> None:
     """Capture a batch's canvas step outcomes and tokens and stage them.
 
     ``steps`` pairs each canvas step call of the batch with its row's int64
@@ -287,14 +287,12 @@ def publish_steps(
     The outcomes report the requests' coordinates unchanged, since a step
     writes no KV.
 
-    Returns the staged outcome of each call, in ``steps`` order.
-
     Raises:
         WorkerError: ``invalid_descriptor`` when a value does not hold its
             call's canvas, or the rows are not adjacent rows of one block.
     """
     if not steps:
-        return ()
+        return
     width = 1 + steps[0][0].bounds.max_tokens
     if any(
         value.dtype != torch.int64
@@ -310,7 +308,6 @@ def publish_steps(
         )
 
     offset, _count = state.output_buffer.capture(block)
-    outcomes = []
     writes = []
     written_rows = []
     for row, (call, _value) in enumerate(steps):
@@ -326,7 +323,6 @@ def publish_steps(
         request.finish_flags = FinishFlags()
         request.product_generations = calls.output_generations(call)
         request.token.committed_tokens = ()
-        outcomes.append(request)
 
     if writes:
         outcome_column = block.view(len(steps), width)[:, 0]
@@ -337,4 +333,3 @@ def publish_steps(
             tuple(writes),
             (outcome_column == STEP_CONTINUED).to(view.dtype),
         )
-    return tuple(outcomes)

@@ -16,68 +16,7 @@ use crate::worker::pending::PendingOutput;
 use crate::worker::storage::{Buffer, TensorRead};
 
 impl PythonBackend {
-    pub(super) fn run_batch<'py>(
-        &self,
-        py: Python<'py>,
-        batch: &mut BatchState,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        if batch.plan.calls.is_empty() {
-            return Ok(py.None().into_bound(py));
-        }
-
-        let numerical = batch.numerical.clone_ref(py);
-        let runner = self.runner.bind(py);
-        let clock = py.import("time")?.getattr("perf_counter_ns")?;
-        let started: u64 = clock.call0()?.extract()?;
-        let scope = runner.call_method1("profile_step", (&numerical,))?;
-        with_context(&scope, || {
-            let mut phase = "batch registration";
-            let executed = (|| {
-                runner.call_method1("reserve", (&numerical,))?;
-                phase = "batch execution";
-                runner.call_method1("execute", (&numerical,))?;
-                phase = "batch commit";
-                self.commit_batch(py, batch)?;
-                Ok(())
-            })();
-
-            let Err(error): PyResult<()> = executed else {
-                return Ok(py.None().into_bound(py));
-            };
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("phase", phase)?;
-            kwargs.set_item("state", &numerical)?;
-            kwargs.set_item("committed", batch.committed)?;
-            let classified = py.import("uniserve_worker.errors")?.call_method(
-                "classify_batch_failure",
-                (error.value(py),),
-                Some(&kwargs),
-            )?;
-
-            // Once stores become visible, rollback could invalidate a reader.
-            // Earlier failures retire all reservations on the consuming stream.
-            if !batch.committed {
-                self.discard_batch(py, batch)?;
-            }
-            if batch.propagate_errors || classified.getattr("fatal")?.extract::<bool>()? {
-                return Err(PyErr::from_value(classified));
-            }
-
-            let bound_at: u64 = numerical.bind(py).getattr("started_ns")?.extract()?;
-            let stats = runner.call_method1(
-                "execution_stats",
-                (
-                    &numerical,
-                    if bound_at == 0 { started } else { bound_at },
-                    py.None(),
-                ),
-            )?;
-            record_execution(numerical.bind(py), &stats)?;
-            Ok(classified)
-        })
-    }
-
-    fn commit_batch(&self, py: Python<'_>, batch: &mut BatchState) -> PyResult<()> {
+    pub(super) fn commit_batch(&self, py: Python<'_>, batch: &mut BatchState) -> PyResult<()> {
         let numerical = batch.numerical.clone_ref(py);
         let scope = numerical.bind(py).call_method0("scope")?;
         with_context(&scope, || {
@@ -85,7 +24,7 @@ impl PythonBackend {
                 .import("time")?
                 .call_method0("perf_counter_ns")?
                 .extract()?;
-            let outputs = pending_outputs(py, batch)?;
+            let outputs = batch.pending_outputs(py)?;
             self.finish_reads(py, &outputs)?;
             self.runner
                 .bind(py)
@@ -254,11 +193,11 @@ impl PythonBackend {
             numerical
                 .bind(py)
                 .setattr("products", PyTuple::new(py, products.iter())?)?;
-            record_execution(numerical.bind(py), &stats)
+            batch.record_execution(py, &stats)
         })
     }
 
-    fn discard_batch(&self, py: Python<'_>, batch: &BatchState) -> PyResult<()> {
+    pub(super) fn discard_batch(&self, py: Python<'_>, batch: &BatchState) -> PyResult<()> {
         let numerical = batch.numerical.bind(py);
         let buffer = numerical.getattr("buffer")?;
         if buffer.is_none() {
@@ -268,7 +207,7 @@ impl PythonBackend {
         }
         let scope = numerical.call_method0("scope")?;
         with_context(&scope, || {
-            let outputs = pending_outputs(py, batch)?;
+            let outputs = batch.pending_outputs(py)?;
             self.finish_reads(py, &outputs)?;
             let buffer = buffer.cast::<OutputBuffer>()?;
             OutputBuffer::seal(buffer)?;
@@ -370,27 +309,6 @@ impl PythonBackend {
         }
         Ok(())
     }
-}
-
-fn record_execution(numerical: &Bound<'_, PyAny>, stats: &Bound<'_, PyAny>) -> PyResult<()> {
-    let kwargs = PyDict::new(numerical.py());
-    kwargs.set_item("execution_us", stats.get_item(0)?)?;
-    kwargs.set_item("stats", stats.get_item(1)?)?;
-    numerical.call_method("record_execution", (), Some(&kwargs))?;
-    Ok(())
-}
-
-fn pending_outputs<'py>(
-    py: Python<'py>,
-    batch: &BatchState,
-) -> PyResult<Vec<Bound<'py, PendingOutput>>> {
-    batch
-        .numerical
-        .bind(py)
-        .getattr("outputs")?
-        .try_iter()?
-        .map(|output| output?.cast_into::<PendingOutput>().map_err(Into::into))
-        .collect()
 }
 
 fn output_writes<'py>(

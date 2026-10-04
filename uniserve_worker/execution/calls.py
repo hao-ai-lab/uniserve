@@ -11,12 +11,10 @@ from __future__ import annotations
 from dataclasses import replace
 
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.request import RequestProgress
-from uniserve_worker.protocol.call import Call, CallStatus, ForwardMode
+from uniserve_worker.protocol.call import Call, ForwardMode
 from uniserve_worker.protocol.identity import CallIdentity
-from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.storage.block_tables import BlockTables
 
 
@@ -118,23 +116,3 @@ def device_gated(call: Call) -> bool:
     predicate is never read on the host and the step does not wait for it.
     """
     return call.kind is ForwardMode.TOKEN_DENOISING and call.canvas is not None
-
-
-def _predicated_outcome(
-    call: Call,
-    *,
-    state: BatchState,
-) -> PendingOutput:
-    """Mark a call whose completion predicate is false as predicated.
-
-    Reuses the call's reserved `PendingOutput`: sets `CallStatus.PREDICATED`,
-    keeps its progress coordinates, and clears finish flags and product
-    generations, which a predicated completion must not carry
-    (`RequestOutput.validate` rejects them).
-    """
-    request = state.pending_output(call.request_key.request_id)
-    request.status = CallStatus.PREDICATED
-    request.progress = execution_runtime(request, None)
-    request.finish_flags = FinishFlags()
-    request.product_generations = ()
-    return request

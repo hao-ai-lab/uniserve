@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,7 @@ from uniserve_worker.execution.commit import (
     publish_predicates,
     validate_outputs,
 )
+from uniserve_worker.execution.dispatch import execute_calls
 from uniserve_worker.execution.image import reserve_images
 from uniserve_worker.execution.prepare import (
     capture_predicates,
@@ -19,7 +21,6 @@ from uniserve_worker.execution.prepare import (
     prepare_inputs,
     reserve_outputs,
 )
-from uniserve_worker.execution.schedule import dispatch_batch
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.output import ForwardStats
 
@@ -104,9 +105,20 @@ class BatchRunner:
             state=state,
         )
 
-    def execute(self, state: BatchState) -> None:
-        """Launch homogeneous computation into the reserved output views."""
-        dispatch_batch(
+    def execute(self, state: BatchState, indices: Sequence[int]) -> None:
+        """Launch the selected homogeneous calls into reserved output views."""
+        scheduled = tuple(state.batch.calls[index] for index in indices)
+
+        with state.scope():
+            for device in dict.fromkeys(
+                device
+                for call in scheduled
+                for device in self.worker.runner.call_devices(call)
+            ):
+                state.output_buffer.begin_device(device)
+
+        execute_calls(
+            scheduled,
             kv_cache=self.worker.kv_cache,
             tensor_store=self.worker.tensor_store,
             worker_info=self.worker.info,

@@ -1,20 +1,12 @@
 """Build homogeneous model calls and publish their results.
 
-``schedule`` drives one batch's calls through dependency rounds; this module
-holds the stages of a round that contains numerical work. Per diffusion step
-offset, ``prepare_diffusion_step`` stages each open trajectory's guidance
-branches (running any missing branch prefixes first),
-``prepare_forward_rows`` builds the round's token, canvas, encoder, denoiser
-and image-decoder rows, ``forward_values`` runs them through
-``ModelExecutor.forward``, ``publish_forward_values`` turns the values into
-samples, readouts, features, images or retained denoiser predictions, and
-``integrate_predictions`` advances each solver and finishes a trajectory at
-its last step.
+The native executor selects active calls. Token, canvas and encoder calls
+run one forward; image diffusion runs each declared solver interval, with
+guidance prefixes before denoising and integration after each prediction.
 
 Shared conventions: a call is named by its ``index`` into ``scheduled``, and
-``outcomes`` maps an index to the ``PendingOutput`` that finished it in this
-batch. The stages skip an index already in ``outcomes`` (and leave it out of
-the rows they pass on), so a call that finishes early (for example a prefill
+``completed`` contains indexes that finished their numerical work. The stages
+skip those indexes, so a call that finishes early (for example a prefill
 with no token output) drops out of the remaining stages and steps.
 """
 
@@ -75,6 +67,129 @@ SampleCandidate = tuple[
 ]
 
 
+def execute_forward(
+    scheduled: tuple[Call, ...],
+    *,
+    state: BatchState,
+    kv_cache: KVCacheManager | None,
+    tensor_store: TensorStore,
+    worker_info: WorkerInfo,
+    latent_pool: LatentPool | None,
+    publication_transports: Mapping[str, Transport],
+    request_tables: BlockTables | None,
+    model_runner: ModelExecutor,
+    decode_state: DecodeState | None,
+    sampling_group: Communicator | None,
+    tokenizer: PreTrainedTokenizerBase | None,
+    config: WorkerConfig,
+) -> None:
+    """Run active calls, including each declared diffusion solver interval."""
+    completed: set[int] = set()
+    if model_runner.image_builder is not None:
+        # An image worker always holds its latent pool.
+        assert latent_pool is not None
+        trajectories, step_count = initialize_trajectories(
+            scheduled,
+            state=state,
+            kv_cache=kv_cache,
+            latent_pool=latent_pool,
+            request_tables=request_tables,
+            model_runner=model_runner,
+        )
+    else:
+        trajectories, step_count = {}, 1
+
+    # step_count is the longest declared solver interval among the opened
+    # trajectories; a trajectory with fewer steps drops out once its
+    # interval ends.
+    for offset in range(step_count):
+        # The numerical schedule is local to this loop. Accepted request
+        # progress is published only after the complete declared interval.
+        if trajectories:
+            assert latent_pool is not None
+            step_inputs = prepare_diffusion_step(
+                offset,
+                trajectories,
+                scheduled,
+                completed,
+                state=state,
+                kv_cache=kv_cache,
+                latent_pool=latent_pool,
+                request_tables=request_tables,
+                model_runner=model_runner,
+                decode_state=decode_state,
+                sampling_group=sampling_group,
+                tokenizer=tokenizer,
+            )
+        else:
+            step_inputs = {}
+
+        forward, prepared_images = prepare_forward_rows(
+            offset,
+            step_inputs,
+            trajectories,
+            scheduled,
+            completed,
+            state=state,
+            tensor_store=tensor_store,
+            latent_pool=latent_pool,
+            request_tables=request_tables,
+            model_runner=model_runner,
+            decode_state=decode_state,
+        )
+
+        values = (
+            forward_values(
+                model_runner,
+                tuple((task, scheduled[index]) for index, task in forward),
+                cache=kv_cache,
+                tables=request_tables,
+                states=decode_state,
+                sampling_group=sampling_group,
+                state=state,
+                retain_sampling=offset + 1 < step_count,
+            )
+            if forward
+            else ()
+        )
+
+        predictions = publish_forward_values(
+            forward,
+            values,
+            prepared_images,
+            trajectories,
+            scheduled,
+            completed,
+            state=state,
+            tensor_store=tensor_store,
+            worker_info=worker_info,
+            publication_transports=publication_transports,
+            model_runner=model_runner,
+            request_tables=request_tables,
+            decode_state=decode_state,
+            sampling_group=sampling_group,
+            config=config,
+        )
+
+        if predictions:
+            assert latent_pool is not None
+            integrate_predictions(
+                predictions,
+                step_inputs,
+                trajectories,
+                offset,
+                scheduled,
+                completed,
+                state=state,
+                worker_info=worker_info,
+                latent_pool=latent_pool,
+                publication_transports=publication_transports,
+                request_tables=request_tables,
+                model_runner=model_runner,
+                config=config,
+            )
+
+
 def forward_values(
     model_runner: ModelExecutor,
     inputs: tuple[tuple[InputRow, Call], ...],
@@ -99,8 +214,8 @@ def forward_values(
 
     With ``retain_sampling``, the graph's greedy output is cloned before it
     is bound. A batch of single-token last-logits decode rows borrows the
-    graph's output storage, which the next replay overwrites; ``schedule``
-    sets the flag while later step offsets remain in the batch.
+    graph's output storage, which the next replay overwrites. The caller sets
+    the flag while later step offsets remain in the batch.
 
     Raises:
         BaseException: The error that failed any output group, re-raised as
@@ -168,7 +283,7 @@ def forward_values(
 def _publish_samples(
     candidates: list[SampleCandidate],
     scheduled: tuple[Call, ...],
-    outcomes: dict[int, PendingOutput],
+    completed: set[int],
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -183,7 +298,7 @@ def _publish_samples(
     graph_sample)``; exactly one of the last two is set. Rows without a graph
     selection are sampled together in one ``sample`` call, the selections are
     captured into the batch's output buffer, token products are published,
-    and each call's outcome is staged into ``outcomes``.
+    and each finished call is marked in ``completed``.
     """
     from uniserve_worker.execution import token
 
@@ -237,7 +352,7 @@ def _publish_samples(
     for (index, task, logits, work, _captured), selected in zip(
         candidates, sampled, strict=True
     ):
-        outcomes[index] = token.publish_sample(
+        token.publish_sample(
             scheduled[index],
             task,
             logits,
@@ -248,6 +363,7 @@ def _publish_samples(
             decode_state=decode_state,
             state=state,
         )
+        completed.add(index)
     record_component(
         state.component_us,
         "text_finalize",
@@ -256,9 +372,7 @@ def _publish_samples(
 
 
 def initialize_trajectories(
-    numerical: tuple[int, ...],
     scheduled: tuple[Call, ...],
-    outcomes: dict[int, PendingOutput],
     *,
     state: BatchState,
     kv_cache: KVCacheManager | None,
@@ -268,8 +382,8 @@ def initialize_trajectories(
 ) -> tuple[dict[int, DiffusionState], int]:
     """Open diffusion trajectories and return the longest declared interval.
 
-    Opens a ``DiffusionState`` for every live denoising call in
-    ``numerical`` and returns them by index together with the largest
+    Opens a ``DiffusionState`` for every denoising call and returns them by
+    index together with the largest
     ``step_count`` among their staged latent parameters (1 when none is
     open). The caller runs that many step offsets; a shorter trajectory drops
     out once its own interval ends.
@@ -277,9 +391,8 @@ def initialize_trajectories(
     from uniserve_worker.execution import diffusion
 
     trajectories: dict[int, DiffusionState] = {}
-    for index in numerical:
-        call = scheduled[index]
-        if call.kind is not MediaCall.DENOISING or index in outcomes:
+    for index, call in enumerate(scheduled):
+        if call.kind is not MediaCall.DENOISING:
             continue
 
         trajectories[index] = diffusion.initialize(
@@ -309,7 +422,7 @@ def prepare_diffusion_step(
     offset: int,
     trajectories: dict[int, DiffusionState],
     scheduled: tuple[Call, ...],
-    outcomes: dict[int, PendingOutput],
+    completed: set[int],
     *,
     state: BatchState,
     kv_cache: KVCacheManager | None,
@@ -335,7 +448,7 @@ def prepare_diffusion_step(
 
     for index, trajectory in trajectories.items():
         call = scheduled[index]
-        if index in outcomes:
+        if index in completed:
             continue
 
         row = state.pending_output(call.request_key.request_id)
@@ -362,7 +475,7 @@ def prepare_diffusion_step(
         prefixes.extend((index, branch, task) for branch, task in prefix_rows)
 
     active_prefixes = tuple(
-        item for item in prefixes if item[0] not in outcomes
+        item for item in prefixes if item[0] not in completed
     )
     if not active_prefixes:
         return step_inputs
@@ -382,7 +495,7 @@ def prepare_diffusion_step(
         active_prefixes, values, strict=True
     ):
         call = scheduled[index]
-        if index in outcomes or numerical_result is None:
+        if index in completed or numerical_result is None:
             continue
 
         value, _sampling_index, _selection, _layout = numerical_result
@@ -411,12 +524,11 @@ def prepare_diffusion_step(
 
 
 def prepare_forward_rows(
-    numerical: tuple[int, ...],
     offset: int,
     step_inputs: Mapping[int, tuple[tuple[Branch, ...], torch.Tensor]],
     trajectories: Mapping[int, DiffusionState],
     scheduled: tuple[Call, ...],
-    outcomes: dict[int, PendingOutput],
+    completed: set[int],
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -425,7 +537,7 @@ def prepare_forward_rows(
     model_runner: ModelExecutor,
     decode_state: DecodeState | None,
 ) -> tuple[list[tuple[int, InputRow]], dict[int, PreparedImage]]:
-    """Build homogeneous numerical rows for the current dependency frontier.
+    """Build homogeneous numerical rows for the current solver step.
 
     Returns ``(index, row)`` pairs for the forward and the prepared encoder
     images by index. Only open trajectories run after the first step offset;
@@ -441,9 +553,8 @@ def prepare_forward_rows(
     forward: list[tuple[int, InputRow]] = []
     images: dict[int, PreparedImage] = {}
 
-    for index in numerical:
-        call = scheduled[index]
-        if index in outcomes or (offset > 0 and index not in step_inputs):
+    for index, call in enumerate(scheduled):
+        if index in completed or (offset > 0 and index not in step_inputs):
             continue
 
         if index in trajectories:
@@ -539,12 +650,13 @@ def prepare_forward_rows(
         # The remaining calls are image decodes. Without a latent input the
         # decoded image is already a resident product and only needs encoding.
         elif call.latent_input is None:
-            outcomes[index] = image.diffusion_finalize_frames(
+            image.diffusion_finalize_frames(
                 call,
                 tensor_store=tensor_store,
                 model_runner=model_runner,
                 state=state,
             )
+            completed.add(index)
         else:
             if latent_pool is None:
                 raise RuntimeError("image decoding requires a latent pool")
@@ -575,7 +687,7 @@ def prepare_forward_rows(
             )
 
     return (
-        [item for item in forward if item[0] not in outcomes],
+        [item for item in forward if item[0] not in completed],
         images,
     )
 
@@ -586,7 +698,7 @@ def publish_forward_values(
     images: Mapping[int, PreparedImage],
     trajectories: Mapping[int, DiffusionState],
     scheduled: tuple[Call, ...],
-    outcomes: dict[int, PendingOutput],
+    completed: set[int],
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -627,7 +739,7 @@ def publish_forward_values(
 
     for (index, task), numerical_result in zip(forward, values, strict=True):
         call = scheduled[index]
-        if index in outcomes or numerical_result is None:
+        if index in completed or numerical_result is None:
             continue
 
         value, sampling_index, graph_sample, layout = numerical_result
@@ -675,11 +787,11 @@ def publish_forward_values(
                     state=state,
                 )
                 if isinstance(selection, PendingOutput):
-                    outcomes[index] = selection
+                    completed.add(index)
                 else:
                     samples.append((index, task, value, selection, None))
         elif index in images:
-            outcomes[index] = image.publish_features(
+            image.publish_features(
                 call,
                 images[index],
                 value,
@@ -689,54 +801,56 @@ def publish_forward_values(
                 config=config,
                 state=state,
             )
+            completed.add(index)
         else:
             if layout is None or layout.value_range is None:
                 raise ValueError(
                     "image decoder must declare its numerical range"
                 )
-            outcomes[index] = image.publish_image(
+            image.publish_image(
                 call,
                 value.detach(),
                 layout.value_range,
                 tensor_store=tensor_store,
                 state=state,
             )
+            completed.add(index)
 
-    for index, rows in contexts.items():
-        selection = token.finish_context(
+    for index, context_rows in contexts.items():
+        context_result = token.finish_context(
             scheduled[index],
-            tuple(rows),
+            tuple(context_rows),
             request_tables=request_tables,
             decode_state=decode_state,
             state=state,
         )
-        if isinstance(selection, PendingOutput):
-            outcomes[index] = selection
+        if isinstance(context_result, PendingOutput):
+            completed.add(index)
         else:
-            task, value, sampling = selection
-            samples.append((index, task, value, sampling, None))
+            context_row, logits, sampling = context_result
+            samples.append((index, context_row, logits, sampling, None))
 
-    stepped = canvas.publish_steps(
+    canvas.publish_steps(
         tuple((scheduled[index], value) for index, value in steps),
         request_tables=request_tables,
         state=state,
         tensor_store=tensor_store,
     )
-    for (index, _value), outcome in zip(steps, stepped, strict=True):
-        outcomes[index] = outcome
+    completed.update(index for index, _value in steps)
 
-    for index, rows in readouts.items():
-        outcomes[index] = canvas.publish(
+    for index, readout_values in readouts.items():
+        canvas.publish(
             scheduled[index],
-            rows,
+            readout_values,
             request_tables=request_tables,
             state=state,
         )
+        completed.add(index)
 
     _publish_samples(
         samples,
         scheduled,
-        outcomes,
+        completed,
         state=state,
         tensor_store=tensor_store,
         model_runner=model_runner,
@@ -753,7 +867,7 @@ def integrate_predictions(
     trajectories: Mapping[int, DiffusionState],
     offset: int,
     scheduled: tuple[Call, ...],
-    outcomes: dict[int, PendingOutput],
+    completed: set[int],
     *,
     state: BatchState,
     worker_info: WorkerInfo,
@@ -774,7 +888,7 @@ def integrate_predictions(
 
     for index, values in predictions.items():
         call = scheduled[index]
-        if index in outcomes:
+        if index in completed:
             continue
 
         _, timestep = step_inputs[index]
@@ -796,7 +910,7 @@ def integrate_predictions(
             int(params.start_step) + offset,
         )
         if offset + 1 == int(params.step_count):
-            outcomes[index] = diffusion.finish(
+            diffusion.finish(
                 call,
                 trajectories[index],
                 worker_info=worker_info,
@@ -806,3 +920,4 @@ def integrate_predictions(
                 config=config,
                 state=state,
             )
+            completed.add(index)

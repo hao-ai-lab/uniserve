@@ -4,7 +4,6 @@ use std::collections::HashSet;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
 use pythonize::depythonize;
 use uniserve_worker_ipc::{BatchOutput, CallStatus, ErrorCode, RequestOutput};
 
@@ -19,15 +18,7 @@ impl PythonBackend {
         py: Python<'_>,
         batch: &BatchState,
     ) -> PyResult<Option<BatchOutput>> {
-        let outputs = batch
-            .numerical
-            .bind(py)
-            .getattr("outputs")?
-            .cast_into::<PyList>()?;
-        let pending = outputs
-            .iter()
-            .map(|output| output.cast_into::<PendingOutput>().map_err(PyErr::from))
-            .collect::<PyResult<Vec<_>>>()?;
+        let pending = batch.pending_outputs(py)?;
         for output in &pending {
             PendingOutput::submit_host_tasks(output)?;
         }
