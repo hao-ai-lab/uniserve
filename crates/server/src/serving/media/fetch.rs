@@ -1161,13 +1161,10 @@ mod tests {
     /// redirect target, which the client never sent.
     #[tokio::test]
     async fn transport_failures_do_not_reveal_redirect_targets() {
-        // A port that was just released has no listener.
-        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let target = format!("http://127.0.0.1:{closed_port}/internal-target");
+        // Keep the destination reserved while refusing every response. Other
+        // tests can bind ephemeral ports without receiving this redirect.
+        let target_server = TestServer::start(|_| Reply::Close(Vec::new())).await;
+        let target = target_server.url("/internal-target");
         let server = TestServer::start(move |_| redirect("302 Found", &target)).await;
         let fetcher = ImageFetcher::new(loopback_policy()).unwrap();
 
@@ -1177,7 +1174,10 @@ mod tests {
             matches!(error, ImageFetchError::Transport { .. }),
             "{message}"
         );
-        assert!(!message.contains(&closed_port.to_string()), "{message}");
+        assert!(
+            !message.contains(&target_server.address.port().to_string()),
+            "{message}"
+        );
         assert!(!message.contains("internal-target"), "{message}");
     }
 
