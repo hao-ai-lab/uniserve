@@ -215,7 +215,7 @@ impl RequestPool {
         PyTuple::new(py, self.pool.request_ids())
     }
 
-    fn has_open_requests(&self, py: Python<'_>) -> PyResult<bool> {
+    pub(crate) fn has_open_requests(&self, py: Python<'_>) -> PyResult<bool> {
         self.pool
             .has_open_requests()
             .map_err(|error| native_error(py, error))

@@ -2613,11 +2613,12 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         worker.close()
 
 
-def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
+def test_later_product_release_unblocks_an_earlier_bank_writer(
+    worker_channel,
+) -> None:
     """A received Free must progress while computation waits for its storage."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
     from uniserve_worker.protocol.output import BatchOutput
 
     with execution_worker(transfer_backends=("shm",), queue_depth=2) as worker:
@@ -2676,7 +2677,7 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
         )
         # This run reaches the worker through its IPC endpoint rather than
         # the submit path, so it states its own coordinates here.
-        endpoint = QueuedWorkerIpc(
+        endpoint = worker_channel(
             tuple(
                 {
                     "kind": "submit",
@@ -2686,7 +2687,7 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
                 for run in (waiting, release)
             )
         )
-        worker.bind(endpoint)
+        worker.bind(endpoint.endpoint)
         with ThreadPoolExecutor(max_workers=1) as executor:
             serving = executor.submit(worker.run)
             try:

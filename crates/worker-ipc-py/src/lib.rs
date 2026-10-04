@@ -1,31 +1,17 @@
-//! Native worker objects and bindings for a rank's end of its worker channel.
+//! Python access to native worker execution, storage and rank channels.
 //!
-//! The `_uniserve_ipc` extension module exposes `Server`, which owns the
-//! rank's `RankServer` (iceoryx2 shared storage for a rank on the head's
-//! host, a TCP socket for a rank elsewhere); `StreamSignal`, which turns CUDA
-//! stream completion into a readable eventfd; `service_name`; and the
-//! `atomic_store_u32` / `atomic_load_u32` accessors for shared-storage segment
-//! header words. The hand-written stub `uniserve_worker/_uniserve_ipc.pyi`
-//! describes the same Python surface and must stay consistent with it.
-//! Request lifecycle and physical buffer pools are implemented by `uniserve-worker` and
-//! registered here so serving and direct Python calls use one native runtime.
+//! `Server` owns a rank's shared-storage or TCP endpoint. The native service
+//! borrows it for the serving run and calls Python for numerical preparation
+//! and execution. `Client` exposes the head's end of the same channel for
+//! direct callers. Standalone channel operations use the public Python
+//! protocol mappings; their transfer records are converted by `convert`.
 //!
-//! # Boundary conversions
-//!
-//! Each request crosses two boundaries:
-//!
-//! 1. The transport carries FlatBuffers frames, which `Frame::decode_request`
-//!    verifies and validates before any Python object exists;
-//! 2. The Rust↔Python FFI boundary, crossed once on the inbound path
-//!    ([`PyServer::recv`] / [`PyServer::try_recv`]) and once on the outbound
-//!    path ([`PyServer::respond`]).
-//!
-//! Submit requests and result and error responses use the typed conversions
-//! in `convert`; info and close requests and info and ok responses use the
-//! schema-derived serde representation (`pythonize` / `depythonize`).
+//! Completion callbacks use native wakes and CUDA stream signals. The
+//! Python surface is declared in `uniserve_worker/_uniserve_ipc.pyi`.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod client;
 mod convert;
 mod worker;
 
@@ -34,16 +20,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
 use pyo3::wrap_pyfunction;
-use pythonize::{depythonize, pythonize};
+use pythonize::pythonize;
 use uniserve_worker::cuda::{StreamSignal, schedule_completion_wake};
 use uniserve_worker_ipc::{RankServer, SHARED_STORAGE_CHANNEL, Wake};
-use uniserve_worker_ipc::{RequestKind, WorkerRequest, WorkerResponse};
+use uniserve_worker_ipc::{RequestKind, WorkerRequest};
 
-#[pyclass(name = "Server")]
+#[pyclass(name = "Server", weakref)]
 /// Python-facing owner of one worker-side IPC endpoint.
 struct PyServer {
     /// Endpoint and completion wake. A call that releases the GIL takes the
@@ -271,15 +257,8 @@ impl PyServer {
 
     /// Converts and publishes one response for the active request.
     fn respond(&self, py: Python<'_>, response: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Result and error responses use the typed extractor, which also
-        // rejects a non-mapping response; info and ok responses fall back to
-        // the schema-derived converter. Conversion finishes before the
-        // endpoint is taken, so a malformed response leaves it untouched.
-        let resp: WorkerResponse = match convert::try_completion_response_from_py(response)? {
-            Some(resp) => resp,
-            None => depythonize(response)
-                .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?,
-        };
+        let resp = convert::response_from_py(response)?;
+
         // Publish without the GIL while retaining exclusive endpoint ownership.
         // Encoding validates info and result payloads, so a response that
         // converts but violates the protocol surfaces as `RuntimeError`.
@@ -410,6 +389,7 @@ fn atomic_load_u32(buffer: PyBuffer<u8>, offset: usize) -> PyResult<u32> {
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     worker::register(m)?;
     m.add_class::<PyServer>()?;
+    m.add_class::<client::PyClient>()?;
     m.add_class::<PyStreamSignal>()?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
     m.add_function(wrap_pyfunction!(atomic_store_u32, m)?)?;

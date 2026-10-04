@@ -1,13 +1,23 @@
 //! Python numerical backend for the shared native batch executor.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
-use pyo3::exceptions::{PyBaseException, PyRuntimeError};
+use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use uniserve_worker::{Backend, Batch, Executor as NativeExecutor, Submission as NativeSubmission};
+use pythonize::depythonize;
+use uniserve_worker::{
+    Backend, Batch, Executor as NativeExecutor, Service, ServiceBackend,
+    Submission as NativeSubmission,
+};
+use uniserve_worker_ipc::{
+    Batch as BatchPlan, BatchOutput, RequestKind, WorkerInfo, WorkerResponseError,
+};
+
+use super::host::with_context;
+use super::request::RequestPool;
+use crate::{PyServer, convert};
 
 use super::error::native_error;
 
@@ -31,9 +41,27 @@ impl Submission {
 struct PythonBackend {
     runner: Py<PyAny>,
     batch_type: Py<PyAny>,
+    requests: Py<RequestPool>,
+    model_runner: Py<PyAny>,
+    transports: Vec<Py<PyAny>>,
+    info: WorkerInfo,
 }
 
 impl PythonBackend {
+    fn batch_state(
+        &self,
+        py: Python<'_>,
+        batch: &Bound<'_, PyAny>,
+        propagate_errors: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("propagate_errors", propagate_errors)?;
+        self.batch_type
+            .bind(py)
+            .call((batch,), Some(&kwargs))
+            .map(Bound::unbind)
+    }
+
     fn call(&self, method: &str, batch: &Py<PyAny>) -> Result<Py<PyAny>, Py<PyBaseException>> {
         Python::attach(|py| {
             self.runner
@@ -176,6 +204,105 @@ impl Backend for PythonBackend {
     }
 }
 
+impl ServiceBackend for PythonBackend {
+    fn batch(&self, plan: &BatchPlan) -> Result<Py<PyAny>, Py<PyBaseException>> {
+        Python::attach(|py| {
+            let build = || {
+                let range = py
+                    .import("uniserve.profiling")?
+                    .getattr("profile_range")?
+                    .call1(("uniserve.worker.batch_decode",))?;
+                with_context(&range, || {
+                    let batch = convert::batch_to_py(py, plan)?;
+                    self.batch_state(py, &batch, false)
+                })
+            };
+            build().map_err(|error: PyErr| error.into_value(py))
+        })
+    }
+
+    fn output(&self, output: Py<PyAny>) -> Result<BatchOutput, Py<PyBaseException>> {
+        Python::attach(|py| {
+            let convert = || -> PyResult<_> {
+                let output = output.bind(py).call_method0("to_mapping")?;
+                convert::run_result_from_py(&output)
+                    .ok_or_else(|| PyValueError::new_err("invalid worker batch output"))
+            };
+            convert().map_err(|error| error.into_value(py))
+        })
+    }
+
+    fn response_error(
+        &self,
+        kind: RequestKind,
+        error: Py<PyBaseException>,
+    ) -> Result<WorkerResponseError, Py<PyBaseException>> {
+        Python::attach(|py| {
+            let report = || -> PyResult<_> {
+                let errors = py.import("uniserve_worker.errors")?;
+                let unexpected = !error
+                    .bind(py)
+                    .is_instance(&errors.getattr("WorkerError")?)?;
+                let classified = if unexpected {
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("context", kind.as_str())?;
+                    errors.getattr("classify")?.call((error,), Some(&kwargs))?
+                } else {
+                    error.into_bound(py).into_any()
+                };
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("unexpected", unexpected)?;
+                py.import("uniserve_worker.profiling")?
+                    .getattr("record_failure")?
+                    .call((kind.as_str(), &classified), Some(&kwargs))?;
+                depythonize(&classified.call_method0("to_mapping")?).map_err(Into::into)
+            };
+            report().map_err(|error| error.into_value(py))
+        })
+    }
+
+    fn has_open_requests(&self) -> Result<bool, Py<PyBaseException>> {
+        Python::attach(|py| {
+            self.requests
+                .borrow(py)
+                .has_open_requests(py)
+                .map_err(|error| error.into_value(py))
+        })
+    }
+
+    fn awaiting_acknowledgment(&self) -> Result<bool, Py<PyBaseException>> {
+        Python::attach(|py| {
+            for transport in &self.transports {
+                let waiting = transport
+                    .bind(py)
+                    .call_method0("awaiting_acknowledgment")
+                    .and_then(|value| value.extract::<bool>())
+                    .map_err(|error| error.into_value(py))?;
+                if waiting {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    fn join_expert_step(&self, leaving: bool) -> Result<(bool, bool), Py<PyBaseException>> {
+        Python::attach(|py| {
+            let join = || -> PyResult<_> {
+                let runner = self.model_runner.bind(py);
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("leaving", leaving)?;
+                let advanced = runner
+                    .call_method("join_expert_step", (), Some(&kwargs))?
+                    .extract()?;
+                let released = runner.getattr("experts")?.getattr("released")?.extract()?;
+                Ok((advanced, released))
+            };
+            join().map_err(|error| error.into_value(py))
+        })
+    }
+}
+
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct Executor {
     executor: Option<NativeExecutor<PythonBackend>>,
@@ -203,6 +330,15 @@ impl Executor {
         let backend = PythonBackend {
             runner: runner.unbind(),
             batch_type,
+            requests: worker.getattr("requests")?.extract()?,
+            model_runner: worker.getattr("runner")?.unbind(),
+            transports: worker
+                .getattr("transports")?
+                .call_method0("values")?
+                .try_iter()?
+                .map(|value| value.map(Bound::unbind))
+                .collect::<PyResult<_>>()?,
+            info: depythonize(&worker.getattr("info")?.call_method0("to_mapping")?)?,
         };
         let executor = NativeExecutor::new(backend, capacity, distributed, collective)
             .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))?;
@@ -219,65 +355,44 @@ impl Executor {
         propagate_errors: bool,
     ) -> PyResult<Submission> {
         let executor = self.executor_mut()?;
-        let id = batch.getattr("batch_id")?.extract()?;
-        let calls = batch.getattr("calls")?;
-        let collective_seq = if calls.len()? == 0 {
-            None
-        } else {
-            Some(batch.getattr("collective_seq")?.extract()?)
-        };
-        let mut requests = HashSet::new();
-        let mut producers = HashSet::new();
-        for call in calls.try_iter()? {
-            let call = call?;
-            requests.insert(
-                call.getattr("request_key")?
-                    .getattr("request_id")?
-                    .extract()?,
-            );
-            for input in call.call_method0("tensor_inputs")?.try_iter()? {
-                producers.insert(
-                    input?
-                        .getattr("producer_call_id")?
-                        .getattr("batch_id")?
-                        .extract()?,
-                );
-            }
-            for field in ["predicate", "kv_input"] {
-                let input = call.getattr(field)?;
-                if !input.is_none() {
-                    producers.insert(
-                        input
-                            .getattr("producer_call_id")?
-                            .getattr("batch_id")?
-                            .extract()?,
-                    );
-                }
-            }
-        }
-        for command in batch.getattr("commands")?.try_iter()? {
-            requests.insert(
-                command?
-                    .getattr("request_key")?
-                    .getattr("request_id")?
-                    .extract()?,
-            );
-        }
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("propagate_errors", propagate_errors)?;
+        let plan = convert::batch_from_py(&batch.call_method0("to_mapping")?)?;
         let state = executor
             .backend()
-            .batch_type
-            .bind(py)
-            .call((batch,), Some(&kwargs))?
-            .unbind();
+            .batch_state(py, batch, propagate_errors)?;
         let submission = executor
-            .submit(
-                Batch::new(id, collective_seq, requests, producers, state),
-                propagate_errors,
-            )
+            .submit(Batch::from_plan(&plan, state), propagate_errors)
             .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))?;
         Ok(Submission { submission })
+    }
+
+    /// Serve the rank's native channel without Python request/response envelopes.
+    /// The resource owner retains both executor and endpoint after this returns.
+    fn serve(&mut self, py: Python<'_>, server: &PyServer) -> PyResult<()> {
+        let executor = self.executor_mut()?;
+        let info = executor.backend().info.clone();
+        let experts = !executor
+            .backend()
+            .model_runner
+            .bind(py)
+            .getattr("experts")?
+            .is_none();
+        let gc = py.import("gc")?;
+        let gc_enabled: bool = gc.call_method0("isenabled")?.extract()?;
+        let mut endpoint = server.take_endpoint()?;
+
+        // Cyclic collection traverses resident models and graphs. Keep it
+        // outside serving and restore the caller's mode on either exit.
+        let result = (|| -> PyResult<()> {
+            gc.call_method0("disable")?;
+            py.detach(|| Service::new(executor, &mut endpoint, info, experts).run())
+                .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))
+        })();
+        let restored = server.replace_endpoint(endpoint);
+        if gc_enabled {
+            gc.call_method0("enable")?;
+        }
+        restored?;
+        result
     }
 
     fn advance(&mut self, py: Python<'_>) -> PyResult<bool> {
@@ -330,6 +445,11 @@ impl Executor {
         if let Some(executor) = &self.executor {
             visit.call(&executor.backend().runner)?;
             visit.call(&executor.backend().batch_type)?;
+            visit.call(&executor.backend().requests)?;
+            visit.call(&executor.backend().model_runner)?;
+            for transport in &executor.backend().transports {
+                visit.call(transport)?;
+            }
             for (batch, error) in executor.batches() {
                 visit.call(batch)?;
                 visit.call(error)?;

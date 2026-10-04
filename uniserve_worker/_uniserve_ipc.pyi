@@ -935,6 +935,7 @@ class Executor:
         self, batch: Batch, *, propagate_errors: bool = False
     ) -> Submission: ...
     def advance(self) -> bool: ...
+    def serve(self, endpoint: Server) -> None: ...
     def poll(self, submission: Submission) -> BatchOutput | None: ...
     def reset(self) -> None: ...
     def drop_request(self, request_id: int) -> None: ...
@@ -1012,6 +1013,26 @@ class RequestPool:
     def retire(self, request_id: int) -> None:
         """Retire a closed request after device and host staging drain."""
         ...
+
+@final
+class Client:
+    """Send requests and receive independently ready results on a rank channel.
+
+    Each outstanding request needs a distinct message_id. One thread owns
+    channel operations; blocking calls release the GIL.
+    """
+
+    def __new__(
+        cls,
+        endpoint: str,
+        max_payload: int = 1_048_576,
+        max_inflight: int = 1,
+        transport: str = ...,
+        timeout: float = 5.0,
+    ) -> Self: ...
+    def send(self, request: Mapping[str, Any]) -> None: ...
+    def recv(self, timeout: float = 0.0) -> dict[str, Any] | None: ...
+    def close(self) -> None: ...
 
 @final
 class Server:
@@ -1128,12 +1149,14 @@ class Server:
     def respond(self, response: Any) -> None:
         """Publish one response to the request identified by its envelope.
 
+        Envelopes use native response fields: ``info``, ``result`` or
+        ``error`` holds the corresponding payload beside ``message_id``.
         A shared-storage endpoint refuses a message id that matches no
         received, unanswered request; a socket endpoint sends whatever id it
         is given.
 
         Raises:
-            ValueError: ``response`` does not decode as a worker response.
+            TypeError, ValueError: ``response`` does not decode.
             RuntimeError: The endpoint is closed or in use, or encoding or
                 publication fails.
         """

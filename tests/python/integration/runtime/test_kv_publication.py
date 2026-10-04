@@ -20,7 +20,6 @@ from tests.python.fixtures.depth_one import (
     kv_publication_call as _publication_call,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.protocol.batch import (
     BlockTable,
     CacheUnitAllocation,
@@ -94,7 +93,8 @@ def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
     return gated, storage
 
 
-def test_kv_install_waits_for_storage_and_input_without_blocking_independent_work(  # noqa: E501
+def test_kv_install_waits_without_blocking_independent_work(
+    worker_channel,
 ) -> None:
     """A KV installation waits for its storage and its input, and no more.
 
@@ -232,7 +232,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                         calls=(call,),
                     ),
                 )
-                ipc = QueuedWorkerIpc(
+                ipc = worker_channel(
                     tuple(
                         {
                             "kind": "submit",
@@ -242,7 +242,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                         for run in runs
                     )
                 )
-                worker.bind(ipc)
+                worker.bind(ipc.endpoint)
                 processing = executor.submit(worker.run)
                 reader_held = True
                 try:

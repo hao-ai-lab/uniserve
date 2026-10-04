@@ -69,6 +69,38 @@ pub struct Batch<B: Backend> {
 }
 
 impl<B: Backend> Batch<B> {
+    /// Bind backend data to the scheduler's request and producer dependencies.
+    pub fn from_plan(plan: &uniserve_worker_ipc::Batch, data: B::Batch) -> Self {
+        let requests = plan
+            .calls
+            .iter()
+            .map(|call| call.request_key.request_id.0)
+            .chain(
+                plan.commands
+                    .iter()
+                    .map(|command| command.request_key().request_id.0),
+            )
+            .collect();
+        let mut producers = HashSet::new();
+        for call in &plan.calls {
+            producers.extend(
+                call.tensor_inputs()
+                    .chain(call.predicate.iter())
+                    .map(|input| input.producer_call_id.batch_id),
+            );
+            if let Some(input) = &call.kv_input {
+                producers.insert(input.producer_call_id.batch_id);
+            }
+        }
+        Self::new(
+            plan.batch_id,
+            (!plan.calls.is_empty()).then_some(plan.collective_seq),
+            requests,
+            producers,
+            data,
+        )
+    }
+
     /// `requests` includes calls and lifecycle commands. `producers` names
     /// batches supplying tensor, predicate, or KV inputs on this rank.
     /// A lifecycle-only batch has no collective sequence.

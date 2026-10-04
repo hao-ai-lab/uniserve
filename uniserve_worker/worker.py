@@ -10,7 +10,7 @@ groups created by `from_config`.
 Both entry paths drive the worker's one `Executor`. The worker process
 (``uniserve_worker.bootstrap.launch``) builds a worker with `from_config`,
 borrows its IPC endpoint with `bind`, and calls `run`, which warms up and
-then runs `Service` on the caller's thread. A Python caller may instead call
+then runs the native service on the caller's thread. A Python caller may call
 `warmup` and drive batches directly through `submit`, `advance` and `poll`.
 Construction performs no warmup, graph capture or IPC I/O.
 
@@ -97,7 +97,6 @@ from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     WorkerInfo,
 )
-from uniserve_worker.service import Service
 from uniserve_worker.storage.block_tables import BlockTables
 from uniserve_worker.storage.buffer_pool import BufferPool
 from uniserve_worker.storage.canvas_slots import (
@@ -804,7 +803,6 @@ class Worker:
         # method.
         startup.pop_all()
         self.executor = Executor(self)
-        self.service: Service | None = None
 
     @property
     def info(self) -> WorkerInfo:
@@ -955,7 +953,6 @@ class Worker:
                 ),
             )
             self.ipc_endpoint = None
-            self.service = None
             return
 
         actions: list[Callable[[], object]] = [self.runner.synchronize]
@@ -1006,7 +1003,6 @@ class Worker:
             close_resources(*actions)
         finally:
             self.ipc_endpoint = None
-            self.service = None
 
             # Keep immutable configuration/info available to the caller, but
             # retaining a closed Worker must not retain its model and tensors.
@@ -1069,12 +1065,11 @@ class Worker:
             ValueError: The endpoint is missing or closed.
         """
         self._require_open()
-        if self.service is not None:
+        if self.ipc_endpoint is not None:
             raise RuntimeError("worker already has a bound IPC endpoint")
         if endpoint is None or endpoint.closed:
             raise ValueError("worker binding requires an open IPC endpoint")
         self.profiler = WorkerProfiler.from_env()
-        self.service = Service(self, endpoint)
         self.ipc_endpoint = endpoint
         self.set_completion_wake(endpoint.wake, endpoint.wake_on_stream)
         return self
@@ -1089,11 +1084,11 @@ class Worker:
         self._require_open()
         if self._run_started:
             raise RuntimeError("worker can only run once")
-        if self.service is None:
+        if self.ipc_endpoint is None:
             raise RuntimeError("worker has no bound IPC endpoint")
         self._run_started = True
         self.warmup()
-        self.service.run()
+        self.executor.serve(self.ipc_endpoint)
 
     def submit(
         self, batch: Batch, *, propagate_errors: bool = False
