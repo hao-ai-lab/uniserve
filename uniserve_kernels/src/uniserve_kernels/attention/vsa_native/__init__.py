@@ -1,7 +1,7 @@
 """SM100a CUDA block-64 attention with independent query and key extents.
 
 The kernel sources live in ``csrc/`` and build through
-:mod:`uniserve_kernels.extension`: the first :func:`load` with a given source
+:mod:`uniserve_kernels.jit`: the first :func:`load` with a given source
 and toolchain compiles them, later processes import the finished module, and
 support queries never compile.
 ``uniserve.runtime.backends.attention.vsa.sm100`` calls :func:`load` while
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from uniserve_kernels import extension
+from uniserve_kernels import jit
 
 
 def supported(device: torch.device | None = None) -> bool:
@@ -39,12 +39,13 @@ def _extension():
     # the sm_100a target; torch adds no TORCH_CUDA_ARCH_LIST targets when the
     # CUDA flags already name an architecture. -lcuda links the driver API
     # that the launcher uses to encode TMA tensor maps.
-    return extension.load(
+    directory = Path(__file__).parent / "csrc"
+    return jit.load(
         "uniserve_sparse_attention_sm100",
-        Path(__file__).parent / "csrc",
-        ["attention.cu"],
-        extra_cflags=["-O3", "-std=c++20"],
-        extra_cuda_cflags=[
+        [directory / "attention.cu"],
+        headers=sorted(directory.glob("*.cuh")),
+        cxx_flags=["-O3", "-std=c++20"],
+        cuda_flags=[
             "-O3",
             "-std=c++20",
             "--use_fast_math",
@@ -53,7 +54,7 @@ def _extension():
             "-Xcompiler=-fno-strict-aliasing",
             "-gencode=arch=compute_100a,code=sm_100a",
         ],
-        extra_ldflags=["-lcuda"],
+        ldflags=["-lcuda"],
     )
 
 

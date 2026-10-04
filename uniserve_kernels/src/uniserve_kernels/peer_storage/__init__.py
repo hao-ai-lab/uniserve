@@ -2,7 +2,7 @@
 
 This package is the Python face of ``csrc/peer_storage.cpp``, a C++
 extension built on the CUDA driver's virtual memory management API and
-compiled on first use through :mod:`uniserve_kernels.extension`. It supplies
+compiled on first use with :func:`uniserve_kernels.jit.load`. It supplies
 physical allocations whose shareable handles other processes can import,
 the mapping of those handles into tensors, and strided host/device DMA.
 
@@ -18,17 +18,16 @@ from pathlib import Path
 
 import torch
 
-from uniserve_kernels import extension
+from uniserve_kernels import jit
 
 
 @lru_cache(maxsize=1)
 def _extension():
-    return extension.load(
+    return jit.load(
         "uniserve_peer_storage",
-        Path(__file__).parent / "csrc",
-        ["peer_storage.cpp"],
-        extra_cflags=["-O2", "-std=c++20"],
-        extra_ldflags=["-lcuda"],
+        [Path(__file__).parent / "csrc" / "peer_storage.cpp"],
+        cxx_flags=["-O2", "-std=c++20"],
+        ldflags=["-lcuda"],
         with_cuda=True,
     )
 
