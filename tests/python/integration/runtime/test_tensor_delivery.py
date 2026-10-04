@@ -31,6 +31,7 @@ from uniserve_worker.storage.buffer_pool import BufferPool
 from uniserve_worker.storage.tensor_store import FeatureMetadata, TensorStore
 from uniserve_worker.transport import make_transports
 from uniserve_worker.transport.fetch import fetch_tensor
+from uniserve_worker.transport.pool import TransferCapacity, TransferPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -986,4 +987,45 @@ def test_transfer_orders_destination_writes_before_its_copy(
             ticket.close()
         transport.release(locator)
         transport.close()
+        events.close()
+
+
+def test_queued_copy_does_not_wait_for_later_destination_stream_work() -> None:
+    device = torch.device("cuda:0")
+    events = EventPool()
+    capacity = TransferCapacity(byte_capacity=16, ticket_capacity=1)
+    pool = TransferPool(
+        workers=1, capacity=capacity, name="tensor-read", event_pool=events
+    )
+    source = torch.arange(4, dtype=torch.float32, pin_memory=True)
+    # Load the fill kernel before any stream is deliberately blocked.
+    destination = torch.full((4,), -1.0, device=device)
+    initializer = torch.cuda.Stream(device=device)
+    allow_copy = threading.Event()
+    retired = threading.Event()
+
+    def read(ticket):
+        assert allow_copy.wait(30), "read was not released"
+        pool.copy(ticket, source, destination)
+
+    try:
+        with blocked_stream(device) as unrelated:
+            with torch.cuda.stream(initializer):
+                destination.fill_(-1)
+                ticket = pool.submit(read, nbytes=16, destination=destination)
+                ticket.add_retirement_callback(retired.set)
+
+                # Work submitted after the read may itself depend on its
+                # result. It cannot be included in the destination handoff.
+                initializer.wait_stream(unrelated)
+
+            allow_copy.set()
+            assert retired.wait(30), "copy waited for work submitted after it"
+            torch.testing.assert_close(
+                ticket.result().cpu(), source, rtol=0, atol=0
+            )
+    finally:
+        allow_copy.set()
+        pool.close()
+        initializer.synchronize()
         events.close()

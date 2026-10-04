@@ -159,7 +159,7 @@ fn cancelling_a_read_does_not_return_its_physical_credit() -> TestResult {
     }));
     notify(ticket.cancel("read cancelled"));
     rx.recv()?;
-    notify(ticket.complete(vec![1, 2, 3]));
+    notify(ticket.complete(vec![1, 2, 3], None));
     assert!(matches!(ticket.result()?, Outcome::Failed(error) if *error == "read cancelled"));
     assert!(ticket.cancellation_error().is_some());
     assert!(!ticket.retirement_ready()?);
@@ -182,7 +182,7 @@ fn a_late_read_failure_preserves_observed_views_but_prevents_more_consumption() 
     ticket.add_done_callback(Box::new(move || {
         let _ = tx.send(());
     }));
-    notify(ticket.complete(vec![1, 2, 3]));
+    notify(ticket.complete(vec![1, 2, 3], None));
     rx.recv()?;
     let Outcome::Success(value) = ticket.result()? else {
         panic!("completed read has no value");
@@ -195,7 +195,7 @@ fn a_late_read_failure_preserves_observed_views_but_prevents_more_consumption() 
     assert!(matches!(ticket.result()?, Outcome::Failed(error) if *error == "device copy failed"));
     assert!(ticket.add_done_callback(Box::new(|| {})).is_some());
 
-    ticket.mark_undrained();
+    ticket.mark_undrained(None, None);
     assert!(ticket.retirement_ready().is_err());
     assert!(ticket.retire().is_err());
     assert!(!ticket.retirement.done());
@@ -212,7 +212,7 @@ fn a_late_read_failure_preserves_observed_views_but_prevents_more_consumption() 
 fn borrowed_consumption_closes_before_its_shared_retirement_completes() -> TestResult {
     let mut borrowed = TransferTicket::<Vec<u8>, &str, Callback>::new(true);
     assert!(borrowed.result().is_err());
-    notify(borrowed.complete(vec![1]));
+    notify(borrowed.complete(vec![1], None));
     assert!(borrowed.close());
     assert!(!borrowed.close());
     assert!(borrowed.result().is_err());
@@ -226,7 +226,7 @@ fn borrowed_consumption_closes_before_its_shared_retirement_completes() -> TestR
     assert!(retirement.subscribe(Box::new(|| {})).is_some());
 
     let mut copied = TransferTicket::<Vec<u8>, &str, Callback>::new(false);
-    notify(copied.complete(vec![1]));
+    notify(copied.complete(vec![1], None));
     assert!(!copied.close());
     assert!(matches!(copied.result()?, Outcome::Success(value) if *value == [1]));
     Ok(())

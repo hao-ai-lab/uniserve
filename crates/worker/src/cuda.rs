@@ -381,7 +381,7 @@ impl Drop for DeviceGuard {
     }
 }
 
-/// A nonblocking stream owned by the worker's completion notifier.
+/// A nonblocking stream owned by worker execution or transport infrastructure.
 pub struct Stream {
     handle: Handle,
 }
