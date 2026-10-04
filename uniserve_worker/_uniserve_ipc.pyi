@@ -56,6 +56,7 @@ __all__ = [
     "Executor",
     "GroupShape",
     "GroupTable",
+    "KVCacheManager",
     "LatentExport",
     "LatentImport",
     "LatentPool",
@@ -78,6 +79,53 @@ __all__ = [
 ]
 
 Source = TypeVar("Source")
+
+@final
+class KVCacheManager:
+    """Physical KV intervals retained by model execution and transfers."""
+
+    def __new__(cls) -> Self: ...
+    @property
+    def has_pending_accesses(self) -> bool: ...
+    @property
+    def has_transfers(self) -> bool: ...
+    def retain_execution(
+        self,
+        request: RequestKey,
+        spans: Sequence[tuple[int, int, int]],
+        completion: Completion,
+    ) -> None: ...
+    def reserve_export(
+        self, buffer: BufferId, spans: Sequence[tuple[int, int, int]]
+    ) -> None: ...
+    def retain_export(
+        self, buffer: BufferId, retirement: Completion
+    ) -> None: ...
+    def release_exports(self, buffers: Iterable[BufferId]) -> None: ...
+    def exported_buffers(self) -> tuple[BufferId, ...]: ...
+    def reserve_import(
+        self,
+        buffer: BufferId,
+        spans: Sequence[tuple[int, int, int]],
+        retirement: Completion,
+    ) -> None: ...
+    def discard_import(self, buffer: BufferId) -> None: ...
+    def write_dependencies(
+        self, spans: Sequence[tuple[int, int, int]]
+    ) -> tuple[Completion, ...]: ...
+    def require_writable(
+        self, spans: Sequence[tuple[int, int, int]]
+    ) -> None: ...
+    def require_reusable(
+        self, spans: Sequence[tuple[int, int, int]]
+    ) -> None: ...
+    def retirement_ready(
+        self,
+        buffers: Iterable[BufferId],
+        requests: Iterable[RequestKey],
+        retained: Iterable[BufferId],
+    ) -> bool: ...
+    def require_retired(self) -> None: ...
 
 @final
 class Completion:

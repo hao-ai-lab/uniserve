@@ -1265,7 +1265,10 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
 /// Uses a fresh `RequestConversion`, so the owner request key and producer
 /// call id are equal to, but not the same objects as, the batch's cached
 /// leaves for the same identities.
-fn buffer_id_to_py<'py>(py: Python<'py>, buffer: &BufferId) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn buffer_id_to_py<'py>(
+    py: Python<'py>,
+    buffer: &BufferId,
+) -> PyResult<Bound<'py, PyAny>> {
     RequestConversion::new(py)?.buffer_id(*buffer)
 }
 

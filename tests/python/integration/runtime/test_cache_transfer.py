@@ -12,7 +12,7 @@ from tests.python.fixtures.cache import mha_pool
 from tests.python.fixtures.shm_publication import serve_pending_publication
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
-from uniserve_worker.errors import WorkerError
+from uniserve_worker.errors import WorkerError, WorkerErrorCode
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
     MAX_TRANSFER_HANDLE_BYTES,
@@ -46,6 +46,7 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
         device="cpu",
         request_pool_size=2,
         table_width=1,
+        import_capacity=2,
     )
     publications = pool
     events = EventPool()
@@ -80,6 +81,20 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
         # reserved while an unrelated page is usable.
         assert not write.completion.done()
         assert not pool.retirement_ready(requests=(source.owner,))
+        with pytest.raises(WorkerError, match="import destination"):
+            pool.zero_units((1,))
+
+        # Refusing another installation of this buffer must preserve the
+        # first import's destination and its ability to finish cancellation.
+        with pytest.raises(WorkerError) as repeated:
+            publications.prepare_install(
+                publication,
+                request_pool_idx=1,
+                tables=_tables(pool, (1,), 256),
+                initialized_units=(1,),
+                transports={consumer.name: consumer},
+            )
+        assert repeated.value.code is WorkerErrorCode.INVALID_DESCRIPTOR
         with pytest.raises(WorkerError, match="import destination"):
             pool.zero_units((1,))
 

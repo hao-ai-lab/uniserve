@@ -1,5 +1,7 @@
 //! Python observers of native storage completion.
 
+use std::ops::Deref;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
@@ -12,7 +14,7 @@ use super::error::native_error;
 
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct Completion {
-    inner: NativeCompletion<Py<PyBaseException>, Py<PyAny>>,
+    inner: Arc<NativeCompletion<Py<PyBaseException>, Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -20,7 +22,7 @@ impl Completion {
     #[new]
     pub(crate) fn new() -> Self {
         Self {
-            inner: NativeCompletion::default(),
+            inner: Arc::new(NativeCompletion::default()),
         }
     }
 
@@ -104,7 +106,7 @@ impl Completion {
     }
 
     fn __clear__(&mut self) {
-        self.inner = NativeCompletion::default();
+        self.inner = Arc::new(NativeCompletion::default());
     }
 }
 
@@ -140,4 +142,26 @@ fn cancelled(py: Python<'_>) -> PyResult<PyErr> {
             .getattr("CancelledError")?
             .call0()?,
     ))
+}
+
+/// A native resource owner retains the Python wrapper for GC tracing while
+/// reading completion state without acquiring the GIL or calling Python.
+pub(crate) struct CompletionRef {
+    pub(crate) owner: Py<Completion>,
+    inner: Arc<NativeCompletion<Py<PyBaseException>, Py<PyAny>>>,
+}
+
+impl CompletionRef {
+    pub(crate) fn new(py: Python<'_>, owner: Py<Completion>) -> Self {
+        let inner = Arc::clone(&owner.borrow(py).inner);
+        Self { owner, inner }
+    }
+}
+
+impl Deref for CompletionRef {
+    type Target = NativeCompletion<Py<PyBaseException>, Py<PyAny>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
