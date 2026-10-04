@@ -5,7 +5,7 @@ use std::sync::Arc;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyType};
 use pythonize::depythonize;
 use uniserve_worker::{
     Backend, Batch, Executor as NativeExecutor, Service, ServiceBackend,
@@ -16,7 +16,9 @@ use uniserve_worker_ipc::{
 };
 
 use super::host::with_context;
+use super::inputs::BatchInputs;
 use super::request::RequestPool;
+use super::transfer::TransferCapacity;
 use crate::{PyServer, convert};
 
 use super::error::native_error;
@@ -41,10 +43,18 @@ impl Submission {
 struct PythonBackend {
     runner: Py<PyAny>,
     batch_type: Py<PyAny>,
+    read_backpressure: Py<PyType>,
     requests: Py<RequestPool>,
     model_runner: Py<PyAny>,
     transports: Vec<Py<PyAny>>,
     info: WorkerInfo,
+}
+
+/// Numerical views and their native input owner, retained for one batch.
+struct BatchState {
+    numerical: Py<PyAny>,
+    inputs: Py<BatchInputs>,
+    imports: bool,
 }
 
 impl PythonBackend {
@@ -53,51 +63,99 @@ impl PythonBackend {
         py: Python<'_>,
         batch: &Bound<'_, PyAny>,
         propagate_errors: bool,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<BatchState> {
         let kwargs = PyDict::new(py);
         kwargs.set_item("propagate_errors", propagate_errors)?;
-        self.batch_type
-            .bind(py)
-            .call((batch,), Some(&kwargs))
-            .map(Bound::unbind)
+        let numerical = self.batch_type.bind(py).call((batch,), Some(&kwargs))?;
+        Ok(BatchState {
+            inputs: numerical.getattr("inputs")?.extract()?,
+            numerical: numerical.unbind(),
+            imports: false,
+        })
     }
 
-    fn call(&self, method: &str, batch: &Py<PyAny>) -> Result<Py<PyAny>, Py<PyBaseException>> {
+    fn call(&self, method: &str, batch: &BatchState) -> Result<Py<PyAny>, Py<PyBaseException>> {
         Python::attach(|py| {
             self.runner
                 .bind(py)
-                .call_method1(method, (batch,))
+                .call_method1(method, (&batch.numerical,))
                 .map(Bound::unbind)
                 .map_err(|error| error.into_value(py))
         })
     }
 
-    fn input_call(
+    fn advance_inputs(
         &self,
-        method: &str,
-        batch: &Py<PyAny>,
+        py: Python<'_>,
+        batch: &BatchState,
         submission: &Arc<NativeSubmission>,
-    ) -> Result<Py<PyAny>, Py<PyBaseException>> {
-        Python::attach(|py| {
-            let call = || -> PyResult<_> {
-                let submission = Py::new(
+    ) -> PyResult<()> {
+        let inputs = &batch.inputs;
+        if inputs.borrow(py).closed() {
+            return Ok(());
+        }
+
+        if !inputs.borrow(py).submitted() {
+            // Reusing an import destination must wait for its previous
+            // reader. Batches without imports can prepare numerical inputs
+            // while those same dependencies still gate model execution.
+            if batch.imports {
+                if !inputs.borrow(py).storage_ready()? {
+                    return Ok(());
+                }
+                inputs.borrow(py).require_storage(py)?;
+            }
+
+            inputs.borrow_mut(py).set_awaiting_reads(false);
+            let prepared = self
+                .runner
+                .bind(py)
+                .call_method1("prepare_inputs", (&batch.numerical,));
+            if let Err(error) = prepared {
+                if !error.is_instance(py, self.read_backpressure.bind(py)) {
+                    return Err(error);
+                }
+
+                let error = error.value(py);
+                let capacity: Py<TransferCapacity> = error.getattr("capacity")?.extract()?;
+                let returns = error.getattr("returns")?.extract()?;
+                inputs.borrow_mut(py).set_awaiting_reads(true);
+
+                // The return counter closes the gap between refusal and
+                // subscription, including a return on another host thread.
+                capacity.get().notify_reads_returned(
                     py,
-                    Submission {
-                        submission: Arc::clone(submission),
-                    },
+                    Self::input_wake(py, submission)?,
+                    returns,
                 )?;
-                self.runner
-                    .bind(py)
-                    .call_method1(method, (batch, submission))
-                    .map(Bound::unbind)
-            };
-            call().map_err(|error| error.into_value(py))
-        })
+                return Ok(());
+            }
+            inputs.borrow_mut(py).set_submitted(true);
+        }
+
+        // Numerical callbacks may acquire or close inputs. Never retain an
+        // input-set borrow across a callback or notification registration.
+        self.runner
+            .bind(py)
+            .call_method1("capture_predicates", (&batch.numerical,))?;
+        Ok(())
+    }
+
+    fn input_wake(py: Python<'_>, submission: &Arc<NativeSubmission>) -> PyResult<Py<PyAny>> {
+        Py::new(
+            py,
+            Submission {
+                submission: Arc::clone(submission),
+            },
+        )?
+        .bind(py)
+        .getattr("notify_ready")
+        .map(Bound::unbind)
     }
 }
 
 impl Backend for PythonBackend {
-    type Batch = Py<PyAny>;
+    type Batch = BatchState;
     type Output = Py<PyAny>;
     type Error = Py<PyBaseException>;
 
@@ -110,7 +168,7 @@ impl Backend for PythonBackend {
             let classify = || -> PyResult<_> {
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("context", context)?;
-                kwargs.set_item("route", batch.bind(py).getattr("route")?)?;
+                kwargs.set_item("route", batch.numerical.bind(py).getattr("route")?)?;
                 py.import("uniserve_worker.errors")?
                     .getattr("classify")?
                     .call((error,), Some(&kwargs))?
@@ -136,7 +194,13 @@ impl Backend for PythonBackend {
     }
 
     fn prepare(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
-        self.call("prepare", batch).map(drop)
+        let imports = self.call("prepare", batch)?;
+        batch.imports = Python::attach(|py| {
+            imports
+                .extract::<bool>(py)
+                .map_err(|error| error.into_value(py))
+        })?;
+        Ok(())
     }
 
     fn prepare_inputs(
@@ -144,11 +208,9 @@ impl Backend for PythonBackend {
         batch: &mut Self::Batch,
         submission: &Arc<NativeSubmission>,
     ) -> Result<bool, Self::Error> {
-        let ready = self.input_call("prepare_inputs", batch, submission)?;
         Python::attach(|py| {
-            ready
-                .bind(py)
-                .extract::<bool>()
+            self.advance_inputs(py, batch, submission)
+                .and_then(|()| batch.inputs.borrow(py).ready())
                 .map_err(|error| error.into_value(py))
         })
     }
@@ -158,7 +220,18 @@ impl Backend for PythonBackend {
         batch: &mut Self::Batch,
         submission: &Arc<NativeSubmission>,
     ) -> Result<(), Self::Error> {
-        self.input_call("await_inputs", batch, submission).map(drop)
+        Python::attach(|py| {
+            let subscribe = || -> PyResult<()> {
+                if !batch.inputs.borrow(py).awaiting_reads() {
+                    BatchInputs::on_ready(
+                        batch.inputs.bind(py),
+                        Self::input_wake(py, submission)?,
+                    )?;
+                }
+                Ok(())
+            };
+            subscribe().map_err(|error| error.into_value(py))
+        })
     }
 
     fn execute(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
@@ -182,6 +255,7 @@ impl Backend for PythonBackend {
     fn result(&mut self, batch: &mut Self::Batch) -> Result<Self::Output, Self::Error> {
         Python::attach(|py| {
             batch
+                .numerical
                 .bind(py)
                 .call_method0("result")
                 .map(Bound::unbind)
@@ -205,7 +279,7 @@ impl Backend for PythonBackend {
 }
 
 impl ServiceBackend for PythonBackend {
-    fn batch(&self, plan: &BatchPlan) -> Result<Py<PyAny>, Py<PyBaseException>> {
+    fn batch(&self, plan: &BatchPlan) -> Result<BatchState, Py<PyBaseException>> {
         Python::attach(|py| {
             let build = || {
                 let range = py
@@ -330,6 +404,11 @@ impl Executor {
         let backend = PythonBackend {
             runner: runner.unbind(),
             batch_type,
+            read_backpressure: py
+                .import("uniserve_worker.transport.pool")?
+                .getattr("ReadBackpressureError")?
+                .cast_into::<PyType>()?
+                .unbind(),
             requests: worker.getattr("requests")?.extract()?,
             model_runner: worker.getattr("runner")?.unbind(),
             transports: worker
@@ -445,13 +524,15 @@ impl Executor {
         if let Some(executor) = &self.executor {
             visit.call(&executor.backend().runner)?;
             visit.call(&executor.backend().batch_type)?;
+            visit.call(&executor.backend().read_backpressure)?;
             visit.call(&executor.backend().requests)?;
             visit.call(&executor.backend().model_runner)?;
             for transport in &executor.backend().transports {
                 visit.call(transport)?;
             }
             for (batch, error) in executor.batches() {
-                visit.call(batch)?;
+                visit.call(&batch.numerical)?;
+                visit.call(&batch.inputs)?;
                 visit.call(error)?;
             }
         }

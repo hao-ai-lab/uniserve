@@ -164,6 +164,16 @@ pub(crate) struct BatchInputs {
     inner: NativeInputs<Input, Dependency>,
 }
 
+impl BatchInputs {
+    pub(super) fn awaiting_reads(&self) -> bool {
+        self.inner.awaiting_reads
+    }
+
+    pub(super) fn set_awaiting_reads(&mut self, waiting: bool) {
+        self.inner.awaiting_reads = waiting;
+    }
+}
+
 #[pymethods]
 impl BatchInputs {
     #[new]
@@ -174,7 +184,7 @@ impl BatchInputs {
     }
 
     #[getter]
-    fn closed(&self) -> bool {
+    pub(super) fn closed(&self) -> bool {
         self.inner.closed()
     }
 
@@ -189,23 +199,13 @@ impl BatchInputs {
     }
 
     #[getter]
-    fn submitted(&self) -> bool {
+    pub(super) fn submitted(&self) -> bool {
         self.inner.submitted
     }
 
     #[setter]
-    fn set_submitted(&mut self, submitted: bool) {
+    pub(super) fn set_submitted(&mut self, submitted: bool) {
         self.inner.submitted = submitted;
-    }
-
-    #[getter]
-    fn awaiting_reads(&self) -> bool {
-        self.inner.awaiting_reads
-    }
-
-    #[setter]
-    fn set_awaiting_reads(&mut self, waiting: bool) {
-        self.inner.awaiting_reads = waiting;
     }
 
     #[getter]
@@ -228,11 +228,11 @@ impl BatchInputs {
             .collect();
     }
 
-    fn storage_ready(&self) -> PyResult<bool> {
+    pub(super) fn storage_ready(&self) -> PyResult<bool> {
         self.inner.storage_ready()
     }
 
-    fn require_storage(&self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn require_storage(&self, py: Python<'_>) -> PyResult<()> {
         for dependency in &self.inner.dependencies {
             if let Dependency::Completion(value) = dependency {
                 value.borrow(py).result(py, None)?;
@@ -241,7 +241,7 @@ impl BatchInputs {
         Ok(())
     }
 
-    fn ready(&self) -> PyResult<bool> {
+    pub(super) fn ready(&self) -> PyResult<bool> {
         self.inner.ready()
     }
 
@@ -329,7 +329,7 @@ impl BatchInputs {
         })
     }
 
-    fn on_ready(slf: &Bound<'_, Self>, callback: Py<PyAny>) -> PyResult<()> {
+    pub(super) fn on_ready(slf: &Bound<'_, Self>, callback: Py<PyAny>) -> PyResult<()> {
         let py = slf.py();
         let (dependencies, wait) = {
             let this = slf.borrow();

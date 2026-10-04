@@ -5,6 +5,7 @@ use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use indexmap::IndexMap;
+use uniserve_worker_ipc::Wake;
 
 use crate::Error;
 
@@ -203,6 +204,7 @@ impl<B: Backend> Batch<B> {
 pub struct Submission {
     batch_id: u64,
     ready: Sender<Weak<Submission>>,
+    completion_wake: Option<Wake>,
 }
 
 impl Submission {
@@ -212,6 +214,9 @@ impl Submission {
 
     pub fn notify_ready(self: &Arc<Self>) {
         let _ = self.ready.send(Arc::downgrade(self));
+        if let Some(wake) = &self.completion_wake {
+            wake.wake();
+        }
     }
 }
 
@@ -226,6 +231,7 @@ pub struct Executor<B: Backend> {
     last_sequence: Option<u64>,
     ready_sender: Sender<Weak<Submission>>,
     ready_receiver: Receiver<Weak<Submission>>,
+    completion_wake: Option<Wake>,
     closed: bool,
 }
 
@@ -256,12 +262,19 @@ impl<B: Backend> Executor<B> {
             last_sequence: None,
             ready_sender,
             ready_receiver,
+            completion_wake: None,
             closed: false,
         })
     }
 
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// The rank service supplies its channel wake for newly admitted batches.
+    /// Direct callers drive progress through advance and poll themselves.
+    pub(crate) fn set_completion_wake(&mut self, wake: Option<Wake>) {
+        self.completion_wake = wake;
     }
 
     /// Borrow backend resources and retained failures for language runtimes
@@ -308,6 +321,7 @@ impl<B: Backend> Executor<B> {
         let submission = Arc::new(Submission {
             batch_id: batch.id,
             ready: self.ready_sender.clone(),
+            completion_wake: self.completion_wake.clone(),
         });
         self.backend.admit(&mut batch.data)?;
         batch.submission = Some(Arc::clone(&submission));

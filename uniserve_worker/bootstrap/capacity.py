@@ -640,7 +640,7 @@ def request_tensor_arena_capacity(
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
         # Read tickets bound the reads in flight: a ticket returns when its
         # read retires, and a batch whose imports need more than are free
-        # waits for returns (``Executor.advance_inputs``). One product's reads
+        # waits for returns in the native executor. One product's reads
         # start together, and a product is written by at most every rank of
         # the group producing it, so the rank keeps at least its own group's
         # world size: the products it reads in several regions come from its

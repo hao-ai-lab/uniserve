@@ -98,7 +98,6 @@ class BatchInputs:
 
     started: int
     submitted: bool
-    awaiting_reads: bool
     predicate: OutputBuffer | None
 
     def __new__(cls) -> Self: ...

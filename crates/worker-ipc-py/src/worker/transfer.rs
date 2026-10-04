@@ -82,7 +82,7 @@ impl TransferCapacity {
     }
 
     #[pyo3(signature = (callback, *, after))]
-    fn notify_reads_returned(
+    pub(super) fn notify_reads_returned(
         &self,
         py: Python<'_>,
         callback: Py<PyAny>,
