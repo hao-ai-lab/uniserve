@@ -9523,8 +9523,6 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "indexmap 2.14.0",
- "libc",
- "libloading 0.8.9",
  "pyo3",
  "pythonize",
  "serde",
@@ -9605,6 +9603,8 @@ version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "indexmap 2.14.0",
+ "libc",
+ "libloading 0.8.9",
  "thiserror 2.0.18",
  "uniserve-core",
  "uniserve-worker-ipc",

@@ -3,8 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tvm_ffi::{Error, Function, Result, Tensor, RUNTIME_ERROR};
-
-use crate::cuda::Event;
+use uniserve_worker::cuda::Event;
 
 pub fn failure(message: impl AsRef<str>) -> Error {
     Error::new(RUNTIME_ERROR, message.as_ref(), "")
@@ -34,7 +33,7 @@ impl Execution {
         // A callback may raise after launching kernels. Record the fence on
         // both paths and retain the input until those kernels have drained.
         let event = if device.device_type as i32 == 2 {
-            Event::record(stream).map(Some).map_err(failure)
+            Event::record(stream as usize).map(Some).map_err(failure)
         } else {
             Ok(None)
         };
@@ -82,7 +81,7 @@ impl Execution {
             if device.device_type as i32 == 1 {
                 event.wait().map_err(failure)?;
             } else {
-                event.wait_on(stream).map_err(failure)?;
+                event.wait_on(stream as usize).map_err(failure)?;
             }
         }
         Ok(output.clone())

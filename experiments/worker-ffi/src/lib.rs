@@ -13,7 +13,6 @@ use uniserve_worker_ipc::{codec, BatchCommand, WorkerRequest as Request};
 
 use execution::{failure, lock};
 
-mod cuda;
 mod execution;
 mod host;
 

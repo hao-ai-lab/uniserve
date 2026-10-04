@@ -12,7 +12,6 @@ crate-type = ["cdylib"]
 [workspace]
 
 [dependencies]
-libloading = "0.8.9"
 tvm-ffi = { git = "https://github.com/apache/tvm-ffi", rev = "df463f9bd269867fc7f4d578d62d80cc2a11d004" }
 uniserve-worker-ipc = { path = "../../crates/worker-ipc" }
 uniserve-worker = { path = "../../crates/worker" }

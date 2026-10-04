@@ -29,9 +29,9 @@
 mod convert;
 mod worker;
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::os::fd::AsRawFd;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -39,6 +39,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
 use pyo3::wrap_pyfunction;
 use pythonize::{depythonize, pythonize};
+use uniserve_worker::cuda::{StreamSignal, schedule_completion_wake};
 use uniserve_worker_ipc::{RankServer, SHARED_STORAGE_CHANNEL, Wake};
 use uniserve_worker_ipc::{RequestKind, WorkerRequest, WorkerResponse};
 
@@ -64,216 +65,33 @@ struct ServerState {
     endpoint: Option<RankServer>,
 }
 
-/// Shared eventfd state retained until the last scheduled callback completes.
-struct StreamSignalState {
-    /// Selector-compatible descriptor owned by this state.
-    fd: i32,
-    /// One-shot scheduling guard for the CUDA callback, reset when CUDA
-    /// rejects the callback so the signal can be scheduled again.
-    scheduled: AtomicBool,
-}
-
-impl Drop for StreamSignalState {
-    /// Closes the owned eventfd when no Python object or callback retains it.
-    fn drop(&mut self) {
-        // SAFETY: this state exclusively owns the eventfd.
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
 /// A selector-compatible one-shot signal fired by a CUDA stream host callback.
 #[pyclass(name = "StreamSignal")]
 struct PyStreamSignal {
-    state: Arc<StreamSignalState>,
-}
-
-/// ABI of `cudaLaunchHostFunc` resolved from the CUDA runtime.
-type CudaLaunchHostFunc = unsafe extern "C" fn(
-    stream: *mut c_void,
-    callback: Option<unsafe extern "C" fn(*mut c_void)>,
-    user_data: *mut c_void,
-) -> i32;
-
-/// Loaded CUDA runtime and the host-callback entry point borrowed from it.
-struct CudaRuntime {
-    /// Library owner that keeps `launch_host_func` valid for the process lifetime.
-    _library: libloading::Library,
-    /// CUDA host-callback launcher copied from the loaded runtime.
-    launch_host_func: CudaLaunchHostFunc,
-}
-
-/// Process-wide result of resolving the CUDA host-callback API.
-static CUDA_RUNTIME: OnceLock<Result<CudaRuntime, String>> = OnceLock::new();
-
-/// Loads the CUDA runtime once and returns its host-callback entry point.
-///
-/// The extension does not link the CUDA runtime; it resolves
-/// `cudaLaunchHostFunc` on first use. The outcome, including a failure, is
-/// cached for the life of the process.
-fn cuda_runtime() -> Result<&'static CudaRuntime, String> {
-    CUDA_RUNTIME
-        .get_or_init(|| {
-            let mut failure = String::new();
-            // Probe conventional sonames in preference order and retain the
-            // final loader diagnostic if none is available.
-            for name in ["libcudart.so", "libcudart.so.13", "libcudart.so.12"] {
-                // SAFETY: the library handle remains owned by `CudaRuntime` for the
-                // process lifetime and the copied symbol has the CUDA runtime ABI.
-                let library = match unsafe { libloading::Library::new(name) } {
-                    Ok(library) => library,
-                    Err(error) => {
-                        failure = format!("{name}: {error}");
-                        continue;
-                    }
-                };
-                // A runtime that loads but lacks the symbol fails here without
-                // trying the remaining sonames.
-                // SAFETY: `cudaLaunchHostFunc` has the signature declared by the
-                // CUDA runtime API and the library stays live in the result.
-                let launch_host_func = unsafe {
-                    *library
-                        .get::<CudaLaunchHostFunc>(b"cudaLaunchHostFunc\0")
-                        .map_err(|error| format!("loading cudaLaunchHostFunc: {error}"))?
-                };
-                return Ok(CudaRuntime {
-                    _library: library,
-                    launch_host_func,
-                });
-            }
-            Err(format!(
-                "loading CUDA runtime for host callbacks failed: {failure}"
-            ))
-        })
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-/// Signals worker completion after preceding CUDA stream work finishes.
-///
-/// CUDA runs host functions on an internal thread. A host function must not
-/// call CUDA APIs, and acquiring the GIL there can deadlock against a Python
-/// thread that holds the GIL while calling CUDA. This callback and
-/// `stream_signal_callback` do neither: they only signal a waiting host
-/// thread.
-unsafe extern "C" fn completion_callback(user_data: *mut c_void) {
-    // SAFETY: `schedule_completion_wake` passes ownership of exactly one boxed
-    // `Wake` to CUDA, which invokes this callback exactly once.
-    let wake = unsafe { Box::from_raw(user_data.cast::<Wake>()) };
-    wake.wake();
-}
-
-/// Writes one eventfd signal after preceding CUDA stream work finishes.
-unsafe extern "C" fn stream_signal_callback(user_data: *mut c_void) {
-    // SAFETY: `PyStreamSignal::schedule` transfers one boxed Arc to CUDA and
-    // CUDA invokes this callback exactly once after preceding stream work.
-    let state = unsafe { Box::from_raw(user_data.cast::<Arc<StreamSignalState>>()) };
-    let value = 1_u64.to_ne_bytes();
-    // SAFETY: `state` keeps the eventfd alive for this call. The descriptor is
-    // non-blocking and an eventfd counter cannot saturate under a one-shot use.
-    let _ = unsafe { libc::write(state.fd, value.as_ptr().cast(), value.len()) };
-}
-
-/// Transfers a completion wake to a one-shot CUDA stream callback.
-fn schedule_completion_wake(stream: usize, wake: Wake) -> Result<(), String> {
-    let runtime = cuda_runtime()?;
-    let user_data = Box::into_raw(Box::new(wake)).cast::<c_void>();
-    // SAFETY: `stream` is the native CUDA stream address supplied by PyTorch;
-    // `user_data` remains owned by CUDA until `completion_callback` runs.
-    let status = unsafe {
-        (runtime.launch_host_func)(stream as *mut c_void, Some(completion_callback), user_data)
-    };
-    if status != 0 {
-        // SAFETY: CUDA rejected the callback and therefore did not take ownership.
-        drop(unsafe { Box::from_raw(user_data.cast::<Wake>()) });
-        return Err(format!(
-            "cudaLaunchHostFunc failed with CUDA status {status}"
-        ));
-    }
-    Ok(())
+    inner: StreamSignal,
 }
 
 #[pymethods]
 impl PyStreamSignal {
     #[new]
-    /// Creates a non-blocking one-shot eventfd signal.
     fn new() -> PyResult<Self> {
-        // SAFETY: eventfd has no pointer arguments and returns an owned fd.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(py_runtime(format!(
-                "creating CUDA stream signal failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(Self {
-            state: Arc::new(StreamSignalState {
-                fd,
-                scheduled: AtomicBool::new(false),
-            }),
-        })
+        let inner = StreamSignal::new()
+            .map_err(|error| py_runtime(format!("creating CUDA stream signal failed: {error}")))?;
+        Ok(Self { inner })
     }
 
-    /// Returns the borrowed descriptor consumed by Python selector loops.
     fn fileno(&self) -> i32 {
-        self.state.fd
+        self.inner.as_raw_fd()
     }
 
-    /// Schedules this signal after all prior work on a CUDA stream.
     fn schedule(&self, stream: usize) -> PyResult<()> {
-        self.state
-            .scheduled
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| py_runtime("CUDA stream signal was scheduled more than once"))?;
-
-        let runtime = cuda_runtime().map_err(py_runtime)?;
-        // Transfer an Arc to CUDA so the eventfd remains alive until the
-        // callback runs, even if this Python object is dropped first.
-        let user_data = Box::into_raw(Box::new(Arc::clone(&self.state))).cast::<c_void>();
-        // SAFETY: `stream` is a native CUDA stream address supplied by PyTorch;
-        // the boxed Arc remains owned by CUDA until the callback runs.
-        let status = unsafe {
-            (runtime.launch_host_func)(
-                stream as *mut c_void,
-                Some(stream_signal_callback),
-                user_data,
-            )
-        };
-        if status != 0 {
-            // SAFETY: CUDA rejected the callback and did not take ownership.
-            drop(unsafe { Box::from_raw(user_data.cast::<Arc<StreamSignalState>>()) });
-            self.state.scheduled.store(false, Ordering::Release);
-            return Err(py_runtime(format!(
-                "cudaLaunchHostFunc failed with CUDA status {status}"
-            )));
-        }
-        Ok(())
+        self.inner.schedule(stream).map_err(py_runtime)
     }
 
-    /// Consumes the eventfd counter produced by the scheduled callback.
     fn consume(&self) -> PyResult<()> {
-        let mut value = 0_u64;
-        // SAFETY: the state owns a valid non-blocking eventfd and `value` is a
-        // writable eight-byte destination, as required by eventfd.
-        let read = unsafe {
-            libc::read(
-                self.state.fd,
-                (&mut value as *mut u64).cast(),
-                std::mem::size_of::<u64>(),
-            )
-        };
-        if read == std::mem::size_of::<u64>() as isize && value > 0 {
-            return Ok(());
-        }
-        Err(py_runtime(if read < 0 {
-            format!(
-                "consuming CUDA stream signal failed: {}",
-                std::io::Error::last_os_error()
-            )
-        } else {
-            "CUDA stream signal carried an invalid eventfd value".to_owned()
-        }))
+        self.inner
+            .consume()
+            .map_err(|error| py_runtime(format!("consuming CUDA stream signal failed: {error}")))
     }
 }
 

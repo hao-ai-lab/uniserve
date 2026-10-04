@@ -899,6 +899,8 @@ version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "indexmap",
+ "libc",
+ "libloading",
  "thiserror 2.0.21",
  "uniserve-core",
  "uniserve-worker-ipc",
@@ -908,7 +910,6 @@ dependencies = [
 name = "uniserve-worker-ffi-experiment"
 version = "0.1.0"
 dependencies = [
- "libloading",
  "tvm-ffi",
  "uniserve-core",
  "uniserve-worker",
