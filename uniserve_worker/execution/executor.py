@@ -1139,4 +1139,7 @@ class Executor:
         live = list(dict.fromkeys(live))
         self._release_requests(live, retained)
         for request_id in live:
+            diffusion = self.worker.requests.get(request_id).diffusion
+            if diffusion is not None:
+                diffusion.close()
             self.worker.requests.retire(request_id)

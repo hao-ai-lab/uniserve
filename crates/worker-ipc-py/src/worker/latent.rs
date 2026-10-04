@@ -11,9 +11,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule, PySlice, PyTuple};
 use uniserve_worker_ipc::{BufferId, RequestKey};
 
-use crate::error::{invalid, resource};
-use crate::protocol::{buffer_id, request_key};
-use crate::transfer::{TransferTicket, retirement_succeeded};
+use super::error::{invalid, resource};
+use super::protocol::{buffer_id, request_key};
+use super::transfer::{TransferTicket, retirement_succeeded};
 
 #[derive(Default)]
 struct LatentSlot {

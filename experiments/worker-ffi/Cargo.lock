@@ -879,12 +879,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniserve-worker"
+version = "0.2.0"
+dependencies = [
+ "indexmap",
+ "thiserror 2.0.21",
+ "uniserve-core",
+ "uniserve-worker-ipc",
+]
+
+[[package]]
 name = "uniserve-worker-ffi-experiment"
 version = "0.1.0"
 dependencies = [
  "libloading",
  "tvm-ffi",
  "uniserve-core",
+ "uniserve-worker",
  "uniserve-worker-ipc",
 ]
 

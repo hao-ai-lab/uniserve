@@ -27,6 +27,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod convert;
+mod worker;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -589,7 +590,7 @@ fn atomic_load_u32(buffer: PyBuffer<u8>, offset: usize) -> PyResult<u32> {
 #[pymodule]
 /// Registers the worker IPC Python extension module.
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    uniserve_worker::register(m)?;
+    worker::register(m)?;
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;

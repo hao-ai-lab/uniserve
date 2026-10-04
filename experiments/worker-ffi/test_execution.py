@@ -6,7 +6,7 @@ from threading import Event
 import pytest
 import torch
 import tvm_ffi
-from bindings import Executor, WorkerRequest
+from bindings import Executor, RequestPool, WorkerRequest
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
@@ -184,3 +184,17 @@ def test_worker_request_stays_native(wire_request):
     assert request.encode() == wire_request
     with pytest.raises(RuntimeError):
         WorkerRequest(b"not a worker frame")
+
+
+def test_native_admission_and_retirement(wire_request):
+    request = WorkerRequest(wire_request)
+    pool = RequestPool(2)
+    # This IPC batch admits and immediately finishes a request, as when a
+    # cancellation reaches the rank before its first numerical call.
+    assert tuple(pool.apply_commands(request)) == (2,)
+    assert not pool.has_open_requests()
+    pool.retire(5)
+    assert tuple(pool.apply_commands(request)) == ()
+    pool.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        pool.apply_commands(request)

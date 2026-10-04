@@ -9522,10 +9522,12 @@ name = "uniserve-ipc-py"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "indexmap 2.14.0",
  "libc",
  "libloading 0.8.9",
  "pyo3",
  "pythonize",
+ "serde",
  "uniserve-core",
  "uniserve-worker",
  "uniserve-worker-ipc",
@@ -9602,7 +9604,7 @@ name = "uniserve-worker"
 version = "0.2.0"
 dependencies = [
  "indexmap 2.14.0",
- "pyo3",
+ "thiserror 2.0.18",
  "uniserve-core",
  "uniserve-worker-ipc",
 ]

@@ -10,10 +10,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow.workspace = true
+indexmap.workspace = true
 libloading.workspace = true
 libc.workspace = true
 pyo3.workspace = true
 pythonize.workspace = true
+serde.workspace = true
 uniserve-core.workspace = true
 uniserve-worker-ipc.workspace = true
 uniserve-worker.workspace = true

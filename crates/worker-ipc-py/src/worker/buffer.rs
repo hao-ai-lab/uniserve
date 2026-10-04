@@ -14,8 +14,8 @@ use pyo3::sync::MutexExt;
 use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker_ipc::BufferId;
 
-use crate::error::{invalid, invariant};
-use crate::protocol::buffer_id;
+use super::error::{invalid, invariant};
+use super::protocol::buffer_id;
 
 /// A pool-issued tensor view of one physical byte range.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]

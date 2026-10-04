@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -75,6 +75,14 @@ class DiffusionState:
     guidance: Guidance | None = None
     kv: KVConditioning | None = None
     slot: SlotLadder | None = None
+
+    def close(self) -> None:
+        """Drain host writes before the request's tensor slot can be reused."""
+        if self.slot is not None and self.slot.staging is not None:
+            # A failed task may have written part of the destination; wait for
+            # its actual exit without rethrowing its already reported error.
+            wait((self.slot.staging,))
+            self.slot.staging = None
 
     @classmethod
     def open(
