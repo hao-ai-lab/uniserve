@@ -1,6 +1,6 @@
-//! TVM-FFI interface experiment for native batch execution.
+//! TVM-FFI interface experiment for native worker execution.
 //!
-//! Only this module registers cross-language objects and converts FFI values.
+//! This module registers the cross-language objects and their public methods.
 //! The production worker extension is not linked or loaded by this library.
 
 use std::sync::{Arc, Mutex};
@@ -8,12 +8,112 @@ use std::sync::{Arc, Mutex};
 use tvm_ffi::derive::{Object, ObjectRef};
 use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFIMethodInfo};
 use tvm_ffi::{Any, Array, Bytes, Function, Object, ObjectArc, ObjectCore, Result, Tensor};
+use uniserve_worker::{HostAction, Outcome};
 use uniserve_worker_ipc::{codec, BatchCommand, WorkerRequest as Request};
 
 use execution::{failure, lock};
 
 mod cuda;
 mod execution;
+mod host;
+
+#[repr(C)]
+#[derive(Object)]
+#[type_key = "uniserve.ffi.HostLane"]
+pub struct HostLaneObj {
+    object: Object,
+    lane: uniserve_worker::HostLane<host::Action>,
+}
+
+#[derive(Clone, ObjectRef)]
+pub struct HostLane {
+    data: ObjectArc<HostLaneObj>,
+}
+
+impl HostLane {
+    fn new(capacity: i64, workers: i64) -> Result<Self> {
+        let capacity = usize::try_from(capacity).map_err(|error| failure(error.to_string()))?;
+        let workers = usize::try_from(workers).map_err(|error| failure(error.to_string()))?;
+        let lane = uniserve_worker::HostLane::new(capacity, workers, "worker-host-lane")
+            .map_err(|error| failure(error.to_string()))?;
+        Ok(Self {
+            data: ObjectArc::new(HostLaneObj {
+                object: Object::new(),
+                lane,
+            }),
+        })
+    }
+
+    fn submit(&self, action: Function) -> Result<HostTask> {
+        let task = self
+            .data
+            .lane
+            .reserve()
+            .map_err(|error| failure(error.to_string()))?;
+
+        if let Err(error) = task
+            .configure(host::Action(action))
+            .and_then(|()| task.submit())
+        {
+            task.cancel(true).map_err(|error| error.to_ffi())?;
+            return Err(failure(error.to_string()));
+        }
+
+        Ok(HostTask {
+            data: ObjectArc::new(HostTaskObj {
+                object: Object::new(),
+                task,
+            }),
+        })
+    }
+
+    fn close(&self) -> Result<()> {
+        let mut errors = self.data.lane.close().into_iter();
+        if let Some(mut error) = errors.next() {
+            for cleanup in errors {
+                host::Action::note_cleanup(&mut error, cleanup);
+            }
+            return Err(error.to_ffi());
+        }
+
+        Ok(())
+    }
+}
+
+#[repr(C)]
+#[derive(Object)]
+#[type_key = "uniserve.ffi.HostTask"]
+pub struct HostTaskObj {
+    object: Object,
+    task: Arc<uniserve_worker::HostTask<host::Action>>,
+}
+
+#[derive(Clone, ObjectRef)]
+pub struct HostTask {
+    data: ObjectArc<HostTaskObj>,
+}
+
+impl HostTask {
+    fn result(&self) -> Result<Option<Bytes>> {
+        match self.data.task.completion.wait(None) {
+            Some(Outcome::Success(value)) => Ok(value.as_ref().as_ref().map(Bytes::from)),
+            Some(Outcome::Failed(error)) => Err(error.to_ffi()),
+            Some(Outcome::Cancelled) => Err(failure("host task was cancelled")),
+            None => unreachable!("an unbounded wait returns a completed outcome"),
+        }
+    }
+
+    fn add_done_callback(&self, callback: Function) {
+        if let Some(callback) = self
+            .data
+            .task
+            .completion
+            .subscribe((callback, self.clone()))
+        {
+            host::Action::notify(vec![callback]);
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Object)]
@@ -257,6 +357,49 @@ fn register() -> Result<()> {
     object::<BatchObj>();
     object::<WorkerRequestObj>();
     object::<RequestPoolObj>();
+    object::<HostLaneObj>();
+    object::<HostTaskObj>();
+
+    method::<HostLaneObj>(
+        "__ffi_init__",
+        Function::from_typed(HostLane::new),
+        "Create bounded native threads for host callbacks.",
+    )?;
+    method::<HostLaneObj>(
+        "submit",
+        Function::from_typed(|lane: HostLane, action: Function| lane.submit(action)),
+        "Submit a callback producing completed host bytes or None.",
+    )?;
+    method::<HostLaneObj>(
+        "close",
+        Function::from_typed(|lane: HostLane| lane.close()),
+        "Drain host actions and release their callback references.",
+    )?;
+    method::<HostTaskObj>(
+        "done",
+        Function::from_typed(|task: HostTask| Ok(task.data.task.completion.done())),
+        "Whether the task has a result, error, or cancellation.",
+    )?;
+    method::<HostTaskObj>(
+        "result",
+        Function::from_typed(|task: HostTask| task.result()),
+        "Wait for the host result without holding the Python GIL.",
+    )?;
+    method::<HostTaskObj>(
+        "cancel",
+        Function::from_typed(|task: HostTask| {
+            task.data.task.cancel(false).map_err(|error| error.to_ffi())
+        }),
+        "Remove queued work; running actions finish normally.",
+    )?;
+    method::<HostTaskObj>(
+        "add_done_callback",
+        Function::from_typed(|task: HostTask, callback: Function| {
+            task.add_done_callback(callback);
+            Ok(())
+        }),
+        "Invoke an observer with this task after completion.",
+    )?;
 
     method::<ExecutorObj>(
         "__ffi_init__",
