@@ -61,6 +61,38 @@ impl Retirement {
         }
     }
 
+    pub(super) fn admit(&self, py: Python<'_>, backend: &PythonBackend) -> PyResult<()> {
+        // Explicit revocation must not wait behind an allocation-dependent
+        // batch. Existing readers retain their physical leases.
+        backend.release_buffers(py, &self.buffers)
+    }
+
+    /// Revoke before input preparation, then again after launch to include
+    /// exports produced by this batch under the same retention rules.
+    pub(super) fn revoke(&mut self, py: Python<'_>, backend: &PythonBackend) -> PyResult<()> {
+        self.exports.clear();
+        for directory in &backend.exports {
+            self.exports.extend(exports::select(
+                directory.bind(py),
+                &self.buffers,
+                &self.requests,
+                &self.retained,
+            )?);
+        }
+        let mut buffers = self.buffers.clone();
+        for key in &self.exports {
+            buffers.insert(buffer_id(key.bind(py))?);
+        }
+        backend.release_buffers(py, &buffers)?;
+
+        if let Some(imports) = &backend.cache_imports {
+            imports
+                .borrow(py)
+                .cancel_request_imports(py, &self.requests, &self.retained)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn begin(&mut self, py: Python<'_>, backend: &PythonBackend) -> PyResult<()> {
         if self.requests.is_empty() && self.buffers.is_empty() {
             self.complete = true;
@@ -91,40 +123,7 @@ impl Retirement {
                 .cancel_request_imports(py, &self.requests)?;
         }
 
-        for directory in &backend.exports {
-            self.exports.extend(exports::select(
-                directory.bind(py),
-                &self.buffers,
-                &self.requests,
-                &self.retained,
-            )?);
-        }
-        for directory in &backend.exports {
-            exports::release(directory.bind(py), &self.exports)?;
-        }
-        if let Some(latents) = &backend.latents {
-            LatentPool::release_buffers(
-                latents.bind(py).clone(),
-                self.exports.iter().map(|key| key.clone_ref(py)).collect(),
-            )?;
-        }
-        if let Some(imports) = &backend.cache_imports {
-            imports
-                .borrow(py)
-                .cancel_request_imports(py, &self.requests, &self.retained)?;
-            let buffers = self
-                .exports
-                .iter()
-                .map(|key| buffer_id(key.bind(py)))
-                .collect::<PyResult<HashSet<_>>>()?;
-            imports.borrow(py).release_buffers(py, &buffers)?;
-            if let Some(cache) = &backend.cache {
-                cache
-                    .borrow_mut(py)
-                    .inner
-                    .release_exports(&buffers.into_iter().collect::<Vec<_>>());
-            }
-        }
+        self.revoke(py, backend)?;
 
         // Finish includes request-state writes issued after output capture.
         // Retain each event before recording so failure cleanup owns every
@@ -233,6 +232,51 @@ impl Retirement {
 }
 
 impl PythonBackend {
+    pub(super) fn release_buffers(
+        &self,
+        py: Python<'_>,
+        buffers: &HashSet<BufferId>,
+    ) -> PyResult<()> {
+        if buffers.is_empty() {
+            return Ok(());
+        }
+
+        self.tensors.get().release_buffers(py, buffers)?;
+        if let Some(cache) = &self.cache {
+            let directory = self
+                .worker
+                .bind(py)
+                .getattr("kv_cache")?
+                .getattr("exports")?;
+            exports::release_buffers(directory.cast::<PyDict>()?, buffers)?;
+            if let Some(imports) = &self.cache_imports {
+                imports.borrow(py).release_buffers(py, buffers)?;
+            }
+            cache
+                .borrow_mut(py)
+                .inner
+                .release_exports(&buffers.iter().copied().collect::<Vec<_>>());
+        }
+        if let Some(latents) = &self.latents {
+            LatentPool::release_buffers(latents.bind(py), buffers)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn reset_slots(&self, py: Python<'_>, slots: &[usize]) -> PyResult<()> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let slots = PyTuple::new(py, slots)?;
+        for name in ["decode_state", "canvas_slots"] {
+            let state = self.worker.bind(py).getattr(name)?;
+            if !state.is_none() {
+                state.call_method1("reset", (&slots,))?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn reap_resources(&self, py: Python<'_>) -> PyResult<()> {
         self.events.borrow(py).reap(py)?;
         // Remote consumers acknowledge exported chunks without a local wake.
@@ -297,22 +341,17 @@ impl PythonBackend {
             })
             .unzip();
         let worker = self.worker.bind(py);
-        let slots = PyTuple::new(py, slots)?;
+        let slot_values = PyTuple::new(py, &slots)?;
         if !keys.is_empty() {
             if let Some(imports) = &self.cache_imports {
                 imports
                     .borrow(py)
                     .cancel_request_imports(py, &keys, retained)?;
             }
-            for name in ["decode_state", "canvas_slots"] {
-                let state = worker.getattr(name)?;
-                if !state.is_none() {
-                    state.call_method1("reset", (&slots,))?;
-                }
-            }
+            self.reset_slots(py, &slots)?;
             let tables = worker.getattr("block_tables")?;
             if !tables.is_none() {
-                tables.call_method1("release", (&slots,))?;
+                tables.call_method1("release", (&slot_values,))?;
             }
         }
 
@@ -330,21 +369,16 @@ impl PythonBackend {
         }
 
         let owners: HashSet<_> = ids.iter().copied().collect();
-        for name in ["tensor_store", "kv_cache", "latent_pool"] {
-            let store = worker.getattr(name)?;
-            if store.is_none() {
-                continue;
-            }
-            let directory = store.getattr("exports")?.cast_into::<PyDict>()?;
-            let mut selected = Vec::new();
-            for (key, _) in &directory {
+        let mut selected = HashSet::new();
+        for directory in &self.exports {
+            for (key, _) in directory.bind(py) {
                 let buffer = buffer_id(&key)?;
                 if owners.contains(&buffer.owner.request_id.0) && !retained.contains(&buffer) {
-                    selected.push(key);
+                    selected.insert(buffer);
                 }
             }
-            store.call_method1("release_buffers", (PyTuple::new(py, selected)?,))?;
         }
+        self.release_buffers(py, &selected)?;
 
         if !keys.is_empty() {
             self.tensors
@@ -360,7 +394,9 @@ impl PythonBackend {
         if !keys.is_empty()
             && let Some(latents) = &self.latents
         {
-            latents.bind(py).call_method1("release_slots", (slots,))?;
+            latents
+                .bind(py)
+                .call_method1("release_slots", (slot_values,))?;
         }
         Ok(())
     }

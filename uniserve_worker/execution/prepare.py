@@ -1,22 +1,18 @@
-"""Validate execution batches and reserve their input and output resources.
+"""Prepare numerical input and output resources for admitted batches.
 
 The native executor and its `BatchRunner` drive a batch through
 these stages, in order:
 
-1. `validate_batch` checks batch-level bounds, routing, and call support
-   after the batch's `Start` commands and before its other commands are
-   applied.
-2. `prepare_batch` runs after the batch's commands are applied. It adds cache
-   publications for KV installations and collects the futures
-   (held by `BatchInputs`) that must resolve before this batch's
-   writes.
-3. `prepare_inputs` runs once those dependencies are done when the batch has
+1. `prepare_batch` runs after Rust checks batch bounds and applies request
+   commands. It binds KV input descriptions and collects storage completions
+   in `BatchInputs` that must resolve before this batch writes.
+2. `prepare_inputs` runs once those dependencies are done when the batch has
    transferred inputs, and immediately otherwise. It validates each
    cross-call transfer against its declared product, reserves its
    destination, starts the physical fetch, and captures completion-valued
    predicates. Each later advance of the batch calls `capture_predicates`
    until the transferred predicate sources are ready.
-4. `reserve_outputs` runs from `uniserve_worker.execution.step` once inputs
+3. `reserve_outputs` runs from `uniserve_worker.execution.step` once inputs
    are ready. It creates the batch's `PendingOutput` records and completion
    buffer, then reserves host tasks, cache tables, latent staging, and device
    output writes, and publishes the transferred inputs into their stores.
@@ -43,7 +39,6 @@ from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import (
     invalid_descriptor,
     resource_error,
-    unsupported_call,
     unsupported_setup,
 )
 from uniserve_worker.execution import calls as calls
@@ -52,9 +47,6 @@ from uniserve_worker.execution.commit import discard_batch
 from uniserve_worker.execution.host_media import (
     BORROWED_INPUT_CALLS,
     encoded_unit_positions,
-)
-from uniserve_worker.execution.media import (
-    validate_batch as validate_video_batch,
 )
 from uniserve_worker.execution.output import PendingOutput, create_outputs
 from uniserve_worker.profiling import record_component
@@ -1192,85 +1184,6 @@ def _reserve_host_tasks(
                 reservation.abandon()
             raise
         pending.host.tasks = tuple(reservations)
-
-
-def validate_batch(
-    batch: Batch,
-    *,
-    worker_info: WorkerInfo,
-    model_runner: ModelExecutor,
-    config: WorkerConfig,
-    predecessors: Mapping[CallId, CallId | None],
-) -> None:
-    """Validate batch resources, routing, and call support before staging.
-
-    Runs before the batch's `Finish` and `Free` commands are applied; `Start`
-    commands are applied first so that `predecessors` covers requests the
-    batch admits. Checks that buffer allocations fit the worker buffer pool,
-    that every call targets a component placed on this rank (when the worker
-    declares components) and a supported call kind, the batch call limit,
-    the upper bound of request-slot indices, and the video preparation
-    ordering checked by `uniserve_worker.execution.media.validate_batch`.
-    Violations raise `invalid_descriptor` or `unsupported_call` errors.
-    """
-    invalid_buffer = next(
-        (
-            params
-            for params in batch.buffer_allocations
-            if params.offset + params.bytes > worker_info.buffer_pool_bytes
-        ),
-        None,
-    )
-    if invalid_buffer is not None:
-        raise invalid_descriptor(
-            "batch buffer params exceeds the worker buffer pool: "
-            f"offset={invalid_buffer.offset}, bytes={invalid_buffer.bytes}, "
-            f"capacity={worker_info.buffer_pool_bytes}, "
-            f"buffer={invalid_buffer.buffer}"
-        )
-
-    if worker_info.components:
-        for call in batch.calls:
-            entry = next(
-                (
-                    entry
-                    for entry in worker_info.components
-                    if entry.name == call.component
-                ),
-                None,
-            )
-            if entry is None or config.rank not in entry.config.ranks:
-                raise invalid_descriptor(
-                    f"call targets component {call.component!r} outside "
-                    "this rank"
-                )
-
-    if len(batch.calls) > config.max_batch_calls:
-        raise invalid_descriptor(
-            "execution batch exceeds the worker_config call limit"
-        )
-
-    for call in batch.calls:
-        variant = call.kind
-        if variant not in worker_info.supported_calls:
-            raise unsupported_call(variant.value, call.request_key.request_id)
-
-    if any(
-        index > config.max_request_pool_size
-        for index in (
-            *(table.request_pool_idx for table in batch.block_tables),
-            *batch.request_pool_indices,
-        )
-    ):
-        raise invalid_descriptor(
-            "execution batch exceeds request-slot capacity"
-        )
-
-    validate_video_batch(
-        batch,
-        postprocessor=model_runner.video_postprocessor,
-        predecessors=predecessors,
-    )
 
 
 def _reserve_outputs(

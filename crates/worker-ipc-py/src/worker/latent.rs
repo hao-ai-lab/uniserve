@@ -12,7 +12,7 @@ use uniserve_worker::{
     LatentExport as NativeLatentExport, LatentImport as NativeLatentImport,
     LatentPool as NativeLatentPool, LatentUpdate as NativeLatentUpdate,
 };
-use uniserve_worker_ipc::{LatentParams, RequestKey};
+use uniserve_worker_ipc::{BufferId, LatentParams, RequestKey};
 
 use super::completion::{Completion, CompletionRef};
 use super::error::{invalid, native_error};
@@ -604,24 +604,14 @@ impl LatentPool {
             .map_err(|error| native_error(py, error))
     }
 
-    /// Revoke exports while retaining pages through physical reader completion.
-    pub(super) fn release_buffers(slf: Bound<'_, Self>, buffers: Vec<Py<PyAny>>) -> PyResult<()> {
+    #[pyo3(name = "release_buffers")]
+    fn release_buffers_py(slf: Bound<'_, Self>, buffers: Vec<Py<PyAny>>) -> PyResult<()> {
         let py = slf.py();
         let ids = buffers
             .iter()
             .map(|buffer| buffer_id(buffer.bind(py)))
-            .collect::<PyResult<Vec<_>>>()?;
-        let exports = {
-            let owner = slf.borrow();
-            owner.inner.release_exports(&ids);
-            owner.exports.clone_ref(py)
-        };
-
-        // Backend revocation may notify observers synchronously, so the pool
-        // must be available while those callbacks run.
-        super::exports::release(exports.bind(py), &buffers)?;
-        slf.borrow_mut().inner.reap();
-        Ok(())
+            .collect::<PyResult<HashSet<_>>>()?;
+        Self::release_buffers(&slf, &ids)
     }
 
     /// Reader completions that must precede writing the next bank.
@@ -808,7 +798,7 @@ impl LatentPool {
                 .map(|source| source.owner.get().buffer.clone_ref(py))
                 .collect()
         };
-        Self::release_buffers(slf.clone(), buffers)?;
+        Self::release_buffers_py(slf.clone(), buffers)?;
         let mut owner = slf.borrow_mut();
         let slots = owner
             .inner
@@ -864,6 +854,27 @@ impl LatentPool {
 }
 
 impl LatentPool {
+    /// Revoke exports while retaining pages through physical reader completion.
+    pub(super) fn release_buffers(
+        slf: &Bound<'_, Self>,
+        buffers: &HashSet<BufferId>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let exports = {
+            let owner = slf.borrow();
+            owner
+                .inner
+                .release_exports(&buffers.iter().copied().collect::<Vec<_>>());
+            owner.exports.clone_ref(py)
+        };
+
+        // Backend revocation may notify observers synchronously, so the pool
+        // must be available while those callbacks run.
+        super::exports::release_buffers(exports.bind(py), buffers)?;
+        slf.borrow_mut().inner.reap();
+        Ok(())
+    }
+
     fn slot(&self, py: Python<'_>, slot: i64) -> PyResult<usize> {
         self.inner
             .slot(slot)

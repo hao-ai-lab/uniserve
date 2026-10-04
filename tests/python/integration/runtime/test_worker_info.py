@@ -174,7 +174,3 @@ def test_worker_capabilities_reflect_enabled_calls(attention_backend) -> None:
             assert set(info["supported_calls"]) == {
                 code.value for code in allowed
             }
-            assert worker.supports_computation(ForwardMode.PREFILL)
-            assert worker.supports_computation(ForwardMode.DECODE) == (
-                ForwardMode.DECODE in allowed
-            )

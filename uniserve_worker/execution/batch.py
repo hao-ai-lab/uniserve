@@ -57,9 +57,8 @@ class BatchState:
 
     batch: Batch
     propagate_errors: bool = False
-    # The call each of this batch's calls follows in its request, derived by
-    # `RequestPool.predecessors` from this rank's request state; None for
-    # independent work.
+    # Native request ordering exposed to numerical staging as a snapshot;
+    # None denotes independent work without a state predecessor.
     predecessors: dict[CallId, CallId | None] = field(default_factory=dict)
 
     # Rust retains physical inputs, host preparations and their readiness.

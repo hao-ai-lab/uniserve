@@ -1,6 +1,7 @@
 //! Python numerical backend for the shared native batch executor.
 
 mod output;
+mod prepare;
 mod retirement;
 
 use std::sync::Arc;
@@ -16,8 +17,7 @@ use uniserve_worker::{
     Submission as NativeSubmission,
 };
 use uniserve_worker_ipc::{
-    Batch as BatchPlan, BatchOutput, CallKind, RequestKey, RequestKind, WorkerInfo,
-    WorkerResponseError,
+    Batch as BatchPlan, BatchOutput, RequestKind, WorkerInfo, WorkerResponseError,
 };
 
 use super::events::EventPool;
@@ -72,8 +72,8 @@ struct PythonBackend {
 
 /// Numerical views and their native input owner, retained for one batch.
 struct BatchState {
-    id: u64,
-    calls: Vec<(RequestKey, CallId, CallKind)>,
+    plan: BatchPlan,
+    predecessors: Vec<Option<CallId>>,
     numerical: Py<PyAny>,
     inputs: Py<BatchInputs>,
     imports: bool,
@@ -93,12 +93,8 @@ impl PythonBackend {
         kwargs.set_item("propagate_errors", propagate_errors)?;
         let numerical = self.batch_type.bind(py).call((batch,), Some(&kwargs))?;
         Ok(BatchState {
-            id: plan.batch_id,
-            calls: plan
-                .calls
-                .iter()
-                .map(|call| (call.request_key, call.call_id, call.code))
-                .collect(),
+            plan: plan.clone(),
+            predecessors: Vec::new(),
             inputs: numerical.getattr("inputs")?.extract()?,
             numerical: numerical.unbind(),
             imports: false,
@@ -223,17 +219,19 @@ impl Backend for PythonBackend {
     }
 
     fn admit(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
-        self.call("admit", batch).map(drop)
+        Python::attach(|py| {
+            batch
+                .retirement
+                .admit(py, self)
+                .map_err(|error| error.into_value(py))
+        })
     }
 
     fn prepare(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
-        let imports = self.call("prepare", batch)?;
-        batch.imports = Python::attach(|py| {
-            imports
-                .extract::<bool>(py)
+        Python::attach(|py| {
+            self.prepare_batch(py, batch)
                 .map_err(|error| error.into_value(py))
-        })?;
-        Ok(())
+        })
     }
 
     fn prepare_inputs(
@@ -268,11 +266,13 @@ impl Backend for PythonBackend {
     }
 
     fn execute(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
-        let failure = self.call("execute", batch)?;
         Python::attach(|py| {
-            if !failure.is_none(py) {
+            let failure = self
+                .execute_batch(py, batch)
+                .map_err(|error| error.into_value(py))?;
+            if !failure.is_none() {
                 batch.output = Some(
-                    self.failed_output(py, batch, failure.bind(py))
+                    self.failed_output(py, batch, &failure)
                         .map_err(|error| error.into_value(py))?,
                 );
             }

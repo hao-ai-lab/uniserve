@@ -1213,7 +1213,8 @@ impl TensorStore {
         self.reclaim(py, &mut state)
     }
 
-    fn release_calls(&self, py: Python<'_>, releases: Bound<'_, PyAny>) -> PyResult<()> {
+    #[pyo3(name = "release_calls")]
+    fn release_calls_py(&self, py: Python<'_>, releases: Bound<'_, PyAny>) -> PyResult<()> {
         let calls = releases
             .try_iter()?
             .map(|release| {
@@ -1224,27 +1225,12 @@ impl TensorStore {
                 ))
             })
             .collect::<PyResult<Vec<_>>>()?;
-        self.lock(py)?.release_calls(calls);
-        Ok(())
+        self.release_calls(py, &calls)
     }
 
-    fn release_buffers(&self, py: Python<'_>, buffers: Bound<'_, PyAny>) -> PyResult<()> {
-        let buffers = PyTuple::new(py, buffers.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
-        let selected = buffer_ids(&buffers)?;
-        super::exports::release_exports(self.exports.bind(py), buffers.as_any())?;
-        let mut state = self.lock(py)?;
-        let released = state.release_buffers(&selected);
-        let released = released
-            .into_iter()
-            .filter_map(|key| state.buffers.get(&key).map(|buffer| buffer.clone_ref(py)))
-            .collect::<Vec<_>>();
-        drop(state);
-
-        for buffer in released {
-            self.retire_buffer(py, &buffer)?;
-        }
-        let mut state = self.lock(py)?;
-        self.reclaim(py, &mut state)
+    #[pyo3(name = "release_buffers")]
+    fn release_buffers_py(&self, py: Python<'_>, buffers: Bound<'_, PyAny>) -> PyResult<()> {
+        self.release_buffers(py, &buffer_ids(&buffers)?)
     }
 
     #[pyo3(signature = (requests, *, retained=None))]
@@ -2098,6 +2084,36 @@ fn import_read(py: Python<'_>, imported: &ImportHandle) -> PyResult<Py<TensorRea
 }
 
 impl TensorStore {
+    pub(super) fn release_calls(
+        &self,
+        py: Python<'_>,
+        calls: &[(RequestKey, CallId)],
+    ) -> PyResult<()> {
+        self.lock(py)?.release_calls(calls.iter().copied());
+        Ok(())
+    }
+
+    pub(super) fn release_buffers(
+        &self,
+        py: Python<'_>,
+        buffers: &HashSet<BufferId>,
+    ) -> PyResult<()> {
+        super::exports::release_buffers(self.exports.bind(py), buffers)?;
+        let mut state = self.lock(py)?;
+        let released = state.release_buffers(buffers);
+        let released = released
+            .into_iter()
+            .filter_map(|key| state.buffers.get(&key).map(|buffer| buffer.clone_ref(py)))
+            .collect::<Vec<_>>();
+        drop(state);
+
+        for buffer in released {
+            self.retire_buffer(py, &buffer)?;
+        }
+        let mut state = self.lock(py)?;
+        self.reclaim(py, &mut state)
+    }
+
     pub(super) fn release_request_set(
         &self,
         py: Python<'_>,

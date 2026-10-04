@@ -4,10 +4,11 @@ use std::collections::HashSet;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::PyDict;
 use uniserve_worker_ipc::{BufferId, RequestKey};
 
-use super::protocol::{buffer_id, request_key};
+use super::protocol::buffer_id;
+use crate::convert;
 
 #[pyfunction]
 pub(super) fn validate_exports(
@@ -46,29 +47,6 @@ pub(super) fn select(
     Ok(selected)
 }
 
-#[pyfunction]
-#[pyo3(signature = (exports, *, buffers=None, requests=None, retained=None))]
-pub(super) fn retiring_exports<'py>(
-    py: Python<'py>,
-    exports: &Bound<'py, PyDict>,
-    buffers: Option<&Bound<'py, PyAny>>,
-    requests: Option<&Bound<'py, PyAny>>,
-    retained: Option<&Bound<'py, PyAny>>,
-) -> PyResult<Bound<'py, PyTuple>> {
-    let buffers = buffer_set(buffers)?;
-    let requests = requests
-        .map(|values| {
-            values
-                .try_iter()?
-                .map(|value| request_key(&value?))
-                .collect()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let retained = buffer_set(retained)?;
-    PyTuple::new(py, select(exports, &buffers, &requests, &retained)?)
-}
-
 /// Revocation rejects new readers. The storage owner still retains its
 /// backing until the transport reports physical retirement.
 pub(super) fn release(exports: &Bound<'_, PyDict>, buffers: &[Py<PyAny>]) -> PyResult<()> {
@@ -82,6 +60,17 @@ pub(super) fn release(exports: &Bound<'_, PyDict>, buffers: &[Py<PyAny>]) -> PyR
         }
     }
     Ok(())
+}
+
+pub(super) fn release_buffers(
+    exports: &Bound<'_, PyDict>,
+    buffers: &HashSet<BufferId>,
+) -> PyResult<()> {
+    let keys = buffers
+        .iter()
+        .map(|buffer| convert::buffer_id_to_py(exports.py(), buffer).map(Bound::unbind))
+        .collect::<PyResult<Vec<_>>>()?;
+    release(exports, &keys)
 }
 
 #[pyfunction]
@@ -103,11 +92,4 @@ pub(super) fn forget(exports: &Bound<'_, PyDict>, buffers: &[Py<PyAny>]) -> PyRe
         }
     }
     Ok(())
-}
-
-fn buffer_set(values: Option<&Bound<'_, PyAny>>) -> PyResult<HashSet<BufferId>> {
-    values
-        .map(|values| values.try_iter()?.map(|value| buffer_id(&value?)).collect())
-        .transpose()
-        .map(Option::unwrap_or_default)
 }
