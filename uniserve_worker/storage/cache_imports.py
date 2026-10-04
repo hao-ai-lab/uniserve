@@ -28,7 +28,6 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
@@ -42,7 +41,7 @@ from uniserve.cache.state import decode_region
 from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor, resource_error
-from uniserve_worker.execution.host import HostLane
+from uniserve_worker.execution.host import HostLane, HostTask
 from uniserve_worker.protocol.identity import BufferId, RequestKey
 from uniserve_worker.protocol.transfer import (
     KvGroupTransfer,
@@ -107,7 +106,7 @@ class CacheImport:
     ``tables`` holds the destination's table of every cache group.
     The native cache manager retains each group's destination span, or the
     whole unit for ``initialized_units``, which is reset before copying.
-    ``completion`` is the copy task's future, resolved at reservation when
+    ``completion`` is the copy task, resolved at reservation when
     there is nothing to copy or reset. ``retirement`` resolves once the
     import is adopted or abandoned and all of its physical access has
     finished; until then the import stays registered and
@@ -124,7 +123,7 @@ class CacheImport:
     tables: tuple[GroupTable, ...]
     initialized_units: tuple[int, ...]
     publication: KvTransfer
-    completion: Future[None] = field(default_factory=Future)
+    completion: HostTask[None] | Completion
     retirement: Completion = field(default_factory=Completion)
     cancelled: bool = False
     released: bool = False
@@ -255,11 +254,19 @@ class CacheImports:
             if publication.tensors or initialized_units
             else None
         )
+        completion: HostTask[None] | Completion
+        if reservation is None:
+            completion = Completion()
+            completion.set_result(None)
+        else:
+            completion = reservation
+
         write = CacheImport(
             request_pool_idx,
             tables,
             initialized_units,
             publication,
+            completion,
         )
 
         buffer = publication.source
@@ -281,11 +288,8 @@ class CacheImports:
             if reservation is None:
                 write._work_finished = True
                 write._stream_finished = True
-                write.completion.set_result(None)
             else:
-                write.completion = reservation.submit(
-                    self._copy, write, transports
-                )
+                reservation.submit(self._copy, write, transports)
         except BaseException:
             if reservation is not None:
                 reservation.abandon()

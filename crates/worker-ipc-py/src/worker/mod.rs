@@ -7,6 +7,7 @@ mod buffer;
 mod completion;
 mod error;
 mod executor;
+mod host;
 mod kv_cache;
 mod latent;
 mod protocol;
@@ -21,6 +22,8 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<block_tables::GroupShape>()?;
     module.add_class::<block_tables::GroupTable>()?;
     module.add_class::<completion::Completion>()?;
+    module.add_class::<host::HostLane>()?;
+    module.add_class::<host::HostTask>()?;
     module.add_class::<kv_cache::KVCacheManager>()?;
     module.add_class::<executor::Executor>()?;
     module.add_class::<executor::Submission>()?;

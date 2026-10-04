@@ -47,7 +47,7 @@ impl Completion {
     #[pyo3(signature = (timeout=None))]
     pub(crate) fn result(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<()> {
         match self.wait(py, timeout)? {
-            Outcome::Success => Ok(()),
+            Outcome::Success(()) => Ok(()),
             Outcome::Failed(error) => Err(PyErr::from_value(error.bind(py).clone().into_any())),
             Outcome::Cancelled => Err(cancelled(py)?),
         }
@@ -60,7 +60,7 @@ impl Completion {
         timeout: Option<f64>,
     ) -> PyResult<Option<Py<PyBaseException>>> {
         match self.wait(py, timeout)? {
-            Outcome::Success => Ok(None),
+            Outcome::Success(()) => Ok(None),
             Outcome::Failed(error) => Ok(Some(error.clone_ref(py))),
             Outcome::Cancelled => Err(cancelled(py)?),
         }
@@ -86,7 +86,7 @@ impl Completion {
         Ok(())
     }
 
-    fn add_done_callback(slf: &Bound<'_, Self>, callback: Py<PyAny>) {
+    pub(crate) fn add_done_callback(slf: &Bound<'_, Self>, callback: Py<PyAny>) {
         let immediate = slf.borrow().inner.subscribe(callback);
         if let Some(callback) = immediate {
             Self::notify(slf, vec![callback]);
@@ -136,7 +136,7 @@ impl Completion {
     }
 }
 
-fn cancelled(py: Python<'_>) -> PyResult<PyErr> {
+pub(super) fn cancelled(py: Python<'_>) -> PyResult<PyErr> {
     Ok(PyErr::from_value(
         py.import("concurrent.futures")?
             .getattr("CancelledError")?
