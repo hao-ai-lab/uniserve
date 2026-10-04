@@ -87,10 +87,28 @@ __all__ = [
     "atomic_load_u32",
     "atomic_store_u32",
     "service_name",
+    "validate_exports",
+    "retiring_exports",
+    "release_exports",
 ]
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")
+
+def validate_exports(
+    resident: dict[BufferId, ExportLocations],
+    candidates: dict[BufferId, ExportLocations],
+) -> None: ...
+def retiring_exports(
+    exports: dict[BufferId, ExportLocations],
+    *,
+    buffers: Iterable[BufferId] = (),
+    requests: Iterable[RequestKey] = (),
+    retained: Iterable[BufferId] = (),
+) -> tuple[BufferId, ...]: ...
+def release_exports(
+    exports: dict[BufferId, ExportLocations], buffers: Iterable[BufferId]
+) -> None: ...
 
 @final
 class BatchInputs:

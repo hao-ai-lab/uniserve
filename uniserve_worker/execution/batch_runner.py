@@ -1,4 +1,4 @@
-"""Numerical preparation and resource retirement for the native executor."""
+"""Numerical preparation and output decoding for the native executor."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
-from uniserve_worker._uniserve_ipc import CUDAEvent
 from uniserve_worker.errors import (
     invalid_descriptor,
 )
@@ -23,11 +22,7 @@ from uniserve_worker.execution.prepare import (
 from uniserve_worker.execution.step import execute_batch
 from uniserve_worker.protocol.batch import Batch, Finish, Free, Start
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
-from uniserve_worker.transport.exports import (
-    forget_exports,
-    release_exports,
-    retiring_exports,
-)
+from uniserve_worker.transport.exports import retiring_exports
 
 if TYPE_CHECKING:
     from uniserve_worker.worker import Worker
@@ -82,51 +77,33 @@ class BatchRunner:
         if freed:
             self.release_buffers(freed)
 
-    def reap(self) -> None:
-        self.worker.device_events.reap()
-        for transport in self.worker.transports.values():
-            transport.reap()
-
-    def poll(self, batch: BatchState) -> tuple[bool, bool]:
-        """Materialize and retire one launched batch."""
-        before = batch.materialized
-
-        # CPU work is submitted by the Worker, never by a readiness query.
+    def materialize(self, batch: BatchState) -> bool:
+        """Read numerical outputs and accept completed request progress."""
         for output in batch.outputs:
             if isinstance(output, PendingOutput) and output.value is None:
                 for task in output.host.tasks:
                     task.submit_if_ready()
 
-        # Outputs are materialized into wire values, and their results
-        # applied to the ``RequestPool``, only once every pending output of
-        # the batch is ready.
-        if not batch.materialized:
-            outputs = tuple(batch.outputs)
-            if any(value is None for value in outputs):
-                raise RuntimeError("launched batch is missing a call output")
-            if all(
-                not isinstance(value, PendingOutput) or value.ready()
-                for value in outputs
-            ):
-                pending = tuple(
-                    value
-                    for value in outputs
-                    if isinstance(value, PendingOutput)
-                )
-                values = tuple(
-                    value.materialize()
-                    if isinstance(value, PendingOutput)
-                    else value
-                    for value in outputs
-                )
-                for output in pending:
-                    self.worker.requests.apply_result(output.request_result())
-                batch.outputs[:] = values
-                batch.materialized = True
+        outputs = tuple(batch.outputs)
+        if any(value is None for value in outputs):
+            raise RuntimeError("launched batch is missing a call output")
+        if any(
+            isinstance(value, PendingOutput) and not value.ready()
+            for value in outputs
+        ):
+            return False
 
-        if batch.materialized:
-            return batch.materialized != before, self._advance_retirement(batch)
-        return False, False
+        pending = tuple(
+            value for value in outputs if isinstance(value, PendingOutput)
+        )
+        values = tuple(
+            value.materialize() if isinstance(value, PendingOutput) else value
+            for value in outputs
+        )
+        for output in pending:
+            self.worker.requests.apply_result(output.request_result())
+        batch.outputs[:] = values
+        return True
 
     def _execute_batch(self, state: BatchState) -> None:
         """Launch a prepared batch and release what its launch consumed.
@@ -316,197 +293,12 @@ class BatchRunner:
     def capture_predicates(self, state: BatchState) -> None:
         capture_predicates(state, self.worker.tensor_store)
 
-    def begin_retirement(self, state: BatchState) -> None:
-        """Begin retiring the batch's ``Finish`` and ``Free`` commands.
-
-        Releases the closed requests' tensor-store products, cancels their
-        pending latent and KV imports, and revokes the exports of closed
-        requests and freed buffers, keeping each ``Finish``'s retained
-        buffers. What ``_advance_retirement`` must still wait for is recorded
-        on ``state``. A batch without such commands is marked retired at once.
-        """
-        batch = state.batch
-        closed = frozenset(
-            command.request_key
-            for command in batch.commands
-            if isinstance(command, Finish)
-        )
-        # Only an epoch resident on this rank has request state to retire.
-        local_closed = frozenset(
-            key
-            for key in closed
-            if (row := self.worker.requests.peek(key.request_id)) is not None
-            and row.request_key == key
-        )
-        freed = frozenset(
-            command.buffer
-            for command in batch.commands
-            if isinstance(command, Free)
-        )
-
-        if not closed and not freed:
-            state.retirement_cleaned = True
-            return
-
-        retained = (
-            frozenset(
-                buffer
-                for command in batch.commands
-                if isinstance(command, Finish)
-                for buffer in command.retained_buffers
-            )
-            - freed
-        )
-        self.worker.tensor_store.release_requests(closed, retained=retained)
-
-        if self.worker.latent_pool is not None:
-            self.worker.latent_pool.cancel_imports(tuple(closed))
-
-        stores = tuple(
-            store
-            for store in (
-                self.worker.tensor_store,
-                self.worker.kv_cache,
-                self.worker.latent_pool,
-            )
-            if store is not None
-        )
-        selected = tuple(
-            buffer
-            for store in stores
-            for buffer in retiring_exports(
-                store.exports, buffers=freed, requests=closed, retained=retained
-            )
-        )
-        # Revoking a publication ends new grants. Its physical retirement is
-        # the storage owner's to observe: a write is not reclaimed while any
-        # publication it retained is live, so retirement needs no second wait
-        # on the same futures.
-        for store in stores:
-            release_exports(store.exports, selected)
-
-        if self.worker.latent_pool is not None:
-            self.worker.latent_pool.release_buffers(selected)
-        if self.worker.kv_cache is not None:
-            self.worker.kv_cache.imports.cancel_requests(
-                closed, retained=retained
-            )
-            self.worker.kv_cache.release_buffers(selected)
-
-        state.retirement_requests = closed
-        state.retirement_local_requests = local_closed
-        state.retirement_buffers = freed
-        state.retained_buffers = retained
-        state.retirement_exports = selected
-        # Finish includes request-state writes issued after output capture.
-        state.retirement_events = (
-            self._record_retirement_events() if closed else ()
-        )
-
-    def _record_retirement_events(self) -> tuple[CUDAEvent, ...]:
-        """Record one tracked event per CUDA device in the buffer pool.
-
-        When the Worker has a completion wake bound, each event schedules it
-        to run once the device work recorded before the event finishes.
-        """
-        events = []
-        for device in self.worker.buffer_pool.devices:
-            if device.type != "cuda":
-                continue
-            event = self.worker.device_events.acquire(device)
-            self.worker.device_events.retain(event, device)
-            self.worker.device_events.record(event, device)
-            self.worker.device_events.schedule_completion_wake(device, event)
-            events.append(event)
-        return tuple(events)
-
-    def _advance_retirement(self, state: BatchState) -> bool:
-        """Advance a launched batch's command retirement.
-
-        Waits for the release work's events, then for every store to report
-        the closed requests and freed buffers ready, then forgets their
-        exports and retires this rank's closed request epochs. Retiring
-        submits slot-reset writes; retirement finishes once they are issued,
-        without waiting for them to run.
-
-        The batch's result acknowledges its ``Finish`` and ``Free`` commands,
-        and the engine reuses a released request row or cache unit only in a
-        batch it builds after reading that result. The reset writes are
-        issued on the device's current stream before the result is sent, and
-        every later batch issues its device work on that stream, or on a
-        batch stream that first waits for it (``prepare.reserve_outputs``),
-        so each reuse runs after the resets. Each rank orders its own stream
-        this way, so the same holds with several data- or expert-parallel
-        ranks. Waiting for the resets to complete would instead hold the
-        result behind every batch launched after this one, whose work
-        precedes the resets on the stream.
-
-        Returns:
-            Whether retirement has finished.
-        """
-        self.worker.device_events.reap()
-        # A device product is held until its consumers acknowledge it. They do
-        # so by writing into the chunk they read, which arrives with no local
-        # notification, so the producing rank looks for it here.
-        for transport in self.worker.transports.values():
-            transport.reap()
-        if not all(event.query() for event in state.retirement_events):
-            return False
-
-        for event in state.retirement_events:
-            self.worker.device_events.release(event)
-        state.retirement_events = ()
-
-        if state.retirement_cleaned:
-            return True
-
-        closed = state.retirement_requests
-        freed = state.retirement_buffers
-        retained = state.retained_buffers
-
-        if any(
-            not self.worker.requests.retirement_ready(key)
-            for key in state.retirement_local_requests
-        ):
-            return False
-        if not self.worker.tensor_store.retirement_ready(
-            buffers=freed, requests=closed, retained=retained
-        ):
-            return False
-        if (
-            self.worker.latent_pool is not None
-            and not self.worker.latent_pool.retirement_ready(tuple(closed))
-        ):
-            return False
-        if (
-            self.worker.kv_cache is not None
-            and not self.worker.kv_cache.retirement_ready(
-                buffers=freed, requests=closed, retained=retained
-            )
-        ):
-            return False
-        for store in (
-            self.worker.tensor_store,
-            self.worker.kv_cache,
-            self.worker.latent_pool,
-        ):
-            if store is not None:
-                forget_exports(store.exports, state.retirement_exports)
-        # The slot resets are stream-ordered before any reuse of the retired
-        # rows (see the docstring), so no completion fence is recorded.
-        self.retire_requests(
-            tuple(state.retirement_local_requests), retained=retained
-        )
-        state.retirement_cleaned = True
-        return True
-
     def close(self, state: BatchState) -> None:
         """Release an owned batch whose result is consumed or abandoned.
 
         Calls whose outputs were never materialized are cancelled in the
-        ``RequestPool``, which closes their requests. Outstanding retirement
-        events are released once complete, and ``BatchState.close`` abandons
-        inputs and outputs while physical readers keep their own leases.
+        ``RequestPool``, which closes their requests. ``BatchState.close``
+        abandons inputs and outputs while physical readers keep their leases.
         """
         pending = tuple(
             output
@@ -516,11 +308,6 @@ class BatchRunner:
         self.worker.requests.cancel_calls(
             tuple(output.call for output in pending)
         )
-        if state.retirement_events:
-            self.worker.device_events.defer_release(
-                state.retirement_events, state
-            )
-            state.retirement_events = ()
         state.close(
             self.worker.tensor_store,
             self.worker.latent_pool,
@@ -629,106 +416,3 @@ class BatchRunner:
                 self.worker.kv_cache.imports.cancel_requests(
                     frozenset((request_key,)), retained=retained
                 )
-
-    def _release_requests(
-        self, request_ids: Sequence[int], retained: frozenset[BufferId]
-    ) -> None:
-        """Release drained requests' storage on this rank.
-
-        Buffers in ``retained`` are kept; every other export and tensor-store
-        product the requests own is released with their KV imports and cache
-        state, decode state, canvas state, block tables, prefix slots, media
-        mux state and latent slots. The slot resets of all the requests are
-        issued together, so a burst of finishing requests costs one set of
-        device writes rather than one per request.
-        """
-        ids = tuple(int(request_id) for request_id in request_ids)
-        requests = tuple(
-            request
-            for request_id in ids
-            if (request := self.worker.requests.peek(request_id)) is not None
-        )
-        keys = tuple(request.request_key for request in requests)
-        slots = tuple(request.request_pool_idx for request in requests)
-
-        if requests:
-            if self.worker.kv_cache is not None:
-                self.worker.kv_cache.imports.cancel_requests(
-                    frozenset(keys), retained=retained
-                )
-            if self.worker.decode_state is not None:
-                self.worker.decode_state.reset(slots)
-            if self.worker.canvas_slots is not None:
-                self.worker.canvas_slots.reset(slots)
-            if self.worker.block_tables is not None:
-                self.worker.block_tables.release(slots)
-
-        if self.worker.kv_cache is not None:
-            for request_id in ids:
-                self.worker.kv_cache.drop(request_id)
-        if self.worker.block_tables is not None:
-            for key in keys:
-                self.worker.block_tables.release_prefixes(key)
-
-        owners = frozenset(ids)
-        for store in (
-            self.worker.tensor_store,
-            self.worker.kv_cache,
-            self.worker.latent_pool,
-        ):
-            if store is not None:
-                selected = tuple(
-                    buffer
-                    for buffer in store.exports
-                    if int(buffer.owner.request_id) in owners
-                    and buffer not in retained
-                )
-                store.release_buffers(selected)
-
-        if requests:
-            self.worker.tensor_store.release_requests(keys, retained=retained)
-        if self.worker.media_mux is not None:
-            for request_id in ids:
-                self.worker.media_mux.drop(request_id)
-        if requests and self.worker.latent_pool is not None:
-            self.worker.latent_pool.release_slots(slots)
-
-    def drop_request(self, request_id: int) -> None:
-        """Release a drained request and remove its admission from the pool."""
-        request_id = int(request_id)
-        self._release_requests((request_id,), frozenset())
-        self.worker.requests.drop(request_id)
-
-    def retire_requests(
-        self,
-        request_keys: Sequence[RequestKey],
-        *,
-        retained: frozenset[BufferId] = frozenset(),
-    ) -> None:
-        """Retire exactly the epochs ``request_keys`` name on this rank.
-
-        Epochs that are not resident or are already retired are skipped.
-        The caller must have waited for their readers to drain, as
-        ``_advance_retirement`` does through the stores' ``retirement_ready``
-        checks. Buffers in ``retained`` are kept.
-        """
-        live = []
-        for key in request_keys:
-            request = self.worker.requests.peek(key.request_id)
-            if (
-                request is not None
-                and request.request_key == key
-                and not request.retired
-            ):
-                live.append(key.request_id)
-        if not live:
-            return
-
-        # A key named twice retires once.
-        live = list(dict.fromkeys(live))
-        self._release_requests(live, retained)
-        for request_id in live:
-            diffusion = self.worker.requests.get(request_id).diffusion
-            if diffusion is not None:
-                diffusion.close()
-            self.worker.requests.retire(request_id)

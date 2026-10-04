@@ -354,9 +354,7 @@ impl KVImporter {
             .try_iter()?
             .map(|buffer| buffer_id(&buffer?))
             .collect::<PyResult<HashSet<_>>>()?;
-        let cancelled = cancel_reads(py, self.inner.release(&buffers));
-        let reaped = self._reap(py);
-        cancelled.and(reaped)
+        self.release_buffers(py, &buffers)
     }
 
     #[pyo3(signature = (requests, *, retained=None))]
@@ -379,9 +377,7 @@ impl KVImporter {
             })
             .transpose()?
             .unwrap_or_default();
-        let cancelled = cancel_reads(py, self.inner.cancel_requests(&requests, &retained));
-        let reaped = self._reap(py);
-        cancelled.and(reaped)
+        self.cancel_request_imports(py, &requests, &retained)
     }
 
     /// Revoke reads before joining the lane. Callbacks retire tasks cancelled
@@ -596,4 +592,27 @@ fn cancel_reads(py: Python<'_>, reads: Vec<Arc<TransferRef>>) -> PyResult<()> {
         }
     }
     failure
+}
+
+impl KVImporter {
+    pub(super) fn cancel_request_imports(
+        &self,
+        py: Python<'_>,
+        requests: &HashSet<uniserve_worker_ipc::RequestKey>,
+        retained: &HashSet<uniserve_worker_ipc::BufferId>,
+    ) -> PyResult<()> {
+        let cancelled = cancel_reads(py, self.inner.cancel_requests(requests, retained));
+        let reaped = self._reap(py);
+        cancelled.and(reaped)
+    }
+
+    pub(super) fn release_buffers(
+        &self,
+        py: Python<'_>,
+        buffers: &HashSet<uniserve_worker_ipc::BufferId>,
+    ) -> PyResult<()> {
+        let cancelled = cancel_reads(py, self.inner.release(buffers));
+        let reaped = self._reap(py);
+        cancelled.and(reaped)
+    }
 }
