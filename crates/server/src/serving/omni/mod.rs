@@ -8,19 +8,20 @@
 //! [`prepare_generation_resources`] then resolves sampling, cache policy, and
 //! the KV budget for both profiles.
 //!
-//! Chat images, and images attached to a SenseNova text prompt, are carried
-//! through prompt rendering as request-scoped text placeholders. After the
-//! chat template or prompt layout renders, each placeholder is replaced
-//! (SenseNova) or removed (Bagel), and its byte offset in the cleaned text is
-//! converted into a prompt-token position by tokenizing the text before it.
-//! Bagel text prompts place images at token positions fixed by the prompt
-//! layout instead (see `bagel_prompt`). Either way the position becomes
-//! `ImageInput::position`, the prompt-token boundary at which the image's
-//! encoder output enters the context.
+//! Input images arrive already resolved (`serving::media`): chat images in
+//! `chat_image_urls` order, text-prompt images in request order. Chat images,
+//! and images attached to a SenseNova text prompt, are carried through prompt
+//! rendering as request-scoped text placeholders. After the chat template or
+//! prompt layout renders, each placeholder is replaced (SenseNova) or removed
+//! (Bagel), and its byte offset in the cleaned text is converted into a
+//! prompt-token position by tokenizing the text before it. Bagel text prompts
+//! place images at token positions fixed by the prompt layout instead (see
+//! `bagel_prompt`). Either way the position becomes `ImageInput::position`,
+//! the prompt-token boundary at which the image's encoder output enters the
+//! context.
 
 mod output;
 
-use std::io::Cursor;
 use thiserror::Error;
 
 use crate::profile::omni::bagel::{BagelProfile, CONTEXT_SYSTEM_PROMPT};
@@ -99,14 +100,13 @@ mod context_image_defaults {
 /// Input image whose prompt position is resolved but whose encoder inputs are not.
 #[derive(Debug, Clone)]
 struct RenderedImage {
-    /// FNV-1a hash of `b64`. SenseNova preprocessing mixes in the image's
-    /// pixel bound, and `prepare_generation_resources` later mixes in the
-    /// request's cache isolation key when it has one.
-    hash: u64,
+    /// The resolved image. Its content hash starts the encoder-cache
+    /// identity: SenseNova preprocessing mixes in the image's pixel bound, and
+    /// `prepare_generation_resources` later mixes in the request's cache
+    /// isolation key when it has one.
+    image: crate::serving::ImageInput,
     /// Prompt-token position with the meaning of `ImageInput::position`.
     position: u32,
-    /// Base64 image payload, without any data-URL header.
-    b64: String,
 }
 
 /// Fills the SenseNova prompt, image inputs, and image-generation parameters.
@@ -120,9 +120,10 @@ struct RenderedImage {
 ///
 /// Fails, among other conditions, when the processor has no chat template
 /// (checked for text prompts too), rendering or tokenization fails, rendering
-/// loses or reorders an image slot, the prompt is empty, image controls are
-/// invalid, an image payload cannot be decoded, or the profile cannot size the
-/// image encoders or the requested output resolution.
+/// loses or reorders an image slot, a chat prompt's image parts do not match
+/// `images` one to one, the prompt is empty, image controls are invalid, or
+/// the profile cannot size the image encoders or the requested output
+/// resolution.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn preprocess_sensenova(
     profile: &SenseNovaProfile,
@@ -143,7 +144,7 @@ pub(super) fn preprocess_sensenova(
             .ok_or(crate::serving::chat::Error::MissingChatTemplate)?,
         request_id,
         prompt,
-        images.into_iter().map(|image| image.b64).collect(),
+        images,
         generation.constraint,
     )?;
     validate_prompt(&prompt_token_ids)?;
@@ -225,7 +226,7 @@ pub(super) fn preprocess_bagel(
             .ok_or(crate::serving::chat::Error::MissingChatTemplate)?,
         request_id,
         prompt,
-        images.into_iter().map(|image| image.b64).collect(),
+        images,
         generation.constraint,
     )?;
     validate_prompt(&prompt_token_ids)?;
@@ -289,7 +290,7 @@ fn sensenova_prompt(
     renderer: &HfChatRenderer,
     request_id: &str,
     prompt: PromptInput,
-    images: Vec<String>,
+    images: Vec<crate::serving::ImageInput>,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     match prompt {
@@ -312,9 +313,9 @@ fn sensenova_prompt(
                 )
             }
         }
-        PromptInput::Chat(chat) => {
-            render_sensenova_chat(profile, tokenizer, renderer, request_id, chat, constraint)
-        }
+        PromptInput::Chat(chat) => render_sensenova_chat(
+            profile, tokenizer, renderer, request_id, chat, images, constraint,
+        ),
     }
 }
 
@@ -332,13 +333,13 @@ fn bagel_prompt(
     renderer: &HfChatRenderer,
     request_id: &str,
     prompt: PromptInput,
-    images: Vec<String>,
+    images: Vec<crate::serving::ImageInput>,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>, bool)> {
     match prompt {
         PromptInput::Chat(chat) => {
             let (prompt_ids, images) =
-                render_bagel_chat(tokenizer, renderer, request_id, chat, constraint)?;
+                render_bagel_chat(tokenizer, renderer, request_id, chat, images, constraint)?;
             Ok((prompt_ids, images, false))
         }
         PromptInput::Text(prompt)
@@ -392,6 +393,7 @@ fn render_sensenova_chat(
     renderer: &HfChatRenderer,
     request_id: &str,
     mut chat: ChatRequest,
+    images: Vec<crate::serving::ImageInput>,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     if !chat
@@ -409,7 +411,7 @@ fn render_sensenova_chat(
             .push(ChatMessage::assistant_text(assistant_prefix));
         generation_prompt_mode = GenerationPromptMode::ContinueFinalAssistant;
     }
-    let (images, placeholders) = replace_chat_images(request_id, &mut chat.messages)?;
+    let placeholders = replace_chat_images(request_id, &mut chat.messages, images.len())?;
     chat.chat_options.generation_prompt_mode = generation_prompt_mode;
     let rendered = renderer.render(&chat).map_err(|error| error.to_string())?;
     preprocess_sensenova_with_slots(tokenizer, &rendered, &placeholders, images, profile)
@@ -427,7 +429,7 @@ fn preprocess_sensenova_with_slots(
     tokenizer: &DynTokenizer,
     rendered: &str,
     placeholders: &[String],
-    images: Vec<String>,
+    images: Vec<crate::serving::ImageInput>,
     profile: &SenseNovaProfile,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     let marker = format!(
@@ -469,6 +471,7 @@ fn render_bagel_chat(
     renderer: &HfChatRenderer,
     request_id: &str,
     mut chat: ChatRequest,
+    images: Vec<crate::serving::ImageInput>,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     if !chat
@@ -479,7 +482,7 @@ fn render_bagel_chat(
     {
         chat.messages.insert(0, ChatMessage::system(system));
     }
-    let (images, placeholders) = replace_chat_images(request_id, &mut chat.messages)?;
+    let placeholders = replace_chat_images(request_id, &mut chat.messages, images.len())?;
     chat.chat_options.generation_prompt_mode = GenerationPromptMode::StartNewAssistant;
     let rendered = renderer.render(&chat).map_err(|error| error.to_string())?;
     tokenize_bagel_with_slots(tokenizer, &rendered, &placeholders, images)
@@ -494,7 +497,7 @@ fn tokenize_bagel_with_slots(
     tokenizer: &DynTokenizer,
     rendered: &str,
     placeholders: &[String],
-    images: Vec<String>,
+    images: Vec<crate::serving::ImageInput>,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     let (clean, byte_offsets) = replace_rendered_slots(rendered, placeholders, "")?;
     let prompt_ids = tokenizer
@@ -740,9 +743,9 @@ fn bagel_context_image_params(
 
 /// Resolves each image's encoder inputs at its final prompt position.
 ///
-/// `encoders_for_dimensions` receives the decoded image width and height in
+/// `encoders_for_dimensions` receives the image's header width and height in
 /// pixels and the request's total image count. The output is ordered by
-/// prompt position.
+/// prompt position, and each image travels to the worker as standard base64.
 fn prepare_image_inputs(
     num_prompt_tokens: usize,
     images: Vec<RenderedImage>,
@@ -752,18 +755,17 @@ fn prepare_image_inputs(
     let image_count = images.len();
     let mut images = images
         .into_iter()
-        .map(|image| {
-            if image.position as usize > num_prompt_tokens {
+        .map(|RenderedImage { image, position }| {
+            if position as usize > num_prompt_tokens {
                 return Err(OmniError::Invalid(
                     "image position exceeds the tokenized prompt".into(),
                 ));
             }
-            let (width, height) = image_dimensions(&image.b64)?;
-            let encoders = encoders_for_dimensions(width, height, image_count)?;
+            let encoders = encoders_for_dimensions(image.width(), image.height(), image_count)?;
             Ok(ImageInput {
-                hash: image.hash,
-                b64: image.b64,
-                position: image.position,
+                hash: image.hash(),
+                b64: base64::engine::general_purpose::STANDARD.encode(image.bytes()),
+                position,
                 num_positions,
                 encoders,
             })
@@ -784,21 +786,21 @@ pub(crate) fn generation_constraint(modalities: ModalitySelection) -> Generation
     }
 }
 
-/// Replaces chat image parts with unique template placeholders and retains their payloads.
+/// Replaces chat image parts with unique template placeholders.
 ///
-/// Returns the base64 payloads and their placeholders in message order.
-/// Assistant messages are skipped, so images in assistant content are not
-/// collected.
+/// Returns the placeholders in message order, which is the
+/// `chat_image_urls` order of the resolved images. Assistant messages are
+/// skipped, so images in assistant content are not collected.
 ///
 /// # Errors
 ///
-/// Fails when an image part is not a `data:image/*;base64` URL with valid
-/// base64 content (see `data_image_payload`).
+/// Fails when the messages hold a number of image parts other than
+/// `image_count`, the number of resolved images.
 fn replace_chat_images(
     request_id: &str,
     messages: &mut [ChatMessage],
-) -> OmniResult<(Vec<String>, Vec<String>)> {
-    let mut images = Vec::new();
+    image_count: usize,
+) -> OmniResult<Vec<String>> {
     let mut placeholders = Vec::new();
     for message in messages {
         let content = match message {
@@ -812,16 +814,22 @@ fn replace_chat_images(
             continue;
         };
         for part in parts {
-            let ChatContentPart::ImageUrl { image_url, .. } = part else {
+            if !matches!(part, ChatContentPart::ImageUrl { .. }) {
                 continue;
-            };
-            let placeholder = image_placeholder(request_id, images.len());
-            images.push(data_image_payload(image_url)?);
+            }
+            let placeholder = image_placeholder(request_id, placeholders.len());
             placeholders.push(placeholder.clone());
             *part = ChatContentPart::Text { text: placeholder };
         }
     }
-    Ok((images, placeholders))
+    if placeholders.len() != image_count {
+        return Err(format!(
+            "chat request has {} image parts but {image_count} resolved input images",
+            placeholders.len()
+        )
+        .into());
+    }
+    Ok(placeholders)
 }
 
 /// Returns the placeholder for one image slot.
@@ -871,33 +879,9 @@ fn replace_rendered_slots(
     Ok((clean, byte_offsets))
 }
 
-/// Validates an inline image data URL and returns its base64 payload.
-///
-/// The payload is decoded only to validate it; the still-encoded text is
-/// returned.
-fn data_image_payload(url: &str) -> OmniResult<String> {
-    let (metadata, payload) = url
-        .split_once(',')
-        .ok_or_else(|| "image chat requires a data:image/*;base64 URL".to_string())?;
-    if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") || payload.is_empty()
-    {
-        return Err(OmniError::Invalid(
-            "image chat requires a data:image/*;base64 URL".to_string(),
-        ));
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .map_err(|error| format!("image chat contains invalid base64 data: {error}"))?;
-    Ok(payload.to_string())
-}
-
-/// Pairs an image payload with its prompt position and content hash.
-fn rendered_image(b64: String, position: u32) -> RenderedImage {
-    RenderedImage {
-        hash: fnv1a(b64.as_bytes()),
-        position,
-        b64,
-    }
+/// Pairs a resolved image with its prompt position.
+fn rendered_image(image: crate::serving::ImageInput, position: u32) -> RenderedImage {
+    RenderedImage { image, position }
 }
 
 /// Prepends the image slots to a SenseNova text prompt, one per line.
@@ -916,20 +900,6 @@ fn prompt_with_image_slots(prompt: &str, placeholders: &[String]) -> String {
     }
     output.push_str(prompt);
     output
-}
-
-/// Returns the `(width, height)` in pixels of a base64-encoded image.
-///
-/// Only the image header is read; the pixels are not decoded.
-fn image_dimensions(b64: &str) -> OmniResult<(u32, u32)> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|error| format!("invalid input image base64: {error}"))?;
-    Ok(image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|error| format!("invalid input image data: {error}"))?
-        .into_dimensions()
-        .map_err(|error| format!("invalid input image data: {error}"))?)
 }
 
 /// Rejects an empty prompt token sequence.

@@ -16,18 +16,6 @@ use crate::serving::text::TextDecodeOptions;
 use crate::serving::text::tokenizer::DynTokenizer;
 use crate::serving::{CacheAccounting, ResourceAccounting, ServeRequestId};
 
-/// One top-level input image of a [`TextPromptRequest`].
-///
-/// The omni preprocessors decode it and compute its prompt position; models
-/// without image input reject it during feature validation. Chat images arrive
-/// separately as `image_url` parts inside the chat messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageInput {
-    /// Standard base64 encoding of the image file bytes, without a `data:` URL
-    /// prefix.
-    pub b64: String,
-}
-
 /// The public prompt: raw text or a chat conversation. Input images live in
 /// programmatic image inputs (and inside chat parts for the chat variant).
 #[derive(Debug, Clone, PartialEq)]
@@ -196,8 +184,10 @@ pub struct TextPromptRequest {
     pub request_id: ServeRequestId,
     /// Plain text passed through the model's text-prompt preprocessing.
     pub prompt: String,
-    /// Top-level input images associated with the prompt.
-    pub images: Vec<ImageInput>,
+    /// Top-level input images associated with the prompt. The omni
+    /// preprocessors compute their prompt positions; models without image
+    /// input reject them during feature validation.
+    pub images: Vec<crate::serving::media::ImageInput>,
     /// Requested output modalities.
     pub modalities: ModalitySelection,
     /// Token sampling controls.
@@ -258,13 +248,13 @@ impl TextPromptRequest {
 pub enum OutputProcessorPolicy {
     /// Raw visible text.
     None,
-    /// Qwen3 chat reasoning and tool-call parsing over decoded text, selected
-    /// for Qwen3 chat prompts (Qwen3 text prompts use `None`). The processor
-    /// parses `<think>` reasoning only when the server's `reasoning_parsing`
-    /// setting is on, and otherwise passes that text through as visible
-    /// text; it parses tool calls only when
+    /// Chat reasoning and tool-call parsing over decoded text, selected for
+    /// the chat prompts of Qwen3 and DiffusionGemma (their text prompts use
+    /// `None`). The processor parses reasoning only when the server's
+    /// `reasoning_parsing` setting is on, and otherwise passes that text
+    /// through as visible text; it parses tool calls only when
     /// `ChatRequest::tool_parsing_enabled` holds.
-    Qwen3(crate::serving::chat::Qwen3ChatOutputProcessor),
+    Chat(crate::serving::chat::ChatOutputProcessor),
     /// SenseNova reasoning and visible-answer filtering over committed text.
     SenseNova(crate::profile::omni::OutputFilterPolicy),
 }

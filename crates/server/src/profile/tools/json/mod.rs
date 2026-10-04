@@ -35,20 +35,12 @@ use winnow::stream::{Partial, Stream};
 use winnow::token::literal;
 
 use super::utils::{
-    JsonObjectScanState, json_str, parse_buffered_event, safe_text_len, take_json_object,
+    JsonObjectScanState, MAX_BUFFER_BYTES, json_str, parse_buffered_event, safe_text_len,
+    take_json_object,
 };
 use super::{Result, ToolCallDelta, ToolParserOutput};
 
 type JsonToolInput<'i> = Partial<&'i str>;
-
-/// Upper bound on the per-stream parser buffer, in bytes.
-///
-/// The buffer retains every byte that has not yet formed a complete event.
-/// Argument bytes leave it as soon as they arrive, but input that cannot yet
-/// complete an event, such as an unterminated tool-call header (for example an
-/// endless function-name string), keeps accumulating. Exceeding the cap fails
-/// `parse_into` with a parse error instead of growing memory without bound.
-const MAX_BUFFER_BYTES: usize = 1 << 20;
 
 /// Marker and key vocabulary of one marker-wrapped JSON tool-call format.
 #[derive(Debug, Clone, Copy)]
@@ -136,8 +128,9 @@ impl JsonToolCallParser {
         }
 
         // Any bytes still buffered here belong to an event that has not yet
-        // completed. Bound that retention so an unterminated tool call cannot
-        // grow the buffer without limit.
+        // completed. Argument bytes leave the buffer as soon as they arrive,
+        // but an unterminated tool-call header (for example an endless
+        // function-name string) keeps accumulating, so bound that retention.
         if self.buffer.len() > MAX_BUFFER_BYTES {
             return Err(parsing_failed!(
                 "{} buffer exceeded {} bytes without completing a tool call",

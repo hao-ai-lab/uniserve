@@ -1,9 +1,10 @@
 //! Internal chat messages, content parts, tools, and render options.
 //!
 //! The Chat Completions preprocessing converts API requests into these types.
-//! `HfChatRenderer` renders a [`ChatRequest`] into the prompt, and
-//! `Qwen3ChatOutputProcessor` reads its tool configuration to decide whether
-//! generated text is parsed for tool calls.
+//! `HfChatRenderer` renders a [`ChatRequest`] into the prompt, and the chat
+//! output processors (`Qwen3ChatOutputProcessor`, `Gemma4ChatOutputProcessor`)
+//! read its tool configuration to decide whether generated text is parsed for
+//! tool calls.
 
 pub use crate::profile::tools::Tool;
 use crate::serving::text::TextDecodeOptions;
@@ -368,6 +369,13 @@ pub struct ChatOptions {
 
     /// Effort level exposed to chat templates for reasoning models.
     pub reasoning_effort: Option<ReasoningEffort>,
+
+    /// The request's own template variables, such as `enable_thinking`. They
+    /// replace the server's default template kwargs of the same name, and
+    /// never name a variable the renderer sets itself
+    /// ([`ChatOptions::RESERVED_TEMPLATE_KWARGS`]).
+    #[serde(default)]
+    pub template_kwargs: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Default for ChatOptions {
@@ -376,11 +384,22 @@ impl Default for ChatOptions {
         Self {
             generation_prompt_mode: GenerationPromptMode::StartNewAssistant,
             reasoning_effort: None,
+            template_kwargs: std::collections::HashMap::new(),
         }
     }
 }
 
 impl ChatOptions {
+    /// Template variables the renderer sets from the request itself, which
+    /// request template kwargs cannot replace.
+    pub const RESERVED_TEMPLATE_KWARGS: [&'static str; 5] = [
+        "messages",
+        "tools",
+        "documents",
+        "add_generation_prompt",
+        "continue_final_message",
+    ];
+
     /// Returns whether to add a generation prompt for a new assistant turn after the
     /// existing chat history.
     pub fn add_generation_prompt(&self) -> bool {
@@ -479,8 +498,8 @@ impl ChatRequest {
     /// choice and tool list.
     ///
     /// `HfChatRenderer` passes the request's `tools` to the template only when
-    /// this holds, and `Qwen3ChatOutputProcessor::new` applies the same
-    /// condition to decide whether to parse tool calls.
+    /// this holds, and the chat output processors apply the same condition to
+    /// decide whether to parse tool calls.
     pub fn tool_parsing_enabled(&self) -> bool {
         matches!(self.tool_choice, ChatToolChoice::Auto) && !self.tools.is_empty()
     }

@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::profile::diffusion_gemma::DenoisingOverrides;
 use crate::serving::chat::ChatTemplateContentFormatOption;
+use crate::serving::media::ImageFetchPolicy;
+use crate::serving::systemone::ReadoutOptions;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
@@ -186,6 +189,12 @@ pub struct Config {
     /// Where video-request condition media may come from, and how large it
     /// may be.
     pub video_media: VideoMediaSettings,
+    /// Time, size, and destination limits for request image references.
+    pub image_fetch: ImageFetchPolicy,
+    /// How System One questions are divided among readout prompts and canvases.
+    pub readout: ReadoutOptions,
+    /// Block-diffusion sampler overrides applied to every generated reply.
+    pub diffusion_generation: DenoisingOverrides,
 }
 
 /// Sources and limits of the condition media of video requests.
@@ -260,6 +269,9 @@ impl Default for Config {
             shutdown_timeout: Duration::from_secs(0),
             reasoning_parsing: true,
             video_media: VideoMediaSettings::default(),
+            image_fetch: ImageFetchPolicy::default(),
+            readout: ReadoutOptions::default(),
+            diffusion_generation: DenoisingOverrides::default(),
         }
     }
 }
