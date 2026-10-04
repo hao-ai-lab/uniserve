@@ -71,9 +71,9 @@ def commit_batch(
 
     ``outcomes`` must be the batch's own bound ``PendingOutput`` records, in
     call order. Every validation failure raises before ``state.published``
-    is set, leaving the batch discardable. On success each output is
-    recorded through ``BatchState.record_outputs`` and its calls are
-    registered as pending in the ``RequestPool``.
+    is set, leaving the batch discardable. On success its calls are registered
+    as pending in the ``RequestPool``; the native executor resolves their
+    results after readback.
     """
     with state.scope():
         commit_started = time.perf_counter_ns()
@@ -258,9 +258,8 @@ def commit_batch(
             request.release_execution_references()
 
         request_pool.add_pending(tuple(record.call for record in records))
-        state.record_outputs(
-            tuple(records),
-            products=tuple(report_products),
+        state.products = tuple(report_products)
+        state.record_execution(
             execution_us=execution_us,
             stats=stats,
         )

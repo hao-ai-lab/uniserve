@@ -4,9 +4,13 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
-use uniserve_core::CallId;
+use uniserve_core::{CallId, TokenLogprob};
 use uniserve_worker::RequestProgress;
-use uniserve_worker_ipc::{CallStatus, ErrorCode, RequestKey};
+use uniserve_worker_ipc::{
+    CallKind, CallStatus, ErrorCode, RequestKey, RequestOutput, TimingCounters,
+};
+
+use crate::convert;
 
 use super::error::native_error;
 use super::host::HostTask;
@@ -27,6 +31,7 @@ const STEP_SKIPPED: i64 = 2;
 pub(crate) struct PendingOutput {
     key: RequestKey,
     id: CallId,
+    code: CallKind,
     progress: RequestProgress,
     accepted: Option<RequestProgress>,
     status: CallStatus,
@@ -79,8 +84,7 @@ pub(crate) struct PendingOutput {
     products: Py<PyTuple>,
     #[pyo3(get, set)]
     _reports_output: bool,
-    #[pyo3(get)]
-    value: Option<Py<PyAny>>,
+    pub(super) value: Option<RequestOutput>,
 }
 
 #[pymethods]
@@ -109,6 +113,7 @@ impl PendingOutput {
         Ok(Self {
             key: request_key(&call.bind(py).getattr("request_key")?)?,
             id: call_id(&call.bind(py).getattr("call_id")?)?,
+            code: pythonize::depythonize(&call.bind(py).getattr("kind")?.getattr("value")?)?,
             progress: RequestProgress {
                 logical_position: coordinates.getattr("logical_position")?.extract()?,
                 flow_step: coordinates.getattr("flow_step")?.extract()?,
@@ -153,6 +158,14 @@ impl PendingOutput {
             _reports_output: true,
             value: None,
         })
+    }
+
+    #[getter]
+    fn value(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.value
+            .as_ref()
+            .map(|value| convert::request_output_to_py(py, value))
+            .transpose()
     }
 
     #[getter]
@@ -268,10 +281,97 @@ impl PendingOutput {
             .all(|task| task.borrow(py).done()))
     }
 
-    pub(super) fn materialize(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+    fn materialize(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        Self::resolve(slf)?;
+        convert::request_output_to_py(slf.py(), slf.borrow().result()?)
+    }
+
+    fn abandon(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        if let Some(value) = &slf.borrow().value {
-            return Ok(value.clone_ref(py));
+        let (host, buffer, row) = {
+            let mut this = slf.borrow_mut();
+            (this.host.clone_ref(py), this.buffer.take(), this.row)
+        };
+        let host = host.bind(py);
+        let tasks = host_tasks(host)?;
+        host.setattr("tasks", PyTuple::empty(py))?;
+        host.setattr("finish", py.None())?;
+
+        // Submitted host work retains its input until it actually finishes.
+        // Try every owner even when a task's release callback fails.
+        let mut failure: Option<PyErr> = None;
+        for result in tasks
+            .iter()
+            .map(|task| task.borrow(py).abandon(py))
+            .chain(buffer.iter().map(|buffer| buffer.get().discard(py, row)))
+        {
+            if let Err(error) = result {
+                if let Some(first) = &failure {
+                    let _ = first
+                        .value(py)
+                        .call_method1("add_note", (error.to_string(),));
+                } else {
+                    failure = Some(error);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.buffer)?;
+        visit.call(&self.call)?;
+        visit.call(&self.request)?;
+        visit.call(&self.token)?;
+        visit.call(&self.latent)?;
+        visit.call(&self.host)?;
+        visit.call(&self.finish_flags)?;
+        visit.call(&self.product_generations)?;
+        visit.call(&self.tensor_exports)?;
+        visit.call(&self.cache_exports)?;
+        visit.call(&self.exported_locators)?;
+        visit.call(&self.cache_publication)?;
+        visit.call(&self.cache_installation)?;
+        visit.call(&self.device_reads)?;
+        visit.call(&self.feature_reads)?;
+        visit.call(&self.writes)?;
+        visit.call(&self.predicate)?;
+        visit.call(&self.token_write)?;
+        visit.call(&self.transition_write)?;
+        visit.call(&self.completion_write)?;
+        visit.call(&self.producer_write)?;
+        visit.call(&self.kv_output)?;
+        visit.call(&self.products)
+    }
+
+    fn __clear__(&mut self, py: Python<'_>) {
+        self.token = py.None();
+        self.latent = py.None();
+        self.host = py.None();
+    }
+}
+
+impl PendingOutput {
+    pub(super) fn result(&self) -> PyResult<&RequestOutput> {
+        self.value
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("call output is not resolved"))
+    }
+
+    pub(super) fn cancel(&self, py: Python<'_>, requests: &mut RequestPool) -> PyResult<()> {
+        if self.value.is_none() {
+            requests
+                .pool
+                .cancel_calls(&[(self.key, self.id)])
+                .map_err(|error| native_error(py, error))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn resolve(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        if slf.borrow().value.is_some() {
+            return Ok(());
         }
         if !Self::ready(slf)? {
             return Err(PyRuntimeError::new_err(
@@ -301,11 +401,14 @@ impl PendingOutput {
         let mut tokens: Vec<i64> = token.getattr("committed_tokens")?.extract()?;
         let mut suppressed = status == CallStatus::Predicated;
         let mut skipped = false;
-        let scores = PyDict::new(py);
+        let mut value = {
+            let this = slf.borrow();
+            request_output(this.key, this.id, this.code, progress)?
+        };
 
         if !suppressed {
             let decoded = resolve_host(py, host, reports)
-                .and_then(|()| decode_scores(py, token, buffer.get(), &scores));
+                .and_then(|()| decode_scores(py, token, buffer.get(), &mut value));
             match decoded {
                 Err(error) if error.is_instance_of::<PyException>(py) => {
                     log_failure(slf, &error)?;
@@ -372,48 +475,49 @@ impl PendingOutput {
 
         let row = slf.borrow().row;
         buffer.get().observe(py, row)?;
-        let timing = buffer.get().timing(py)?;
+        let (queued_us, device_us, copy_us, host_us) = buffer.get().timing(py)?;
         slf.borrow_mut().buffer = None;
 
-        let protocol = py.import("uniserve_worker.protocol.output")?;
-        let kwargs = PyDict::new(py);
         let this = slf.borrow();
-        kwargs.set_item("request_key", this.request_key(py)?)?;
-        kwargs.set_item("call_id", this.call_id(py)?)?;
-        kwargs.set_item("status", call_enum(py, "CallStatus", &status)?)?;
-        kwargs.set_item("kind", this.kind(py)?)?;
-        kwargs.set_item(
-            "error_code",
-            error_code
+        value.status = status;
+        value.error_code = error_code;
+        value.timing_counters = TimingCounters {
+            queued_us,
+            device_us,
+            copy_us,
+            host_us,
+        };
+        set_progress(&mut value, progress)?;
+        value.committed_tokens = tokens
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<Result<_, _>>()
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let media = host.getattr("media")?;
+        if !media.is_none() {
+            value.media_output = Some(pythonize::depythonize(&media.call_method0("to_mapping")?)?);
+        }
+        if !suppressed {
+            value.product_generations = this.product_generations.extract(py)?;
+            value.finish_flags =
+                pythonize::depythonize(&this.finish_flags.bind(py).call_method0("to_mapping")?)?;
+            value.kv_output = this
+                .kv_output
                 .as_ref()
-                .map(|code| call_enum(py, "ErrorCode", code))
-                .transpose()?,
-        )?;
-        kwargs.set_item(
-            "timing_counters",
-            protocol.getattr("TimingCounters")?.call1(timing)?,
-        )?;
-        kwargs.set_item("position", progress.logical_position)?;
-        kwargs.set_item("kv_visible_len", progress.kv_visible_len)?;
-        kwargs.set_item("kv_computed_len", progress.kv_computed_len)?;
-        kwargs.set_item("num_completed_steps", progress.flow_step)?;
-        kwargs.set_item("committed_tokens", PyTuple::new(py, tokens)?)?;
-        kwargs.set_item("media_output", host.getattr("media")?)?;
-        if suppressed {
-            kwargs.set_item("product_generations", PyTuple::empty(py))?;
-            kwargs.set_item("finish_flags", protocol.getattr("FinishFlags")?.call0()?)?;
-        } else {
-            kwargs.set_item("product_generations", &this.product_generations)?;
-            kwargs.set_item("finish_flags", &this.finish_flags)?;
-            kwargs.set_item("kv_output", &this.kv_output)?;
-            if reports {
-                kwargs.update(scores.as_mapping())?;
-            }
+                .map(|output| {
+                    convert::kv_transfer_from_py(&output.bind(py).call_method0("to_mapping")?)
+                        .ok_or_else(|| PyRuntimeError::new_err("invalid KV output"))
+                })
+                .transpose()?;
+        }
+        if suppressed || !reports {
+            value.sampled_logprob = None;
+            value.top_logprobs.clear();
+            value.prompt_logprobs.clear();
+            value.candidate_logprobs.clear();
         }
         drop(this);
 
-        let value = protocol.getattr("RequestOutput")?.call((), Some(&kwargs))?;
-        value.call_method0("validate")?;
         host.setattr("tasks", PyTuple::empty(py))?;
         let mut this = slf.borrow_mut();
         this.accepted = Some(
@@ -425,77 +529,10 @@ impl PendingOutput {
         );
         this.status = status;
         this.error_code = error_code;
-        this.value = Some(value.clone().unbind());
-        Ok(value.unbind())
+        this.value = Some(value);
+        Ok(())
     }
 
-    fn abandon(slf: &Bound<'_, Self>) -> PyResult<()> {
-        let py = slf.py();
-        let (host, buffer, row) = {
-            let mut this = slf.borrow_mut();
-            (this.host.clone_ref(py), this.buffer.take(), this.row)
-        };
-        let host = host.bind(py);
-        let tasks = host_tasks(host)?;
-        host.setattr("tasks", PyTuple::empty(py))?;
-        host.setattr("finish", py.None())?;
-
-        // Submitted host work retains its input until it actually finishes.
-        // Try every owner even when a task's release callback fails.
-        let mut failure: Option<PyErr> = None;
-        for result in tasks
-            .iter()
-            .map(|task| task.borrow(py).abandon(py))
-            .chain(buffer.iter().map(|buffer| buffer.get().discard(py, row)))
-        {
-            if let Err(error) = result {
-                if let Some(first) = &failure {
-                    let _ = first
-                        .value(py)
-                        .call_method1("add_note", (error.to_string(),));
-                } else {
-                    failure = Some(error);
-                }
-            }
-        }
-        failure.map_or(Ok(()), Err)
-    }
-
-    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.buffer)?;
-        visit.call(&self.call)?;
-        visit.call(&self.request)?;
-        visit.call(&self.token)?;
-        visit.call(&self.latent)?;
-        visit.call(&self.host)?;
-        visit.call(&self.finish_flags)?;
-        visit.call(&self.product_generations)?;
-        visit.call(&self.tensor_exports)?;
-        visit.call(&self.cache_exports)?;
-        visit.call(&self.exported_locators)?;
-        visit.call(&self.cache_publication)?;
-        visit.call(&self.cache_installation)?;
-        visit.call(&self.device_reads)?;
-        visit.call(&self.feature_reads)?;
-        visit.call(&self.writes)?;
-        visit.call(&self.predicate)?;
-        visit.call(&self.token_write)?;
-        visit.call(&self.transition_write)?;
-        visit.call(&self.completion_write)?;
-        visit.call(&self.producer_write)?;
-        visit.call(&self.kv_output)?;
-        visit.call(&self.products)?;
-        visit.call(&self.value)
-    }
-
-    fn __clear__(&mut self, py: Python<'_>) {
-        self.token = py.None();
-        self.latent = py.None();
-        self.host = py.None();
-    }
-}
-
-impl PendingOutput {
     pub(super) fn submit_host_tasks(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let host = {
@@ -564,31 +601,26 @@ fn decode_scores(
     py: Python<'_>,
     token: &Bound<'_, PyAny>,
     buffer: &OutputBuffer,
-    scores: &Bound<'_, PyDict>,
+    output: &mut RequestOutput,
 ) -> PyResult<Option<(i64, Vec<i64>)>> {
     if let Some(span) = token.getattr("logprob_range")?.extract()? {
         let values = buffer.logprob_values(py, span)?;
-        scores.set_item("sampled_logprob", values.bind(py).get_item(0)?)?;
-        scores.set_item("top_logprobs", values.bind(py).get_item(1)?)?;
+        output.sampled_logprob = values.bind(py).get_item(0)?.extract()?;
+        output.top_logprobs = logprobs(&values.bind(py).get_item(1)?)?;
     }
     let spans: Vec<(usize, usize, usize)> = token.getattr("prompt_logprob_ranges")?.extract()?;
-    let prompt = spans
+    output.prompt_logprobs = spans
         .into_iter()
-        .map(|span| {
-            buffer
-                .logprob_values(py, span)?
-                .bind(py)
-                .get_item(1)
-                .map(Bound::unbind)
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    scores.set_item("prompt_logprobs", PyTuple::new(py, prompt)?)?;
+        .map(|span| logprobs(&buffer.logprob_values(py, span)?.bind(py).get_item(1)?))
+        .collect::<PyResult<_>>()?;
 
     if let Some((offset, count)) = token.getattr("candidate_range")?.extract()? {
         let words: Vec<i64> = buffer.read_tokens(py, offset, count)?.extract(py)?;
         // Candidate scores are float32 bits sign-extended from int32.
-        let candidates = words.into_iter().map(|word| f32::from_bits(word as u32));
-        scores.set_item("candidate_logprobs", PyTuple::new(py, candidates)?)?;
+        output.candidate_logprobs = words
+            .into_iter()
+            .map(|word| f32::from_bits(word as u32))
+            .collect();
     }
     if let Some((offset, count)) = token.getattr("canvas_range")?.extract()? {
         let words: Vec<i64> = buffer.read_tokens(py, offset, count)?.extract(py)?;
@@ -600,6 +632,65 @@ fn decode_scores(
         return Ok(Some((outcome, tokens.to_vec())));
     }
     Ok(None)
+}
+
+fn logprobs(values: &Bound<'_, PyAny>) -> PyResult<Vec<TokenLogprob>> {
+    values
+        .try_iter()?
+        .map(|value| {
+            let (token_id, logprob, rank) = value?.extract()?;
+            Ok(TokenLogprob {
+                token_id,
+                logprob,
+                rank,
+            })
+        })
+        .collect()
+}
+
+/// Initialize the wire result from accepted request coordinates. Numerical
+/// completion and batch failure fill the same result type before delivery.
+pub(super) fn request_output(
+    key: RequestKey,
+    id: CallId,
+    code: CallKind,
+    progress: RequestProgress,
+) -> PyResult<RequestOutput> {
+    let mut output = RequestOutput {
+        request_key: key,
+        call_id: id,
+        code,
+        status: CallStatus::Ok,
+        product_generations: Vec::new(),
+        error_code: None,
+        timing_counters: Default::default(),
+        position: 0,
+        kv_visible_len: 0,
+        kv_computed_len: 0,
+        num_completed_steps: 0,
+        committed_tokens: Vec::new(),
+        sampled_logprob: None,
+        top_logprobs: Vec::new(),
+        prompt_logprobs: Vec::new(),
+        candidate_logprobs: Vec::new(),
+        finish_flags: Default::default(),
+        media_output: None,
+        kv_output: None,
+    };
+    set_progress(&mut output, progress)?;
+    Ok(output)
+}
+
+fn set_progress(output: &mut RequestOutput, progress: RequestProgress) -> PyResult<()> {
+    let narrow = |value| {
+        u32::try_from(value)
+            .map_err(|error: std::num::TryFromIntError| PyRuntimeError::new_err(error.to_string()))
+    };
+    output.position = narrow(progress.logical_position)?;
+    output.kv_visible_len = narrow(progress.kv_visible_len)?;
+    output.kv_computed_len = narrow(progress.kv_computed_len)?;
+    output.num_completed_steps = narrow(progress.flow_step)?;
+    Ok(())
 }
 
 fn accepted_tokens(token: &Bound<'_, PyAny>, sampled: i64, accepted: i64) -> PyResult<Vec<i64>> {

@@ -374,44 +374,48 @@ def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent()
 
 
 def test_decode_reuses_the_published_request_page_table() -> None:
-    worker = execution_worker(queue_depth=2)
-    admission = ar_params(10, block_ids=(0,))
-    predecessor = token_call(
-        admission.request_key,
-        call_id=CallId(1, 0),
-        predecessor=root_parent(admission),
-        mode=ForwardMode.PREFILL,
-        tokens=(3, 4),
-    )
-    worker.submit(
-        execution_batch(
-            batch_id=1,
-            admissions=(admission,),
-            calls=(predecessor,),
+    with execution_worker(queue_depth=2) as worker:
+        admission = ar_params(10, block_ids=(0,))
+        predecessor = token_call(
+            admission.request_key,
+            call_id=CallId(1, 0),
+            predecessor=root_parent(admission),
+            mode=ForwardMode.PREFILL,
+            tokens=(3, 4),
         )
-    )
-    device_parent = predecessor.call_id
-    template = token_call(
-        admission.request_key,
-        call_id=CallId(2, 0),
-        predecessor=device_parent,
-        mode=ForwardMode.DECODE,
-        tokens=(0,),
-        predicate=predecessor.token_output,
-    )
-    call = replace(template, input_token_ids=())
-    report = finalized_report(
-        worker,
         worker.submit(
             execution_batch(
-                batch_id=2,
-                calls=(call,),
+                batch_id=1,
+                admissions=(admission,),
+                calls=(predecessor,),
             )
-        ),
-    )
+        )
+        expected = expected_successor(4)
 
-    assert report.completions[0].status is CallStatus.OK
-    assert report.completions[0].kv_visible_len == 3
+        # Generate beyond the bounded relay window, consuming each previous
+        # device token while preserving the request's existing KV page table.
+        for batch_id in range(2, 10):
+            template = token_call(
+                admission.request_key,
+                call_id=CallId(batch_id, 0),
+                predecessor=predecessor.call_id,
+                mode=ForwardMode.DECODE,
+                tokens=(0,),
+                predicate=predecessor.token_output,
+            )
+            call = replace(template, input_token_ids=())
+            report = finalized_report(
+                worker,
+                worker.submit(
+                    execution_batch(batch_id=batch_id, calls=(call,))
+                ),
+            )
+            expected = expected_successor(expected)
+            completion = report.completions[0]
+            assert completion.status is CallStatus.OK
+            assert completion.kv_visible_len == batch_id + 1
+            assert completion.committed_tokens == (expected,)
+            predecessor = call
 
 
 @pytest.mark.parametrize(

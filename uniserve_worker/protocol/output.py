@@ -2,9 +2,9 @@
 
 A rank reports each submitted batch as one `BatchOutput`: a `RequestOutput`
 per call plus the tensor products successful calls published. The execution
-package builds these records once every call's output has materialized on the
-host. The numerical backend serializes them with `to_mapping` into the
-native `BatchOutput`; the Rust service sends the response directly.
+backend resolves and delivers native records after readback and retirement.
+Direct Python callers receive these views when they consume a result; the
+rank service sends native results without constructing Python records.
 """
 
 from __future__ import annotations

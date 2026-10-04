@@ -1,20 +1,23 @@
 //! Python numerical backend for the shared native batch executor.
 
+mod output;
 mod retirement;
 
 use std::sync::Arc;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
-use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyBaseException, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyType};
+use pyo3::types::{PyDict, PyType};
 use pythonize::depythonize;
+use uniserve_core::CallId;
 use uniserve_worker::{
     Backend, Batch, Executor as NativeExecutor, Service, ServiceBackend,
     Submission as NativeSubmission,
 };
 use uniserve_worker_ipc::{
-    Batch as BatchPlan, BatchOutput, RequestKind, WorkerInfo, WorkerResponseError,
+    Batch as BatchPlan, BatchOutput, CallKind, RequestKey, RequestKind, WorkerInfo,
+    WorkerResponseError,
 };
 
 use super::events::EventPool;
@@ -69,10 +72,12 @@ struct PythonBackend {
 
 /// Numerical views and their native input owner, retained for one batch.
 struct BatchState {
+    id: u64,
+    calls: Vec<(RequestKey, CallId, CallKind)>,
     numerical: Py<PyAny>,
     inputs: Py<BatchInputs>,
     imports: bool,
-    materialized: bool,
+    output: Option<BatchOutput>,
     retirement: Retirement,
 }
 
@@ -88,10 +93,16 @@ impl PythonBackend {
         kwargs.set_item("propagate_errors", propagate_errors)?;
         let numerical = self.batch_type.bind(py).call((batch,), Some(&kwargs))?;
         Ok(BatchState {
+            id: plan.batch_id,
+            calls: plan
+                .calls
+                .iter()
+                .map(|call| (call.request_key, call.call_id, call.code))
+                .collect(),
             inputs: numerical.getattr("inputs")?.extract()?,
             numerical: numerical.unbind(),
             imports: false,
-            materialized: false,
+            output: None,
             retirement: Retirement::new(plan),
         })
     }
@@ -104,53 +115,6 @@ impl PythonBackend {
                 .map(Bound::unbind)
                 .map_err(|error| error.into_value(py))
         })
-    }
-
-    fn materialize(&self, py: Python<'_>, batch: &BatchState) -> PyResult<bool> {
-        let outputs = batch
-            .numerical
-            .bind(py)
-            .getattr("outputs")?
-            .cast_into::<PyList>()?;
-        let pending = outputs
-            .iter()
-            .filter_map(|output| output.cast_into::<PendingOutput>().ok())
-            .collect::<Vec<_>>();
-        for output in &pending {
-            PendingOutput::submit_host_tasks(output)?;
-        }
-        if outputs.iter().any(|output| output.is_none()) {
-            return Err(PyRuntimeError::new_err(
-                "launched batch is missing a call output",
-            ));
-        }
-        for output in &pending {
-            if !PendingOutput::ready(output)? {
-                return Ok(false);
-            }
-        }
-
-        // Materialize every row before committing request progress. A failure
-        // cannot leave a partly replaced list of numerical result owners.
-        let values = outputs
-            .iter()
-            .map(|output| {
-                if let Ok(pending) = output.cast::<PendingOutput>() {
-                    PendingOutput::materialize(pending)
-                } else {
-                    Ok(output.unbind())
-                }
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        for output in pending {
-            output
-                .borrow()
-                .accept(py, &mut self.requests.borrow_mut(py))?;
-        }
-        for (index, value) in values.into_iter().enumerate() {
-            outputs.set_item(index, value)?;
-        }
-        Ok(true)
     }
 
     fn advance_inputs(
@@ -225,7 +189,7 @@ impl PythonBackend {
 
 impl Backend for PythonBackend {
     type Batch = BatchState;
-    type Output = Py<PyAny>;
+    type Output = BatchOutput;
     type Error = Py<PyBaseException>;
 
     fn error(&self, error: uniserve_worker::Error) -> Self::Error {
@@ -304,7 +268,16 @@ impl Backend for PythonBackend {
     }
 
     fn execute(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
-        self.call("execute", batch).map(drop)
+        let failure = self.call("execute", batch)?;
+        Python::attach(|py| {
+            if !failure.is_none(py) {
+                batch.output = Some(
+                    self.failed_output(py, batch, failure.bind(py))
+                        .map_err(|error| error.into_value(py))?,
+                );
+            }
+            Ok(())
+        })
     }
 
     fn begin_retirement(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
@@ -317,14 +290,14 @@ impl Backend for PythonBackend {
     }
 
     fn poll(&mut self, batch: &mut Self::Batch) -> Result<(bool, bool), Self::Error> {
-        let before = batch.materialized;
-        if !batch.materialized {
-            batch.materialized = Python::attach(|py| {
+        let before = batch.output.is_some();
+        if batch.output.is_none() {
+            batch.output = Python::attach(|py| {
                 self.materialize(py, batch)
                     .map_err(|error| error.into_value(py))
             })?;
         }
-        if !batch.materialized {
+        if batch.output.is_none() {
             return Ok((false, false));
         }
         let retired = Python::attach(|py| {
@@ -333,22 +306,34 @@ impl Backend for PythonBackend {
                 .poll(py, self)
                 .map_err(|error| error.into_value(py))
         })?;
-        Ok((batch.materialized != before, retired))
+        Ok((!before, retired))
     }
 
     fn result(&mut self, batch: &mut Self::Batch) -> Result<Self::Output, Self::Error> {
-        Python::attach(|py| {
-            batch
-                .numerical
-                .bind(py)
-                .call_method0("result")
-                .map(Bound::unbind)
-                .map_err(|error| error.into_value(py))
+        batch.output.clone().ok_or_else(|| {
+            Python::attach(|py| {
+                PyRuntimeError::new_err("batch output is not resolved").into_value(py)
+            })
         })
     }
 
     fn close(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error> {
         let deferred = Python::attach(|py| {
+            if batch.output.is_none() {
+                let cancel = || -> PyResult<()> {
+                    for output in batch.numerical.bind(py).getattr("outputs")?.try_iter()? {
+                        let output = output?;
+                        if !output.is_none() {
+                            output
+                                .cast::<PendingOutput>()?
+                                .borrow()
+                                .cancel(py, &mut self.requests.borrow_mut(py))?;
+                        }
+                    }
+                    Ok(())
+                };
+                cancel().map_err(|error| error.into_value(py))?;
+            }
             batch
                 .retirement
                 .close(py, self, &batch.numerical)
@@ -387,17 +372,6 @@ impl ServiceBackend for PythonBackend {
                 })
             };
             build().map_err(|error: PyErr| error.into_value(py))
-        })
-    }
-
-    fn output(&self, output: Py<PyAny>) -> Result<BatchOutput, Py<PyBaseException>> {
-        Python::attach(|py| {
-            let convert = || -> PyResult<_> {
-                let output = output.bind(py).call_method0("to_mapping")?;
-                convert::run_result_from_py(&output)
-                    .ok_or_else(|| PyValueError::new_err("invalid worker batch output"))
-            };
-            convert().map_err(|error| error.into_value(py))
         })
     }
 
@@ -614,7 +588,9 @@ impl Executor {
     fn poll(&mut self, py: Python<'_>, submission: &Submission) -> PyResult<Option<Py<PyAny>>> {
         self.executor_mut()?
             .poll(&submission.submission)
-            .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))
+            .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))?
+            .map(|output| convert::batch_output_to_py(py, &output))
+            .transpose()
     }
 
     #[getter]

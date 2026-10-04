@@ -551,6 +551,15 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
     )
     assert failed.completions[0].status is CallStatus.ERROR
     assert failed.completions[0].error_code is ErrorCode.INVALID_CALL
+    # Registration failed before this chunk executed. Report the accepted
+    # prefix, so the caller can continue from the preceding successful call.
+    failed_output = failed.completions[0]
+    assert (
+        failed_output.position,
+        failed_output.kv_visible_len,
+        failed_output.kv_computed_len,
+    ) == (2, 2, 2)
+    assert failed_output.committed_tokens == ()
 
     continued = token_call(
         admission.request_key,
