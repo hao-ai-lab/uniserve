@@ -66,6 +66,13 @@ gpu = [
 uniserve-kernels = { path = "uniserve_kernels", editable = true }
 uniserve-eval = { path = "uniserve_eval", editable = true }
 
+[tool.uv]
+# DeepEP's elastic transport uses the GIN request and traffic-class APIs
+# supplied by NCCL 2.30.4. Keep one NCCL runtime for PyTorch and DeepEP.
+override-dependencies = [
+    "nvidia-nccl-cu13==2.30.4; sys_platform == 'linux'",
+]
+
 [project.scripts]
 uniserve-worker = "uniserve_worker.main:main"
 

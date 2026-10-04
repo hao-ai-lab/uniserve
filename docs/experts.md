@@ -27,3 +27,36 @@ The colocated MegaMoE provider requires directly mapped NVLink peer memory. Its 
 The CUDA graph owner captures computation around copy submissions that cannot be placed inside a graph. External events preserve dependencies between graph segments and copies. Published peer pages, local slots and their mappings must outlive all contexts and graph replays that read them. Release the owner only after those readers have retired.
 
 Install the locked GPU extra to use native expert providers and NVSHMEM. Distributed correctness tests cover weighted outputs, empty participation, repeated graph replay, unequal token counts and independent prefetch progress; they do not establish a preferred deployment ratio or throughput.
+
+## Asymmetric expert exchange
+
+An `ExpertExchange` can separate source-only attention ranks from expert-only ranks in one ordered communicator. `attention_ranks=N` assigns the first N members to sources; the remaining M members own equal contiguous expert partitions. Source parameters may remain on meta, while expert ranks materialize the same `FusedMoE` modules used by colocated execution. `source_group` identifies the global ranks that execute one source forward together, such as a tensor-parallel group. Every member must declare consistent, disjoint source groups, and a source group starts only after all its members submit the same capability.
+
+The runtime retains the model's logical expert ids, hidden widths and numerical representation. A transport provider owns wire ids, padding, communication streams and staging buffers. Every rank agrees the capability and capacity and visits the same layer sequence, including empty sources. Dispatch and combine alternate before reusing a buffer; unused capacity has invalid expert ids and zero route weights. The expert equation applies each route weight exactly once, after its output projection, before returning the completed logical rows to the source.
+
+| Transport | Source/expert placement | Numerical representation |
+| --- | --- | --- |
+| `deepep` | Unequal N/M groups or colocated expert parallelism | BF16 or calibrated NVFP4; packed values and scales travel without requantization |
+| `megamoe` | Unequal N/M groups | Split MegaMoE on supported Blackwell devices, with MXFP8 or calibrated NVFP4 SiLU experts |
+
+DeepEP uses the NCCL GIN API; the locked environment pins NCCL 2.30.4 for both PyTorch and the native transport. Split MegaMoE pads physical hidden and intermediate tiles to multiples of 512 and removes padding from returned rows. Padding preserves encoded values and scales. Native sources from the pinned FastAFD reference and their dependency licenses are packaged with `uniserve-kernels` and built through the shared content-addressed JIT owner. Kernel preparation completes before peers enter device communication waits.
+
+Expert correctness checks use the weighted equation on the actual encoded values and scales. Fused kernels and tensor-parallel reductions can round intermediate results differently, including resolving a later router tie differently. Quantized complete-model checks therefore follow the selected provider's autoregressive tokens and compare its eager and captured execution; they do not require identical routing or tokens across different kernel implementations. Transport identity, route weighting, finite outputs and resource lifetime remain required in every representation.
+
+## Numerical microbatches
+
+`Microbatches` borrows an ordered sequence of `ExecutionContext` instances with distinct CUDA streams, scratch and expert exchanges on one device. Immutable model weights may be shared. Each invocation receives one ordinary numerical callable per context and returns results in the same order:
+
+```python
+from contextlib import closing
+
+from uniserve.runtime import Microbatches
+
+# Contexts, inputs and model weights have already been loaded and bound.
+with closing(Microbatches(contexts)) as run:
+    outputs = run((lambda: model(inputs[0]), lambda: model(inputs[1])))
+```
+
+The runtime starts host turns in index order and yields after posting an expert dispatch. Model forwards keep their local variables and ordinary sequential composition. The caller's CUDA stream forks into the context streams and joins them before returning, so `CUDAGraph` captures the complete dependency graph. Warm every numerical specialization through this owner before capture; CUDA library handles belong to the host threads that execute them.
+
+A host exception wakes suspended calls, waits for their host turns to retire and propagates the original failure. One owner cannot run overlapping invocations. Distributed process failure remains the deployment owner's responsibility. Normal retirement drains device readers before closing graphs, microbatch owners, contexts and collective buffers. Split MegaMoE uses one persistent expert launch over the complete layer-major, microbatch-minor sequence, avoiding competing persistent grids that could wait on different peers.

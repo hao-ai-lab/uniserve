@@ -10,6 +10,7 @@ from uniserve.quantization import QuantizedTensor, RowOrder
 
 from ..backends import moe as moe_backend
 from ..backends import record_kernel_choice
+from ..microbatches import yield_microbatch
 from . import capturing
 
 
@@ -49,11 +50,7 @@ class MoEBinding:
             if weights is not None and weights.contains(module)
             else None
         )
-        self.exchange = (
-            exchange
-            if module.expert_group.size > 1 and self.weights is None
-            else None
-        )
+        self.exchange = exchange if self.weights is None else None
         if (
             module.expert_group.size > 1
             and exchange is None
@@ -75,11 +72,21 @@ class MoEBinding:
         )
 
     def prepare(self, size: TextSize):
+        if (
+            self.exchange is not None
+            and self.exchange.source_only
+            and self.exchange.transport != "megamoe"
+        ):
+            # This rank owns routing/attention, so its expert parameters can
+            # remain meta. Only expert ranks prepare numerical expert kernels.
+            self.provider = "remote"
+            self._invalid_expert = self.module.num_experts
+            return None
         previous = self.operator
         if self.exchange is not None:
             # Received rows, not local tokens, reach the local experts.
             size = TextSize(
-                self.module.expert_group.size * self.exchange.max_tokens, 1
+                self.exchange.group.size * self.exchange.max_tokens, 1
             )
         if previous is not None and previous.size.num_tokens >= size.num_tokens:
             return previous
@@ -92,7 +99,14 @@ class MoEBinding:
                 max(size.num_tokens, self.size.num_tokens),
                 max(size.batch_size, self.size.batch_size),
             )
-        if self.exchange is not None and self.exchange.transport == "megamoe":
+        if (
+            self.exchange is not None
+            and self.exchange.transport == "megamoe"
+            and self.exchange.attention_ranks
+        ):
+            operator = self.exchange.fused.prepare(self.module, size)
+            provider = None
+        elif self.exchange is not None and self.exchange.transport == "megamoe":
             # The fused kernel exchanges, computes and combines in one launch
             # over the exchange's symmetric staging.
             from ..backends.moe import megamoe
@@ -119,8 +133,12 @@ class MoEBinding:
         if previous is not None:
             previous.close()
         self.operator = operator
-        self.provider = provider.name
-        self._invalid_expert = provider.invalid_expert(self.module)
+        self.provider = "megamoe" if provider is None else provider.name
+        self._invalid_expert = (
+            self.module.num_experts
+            if provider is None
+            else provider.invalid_expert(self.module)
+        )
         record_kernel_choice()
         return operator
 
@@ -134,7 +152,7 @@ class MoEBinding:
         all-to-all exchange and the representation its hidden states travel
         in. Empty until the call site is prepared.
         """
-        if self.operator is None:
+        if self.provider is None:
             return []
         projections = {}
         for name in ("up_gate", "down"):
@@ -152,10 +170,12 @@ class MoEBinding:
             {}
             if self.exchange is None
             else {
-                "expert_parallel": self.module.expert_group.size,
-                "exchange": "megamoe"
-                if self.exchange.transport == "megamoe"
-                else "flashinfer_mnnvl_alltoall",
+                "expert_parallel": self.exchange.group.size,
+                "exchange": (
+                    "flashinfer_mnnvl_alltoall"
+                    if self.exchange.transport == "alltoall"
+                    else self.exchange.transport
+                ),
                 # The representation hidden states travel in.
                 "payload": "nvfp4"
                 if isinstance(self.operator, moe_backend.NVFP4Operator)
@@ -191,7 +211,20 @@ class MoEBinding:
             exchange.enter(id(self.module))
             output = operator(hidden, topk_ids, topk_weights)
         else:
-            if isinstance(operator, moe_backend.NVFP4Operator):
+            quantizer = self.module.up_gate.input_quantizer
+            if (
+                exchange.transport == "deepep"
+                and quantizer is not None
+                and quantizer.format == "nvfp4"
+                and not isinstance(hidden, QuantizedTensor)
+            ):
+                # Both roles declare the same wire representation, including
+                # empty participants whose expert parameters may remain meta.
+                hidden = quantizer.quantize(hidden)
+            if (
+                isinstance(operator, moe_backend.NVFP4Operator)
+                and exchange.transport == "alltoall"
+            ):
                 # NVFP4 experts read their input encoding, so the hidden
                 # states travel in it: rows already stored in it as they
                 # are, BF16 rows (a join's empty rows included) encoded here
@@ -207,10 +240,20 @@ class MoEBinding:
                 topk_weights,
                 invalid_expert=self._invalid_expert,
             )
+            yield_microbatch()
             # The local experts combine their routes into this rank's
             # partial sums, and the exchange sums the ranks' partials (FP32,
             # one BF16 rounding).
-            output = exchange.combine(operator(*received), hidden.shape[0])
+            partial = (
+                torch.zeros(
+                    received[0].shape,
+                    dtype=received[0].dtype,
+                    device=received[0].device,
+                )
+                if exchange.source_only
+                else operator(*received)
+            )
+            output = exchange.combine(partial, hidden.shape[0])
         # Uncombined, the combined rows are the one-route Routes of unit
         # weight.
         if combine:

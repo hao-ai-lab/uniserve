@@ -1,0 +1,4 @@
+# Retain upstream native sources and licenses; focus default PR diffs on bindings.
+uniserve_kernels/src/uniserve_kernels/deepep/csrc/** linguist-vendored
+uniserve_kernels/src/uniserve_kernels/deepgemm/csrc/** linguist-vendored
+uniserve_kernels/src/uniserve_kernels/megamoe/** linguist-vendored
