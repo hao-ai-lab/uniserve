@@ -946,7 +946,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         if committed:
             pool.validate_updates((commit,))
             pool.apply_updates((commit,))
-            source = pool.reserve_current_publication(
+            source = pool.reserve_current_export(
                 product,
                 request_pool_idx=1,
                 page_table=pages,
@@ -957,14 +957,14 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
                 width=176,
             )
         else:
-            source = pool.reserve_publication(
+            source = pool.reserve_export(
                 product, request_pool_idx=1, page_table=pages, latent_units=11
             )
         offset = 0
         for span in source.spans:
             location = transport.publish(span, offset=(offset, 0))
             locations.append(location)
-            pool.retain_publication(
+            pool.retain_export(
                 source, transport.publication_retirement(location)
             )
             readers.append(
@@ -1114,12 +1114,12 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
     staging = pool.stage(((1,),), (4,))[0]
     staging.value.fill_(1)
     pool.initialize(1, staging, latent_units=4)
-    source = pool.reserve_publication(
+    source = pool.reserve_export(
         product, request_pool_idx=1, page_table=(1,), latent_units=4
     )
     locator = transport.publish(source.spans[0], consumers=(1,))
     retirement = transport.publication_retirement(locator)
-    pool.retain_publication(source, retirement)
+    pool.retain_export(source, retirement)
     commit = latent_output(1, (1,), 4, 16, 64)
     pool.validate_updates((commit,))
     pool.apply_updates((commit,))
@@ -1214,11 +1214,11 @@ def test_unknown_latent_reader_completion_retains_only_its_pages(
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(4), StaticDim(4))),
     )
-    source = pool.reserve_publication(
+    source = pool.reserve_export(
         product, request_pool_idx=1, page_table=(1,), latent_units=4
     )
     retirement: Completion = Completion()
-    pool.retain_publication(source, retirement)
+    pool.retain_export(source, retirement)
     if ending == "failed":
         retirement.set_exception(RuntimeError("reader completion unknown"))
         error = RuntimeError

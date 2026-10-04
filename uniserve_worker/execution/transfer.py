@@ -210,7 +210,7 @@ def _publish_current_latent(
 ) -> TensorPublication:
     """Publish the committed trajectory's current latent pages as a product.
 
-    ``LatentPool.reserve_current_publication`` requires the staged start
+    ``LatentPool.reserve_current_export`` requires the staged start
     step, the input's generation, units, raster and pages to match the
     slot's committed trajectory. The product must be the call's declared
     latent output, and publication leaves the request's generation and step
@@ -227,7 +227,7 @@ def _publish_current_latent(
     if params is None or staging is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
-    source = latent_pool.reserve_current_publication(
+    source = latent_pool.reserve_current_export(
         product,
         request_pool_idx=row.request.request_pool_idx,
         page_table=params.page_table,
@@ -262,8 +262,8 @@ def publish_latent_source(
     """Publish reserved latent page spans as one latent product.
 
     The spans are published as a ``[latent_units, latent_width]`` tensor in
-    the pool's storage dtype. Each publication's retirement future is
-    attached through ``LatentPool.retain_publication``, which keeps the page
+    the pool's storage dtype. Each export's completion is
+    attached through ``LatentPool.retain_export``, which keeps the page
     bank until its readers retire. The locators are recorded on the
     product's pending output.
     """
@@ -294,7 +294,7 @@ def publish_latent_source(
     locations = publish_tensor(
         transports,
         source.spans,
-        retain=partial(pool.retain_publication, source),
+        retain=partial(pool.retain_export, source),
         consumers=row.call.consumer_slots,
     )
     request.exported_locators.extend(locations)

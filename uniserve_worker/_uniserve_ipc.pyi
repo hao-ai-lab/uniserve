@@ -506,7 +506,7 @@ class LatentPool:
         height: int,
         width: int,
     ) -> None: ...
-    def reserve_publication(
+    def reserve_export(
         self,
         product: TensorRef,
         *,
@@ -514,7 +514,7 @@ class LatentPool:
         page_table: Sequence[int],
         latent_units: int,
     ) -> LatentExport: ...
-    def reserve_current_publication(
+    def reserve_current_export(
         self,
         product: TensorRef,
         *,
@@ -526,7 +526,7 @@ class LatentPool:
         height: int,
         width: int,
     ) -> LatentExport: ...
-    def retain_publication(
+    def retain_export(
         self, source: LatentExport, retirement: Completion
     ) -> None: ...
     def release_buffers(self, buffers: Sequence[BufferId]) -> None: ...
