@@ -43,7 +43,7 @@ def lane():
 def _run(lane: HostLane, schedule):
     task = schedule(lane.reserve())
     task.submit_if_ready()
-    return task.promise.result(timeout=30)
+    return task.result(timeout=30)
 
 
 def test_borrowed_and_imported_units_assemble_with_audio_into_an_artifact(
@@ -155,6 +155,6 @@ def test_a_dropped_request_refuses_further_assembly(lane):
     mux.drop(request.request_id)
     audio.submit_if_ready()
     with pytest.raises(WorkerError, match="discarded"):
-        audio.promise.result(timeout=30)
+        audio.result(timeout=30)
     with pytest.raises(WorkerError, match="no active session"):
         mux.finalize_artifact(request, lane.reserve(), CALL)

@@ -464,7 +464,7 @@ class PendingOutput:
         if self._buffer is None or not self._buffer.ready():
             return False
         for task in self.host.tasks:
-            if not task.ready():
+            if not task.done():
                 return False
         return True
 

@@ -1,44 +1,44 @@
-//! Shared completion of a physical storage access.
+//! Shared operation results, waits, and completion observers.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::{Error, Result};
 
-/// Only successful completion permits storage reuse. Failure and cancellation
-/// report the operation's outcome without asserting that a device has stopped.
+/// The operation's result. Physical storage requires a successful retirement
+/// signal; a task result alone does not establish that a device has stopped.
 #[derive(Debug)]
-pub enum Outcome<E> {
-    Success,
+pub enum Outcome<E, T = ()> {
+    Success(T),
     Failed(Arc<E>),
     Cancelled,
 }
 
-impl<E> Clone for Outcome<E> {
+impl<E, T: Clone> Clone for Outcome<E, T> {
     fn clone(&self) -> Self {
         match self {
-            Self::Success => Self::Success,
+            Self::Success(value) => Self::Success(value.clone()),
             Self::Failed(error) => Self::Failed(Arc::clone(error)),
             Self::Cancelled => Self::Cancelled,
         }
     }
 }
 
-struct State<E, C> {
-    outcome: Option<Outcome<E>>,
+struct State<E, C, T> {
+    outcome: Option<Outcome<E, T>>,
     callbacks: Vec<C>,
 }
 
-/// One completion shared by a producer and its storage consumers.
+/// One completion shared by an operation and its consumers.
 ///
 /// Errors and callbacks belong to the backend. Completing an operation returns
 /// its callbacks so the backend can dispatch them after releasing the lock.
-pub struct Completion<E, C> {
-    state: Mutex<State<E, C>>,
+pub struct Completion<E, C, T = ()> {
+    state: Mutex<State<E, C, T>>,
     ready: Condvar,
 }
 
-impl<E, C> Default for Completion<E, C> {
+impl<E, C, T> Default for Completion<E, C, T> {
     fn default() -> Self {
         Self {
             state: Mutex::new(State {
@@ -50,8 +50,8 @@ impl<E, C> Default for Completion<E, C> {
     }
 }
 
-impl<E, C> Completion<E, C> {
-    fn state(&self) -> MutexGuard<'_, State<E, C>> {
+impl<E, C, T: Clone> Completion<E, C, T> {
+    fn state(&self) -> MutexGuard<'_, State<E, C, T>> {
         // No user code mutates state under the lock. A panicking reference
         // visitor cannot leave a partially completed operation.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -62,17 +62,17 @@ impl<E, C> Completion<E, C> {
     }
 
     pub fn succeeded(&self) -> bool {
-        matches!(self.state().outcome, Some(Outcome::Success))
+        matches!(self.state().outcome, Some(Outcome::Success(_)))
     }
 
-    pub fn outcome(&self) -> Option<Outcome<E>> {
+    pub fn outcome(&self) -> Option<Outcome<E, T>> {
         self.state().outcome.clone()
     }
 
     /// Return None only if the timeout expires before completion.
-    pub fn wait(&self, timeout: Option<Duration>) -> Option<Outcome<E>> {
+    pub fn wait(&self, timeout: Option<Duration>) -> Option<Outcome<E, T>> {
         let state = self.state();
-        let pending = |state: &mut State<E, C>| state.outcome.is_none();
+        let pending = |state: &mut State<E, C, T>| state.outcome.is_none();
         let state = match timeout {
             Some(timeout) => {
                 self.ready
@@ -99,14 +99,14 @@ impl<E, C> Completion<E, C> {
         None
     }
 
-    pub fn complete(&self, result: std::result::Result<(), E>) -> Result<Vec<C>> {
+    pub fn complete(&self, result: std::result::Result<T, E>) -> Result<Vec<C>> {
         let mut state = self.state();
         if state.outcome.is_some() {
             return Err(Error::State("operation has already completed"));
         }
 
         state.outcome = Some(match result {
-            Ok(()) => Outcome::Success,
+            Ok(value) => Outcome::Success(value),
             Err(error) => Outcome::Failed(Arc::new(error)),
         });
         let callbacks = std::mem::take(&mut state.callbacks);
@@ -131,7 +131,7 @@ impl<E, C> Completion<E, C> {
 
     /// Trace backend references for garbage collection. The visitor must not
     /// invoke user code or re-enter this completion while the lock is held.
-    pub fn visit<R>(&self, visitor: impl FnOnce(Option<&Outcome<E>>, &[C]) -> R) -> R {
+    pub fn visit<R>(&self, visitor: impl FnOnce(Option<&Outcome<E, T>>, &[C]) -> R) -> R {
         let state = self.state();
         visitor(state.outcome.as_ref(), &state.callbacks)
     }
@@ -165,7 +165,7 @@ mod tests {
                 rx.recv()?;
                 assert!(matches!(
                     waiter.join().map_err(|_| "waiter panicked")?,
-                    Some(Outcome::Success)
+                    Some(Outcome::Success(()))
                 ));
                 subscriber.join().map_err(|_| "subscriber panicked")??;
                 Ok(())

@@ -45,15 +45,15 @@ def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() 
     )
     successor = pool.reserve().configure(
         lambda: 2,
-        dependencies=(predecessor.promise,),
+        dependencies=(predecessor,),
         profile_name="output.successor",
     )
     try:
         successor.submit_if_ready()
         predecessor.abandon()
         with pytest.raises(CancelledError):
-            successor.promise.result(timeout=5)
-        assert predecessor.promise.cancelled()
+            successor.result(timeout=5)
+        assert predecessor.cancelled()
     finally:
         predecessor.abandon()
         successor.abandon()

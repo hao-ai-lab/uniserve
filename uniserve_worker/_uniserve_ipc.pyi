@@ -14,7 +14,7 @@ its numerical ``BufferBinding`` views.
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from types import TracebackType
-from typing import Any, Generic, Self, TypeVar, final
+from typing import Any, Generic, ParamSpec, Self, TypeVar, final
 
 import torch
 
@@ -56,6 +56,8 @@ __all__ = [
     "Executor",
     "GroupShape",
     "GroupTable",
+    "HostLane",
+    "HostTask",
     "KVCacheManager",
     "LatentExport",
     "LatentImport",
@@ -79,6 +81,65 @@ __all__ = [
 ]
 
 Source = TypeVar("Source")
+Args = ParamSpec("Args")
+
+@final
+class HostLane:
+    """Bounded host threads, with capacity reserved before task inputs exist."""
+
+    def __new__(cls, *, max_inflight: int, workers: int) -> Self: ...
+    @property
+    def max_inflight(self) -> int: ...
+    @property
+    def reserved(self) -> int: ...
+    def set_completion_wake(self, wake: Callable[[], None] | None) -> None: ...
+    def reserve(self) -> HostTask[Any]: ...
+    def abort(self) -> None:
+        """Stop admission without joining running work; cancel queued work."""
+    def close(self) -> None:
+        """Cancel unsubmitted tasks, then drain all submitted work."""
+
+@final
+class HostTask(Generic[Source]):
+    """An admitted action, its result, and its physical input lease.
+
+    Result observers may immediately reserve returned lane capacity. A failed
+    or cancelled input producer keeps its lease until physical retirement is
+    known. Cancelling queued work retains capacity until a thread dequeues it.
+    """
+
+    def configure(
+        self,
+        action: Callable[[], Source],
+        *,
+        dependencies: Sequence[HostTask[Any] | Completion] = (),
+        input_ready: Callable[[], bool] | None = None,
+        input_completion: Callable[[], Completion] | None = None,
+        release: Callable[[], None] | None = None,
+        profile_name: str = "uniserve.host",
+    ) -> Self:
+        """Attach numerical work; take the input lease only on success."""
+    def submit(
+        self,
+        function: Callable[Args, Source],
+        *args: Args.args,
+        **kwargs: Args.kwargs,
+    ) -> Self:
+        """Configure and submit an immediate action without an input lease."""
+    def submit_if_ready(self) -> None:
+        """Submit once the input is CPU-readable; repeat calls are harmless."""
+    def done(self) -> bool: ...
+    def cancelled(self) -> bool: ...
+    def result(self, timeout: float | None = None) -> Source:
+        """Wait without holding the GIL; preserve the original action error."""
+    def exception(
+        self, timeout: float | None = None
+    ) -> BaseException | None: ...
+    def add_done_callback(self, callback: Callable[[Self], object]) -> None: ...
+    def abandon(self) -> None:
+        """Cancel only unsubmitted work; submitted readers keep their inputs."""
+    def cancel(self) -> bool:
+        """Withdraw unsubmitted or queued work; running actions finish."""
 
 @final
 class KVCacheManager:

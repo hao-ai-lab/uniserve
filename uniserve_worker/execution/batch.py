@@ -291,7 +291,7 @@ class BatchState:
             and all(
                 dependency.done() for dependency in self.storage_dependencies
             )
-            and all(task.ready() for task in self.image_tasks.values())
+            and all(task.done() for task in self.image_tasks.values())
             and all(ticket.ready() for ticket in self.input_tickets())
             and all(
                 write.completion.done() for write in self.cache_imports.values()
@@ -364,7 +364,7 @@ class BatchState:
         tickets = tuple(self.input_tickets())
         dependencies = (
             self.storage_dependencies
-            + tuple(task.promise for task in self.image_tasks.values())
+            + tuple(self.image_tasks.values())
             + tuple(write.completion for write in self.cache_imports.values())
         )
         if self.predicate_buffer is not None and self.predicates_sealed:
