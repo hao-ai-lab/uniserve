@@ -6,8 +6,15 @@ single-token KV pages holding only its valid keys, so partial and empty
 blocks need no score mask. Dense-prefix query rows attend their complete
 valid key domain through FlashAttention-4's SM90 kernel, whose device
 predicate excludes each tile's padding. Query packing preserves owner and
-interval order, including a final short interval. FA3's scheduler narrows
-KV offsets to signed 32 bits, so a large query domain splits into
+interval order, including a final short interval.
+
+SM120/SM121 use a native kernel that reads the block maps directly. Other
+devices use FlashInfer's FA2 block-sparse prefill over a head-flattened BSR
+in which each selected 64x64 block carries 512 bytes of packed
+key-validity bits, excluding the padding keys of partial and empty tiles.
+
+FA3's scheduler narrows single-token page offsets, and FA2 its packed-mask
+byte offsets, to signed 32 bits. A query domain exceeding either splits into
 independent windows, each retaining its queries' complete selected keys.
 
 Startup graphs capture the CSR updates together with attention. Serialized
@@ -58,7 +65,10 @@ _TILE = 64
 _HEAD_DIM = 128
 _FLOAT_WORKSPACE_BYTES = 128 * 1024 * 1024
 _INDEX_BLOCK = 256
-_MAX_TOKEN_REFERENCES = torch.iinfo(torch.int32).max
+# Packed key-validity bytes of one selected 64x64 BSR block.
+_MASK_BYTES = _TILE * _TILE // 8
+# Largest offset one FA3 or FA2 launch can address.
+_MAX_OFFSET = torch.iinfo(torch.int32).max
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +125,7 @@ class _TokenPlan:
 class _Queries:
     """Independent query windows over the same complete key domain."""
 
-    plans: tuple[_TokenPlan, ...]
+    plans: tuple[_SparsePlan | _TokenPlan, ...]
     heads: int
     owners: int
     rows: int
@@ -326,8 +336,14 @@ if triton is not None:
 
         # Pack each key tile's valid rows as bits, 8 rows per byte, so the
         # FlashInfer BSR mask marks exactly valid_sizes[tile] keys per tile.
+        # Every BSR entry owns tile_rows * bytes_per_tile_row mask bytes, so
+        # the row's byte offset is formed in 64 bits rather than from the
+        # int32 entry offset.
         bytes_per_tile_row = tile_rows // 8
         mask_bytes = selected_count * tile_rows * bytes_per_tile_row
+        row_mask = packed_mask + destination.to(tl.int64) * (
+            tile_rows * bytes_per_tile_row
+        )
         for begin in tl.range(0, mask_bytes, 1024):
             byte_offsets = begin + tl.arange(0, 1024)
             active = byte_offsets < mask_bytes
@@ -351,9 +367,7 @@ if triton is not None:
                 8,
             )
             tl.store(
-                packed_mask
-                + destination * tile_rows * bytes_per_tile_row
-                + byte_offsets,
+                row_mask + byte_offsets,
                 ((1 << bits) - 1).to(tl.uint8),
                 mask=active,
             )
@@ -398,6 +412,29 @@ def available(device: torch.device | None = None) -> bool:
 def import_error() -> BaseException | None:
     """Return the dependency error that disabled this provider, if any."""
     return _FLASHINFER_IMPORT_ERROR or _TRITON_IMPORT_ERROR
+
+
+def _csr_buffers(
+    entries: int, rows: int, *, hopper: bool
+) -> tuple[str, dict[str, BufferConfig]]:
+    """Name and size the mutable CSR one plan rewrites before each launch.
+
+    ``rows`` counts the plan's head-flattened query tiles and ``entries``
+    their declared key tiles. No extent decreases as either grows, so
+    requirements sized for the most rows and entries of several plans
+    contain each plan's own.
+    """
+    if hopper:
+        # FA3 lists one single-token page per key row of each selected tile.
+        return "vsa_sparse_tokens", {
+            "indices": BufferConfig((entries * _TILE,), torch.int32),
+            "indptr": BufferConfig((rows + 1,), torch.int32),
+            "counts": BufferConfig((rows,), torch.int32),
+        }
+    return "vsa_bsr_rows", {
+        "indices": BufferConfig((entries,), torch.int32),
+        "mask": BufferConfig((entries * _MASK_BYTES,), torch.uint8),
+    }
 
 
 def _plan_for(
@@ -465,29 +502,47 @@ def _plan_for(
     )
     counts = counts.index_select(1, selected).reshape(-1)
     hopper = torch.cuda.get_device_capability(query.device)[0] == 9
-    if (
-        hopper
-        and int(counts.sum(dtype=torch.int64)) * _TILE > _MAX_TOKEN_REFERENCES
-    ):
-        # FA3's WorkTileInfo narrows KV offsets to signed int even when the
-        # public CSR uses int64. Independent query windows preserve every
-        # selected key while bounding each launch's scheduler offsets.
+    # Each declared key tile occupies 64 single-token pages of FA3's CSR or
+    # 512 bytes of FA2's packed mask. FA3's WorkTileInfo narrows KV offsets
+    # to signed int even when the public CSR uses int64, and FA2 locates
+    # each query tile's mask bits through int32 byte offsets.
+    entry_size = _TILE if hopper else _MASK_BYTES
+    if int(counts.sum(dtype=torch.int64)) * entry_size > _MAX_OFFSET:
+        # Independent query windows preserve every selected key while
+        # bounding each launch's offsets.
         costs = (
             counts.view(heads, owners, interval_tiles).sum(
                 dim=(0, 1), dtype=torch.int64
             )
-            * _TILE
+            * entry_size
         )
         windows = []
         begin, capacity = 0, 0
         for tile, cost in enumerate(costs.tolist()):
-            if cost > _MAX_TOKEN_REFERENCES:
-                raise ValueError("one VSA query tile exceeds FA3's KV capacity")
-            if capacity + cost > _MAX_TOKEN_REFERENCES:
+            if cost > _MAX_OFFSET:
+                raise ValueError(
+                    "one VSA query tile exceeds the 32-bit attention offsets"
+                )
+            if capacity + cost > _MAX_OFFSET:
                 windows.append((begin, tile))
                 begin, capacity = tile, 0
             capacity += cost
         windows.append((begin, interval_tiles))
+
+        if state.transient is not None:
+            # Windows run one after another and borrow one shared backing,
+            # but a window larger than every backing allocates another and
+            # earlier ones stay bound to their plans. Greedy windows all
+            # approach the offset limit, so borrow the largest extents
+            # before planning any of them.
+            role, requirements = _csr_buffers(
+                max(int(costs[begin:end].sum()) for begin, end in windows)
+                // entry_size,
+                heads * owners * max(end - begin for begin, end in windows),
+                hopper=hopper,
+            )
+            state.transient(role, requirements, query.device)
+
         plans = tuple(
             _plan_for(
                 state,
@@ -524,13 +579,9 @@ def _plan_for(
         state.plans[cache_key] = plan
         return plan
     indptr = indptr_host.to(query.device)
-    index_count = int(indptr_host[-1])
-    requirements = {
-        "indices": BufferConfig((index_count,), torch.int32),
-        "mask": BufferConfig(
-            (index_count * _TILE * (_TILE // 8),), torch.uint8
-        ),
-    }
+    role, requirements = _csr_buffers(
+        int(indptr_host[-1]), counts.numel(), hopper=False
+    )
     # Every launch rewrites its complete index list and key-validity mask.
     # Serialized layers and layouts can borrow the same mutable backing;
     # retaining a mask per layer would multiply quadratic storage by depth.
@@ -542,7 +593,7 @@ def _plan_for(
             for name, config in requirements.items()
         }
         if state.transient is None
-        else state.transient("vsa_bsr_rows", requirements, query.device)
+        else state.transient(role, requirements, query.device)
     )
     indices = maps["indices"]
     indices.zero_()
@@ -589,8 +640,9 @@ def _plan_for(
         )
     # The execution interface indexes packed-mask bytes. Own these offsets
     # alongside the mutable bits, deriving each query tile from its exact
-    # CSR extent.
-    mask_offsets.copy_((indptr_host * (_TILE * _TILE // 8)).to(query.device))
+    # CSR extent. They are formed in 64 bits; query windows keep every one
+    # within FlashInfer's int32 mask offsets.
+    mask_offsets.copy_(indptr_host.to(torch.int64) * _MASK_BYTES)
 
     plan = _SparsePlan(
         wrapper,
@@ -629,18 +681,16 @@ def _token_plan(
     batch_size = indptr_host.numel() - 1
     index_dtype = torch.int32
     token_indptr = indptr_host * _TILE
-    requirements = {
-        "indices": BufferConfig((int(token_indptr[-1]),), index_dtype),
-        "indptr": BufferConfig((batch_size + 1,), index_dtype),
-        "counts": BufferConfig((batch_size,), torch.int32),
-    }
+    role, requirements = _csr_buffers(
+        int(indptr_host[-1]), batch_size, hopper=True
+    )
     maps = (
         {
             name: torch.empty(config.shape, dtype=config.dtype, device=device)
             for name, config in requirements.items()
         }
         if state.transient is None
-        else state.transient("vsa_sparse_tokens", requirements, device)
+        else state.transient(role, requirements, device)
     )
     indices = maps["indices"]
     indices.zero_()
