@@ -1,18 +1,15 @@
-//! Registered transfer buffers and their outstanding readers.
-//!
-//! Backends supply fences and acknowledgment checks. The registry decides when
-//! a revoked buffer has no remaining users and can be handed back to its owner.
+//! Numerical sources and callbacks for the native buffer registry.
 
-use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyBaseException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
+use uniserve_worker::{BufferRegistry as NativeBufferRegistry, RegisteredBuffer};
 
-use super::completion::Completion;
-use super::error::{invalid, invariant, resource};
+use super::completion::{Completion, CompletionRef};
+use super::error::{invalid, invariant, native_error};
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum BufferKey {
@@ -21,27 +18,12 @@ enum BufferKey {
     Cuda(String),
 }
 
-#[derive(PartialEq)]
-enum Status {
-    Active,
-    Revoked,
-    Reclaiming,
-}
-
-struct RegisteredBuffer {
+struct Source {
     locator: Py<PyAny>,
-    source: Py<PyAny>,
-    retirement: Py<Completion>,
-    readers: usize,
-    pending: bool,
-    failed: bool,
-    status: Status,
+    value: Py<PyAny>,
 }
 
-struct RegistryState {
-    buffers: HashMap<BufferKey, RegisteredBuffer>,
-    closing: bool,
-}
+type Registry = NativeBufferRegistry<BufferKey, Source, CompletionRef>;
 
 /// Retain source storage until its producer and all granted readers finish.
 /// Reclaim callbacks and retirement observers run outside the registry lock.
@@ -49,11 +31,10 @@ struct RegistryState {
 pub(crate) struct BufferRegistry {
     #[pyo3(get)]
     name: String,
-    capacity: usize,
     reclaim: Py<PyAny>,
     drain: Py<PyAny>,
     settled: Py<PyAny>,
-    state: Mutex<RegistryState>,
+    state: Mutex<Registry>,
 }
 
 #[pymethods]
@@ -67,9 +48,8 @@ impl BufferRegistry {
         drain: Py<PyAny>,
         settled: Py<PyAny>,
     ) -> PyResult<Self> {
-        if capacity == 0 {
-            return Err(PyValueError::new_err("buffer capacity must be positive"));
-        }
+        let state =
+            Registry::new(capacity).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let suffix: String = py
             .import("uuid")?
             .call_method0("uuid4")?
@@ -78,14 +58,10 @@ impl BufferRegistry {
 
         Ok(Self {
             name: format!("uniserve-buffers-{suffix}"),
-            capacity,
             reclaim,
             drain,
             settled,
-            state: Mutex::new(RegistryState {
-                buffers: HashMap::new(),
-                closing: false,
-            }),
+            state: Mutex::new(state),
         })
     }
 
@@ -102,26 +78,17 @@ impl BufferRegistry {
         let key = self.key(locator.bind(py))?;
         self.remove_finished(py)?;
         let retirement = Py::new(py, Completion::new())?;
-        let mut state = self.lock(py)?;
-        if state.closing || state.buffers.len() >= self.capacity {
-            return Err(resource(py, "transport buffer capacity is unavailable"));
-        }
-        if state.buffers.contains_key(&key) {
-            return Err(invalid(py, "buffer is already registered"));
-        }
-        state.buffers.insert(
-            key,
-            RegisteredBuffer {
-                locator,
-                source,
-                retirement,
-                readers: 0,
+        self.lock(py)?
+            .register(
+                key,
+                Source {
+                    locator,
+                    value: source,
+                },
+                CompletionRef::new(py, retirement),
                 pending,
-                failed: false,
-                status: Status::Active,
-            },
-        );
-        Ok(())
+            )
+            .map_err(|error| native_error(py, error))
     }
 
     /// Inspect owner-held storage, including after reads have been revoked.
@@ -129,7 +96,8 @@ impl BufferRegistry {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
         Ok(Self::buffer(&mut state, &key, locator)?
-            .source
+            .source()
+            .value
             .clone_ref(py))
     }
 
@@ -138,25 +106,19 @@ impl BufferRegistry {
     fn acquire(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
-        let buffer = Self::buffer(&mut state, &key, locator)?;
-        if buffer.status != Status::Active {
-            return Err(invalid(py, "buffer is no longer available for reading"));
-        }
-        if buffer.failed {
-            return Err(resource(py, "buffer producer failed before readiness"));
-        }
-        buffer.readers += 1;
-        Ok(buffer.source.clone_ref(py))
+        Ok(Self::buffer(&mut state, &key, locator)?
+            .acquire()
+            .map_err(|error| native_error(py, error))?
+            .value
+            .clone_ref(py))
     }
 
     fn release_reader(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<()> {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
-        let buffer = Self::buffer(&mut state, &key, locator)?;
-        buffer.readers = buffer
-            .readers
-            .checked_sub(1)
-            .ok_or_else(|| invariant(py, "buffer read was already released"))?;
+        Self::buffer(&mut state, &key, locator)?
+            .release_reader()
+            .map_err(|error| native_error(py, error))?;
         drop(state);
         self.reclaim_buffer(py, &key)
     }
@@ -171,25 +133,16 @@ impl BufferRegistry {
         error: Option<Py<PyBaseException>>,
         producer_completed: bool,
     ) -> PyResult<()> {
-        if !producer_completed && error.is_none() {
-            return Err(PyValueError::new_err(
-                "unknown producer completion requires a failure",
-            ));
-        }
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
         let buffer = Self::buffer(&mut state, &key, locator)?;
-        buffer.pending = !producer_completed;
-        buffer.failed = error.is_some();
-        let retirement = buffer.retirement.clone_ref(py);
+        let callbacks = buffer
+            .complete(error, producer_completed)
+            .map_err(|error| native_error(py, error))?;
+        let retirement = buffer.retirement().owner.clone_ref(py);
         drop(state);
 
-        if !producer_completed
-            && !retirement.borrow(py).done()
-            && let Some(error) = error
-        {
-            Completion::set_exception(retirement.bind(py), error)?;
-        }
+        Completion::notify(retirement.bind(py), callbacks);
         self.reclaim_buffer(py, &key)
     }
 
@@ -202,14 +155,12 @@ impl BufferRegistry {
     ) -> PyResult<Option<Py<Completion>>> {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
-        if !state.buffers.contains_key(&key) {
+        if state.get_mut(&key).is_none() {
             return Ok(None);
         }
         let buffer = Self::buffer(&mut state, &key, locator)?;
-        if buffer.status == Status::Active {
-            buffer.status = Status::Revoked;
-        }
-        let retirement = buffer.retirement.clone_ref(py);
+        buffer.release();
+        let retirement = buffer.retirement().owner.clone_ref(py);
         drop(state);
         self.reclaim_buffer(py, &key)?;
         Ok(Some(retirement))
@@ -219,27 +170,18 @@ impl BufferRegistry {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
         Ok(Self::buffer(&mut state, &key, locator)?
-            .retirement
+            .retirement()
+            .owner
             .clone_ref(py))
     }
 
     fn awaiting_acknowledgment(&self, py: Python<'_>) -> PyResult<bool> {
-        Ok(self
-            .lock(py)?
-            .buffers
-            .values()
-            .any(|buffer| buffer.status == Status::Revoked && !buffer.pending))
+        Ok(self.lock(py)?.awaiting_acknowledgment())
     }
 
     /// Sweep backend acknowledgments and discard successfully retired storage.
     fn reap(&self, py: Python<'_>) -> PyResult<()> {
-        let keys: Vec<_> = self
-            .lock(py)?
-            .buffers
-            .iter()
-            .filter(|(_, buffer)| buffer.status == Status::Revoked)
-            .map(|(key, _)| key.clone())
-            .collect();
+        let keys: Vec<_> = self.lock(py)?.revoked().cloned().collect();
         for key in keys {
             self.reclaim_buffer(py, &key)?;
         }
@@ -247,34 +189,21 @@ impl BufferRegistry {
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        state.closing = true;
-        for buffer in state.buffers.values_mut() {
-            if buffer.status == Status::Active {
-                buffer.status = Status::Revoked;
-            }
-        }
-        drop(state);
+        self.lock(py)?.close();
         self.reap(py)?;
 
         let sources: Vec<_> = self
             .lock(py)?
-            .buffers
-            .values()
-            .filter(|buffer| buffer.status == Status::Reclaiming)
-            .map(|buffer| buffer.source.clone_ref(py))
+            .draining()
+            .map(|source| source.value.clone_ref(py))
             .collect();
         for source in sources {
             self.drain.bind(py).call1((source,))?;
         }
         self.remove_finished(py)?;
-        if !self.lock(py)?.buffers.is_empty() {
-            return Err(resource(
-                py,
-                "buffer completion or readers remain unresolved; storage is retained",
-            ));
-        }
-        Ok(())
+        self.lock(py)?
+            .require_retired()
+            .map_err(|error| native_error(py, error))
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
@@ -286,17 +215,17 @@ impl BufferRegistry {
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
             Err(TryLockError::WouldBlock) => return Ok(()),
         };
-        for buffer in state.buffers.values() {
-            visit.call(&buffer.locator)?;
-            visit.call(&buffer.source)?;
-            visit.call(&buffer.retirement)?;
+        for buffer in state.buffers() {
+            visit.call(&buffer.source().locator)?;
+            visit.call(&buffer.source().value)?;
+            visit.call(&buffer.retirement().owner)?;
         }
         Ok(())
     }
 }
 
 impl BufferRegistry {
-    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, RegistryState>> {
+    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, Registry>> {
         self.state
             .lock_py_attached(py)
             .map_err(|_| invariant(py, "buffer registry lock is poisoned"))
@@ -319,17 +248,16 @@ impl BufferRegistry {
     }
 
     fn buffer<'a>(
-        state: &'a mut RegistryState,
+        state: &'a mut Registry,
         key: &BufferKey,
         locator: &Bound<'_, PyAny>,
-    ) -> PyResult<&'a mut RegisteredBuffer> {
+    ) -> PyResult<&'a mut RegisteredBuffer<Source, CompletionRef>> {
         let buffer = state
-            .buffers
             .get_mut(key)
             .ok_or_else(|| invalid(locator.py(), "buffer is no longer registered"))?;
         // The immutable locator describes the actual view, including its fence.
         // Comparing it directly avoids serializing and hashing tensor metadata.
-        if !buffer.locator.bind(locator.py()).eq(locator)? {
+        if !buffer.source().locator.bind(locator.py()).eq(locator)? {
             return Err(invalid(
                 locator.py(),
                 "buffer locator changed its registered view",
@@ -340,25 +268,16 @@ impl BufferRegistry {
 
     fn reclaim_buffer(&self, py: Python<'_>, key: &BufferKey) -> PyResult<()> {
         let mut state = self.lock(py)?;
-        let Some(buffer) = state.buffers.get_mut(key) else {
+        let Some(buffer) = state.get_mut(key) else {
             return Ok(());
         };
-        if buffer.status != Status::Revoked || buffer.pending || buffer.readers != 0 {
+        let Some((source, retirement)) = buffer
+            .begin_reclaim(|source| self.settled.bind(py).call1((&source.value,))?.is_truthy())?
+        else {
             return Ok(());
-        }
-        // Hold the lock while inspecting mapped acknowledgment words: another
-        // reaper must not unmap the source during this read-only backend query.
-        if !self
-            .settled
-            .bind(py)
-            .call1((&buffer.source,))?
-            .is_truthy()?
-        {
-            return Ok(());
-        }
-        buffer.status = Status::Reclaiming;
-        let source = buffer.source.clone_ref(py);
-        let retirement = buffer.retirement.clone_ref(py);
+        };
+        let source = source.value.clone_ref(py);
+        let retirement = retirement.owner.clone_ref(py);
         drop(state);
 
         if let Err(error) = self.reclaim.bind(py).call1((source, &retirement)) {
@@ -371,20 +290,7 @@ impl BufferRegistry {
     }
 
     fn remove_finished(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        let mut finished = Vec::new();
-        // Failed retirement keeps its backing storage held, so close can report
-        // it without permitting reuse after an unknown device completion.
-        for (key, buffer) in &state.buffers {
-            if buffer.status == Status::Reclaiming && buffer.retirement.borrow(py).succeeded() {
-                finished.push(key.clone());
-            }
-        }
-        let retired: Vec<_> = finished
-            .iter()
-            .filter_map(|key| state.buffers.remove(key))
-            .collect();
-        drop(state);
+        let retired = self.lock(py)?.take_finished();
         drop(retired);
         Ok(())
     }

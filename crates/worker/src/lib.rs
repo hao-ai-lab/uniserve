@@ -6,6 +6,7 @@ mod error;
 mod executor;
 mod host;
 mod kv_cache;
+mod registry;
 mod request;
 mod transfer;
 
@@ -15,5 +16,6 @@ pub use error::{Error, Result};
 pub use executor::{Backend, Batch, Executor, Submission};
 pub use host::{HostAction, HostLane, HostTask};
 pub use kv_cache::KVCacheManager;
+pub use registry::{BufferRegistry, RegisteredBuffer};
 pub use request::{Request, RequestPool, RequestProgress};
 pub use transfer::{ReadReservation, TransferCapacity, TransferTicket};
