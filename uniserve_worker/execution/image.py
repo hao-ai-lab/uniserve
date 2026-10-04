@@ -447,7 +447,7 @@ def publish_image(
         max_bytes=int(call.bounds.max_completion_bytes),
         state=state,
     )
-    request.progress = replace(calls.require_progress(request), flow_step=0)
+    request.progress = replace(request.progress, flow_step=0)
     request.latent.update.params = params
     request.latent.update.generation = int(latent_input.generation)
     request.latent.update.step = int(params.start_step)

@@ -31,7 +31,7 @@ import torch
 from uniserve.diffusion import Branch
 from uniserve.tensors import OutputLayout
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import calls, canvas
+from uniserve_worker.execution import canvas
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.output import PendingOutput, capture_samples
@@ -466,9 +466,7 @@ def prepare_forward_rows(
                 staging.value[: int(params.latent_units)],
                 guide,
                 timestep,
-                conditioning_position=int(
-                    calls.require_progress(row).logical_position
-                ),
+                conditioning_position=int(row.progress.logical_position),
                 device=model_runner.call_devices(call)[1],
             )
             forward.extend((index, task) for task in rows)

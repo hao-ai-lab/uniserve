@@ -150,12 +150,11 @@ def execute(
         request.cache_installation = (source, output, installed)
 
         outcome = image.non_state_outcome(call, state=state)
-        if outcome.progress is not None:
-            outcome.progress = replace(
-                outcome.progress,
-                kv_visible_len=int(installed.published_extent),
-                kv_computed_len=int(installed.published_extent),
-            )
+        outcome.progress = replace(
+            outcome.progress,
+            kv_visible_len=int(installed.published_extent),
+            kv_computed_len=int(installed.published_extent),
+        )
     else:
         inputs = call.tensor_inputs()
         outputs = call.tensor_outputs()

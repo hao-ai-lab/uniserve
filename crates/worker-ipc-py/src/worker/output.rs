@@ -130,7 +130,7 @@ impl OutputBuffer {
         pool.reap(py)
     }
 
-    fn ready(&self, py: Python<'_>) -> PyResult<bool> {
+    pub(super) fn ready(&self, py: Python<'_>) -> PyResult<bool> {
         let ready = self.query_ready(py)?;
         if ready {
             Completion::resolve(self.completion.bind(py))?;
@@ -143,7 +143,12 @@ impl OutputBuffer {
         Ok(self.completion.clone_ref(py))
     }
 
-    fn read_tokens(&self, py: Python<'_>, offset: usize, count: usize) -> PyResult<Py<PyAny>> {
+    pub(super) fn read_tokens(
+        &self,
+        py: Python<'_>,
+        offset: usize,
+        count: usize,
+    ) -> PyResult<Py<PyAny>> {
         if let Some(cached) = self.tokens.bind(py).get_item((offset, count))? {
             return Ok(cached.unbind());
         }
@@ -169,7 +174,11 @@ impl OutputBuffer {
         Ok(values.unbind())
     }
 
-    fn logprob_values(&self, py: Python<'_>, span: (usize, usize, usize)) -> PyResult<Py<PyAny>> {
+    pub(super) fn logprob_values(
+        &self,
+        py: Python<'_>,
+        span: (usize, usize, usize),
+    ) -> PyResult<Py<PyAny>> {
         let (offset, count, row) = span;
         let key = (offset, count);
         let details = match self.logprobs.bind(py).get_item(key)? {
@@ -191,7 +200,7 @@ impl OutputBuffer {
         Ok(details.get_item(row)?.unbind())
     }
 
-    fn observe(&self, py: Python<'_>, row: usize) -> PyResult<(u64, u64)> {
+    pub(super) fn observe(&self, py: Python<'_>, row: usize) -> PyResult<(u64, u64)> {
         self.ready(py)?;
         let timing = self
             .lock(py)?
@@ -200,7 +209,7 @@ impl OutputBuffer {
         Ok((timing[2], timing[3]))
     }
 
-    fn timing(&self, py: Python<'_>) -> PyResult<(u64, u64, u64, u64)> {
+    pub(super) fn timing(&self, py: Python<'_>) -> PyResult<(u64, u64, u64, u64)> {
         let [queued, device, copy, host] = self
             .lock(py)?
             .timing()
@@ -208,7 +217,7 @@ impl OutputBuffer {
         Ok((queued, device, copy, host))
     }
 
-    fn discard(&self, py: Python<'_>, row: usize) -> PyResult<()> {
+    pub(super) fn discard(&self, py: Python<'_>, row: usize) -> PyResult<()> {
         self.lock(py)?.discard(row);
         Ok(())
     }

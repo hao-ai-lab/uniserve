@@ -22,6 +22,11 @@ import uniserve_worker.storage.kv_cache as kv_cache
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
+from uniserve_worker.execution.output import (
+    HostResult,
+    LatentResult,
+    TokenResult,
+)
 from uniserve_worker.execution.request import RequestProgress, RequestResult
 from uniserve_worker.protocol.batch import (
     Batch,
@@ -29,10 +34,21 @@ from uniserve_worker.protocol.batch import (
     BufferAllocation,
     LatentParams,
     NewRequest,
+    TensorPublication,
 )
-from uniserve_worker.protocol.call import Call, ImageParams
+from uniserve_worker.protocol.call import (
+    Call,
+    CallKind,
+    CallStatus,
+    ErrorCode,
+    ImageParams,
+)
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
-from uniserve_worker.protocol.output import BatchOutput
+from uniserve_worker.protocol.output import (
+    BatchOutput,
+    FinishFlags,
+    RequestOutput,
+)
 from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import (
     KvTransfer,
@@ -72,6 +88,7 @@ __all__ = [
     "LatentUpdate",
     "OutputBuffer",
     "OutputPool",
+    "PendingOutput",
     "Request",
     "RequestPool",
     "ReadReservation",
@@ -148,6 +165,59 @@ class BatchInputs:
         kv_importer: KVImporter | None,
     ) -> None:
         """Release consumers once, attempting every resource after failures."""
+
+@final
+class PendingOutput:
+    """Own result decoding and output retirement for one numerical call."""
+
+    def __new__(
+        cls, call: Call, request: Request, buffer: OutputBuffer, row: int
+    ) -> Self: ...
+
+    call: Call
+    request: Request
+    token: TokenResult
+    latent: LatentResult
+    host: HostResult
+    progress: RequestProgress
+    status: CallStatus
+    error_code: ErrorCode | None
+    finish_flags: FinishFlags
+    product_generations: tuple[int, ...]
+    tensor_exports: dict[BufferId, ExportLocations]
+    cache_exports: dict[BufferId, ExportLocations]
+    exported_locators: list[Locator]
+    cache_publication: tuple[BufferId, KvTransfer] | None
+    cache_installation: tuple[BufferId, BufferId, KvTransfer] | None
+    device_reads: list[TensorRead]
+    feature_reads: list[TensorRead]
+    writes: list[Buffer]
+    predicate: tuple[torch.Tensor, bool] | None
+    token_write: Buffer | None
+    transition_write: Buffer | None
+    completion_write: Buffer | None
+    producer_write: Buffer | None
+    kv_output: KvTransfer | None
+    products: tuple[TensorPublication, ...]
+    _reports_output: bool
+
+    @property
+    def request_key(self) -> RequestKey: ...
+    @property
+    def call_id(self) -> CallId: ...
+    @property
+    def kind(self) -> CallKind: ...
+    @property
+    def value(self) -> RequestOutput | None: ...
+    @property
+    def _buffer(self) -> OutputBuffer | None: ...
+    def ready(self) -> bool: ...
+    def materialize(self) -> RequestOutput:
+        """Resolve completed work once; retain accepted progress on failure."""
+    def release_execution_references(self) -> None:
+        """Drop borrowed views after their owning stores commit or discard."""
+    def abandon(self) -> None:
+        """Discard delivery while in-flight readers keep their storage."""
 
 @final
 class OutputBuffer:

@@ -943,7 +943,7 @@ def execute(
     elif call.kind is MediaCall.DENOISING:
         params = trajectory_params(call, state=state)
         start_step, step_count = int(params.start_step), int(params.step_count)
-        if start_step != calls.require_progress(request).flow_step:
+        if start_step != request.progress.flow_step:
             raise invalid_descriptor(
                 "denoising does not begin at the selected request step"
             )
@@ -1004,17 +1004,14 @@ def execute(
             previous=start_step,
         )
         request.progress = replace(
-            calls.require_progress(request),
+            request.progress,
             flow_step=start_step + step_count,
         )
 
         # Only the call that completes denoising may declare products, and
         # it publishes the step's result, the final samples.
         if call.outputs:
-            if (
-                calls.require_progress(request).flow_step
-                != media.num_inference_steps
-            ):
+            if request.progress.flow_step != media.num_inference_steps:
                 raise invalid_descriptor(
                     "final latent products require completed denoising"
                 )

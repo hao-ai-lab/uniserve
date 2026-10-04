@@ -15,6 +15,7 @@ mod kv_cache;
 mod kv_import;
 mod latent;
 mod output;
+mod pending;
 mod protocol;
 mod registry;
 mod request;
@@ -52,6 +53,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<latent::LatentUpdate>()?;
     module.add_class::<output::OutputBuffer>()?;
     module.add_class::<output::OutputPool>()?;
+    module.add_class::<pending::PendingOutput>()?;
     module.add_class::<registry::BufferRegistry>()?;
     module.add_class::<request::Request>()?;
     module.add_class::<request::RequestPool>()?;

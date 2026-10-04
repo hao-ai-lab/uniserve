@@ -50,8 +50,8 @@ class RequestProgress:
 class RequestResult:
     """An observed call status and the progress accepted by its output owner.
 
-    Built by `PendingOutput.request_result` after materialization and applied
-    by `RequestPool.apply_result`.
+    Direct callers apply these values with `RequestPool.apply_result`;
+    serving accepts native completion updates in the executor.
     """
 
     request_key: RequestKey

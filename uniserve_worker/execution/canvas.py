@@ -89,7 +89,7 @@ def prepare_rows(
             "canvas rows must partition the call's tokens over its prefix"
         )
 
-    start = int(calls.require_progress(request).logical_position)
+    start = int(request.progress.logical_position)
     # The token tuple converts through NumPy, which reads Python ints far
     # faster than a tensor construction does.
     tokens = torch.from_numpy(np.asarray(call.input_token_ids, dtype=np.int64))
@@ -243,7 +243,7 @@ def prepare_step(
         raise invalid_descriptor("the canvas step exceeds its step limit")
     canvas_slots.advance(slot, step.block, step.step)
 
-    start = int(calls.require_progress(request).logical_position)
+    start = int(request.progress.logical_position)
     return CanvasStepRow(
         forward_mode=ForwardMode.TOKEN_DENOISING,
         request_pool_idx=slot,

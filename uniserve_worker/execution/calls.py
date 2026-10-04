@@ -31,18 +31,6 @@ def output_generations(call: Call) -> tuple[int, ...]:
     )
 
 
-def require_progress(output: PendingOutput) -> RequestProgress:
-    """Return a pending output's progress for a state-consuming call.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when the output has no progress.
-    """
-    progress = output.progress
-    if progress is None:
-        raise invalid_descriptor("call does not consume request progress")
-    return progress
-
-
 def execution_runtime(
     request: PendingOutput,
     cache: tuple[int, int, int] | None,
