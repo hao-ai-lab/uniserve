@@ -3,7 +3,7 @@
 Ownership runs through consumer completion.
 """
 
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import replace
 from threading import Event
 
@@ -13,6 +13,7 @@ import torch
 from tests.python.fixtures.cache import mha_pool
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import WorkerError, WorkerErrorCode
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.protocol.batch import (
@@ -261,7 +262,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             (2,), start=0, key=independent, value=independent
         )
         output = outputs.acquire(1, token_capacity=8, devices=(device,))
-        completion = output.completion_future()
+        completion = output.completion()
         cache.retain_execution(
             request, _table(cache, (1,)), length=3, completion=completion
         )
@@ -325,7 +326,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         # A subsequent lease over the same bounded output storage must retain
         # its own computation even though the preceding future is complete.
         next_output = outputs.acquire(1, token_capacity=8, devices=(device,))
-        next_completion = next_output.completion_future()
+        next_completion = next_output.completion()
         cache.retain_execution(
             request, _table(cache, (1,)), length=4, completion=next_completion
         )
@@ -419,7 +420,7 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
             buffer.owner,
             _table(pool, pages),
             length=3,
-            completion=output.completion_future(),
+            completion=output.completion(),
         )
         readers[1].close()
         for future in dependencies:
@@ -1218,7 +1219,7 @@ def test_unknown_latent_reader_completion_retains_only_its_pages(
     source = pool.reserve_publication(
         product, request_pool_idx=1, page_table=(1,), latent_units=4
     )
-    retirement: Future[None] = Future()
+    retirement: Completion = Completion()
     pool.retain_publication(source, retirement)
     if ending == "failed":
         retirement.set_exception(RuntimeError("reader completion unknown"))

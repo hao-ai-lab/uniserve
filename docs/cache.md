@@ -12,6 +12,8 @@ The worker's native `BlockTables` owns installed assignments, per-slot capacity,
 
 `KVCacheManager` retains execution accesses, publications and imports until their asynchronous readers retire. Writers must satisfy those dependencies before changing an overlapping token interval; cancelled or failed completion alone does not authorize reuse. Transfers preserve each group's interval and publication lineage, including partial final pages and different pipeline or head partitions.
 
+Storage owners share a native `Completion` for each asynchronous access. CUDA fences and transport acknowledgments resolve these signals; tensor references alone do not establish completion. A successful signal permits reuse, while failure preserves the original error and keeps the affected storage held. Waiting releases the Python GIL, and observers run outside the completion lock.
+
 Recycling resets the state a subsequent writer reads, including FP8 initialization flags and scales. Payload bytes may remain when every group's representation keeps them finite and visibility excludes unwritten positions. Pools containing different storage element types clear recycled payloads because reinterpreting stale bytes may produce nonfinite values. Explicit `zero_units` clears payloads and metadata regardless of representation.
 
 Serving attention uses staged host mirrors of sequence lengths and start pages. Worker execution contexts disable deriving those mirrors from device tensors and reject a missing mirror when a selected provider needs it. Direct Python callers may allow derivation outside capture. These obligations accompany the [attention input contract](attention.md).

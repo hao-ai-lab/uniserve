@@ -923,7 +923,7 @@ def defer_image_encoding(
         return reservation.configure(
             encode,
             input_ready=state.output_buffer.ready,
-            input_completion=state.output_buffer.completion_future,
+            input_completion=state.output_buffer.completion,
             release=release,
             profile_name="uniserve.image.encode",
         )

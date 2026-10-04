@@ -10,10 +10,10 @@ location and by which consumers each backend reaches, and returns one
 
 from __future__ import annotations
 
-import concurrent.futures
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import resource_error, unsupported_setup
 from uniserve_worker.protocol.transfer import Locator
 from uniserve_worker.transport.interface import Transport
@@ -33,7 +33,7 @@ def publish_tensor(
     transports: Mapping[str, Transport],
     source: torch.Tensor | tuple[torch.Tensor, ...],
     *,
-    retain: Callable[[concurrent.futures.Future[None]], None],
+    retain: Callable[[Completion], None],
     offset: tuple[int, ...] | None = None,
     consumers: Sequence[int] = (),
     host: bool = False,
@@ -55,7 +55,7 @@ def publish_tensor(
     Args:
         transports: The rank's configured backends, keyed by mechanism name.
         source: The product, as one tensor or as ordered first-axis spans.
-        retain: Receives each publication's retirement future, which
+        retain: Receives each publication's retirement signal, which
             completes once that backend has handed its storage back.
         offset: The product's offset within the logical tensor it belongs
             to, zero on every axis when omitted.

@@ -12,7 +12,6 @@ named consumer is still reading it.
 
 from __future__ import annotations
 
-import concurrent.futures
 import ctypes
 import queue
 import selectors
@@ -24,6 +23,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from uniserve.runtime import EventPool
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.protocol.transfer import (
     Locator,
@@ -245,18 +245,14 @@ class ShmTransport(Transport):
             int(slot) in self._host_slots for slot in consumers
         )
 
-    def publication_retirement(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None]:
+    def publication_retirement(self, locator: Locator) -> Completion:
         return self._buffers.retirement(locator)
 
     def set_completion_wake(self, wake: Any) -> None:
         self._completion_wake = wake
         self._reads.set_completion_wake(wake)
 
-    def _reclaim(
-        self, source: _ShmSource, retirement: concurrent.futures.Future[None]
-    ) -> None:
+    def _reclaim(self, source: _ShmSource, retirement: Completion) -> None:
         # Producer completion and reader acknowledgments have both arrived.
         self._free_segment(source.shm, source.nbytes, source.registered)
         source.registered = None
@@ -631,9 +627,7 @@ class ShmTransport(Transport):
                 ownership.pop_all().close,
             )
 
-    def release(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None] | None:
+    def release(self, locator: Locator) -> Completion | None:
         if not isinstance(locator.transport, PosixShmTransfer):
             raise invalid_descriptor(
                 "shared storage release requires a shared storage locator"

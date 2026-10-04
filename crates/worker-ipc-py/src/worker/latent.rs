@@ -11,9 +11,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule, PySlice, PyTuple};
 use uniserve_worker_ipc::{BufferId, RequestKey};
 
+use super::completion::Completion;
 use super::error::{invalid, resource};
 use super::protocol::{buffer_id, request_key};
-use super::transfer::{TransferTicket, retirement_succeeded};
+use super::transfer::TransferTicket;
 
 #[derive(Default)]
 struct LatentSlot {
@@ -123,7 +124,7 @@ pub(crate) struct LatentExport {
     pages: Vec<usize>,
     #[pyo3(get)]
     spans: Py<PyTuple>,
-    retirements: Vec<Py<PyAny>>,
+    retirements: Vec<Py<Completion>>,
     released: bool,
 }
 
@@ -605,7 +606,7 @@ impl LatentPool {
         &self,
         py: Python<'_>,
         source: &Bound<'_, LatentExport>,
-        retirement: Py<PyAny>,
+        retirement: Py<Completion>,
     ) -> PyResult<()> {
         let mut value = source.borrow_mut();
         if value.released
@@ -942,9 +943,9 @@ impl LatentPool {
             let source = source.borrow(py);
             if requests.contains(&source.id.owner) {
                 for future in &source.retirements {
-                    let future = future.bind(py);
-                    if future.call_method0("done")?.is_truthy()? {
-                        future.call_method0("result")?;
+                    let completion = future.borrow(py);
+                    if completion.done() {
+                        completion.result(py, None)?;
                     }
                 }
             }
@@ -1304,7 +1305,7 @@ impl LatentPool {
             }
             let mut retired = true;
             for future in &source.retirements {
-                retired &= retirement_succeeded(future.bind(py))?;
+                retired &= future.borrow(py).succeeded();
             }
             if retired {
                 exports.push(*id);

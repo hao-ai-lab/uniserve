@@ -690,8 +690,9 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
         transport.reap()
         retirement.result(timeout=5)
         replacement = transport.publish(source)
-        with pytest.raises(WorkerError, match="retired"):
+        with pytest.raises(WorkerError) as retired:
             _await_ticket(consumer.fetch(locator, device=torch.device("cpu")))
+        assert retired.value.code is WorkerErrorCode.INVALID_DESCRIPTOR
     finally:
         for channel, process in readers:
             if process.is_alive():
@@ -866,8 +867,9 @@ def test_shm_producer_failure_fails_its_pending_read_and_preserves_independent_r
         )
         with pytest.raises(WorkerError, match="failed before readiness"):
             pending.result()
-        with pytest.raises(WorkerError, match="retired, invalid"):
+        with pytest.raises(WorkerError) as retired:
             _await_ticket(consumer.fetch(locator, device=torch.device("cpu")))
+        assert retired.value.code is WorkerErrorCode.INVALID_DESCRIPTOR
         actual = _await_ticket(
             consumer.fetch(healthy, device=torch.device("cpu"))
         )

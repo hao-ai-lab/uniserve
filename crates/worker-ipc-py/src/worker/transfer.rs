@@ -14,13 +14,6 @@ use pyo3::types::{PyCFunction, PyDict, PyTuple};
 
 use super::error::{invalid, invariant, resource, unsupported};
 
-/// Failed or cancelled retirement cannot authorize physical storage reuse.
-pub(crate) fn retirement_succeeded(future: &Bound<'_, PyAny>) -> PyResult<bool> {
-    Ok(future.call_method0("done")?.is_truthy()?
-        && !future.call_method0("cancelled")?.is_truthy()?
-        && future.call_method0("exception")?.is_none())
-}
-
 struct CapacityState {
     used: u64,
     reads_free: usize,

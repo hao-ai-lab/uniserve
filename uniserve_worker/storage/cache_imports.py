@@ -40,6 +40,7 @@ import torch
 from uniserve.cache import mha
 from uniserve.cache.state import decode_region
 from uniserve.quantization import QuantizedTensor, Quantizer
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.protocol.identity import BufferId, RequestKey
@@ -126,7 +127,7 @@ class CacheImport:
     publication: KvTransfer
     ranges: dict[int, tuple[int, int]]
     completion: Future[None] = field(default_factory=Future)
-    retirement: Future[None] = field(default_factory=Future)
+    retirement: Completion = field(default_factory=Completion)
     cancelled: bool = False
     released: bool = False
     _tickets: set[TransferTicket] = field(default_factory=set, repr=False)
@@ -220,11 +221,11 @@ class CacheImports:
 
     def dependencies(
         self, ranges: tuple[tuple[int, int, int], ...]
-    ) -> tuple[Future[None], ...]:
+    ) -> tuple[Completion, ...]:
         """Return retirements of imports whose destinations overlap ``ranges``.
 
         ``ranges`` holds ``(page, offset, count)`` token spans. Each returned
-        future is a registered import's `CacheImport.retirement`.
+        completion is a registered import's `CacheImport.retirement`.
         """
         with self._condition:
             return tuple(
