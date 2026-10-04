@@ -15,7 +15,6 @@ finished.
 
 from __future__ import annotations
 
-import concurrent.futures
 import time
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -25,6 +24,7 @@ import torch
 
 from uniserve.runtime import EventPool
 from uniserve.runtime.device import canonical_device
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import WorkerError, WorkerErrorCode, resource_error
 from uniserve_worker.profiling import timing_events_enabled
 from uniserve_worker.sampling.output import decode_logprobs
@@ -83,7 +83,7 @@ class OutputBuffer:
         "_ready_ns",
         "_timing",
         "_timing_events",
-        "_completion_future",
+        "_completion",
         "_completion_registered",
         "_release_to_pool",
         "_released_to_pool",
@@ -186,7 +186,7 @@ class OutputBuffer:
         self._timing: tuple[int, int, int, int] | None = None
         self._timing_events = timing_events_enabled()
 
-        self._completion_future: concurrent.futures.Future[None] | None = None
+        self._completion: Completion | None = None
         self._completion_registered = False
 
         self._release_to_pool = release_to_pool
@@ -269,7 +269,7 @@ class OutputBuffer:
         self._timing = None
         self._timing_events = timing_events_enabled()
 
-        self._completion_future = None
+        self._completion = None
         self._completion_registered = False
         self._released_to_pool = False
 
@@ -479,7 +479,7 @@ class OutputBuffer:
         """Return whether all sealed device-copy events have completed.
 
         The first true result stamps the ready time and resolves the
-        completion future.
+        completion signal.
         """
         if not self._sealed:
             return False
@@ -491,55 +491,59 @@ class OutputBuffer:
         self._complete_dependents()
         return True
 
-    def completion_future(self) -> concurrent.futures.Future[None]:
+    def completion(self) -> Completion:
         """Expose this output lease's device fence to physical storage owners.
 
-        The future belongs to this lease even after the pinned buffer is reused.
+        The signal belongs to this lease even after the pinned buffer is reused.
         It adds no CUDA event or host/device payload allocation.
         """
-        if self._completion_future is None:
-            self._completion_future = concurrent.futures.Future()
-        future = self._completion_future
+        if self._completion is None:
+            self._completion = Completion()
+        completion = self._completion
         self._bind_completion()
         if self.ready():
             self._complete_dependents()
-        return future
+        return completion
 
     def _bind_completion(self) -> None:
-        """Arrange for the completion future to resolve once sealed events do.
+        """Resolve the completion signal once sealed events finish.
 
-        Runs once per lease after both sealing and a completion-future
-        request. The future resolves at once when the lease is already ready,
+        Runs once per lease after both sealing and a completion request.
+        The signal resolves at once when the lease is already ready,
         its events are released, or it has no CUDA events.
         """
-        future = self._completion_future
-        if not self._sealed or future is None or self._completion_registered:
+        completion = self._completion
+        if (
+            not self._sealed
+            or completion is None
+            or self._completion_registered
+        ):
             return
         self._completion_registered = True
         if self._ready_ns or self._events_released or not self._events:
-            self._resolve_completion(future)
+            self._resolve_completion(completion)
             return
 
         # Physical retirement is independent of whether a host reads the output
         # report. Retain the existing fences until the event loop observes them,
-        # and bind the callback to this lease's future across buffer reuse.
+        # and bind the callback to this lease's signal across buffer reuse.
         for device in self.devices:
             self.event_pool.retain(self._events[str(device)], device)
         self.event_pool.defer_release(
             tuple(self._events.values()),
-            future,
-            completed=partial(self._resolve_completion, future),
+            completion,
+            completed=partial(self._resolve_completion, completion),
         )
 
     @staticmethod
-    def _resolve_completion(future: concurrent.futures.Future[None]) -> None:
-        if not future.done():
-            future.set_result(None)
+    def _resolve_completion(completion: Completion) -> None:
+        if not completion.done():
+            completion.set_result(None)
 
     def _complete_dependents(self) -> None:
-        future = self._completion_future
-        if future is not None:
-            self._resolve_completion(future)
+        completion = self._completion
+        if completion is not None:
+            self._resolve_completion(completion)
 
     def read_tokens(self, offset: int, count: int) -> tuple[int, ...]:
         """Read a registered integer range once its producer copy completes.
@@ -752,7 +756,7 @@ class OutputBuffer:
     def events_released(self) -> None:
         """Receive completion of an event-pool asynchronous release.
 
-        Also resolves the completion future and returns the buffer to its
+        Also resolves the completion signal and returns the buffer to its
         pool when no CPU reader remains.
         """
         self._release_pending = False

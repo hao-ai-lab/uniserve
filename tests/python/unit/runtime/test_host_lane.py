@@ -1,12 +1,13 @@
 """CPU admission and pinned-input lifetime at the public executor boundary."""
 
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from threading import Event
 
 import pytest
 import torch
 
 from uniserve.runtime import EventPool
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.storage.output import OutputPool
@@ -109,9 +110,12 @@ def test_ready_does_not_submit_and_failure_releases_capacity() -> None:
         pool.close()
 
 
-def test_cancel_preserves_input_until_its_producer_completes() -> None:
+@pytest.mark.parametrize("outcome", ("success", "failure", "cancelled"))
+def test_cancel_preserves_input_until_its_producer_completes(
+    outcome: str,
+) -> None:
     pool = HostLane(max_inflight=1, workers=1)
-    copied: Future[None] = Future()
+    copied: Completion = Completion()
     released = Event()
     task = pool.reserve().configure(
         lambda: 1,
@@ -124,8 +128,13 @@ def test_cancel_preserves_input_until_its_producer_completes() -> None:
         task.abandon()
         assert task.promise.cancelled()
         assert not released.is_set()
-        copied.set_result(None)
-        assert released.is_set()
+        if outcome == "success":
+            copied.set_result(None)
+        elif outcome == "failure":
+            copied.set_exception(RuntimeError("device completion unknown"))
+        else:
+            copied.cancel()
+        assert released.is_set() == (outcome == "success")
     finally:
         pool.close()
 
@@ -147,7 +156,7 @@ def test_abandoned_output_remains_readable_until_cpu_reader_finishes() -> None:
     task = pool.reserve().configure(
         read,
         input_ready=buffer.ready,
-        input_completion=buffer.completion_future,
+        input_completion=buffer.completion,
         release=buffer.retain_cpu_reader(),
     )
     try:

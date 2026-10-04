@@ -4,18 +4,18 @@ A producer publishes a product through a `Transport` and receives a `Locator`
 naming where its bytes are. The engine carries that locator to consumers,
 whose own transport of the same kind reads from it into a destination and
 returns a `TransferTicket`. The producer keeps the published storage
-unwritten until the publication's retirement future completes after the
+unwritten until the publication's retirement signal completes after the
 engine releases it.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.protocol.transfer import Locator, WorkerEndpoint
 from uniserve_worker.transport.ticket import TransferTicket
 
@@ -119,21 +119,17 @@ class Transport(ABC):
         """
 
     @abstractmethod
-    def release(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None] | None:
+    def release(self, locator: Locator) -> Completion | None:
         """Revoke new reads of a publication and return its retirement.
 
-        The returned future completes once the owner may reuse the published
+        The returned signal completes once the owner may reuse the published
         storage. `None` means this instance holds no registration for the
         locator; `channel` always returns `None`, since it retains nothing
         after publishing.
         """
 
     @abstractmethod
-    def publication_retirement(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None]:
+    def publication_retirement(self, locator: Locator) -> Completion:
         """Observe physical ownership completion.
 
         The publication is not revoked.

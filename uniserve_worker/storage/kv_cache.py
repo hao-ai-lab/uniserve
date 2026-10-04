@@ -11,7 +11,7 @@ kinds of owner retain unit intervals, each as ``unit -> (token offset, token
 count)``:
 
 - Execution accesses (``CacheAccess``): the units a model call reads or
-  writes, retained until the batch's completion future succeeds.
+  writes, retained until the batch's completion signal succeeds.
 - Publications (``CacheExport``): an immutable token interval exported
   through transports, retained until the buffer is released and every
   physical registration has retired.
@@ -29,7 +29,6 @@ publication or installation must extend.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -39,6 +38,7 @@ import torch
 
 from uniserve.math import ceil_div
 from uniserve.runtime import PrefixCache
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
@@ -81,7 +81,7 @@ class CacheExport:
 
     buffer: BufferId
     ranges: dict[int, tuple[int, int]]
-    retirements: tuple[Future[None], ...] = ()
+    retirements: tuple[Completion, ...] = ()
     released: bool = False
 
 
@@ -94,7 +94,7 @@ class CacheAccess:
     interval per unit.
     """
 
-    completion: Future[None]
+    completion: Completion
     requests: set[RequestKey]
     ranges: dict[int, tuple[int, int]]
 
@@ -213,11 +213,11 @@ class KVCacheManager:
         self.exports: dict[BufferId, ExportLocations] = {}
         self._sources: dict[BufferId, CacheExport] = {}
 
-        # Execution accesses by completion future, indexed by unit.
-        # ``_execution_completed`` runs as a future callback on the thread
+        # Execution accesses by completion signal, indexed by unit.
+        # ``_execution_completed`` runs as an observer on the thread
         # that resolves the completion, so both maps are mutated under
         # ``_execution_lock``.
-        self._executions: dict[Future[None], CacheAccess] = {}
+        self._executions: dict[Completion, CacheAccess] = {}
         self._execution_units: dict[int, set[CacheAccess]] = {}
         self._execution_lock = RLock()
 
@@ -318,7 +318,7 @@ class KVCacheManager:
         table: GroupTable,
         *,
         length: int,
-        completion: Future[None],
+        completion: Completion,
     ) -> None:
         """Retain a model access until its device work completes.
 
@@ -367,12 +367,12 @@ class KVCacheManager:
         if register:
             completion.add_done_callback(self._execution_completed)
 
-    def _execution_completed(self, completion: Future[None]) -> None:
+    def _execution_completed(self, completion: Completion) -> None:
         # A failed or cancelled completion leaves its access registered: its
         # ranges stay blocked, ``retirement_ready`` re-raises the failure for
         # its requests, and ``close`` refuses to proceed.
         with self._execution_lock:
-            if completion.cancelled() or completion.exception() is not None:
+            if not completion.succeeded():
                 return
             execution = self._executions.pop(completion, None)
             if execution is None:
@@ -386,7 +386,7 @@ class KVCacheManager:
 
     def _execution_dependencies(
         self, ranges: Sequence[tuple[int, int, int]]
-    ) -> tuple[Future[None], ...]:
+    ) -> tuple[Completion, ...]:
         """Return completions of accesses that overlap the given spans."""
         with self._execution_lock:
             return tuple(
@@ -434,7 +434,7 @@ class KVCacheManager:
     ) -> CacheExport:
         """Retain the exact published spans before exporting any view.
 
-        The caller attaches every registration's retirement future with
+        The caller attaches every registration's retirement signal with
         ``retain_publication`` and releases this reservation
         (``release_buffers``) if publication is abandoned before semantic
         visibility.
@@ -456,7 +456,7 @@ class KVCacheManager:
         return source
 
     def retain_publication(
-        self, source: CacheExport, retirement: Future[None]
+        self, source: CacheExport, retirement: Completion
     ) -> None:
         """Retain the published interval until this registration retires.
 
@@ -541,8 +541,8 @@ class KVCacheManager:
 
     def write_dependencies(
         self, ranges: Sequence[tuple[int, int, int]]
-    ) -> tuple[Future[None], ...]:
-        """Return the futures that must resolve before writing spans.
+    ) -> tuple[Completion, ...]:
+        """Return the completions that must succeed before writing spans.
 
         ``ranges`` holds ``(unit, token offset, token count)`` spans. These
         are the completions of overlapping execution accesses and the
@@ -621,10 +621,7 @@ class KVCacheManager:
         # ``retirement_ready`` re-raises the failure and ``close`` refuses.
         for buffer, source in tuple(self._sources.items()):
             if source.released and all(
-                future.done()
-                and not future.cancelled()
-                and future.exception() is None
-                for future in source.retirements
+                completion.succeeded() for completion in source.retirements
             ):
                 del self._sources[buffer]
 

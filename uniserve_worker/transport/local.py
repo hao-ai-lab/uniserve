@@ -9,7 +9,6 @@ the owning instance through the process-wide `_endpoints` registry, so any
 
 from __future__ import annotations
 
-import concurrent.futures
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -18,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from uniserve import _slices
 from uniserve.runtime import EventPool
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     LocalTransfer,
@@ -100,9 +100,7 @@ class LocalTransport(Transport):
         """Expose the process-unique endpoint encoded into local locators."""
         return self._buffers.name
 
-    def publication_retirement(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None]:
+    def publication_retirement(self, locator: Locator) -> Completion:
         """Retain the allocation ownership shared by local calls.
 
         Local copies and borrowed views use the same ownership.
@@ -151,7 +149,7 @@ class LocalTransport(Transport):
             )
             self._buffers.register(locator, source)
         except BaseException:
-            self._reclaim(source, concurrent.futures.Future())
+            self._reclaim(source, Completion())
             raise
         return locator
 
@@ -262,9 +260,7 @@ class LocalTransport(Transport):
         finally:
             self.capacity.return_reads()
 
-    def _reclaim(
-        self, source: _LocalSource, retirement: concurrent.futures.Future[None]
-    ) -> None:
+    def _reclaim(self, source: _LocalSource, retirement: Completion) -> None:
         def completed() -> None:
             self.capacity.release(tensor_nbytes(source.tensor))
             retirement.set_result(None)
@@ -281,9 +277,7 @@ class LocalTransport(Transport):
             source.event.synchronize()
             self._events.reap()
 
-    def release(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None] | None:
+    def release(self, locator: Locator) -> Completion | None:
         """Revoke new local reads.
 
         Existing copies and borrowed views are retained.

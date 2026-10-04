@@ -28,6 +28,7 @@ from typing import Any, ParamSpec, TypeVar
 
 from uniserve.profiling import profile_range
 from uniserve.runtime.resources import close_resources
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import resource_error
 
 __all__ = ["HostLane", "HostTask"]
@@ -198,7 +199,7 @@ class HostTask:
 
     The task's ``release`` callback runs at most once: when the task
     finishes or, on cancellation, once the input's producer copy
-    (``input_completion``, when given) has completed.
+    (``input_completion``, when given) has completed successfully.
 
     Attributes:
         promise: Resolves with the action's value or error, or is cancelled
@@ -213,11 +214,11 @@ class HostTask:
         )
         self._submitted = False
         self._action: Callable[[], Any] | None = None
-        self._dependencies: tuple[concurrent.futures.Future[Any], ...] = ()
+        self._dependencies: tuple[
+            concurrent.futures.Future[Any] | Completion, ...
+        ] = ()
         self._input_ready: Callable[[], bool] | None = None
-        self._input_completion: (
-            Callable[[], concurrent.futures.Future[None]] | None
-        ) = None
+        self._input_completion: Callable[[], Completion] | None = None
         self._release: Callable[[], None] | None = None
         self._profile_name = "uniserve.host"
 
@@ -225,10 +226,11 @@ class HostTask:
         self,
         action: Callable[[], Any],
         *,
-        dependencies: tuple[concurrent.futures.Future[Any], ...] = (),
+        dependencies: tuple[
+            concurrent.futures.Future[Any] | Completion, ...
+        ] = (),
         input_ready: Callable[[], bool] | None = None,
-        input_completion: Callable[[], concurrent.futures.Future[None]]
-        | None = None,
+        input_completion: Callable[[], Completion] | None = None,
         release: Callable[[], None] | None = None,
         profile_name: str = "uniserve.host",
     ) -> HostTask:
@@ -243,8 +245,8 @@ class HostTask:
                 with that error.
             input_ready: Polled by ``submit_if_ready``; the task is submitted
                 once it returns True. None submits on the first poll.
-            input_completion: Returns the future of the copy that produces the
-                input, so cancellation defers ``release`` until the copy stops
+            input_completion: Returns the input copy's completion signal,
+                so cancellation defers ``release`` until the copy stops
                 writing the leased storage.
             release: Returns the input lease; see the class docstring.
             profile_name: Profiler range name around ``action``.
@@ -404,9 +406,12 @@ class HostTask:
         # storage; defer the release until that copy completes.
         if self._input_completion is not None:
             completion = self._input_completion()
-            if not completion.done():
-                completion.add_done_callback(
-                    lambda _future: self._release_input()
-                )
-                return
+            completion.add_done_callback(self._input_completed)
+            return
         self._release_input()
+
+    def _input_completed(self, completion: Completion) -> None:
+        # Failure or cancellation cannot establish that the producer stopped
+        # writing. Keep its input lease until physical completion is known.
+        if completion.succeeded():
+            self._release_input()

@@ -18,7 +18,6 @@ sweeps them.
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import os
 import sys
@@ -32,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from uniserve.profiling import profile_range
 from uniserve.runtime import EventPool
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     DESCRIPTOR_HANDLE_BYTES,
@@ -102,7 +102,7 @@ class _CudaSource:
     capacity: TransferCapacity
     handle: bytes
     copied_source: torch.Tensor | tuple[torch.Tensor, ...] | None = None
-    retirement: concurrent.futures.Future[None] | None = None
+    retirement: Completion | None = None
     #: Pool and chunk this publication occupies, when it came from a pool.
     pool: VmmPool | None = None
     chunk: PoolChunk | None = None
@@ -236,9 +236,7 @@ class CudaVmmTransport(Transport):
             self._grants = DescriptorGrants(self.endpoint())
         return self._grants
 
-    def publication_retirement(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None]:
+    def publication_retirement(self, locator: Locator) -> Completion:
         return self._buffers.retirement(locator)
 
     def set_completion_wake(self, wake: Any) -> None:
@@ -259,7 +257,7 @@ class CudaVmmTransport(Transport):
     def _reclaim(
         self,
         source: _CudaSource,
-        retirement: concurrent.futures.Future[None] | None = None,
+        retirement: Completion | None = None,
     ) -> None:
         source.retirement = retirement
         if source.chunk is not None and source.pool is not None:
@@ -772,9 +770,7 @@ class CudaVmmTransport(Transport):
             ticket._fail(error)
             raise
 
-    def release(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None] | None:
+    def release(self, locator: Locator) -> Completion | None:
         if not isinstance(locator.transport, CudaVmmTransfer):
             raise invalid_descriptor(
                 "CUDA VMM release requires a CUDA VMM locator"

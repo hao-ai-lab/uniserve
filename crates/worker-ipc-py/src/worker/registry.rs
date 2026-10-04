@@ -7,12 +7,12 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyBaseException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 
+use super::completion::Completion;
 use super::error::{invalid, invariant, resource};
-use super::transfer::retirement_succeeded;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum BufferKey {
@@ -31,7 +31,7 @@ enum Status {
 struct RegisteredBuffer {
     locator: Py<PyAny>,
     source: Py<PyAny>,
-    retirement: Py<PyAny>,
+    retirement: Py<Completion>,
     readers: usize,
     pending: bool,
     failed: bool,
@@ -101,11 +101,7 @@ impl BufferRegistry {
     ) -> PyResult<()> {
         let key = self.key(locator.bind(py))?;
         self.remove_finished(py)?;
-        let retirement = py
-            .import("concurrent.futures")?
-            .getattr("Future")?
-            .call0()?
-            .unbind();
+        let retirement = Py::new(py, Completion::new())?;
         let mut state = self.lock(py)?;
         if state.closing || state.buffers.len() >= self.capacity {
             return Err(resource(py, "transport buffer capacity is unavailable"));
@@ -172,7 +168,7 @@ impl BufferRegistry {
         &self,
         py: Python<'_>,
         locator: &Bound<'_, PyAny>,
-        error: Option<Py<PyAny>>,
+        error: Option<Py<PyBaseException>>,
         producer_completed: bool,
     ) -> PyResult<()> {
         if !producer_completed && error.is_none() {
@@ -188,17 +184,22 @@ impl BufferRegistry {
         let retirement = buffer.retirement.clone_ref(py);
         drop(state);
 
-        if !producer_completed && !retirement.bind(py).call_method0("done")?.is_truthy()? {
-            retirement
-                .bind(py)
-                .call_method1("set_exception", (error,))?;
+        if !producer_completed
+            && !retirement.borrow(py).done()
+            && let Some(error) = error
+        {
+            Completion::set_exception(retirement.bind(py), error)?;
         }
         self.reclaim_buffer(py, &key)
     }
 
-    /// Revoke future reads; the returned future completes after physical
+    /// Revoke future reads; the returned signal completes after physical
     /// retirement. A buffer already removed from the registry returns None.
-    fn release(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
+    fn release(
+        &self,
+        py: Python<'_>,
+        locator: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<Completion>>> {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
         if !state.buffers.contains_key(&key) {
@@ -214,7 +215,7 @@ impl BufferRegistry {
         Ok(Some(retirement))
     }
 
-    fn retirement(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    fn retirement(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<Py<Completion>> {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
         Ok(Self::buffer(&mut state, &key, locator)?
@@ -361,10 +362,8 @@ impl BufferRegistry {
         drop(state);
 
         if let Err(error) = self.reclaim.bind(py).call1((source, &retirement)) {
-            if !retirement.bind(py).call_method0("done")?.is_truthy()? {
-                retirement
-                    .bind(py)
-                    .call_method1("set_exception", (error.value(py),))?;
+            if !retirement.borrow(py).done() {
+                Completion::set_exception(retirement.bind(py), error.value(py).clone().unbind())?;
             }
             return Err(error);
         }
@@ -377,8 +376,7 @@ impl BufferRegistry {
         // Failed retirement keeps its backing storage held, so close can report
         // it without permitting reuse after an unknown device completion.
         for (key, buffer) in &state.buffers {
-            let future = buffer.retirement.bind(py);
-            if buffer.status == Status::Reclaiming && retirement_succeeded(future)? {
+            if buffer.status == Status::Reclaiming && buffer.retirement.borrow(py).succeeded() {
                 finished.push(key.clone());
             }
         }

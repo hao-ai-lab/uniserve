@@ -32,7 +32,6 @@ import math
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from concurrent.futures import Future
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, cast
@@ -40,6 +39,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from uniserve.media import image as media_image
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import (
     invalid_descriptor,
     resource_error,
@@ -129,7 +129,7 @@ def prepare_batch(
     accesses, a KV installation without a request slot.
     """
     batch = prepared.batch
-    storage_dependencies: list[Future[None]] = []
+    storage_dependencies: list[Completion] = []
 
     pool = latent_pool
     if pool is not None:
@@ -1838,7 +1838,7 @@ def _bind_cache_tables(
                     call.request_key,
                     page_tables.table(slot, group),
                     length=length,
-                    completion=state.output_buffer.completion_future(),
+                    completion=state.output_buffer.completion(),
                 )
 
     record_component(state.component_us, "bc_tables", started)

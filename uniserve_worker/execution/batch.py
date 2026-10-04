@@ -16,7 +16,6 @@ dependency rather than the worker thread.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
@@ -26,6 +25,7 @@ from typing import cast
 import torch
 
 from uniserve.runtime.resources import close_resources
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
@@ -98,7 +98,7 @@ class BatchState:
     # writes its target latent, cache-page and KV storage (they gate
     # execution even without imports), and the products and KV transfers it
     # imports.
-    storage_dependencies: tuple[Future[None], ...] = ()
+    storage_dependencies: tuple[Completion, ...] = ()
     input_products: tuple[TensorPublication, ...] = ()
     kv_inputs: tuple[KvTransfer, ...] = ()
     # Entries of ``input_products`` whose reads `prepare_inputs` has started;
@@ -368,7 +368,7 @@ class BatchState:
             + tuple(write.completion for write in self.cache_imports.values())
         )
         if self.predicate_buffer is not None and self.predicates_sealed:
-            dependencies += (self.predicate_buffer.completion_future(),)
+            dependencies += (self.predicate_buffer.completion(),)
         if not tickets and not dependencies:
             callback()
             return

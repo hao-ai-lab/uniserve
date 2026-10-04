@@ -17,8 +17,8 @@ use uniserve_core::CallId;
 use uniserve_worker_ipc::{BufferId, RequestKey};
 
 use super::buffer::{BufferBinding, BufferPool};
+use super::completion::Completion;
 use super::error::{invalid, invariant, resource};
-use super::transfer::retirement_succeeded;
 
 type BufferKey = (RequestKey, CallId, u16);
 type CallKey = (RequestKey, CallId);
@@ -87,7 +87,7 @@ pub(crate) struct Buffer {
     readers: usize,
     reader_events: Vec<Py<PyAny>>,
     transfers: Vec<Py<PyAny>>,
-    exports: Vec<Py<PyAny>>,
+    exports: Vec<Py<Completion>>,
     released: bool,
 }
 
@@ -114,13 +114,11 @@ impl Buffer {
         if let Some(fence) = &self.producer {
             visit.call(&fence.event)?;
         }
-        for value in self
-            .reader_events
-            .iter()
-            .chain(&self.transfers)
-            .chain(&self.exports)
-        {
+        for value in self.reader_events.iter().chain(&self.transfers) {
             visit.call(value)?;
+        }
+        for completion in &self.exports {
+            visit.call(completion)?;
         }
         Ok(())
     }
@@ -181,8 +179,7 @@ impl Buffer {
             }
         }
         for export in &self.exports {
-            let export = export.bind(py);
-            if !retirement_succeeded(export)? {
+            if !export.borrow(py).succeeded() {
                 return Ok(false);
             }
         }
@@ -1548,15 +1545,14 @@ impl TensorStore {
         &self,
         py: Python<'_>,
         write: &Bound<'_, Buffer>,
-        retirement: Py<PyAny>,
+        retirement: Py<Completion>,
     ) -> PyResult<()> {
         let state = self.lock(py)?;
         state.require_buffer(py, write)?;
         let value = write.borrow();
         let mut retained = Vec::new();
         for export in &value.exports {
-            let future = export.bind(py);
-            if !retirement_succeeded(future)? {
+            if !export.borrow(py).succeeded() {
                 retained.push(export.clone_ref(py));
             }
         }

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import time
 import uuid
@@ -12,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from uniserve import _slices
 from uniserve.profiling import profile_range
 from uniserve.runtime import EventPool
+from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     ChannelTransfer,
@@ -215,16 +215,12 @@ class ChannelTransport(Transport):
             reservation=reservation,
         )
 
-    def release(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None] | None:
+    def release(self, locator: Locator) -> Completion | None:
         """Revoke a publication the rank no longer owns anything of."""
         self._require_own(locator)
         return None
 
-    def publication_retirement(
-        self, locator: Locator
-    ) -> concurrent.futures.Future[None]:
+    def publication_retirement(self, locator: Locator) -> Completion:
         """Expose completion, which publication itself established.
 
         The product was copied out of the rank's storage while it published,
@@ -232,7 +228,7 @@ class ChannelTransport(Transport):
         once. The head holds the bytes from here, until the buffer is freed.
         """
         self._require_own(locator)
-        settled: concurrent.futures.Future[None] = concurrent.futures.Future()
+        settled: Completion = Completion()
         settled.set_result(None)
         return settled
 

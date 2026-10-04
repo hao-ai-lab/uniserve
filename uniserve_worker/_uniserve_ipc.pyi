@@ -12,7 +12,6 @@ its numerical ``BufferBinding`` views.
 """
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import Future
 from contextlib import AbstractContextManager
 from types import TracebackType
 from typing import Any, Generic, Self, TypeVar, final
@@ -53,6 +52,7 @@ __all__ = [
     "BufferBinding",
     "BufferPool",
     "BufferRegistry",
+    "Completion",
     "Executor",
     "GroupShape",
     "GroupTable",
@@ -80,10 +80,34 @@ __all__ = [
 Source = TypeVar("Source")
 
 @final
+class Completion:
+    """Native completion shared by a producer and its storage consumers.
+
+    Cancellation and failure wake observers but do not authorize storage reuse.
+    Callbacks receive this completion, even when registered after it finishes.
+    Waits release the GIL; errors retain the original exception.
+    """
+
+    def __new__(cls) -> Self: ...
+    def done(self) -> bool: ...
+    def succeeded(self) -> bool: ...
+    def cancelled(self) -> bool: ...
+    def cancel(self) -> bool: ...
+    def result(self, timeout: float | None = None) -> None: ...
+    def exception(
+        self, timeout: float | None = None
+    ) -> BaseException | None: ...
+    def set_result(self, result: None) -> None: ...
+    def set_exception(self, error: BaseException) -> None: ...
+    def add_done_callback(
+        self, callback: Callable[[Completion], object]
+    ) -> None: ...
+
+@final
 class BufferRegistry(Generic[Source]):
     """Retain registered storage until its producer and readers finish.
 
-    Reclaim hands the source back and completes its retirement future. Drain
+    Reclaim hands the source back and completes its retirement signal. Drain
     waits for an in-flight reclamation at shutdown. Settled inspects backend
     acknowledgments; it must not mutate the registry or invoke observers.
     """
@@ -92,7 +116,7 @@ class BufferRegistry(Generic[Source]):
         cls,
         *,
         capacity: int,
-        reclaim: Callable[[Source, Future[None]], None],
+        reclaim: Callable[[Source, Completion], None],
         drain: Callable[[Source], None],
         settled: Callable[[Source], bool],
     ) -> Self: ...
@@ -111,8 +135,8 @@ class BufferRegistry(Generic[Source]):
         error: BaseException | None = None,
         producer_completed: bool = True,
     ) -> None: ...
-    def release(self, locator: Locator) -> Future[None] | None: ...
-    def retirement(self, locator: Locator) -> Future[None]: ...
+    def release(self, locator: Locator) -> Completion | None: ...
+    def retirement(self, locator: Locator) -> Completion: ...
     def awaiting_acknowledgment(self) -> bool: ...
     def reap(self) -> None: ...
     def close(self) -> None: ...
@@ -392,12 +416,12 @@ class LatentPool:
         width: int,
     ) -> LatentExport: ...
     def retain_publication(
-        self, source: LatentExport, retirement: Future[None]
+        self, source: LatentExport, retirement: Completion
     ) -> None: ...
     def release_buffers(self, buffers: Sequence[BufferId]) -> None: ...
     def write_dependencies(
         self, request_pool_idx: int, page_table: Sequence[int]
-    ) -> tuple[Future[None], ...]: ...
+    ) -> tuple[Completion, ...]: ...
     def stage_timestep(
         self, request_pool_idx: int, value: float
     ) -> torch.Tensor: ...
@@ -592,7 +616,7 @@ class TensorStore:
     def validate_writes(self, writes: tuple[Buffer, ...]) -> None: ...
     def commit_writes(self, writes: tuple[Buffer, ...]) -> None: ...
     def retain_publication(
-        self, write: Buffer, retirement: Future[None]
+        self, write: Buffer, retirement: Completion
     ) -> None: ...
     def retain_transfer(
         self, write: Buffer, ticket: TransferTicket
