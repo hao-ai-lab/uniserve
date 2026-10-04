@@ -32,13 +32,13 @@ impl Workspace {
     }
 }
 
-enum CopyCompletion {
+pub(super) enum CopyCompletion {
     Task(Py<HostTask>),
     Immediate(Py<Completion>),
 }
 
 impl CopyCompletion {
-    fn done(&self, py: Python<'_>) -> bool {
+    pub(crate) fn done(&self, py: Python<'_>) -> bool {
         match self {
             Self::Task(task) => task.borrow(py).done(),
             Self::Immediate(completion) => completion.borrow(py).done(),
@@ -69,7 +69,7 @@ pub(crate) struct KVImport {
     initialized_units: Py<PyTuple>,
     #[pyo3(get)]
     publication: Py<PyAny>,
-    completion: CopyCompletion,
+    pub(super) completion: CopyCompletion,
     #[pyo3(get)]
     retirement: Py<Completion>,
 }
@@ -87,7 +87,7 @@ impl KVImport {
     }
 
     #[getter]
-    fn released(&self) -> bool {
+    pub(crate) fn released(&self) -> bool {
         self.inner.released()
     }
 
@@ -343,7 +343,7 @@ impl KVImporter {
         self._reap(py)
     }
 
-    fn abandon(&self, py: Python<'_>, write: &KVImport) -> PyResult<()> {
+    pub(crate) fn abandon(&self, py: Python<'_>, write: &KVImport) -> PyResult<()> {
         let cancelled = cancel_reads(py, self.inner.abandon(&write.inner));
         let reaped = self._reap(py);
         cancelled.and(reaped)

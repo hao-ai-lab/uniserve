@@ -48,6 +48,7 @@ from uniserve_worker.transport.interface import Transport
 from uniserve_worker.worker import Worker
 
 __all__ = [
+    "BatchInputs",
     "BlockTables",
     "Buffer",
     "BufferBinding",
@@ -92,8 +93,51 @@ Source = TypeVar("Source")
 Args = ParamSpec("Args")
 
 @final
+class BatchInputs:
+    """Batch input leases, preparation progress and completion observers."""
+
+    started: int
+    submitted: bool
+    awaiting_reads: bool
+    predicate: OutputBuffer | None
+
+    def __new__(cls) -> Self: ...
+    @property
+    def closed(self) -> bool: ...
+    def set_dependencies(self, dependencies: Sequence[Completion]) -> None: ...
+    def storage_ready(self) -> bool: ...
+    def require_storage(self) -> None: ...
+    def ready(self) -> bool: ...
+    def input_ready(self, buffer: BufferId) -> bool: ...
+    def is_borrowed(self, buffer: BufferId) -> bool: ...
+    def add(
+        self,
+        buffer: BufferId,
+        value: TensorRead | LatentImport | KVImport | None = None,
+    ) -> None: ...
+    def remove(self, buffer: BufferId) -> None: ...
+    def tensor(self, buffer: BufferId) -> TensorRead | None: ...
+    def latent(self, buffer: BufferId) -> LatentImport | None: ...
+    def cache(self, buffer: BufferId) -> KVImport | None: ...
+    def cache_imports(self) -> list[KVImport]: ...
+    def add_image(self, call: CallId, task: HostTask) -> None: ...
+    def image(self, call: CallId) -> HostTask | None: ...
+    def on_ready(self, callback: Callable[[], None]) -> None:
+        """Notify once this snapshot of dependencies is consumable."""
+    def close(
+        self,
+        tensor_store: TensorStore,
+        latent_pool: LatentPool | None,
+        kv_importer: KVImporter | None,
+    ) -> None:
+        """Release consumers once, attempting every resource after failures."""
+
+@final
 class OutputBuffer:
     """One batch's captures and readback fence; only its storage is recycled."""
+
+    @property
+    def sealed(self) -> bool: ...
 
     event_pool: EventPool
     devices: tuple[torch.device, ...]

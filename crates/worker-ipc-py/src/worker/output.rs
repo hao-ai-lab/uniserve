@@ -31,6 +31,11 @@ pub(crate) struct OutputBuffer {
 
 #[pymethods]
 impl OutputBuffer {
+    #[getter]
+    pub(crate) fn sealed(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(self.lock(py)?.sealed())
+    }
+
     fn register_device(&self, py: Python<'_>, device: &Bound<'_, PyAny>) -> PyResult<()> {
         let (device, _) = stream(py, device)?;
         self.lock(py)?
@@ -126,18 +131,14 @@ impl OutputBuffer {
     }
 
     fn ready(&self, py: Python<'_>) -> PyResult<bool> {
-        let ready = self
-            .lock(py)?
-            .ready_at()
-            .map_err(|error| native_error(py, error))?
-            .is_some();
+        let ready = self.query_ready(py)?;
         if ready {
             Completion::resolve(self.completion.bind(py))?;
         }
         Ok(ready)
     }
 
-    fn completion(&self, py: Python<'_>) -> PyResult<Py<Completion>> {
+    pub(crate) fn completion(&self, py: Python<'_>) -> PyResult<Py<Completion>> {
         self.ready(py)?;
         Ok(self.completion.clone_ref(py))
     }
@@ -212,7 +213,7 @@ impl OutputBuffer {
         Ok(())
     }
 
-    fn abandon(slf: &Bound<'_, Self>) -> PyResult<()> {
+    pub(crate) fn abandon(slf: &Bound<'_, Self>) -> PyResult<()> {
         Self::seal(slf)?;
         slf.get().lock(slf.py())?.abandon();
         Ok(())
@@ -257,6 +258,16 @@ impl OutputBuffer {
 }
 
 impl OutputBuffer {
+    /// Observe copy fences without dispatching completion callbacks. Batch
+    /// readiness borrows its input set; the event pool notifies its observers.
+    pub(crate) fn query_ready(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(self
+            .lock(py)?
+            .ready_at()
+            .map_err(|error| native_error(py, error))?
+            .is_some())
+    }
+
     fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, NativeBuffer<Py<PyAny>>>> {
         self.inner
             .lock_py_attached(py)

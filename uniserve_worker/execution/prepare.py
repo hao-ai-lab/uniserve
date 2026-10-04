@@ -8,7 +8,7 @@ these stages, in order:
    applied.
 2. `prepare_batch` runs after the batch's commands are applied. It adds cache
    publications for KV installations and collects the futures
-   (`BatchState.storage_dependencies`) that must resolve before this batch's
+   (held by `BatchInputs`) that must resolve before this batch's
    writes.
 3. `prepare_inputs` runs once those dependencies are done when the batch has
    transferred inputs, and immediately otherwise. It validates each
@@ -121,7 +121,7 @@ def prepare_batch(
     cache-page, and KV write records the future that must complete before its
     target storage is written.
 
-    Sets `storage_dependencies`, `input_products`, and `kv_inputs` on
+    Binds storage dependencies and records `input_products` and `kv_inputs` on
     `prepared`; reserves nothing. Malformed batches raise
     `invalid_descriptor` errors, for example a latent write without a
     request slot, a KV installation whose source is neither supplied by the
@@ -262,7 +262,7 @@ def prepare_batch(
                             )
                         )
 
-    prepared.storage_dependencies = tuple(storage_dependencies)
+    prepared.inputs.set_dependencies(storage_dependencies)
     prepared.input_products = tuple(entries)
     prepared.kv_inputs = tuple(kv_entries)
 
@@ -322,19 +322,19 @@ def prepare_inputs(
 
     A product import starts all of its reads or none, and too few free read
     tickets refuse it (`ReadBackpressureError`): the imports already started
-    keep their destinations and reads, `state.inputs_started` counts the
+    keep their destinations and reads, `state.inputs.started` counts the
     handled entries, and the error propagates. Read tickets return as reads
     retire whatever the batch does, so the executor calls again once one
     returns and preparation resumes at the refused import. A KV installation
     is not resumed part way, so a refused one fails the batch.
 
-    Inputs read in place are recorded in `state.borrowed_inputs` instead of
-    imported: a video encode's input held in a shared-memory segment on this
+    Inputs read in place are registered as borrowed in `BatchInputs`: a video
+    encode's input held in a shared-memory segment on this
     node, and every transferred input of a mux call. Device and encoder
     products are imported through `TensorStore.import_tensor` into
-    `state.tensor_reads`, latent products into reserved `LatentPool` pages
-    (`state.latent_imports`), and KV publications through
-    `KVCacheManager.prepare_install` (`state.cache_imports`).
+    batch-owned tensor reads, latent products into reserved `LatentPool`
+    pages, and KV inputs through `KVCacheManager.prepare_install`.
+    `BatchInputs` retains each reservation until its consumer closes.
     """
     from uniserve_worker.execution import transfer
 
@@ -373,14 +373,15 @@ def prepare_inputs(
             for location in entry.value.tensor.locations
         )
     }
-    state.borrowed_inputs.update(borrowed)
+    for buffer in borrowed:
+        state.inputs.add(buffer)
     # Only a refused product import leaves the batch resumable.
     resumable = True
     try:
-        for index in range(state.inputs_started, len(entries)):
+        for index in range(state.inputs.started, len(entries)):
             entry = entries[index]
             # Every entry before this one has started its reads.
-            state.inputs_started = index
+            state.inputs.started = index
             assert transports
             if entry.product.buffer_id in borrowed:
                 continue
@@ -508,7 +509,7 @@ def prepare_inputs(
                 call.kind is MediaCall.MUXING and entry.product in call.inputs
                 for call in batch.calls
             ):
-                state.borrowed_inputs.add(entry.product.buffer_id)
+                state.inputs.add(entry.product.buffer_id)
                 continue
 
             parameters = {
@@ -568,7 +569,7 @@ def prepare_inputs(
                     ),
                 )
                 assert imported.imported is not None
-                state.tensor_reads[entry.product.buffer_id] = imported
+                state.inputs.add(entry.product.buffer_id, imported)
                 continue
 
             elif isinstance(value, LatentTransferValue):
@@ -641,10 +642,10 @@ def prepare_inputs(
                     latent_units=value.latent_units,
                 )
 
-                # Record the reservation before fetching so that `close_inputs`
+                # Record the reservation before fetching so input cleanup
                 # abandons it if `fetch_tensor` raises; each started copy is
                 # retained on the import through `retain_transfer`.
-                state.latent_imports[entry.product.buffer_id] = binding
+                state.inputs.add(entry.product.buffer_id, binding)
                 from uniserve_worker.transport.fetch import fetch_tensor
 
                 try:
@@ -663,11 +664,11 @@ def prepare_inputs(
                 except ReadBackpressureError:
                     # No read started; the resumed import reserves its pages
                     # again.
-                    del state.latent_imports[entry.product.buffer_id]
+                    state.inputs.remove(entry.product.buffer_id)
                     pool.abandon_import(binding)
                     raise
 
-        state.inputs_started = len(entries)
+        state.inputs.started = len(entries)
         resumable = False
         for kv_transfer in kv_entries:
             consumers = tuple(
@@ -727,7 +728,7 @@ def prepare_inputs(
                 initialized_units=initialized,
                 transports=transports,
             )
-            state.cache_imports[kv_transfer.source] = write
+            state.inputs.add(kv_transfer.source, write)
 
         _prepare_predicates(
             state,
@@ -743,7 +744,11 @@ def prepare_inputs(
         # Release every input reserved above; a cleanup failure annotates the
         # original error rather than masking it.
         try:
-            state.close_inputs(tensor_store, latent_pool, kv_cache)
+            state.inputs.close(
+                tensor_store,
+                latent_pool,
+                None if kv_cache is None else kv_cache.imports,
+            )
         except BaseException as cleanup_error:
             error.add_note(f"batch input cleanup failed: {cleanup_error!r}")
         if isinstance(error, ReadBackpressureError):
@@ -762,7 +767,7 @@ def _prepare_predicates(
 
     Each such call owns one row of the buffer. Local sources are
     consumed and captured now; transferred sources (those with a prepared
-    `state.tensor_reads` import) are recorded in `state.predicate_transfers`
+    batch-owned tensor import) are recorded in `state.predicate_transfers`
     for `capture_predicates`. The buffer is sealed once every row is
     captured, and `BatchState.predicate_values` reads it after the copies
     complete. I64 relay predicates are not captured here; `_consume_predicates`
@@ -798,7 +803,7 @@ def _prepare_predicates(
         }
         for call in scheduled:
             source = cast(TensorRef, call.predicate).buffer_id
-            if source not in state.tensor_reads:
+            if state.inputs.tensor(source) is None:
                 grouped[model_runner.call_devices(call)[0]].append(call)
             else:
                 pending.append(
@@ -831,8 +836,7 @@ def _prepare_predicates(
 
         # Sealing forbids further captures, so seal now only when no
         # transferred row remains for `capture_predicates`.
-        sealed = not pending
-        if sealed:
+        if not pending:
             buffer.seal()
     except BaseException:
         # Every acquired read must receive a reader event even when preparation
@@ -843,10 +847,9 @@ def _prepare_predicates(
             tensor_store.complete_reads(unrecorded)
         buffer.abandon()
         raise
-    state.predicate_buffer = buffer
+    state.inputs.predicate = buffer
     state.predicate_entries = captures
     state.predicate_transfers = tuple(pending)
-    state.predicates_sealed = sealed
 
 
 def capture_predicates(state: BatchState, tensor_store: TensorStore) -> None:
@@ -856,17 +859,18 @@ def capture_predicates(state: BatchState, tensor_store: TensorStore) -> None:
     any transferred predicate source is not yet ready; the executor calls it
     again on later advances. On failure the predicate buffer is abandoned.
     """
-    buffer = state.predicate_buffer
-    if buffer is None or state.predicates_sealed:
+    buffer = state.inputs.predicate
+    if buffer is None or buffer.sealed:
         return
     if not all(
-        state.input_ready(source) for _, source, _ in state.predicate_transfers
+        state.inputs.input_ready(source)
+        for _, source, _ in state.predicate_transfers
     ):
         return
 
     try:
         for identity, source, row in state.predicate_transfers:
-            read = state.tensor_reads[source]
+            read = cast(TensorRead, state.inputs.tensor(source))
             tensor_store.wait_import(read)
             state.predicate_entries.append(
                 (identity, buffer.capture(read.tensor), row)
@@ -875,8 +879,6 @@ def capture_predicates(state: BatchState, tensor_store: TensorStore) -> None:
     except BaseException:
         buffer.abandon()
         raise
-
-    state.predicates_sealed = True
 
 
 def reserve_outputs(
@@ -1763,7 +1765,7 @@ def _bind_cache_tables(
         # recycled for its new owner below.
         initialized = {
             unit
-            for write in state.cache_imports.values()
+            for write in state.inputs.cache_imports()
             if write.request_pool_idx == allocation.request_pool_idx
             for unit in write.initialized_units
         }
@@ -1866,7 +1868,8 @@ def _stage_input_products(
     # KV imports consumed by this batch must be complete and conflict-free
     # before any transferred product is published.
     cache_inputs = {call.kv_input for call in state.batch.calls}
-    for buffer, write in state.cache_imports.items():
+    for write in state.inputs.cache_imports():
+        buffer = write.publication.source
         if buffer not in cache_inputs:
             continue
         if not write.completion.done():
@@ -1885,9 +1888,9 @@ def _stage_input_products(
 
     for entry in input_products:
         product = entry.product
-        if product.buffer_id in state.borrowed_inputs:
+        if state.inputs.is_borrowed(product.buffer_id):
             continue
-        if not state.input_ready(product.buffer_id):
+        if not state.inputs.input_ready(product.buffer_id):
             raise invalid_descriptor(
                 "cross-call input has no query-ready prepared transfer"
             )
@@ -1929,7 +1932,7 @@ def _stage_input_products(
                     "latent transfer destination already owns a trajectory"
                 )
 
-            binding = state.latent_imports.get(product.buffer_id)
+            binding = state.inputs.latent(product.buffer_id)
             if not isinstance(binding, LatentImport):
                 raise RuntimeError(
                     "latent transfer lost its reserved destination"
@@ -1978,7 +1981,7 @@ def _stage_input_products(
         ):
             raise RuntimeError("prepared transfer has an unknown descriptor")
 
-        imported = state.tensor_reads.get(product.buffer_id)
+        imported = state.inputs.tensor(product.buffer_id)
         if imported is None:
             raise RuntimeError("tensor transfer lost its reserved destination")
         tensor_store.complete_import(imported)

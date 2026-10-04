@@ -138,7 +138,7 @@ def execute(
                 "KV installation requires source and output identities"
             )
         request = state.pending_output(request_id)
-        write = state.cache_imports.get(source)
+        write = state.inputs.cache(source)
         if write is None:
             raise invalid_descriptor(
                 "KV installation has no reserved physical input"

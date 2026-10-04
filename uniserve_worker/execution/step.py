@@ -103,7 +103,7 @@ def execute_batch(
 ) -> None:
     """Reserve, execute and commit one prepared batch.
 
-    The caller must have observed ``state.inputs_ready()``; a batch whose
+    The caller must have observed ``state.inputs.ready()``; a batch whose
     inputs are not ready raises ``RuntimeError``. The prepared predicate
     values must cover exactly the calls with a U8 completion predicate, or
     ``invalid_descriptor`` is raised. A batch without calls is only marked
@@ -118,7 +118,7 @@ def execute_batch(
     had already begun publication.
     """
     batch = state.batch
-    if not state.inputs_ready():
+    if not state.inputs.ready():
         raise RuntimeError(
             "prepared execution was observed before transfer readiness"
         )

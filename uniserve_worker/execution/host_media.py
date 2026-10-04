@@ -318,7 +318,7 @@ def execute(
         publication = _input_publication(call, state)
         # Batch preparation borrows the round only when it is published over
         # shared storage on this node; otherwise the tensor store holds it.
-        imported = call.inputs[0].buffer_id not in state.borrowed_inputs
+        imported = not state.inputs.is_borrowed(call.inputs[0].buffer_id)
         imported_read = None
         imported_units = None
         if imported:
@@ -472,7 +472,7 @@ def execute(
         # artifact.
         units: list[bytes] = []
         for index, product in enumerate(call.inputs):
-            if product.buffer_id in state.borrowed_inputs:
+            if state.inputs.is_borrowed(product.buffer_id):
                 publication = _input_publication(call, state, index)
                 units.extend(
                     read_encoded_units(

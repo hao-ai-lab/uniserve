@@ -9,6 +9,7 @@ mod error;
 mod events;
 mod executor;
 mod host;
+mod inputs;
 mod kv_cache;
 mod kv_import;
 mod latent;
@@ -33,6 +34,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     module.add_class::<host::HostLane>()?;
     module.add_class::<host::HostTask>()?;
+    module.add_class::<inputs::BatchInputs>()?;
     module.add_class::<kv_cache::KVCacheManager>()?;
     module.add_class::<kv_import::KVImport>()?;
     module.add_class::<kv_import::KVImporter>()?;

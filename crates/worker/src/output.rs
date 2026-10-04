@@ -75,6 +75,10 @@ impl<A> OutputBuffer<A> {
         }
     }
 
+    pub fn sealed(&self) -> bool {
+        self.sealed
+    }
+
     pub fn storage(&self) -> Result<&OutputStorage<A>> {
         self.storage
             .as_ref()
