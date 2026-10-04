@@ -4,6 +4,8 @@ UniServe schedules requests in Rust and executes numerical calls through a Pytho
 
 The worker's native `RequestPool` binds each admitted request epoch to the engine-assigned slot. It tracks pending calls, accepts progress without allowing late results to roll it back, and rejects stale epochs after slot reuse. A `Request` retains numerical state for its observers until the executor drains its work and the pool retires it. Direct Python callers and serving share this lifecycle through the same native extension.
 
+The native `BufferPool` backs scheduler-placed products with fixed device arenas. It rejects overlapping physical ranges and accepts release only for the current binding issued by that pool. Ranks that hold a subset of the logical products can use compact physical placement. Tensor views retain the arena backing; storage owners must retire device accesses and transport readers before releasing a binding for reuse.
+
 ## Token and canvas calls
 
 Prefill, token decode and token denoising use separate homogeneous numerical calls. A prefill can write context without projecting logits or sampling. Readout canvases attend to that context without changing its KV entries; their candidate probabilities are normalized over the full vocabulary.

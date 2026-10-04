@@ -3,7 +3,7 @@
 Ownership runs through consumer completion.
 """
 
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import replace
 from threading import Event
 
@@ -13,7 +13,7 @@ import torch
 from tests.python.fixtures.cache import mha_pool
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
-from uniserve_worker.errors import WorkerError
+from uniserve_worker.errors import WorkerError, WorkerErrorCode
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.protocol.batch import (
     BufferAllocation,
@@ -123,6 +123,100 @@ def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
     finally:
         buffers.release(second_binding)
         buffers.close()
+
+
+def test_persistent_buffer_release_requires_issuing_pool_and_generation():
+    reference = TensorRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_call_id=CallId(1, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(4),)),
+    )
+    allocation = BufferAllocation(reference.buffer_id, 0, 16)
+    pools = [BufferPool(byte_capacity=16, devices=("cpu",)) for _ in range(2)]
+    try:
+        bindings = [
+            pool.bind(
+                reference,
+                allocation,
+                device="cpu",
+                dtype=torch.float32,
+                shape=(4,),
+            )
+            for pool in pools
+        ]
+        with pytest.raises(WorkerError) as failure:
+            pools[0].release(bindings[1])
+        assert failure.value.code is WorkerErrorCode.INVARIANT_VIOLATION
+        assert failure.value.fatal
+        with pytest.raises(WorkerError, match="already bound"):
+            pools[0].bind(
+                reference,
+                allocation,
+                device="cpu",
+                dtype=torch.float32,
+                shape=(4,),
+            )
+
+        pools[0].release(bindings[0])
+        replacement = pools[0].bind(
+            reference,
+            allocation,
+            device="cpu",
+            dtype=torch.float32,
+            shape=(4,),
+        )
+        with pytest.raises(WorkerError, match="stale persistent buffer"):
+            pools[0].release(bindings[0])
+        replacement.tensor.fill_(3)
+        torch.testing.assert_close(
+            replacement.tensor, torch.full((4,), 3.0), rtol=0, atol=0
+        )
+        pools[0].release(replacement)
+        pools[1].release(bindings[1])
+    finally:
+        for pool in pools:
+            pool.close()
+
+
+def test_concurrent_buffer_bindings_preserve_independent_values():
+    reference = TensorRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_call_id=CallId(1, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(4),)),
+    )
+    pool = BufferPool(byte_capacity=64, devices=("cpu",))
+
+    def bind(index):
+        output = replace(reference, output_index=index)
+        binding = pool.bind(
+            output,
+            BufferAllocation(output.buffer_id, index * 16, 16),
+            device="cpu",
+            dtype=torch.float32,
+            shape=(4,),
+        )
+        binding.tensor.fill_(index)
+        return binding
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as threads:
+            bindings = list(threads.map(bind, range(4)))
+        for index, binding in enumerate(bindings):
+            torch.testing.assert_close(
+                binding.tensor,
+                torch.full((4,), float(index)),
+                rtol=0,
+                atol=0,
+            )
+            pool.release(binding)
+    finally:
+        pool.close()
 
 
 def _table(pool, units):
