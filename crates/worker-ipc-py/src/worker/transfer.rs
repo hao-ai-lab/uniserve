@@ -13,6 +13,7 @@ use pyo3::sync::MutexExt;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 
 use super::error::{invalid, invariant, resource, unsupported};
+use super::host::{HostLane, HostTask, with_context};
 
 struct CapacityState {
     used: u64,
@@ -285,7 +286,7 @@ struct TicketState {
     cancelled: bool,
     retired: bool,
     unretired: Vec<Py<PyAny>>,
-    work: Option<Py<PyAny>>,
+    work: Option<Py<HostTask>>,
     access: ReadAccess,
     done_callbacks: Vec<Py<PyAny>>,
     retirement_callbacks: Vec<Py<PyAny>>,
@@ -400,7 +401,7 @@ impl TransferTicket {
         drop(state);
         notify(py, callbacks);
         if let Some(work) = work {
-            work.bind(py).call_method0("cancel")?;
+            work.borrow(py).cancel(py)?;
         }
         Ok(())
     }
@@ -727,12 +728,11 @@ struct PoolState {
     streams: HashMap<(std::thread::ThreadId, String), Py<PyAny>>,
 }
 
-/// Execute a backend's reads against the rank's shared credits. The standard
-/// Python thread executor supplies threads; Rust owns submission, cancellation,
-/// stream ordering, failure classification, and credit retirement.
+/// Execute a backend's reads against the rank's shared credits. The native host
+/// lane supplies threads; the pool orders copy streams and retires read credits.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct TransferPool {
-    executor: Py<PyAny>,
+    lane: HostLane,
     capacity: Py<TransferCapacity>,
     events: Py<PyAny>,
     state: Mutex<PoolState>,
@@ -744,21 +744,15 @@ impl TransferPool {
     #[pyo3(signature = (*, workers, capacity, name, event_pool))]
     fn new(
         py: Python<'_>,
-        workers: isize,
+        workers: usize,
         capacity: Py<TransferCapacity>,
         name: &str,
         event_pool: Py<PyAny>,
     ) -> PyResult<Self> {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("max_workers", workers)?;
-        kwargs.set_item("thread_name_prefix", name)?;
-        let executor = py
-            .import("concurrent.futures")?
-            .getattr("ThreadPoolExecutor")?
-            .call((), Some(&kwargs))?
-            .unbind();
+        let limit = capacity.get().ticket_capacity;
+        let lane = HostLane::new(py, limit, workers.min(limit), name)?;
         Ok(Self {
-            executor,
+            lane,
             capacity,
             events: event_pool,
             state: Mutex::new(PoolState {
@@ -818,7 +812,11 @@ impl TransferPool {
             owner.capacity.get().return_reads(py, 1)?;
             return Err(error);
         }
+
+        let mut work = None;
         let submitted = (|| -> PyResult<Py<TransferTicket>> {
+            let task = owner.lane.reserve(py)?;
+            work = Some(task.clone_ref(py));
             let ticket = Py::new(py, TransferTicket::new(owner.events.clone_ref(py), None))?;
             if let Some(destination) = destination {
                 let spans = tensor_spans(&destination)?;
@@ -833,10 +831,12 @@ impl TransferPool {
                     };
                 }
             }
+
             if let Some(wake) = owner.lock(py)?.wake.as_ref().map(|wake| wake.clone_ref(py)) {
                 ticket.get().add_done_callback(py, wake.clone_ref(py))?;
                 ticket.get().add_retirement_callback(py, wake)?;
             }
+
             let task_owner = slf.clone().unbind();
             let task_ticket = ticket.clone_ref(py);
             let arguments = args.clone().unbind();
@@ -851,37 +851,43 @@ impl TransferPool {
                     task_owner.get().run(py, &task_ticket, &call, &arguments)
                 },
             )?;
-            let completion = Mutex::new(Some((slf.clone().unbind(), ticket.clone_ref(py))));
+
+            let pool = slf.clone().unbind();
+            let completed = ticket.clone_ref(py);
             let finished = PyCFunction::new_closure(
                 py,
                 None,
                 None,
                 move |args: &Bound<'_, PyTuple>, _: Option<&Bound<'_, PyDict>>| -> PyResult<()> {
-                    let py = args.py();
-                    let finished = completion
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .take();
-                    if let Some((pool, ticket)) = finished {
-                        pool.get()
-                            .finished(py, &ticket, nbytes, &args.get_item(0)?)?;
-                    }
-                    Ok(())
+                    pool.get().finished(
+                        args.py(),
+                        &completed,
+                        nbytes,
+                        &args.get_item(0)?.cast::<HostTask>()?.borrow(),
+                    )
                 },
             )?;
-            let work = owner.executor.bind(py).call_method1("submit", (run,))?;
-            let cancelled = {
-                let mut state = ticket.get().lock(py)?;
-                state.work = Some(work.clone().unbind());
-                state.cancelled
-            };
-            if cancelled {
-                work.call_method0("cancel")?;
-            }
-            work.call_method1("add_done_callback", (finished,))?;
+
+            HostTask::configure(
+                task.bind(py),
+                run.into_any().unbind(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                "uniserve.transfer",
+            )?;
+
+            ticket.get().lock(py)?.work = Some(task.clone_ref(py));
+            task.borrow(py).submit_if_ready(py)?;
+            HostTask::add_done_callback(task.bind(py), finished.into_any().unbind());
             Ok(ticket)
         })();
+
         if submitted.is_err() {
+            if let Some(work) = work {
+                work.borrow(py).abandon(py)?;
+            }
             owner.capacity.get().release(py, nbytes)?;
             owner.capacity.get().return_reads(py, 1)?;
         }
@@ -999,12 +1005,7 @@ impl TransferPool {
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("wait", true)?;
-        kwargs.set_item("cancel_futures", false)?;
-        self.executor
-            .bind(py)
-            .call_method("shutdown", (), Some(&kwargs))?;
+        self.lane.close(py)?;
         let (streams, error) = {
             let mut state = self.lock(py)?;
             (
@@ -1020,7 +1021,6 @@ impl TransferPool {
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.executor)?;
         visit.call(&self.capacity)?;
         visit.call(&self.events)?;
         if let Some(state) = gc_lock(&self.state) {
@@ -1051,19 +1051,36 @@ impl TransferPool {
         call: &Py<PyAny>,
         args: &Py<PyTuple>,
     ) -> PyResult<()> {
-        let result = (|| -> PyResult<()> {
-            ticket.get().require_active(py)?;
-            with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
-                let mut arguments = vec![ticket.bind(py).as_any().clone()];
-                arguments.extend(args.bind(py).iter());
-                call.bind(py).call1(PyTuple::new(py, arguments)?)?;
-                Ok(())
-            })
-        })();
-        if let Err(error) = result {
-            let error = error.into_value(py).into_any();
+        ticket.get().require_active(py)?;
+        with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
+            let mut arguments = vec![ticket.bind(py).as_any().clone()];
+            arguments.extend(args.bind(py).iter());
+            call.bind(py).call1(PyTuple::new(py, arguments)?)?;
+            Ok(())
+        })
+    }
+
+    fn finished(
+        &self,
+        py: Python<'_>,
+        ticket: &Py<TransferTicket>,
+        nbytes: i64,
+        work: &HostTask,
+    ) -> PyResult<()> {
+        let undrained = {
+            let mut state = ticket.get().lock(py)?;
+            state.work = None;
+            !state.unretired.is_empty()
+        };
+        let error = if work.cancelled() {
+            Some(resource(py, "transfer read was cancelled before submission").into_value(py))
+        } else {
+            work.exception(py, Some(0.0))?
+        };
+
+        if let Some(error) = error {
+            let error = error.into_any();
             let late = ticket.get().fail(py, error.clone_ref(py))?;
-            let undrained = !ticket.get().lock(py)?.unretired.is_empty();
             if late || undrained {
                 let mut state = self.lock(py)?;
                 if state.error.is_none() {
@@ -1081,33 +1098,11 @@ impl TransferPool {
                 }
             }
         }
-        Ok(())
-    }
 
-    fn finished(
-        &self,
-        py: Python<'_>,
-        ticket: &Py<TransferTicket>,
-        nbytes: i64,
-        work: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let undrained = {
-            let mut state = ticket.get().lock(py)?;
-            state.work = None;
-            !state.unretired.is_empty()
-        };
         if !undrained {
             self.capacity.get().release(py, nbytes)?;
             self.capacity.get().return_reads(py, 1)?;
             ticket.get().retire(py)?;
-        }
-        if work.call_method0("cancelled")?.extract::<bool>()? {
-            ticket.get().fail(
-                py,
-                resource(py, "transfer read was cancelled before submission")
-                    .into_value(py)
-                    .into_any(),
-            )?;
         }
         Ok(())
     }
@@ -1167,29 +1162,6 @@ fn record_consumers(
         })?;
     }
     Ok(events)
-}
-
-/// Enter PyTorch's thread-local inference/device/stream scopes. These contexts
-/// restore their prior state on either exit and do not suppress exceptions.
-fn with_context<T>(
-    context: &Bound<'_, PyAny>,
-    operation: impl FnOnce() -> PyResult<T>,
-) -> PyResult<T> {
-    let py = context.py();
-    context.call_method0("__enter__")?;
-    match operation() {
-        Ok(value) => {
-            context.call_method1("__exit__", (py.None(), py.None(), py.None()))?;
-            Ok(value)
-        }
-        Err(error) => {
-            context.call_method1(
-                "__exit__",
-                (error.get_type(py), error.value(py), error.traceback(py)),
-            )?;
-            Err(error)
-        }
-    }
 }
 
 // Completion callbacks may inspect their ticket or submit another read. Run

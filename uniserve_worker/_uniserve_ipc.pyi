@@ -87,7 +87,9 @@ Args = ParamSpec("Args")
 class HostLane:
     """Bounded host threads, with capacity reserved before task inputs exist."""
 
-    def __new__(cls, *, max_inflight: int, workers: int) -> Self: ...
+    def __new__(
+        cls, *, max_inflight: int, workers: int, name: str = "worker-host-lane"
+    ) -> Self: ...
     @property
     def max_inflight(self) -> int: ...
     @property
@@ -105,7 +107,7 @@ class HostTask(Generic[Source]):
 
     Result observers may immediately reserve returned lane capacity. A failed
     or cancelled input producer keeps its lease until physical retirement is
-    known. Cancelling queued work retains capacity until a thread dequeues it.
+    known. Cancelling queued work removes it before returning capacity.
     """
 
     def configure(

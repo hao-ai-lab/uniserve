@@ -1,10 +1,8 @@
 //! Bounded host execution shared by media encoding and cache transfer.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
-
-use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::{Completion, Error, Outcome, Result};
 
@@ -43,8 +41,8 @@ struct TaskState<A> {
     action: Option<Arc<A>>,
 }
 
-/// One admitted action and its result. Queued cancellation resolves the result
-/// immediately, but keeps admission capacity until a worker dequeues the task.
+/// One admitted action and its result. Cancellation removes queued work before
+/// returning capacity; running work retains its inputs until it completes.
 pub struct HostTask<A: HostAction> {
     lane: Weak<Mutex<LaneState<A>>>,
     state: Mutex<TaskState<A>>,
@@ -97,20 +95,9 @@ impl<A: HostAction> HostTask<A> {
             return Err(Error::State("host task has no action"));
         }
 
-        let worker = lane
-            .workers
-            .iter_mut()
-            .min_by_key(|worker| worker.queued)
-            .ok_or(Error::State("host lane has no workers"))?;
-
-        // Sending under the admission lock orders accepted work before close's
-        // stop messages. The channel is unbounded; admission supplies its bound.
-        worker
-            .queue
-            .send(Some(Arc::clone(self)))
-            .map_err(|_| Error::State("host worker has stopped"))?;
-        worker.queued += 1;
+        lane.queue.push_back(Arc::clone(self));
         state.phase = Phase::Queued;
+        lane.ready.notify_one();
 
         Ok(())
     }
@@ -146,18 +133,20 @@ impl<A: HostAction> HostTask<A> {
             return Ok(false);
         }
 
-        let unused = state.phase == Phase::Reserved;
-        if unused {
-            state.phase = Phase::Finished;
-            if let Some(lane) = lane.as_mut() {
-                lane.tasks.remove(&(Arc::as_ptr(self) as usize));
+        if let Some(lane) = lane.as_mut() {
+            // Dequeue and cancellation use the same admission lock. Once a
+            // worker claims this task, cancellation can no longer release it.
+            if state.phase == Phase::Queued {
+                lane.queue.retain(|task| !Arc::ptr_eq(task, self));
             }
+            lane.tasks.remove(&(Arc::as_ptr(self) as usize));
         }
+        state.phase = Phase::Finished;
         let (cancelled, callbacks) = self.completion.cancel();
         drop(state);
         drop(lane);
 
-        let released = if unused { self.release_input() } else { Ok(()) };
+        let released = self.release_input();
         A::notify(callbacks);
         released.map(|()| cancelled)
     }
@@ -279,17 +268,13 @@ impl<A: HostAction> HostTask<A> {
     }
 }
 
-struct Worker<A: HostAction> {
-    queue: Sender<Option<Arc<HostTask<A>>>>,
-    queued: usize,
-}
-
 struct LaneState<A: HostAction> {
     capacity: usize,
     closed: bool,
     aborted: bool,
     tasks: HashMap<usize, Arc<HostTask<A>>>,
-    workers: Vec<Worker<A>>,
+    queue: VecDeque<Arc<HostTask<A>>>,
+    ready: Arc<Condvar>,
     wake: Option<Arc<A::Wake>>,
 }
 
@@ -301,38 +286,38 @@ pub struct HostLane<A: HostAction> {
 }
 
 impl<A: HostAction> HostLane<A> {
-    pub fn new(capacity: usize, workers: usize) -> Result<Self> {
+    pub fn new(capacity: usize, workers: usize, name: &str) -> Result<Self> {
         if capacity == 0 || workers == 0 || workers > capacity {
             return Err(Error::Invalid(
                 "host workers must lie within positive lane capacity".into(),
             ));
         }
-        let mut queues = Vec::new();
-        let mut receivers = Vec::new();
-        for _ in 0..workers {
-            let (queue, receiver) = unbounded();
-            queues.push(Worker { queue, queued: 0 });
-            receivers.push(receiver);
-        }
+
+        let ready = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(LaneState {
             capacity,
             closed: false,
             aborted: false,
             tasks: HashMap::new(),
-            workers: queues,
+            queue: VecDeque::new(),
+            ready: Arc::clone(&ready),
             wake: None,
         }));
+
         let mut threads = Vec::new();
-        for (index, receiver) in receivers.into_iter().enumerate() {
+        for index in 0..workers {
             let shared = Arc::clone(&state);
+            let ready = Arc::clone(&ready);
             match thread::Builder::new()
-                .name(format!("worker-host-lane-{index}"))
-                .spawn(move || run_worker(shared, index, receiver))
+                .name(format!("{name}-{index}"))
+                .spawn(move || run_worker(shared, ready))
             {
                 Ok(thread) => threads.push(thread),
                 Err(error) => {
-                    for worker in &state.lock().unwrap_or_else(PoisonError::into_inner).workers {
-                        let _ = worker.queue.send(None);
+                    {
+                        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                        state.closed = true;
+                        state.ready.notify_all();
                     }
                     for thread in threads {
                         let _ = thread.join();
@@ -343,6 +328,7 @@ impl<A: HostAction> HostLane<A> {
                 }
             }
         }
+
         Ok(Self {
             state,
             threads: Mutex::new(threads),
@@ -389,9 +375,7 @@ impl<A: HostAction> HostLane<A> {
             let mut state = self.state();
             state.closed = true;
             state.aborted = true;
-            for worker in &state.workers {
-                let _ = worker.queue.send(None);
-            }
+            state.ready.notify_all();
             state.wake.take()
         };
         drop(wake);
@@ -414,12 +398,7 @@ impl<A: HostAction> HostLane<A> {
                 errors.push(error);
             }
         }
-        {
-            let state = self.state();
-            for worker in &state.workers {
-                let _ = worker.queue.send(None);
-            }
-        }
+        self.state().ready.notify_all();
         let threads =
             std::mem::take(&mut *self.threads.lock().unwrap_or_else(PoisonError::into_inner));
         for thread in threads {
@@ -443,14 +422,22 @@ impl<A: HostAction> Drop for HostLane<A> {
     }
 }
 
-fn run_worker<A: HostAction>(
-    state: Arc<Mutex<LaneState<A>>>,
-    index: usize,
-    receiver: Receiver<Option<Arc<HostTask<A>>>>,
-) {
-    while let Ok(Some(task)) = receiver.recv() {
-        let aborted = state.lock().unwrap_or_else(PoisonError::into_inner).aborted;
+fn run_worker<A: HostAction>(state: Arc<Mutex<LaneState<A>>>, ready: Arc<Condvar>) {
+    loop {
+        let mut state = ready
+            .wait_while(
+                state.lock().unwrap_or_else(PoisonError::into_inner),
+                |state| state.queue.is_empty() && !state.closed,
+            )
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(task) = state.queue.pop_front() else {
+            return;
+        };
+
+        task.state().phase = Phase::Running;
+        let aborted = state.aborted;
+        drop(state);
+
         task.run(aborted);
-        state.lock().unwrap_or_else(PoisonError::into_inner).workers[index].queued -= 1;
     }
 }

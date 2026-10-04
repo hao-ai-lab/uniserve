@@ -61,13 +61,7 @@ impl HostAction for PythonAction {
                     .import("uniserve.profiling")?
                     .getattr("profile_range")?
                     .call1((&self.profile_name,))?;
-                scope.call_method0("__enter__")?;
-                let result = self.action.bind(py).call0();
-                let close = scope.call_method1("__exit__", (py.None(), py.None(), py.None()));
-                match (result, close) {
-                    (Ok(value), Ok(_)) => Ok(value.unbind()),
-                    (Err(error), _) | (_, Err(error)) => Err(error),
-                }
+                with_context(&scope, || self.action.bind(py).call0().map(Bound::unbind))
             };
             run().map_err(|error| error.into_value(py))
         })
@@ -178,10 +172,15 @@ pub(crate) struct HostLane {
 #[pymethods]
 impl HostLane {
     #[new]
-    #[pyo3(signature = (*, max_inflight, workers))]
-    fn new(py: Python<'_>, max_inflight: usize, workers: usize) -> PyResult<Self> {
+    #[pyo3(signature = (*, max_inflight, workers, name="worker-host-lane"))]
+    pub(crate) fn new(
+        py: Python<'_>,
+        max_inflight: usize,
+        workers: usize,
+        name: &str,
+    ) -> PyResult<Self> {
         Ok(Self {
-            lane: NativeHostLane::new(max_inflight, workers)
+            lane: NativeHostLane::new(max_inflight, workers, name)
                 .map_err(|error| native_error(py, error))?,
             max_inflight,
         })
@@ -196,7 +195,7 @@ impl HostLane {
         self.lane.set_wake(wake);
     }
 
-    fn reserve(&self, py: Python<'_>) -> PyResult<Py<HostTask>> {
+    pub(crate) fn reserve(&self, py: Python<'_>) -> PyResult<Py<HostTask>> {
         let task = self
             .lane
             .reserve()
@@ -216,7 +215,7 @@ impl HostLane {
         self.lane.abort();
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn close(&self, py: Python<'_>) -> PyResult<()> {
         let mut errors = py.detach(|| self.lane.close()).into_iter();
         if let Some(mut error) = errors.next() {
             for cleanup in errors {
@@ -236,7 +235,7 @@ pub(crate) struct HostTask {
 #[pymethods]
 impl HostTask {
     #[pyo3(signature = (action, *, dependencies=Vec::new(), input_ready=None, input_completion=None, release=None, profile_name="uniserve.host"))]
-    fn configure<'py>(
+    pub(crate) fn configure<'py>(
         slf: &Bound<'py, Self>,
         action: Py<PyAny>,
         dependencies: Vec<Py<PyAny>>,
@@ -307,7 +306,7 @@ impl HostTask {
         Ok(slf.clone())
     }
 
-    fn submit_if_ready(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn submit_if_ready(&self, py: Python<'_>) -> PyResult<()> {
         self.task
             .submit_if_ready()
             .map_err(|error| PyErr::from_value(error.bind(py).clone().into_any()))
@@ -317,7 +316,7 @@ impl HostTask {
         self.task.completion.done()
     }
 
-    fn cancelled(&self) -> bool {
+    pub(crate) fn cancelled(&self) -> bool {
         matches!(self.task.completion.outcome(), Some(Outcome::Cancelled))
     }
 
@@ -331,7 +330,7 @@ impl HostTask {
     }
 
     #[pyo3(signature = (timeout=None))]
-    fn exception(
+    pub(crate) fn exception(
         &self,
         py: Python<'_>,
         timeout: Option<f64>,
@@ -343,7 +342,7 @@ impl HostTask {
         }
     }
 
-    fn add_done_callback(slf: &Bound<'_, Self>, callback: Py<PyAny>) {
+    pub(crate) fn add_done_callback(slf: &Bound<'_, Self>, callback: Py<PyAny>) {
         let immediate = slf
             .borrow()
             .task
@@ -354,14 +353,14 @@ impl HostTask {
         }
     }
 
-    fn abandon(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn abandon(&self, py: Python<'_>) -> PyResult<()> {
         self.task
             .cancel(true)
             .map(drop)
             .map_err(|error| PyErr::from_value(error.bind(py).clone().into_any()))
     }
 
-    fn cancel(&self, py: Python<'_>) -> PyResult<bool> {
+    pub(crate) fn cancel(&self, py: Python<'_>) -> PyResult<bool> {
         self.task
             .cancel(false)
             .map_err(|error| PyErr::from_value(error.bind(py).clone().into_any()))
@@ -428,5 +427,28 @@ impl HostTask {
             .transpose()?;
         py.detach(|| self.task.completion.wait(timeout))
             .ok_or_else(|| PyTimeoutError::new_err("host task has not completed"))
+    }
+}
+
+/// Enter PyTorch's thread-local inference/device/stream scopes. These contexts
+/// restore their prior state on either exit and do not suppress exceptions.
+pub(super) fn with_context<T>(
+    context: &Bound<'_, PyAny>,
+    operation: impl FnOnce() -> PyResult<T>,
+) -> PyResult<T> {
+    let py = context.py();
+    context.call_method0("__enter__")?;
+    match operation() {
+        Ok(value) => {
+            context.call_method1("__exit__", (py.None(), py.None(), py.None()))?;
+            Ok(value)
+        }
+        Err(error) => {
+            context.call_method1(
+                "__exit__",
+                (error.get_type(py), error.value(py), error.traceback(py)),
+            )?;
+            Err(error)
+        }
     }
 }

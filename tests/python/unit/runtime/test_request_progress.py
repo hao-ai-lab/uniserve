@@ -11,6 +11,7 @@ from uniserve.media import image
 from uniserve.model import ConditionRole
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.execution.diffusion_state import DiffusionState, SlotLadder
+from uniserve_worker.execution.host import HostLane
 from uniserve_worker.execution.request import (
     RequestPool,
     RequestProgress,
@@ -274,19 +275,39 @@ def test_diffusion_close_drains_a_failed_host_write():
         destination.fill_(7)
         raise RuntimeError("host staging failed after writing")
 
-    with ThreadPoolExecutor(max_workers=2) as tasks:
-        staging = tasks.submit(stage)
+    lane = HostLane(max_inflight=1, workers=1)
+    try:
+        staging = lane.reserve().submit(stage)
         state = DiffusionState(
             size=(), schedules={}, slot=SlotLadder(staging=staging)
         )
-        closing = tasks.submit(state.close)
-        try:
-            with pytest.raises(TimeoutError):
-                closing.result(timeout=0.05)
-        finally:
-            release.set()
+        with ThreadPoolExecutor(max_workers=1) as tasks:
+            closing = tasks.submit(state.close)
+            try:
+                with pytest.raises(TimeoutError):
+                    closing.result(timeout=0.05)
+            finally:
+                release.set()
 
-        closing.result(timeout=5)
+            closing.result(timeout=5)
         assert destination.item() == 7
         with pytest.raises(RuntimeError, match="host staging failed"):
             staging.result()
+    finally:
+        release.set()
+        lane.close()
+
+
+def test_diffusion_close_retires_cancelled_host_staging():
+    destination = torch.zeros(1)
+    lane = HostLane(max_inflight=1, workers=1)
+    try:
+        staging = lane.reserve().configure(lambda: destination.fill_(7))
+        staging.cancel()
+        state = DiffusionState(
+            size=(), schedules={}, slot=SlotLadder(staging=staging)
+        )
+        state.close()
+        assert destination.item() == 0
+    finally:
+        lane.close()

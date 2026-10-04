@@ -1,5 +1,7 @@
 """Read cancellation and failures through the transfer submission contract."""
 
+import gc
+import weakref
 from threading import Event
 
 import pytest
@@ -51,6 +53,10 @@ def test_queued_cancellation_returns_credit_without_waiting_for_another_read():
         with pytest.raises(WorkerError, match="cancelled"):
             cancelled.result()
         assert torch.equal(cancelled_value, torch.zeros_like(source))
+        reference = weakref.ref(cancelled_value)
+        del cancelled_value
+        gc.collect()
+        assert reference() is None
 
         # Its replacement is admitted while the independent first read still
         # holds the only worker thread and its own byte/read reservation.
@@ -68,13 +74,19 @@ def test_queued_cancellation_returns_credit_without_waiting_for_another_read():
         assert torch.equal(replacement.result(), source)
         assert first.retirement_ready() and replacement.retirement_ready()
         assert capacity.used == 0
+        with pytest.raises(WorkerError, match="closed"):
+            pool.submit(pool.copy, source, replacement_value, nbytes=4)
+        assert capacity.used == 0
+        capacity.take_reads(2)
+        capacity.return_reads(2)
     finally:
         proceed.set()
         pool.close()
         events.close()
 
 
-def test_late_read_failure_retires_storage_and_rejects_further_submissions():
+@pytest.mark.parametrize("delivered", (False, True))
+def test_read_failure_retires_storage_and_preserves_failure_scope(delivered):
     events = EventPool()
     capacity = TransferCapacity(4, 1)
     pool = TransferPool(
@@ -82,24 +94,34 @@ def test_late_read_failure_retires_storage_and_rejects_further_submissions():
     )
     source = torch.tensor([3.0])
     destination = torch.zeros_like(source)
+    failure = RuntimeError("source failed")
 
     def failing_source(ticket):
-        pool.copy(ticket, source, destination)
-        raise RuntimeError("source failed after delivering its views")
+        if delivered:
+            pool.copy(ticket, source, destination)
+        raise failure
 
     try:
         ticket = pool.submit(failing_source, nbytes=4, destination=destination)
         retired = Event()
         ticket.add_retirement_callback(retired.set)
         assert retired.wait(5), "drained failed read did not retire"
-        assert torch.equal(destination, source)
+        expected = source if delivered else torch.zeros_like(source)
+        assert torch.equal(destination, expected)
         assert capacity.used == 0
-        with pytest.raises(RuntimeError, match="source failed"):
+        with pytest.raises(RuntimeError, match="source failed") as raised:
             ticket.result()
-        with pytest.raises(RuntimeError, match="source failed"):
-            pool.submit(pool.copy, source, destination, nbytes=4)
-        with pytest.raises(RuntimeError, match="source failed"):
+        assert raised.value is failure
+        if delivered:
+            with pytest.raises(RuntimeError, match="source failed"):
+                pool.submit(pool.copy, source, destination, nbytes=4)
+            with pytest.raises(RuntimeError, match="source failed"):
+                pool.close()
+        else:
+            replacement = pool.submit(pool.copy, source, destination, nbytes=4)
             pool.close()
+            assert torch.equal(replacement.result(), source)
+            assert replacement.retirement_ready()
     finally:
         try:
             pool.close()

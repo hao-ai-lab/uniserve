@@ -30,7 +30,6 @@ import logging
 import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
@@ -102,6 +101,7 @@ from uniserve_worker.execution.conditions import (
     condition_layout,
     library_conditions,
 )
+from uniserve_worker.execution.host import HostLane
 from uniserve_worker.execution.kernel_table import (
     KernelRecords,
     format_kernel_table,
@@ -367,8 +367,10 @@ class ModelExecutor:
             # its own thread, off the service thread that launches device
             # work, as soon as the request is admitted.
             self.noise_draws = (
-                ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="worker-noise"
+                HostLane(
+                    max_inflight=worker_config.max_request_pool_size,
+                    workers=1,
+                    name="worker-noise",
                 )
                 if self._denoiser is not None
                 else None
@@ -2155,7 +2157,9 @@ class ModelExecutor:
         # A constructor failure closes before ``noise_draws`` is assigned.
         noise_draws = getattr(self, "noise_draws", None)
         if noise_draws is not None:
-            noise_draws.shutdown(wait=not aborted, cancel_futures=True)
+            noise_draws.abort()
+            if not aborted:
+                noise_draws.close()
 
         if aborted:
             from uniserve.runtime.resources import retain_until_exit
