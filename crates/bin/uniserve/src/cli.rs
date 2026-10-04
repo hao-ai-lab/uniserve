@@ -83,6 +83,27 @@ impl From<SchedulerPolicyArg> for SchedulingPolicy {
     }
 }
 
+/// Distributed expert access accepted by the command line.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ExpertExchangeArg {
+    /// FlashInfer's NVLink all-to-all around each rank's grouped experts.
+    Alltoall,
+    /// The fused CuTeDSL MegaMoE kernel (NVFP4 experts).
+    Megamoe,
+    /// Distributed weight data parallelism with asynchronous NVLink prefetch.
+    Dwdp,
+}
+
+impl From<ExpertExchangeArg> for uniserve_engine::ExpertExchange {
+    fn from(value: ExpertExchangeArg) -> Self {
+        match value {
+            ExpertExchangeArg::Alltoall => Self::AllToAll,
+            ExpertExchangeArg::Megamoe => Self::MegaMoe,
+            ExpertExchangeArg::Dwdp => Self::Dwdp,
+        }
+    }
+}
+
 /// Arguments for the `serve` command.
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
@@ -174,6 +195,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// Optional explicit KV token capacity override for the worker.
     #[arg(long = "max-total-tokens")]
     pub kv_token_capacity: Option<u64>,
+    /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
+    #[arg(long)]
+    pub disable_prefix_cache: bool,
     /// Response-ring slot capacity in bytes for the worker IPC transport.
     #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub resp_slot_cap: usize,
@@ -186,9 +210,28 @@ pub(crate) struct SharedRuntimeArgs {
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
     pub worker_python: std::path::PathBuf,
-    /// Number of physical worker processes when configuration is omitted.
+    /// Number of physical worker processes of each replica when configuration
+    /// is omitted; they form one tensor-parallel group.
     #[arg(long = "worker-ranks", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
+    /// Number of independent model replicas. Each replica runs its own
+    /// scheduler, KV cache and worker ranks, and every request is served by
+    /// the replica with the fewest requests in flight. Without `--workers`,
+    /// the replicas take `--worker-ranks` ranks each, placed in blocks over
+    /// `--worker-hosts`; a `--workers` file lists the replicas as equal
+    /// consecutive blocks of groups.
+    #[arg(long = "data-parallel-size", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub data_parallel_size: usize,
+    /// Shard the model's routed experts across the data-parallel replicas:
+    /// each one-rank replica keeps its share of every expert layer and
+    /// uses the selected expert exchange, while attention and every other
+    /// layer stay data-parallel.
+    #[arg(long = "expert-parallel", default_value_t = false)]
+    pub expert_parallel: bool,
+    /// Access distributed experts through NVLink all-to-all, fused MegaMoE,
+    /// or DWDP's asynchronous weight prefetch with independent rank progress.
+    #[arg(long = "expert-exchange", value_enum, default_value = "alltoall")]
+    pub expert_exchange: ExpertExchangeArg,
     /// Path to a JSON deployment configuration: the Worker instances to serve,
     /// each one's node/device ranks, and the components placed on them.
     #[arg(long, value_name = "FILE", value_parser = read_workers)]
@@ -370,27 +413,31 @@ impl SharedRuntimeArgs {
                 .long_prefill_threshold
                 .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
             mixed_prefill_tokens: self.mixed_prefill_tokens,
+            prefix_cache: !self.disable_prefix_cache,
             scheduler_policy: self.scheduler_policy.into(),
             // `None` lets `build_state` derive the model's real context length;
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
             max_condition_rows: self.max_condition_rows,
-            // Without a written configuration a deployment serves one
-            // component over every rank. A model whose components are placed
-            // differently -- on disjoint ranks, or with distinct partitions --
-            // is served by writing that configuration, which `--workers`
-            // parses into exactly the type this builds.
+            // Without a written configuration each replica serves one
+            // component over its `--worker-ranks` ranks. A model whose
+            // components are placed differently -- on disjoint ranks, or with
+            // distinct partitions -- is served by writing that configuration,
+            // which `--workers` parses into exactly the type this builds.
             workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
-                vec![WorkerConfig::placed(
+                WorkerConfig::replicated(
                     &self.rank_hosts(),
                     &self.device,
+                    self.data_parallel_size,
                     self.worker_ranks,
                     queue_depth,
                     WorkerConfig::single_component(DEFAULT_COMPONENT, self.worker_ranks),
-                )]
+                )
             }),
             transfer: self.transfer.clone().unwrap_or_default(),
+            data_parallel_size: self.data_parallel_size,
+            expert_parallel: self.expert_parallel.then_some(self.expert_exchange.into()),
             worker_process,
         }
     }
@@ -482,10 +529,17 @@ pub(crate) struct WorkerProcessOptions {
     pub graph_policy: String,
     #[arg(long, hide = true)]
     pub decode_graph_batch_sizes: Option<String>,
-    #[arg(long, action = ArgAction::Set, default_value_t = false, hide = true)]
+    /// Replay a startup-captured CUDA graph for every prefill call
+    /// (default). `false` runs prefill eagerly, for debugging only.
+    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub prefill_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub prefill_graph_token_sizes: Option<String>,
+    /// Capture image denoising calls at the configured flow shapes and
+    /// replay those whose exact input signature was captured (default).
+    /// `false` runs image denoising eagerly, for debugging only.
+    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
+    pub flow_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub flow_graph_batch_sizes: Option<String>,
     #[arg(long, hide = true)]
@@ -539,6 +593,7 @@ impl WorkerProcessOptions {
             decode_graph_batch_sizes: self.decode_graph_batch_sizes.clone(),
             prefill_cuda_graph: self.prefill_cuda_graph,
             prefill_graph_token_sizes: self.prefill_graph_token_sizes.clone(),
+            flow_cuda_graph: self.flow_cuda_graph,
             flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
             flow_graph_shapes: self.flow_graph_shapes.clone(),
             video_text_capacities: self.video_text_capacities.clone(),

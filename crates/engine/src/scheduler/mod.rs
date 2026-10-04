@@ -39,12 +39,14 @@ mod config;
 mod stats;
 pub(crate) mod stats_report;
 
+pub(crate) use config::MAX_NUM_SEQS;
+use config::MAX_NUM_WAITING;
 pub use config::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulingPolicy,
 };
-use config::{MAX_NUM_SEQS, MAX_NUM_WAITING};
 pub(crate) use execution::generation_consuming_calls;
+pub(crate) use run::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
@@ -78,7 +80,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::scheduler::generation::{
-    GenerationPhase as Phase, consumes_image_features, is_feedback_computation, is_prompt_extend,
+    BlockCursor, GenerationPhase as Phase, consumes_image_features, is_feedback_computation,
+    is_prompt_extend,
 };
 
 use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx};
@@ -124,7 +127,8 @@ const MAX_INFLIGHT_TRANSFERS: usize = 256;
 enum BatchKind {
     /// Every forward prefill, and text, vision, and latent encoding.
     Prefill,
-    /// Token decode and speculative verification.
+    /// Calls that advance admitted requests without growing their prompt:
+    /// token decode, speculative verification, and canvas denoising.
     Decode,
     /// Latent preparation, denoising, image, video, and audio decoding, video
     /// and audio encoding, muxing, and transfers.
@@ -444,6 +448,7 @@ impl Scheduler {
             (RuntimeFamily::Ar, RuntimeFamily::Ar)
                 | (RuntimeFamily::Diffusion, RuntimeFamily::Diffusion)
                 | (RuntimeFamily::Umm, RuntimeFamily::Ar | RuntimeFamily::Umm)
+                | (RuntimeFamily::BlockDiffusion, RuntimeFamily::BlockDiffusion)
         )
     }
 }
@@ -522,9 +527,9 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
         | CallKind::Media(MediaCall::TextEncoding)
         | CallKind::Media(MediaCall::VisionEncoding)
         | CallKind::Media(MediaCall::LatentEncoding) => BatchKind::Prefill,
-        CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
-            BatchKind::Decode
-        }
+        CallKind::Forward(
+            ForwardMode::Decode | ForwardMode::Verify | ForwardMode::TokenDenoising,
+        ) => BatchKind::Decode,
         CallKind::Media(MediaCall::Denoising)
         | CallKind::Media(MediaCall::VideoDecoding)
         | CallKind::Media(MediaCall::LatentPreparation)

@@ -27,6 +27,7 @@ use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
 };
+use crate::scheduler::{MAX_FLOW_PREFIX_ROWS, MAX_NUM_SEQS, flow_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
@@ -273,9 +274,50 @@ impl WorkerConfig {
             storage_fraction: None,
         }
     }
+
+    /// Expands the data-parallel CLI shorthand into `replicas` groups of
+    /// `ranks_per_replica` ranks, each carrying `components`.
+    ///
+    /// All `replicas * ranks_per_replica` ranks are placed at once as
+    /// [`WorkerConfig::placed`] places them, in blocks over `hosts`, and
+    /// consecutive runs of `ranks_per_replica` form the replicas, so
+    /// replicas fill the head's host first. One replica is the group
+    /// `model`; replica `i` of several is `model-<i>`.
+    pub fn replicated(
+        hosts: &[String],
+        device: &str,
+        replicas: usize,
+        ranks_per_replica: usize,
+        queue_depth: usize,
+        components: BTreeMap<String, ComponentConfig>,
+    ) -> Vec<Self> {
+        let placed = Self::placed(
+            hosts,
+            device,
+            replicas * ranks_per_replica,
+            queue_depth,
+            components,
+        );
+        if replicas <= 1 {
+            return vec![placed];
+        }
+        placed
+            .ranks
+            .chunks(ranks_per_replica.max(1))
+            .enumerate()
+            .map(|(index, ranks)| Self {
+                id: WorkerId(format!("model-{index}")),
+                ranks: ranks.to_vec(),
+                components: placed.components.clone(),
+                queue_depth,
+                storage_fraction: None,
+            })
+            .collect()
+    }
 }
 
-/// Configuration for one in-process engine core.
+/// Configuration for the in-process engine cores of one deployment: one core,
+/// or one per data-parallel replica.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Request runtime selected for this configuration.
@@ -286,13 +328,17 @@ pub struct EngineConfig {
     pub max_batch: usize,
     /// Maximum number of tokens scheduled in one engine step.
     pub max_num_batched_tokens: usize,
-    /// Maximum number of concurrently running requests.
+    /// Maximum number of concurrently running requests. `EngineCore::new`
+    /// sizes every worker's request pool from it.
     pub max_num_seqs: usize,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as one mixed extend+decode forward. `0` disables mixing.
     pub mixed_prefill_tokens: usize,
+    /// Reuse and retain prompt KV prefixes across requests. Disabling this
+    /// does not remove the KV storage needed within an active request.
+    pub prefix_cache: bool,
     /// Waiting queue policy for admitting/scheduling requests.
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length reported to the frontend.
@@ -306,6 +352,16 @@ pub struct EngineConfig {
     /// and across WorkerGroups, that no configured edge covers, derived from
     /// rank node/device coordinates.
     pub transfer: TransferConfig,
+    /// Number of independent replicas `workers` forms, as equal consecutive
+    /// blocks of groups; each replica is served by its own engine core
+    /// ([`EngineCore::replicas`]). One means the workers form one engine.
+    pub data_parallel_size: usize,
+    /// Whether the data-parallel replicas shard the model's routed experts,
+    /// and how they exchange tokens: each replica is then one rank, keeps
+    /// its share of every expert layer and exchanges tokens with the others
+    /// at those layers, while attention and every other layer stay
+    /// data-parallel. `None` keeps every expert on every replica.
+    pub expert_parallel: Option<crate::worker::ExpertExchange>,
     /// Rank launch defaults refined by each WorkerGroup configuration.
     ///
     /// Every constructor also reads the model identifier (`model`) and
@@ -350,6 +406,7 @@ impl EngineConfig {
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
+            prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
             workers: vec![WorkerConfig::placed(
@@ -360,6 +417,8 @@ impl EngineConfig {
                 WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )],
             transfer: TransferConfig::default(),
+            data_parallel_size: 1,
+            expert_parallel: None,
             worker_process,
             bos: 0,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
@@ -401,67 +460,208 @@ impl EngineCore {
     /// Launches every configured WorkerGroup, builds the scheduler, and starts
     /// the scheduler owner thread.
     ///
+    /// Every group is launched with a request pool of `max_num_seqs` rows
+    /// plus the largest reserve a runtime keeps outside that limit.
+    ///
     /// Blocks until every rank has loaded the model and reported its
-    /// capabilities. Fails when `WorkerConfig::validate_all` rejects the
+    /// capabilities. Fails when `config.data_parallel_size` is not one (see
+    /// [`EngineCore::replicas`]), `WorkerConfig::validate_all` rejects the
     /// workers, a configured transfer edge names an unconfigured worker,
     /// `WorkerGroup::spawn_all` fails to launch a group,
-    /// `WorkerExecutor::try_new` refuses the launched groups, or the scheduler
-    /// or its thread cannot be created.
-    pub fn new(mut config: EngineConfig) -> anyhow::Result<Self> {
-        // Validates the workers and fills default edges; the edges it adds
-        // only name configured workers, so the check below covers the
-        // explicitly configured ones.
-        config.transfer = config.transfer.with_worker_defaults(&config.workers)?;
-        let instances = config
-            .workers
-            .iter()
-            .map(|worker| worker.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        for edge in &config.transfer.edges {
-            anyhow::ensure!(
-                instances.contains(&edge.source_worker)
-                    && instances.contains(&edge.destination_worker),
-                "transfer edge names an unconfigured worker"
+    /// `WorkerExecutor::try_new` refuses the launched groups, the workers of
+    /// a runtime with a KV cache hold too few request rows for
+    /// `max_num_seqs` running requests, or the scheduler or its thread
+    /// cannot be created.
+    pub fn new(config: EngineConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.data_parallel_size == 1,
+            "one engine core serves one replica; EngineCore::replicas launches \
+             data-parallel replicas"
+        );
+        let mut cores = Self::replicas(config)?;
+        Ok(cores.remove(0))
+    }
+
+    /// Launches `config.data_parallel_size` independent replicas of the
+    /// deployment and returns one engine core per replica.
+    ///
+    /// `config.workers` lists the replicas as equal consecutive blocks of
+    /// WorkerGroups. Each replica gets its own scheduler thread, executor, KV
+    /// pool, prefix cache and request rows over its own groups, the way
+    /// SGLang runs one scheduler per data-parallel rank behind its
+    /// `DataParallelController` and vLLM one engine core per data-parallel
+    /// rank. Every group of every replica launches through one
+    /// `WorkerGroup::spawn_all`, so the replicas load their models at the same
+    /// time and one launcher per remote host serves all of them.
+    ///
+    /// Replicas exchange no products: every configured transfer edge must stay
+    /// inside one replica, and each replica binds its default edges over its
+    /// own groups only.
+    ///
+    /// Fails when the size is zero or does not divide the groups, when the
+    /// replicas are not the same deployment on different ranks (group count,
+    /// rank counts, components, queue depth and storage fraction must match
+    /// position by position), when a configured edge crosses replicas or
+    /// names an unconfigured worker, or for any reason `EngineCore::new`
+    /// names.
+    pub fn replicas(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
+        let size = config.data_parallel_size;
+        anyhow::ensure!(
+            size > 0 && !config.workers.is_empty() && config.workers.len().is_multiple_of(size),
+            "{} worker groups do not form {size} equal data-parallel replicas",
+            config.workers.len()
+        );
+        WorkerConfig::validate_all(&config.workers)?;
+        let replicas: Vec<&[WorkerConfig]> =
+            config.workers.chunks(config.workers.len() / size).collect();
+        for replica in &replicas[1..] {
+            for (group, first) in replica.iter().zip(replicas[0]) {
+                anyhow::ensure!(
+                    group.ranks.len() == first.ranks.len()
+                        && group.components == first.components
+                        && group.queue_depth == first.queue_depth
+                        && group.storage_fraction == first.storage_fraction,
+                    "data-parallel replicas must place the same groups: worker {} \
+                     differs from worker {}",
+                    group.id,
+                    first.id
+                );
+            }
+        }
+
+        // Replicas that shard their experts are one rank each: the expert
+        // exchange joins one rank per replica, and a replica with tensor
+        // parallel attention would also need its own expert partition.
+        anyhow::ensure!(
+            config.expert_parallel.is_none()
+                || (size > 1
+                    && replicas
+                        .iter()
+                        .all(|replica| { replica.len() == 1 && replica[0].ranks.len() == 1 })),
+            "expert parallelism shards experts across two or more data-parallel \
+             replicas of one rank each"
+        );
+
+        // Each replica resolves its transfer edges over its own groups. The
+        // edges `with_worker_defaults` adds only name the replica's groups, so
+        // checking the configured ones covers every edge.
+        let mut transfers = Vec::with_capacity(size);
+        let mut assigned = 0;
+        for replica in &replicas {
+            let members = replica
+                .iter()
+                .map(|worker| worker.id.clone())
+                .collect::<BTreeSet<_>>();
+            let edges = config
+                .transfer
+                .edges
+                .iter()
+                .filter(|edge| members.contains(&edge.source_worker))
+                .cloned()
+                .collect::<Vec<_>>();
+            for edge in &edges {
+                anyhow::ensure!(
+                    members.contains(&edge.destination_worker),
+                    "transfer edge {} -> {} leaves its source's data-parallel replica",
+                    edge.source_worker,
+                    edge.destination_worker
+                );
+            }
+            assigned += edges.len();
+            transfers.push(
+                TransferConfig {
+                    edges,
+                    ..config.transfer.clone()
+                }
+                .with_worker_defaults(replica)?,
             );
         }
-        let peers = config
-            .workers
-            .iter()
-            .map(|worker| (worker.id.to_string(), worker.components.clone()))
-            .collect::<std::collections::BTreeMap<_, _>>();
+        anyhow::ensure!(
+            assigned == config.transfer.edges.len(),
+            "transfer edge names an unconfigured worker"
+        );
+
+        // Every group holds a request row for each running request the
+        // scheduler may keep resident, plus the rows a runtime keeps outside
+        // that limit. Only the loaded capabilities decide that reserve
+        // (`flow_prefix_rows`), so the launch sizes for the largest one.
+        let max_num_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
+        let max_request_pool_size = u32::try_from(max_num_seqs + MAX_FLOW_PREFIX_ROWS)
+            .context("max_num_seqs exceeds the worker request-pool field")?;
 
         // Each group launches from the shared defaults with its own identity,
-        // placement, components, queue depth, and storage fraction, plus the
-        // resolved transfer edges and every group's components (`peers`),
-        // from which the group resolves the ranks, possibly in other groups,
-        // that read its products.
-        let mut bindings = Vec::new();
-        let mut arguments = Vec::new();
-        for worker in &config.workers {
-            arguments.push(WorkerProcessArgs {
-                worker_id: worker.id.to_string(),
-                ranks: worker.ranks.clone(),
-                components: worker.components.clone(),
-                peers: peers.clone(),
-                queue_depth: worker.queue_depth,
-                kv_storage_fraction: worker
-                    .storage_fraction
-                    .unwrap_or(config.worker_process.kv_storage_fraction),
-                transfer: config.transfer.clone(),
-                ..config.worker_process.clone()
-            });
-            bindings.push(worker.id.clone());
+        // placement, components, queue depth, and storage fraction, plus its
+        // replica's resolved transfer edges and the components of every group
+        // of its replica (`peers`), from which the group resolves the ranks,
+        // possibly in other groups, that read its products.
+        let mut arguments = Vec::with_capacity(config.workers.len());
+        for (index, (replica, transfer)) in replicas.iter().zip(&transfers).enumerate() {
+            let peers = replica
+                .iter()
+                .map(|worker| (worker.id.to_string(), worker.components.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for worker in *replica {
+                arguments.push(WorkerProcessArgs {
+                    worker_id: worker.id.to_string(),
+                    ranks: worker.ranks.clone(),
+                    components: worker.components.clone(),
+                    peers: peers.clone(),
+                    queue_depth: worker.queue_depth,
+                    max_request_pool_size,
+                    kv_storage_fraction: worker
+                        .storage_fraction
+                        .unwrap_or(config.worker_process.kv_storage_fraction),
+                    transfer: transfer.clone(),
+                    expert_parallel: config.expert_parallel.map(|exchange| {
+                        crate::worker::ExpertParallelPlacement {
+                            rank: index as u32,
+                            size: size as u32,
+                            address: None,
+                            exchange,
+                        }
+                    }),
+                    ..config.worker_process.clone()
+                });
+            }
         }
 
         // `spawn_all` returns groups in argument order, which pairs each group
-        // with its identity.
-        let workers = bindings
-            .into_iter()
-            .zip(WorkerGroup::spawn_all(arguments)?)
-            .collect();
-        let executor = WorkerExecutor::try_new(workers, config.transfer.clone())?;
-        let waker = executor.command_waker();
-        Self::assemble(config, Box::new(executor), waker)
+        // with its identity and, block by block, with its replica.
+        let mut groups = config
+            .workers
+            .iter()
+            .map(|worker| worker.id.clone())
+            .zip(WorkerGroup::spawn_all(arguments)?);
+        let mut cores = Vec::with_capacity(size);
+        for (replica, transfer) in replicas.iter().zip(transfers) {
+            let workers = groups.by_ref().take(replica.len()).collect();
+            let executor = WorkerExecutor::try_new(workers, transfer.clone())?;
+
+            // A token runtime serves `max_num_seqs` running requests only while
+            // its workers hold that many request rows beyond the reserve; the
+            // scheduler would otherwise lower the limit. Workers without a KV
+            // cache fit their request pools to device storage, and the
+            // scheduler bounds their requests by the rows they report.
+            let info = executor.info().runtime_info()?;
+            let request_rows = info.request_slots as usize;
+            let needed_rows = max_num_seqs + flow_prefix_rows(&info);
+            anyhow::ensure!(
+                !info.uses_kv() || request_rows >= needed_rows,
+                "the workers hold {request_rows} request rows, but {max_num_seqs} running \
+                 requests need {needed_rows}"
+            );
+
+            let waker = executor.command_waker();
+            let replica_config = EngineConfig {
+                workers: replica.to_vec(),
+                transfer,
+                data_parallel_size: 1,
+                expert_parallel: None,
+                ..config.clone()
+            };
+            cores.push(Self::assemble(replica_config, Box::new(executor), waker)?);
+        }
+        Ok(cores)
     }
 
     /// Builds the engine core from an executor supplied by a higher composition layer.
@@ -492,7 +692,7 @@ impl EngineCore {
         waker: CommandWaker,
     ) -> anyhow::Result<Self> {
         let ctrl = config.control_tokens();
-        let sched = Scheduler::with_model_limits(
+        let mut sched = Scheduler::with_model_limits(
             executor,
             ctrl,
             SchedulerConfig {
@@ -508,6 +708,7 @@ impl EngineCore {
             config.worker_process.model_dtype,
             config.generation_limits,
         )?;
+        sched.set_prefix_cache(config.prefix_cache);
         let info = sched.info().clone();
         let model_dtype = config.worker_process.model_dtype;
         let generation_limits = sched.generation_limits().clone();
@@ -750,6 +951,122 @@ mod tests {
             );
         }
         assert_eq!(worker.components["alone"].ranks, vec![0]);
+    }
+
+    /// Four two-rank replicas over two four-device hosts fill the head's host
+    /// first, and each replica keeps its ranks on one host.
+    #[test]
+    fn the_data_parallel_shorthand_places_replicas_in_host_blocks() {
+        let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
+        let replicas = WorkerConfig::replicated(
+            &hosts,
+            "cuda",
+            4,
+            2,
+            2,
+            WorkerConfig::single_component("model", 2),
+        );
+
+        let placement: Vec<_> = replicas
+            .iter()
+            .map(|worker| {
+                (
+                    worker.id.to_string(),
+                    worker
+                        .ranks
+                        .iter()
+                        .map(|rank| format!("{}/{}", rank.node, rank.device))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            placement,
+            vec![
+                (
+                    "model-0".into(),
+                    vec!["rank-0/cuda:0".into(), "rank-0/cuda:1".into()]
+                ),
+                (
+                    "model-1".into(),
+                    vec!["rank-0/cuda:2".into(), "rank-0/cuda:3".into()]
+                ),
+                (
+                    "model-2".into(),
+                    vec!["rank-1/cuda:0".into(), "rank-1/cuda:1".into()]
+                ),
+                (
+                    "model-3".into(),
+                    vec!["rank-1/cuda:2".into(), "rank-1/cuda:3".into()]
+                ),
+            ]
+        );
+        assert!(WorkerConfig::validate_all(&replicas).is_ok());
+
+        // One replica keeps the single-group identity.
+        let single = WorkerConfig::replicated(
+            &hosts,
+            "cuda",
+            1,
+            2,
+            2,
+            WorkerConfig::single_component("model", 2),
+        );
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].id.to_string(), "model");
+    }
+
+    /// Replicas must be the same deployment on different ranks, and the size
+    /// must divide the groups; both are refused before any rank launches.
+    #[test]
+    fn data_parallel_replicas_refuse_unequal_deployments() {
+        let hosts = ["localhost".to_owned()];
+        let mut config = EngineConfig {
+            workers: WorkerConfig::replicated(
+                &hosts,
+                "cpu",
+                2,
+                1,
+                2,
+                WorkerConfig::single_component("model", 1),
+            ),
+            data_parallel_size: 3,
+            ..EngineConfig::sim("sim-model")
+        };
+        assert!(EngineCore::replicas(config.clone()).is_err());
+
+        config.data_parallel_size = 2;
+        config.workers[1].queue_depth = 3;
+        let error = EngineCore::replicas(config)
+            .err()
+            .expect("unequal replicas are refused");
+        assert!(error.to_string().contains("data-parallel replicas"));
+    }
+
+    /// Experts shard across two or more replicas of one rank each; any other
+    /// placement is refused before a rank launches.
+    #[test]
+    fn expert_parallelism_needs_several_one_rank_replicas() {
+        let hosts = ["localhost".to_owned()];
+        for (replicas, ranks) in [(1, 1), (2, 2)] {
+            let config = EngineConfig {
+                workers: WorkerConfig::replicated(
+                    &hosts,
+                    "cpu",
+                    replicas,
+                    ranks,
+                    2,
+                    WorkerConfig::single_component("model", ranks),
+                ),
+                data_parallel_size: replicas,
+                expert_parallel: Some(crate::worker::ExpertExchange::AllToAll),
+                ..EngineConfig::sim("sim-model")
+            };
+            let error = EngineCore::replicas(config)
+                .err()
+                .expect("the placement is refused");
+            assert!(error.to_string().contains("expert parallelism"), "{error}");
+        }
     }
 
     #[test]

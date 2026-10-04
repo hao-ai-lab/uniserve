@@ -11,8 +11,10 @@ import torch
 from uniserve.model.inputs import TextSize
 from uniserve.nn import _binding
 from uniserve.nn.attention.inputs import DenseInput
+from uniserve.quantization import QuantizedTensor
 
 from ..backends import attention as attention_backend
+from ..backends import record_kernel_choice
 from . import capturing
 
 
@@ -75,6 +77,8 @@ class AttentionBinding:
         self.derive_host_lengths = derive_host_lengths
         self.device, self.dtype, self.allocate = device, dtype, allocate
         self.operators = {}
+        # Name of the provider each prepared dtype's operator belongs to.
+        self.providers = {}
         self._bound = set()
         self._bound_batches = {}
         self.batch = None
@@ -152,14 +156,80 @@ class AttentionBinding:
             **options, workspace=self.allocate(requirements, self.device)
         )
         self.operators[dtype] = operator
+        self.providers[dtype] = provider.name
+        record_kernel_choice()
         self._bound.discard(dtype)
         return operator
+
+    def kernels(self):
+        """Describe the kernels serving this call site, one per dtype.
+
+        Each record carries the layer's local head counts, head dimension,
+        history window and cache storage, the prepared ``provider`` and the
+        provider serving each input class the call site has met
+        (``inputs``; see ``Operator.selections``). A provider other than
+        automatic selection serves every input itself. A call site that
+        prepares at its first call and has not been called yet reports one
+        record whose ``dtype`` and ``provider`` are None.
+        """
+        cache = None
+        if self.cache is not None:
+            storage = (
+                "per-block FP8"
+                if isinstance(self.cache.key, QuantizedTensor)
+                else str(self.cache.key.dtype).removeprefix("torch.")
+            )
+            cache = f"{storage} pages of {self.cache.block_size} tokens"
+        layer = {
+            "op": "attention",
+            "heads": self.module.local_heads,
+            "kv_heads": self.module.local_kv_heads,
+            "head_dim": self.module.head_dim,
+            "window": self.module.window,
+        }
+        if not self.operators:
+            return [
+                {
+                    **layer,
+                    "dtype": None,
+                    "cache": cache,
+                    "provider": None,
+                    "inputs": {},
+                }
+            ]
+        return [
+            {
+                **layer,
+                "dtype": str(dtype).removeprefix("torch."),
+                "cache": cache,
+                "provider": self.providers[dtype],
+                "inputs": dict(operator.selections()),
+            }
+            for dtype, operator in self.operators.items()
+        ]
 
     def partitions_tokens(self):
         """Report whether token partitions read exact host lengths."""
         return (
             self.module.context_parallel is not None
             or self.module.exchange.group.size > 1
+        )
+
+    @property
+    def builds_launch_plan(self):
+        """Whether binding builds per-batch state a captured launch reads.
+
+        True when an operator builds a launch plan
+        (``Operator.builds_launch_plan``), when token partitions follow
+        host lengths, or before any operator is prepared.
+        """
+        return (
+            not self.operators
+            or self.partitions_tokens()
+            or any(
+                operator.builds_launch_plan
+                for operator in self.operators.values()
+            )
         )
 
     def reads_host_lengths(self, batch):
@@ -318,6 +388,7 @@ class AttentionBinding:
         for operator in self.operators.values():
             operator.close()
         self.operators.clear()
+        self.providers.clear()
         self._bound_batches.clear()
         self.context_plans.clear()
         self.cache_batches.clear()

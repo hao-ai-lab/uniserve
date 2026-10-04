@@ -3,19 +3,24 @@
 Text calls replay graphs captured at configured bucket shapes. Selection
 (``text_shape``) picks a bucket for a staged batch, ``pad_text`` widens the
 batch's views of the runner's fixed staging to that bucket and makes the
-padding inert, and ``capture_batch``/``replay_batch`` capture and replay the
-call together with graph-capturable greedy decoding. The ``select_*``
-helpers turn configured sizes into the capture shapes ``ModelExecutor``
-prepares at startup.
+padding inert. Decode buckets capture the call together with
+graph-capturable greedy decoding (``capture_batch``/``replay_batch``);
+prefill buckets capture the backbone's hidden states alone
+(``capture_hidden``/``replay_hidden``), and the runner selects each row's
+logits or hidden rows from them after the replay. The ``select_*`` helpers
+turn configured sizes into the capture shapes ``ModelExecutor`` prepares at
+startup.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from itertools import accumulate
 
 import torch
 
+from uniserve.math import ceil_div
 from uniserve.model import EmbeddingReplacement, TextInput
 from uniserve.nn.attention import (
     AttentionBatch,
@@ -58,24 +63,34 @@ class DiffusionShape:
 class PrefillShape:
     """A prefill capture bucket.
 
+    A prefill graph computes the backbone's hidden states of every token, so
+    one bucket serves rows with any output selection; the runner selects
+    logits or hidden rows after the replay.
+
     Attributes:
         token_bucket: Flat token count the bucket pads to.
         row_bucket: Row count the bucket pads to, including one padding
             sequence: ``text_shape`` only selects a bucket with more rows than
             the batch.
-        live_rows: Row count of the startup capture batch in
+        live_rows: Least row count of the startup capture batch in
             ``uniserve_worker.model_executor.startup.prepare_prefill``;
             ``select_prefill_captures`` sets it to the next smaller
             configured row size, one for the smallest.
-        causal: Attention causality of every row.
-        selection: Output selection of every row.
+        causal: Attention causality of every row, or None for device flags.
+        embeddings: Whether the call replaces token embeddings with supplied
+            values, as image feature rows and every prefill of a lane with an
+            image builder do.
+        outputs: Whether the graph evaluates the backbone's hidden states,
+            from which rows select their outputs, or only writes the K/V
+            cache, for calls whose rows all select ``TokenSelection.CACHE``.
     """
 
     token_bucket: int
     row_bucket: int
     live_rows: int
-    causal: bool = True
-    selection: TokenSelection = TokenSelection.LAST_LOGITS
+    causal: bool | None = True
+    embeddings: bool = False
+    outputs: bool = True
 
 
 def select_flow_captures(
@@ -111,50 +126,169 @@ def select_flow_captures(
     )
 
 
+def prefill_units(pages, rows, tokens):
+    """Return the fewest pool units a prefill of ``rows`` rows holds.
+
+    ``pages`` holds ``(page_tokens, units_per_page)`` of every cache group.
+    A prefill row writes its query tokens into pages of its own in every
+    group, so a call of ``rows`` rows and ``tokens`` query tokens holds at
+    least ``max(rows, ceil(tokens / page_tokens))`` pages of each group,
+    whatever its row lengths and prefixes. ``capture_lengths`` in
+    ``startup`` stages rows that hold exactly this many.
+    """
+    return sum(
+        units * max(rows, ceil_div(tokens, page)) for page, units in pages
+    )
+
+
 def select_prefill_captures(
-    token_sizes, row_sizes, *, max_rows, max_tokens, visual=False
+    token_sizes,
+    row_sizes,
+    *,
+    max_rows,
+    max_tokens,
+    variants,
+    outputs=True,
+    pool=None,
 ):
     """Build prefill capture buckets from configured token and row sizes.
 
-    ``text_shape`` routes a batch only to a row bucket strictly larger than
-    its row count, leaving room for the padding sequence, so row sizes
-    of one are dropped and each bucket's ``live_rows`` is the next smaller
-    configured row size (one for the smallest). Buckets are built while
-    their ``live_rows`` fits ``max_rows``; a bucket's own row count is the
-    configured size and may exceed ``max_rows``, since a full batch still
-    needs a strictly larger bucket. With ``visual``, each shape is also
-    captured for noncausal rows selecting logits or hidden states.
+    Token buckets are the configured sizes up to ``max_tokens`` and
+    ``max_tokens`` itself, the most tokens one staged call holds, so every
+    call the staging accepts fits a bucket. ``text_shape`` routes a batch
+    only to a row bucket strictly larger than its row count, leaving room
+    for the padding sequence, so row sizes of one are dropped and each
+    bucket's ``live_rows`` is the next smaller configured row size (one for
+    the smallest). Buckets are built while their ``live_rows`` fits
+    ``max_rows``; a bucket's own row count is the configured size and may
+    exceed ``max_rows``, since a full batch still needs a strictly larger
+    bucket. Every shape is captured once per ``(causal, embeddings)`` pair
+    of ``variants``, evaluating hidden states with ``outputs`` and only the
+    K/V cache without.
+
+    ``pool`` is ``(pages, units)``: the ``prefill_units`` pages of every
+    cache group and the unit pool's allocatable units, or None before the
+    pool is sized. A bucket serves batches of at least its ``live_rows``
+    rows and more tokens than the next smaller token bucket of its row
+    count; a bucket for which even the smallest such batch holds more units
+    than the pool is left out, since the engine never forms a batch it
+    serves. A row count's first token bucket serves batches of one token
+    per row, whose pages fit whenever ``live_rows`` rows fit, so the row
+    buckets, and the prefill row bound they report, are unchanged.
     """
     buckets: list[PrefillShape] = []
-    variants: tuple[tuple[bool, TokenSelection], ...] = (
-        (True, TokenSelection.LAST_LOGITS),
-    )
-    if visual:
-        # Feature appends expose the whole image to each query, optionally
-        # sampling at its trailing marker after publishing the prefix.
-        variants += (
-            (False, TokenSelection.LAST_LOGITS),
-            (False, TokenSelection.HIDDEN),
-        )
+    sizes = {int(value) for value in token_sizes if value <= max_tokens}
+    sizes.add(int(max_tokens))
 
     minimum_rows = 1
     for rows in sorted({int(value) for value in row_sizes if value > 1}):
         if minimum_rows > max_rows:
             break
         minimum_tokens = minimum_rows if minimum_rows == 1 else minimum_rows + 1
+        # The fewest tokens of a batch the next bucket serves.
+        least = minimum_rows
         for tokens in sorted(
-            {
-                value
-                for value in token_sizes
-                if minimum_tokens <= value <= max_tokens
-            }
+            value for value in sizes if value >= minimum_tokens
         ):
+            if pool is not None:
+                pages, units = pool
+                if prefill_units(pages, minimum_rows, least) > units:
+                    break
             buckets.extend(
-                PrefillShape(tokens, rows, minimum_rows, causal, selection)
-                for causal, selection in variants
+                PrefillShape(
+                    tokens, rows, minimum_rows, causal, embeddings, outputs
+                )
+                for causal, embeddings in variants
             )
+            least = tokens + 1
         minimum_rows = rows
     return tuple(buckets)
+
+
+def decode_captures(config, *, max_rows, row_units, num_units):
+    """Select the decode batch sizes a CUDA text entry captures at startup.
+
+    ``config`` is the ``WorkerConfig``. A configured size is kept when it is
+    positive, at most ``max_rows``, and its rows fit the KV pool's
+    allocatable units: capturing ``rows`` decode rows stages one page of
+    every cache group per row (``row_units`` units) on the ``num_units``
+    pool, whose unit zero is the sentinel. The sizes keep their configured
+    order. Empty when the graph policy is off, which leaves decode calls
+    eager.
+    """
+    if config.graph_policy == "off":
+        return ()
+    return tuple(
+        value
+        for value in config.decode_graph_batch_sizes
+        if 0 < value <= max_rows and value * row_units < num_units
+    )
+
+
+def prefill_captures(
+    config,
+    *,
+    max_rows,
+    max_tokens,
+    image_builder,
+    feature_injection,
+    device_causality,
+    pool=None,
+):
+    """Select the prefill buckets a CUDA text entry captures at startup.
+
+    ``config`` is the ``WorkerConfig``: its ``prefill_graph_token_sizes``
+    and the fixed ``DEFAULT_PREFILL_GRAPH_ROW_BUCKETS`` size the buckets up to
+    ``max_rows`` rows and ``max_tokens`` tokens, the most one staged call
+    holds, keeping those whose batches fit the unit ``pool`` (see
+    ``select_prefill_captures``). Causal text is always captured, with
+    embedding replacement when the lane has an ``image_builder`` (every
+    prefill of such a lane replaces embeddings); a model whose image
+    processor declares ``feature_injection`` also appends non-causal image
+    feature rows and mixed text/image contexts, which replace embeddings.
+    Mixed contexts carry device causal flags through graph replay and are
+    captured only when the attention provider accepts that representation
+    (its ``device_causality`` capability).
+    The graphs evaluate
+    hidden states when the deployment's prefill calls select outputs
+    (``prefill_outputs``) and only write the K/V cache otherwise. Empty when
+    the graph policy is off or prefill graphs are disabled, which leaves
+    prefill calls eager.
+    """
+    from uniserve_worker.config.execution import (
+        DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
+    )
+
+    if config.graph_policy == "off" or not config.prefill_cuda_graph:
+        return ()
+    variants: tuple[tuple[bool | None, bool], ...] = (
+        (True, bool(image_builder)),
+    )
+    if feature_injection:
+        variants += ((False, True),)
+        if device_causality:
+            variants += ((None, True),)
+    return select_prefill_captures(
+        config.prefill_graph_token_sizes,
+        DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
+        max_rows=max_rows,
+        max_tokens=max_tokens,
+        variants=variants,
+        outputs=config.prefill_outputs,
+        pool=pool,
+    )
+
+
+def prefill_rows(shapes, *, max_rows):
+    """Return the most rows one prefill call may hold with ``shapes``.
+
+    A bucket serves batches with fewer rows than it pads to, so the bound is
+    one less than the widest bucket, at most ``max_rows``. None without
+    shapes, when prefill calls run eagerly and only ``max_rows`` applies.
+    """
+    if not shapes:
+        return None
+    return min(max_rows, max(shape.row_bucket for shape in shapes) - 1)
 
 
 def bind_attention(static, live):
@@ -181,24 +315,28 @@ def bind_attention(static, live):
             prefixes=replace(entry.prefixes, host=current.prefixes.host),
             block_table=blocks,
         )
+        if isinstance(entry, PagedInput):
+            entries[table] = replace(entries[table], causal=current.causal)
     return AttentionBatch(entries, queries)
 
 
 def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
-    """Choose a bucket with the call's attention and output semantics.
+    """Choose a bucket with the call's attention semantics.
 
     Returns:
         ``(rows, tokens, widths, decode)`` for ``pad_text``, where
         ``widths[t]`` is the width to stage for numerical table ``t``: at
-        least its staged width and its ``table_widths`` floor. A
-        single-token causal decode batch selecting last logits uses the
-        first configured decode size at least its row count, with
-        ``tokens == rows``. Any other batch, or a decode batch no decode size
-        fits, uses the smallest prefill shape, by rows then tokens, with more
-        rows than the batch and at least its token count. None when the
-        input is not paged text over tables ``0..n-1``, rows mix causality or
-        output selection, a row has no query token, or no configured shape
-        fits.
+        least its staged width and its ``table_widths`` floor. A decode
+        batch (``ForwardMode.DECODE`` with one query token per row) uses the
+        first configured decode size at least its row count, with ``tokens ==
+        rows``, when its rows are causal and all select last logits. Any other
+        batch uses the smallest prefill shape, by rows then tokens, with the
+        batch's causality and embedding replacement, more rows than the
+        batch and at least its token count; its rows may select any outputs.
+        None when the input is not paged text over tables ``0..n-1``, rows
+        lack device flags for mixed causality, a row has no query token, or
+        no configured shape of the batch's kind fits; a decode batch never
+        uses a prefill shape.
 
     Raises:
         ValueError: If the attention input has no host query lengths.
@@ -221,12 +359,12 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
         for table in range(len(inputs.attention.entries))
     )
     attention = entries[0]
-    selection = batch.token_selections[0]
-    causal = attention.causal[0]
-    if any(value is not selection for value in batch.token_selections):
-        return None
-    if any(value != causal for entry in entries for value in entry.causal):
-        return None
+    causal = (
+        None if attention.causal_values is not None else attention.causal[0]
+    )
+    if causal is not None:
+        if any(value != causal for entry in entries for value in entry.causal):
+            return None
     queries = attention.queries.host
     if queries is None:
         raise ValueError("graph shape selection requires host query lengths")
@@ -240,22 +378,26 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
         )
         for table, entry in enumerate(entries)
     )
-    if (
-        batch.forward_mode is ForwardMode.DECODE
-        and selection is TokenSelection.LAST_LOGITS
-        and causal
-        and all(length == 1 for length in queries)
+    if batch.forward_mode is ForwardMode.DECODE and all(
+        length == 1 for length in queries
     ):
+        if not causal or any(
+            selection is not TokenSelection.LAST_LOGITS
+            for selection in batch.token_selections
+        ):
+            return None
         rows = next(
             (value for value in decode_sizes if value >= batch.row_count), None
         )
-        if rows is not None:
-            return rows, rows, widths, True
+        return None if rows is None else (rows, rows, widths, True)
 
+    embeddings = inputs.embeddings is not None
     shapes = tuple(
         shape
         for shape in prefill_shapes
-        if shape.row_bucket > batch.row_count
+        if shape.causal == causal
+        and shape.embeddings == embeddings
+        and shape.row_bucket > batch.row_count
         and shape.token_bucket >= inputs.input_ids.numel()
     )
     if not shapes:
@@ -292,7 +434,17 @@ def _fixed_view(tensor, shape):
     )
 
 
-def pad_text(batch, rows, tokens, widths, decode):
+def _stage_offsets(offsets: torch.Tensor, lengths: tuple[int, ...]) -> None:
+    """Copy the running offsets of host ``lengths``, from zero, into place."""
+    offsets.copy_(
+        torch.tensor(
+            tuple(accumulate(lengths, initial=0)), dtype=offsets.dtype
+        ),
+        non_blocking=True,
+    )
+
+
+def pad_text(batch, rows, tokens, widths, decode, *, staging):
     """Borrow a fixed bucket and make padding inert, including cache writes.
 
     Physical unit zero is valid storage. Padding queries read disposable
@@ -301,16 +453,20 @@ def pad_text(batch, rows, tokens, widths, decode):
     one additional numerical sequence. ``widths[t]`` is the staged width of
     numerical table ``t``.
 
-    The batch's tensors must be views of the runner's fixed staging: padding
-    is written in place past the live extents, and the returned batch views
-    the same storage at the bucket shape. Padding rows use request slot zero,
-    which the block tables reserve for padding.
+    The batch's tensors must be views of ``staging``, the runner's fixed
+    staging (``AttentionBuffers``): padding is written in place past the
+    live extents, and the returned batch views the same storage at the
+    bucket shape. Padding rows use request slot zero, which the block tables
+    reserve for padding. Lengths and offsets derive from the host lengths
+    and stage with one copy each; every table's padding clears with one
+    launch per column.
     """
     inputs, live_rows = batch.inputs, batch.row_count
     attention, live_tokens = inputs.attention, inputs.input_ids.numel()
     if rows < live_rows or tokens < live_tokens:
         raise ValueError("graph shape is smaller than its live inputs")
-    causal = next(iter(attention.entries.values())).causal[0]
+    first = next(iter(attention.entries.values()))
+    causal = first.causal[0]
 
     padding, extra = tokens - live_tokens, rows - live_rows
     if padding and not extra:
@@ -339,53 +495,62 @@ def pad_text(batch, rows, tokens, widths, decode):
     slots = _fixed_view(batch.request_pool_indices, (rows,))
     slots[live_rows:].zero_()
 
-    # The shared query domain pads once; every table then pads its own page
-    # columns, prefixes and write addresses against it.
+    # The shared query domain pads once, from the host lengths.
     queries = _fixed_view(attention.queries.values, (rows,))
-    queries[live_rows:].zero_()
-    if decode:
-        queries[live_rows:].fill_(1)
-    elif padding:
-        queries[live_rows : live_rows + 1].fill_(padding)
+    if extra:
+        queries[live_rows:].copy_(
+            torch.tensor(dummy, dtype=queries.dtype), non_blocking=True
+        )
     query_offsets = _fixed_view(attention.queries.offsets, (rows + 1,))
-    torch.cumsum(queries, dim=0, out=query_offsets[1:])
+    _stage_offsets(query_offsets, host_queries)
     shared = SequenceLengths(
         host=host_queries, values=queries, offsets=query_offsets
     )
 
+    # Tables staged together share one prefix column, padded once; every
+    # table's page columns and write addresses pad with one launch each.
+    staging.clear_padding(
+        live_rows=live_rows, rows=rows, live_tokens=live_tokens, tokens=tokens
+    )
+    flags = None
+    if first.causal_values is not None:
+        flags = _fixed_view(first.causal_values, (rows,))
+        flags[live_rows:].fill_(int(causal))
+    padded_prefixes = {}
     entries = {}
     for number, entry in attention.entries.items():
         blocks = entry.block_table
         table = _fixed_view(blocks.indices, (rows, widths[number]))
-        table[live_rows:].zero_()
         start = blocks.start_page
         start_host = blocks.start_page_host
         if start is not None:
             start = _fixed_view(start, (rows,))
-            start[live_rows:].zero_()
             if start_host is not None:
                 start_host = start_host + (0,) * extra
 
-        prefix = _fixed_view(entry.prefixes.values, (rows,))
-        prefix[live_rows:].zero_()
-        prefix_offsets = _fixed_view(entry.prefixes.offsets, (rows + 1,))
-        torch.cumsum(prefix, dim=0, out=prefix_offsets[1:])
+        prefixes = padded_prefixes.get(id(entry.prefixes.values))
+        if prefixes is None:
+            prefix = _fixed_view(entry.prefixes.values, (rows,))
+            prefix[live_rows:].zero_()
+            prefix_offsets = _fixed_view(entry.prefixes.offsets, (rows + 1,))
+            host_prefixes = entry.prefixes.host + (0,) * extra
+            _stage_offsets(prefix_offsets, host_prefixes)
+            prefixes = SequenceLengths(
+                host=host_prefixes, values=prefix, offsets=prefix_offsets
+            )
+            padded_prefixes[id(entry.prefixes.values)] = prefixes
 
         writes = entry.write_indices
         if writes is not None:
             writes = _fixed_view(writes, (tokens,))
-            writes[live_tokens:].fill_(-1)
 
         entries[number] = PagedInput(
             shared,
-            SequenceLengths(
-                host=entry.prefixes.host + (0,) * extra,
-                values=prefix,
-                offsets=prefix_offsets,
-            ),
+            prefixes,
             BlockTable(table, blocks.block_size, start, start_host),
             writes,
-            (causal,) * rows,
+            entry.causal + (causal,) * extra,
+            flags,
         )
     padded = AttentionBatch(entries, shared)
 
@@ -505,11 +670,7 @@ def capture_batch(
     ``batch`` as its fixed input. The state ``restore_writes`` snapshots is
     restored after the warm call and after capture.
     """
-    with context.activate():
-        attention = getattr(batch.inputs, "attention", None)
-        if attention is not None:
-            context.bind_attention(attention)
-        restore = restore_writes(batch, cache)
+    restore = _prepare_capture(context, batch, cache)
 
     def compute(static):
         output = call(static)
@@ -520,12 +681,35 @@ def capture_batch(
     )
 
 
-def replay_batch(graph: CUDAGraphRunner, batch, *, rows=None, borrow=False):
-    """Replay staged inputs and retain the live output rows.
+def capture_hidden(context, batch, call, *, pools=None, cache=None):
+    """Capture a prefill bucket's hidden states on the batch's fixed backing.
 
-    ``rows`` is the live row count (default: ``batch.row_count``); outputs of
-    padding rows are dropped. With ``borrow``, the result views the graph's
-    output storage, which the next replay overwrites; otherwise it is cloned.
+    ``call(static)`` returns the ``[tokens, hidden]`` backbone output of the
+    padded ``batch``, which the graph retains as its fixed input. The state
+    ``restore_writes`` snapshots is restored after the warm call and after
+    capture.
+    """
+    restore = _prepare_capture(context, batch, cache)
+    return CUDAGraphRunner.capture(
+        context, batch, call, pools=pools, restore=restore
+    )
+
+
+def _prepare_capture(context, batch, cache):
+    """Plan the batch's attention and snapshot the cache blocks it writes."""
+    with context.activate():
+        attention = getattr(batch.inputs, "attention", None)
+        if attention is not None:
+            context.bind_attention(attention)
+        return restore_writes(batch, cache)
+
+
+def _replay(graph, batch):
+    """Copy ``batch`` into the graph's inputs, rebind its lengths, replay.
+
+    Attention plans take the live host sequence lengths and start pages
+    with the captured device addresses. Returns the graph's retained output
+    views, which the next replay overwrites.
     """
     context = graph.executable.context
     with context.activate():
@@ -533,40 +717,39 @@ def replay_batch(graph: CUDAGraphRunner, batch, *, rows=None, borrow=False):
         attention = getattr(batch.inputs, "attention", None)
         if attention is not None:
             context.bind_attention(
-                bind_attention(graph.inputs.value.inputs.attention, attention)
+                bind_attention(graph.inputs.value.inputs.attention, attention),
+                replay=True,
             )
+        return graph.executable.replay()
 
-        output, greedy = graph.executable.replay()
-        count = batch.row_count if rows is None else rows
-        values = output.values
-        if isinstance(batch.inputs, TextInput) and all(
-            selection is TokenSelection.HIDDEN
-            for selection in batch.token_selections
-        ):
-            # Capture fixes tensor addresses, not the live sequence cuts.
-            # Uniform hidden results share one contiguous,
-            # pipeline-published tensor; split its views again using this
-            # invocation's lengths.
-            view = adjacent_view(values)
-            if view is None:
-                raise ValueError(
-                    "hidden graph results must share contiguous output storage"
-                )
-            if attention is None:
-                raise ValueError(
-                    "hidden graph results require live attention sequences"
-                )
-            values = view.reshape(-1, values[0].shape[-1]).split(
-                attention.queries.host
-            )
-        result = replace(
-            output,
-            values=values[:count],
-            vocabularies=output.vocabularies[:count],
-            layouts=output.layouts[:count],
-            greedy=trim_greedy(greedy, count),
-        )
-        return result if borrow else result.clone()
+
+def replay_batch(graph: CUDAGraphRunner, batch, *, rows=None, borrow=False):
+    """Replay staged inputs and retain the live output rows.
+
+    ``rows`` is the live row count (default: ``batch.row_count``); outputs of
+    padding rows are dropped. With ``borrow``, the result views the graph's
+    output storage, which the next replay overwrites; otherwise it is cloned.
+    """
+    output, greedy = _replay(graph, batch)
+    count = batch.row_count if rows is None else rows
+    result = replace(
+        output,
+        values=output.values[:count],
+        vocabularies=output.vocabularies[:count],
+        layouts=output.layouts[:count],
+        greedy=trim_greedy(greedy, count),
+    )
+    return result if borrow else result.clone()
+
+
+def replay_hidden(graph: CUDAGraphRunner, batch) -> torch.Tensor:
+    """Replay a prefill bucket and return its hidden states.
+
+    The result is the graph's ``[token bucket, hidden]`` output view, whose
+    rows past the batch's live tokens hold padding; the next replay of any
+    graph sharing that backing overwrites it.
+    """
+    return _replay(graph, batch)
 
 
 def greedy_decode(

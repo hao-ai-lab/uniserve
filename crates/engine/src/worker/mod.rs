@@ -102,6 +102,11 @@ pub struct WorkerProcessArgs {
     pub max_batch_calls: u32,
     /// Maximum tokens accepted in one worker run.
     pub max_batch_tokens: u32,
+    /// Request rows each rank holds: the size of the worker's request pool,
+    /// whose rows carry per-request state such as canvases, sampling state
+    /// and block tables. A worker that fits its request tensors to device
+    /// storage takes this as the largest pool it may choose.
+    pub max_request_pool_size: u32,
     /// Attention implementation selected for model execution.
     pub attention_backend: uniserve_worker_ipc::AttentionBackend,
     /// Optional public worker capability selectors; empty uses the model default.
@@ -137,10 +142,18 @@ pub struct WorkerProcessArgs {
     pub graph_policy: String,
     /// Optional decode batch sizes selected for CUDA graph capture.
     pub decode_graph_batch_sizes: Option<String>,
-    /// Whether prefill execution may use captured CUDA graphs.
+    /// Whether every prefill call replays a CUDA graph captured at
+    /// startup; without it prefill runs eagerly, for debugging.
     pub prefill_cuda_graph: bool,
+    /// Whether any prefill call of the deployment samples a token or scores
+    /// its prompt. Without it every prefill only writes the K/V cache, and
+    /// the worker's prefill graphs stop at the final layer's cache write.
+    pub prefill_outputs: bool,
     /// Optional prefill token counts selected for CUDA graph capture.
     pub prefill_graph_token_sizes: Option<String>,
+    /// Whether image denoising calls capture and replay CUDA graphs at the
+    /// configured flow shapes.
+    pub flow_cuda_graph: bool,
     /// Optional diffusion batch sizes selected for CUDA graph capture.
     pub flow_graph_batch_sizes: Option<String>,
     /// Optional diffusion tensor shapes selected for CUDA graph capture.
@@ -148,6 +161,12 @@ pub struct WorkerProcessArgs {
     /// Optional text capacities, in prompt tokens, of a video denoiser's
     /// layouts, as a comma-separated increasing list.
     pub video_text_capacities: Option<String>,
+    /// Block-diffusion sampling of every canvas the deployment generates, as
+    /// the server resolves it; `None` when the served model generates no
+    /// canvases. The worker keeps the argmax history its stability
+    /// threshold needs, prepares its canvas steps for exactly this sampling,
+    /// and refuses a request that carries another.
+    pub canvas_sampling: Option<uniserve_core::CanvasSampling>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
     /// Optional FlashInfer tensor-core selection forwarded to the worker.
@@ -175,6 +194,48 @@ pub struct WorkerProcessArgs {
     /// bounds the frame counts a video worker provisions from below; `None`
     /// provisions every frame count the model generates.
     pub min_video_seconds: Option<f64>,
+    /// This group's place in the expert-parallel world its data-parallel
+    /// replica joins, when the deployment shards routed experts across the
+    /// replicas; `None` keeps every expert on the group's own ranks.
+    pub expert_parallel: Option<ExpertParallelPlacement>,
+}
+
+/// How replicas access distributed experts: token exchange or weight prefetch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpertExchange {
+    /// FlashInfer's NVLink all-to-all dispatch and combine around each
+    /// rank's grouped expert kernel.
+    #[default]
+    #[serde(rename = "alltoall")]
+    AllToAll,
+    /// The fused CuTeDSL MegaMoE kernel, which dispatches, runs the experts
+    /// and combines in one launch per layer over NVSHMEM; NVFP4 experts only.
+    #[serde(rename = "megamoe")]
+    MegaMoe,
+    /// Independent data-parallel execution with asynchronous peer weight
+    /// prefetch into double buffers. Inference has no rank collectives.
+    #[serde(rename = "dwdp")]
+    Dwdp,
+}
+
+/// One single-rank replica's place in an expert-parallel world.
+///
+/// The world's ranks are the data-parallel replicas in order: replica `rank`
+/// of `size` keeps routed experts `[rank * E / size, (rank + 1) * E / size)`
+/// and exchanges tokens with the other replicas at every expert layer.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ExpertParallelPlacement {
+    /// The replica's rank in the expert-parallel world.
+    pub rank: u32,
+    /// Number of replicas sharing the experts.
+    pub size: u32,
+    /// TCP address of the world's rendezvous store. `WorkerGroup::spawn_all`
+    /// reserves it once the deployment's hosts are known; world rank 0 serves
+    /// it on a socket the head binds.
+    pub address: Option<String>,
+    /// How the world exchanges tokens at every expert layer.
+    pub exchange: ExpertExchange,
 }
 
 /// Parks until one descriptor becomes readable or `timeout` expires.

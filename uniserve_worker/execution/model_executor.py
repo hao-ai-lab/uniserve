@@ -51,6 +51,7 @@ from uniserve.model import (
     TextConditioner,
     TextEncoder,
     TextSize,
+    TokenDenoiser,
     VideoDecoder,
     VideoEncoder,
     VideoPostprocessor,
@@ -65,6 +66,7 @@ from uniserve.runtime import (
     Scratch,
     partition_streams,
 )
+from uniserve.runtime.backends import kernel_choices
 from uniserve.runtime.backends.attention import resolve as attention_backend
 from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
 from uniserve.runtime.cuda_graph import CUDAGraphError
@@ -100,6 +102,10 @@ from uniserve_worker.execution.conditions import (
     condition_layout,
     library_conditions,
 )
+from uniserve_worker.execution.kernel_table import (
+    KernelRecords,
+    format_kernel_table,
+)
 from uniserve_worker.model_executor.component_binding import (
     ComponentBinding,
 )
@@ -111,12 +117,14 @@ from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
 from uniserve_worker.model_executor.graph_inputs import (
     DiffusionShape,
     PrefillShape,
+    decode_captures,
+    prefill_captures,
     select_flow_captures,
-    select_prefill_captures,
 )
 from uniserve_worker.model_executor.graph_storage import GraphStorage
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
 from uniserve_worker.model_executor.input_batch import (
+    CanvasStepRow,
     InputRow,
     TokenRow,
 )
@@ -144,8 +152,10 @@ from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.sampling.metadata import TokenSelection
 
 if TYPE_CHECKING:
+    from uniserve_worker.model_executor.canvas_runner import CanvasRunner
     from uniserve_worker.model_executor.media_inputs import MediaBuilder
     from uniserve_worker.storage.block_tables import BlockTables
+    from uniserve_worker.storage.canvas_slots import CanvasSlots
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
@@ -291,12 +301,21 @@ class ModelExecutor:
         self.graph_storage = GraphStorage()
         self.decode_shapes: dict[ModelRunner, tuple[int, ...]] = {}
         self.prefill_shapes: dict[ModelRunner, tuple[PrefillShape, ...]] = {}
-        self.prefill_row_sizes: tuple[int, ...] = ()
         self.flow_captures: tuple[DiffusionShape, ...] = ()
         self.flow_cfg_branches: tuple[int, ...] = ()
         self.table_widths: tuple[int, ...] = ()
         self.decode_predicates = None
         self.kv_cache = None
+        # The all-to-all exchange of expert-parallel layers, which
+        # ``configure_inputs`` builds; ``None`` without such layers. The
+        # runners stepping through it are registered at capture.
+        self.experts = None
+        self.expert_weights = None
+        self._expert_runners: list[ModelRunner] = []
+        # With graphs, a rank without a forward of its own joins each expert
+        # step by replaying the captured join of the step's capacity
+        # (``JoinGraphs``), which startup captures after the runners' graphs.
+        self._expert_joins = None
         # A standalone denoiser's component, binding and call, the request
         # bank and latent pool its ladders gather through, and the one
         # runner that serves every layout the media builder admits.
@@ -307,9 +326,16 @@ class ModelExecutor:
         # Layouts the runner prepared while serving, least recently used
         # first (``diffusion_layout``).
         self._serving_layouts: OrderedDict[object, None] = OrderedDict()
+        # The resident sampler state of generating canvases, bound when this
+        # rank runs token denoising (``bind_canvas_slots``).
+        self.canvas_slots: CanvasSlots | None = None
 
         self.uses_lanes = False
         self._startup_complete = self._closed = False
+        # Kernel records of every runner, and the process's kernel choice
+        # count when they were last gathered (see ``_report_new_kernels``).
+        self._kernels = KernelRecords()
+        self._kernel_choices = 0
 
         try:
             for name, binding in self.bindings.items():
@@ -932,7 +958,7 @@ class ModelExecutor:
             f"uniserve.model.module rank={self.worker_config.rank} work={name}"
         ):
             try:
-                return runner.execute_model(*args, **kwargs)
+                result = runner.execute_model(*args, **kwargs)
             except CUDAGraphError:
                 # Retire the failed context and its graphs; the next call at
                 # this size prepares a fresh one.
@@ -945,6 +971,8 @@ class ModelExecutor:
                     )
                 )
                 raise
+        self._report_new_kernels()
+        return result
 
     @property
     def denoises(self) -> bool:
@@ -966,6 +994,26 @@ class ModelExecutor:
             )
         self.diffusion_bank = dict(bank)
         self.latent_pool = pool
+
+    @property
+    def canvas_runner(self) -> CanvasRunner | None:
+        """The runner of this rank's token denoising, if it has one."""
+        for (_name, kind), entry in self._forward_calls.items():
+            if kind is ForwardMode.TOKEN_DENOISING:
+                return cast("CanvasRunner", entry)
+        return None
+
+    def bind_canvas_slots(self, slots: CanvasSlots) -> None:
+        """Lend the resident sampler state to the token-denoising runner.
+
+        Raises:
+            RuntimeError: When this rank runs no token denoising.
+        """
+        runner = self.canvas_runner
+        if runner is None:
+            raise RuntimeError("this rank runs no token denoising")
+        runner.bind_canvas_slots(slots)
+        self.canvas_slots = slots
 
     @property
     def diffusion(self) -> DiffusionRunner:
@@ -1205,7 +1253,6 @@ class ModelExecutor:
         decode_predicates,
         max_calls,
         request_slots,
-        max_tokens,
         latent_capacity_units,
         table_widths,
         max_inflight,
@@ -1214,43 +1261,55 @@ class ModelExecutor:
 
         Creates one capability runner per (entry, path, lane) covering a
         computation kind, with its input buffers, execution context, decode /
-        prefill capture shapes, and private CUDA graph storage pools. Callable
-        once: a second call raises ``RuntimeError`` when the first bound any
-        entry. Raises ``ValueError`` when two staged entries of one component
-        cover the same computation kind, and as ``_initialize_streams`` does.
+        prefill capture shapes, and CUDA graph storage pools: private ones,
+        except that the text and canvas runners of one lane stream share
+        theirs. Prefill buckets reach the text tokens ``input_config`` stages
+        per call, and ``max_calls`` and ``request_slots`` bound their live
+        rows. Callable once: a second call raises ``RuntimeError`` when the
+        first bound any entry. Raises ``ValueError`` when two staged entries
+        of one component cover the same computation kind, and as
+        ``_initialize_streams`` does.
         """
-        from uniserve_worker.config.execution import (
-            DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
+        from uniserve_worker.model_executor.canvas_runner import (
+            CanvasRunner,
+            canvas_staging_rows,
         )
+        from uniserve_worker.model_executor.text_runner import TextRunner
 
         if self.entries:
             raise RuntimeError("input execution resources are already bound")
 
         self.kv_cache, self.decode_predicates = kv_cache, decode_predicates
         self.table_widths = tuple(table_widths)
-        self.prefill_row_sizes = DEFAULT_PREFILL_GRAPH_ROW_BUCKETS
         config = self.worker_config
         self._initialize_streams(event_slots=max_inflight + 1)
+        if config.expert_exchange == "dwdp":
+            from uniserve.runtime.weight_prefetch import WeightPrefetch
 
-        # A decode row holds at least one page of every cache group, and one
-        # prefill row at most the tokens the pool's units cover in every
-        # group.
+            if len(self._lane_streams) > 1:
+                raise ValueError(
+                    "DWDP weight buffers require one execution lane"
+                )
+            self.expert_weights = WeightPrefetch(self.model)
+        self.experts = self._expert_exchange(input_config.max_tokens)
+
+        # A decode or prefill row, and the request of every canvas a call
+        # reads, holds at least one page of every cache group, so the pool's
+        # allocatable units bound the rows of each call. A prefill call holds
+        # at most the text tokens its staging accepts, the batch token budget
+        # plus one image's feature span, and at most the tokens the pool's
+        # units cover.
         max_rows = min(max_calls, request_slots)
-        decode_sizes = tuple(
-            value
-            for value in config.decode_graph_batch_sizes
-            if 0 < value <= max_rows
-            and value * kv_cache.row_units < kv_cache.info.num_units
+        pool_rows = (kv_cache.info.num_units - 1) // kv_cache.row_units
+        decode_sizes = decode_captures(
+            config,
+            max_rows=max_rows,
+            row_units=kv_cache.row_units,
+            num_units=kv_cache.info.num_units,
         )
-        prefill_capacity = min(
-            max_tokens,
-            config.max_sequence_tokens,
-            kv_cache.token_capacity,
-        )
-        prefill_sizes = tuple(
-            value
-            for value in config.prefill_graph_token_sizes
-            if 0 < value <= prefill_capacity
+        feature_injection = (
+            self.processor is not None
+            and self.processor.feature_injection is not None
         )
         if self.image_builder is not None:
             from uniserve.media import image
@@ -1277,6 +1336,13 @@ class ModelExecutor:
             )
 
         staged = buffered_kinds(diffusion=self.image_builder is not None)
+        # The first text or canvas runner with graph pools on each (device,
+        # lane stream). A lane stream runs one call at a time and every such
+        # runner allocates its persistent graph storage before the first
+        # capture, so their graphs share one pool: each capture reuses the
+        # blocks the others' intermediates free, and the pool holds the
+        # largest call's intermediates rather than one copy per runner.
+        token_pools: dict[tuple[str, int], ModelRunner] = {}
 
         for (name, path, method), (
             placement,
@@ -1317,32 +1383,53 @@ class ModelExecutor:
                     if lane is None
                     else min(max_rows, lane.max_batch_calls or max_rows)
                 )
-                tokens = (
-                    input_config.max_tokens
-                    if lane is None
-                    else min(
-                        input_config.max_tokens,
-                        lane.max_batch_tokens or input_config.max_tokens,
-                    )
-                )
+                # Graph pools exist only on CUDA, where every decode call
+                # replays a captured bucket; a lane with none can serve no
+                # decode call there.
                 decode = (
                     tuple(value for value in decode_sizes if value <= rows)
-                    if ForwardMode.DECODE in kinds
+                    if ForwardMode.DECODE in kinds and target.type == "cuda"
                     else ()
                 )
-                prefill = (
-                    select_prefill_captures(
-                        prefill_sizes,
-                        self.prefill_row_sizes,
-                        max_rows=rows,
-                        max_tokens=tokens,
-                        visual=self.image_builder is not None,
+                if (
+                    ForwardMode.DECODE in kinds
+                    and target.type == "cuda"
+                    and config.graph_policy != "off"
+                    and not decode
+                ):
+                    raise ValueError(
+                        f"no configured decode graph size fits {rows} rows "
+                        f"and a KV pool of {kv_cache.info.num_units} units, "
+                        f"whose rows hold {kv_cache.row_units} units each"
                     )
-                    if ForwardMode.PREFILL in kinds
+                # Graph pools exist only on CUDA, where every prefill call
+                # replays a captured bucket.
+                prefill = (
+                    prefill_captures(
+                        config,
+                        max_rows=min(rows, pool_rows),
+                        max_tokens=min(
+                            input_config.max_text_tokens,
+                            kv_cache.token_capacity,
+                        ),
+                        image_builder=self.image_builder is not None,
+                        feature_injection=feature_injection,
+                        device_causality=self.attention.device_causality,
+                        pool=(
+                            tuple(
+                                (group.page_tokens, group.units_per_page)
+                                for group in kv_cache.shapes
+                            ),
+                            kv_cache.info.num_units - 1,
+                        ),
+                    )
+                    if ForwardMode.PREFILL in kinds and target.type == "cuda"
                     else ()
                 )
                 # A prefill bucket includes a padding sequence beyond admitted
-                # requests. It consumes staging, but no scheduler request slot.
+                # requests, and a canvas readout bucket padding sequences
+                # (``canvas_runner.canvas_staging_rows``). They consume
+                # staging, but no scheduler request slot.
                 fields = (
                     replace(
                         input_config,
@@ -1352,6 +1439,13 @@ class ModelExecutor:
                         ),
                     )
                     if prefill
+                    else replace(
+                        input_config,
+                        max_rows=canvas_staging_rows(input_config.max_rows),
+                    )
+                    if ForwardMode.TOKEN_DENOISING in kinds
+                    and target.type == "cuda"
+                    and config.graph_policy != "off"
                     else input_config
                 )
                 inputs = context = entry = None
@@ -1377,20 +1471,24 @@ class ModelExecutor:
                                 else {}
                             ),
                         )
+                        # Token passes and image denoising read the paged
+                        # KV cache; canvas passes read it without writing.
+                        reads_cache = isinstance(
+                            call.module,
+                            (CausalLM, ImageDenoiser, TokenDenoiser),
+                        )
                         # Staging supplies every host sequence length and
                         # start page, so attention planning never copies
                         # them from the device while serving.
                         context = ExecutionContext(
                             call.module,
-                            cache=kv_cache.cache
-                            if isinstance(
-                                call.module, (CausalLM, ImageDenoiser)
-                            )
-                            else None,
+                            cache=kv_cache.cache if reads_cache else None,
                             attention=self.attention,
                             stream=stream,
                             groups=call.groups,
                             derive_host_lengths=False,
+                            experts=self.experts,
+                            weights=self.expert_weights,
                         )
                         # Text staging counts canonical tokens. Spatial codecs
                         # and vision towers expand those into different query
@@ -1398,12 +1496,15 @@ class ModelExecutor:
                         # shapes encountered during preparation/eager execution.
                         size = (
                             TextSize(fields.max_tokens, fields.max_rows)
-                            if isinstance(
-                                call.module, (CausalLM, ImageDenoiser)
-                            )
+                            if reads_cache
                             else None
                         )
-                        entry = self._runner_types[id(call)](
+                        runner_class = self._runner_types[id(call)]
+                        token_runner = issubclass(
+                            runner_class, (TextRunner, CanvasRunner)
+                        )
+                        pool_key = (str(target), id(stream))
+                        entry = runner_class(
                             name,
                             call,
                             target,
@@ -1413,6 +1514,7 @@ class ModelExecutor:
                             inputs,
                             storage=self.graph_storage,
                             prefill_graph=config.prefill_cuda_graph,
+                            exact_graphs=config.flow_cuda_graph,
                             cache=kv_cache.cache,
                             predicates=decode_predicates,
                             rank=config.rank,
@@ -1420,7 +1522,12 @@ class ModelExecutor:
                             if config.graph_policy != "off"
                             and target.type == "cuda"
                             else (),
+                            share=token_pools.get(pool_key)
+                            if token_runner
+                            else None,
                         )
+                        if token_runner and entry.pools:
+                            token_pools.setdefault(pool_key, entry)
                         with self.graph_storage.allocate(entry):
                             context.prepare(size)
                         self.graph_storage.check()
@@ -1453,6 +1560,8 @@ class ModelExecutor:
 
                 entry.decode_shapes, entry.prefill_shapes = decode, prefill
                 entry.table_widths = self.table_widths
+                if isinstance(entry, CanvasRunner):
+                    entry.pool_rows = pool_rows
 
                 for kind in kinds:
                     key = (name, kind)
@@ -1461,6 +1570,156 @@ class ModelExecutor:
                             f"computation {key} has multiple lane bindings"
                         )
                     self._forward_calls[key] = entry
+
+    def _expert_exchange(self, max_tokens):
+        """Build the worker's all-to-all exchange for expert-parallel layers.
+
+        Every expert-parallel ``FusedMoE`` of the model shares the exchange
+        of its group, sized for ``max_tokens`` tokens per rank, the most one
+        staged call holds, over the transport ``WorkerConfig.expert_exchange``
+        names; ``None`` when no layer is expert-parallel.
+        Construction maps peer memory collectively, so every rank of the
+        group builds it at this same point of its startup. The exchange
+        serializes its layers on one stream, so an expert-parallel worker
+        runs its forwards on one execution lane.
+
+        Raises:
+            ValueError: The layers span several expert groups or shapes, or
+                the worker has several execution lanes.
+        """
+        from uniserve.nn.moe import FusedMoE
+        from uniserve.runtime.expert_exchange import ExpertExchange
+
+        if self.expert_weights is not None:
+            return None
+        layers = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, FusedMoE) and module.expert_group.size > 1
+        ]
+        if not layers:
+            return None
+        first = layers[0]
+        shape = (
+            first.expert_group,
+            first.num_experts,
+            first.top_k,
+            first.hidden_size,
+        )
+        if any(
+            (
+                layer.expert_group,
+                layer.num_experts,
+                layer.top_k,
+                layer.hidden_size,
+            )
+            != shape
+            for layer in layers
+        ):
+            raise ValueError(
+                "expert-parallel layers share one group, expert count, top-k "
+                "and hidden size"
+            )
+        if len(self._lane_streams) > 1:
+            raise ValueError(
+                "an expert-parallel worker runs its forwards on one lane"
+            )
+        return ExpertExchange(
+            first.expert_group,
+            max_tokens=max_tokens,
+            top_k=first.top_k,
+            num_experts=first.num_experts,
+            hidden_size=first.hidden_size,
+            device=first.up_gate.weight.device,
+            transport=self.worker_config.expert_exchange,
+            intermediate_size=first.intermediate_size,
+            activation=first.activation,
+        )
+
+    def _bind_expert_steps(self):
+        """Bind forwards reaching experts to a common transfer catalog.
+
+        Every local numerical graph captures the transfer capacities that
+        hold its tokens. All ranks must share the same catalog, including
+        ranks whose next step has no local work.
+
+        Raises:
+            RuntimeError: The ranks' step plans differ.
+        """
+        exchange = self.experts
+        if exchange is None:
+            return
+        self._expert_runners = []
+        for entry in self.entries.values():
+            if entry.context.experts is not exchange or not (
+                {ForwardMode.PREFILL, ForwardMode.TOKEN_DENOISING}
+                & set(entry.call_kinds)
+            ):
+                continue
+            entry.expert_step = True
+            entry.expert_order = len(self._expert_runners)
+            self._expert_runners.append(entry)
+
+        # Warmup executes collectives too. Equal transfer catalogs alone do
+        # not establish that peers capture the same local numerical calls.
+        plan = (
+            exchange.capacities,
+            tuple(entry.capture_plan() for entry in self._expert_runners),
+        )
+        plans = [None] * exchange.group.size
+        torch.distributed.all_gather_object(
+            plans, plan, group=exchange.group._require()
+        )
+        if any(other != plan for other in plans):
+            raise RuntimeError(
+                f"expert-parallel ranks have different capture plans: {plans}"
+            )
+
+    def join_expert_step(self, *, leaving: bool = False) -> bool:
+        """Take part in the next expert step when this rank has no forward.
+
+        Agrees with the expert group with no tokens; when another rank takes
+        a step, joins every expert layer at the agreed capacity so that
+        rank's exchanges complete. Returns whether a step ran. A rank
+        shutting down passes ``leaving`` until ``experts.released``. Without
+        an exchange nothing happens.
+        """
+        exchange = self.experts
+        if exchange is None or not self._expert_runners:
+            return False
+        with profile_range("uniserve.expert.agree"):
+            capacity = exchange.agree(0, leaving=leaving)
+        if not capacity:
+            return False
+        runner = self._expert_runners[0]
+        context, stream = runner.context, runner.context.stream
+        if stream is not None:
+            stream.wait(torch.cuda.current_stream(runner.device))
+        try:
+            with (
+                torch.inference_mode(),
+                profile_range(
+                    f"uniserve.expert.step tokens=0 capacity={capacity}"
+                ),
+            ):
+                if self._expert_joins is not None:
+                    # Startup captured every shared transfer capacity; a
+                    # missing one fails rather than join eagerly.
+                    self._expert_joins.replay(capacity)
+                else:
+                    # Without graphs every step, joins included, is eager.
+                    with context.activate():
+                        exchange.begin(capacity)
+                        try:
+                            context.join_expert_layers()
+                        finally:
+                            exchange.end()
+        finally:
+            if stream is not None:
+                torch.cuda.current_stream(runner.device).wait_stream(
+                    stream.stream
+                )
+        return True
 
     def call_devices(self, call):
         """Return ``(compute, staged, output)`` devices for one call.
@@ -1508,24 +1767,33 @@ class ModelExecutor:
 
     @torch.inference_mode()
     def capture(self, *, tokenizer, latents):
-        """Capture every entry's configured prefill, decode, and flow graphs."""
+        """Prepare every staged entry before serving.
+
+        Captures each entry's configured prefill, decode, canvas and flow
+        graphs, running one eager call of each kind that captures none, then
+        runs one synthetic image through every image encoding and decoding
+        entry (see ``startup.prepare_images``), so every staged call kind has
+        prepared its call sites and chosen its kernels.
+        """
         from uniserve_worker.model_executor.startup import (
+            prepare_canvas,
             prepare_decode,
+            prepare_images,
             prepare_prefill,
         )
 
-        for phase in ("prefill", "decode", "flow"):
+        self._bind_expert_steps()
+        for phase in ("prefill", "decode", "canvas", "flow"):
             for entry in self.entries.values():
                 forward = entry.batch_forward
                 if (
                     phase == "prefill"
                     and ForwardMode.PREFILL in entry.call_kinds
                 ):
-                    shapes = (
-                        self.prefill_shapes[entry]
-                        if self.worker_config.graph_policy != "off"
-                        and self.worker_config.prefill_cuda_graph
-                        else (PrefillShape(1, 1, 1),)
+                    # Without captured buckets, one causal token warms the
+                    # entry eagerly.
+                    shapes = self.prefill_shapes[entry] or (
+                        PrefillShape(1, 1, 1),
                     )
                     prepare_prefill(
                         self, entry, entry.input_buffers, forward, shapes
@@ -1535,6 +1803,11 @@ class ModelExecutor:
                 ):
                     prepare_decode(self, entry, entry.input_buffers, forward)
                 elif (
+                    phase == "canvas"
+                    and ForwardMode.TOKEN_DENOISING in entry.call_kinds
+                ):
+                    prepare_canvas(self, entry)
+                elif (
                     phase == "flow" and MediaCall.DENOISING in entry.call_kinds
                 ):
                     from uniserve_worker.model_executor.startup import (
@@ -1542,7 +1815,39 @@ class ModelExecutor:
                     )
 
                     prepare_flow(self, entry, latents, tokenizer)
+        prepare_images(self, latents)
+        self._capture_expert_joins()
         self.synchronize()
+
+    def _capture_expert_joins(self):
+        """Capture a rank's join of an expert step at every step capacity.
+
+        The step agreement returns a configured transfer capacity
+        (``ExpertExchange.agree``), so a join graph at each of those
+        capacities serves every step this rank joins without a forward of
+        its own; replaying it keeps the join at device speed instead of a
+        host-launched run of kernels per layer, which every other rank would
+        wait on at each exchange. Every rank captures the same capacities in
+        the same order, after the runners' graphs, in the first expert
+        runner's context and graph pools. Without graphs nothing is
+        captured and joins stay eager like every other step.
+        """
+        from uniserve.runtime.expert_exchange import JoinGraphs
+
+        exchange = self.experts
+        if exchange is None or not self._expert_runners:
+            return
+        runner = self._expert_runners[0]
+        if not runner.pools:
+            return
+        self._expert_joins = JoinGraphs(
+            runner.context,
+            exchange,
+            exchange.capacities,
+            pools=runner.pools,
+        )
+        for entry in self._expert_runners:
+            entry.expert_joins = self._expert_joins
 
     def complete_startup(self):
         """Seal startup: check captured-graph storage budgets and stream grants.
@@ -1593,13 +1898,54 @@ class ModelExecutor:
         for _, stream in self._lane_streams:
             stream.verify()
         self.graph_storage.seal()
+
+        # Warmup and capture have now prepared the call sites and resolved
+        # the selections they exercise.
+        self._kernel_choices = kernel_choices()
+        self._kernels.add(self._runners())
+        self._log_kernels("startup")
+
         self._startup_complete = True
-        for entry in (
+        for entry in self._runners():
+            entry._startup_complete = True
+
+    def _runners(self) -> tuple[ModelRunner, ...]:
+        """Return every runner this executor currently holds."""
+        return (
             *self.entries.values(),
             *self._module_entries.values(),
             *(() if self._diffusion is None else (self._diffusion,)),
-        ):
-            entry._startup_complete = True
+        )
+
+    def _log_kernels(self, stage: str) -> None:
+        """Log the table of every kernel record (see ``kernel_table``)."""
+        logger.info(
+            "%s",
+            format_kernel_table(
+                self._kernels.table(
+                    stage=stage,
+                    rank=self.worker_config.rank,
+                    device=str(self.worker_config.device),
+                )
+            ),
+        )
+
+    def _report_new_kernels(self) -> None:
+        """Log the table again after a serving call chose a new kernel.
+
+        Call sites prepared at their first call and input classes startup
+        did not exercise choose their kernels while serving. The process's
+        choice count keeps the check per call to one integer comparison;
+        records are gathered only after it changes, and the table is logged
+        only when they include a new call site or kernel (a computation
+        prepared again at another size repeats known records).
+        """
+        choices = kernel_choices()
+        if not self._startup_complete or choices == self._kernel_choices:
+            return
+        self._kernel_choices = choices
+        if self._kernels.add(self._runners()):
+            self._log_kernels("serving")
 
     def synchronize(self):
         """Host-synchronize every owned stream and each device's current stream.
@@ -1648,6 +1994,9 @@ class ModelExecutor:
                 *(() if self._diffusion is None else (self._diffusion,)),
             )
         ]
+        joins, self._expert_joins = self._expert_joins, None
+        if joins is not None:
+            actions.append(joins.close)
         close_resources(*actions)
 
     def close(self, *, aborted: bool = False):
@@ -1696,6 +2045,8 @@ class ModelExecutor:
             actions.append(self._diffusion.close)
         for entry in self.entries.values():
             actions.append(entry.close)
+        if self.expert_weights is not None:
+            actions.append(self.expert_weights.close)
 
         # Each stream retires the communicators every context on it shared,
         # then its native resources. Streams close in reverse creation order
@@ -1815,8 +2166,12 @@ class ModelExecutor:
         Fatal failures propagate immediately because later device work is
         unsafe.
         """
-        # Rows sharing an entry, forward mode, device, and media shape form
-        # one homogeneous numerical call.
+        # Rows sharing an entry, forward mode, device, row type, media shape
+        # and attention causality form one homogeneous numerical call: a
+        # canvas readout and a canvas step of one pass are separate calls.
+        # A context call's interdependent text and vision segments stay in
+        # one prefill: attention writes all their K/V before reading it.
+        # Independent uniform calls retain their causal/non-causal graphs.
         grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
         bindings: dict[int, ModelRunner] = {}
         for index, (task, call) in enumerate(tasks):
@@ -1838,9 +2193,21 @@ class ModelExecutor:
                 shape = tuple(int(value) for value in task.encode_pixels.shape)
             elif isinstance(task, (DiffusionRow, DecodeRow)):
                 shape = (task.image_height, task.image_width)
-            grouped[(entry, task.forward_mode, str(target), shape)].append(
-                index
+            causal = (
+                None
+                if call.vision_inputs and call.completion_output is None
+                else isinstance(task, TokenRow) and task.causal
             )
+            grouped[
+                (
+                    entry,
+                    task.forward_mode,
+                    str(target),
+                    type(task),
+                    shape,
+                    causal,
+                )
+            ].append(index)
 
         groups = list(grouped.values())
         for group_index, indexes in enumerate(groups):
@@ -2029,6 +2396,7 @@ class ModelExecutor:
                     mode_us={forward_mode.value: duration_us},
                     component_us={"forward": duration_us},
                 )
+                self._report_new_kernels()
                 return replace(
                     output,
                     request_pool_indices=request_pool_indices,
@@ -2061,6 +2429,13 @@ def _validate_outputs(
             raise ValueError(
                 f"model output is on {value.device}, expected {device}"
             )
+        # A canvas step reports the sampler's decision, not a raw output.
+        if isinstance(task, CanvasStepRow):
+            if value.dtype != torch.int64 or value.shape != (
+                1 + task.canvas_length,
+            ):
+                raise ValueError("a canvas step reports its stop and canvas")
+            continue
         if not value.is_floating_point():
             raise ValueError("raw neural outputs must use a floating dtype")
 

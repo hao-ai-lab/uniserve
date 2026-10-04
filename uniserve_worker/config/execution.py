@@ -24,6 +24,7 @@ from uniserve.runtime.backends.attention.flashinfer import (
     Config as FlashInferConfig,
 )
 from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.protocol.batch import CanvasSampling
 from uniserve_worker.protocol.call import (
     CALL_KINDS,
     CallKind,
@@ -95,7 +96,9 @@ DEFAULT_DECODE_GRAPH_BATCH_SIZES = (
 
 # Token buckets step linearly within each range, with a step that widens as the
 # counts grow. A prefill rounded up to a bucket gains less padding than the gap
-# below that bucket.
+# below that bucket. Keep 64-token spacing through 4096: these prompt batches
+# have enough compute for padding to affect latency, while the additional
+# captured graphs still share their large execution buffers.
 DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     4,
     8,
@@ -134,19 +137,7 @@ DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     832,
     896,
     960,
-    1024,
-    1280,
-    1536,
-    1792,
-    2048,
-    2304,
-    2560,
-    2816,
-    3072,
-    3328,
-    3584,
-    3840,
-    4096,
+    *range(1024, 4097, 64),
     4608,
     5120,
     5632,
@@ -233,7 +224,11 @@ LANE_COMPUTATION_GROUPS: dict[str, tuple[CallKind, ...]] = {
         MediaCall.TEXT_ENCODING,
         *TransferMode,
     ),
-    "decode": (ForwardMode.DECODE, ForwardMode.VERIFY),
+    "decode": (
+        ForwardMode.DECODE,
+        ForwardMode.VERIFY,
+        ForwardMode.TOKEN_DENOISING,
+    ),
     "flow": (
         MediaCall.LATENT_PREPARATION,
         MediaCall.DENOISING,
@@ -309,11 +304,31 @@ class WorkerConfig:
     ``block_size`` is resolved from the model's cache layers and attention
     kernels (``bootstrap.cache.resolve_page_size``) before the unit pool is
     planned.
+
+    Graphs: ``graph_policy`` ``"off"`` disables every graph. Otherwise every
+    decode call on a CUDA device replays a graph captured at startup for one
+    of the ``decode_graph_batch_sizes`` whose rows' pages fit the KV pool,
+    and with ``prefill_cuda_graph`` every prefill call replays a graph
+    captured over ``prefill_graph_token_sizes`` token buckets. A call no
+    captured graph holds fails, and the worker reports the rows its graphs
+    hold so the engine never forms one. Turning ``prefill_cuda_graph`` off
+    runs prefill eagerly, for debugging. Without ``prefill_outputs`` the
+    deployment's prefill calls select no output (``TokenSelection.CACHE``):
+    their graphs only write the K/V cache, and a prefill call that selects
+    logits or hidden states has no graph.
+    ``flow_cuda_graph`` (on by default) captures image denoising calls at
+    the ``flow_graph_shapes`` and ``flow_graph_batch_sizes`` combinations
+    and replays those whose exact input signature was captured; turning it
+    off runs image denoising eagerly, for debugging.
     """
 
     device: str = "cpu"
     rank: int = 0
     world_size: int = 1
+    # How an expert-parallel replica exchanges tokens at every expert layer:
+    # "alltoall" (NVLink all-to-all around the grouped expert kernel) or
+    # "megamoe" (the fused MegaMoE kernel, NVFP4 experts).
+    expert_exchange: str = "alltoall"
     # Tokens per KV page of the cache group with the widest token rows; None
     # until resolved.
     block_size: int | None = None
@@ -340,6 +355,10 @@ class WorkerConfig:
     # it selects which of a checkpoint's video denoisers the deployment
     # serves.
     deployment_components: tuple[str, ...] = ()
+    # Block-diffusion sampling of every canvas the deployment generates; None
+    # when it generates none. Generating canvases keep the argmax history
+    # its stability threshold needs and run their steps with exactly it.
+    canvas_sampling: CanvasSampling | None = None
     max_request_pool_size: int = 128
     encoder_cache_entries: int = 256
     generation_device: str | None = None
@@ -351,10 +370,15 @@ class WorkerConfig:
     lanes: tuple[LaneConfig, ...] = ()
     graph_policy: str = "auto"
     decode_graph_batch_sizes: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
-    prefill_cuda_graph: bool = False
+    prefill_cuda_graph: bool = True
+    # Whether any prefill call of the deployment selects logits or hidden
+    # states. A deployment whose prompts only condition token-denoising
+    # canvases writes the K/V cache alone.
+    prefill_outputs: bool = True
     prefill_graph_token_sizes: tuple[int, ...] = (
         DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
     )
+    flow_cuda_graph: bool = True
     flow_graph_batch_sizes: tuple[int, ...] = (1, 2, 3, 4)
     flow_graph_shapes: tuple[tuple[int, int], ...] = (
         (1152, 2048),
@@ -450,6 +474,28 @@ def worker_config_from_namespace(
         WorkerError: If the assembled configuration violates a
             ``WorkerConfig`` invariant.
     """
+    expert_parallel = getattr(namespace, "expert_parallel", None) or {}
+    prefill_tokens = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
+    if (
+        expert_parallel
+        and expert_parallel.get("exchange", "alltoall") == "alltoall"
+    ):
+        # Each local shape also captures larger transfer capacities. Bound
+        # that product with geometric small buckets and 512-token spacing
+        # thereafter; the default catalog's maximum padding gap stays 512,
+        # within the same KV padding allocation as independent replicas.
+        # An explicit launch catalog still takes precedence below.
+        prefill_tokens = (
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            *range(1024, 16385, 512),
+        )
     return WorkerConfig(
         device=device,
         rank=int(namespace.rank),
@@ -458,6 +504,8 @@ def worker_config_from_namespace(
         block_size=_positive_optional_int(namespace.block_size),
         max_batch_calls=int(namespace.max_batch_calls),
         max_batch_tokens=int(namespace.max_batch_tokens),
+        # The engine sizes the request pool from its running-request limit.
+        max_request_pool_size=int(namespace.max_request_pool_size),
         max_sequence_tokens=int(namespace.max_model_len),
         max_video_seconds=float(namespace.max_video_seconds),
         max_condition_rows=int(namespace.max_condition_rows),
@@ -470,6 +518,9 @@ def worker_config_from_namespace(
         ),
         deployment_components=tuple(
             str(name) for name in namespace.deployment_components
+        ),
+        canvas_sampling=_canvas_sampling(
+            getattr(namespace, "canvas_sampling", None)
         ),
         kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
         attention_backend=str(namespace.attention_backend),
@@ -486,9 +537,12 @@ def worker_config_from_namespace(
             default=DEFAULT_DECODE_GRAPH_BATCH_SIZES,
         ),
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
+        prefill_outputs=bool(getattr(namespace, "prefill_outputs", True)),
+        expert_exchange=str(expert_parallel.get("exchange", "alltoall")),
+        flow_cuda_graph=bool(getattr(namespace, "flow_cuda_graph", True)),
         prefill_graph_token_sizes=_parse_positive_int_csv(
             namespace.prefill_graph_token_sizes,
-            default=DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
+            default=prefill_tokens,
         ),
         flow_graph_batch_sizes=_parse_positive_int_csv(
             namespace.flow_graph_batch_sizes,
@@ -527,6 +581,15 @@ def _none_if_empty(value: object | None) -> str | None:
             "an explicitly provided string setting must not be empty"
         )
     return text
+
+
+def _canvas_sampling(value: object | None) -> CanvasSampling | None:
+    """Parse the served block-diffusion sampling, keeping ``None`` as none."""
+    return (
+        None
+        if value is None
+        else CanvasSampling.from_mapping(value, "canvas_sampling")
+    )
 
 
 def _optional_float(value: object | None) -> float | None:

@@ -214,10 +214,18 @@ _USES = count()
 
 @dataclass
 class GraphBucket:
-    """Variants sharing one prepared numerical shape and its fixed backing."""
+    """Variants sharing one prepared numerical shape and its fixed backing.
+
+    ``expert_layers`` names, by module identity, the expert-parallel layers
+    whose exchanges the graphs replay, so a step that replays them knows
+    which layers its forward reached. Expert-step variants are keyed by
+    transfer capacity; independent calls use ``None``. Every variant keeps
+    the same local numerical shape and input backing.
+    """
 
     graphs: dict = field(default_factory=dict)
     last_used: int = field(default_factory=lambda: next(_USES))
+    expert_layers: frozenset[int] = frozenset()
 
     def touch(self):
         self.last_used = next(_USES)

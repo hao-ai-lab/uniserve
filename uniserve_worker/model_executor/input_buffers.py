@@ -8,22 +8,34 @@ those columns. Because the addresses never change, text graph buckets capture
 the staging columns themselves, and ``graph_inputs.pad_text`` can widen the
 staged slices in place to a bucket's capacity.
 
-Token staging copies its inputs into owned columns; diffusion staging does the
-same for attention metadata, positions and timesteps but borrows the rows'
-latents. Vision and latent-encoding staging and image-decode staging own only
-the request-slot column and borrow the rows' tensors. Borrowed tensors must
+Token staging copies its inputs into owned columns, as canvas staging does for
+token canvases and their answer slots; diffusion staging does the same for
+attention metadata, positions and timesteps but borrows the rows' latents.
+The attention metadata of rows that name their request slots is gathered on
+the device from the slots' resident block tables (``stage_rows``); a caller
+may instead pass a prepared host attention batch (``stage_attention``).
+Vision and latent-encoding staging and image-decode staging own only the
+request-slot column and borrow the rows' tensors. Borrowed tensors must
 already reside on the entry's device.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from itertools import accumulate
 
+import numpy as np
 import torch
 
-from uniserve.math import bucketed_length
+from uniserve.diffusion.canvas import CanvasState
+from uniserve.math import bucketed_length, ceil_div
 from uniserve.media import image
-from uniserve.model import EmbeddingReplacement, TextInput, VisionInput
+from uniserve.model import (
+    CanvasInput,
+    EmbeddingReplacement,
+    TextInput,
+    VisionInput,
+)
 from uniserve.nn.attention import (
     AttentionBatch,
     BlockTable,
@@ -37,8 +49,14 @@ from uniserve.tensors import BufferConfig, adjacent_view
 from uniserve_worker.model_executor._decode_inputs import (
     gather_request_decode_inputs,
 )
+from uniserve_worker.model_executor._row_inputs import (
+    ROW_SECTIONS,
+    gather_request_rows,
+    row_columns_size,
+    row_columns_stride,
+)
 from uniserve_worker.model_executor.attention import (
-    columns,
+    first_page,
     row_tables,
     table_pages,
 )
@@ -49,8 +67,12 @@ from uniserve_worker.model_executor.diffusion_inputs import (
 )
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
 from uniserve_worker.model_executor.input_batch import (
+    CanvasRow,
+    CanvasStepInput,
+    CanvasStepRow,
     InputBatch,
     InputRow,
+    ReadoutInput,
     TokenRow,
 )
 from uniserve_worker.protocol.call import ForwardMode, MediaCall
@@ -114,10 +136,16 @@ class AttentionBufferConfig(RowBufferConfig):
             "start_pages": BufferConfig((tables, rows), torch.int32),
             "cache_lengths": BufferConfig((rows,), torch.int32),
             "query_lengths": BufferConfig((rows,), torch.int32),
+            "causal_values": BufferConfig((rows,), torch.int32),
             "cumulative_query_lengths": BufferConfig((rows + 1,), torch.int32),
             "cumulative_prefix_lengths": BufferConfig((rows + 1,), torch.int32),
             # [table, token]: each table addresses its own units.
             "write_indices": BufferConfig((tables, tokens), torch.int64),
+            # Host columns of a call's rows for their device staging
+            # (``AttentionBuffers.stage_rows``).
+            "row_columns": BufferConfig(
+                (row_columns_size(rows, tables, tokens),), torch.int64
+            ),
         }
 
 
@@ -165,6 +193,32 @@ class TokenBufferConfig(AttentionBufferConfig):
         return fields
 
 
+# The rows of ``CanvasBuffers.step_columns``, per staged canvas step: its
+# request slot, seed, block and step index.
+STEP_COLUMNS = ("step_slots", "step_seeds", "step_blocks", "step_indices")
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasBufferConfig(AttentionBufferConfig):
+    """Canvas token, slot and sampling columns of a token-denoising call.
+
+    ``max_rows`` bounds the canvas rows of one call and ``max_tokens`` their
+    tokens, which also bounds the slots they read. A generating canvas step
+    stages its row's request slot and sampling coordinates in the rows of
+    ``step_columns`` (``STEP_COLUMNS``).
+    """
+
+    def buffers(self):
+        return {
+            **AttentionBufferConfig.buffers(self),
+            "input_ids": BufferConfig((self.max_tokens,), torch.int64),
+            "slot_tokens": BufferConfig((self.max_tokens,), torch.int64),
+            "step_columns": BufferConfig(
+                (len(STEP_COLUMNS), self.max_rows), torch.int64
+            ),
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class DiffusionBufferConfig(AttentionBufferConfig):
     """Attention columns, one solver time per image sequence and a step.
@@ -193,7 +247,8 @@ class InputBuffers:
     stream that stages them.
     """
 
-    row_type: type[InputRow]
+    # The row types this staging accepts.
+    row_type: type[InputRow] | tuple[type[InputRow], ...]
 
     # Each field ``config.buffers()`` names becomes a fixed-address column
     # attribute of the same name at construction.
@@ -239,9 +294,13 @@ class InputBuffers:
         if not 0 < len(rows) <= self.max_rows:
             raise ValueError("row count exceeds input-buffer capacity")
         if any(not isinstance(row, self.row_type) for row in rows):
-            raise TypeError(
-                f"this staging requires {self.row_type.__name__} inputs"
+            types = (
+                self.row_type
+                if isinstance(self.row_type, tuple)
+                else (self.row_type,)
             )
+            names = " or ".join(kind.__name__ for kind in types)
+            raise TypeError(f"this staging requires {names} inputs")
         # Token rows of any ForwardMode share one staging layout; a media row
         # must match the call kind exactly.
         if any(
@@ -301,6 +360,177 @@ class AttentionBuffers(InputBuffers):
         # -1 is the attention write-index sentinel for a token that writes no
         # cache slot; unstaged capacity starts inert.
         self.write_indices.fill_(-1)
+        # Pinned sources of the host columns ``stage_rows`` copies.
+        self._row_host = HostBuffers(
+            self.row_columns.shape,
+            dtype=torch.int64,
+            depth=options.get("max_inflight", 1),
+            device=self.device,
+        )
+
+    def close(self):
+        self._row_host.close()
+        super().close()
+
+    def stage_rows(self, rows, *, tables, cache):
+        """Stage the attention columns of token rows from their slots' tables.
+
+        ``rows`` are one call's ``AttentionRow`` values, validated against
+        the installed tables (``attention.row_tables``). Every numerical
+        table stages the pages ``attention.table_pages`` selects: all of a
+        full table's installed pages, and a windowed table's pages from the
+        first one the row's first query reaches back to, through the row's
+        last query. The host supplies per-row lengths, each table's staged
+        page count per row and each token's row with one copy; the units,
+        first staged pages and write addresses are gathered on the device
+        from the request slots' resident tables (``gather_request_rows``).
+
+        Returns an ``AttentionBatch`` over this owner's columns: paged
+        entries when any row writes the cache, in which the tokens of rows
+        that do not write carry the -1 address, and otherwise segmented
+        entries in which every query sees its whole current sequence. Query
+        and prefix lengths and windowed tables' first staged pages keep
+        exact host mirrors.
+
+        Raises:
+            WorkerError: From ``attention.row_tables``.
+            ValueError: A read-only call has a causal row, or a table or the
+                call exceeds this owner's capacity.
+        """
+        groups = row_tables(rows, tables=tables, cache=cache)
+        count = len(rows)
+        queries = tuple(int(row.query_tokens) for row in rows)
+        prefixes = tuple(int(row.seq_len) for row in rows)
+        write = tuple(bool(row.write_kv) for row in rows)
+        causal = tuple(bool(row.causal) for row in rows)
+        flags = self.stage_causality(causal)
+        if not any(write) and any(causal):
+            raise ValueError(
+                "read-only prefix/current calls require noncausal current "
+                "sequences"
+            )
+        total = sum(queries)
+        if count > self.max_rows or total > self.write_indices.shape[1]:
+            raise ValueError("attention rows exceed input-buffer capacity")
+
+        # Host columns, each section ``stride`` long (``_row_inputs``), in a
+        # pinned ring slot that keeps its previous call's values: the kernel
+        # reads only the live rows of each section, and the offsets' leading
+        # zeros are rewritten.
+        stride = row_columns_stride(self.max_rows)
+        number = len(self.table_widths)
+        section = (ROW_SECTIONS + number) * stride
+        slot, pinned = self._row_host.acquire()
+        host = pinned.numpy()
+        host[:count] = [row.request_pool_idx for row in rows]
+        host[stride : stride + count] = prefixes
+        host[2 * stride : 2 * stride + count] = queries
+        host[3 * stride : 3 * stride + count] = write
+        host[4 * stride] = host[5 * stride] = 0
+        host[4 * stride + 1 : 4 * stride + count + 1] = list(
+            accumulate(queries)
+        )
+        host[5 * stride + 1 : 5 * stride + count + 1] = list(
+            accumulate(prefixes)
+        )
+        host[section : section + total] = np.repeat(np.arange(count), queries)
+
+        # Each table's staged pages per row and, for a windowed table, its
+        # first staged page; a group's tables stage the same pages.
+        widths, firsts, block_sizes = [], [], []
+        for group, shape in enumerate(tables.groups):
+            pages, first_pages = [], []
+            for row_groups, prefix, query in zip(
+                groups, prefixes, queries, strict=True
+            ):
+                table = row_groups[group]
+                if shape.window is None:
+                    first, end = 0, table.end_page
+                else:
+                    first = first_page(table, prefix)
+                    end = min(
+                        table.end_page,
+                        ceil_div(prefix + query, shape.page_tokens),
+                    )
+                pages.append(max(0, end - first))
+                first_pages.append(first)
+            for position in range(shape.units_per_page):
+                table_number = tables.first_table[group] + position
+                start = (ROW_SECTIONS + table_number) * stride
+                host[start : start + count] = pages
+                widths.append(max(1, *pages))
+                block_sizes.append(shape.page_tokens)
+                firsts.append(
+                    None if shape.window is None else tuple(first_pages)
+                )
+        if any(
+            width > capacity
+            for width, capacity in zip(widths, self.table_widths, strict=True)
+        ):
+            raise ValueError("block tables exceed input-buffer capacity")
+
+        self.row_columns[: section + total].copy_(
+            pinned[: section + total], non_blocking=True
+        )
+        self._row_host.record_copy(slot)
+        gather_request_rows(
+            columns=self.row_columns,
+            rows=count,
+            tokens=total,
+            width=max(widths),
+            request_unit_tables=tables.unit_tables,
+            request_start_pages=tables.start_pages,
+            table_shapes=tables.table_shapes,
+            block_tables=self.block_tables,
+            start_pages=self.start_pages,
+            cache_lengths=self.cache_lengths,
+            query_lengths=self.query_lengths,
+            query_offsets=self.cumulative_query_lengths,
+            prefix_offsets=self.cumulative_prefix_lengths,
+            write_indices=self.write_indices,
+        )
+
+        shared = SequenceLengths(
+            host=queries,
+            values=self.query_lengths[:count],
+            offsets=self.cumulative_query_lengths[: count + 1],
+        )
+        prefix_lengths = SequenceLengths(
+            host=prefixes,
+            values=self.cache_lengths[:count],
+            offsets=self.cumulative_prefix_lengths[: count + 1],
+        )
+        entries = {}
+        for table_number, (width, first_pages) in enumerate(
+            zip(widths, firsts, strict=True)
+        ):
+            blocks = BlockTable(
+                self.block_tables[table_number, :count, :width],
+                block_sizes[table_number],
+                None
+                if first_pages is None
+                else self.start_pages[table_number, :count],
+                first_pages,
+            )
+            if any(write):
+                entries[table_number] = PagedInput(
+                    shared,
+                    prefix_lengths,
+                    blocks,
+                    self.write_indices[table_number, :total],
+                    causal,
+                    flags,
+                )
+            else:
+                entries[table_number] = SegmentedInput(
+                    shared,
+                    prefix_lengths,
+                    blocks,
+                    None,
+                    shared.values[:, None].expand(-1, max(queries)),
+                    True,
+                )
+        return AttentionBatch(entries, shared)
 
     def stage_attention(self, attention):
         """Copy every table's paged or segmented columns into fixed buffers.
@@ -355,11 +585,29 @@ class AttentionBuffers(InputBuffers):
             ),
         )
 
+        flags = (
+            self.stage_causality(first.causal)
+            if isinstance(first, PagedInput)
+            else None
+        )
         staged = {
             number: self._stage_table(number, entry, queries, prefixes, count)
             for number, entry in entries.items()
         }
+        if flags is not None:
+            staged = {
+                number: replace(entry, causal_values=flags)
+                for number, entry in staged.items()
+            }
         return AttentionBatch(staged, queries)
+
+    def stage_causality(self, causal, *, dynamic=False):
+        """Stage one shared visibility column for a mixed numerical call."""
+        if not dynamic and len(set(causal)) < 2:
+            return None
+        values = self.causal_values[: len(causal)]
+        values.copy_(torch.tensor(causal, dtype=torch.int32), non_blocking=True)
+        return values
 
     def _stage_table(self, number, entry, queries, prefixes, count):
         """Stage one table's pages, start pages and write addresses."""
@@ -405,20 +653,61 @@ class AttentionBuffers(InputBuffers):
             True,
         )
 
-    def _positions(self, source, offset, count):
-        if source.ndim == 1:
-            source = source.unsqueeze(0)
+    def _stage_positions(self, sources, lengths):
+        """Copy the rows' positions into the packed position columns.
+
+        Each source is ``[tokens]`` or ``[axes, tokens]`` with one or three
+        axes over its row's tokens; a one-axis row fills axis zero only.
+        Rows whose positions share an axis count and a device stage with one
+        copy of their concatenation, the rest row by row.
+        """
+        shaped = []
+        for source, count in zip(sources, lengths, strict=True):
+            if source.ndim == 1:
+                source = source.unsqueeze(0)
+            if (
+                source.ndim != 2
+                or source.shape[0] not in (1, 3)
+                or source.shape[1] != count
+            ):
+                raise ValueError(
+                    "positions must have one or three axes over the token span"
+                )
+            shaped.append(source)
+
         if (
-            source.ndim != 2
-            or source.shape[0] not in (1, 3)
-            or source.shape[1] != count
+            len({source.shape[0] for source in shaped}) == 1
+            and len({source.device for source in shaped}) == 1
         ):
-            raise ValueError(
-                "positions must have one or three axes over the token span"
+            packed = shaped[0] if len(shaped) == 1 else torch.cat(shaped, 1)
+            self.positions[: packed.shape[0], : packed.shape[1]].copy_(
+                packed, non_blocking=True
             )
-        self.positions[: source.shape[0], offset : offset + count].copy_(
-            source, non_blocking=True
-        )
+            return
+
+        offset = 0
+        for source, count in zip(shaped, lengths, strict=True):
+            self.positions[: source.shape[0], offset : offset + count].copy_(
+                source, non_blocking=True
+            )
+            offset += count
+
+    def clear_padding(self, *, live_rows, rows, live_tokens, tokens):
+        """Make the padding of every staged table inert, one launch per column.
+
+        Rows ``live_rows..rows`` of every table's units and start pages
+        become zero (unit zero is valid storage, page zero the first), and
+        tokens ``live_tokens..tokens`` of every table's write addresses
+        become -1, no cache write. Each column is one ``[table, ...]``
+        tensor whose tables are the staged views (``_stage_table``), so one
+        launch covers every table; columns past a table's graph width are
+        never read.
+        """
+        if rows > live_rows:
+            self.block_tables[:, live_rows:rows].zero_()
+            self.start_pages[:, live_rows:rows].zero_()
+        if tokens > live_tokens:
+            self.write_indices[:, live_tokens:tokens].fill_(-1)
 
     def _vector(self, target, source):
         if source.numel() > target.numel():
@@ -538,12 +827,12 @@ class TokenBuffers(AttentionBuffers):
                 for row in rows
             )
 
-        attention = (
-            columns(rows, cache=cache, tables=tables)
+        staged = (
+            self.stage_rows(rows, tables=tables, cache=cache)
             if attention is None
-            else attention
+            else self.stage_attention(attention)
         )
-        inputs = self._text(rows, self.stage_attention(attention))
+        inputs = self._text(rows, staged)
         return inputs, tuple(row.selection for row in rows), finish
 
     def _text(self, rows, attention):
@@ -609,17 +898,20 @@ class TokenBuffers(AttentionBuffers):
         # Multimodal text uses one three-axis representation for prefill and
         # decode. Spatial coordinates of ordinary text stay zero; numerical
         # layers can consume the prepared axes directly on every replay.
-        offset, axes = 0, 3 if self.image_builder is not None else 1
+        self._stage_positions(tuple(row.positions for row in rows), lengths)
+        axes = max(
+            3 if self.image_builder is not None else 1,
+            *(
+                1 if row.positions.ndim == 1 else row.positions.shape[0]
+                for row in rows
+            ),
+        )
+        offset = 0
         for row, length in zip(rows, lengths, strict=True):
             if input_ids is None:
                 self.input_ids[offset : offset + length].copy_(
                     row.token_ids.reshape(-1), non_blocking=True
                 )
-
-            self._positions(row.positions, offset, length)
-            axes = max(
-                axes, 1 if row.positions.ndim == 1 else row.positions.shape[0]
-            )
 
             if row.token_embeddings is not None:
                 values = row.token_embeddings.reshape(length, -1)
@@ -746,6 +1038,223 @@ class TokenBuffers(AttentionBuffers):
         return TextInput(self.input_ids[:count], positions, attention)
 
 
+class CanvasBuffers(AttentionBuffers):
+    """Stage token canvases, their slots and candidate reads on their lane.
+
+    Canvas tokens, positions, attention metadata and slot indices use fixed
+    columns bounded by the configured rows and tokens. The candidate ids a
+    call reads have no configured bound, so their backing grows to the
+    largest call staged so far and keeps its address until a larger call
+    arrives; the readout head that consumes them runs outside any graph.
+
+    Generating canvas steps (``CanvasStepRow``) stage their rows' resident
+    sampler state from the ``CanvasSlots`` bound with ``bind_canvas_slots``;
+    their canvas tokens and self-conditioning embeddings are the model's
+    inputs. One call stages either readout rows or step rows.
+    """
+
+    row_type = (CanvasRow, CanvasStepRow)
+
+    input_ids: torch.Tensor
+    slot_tokens: torch.Tensor
+    step_columns: torch.Tensor
+
+    def __init__(self, *, config: CanvasBufferConfig, **options):
+        super().__init__(config=config, **options)
+        # Candidate matrix and selection indices share one int64 backing.
+        self._candidates = torch.empty(0, dtype=torch.int64, device=self.device)
+        self._canvas_slots = None
+        # Pinned sources of the step columns, which stage with one copy.
+        self._step_host = HostBuffers(
+            self.step_columns.shape,
+            dtype=torch.int64,
+            depth=options.get("max_inflight", 1),
+            device=self.device,
+        )
+
+    def close(self):
+        self._step_host.close()
+        super().close()
+
+    def bind_canvas_slots(self, slots) -> None:
+        """Borrow the resident sampler state that canvas steps stage from."""
+        self._canvas_slots = slots
+
+    def _prepare_inputs(
+        self, rows, *, attention=None, cache=None, tables=None, states=None
+    ):
+        staged = (
+            self.stage_rows(rows, tables=tables, cache=cache)
+            if attention is None
+            else self.stage_attention(attention)
+        )
+        steps = sum(isinstance(row, CanvasStepRow) for row in rows)
+        if steps:
+            if steps != len(rows):
+                raise ValueError(
+                    "one canvas call stages readout rows or canvas steps"
+                )
+            return self._prepare_steps(rows, staged), (), None
+
+        lengths = tuple(row.query_tokens for row in rows)
+        total = sum(lengths)
+        if total > self.max_tokens:
+            raise ValueError("canvas tokens exceed input-buffer capacity")
+
+        # Rows pack back to back: their tokens and positions stage with one
+        # copy each, and each row's slots shift by the tokens of the rows
+        # before it.
+        values = tuple(row.token_ids.reshape(-1) for row in rows)
+        packed = None
+        if len({value.device for value in values}) == 1:
+            packed = adjacent_view(values)
+            packed = torch.cat(values) if packed is None else packed
+            self.input_ids[:total].copy_(packed, non_blocking=True)
+        self._stage_positions(tuple(row.positions for row in rows), lengths)
+
+        slots, groups, offset = [], [], 0
+        for row, length in zip(rows, lengths, strict=True):
+            if packed is None:
+                self.input_ids[offset : offset + length].copy_(
+                    row.token_ids.reshape(-1), non_blocking=True
+                )
+            offsets = row.candidate_offsets
+            for index, token in enumerate(row.slot_tokens):
+                slots.append(offset + token)
+                groups.append(
+                    row.candidate_ids[offsets[index] : offsets[index + 1]]
+                )
+            offset += length
+
+        count = len(slots)
+        slot_tokens = self.slot_tokens[:count]
+        slot_tokens.copy_(
+            torch.from_numpy(np.asarray(slots, dtype=np.int64)),
+            non_blocking=True,
+        )
+
+        # A [slots, width] matrix holds every slot's candidates, padded with
+        # its first one; the selection names the real entries in order.
+        # Both stage from one host array into the shared backing.
+        sizes = np.fromiter(map(len, groups), dtype=np.int64, count=count)
+        width = int(sizes.max())
+        host = np.empty(count * width + int(sizes.sum()), dtype=np.int64)
+        matrix = host[: count * width].reshape(count, width)
+        for index, group in enumerate(groups):
+            matrix[index, : len(group)] = group
+            matrix[index, len(group) :] = group[0]
+        host[count * width :] = np.flatnonzero(
+            np.arange(width)[None, :] < sizes[:, None]
+        )
+        backing = self._candidate_backing(host.size)
+        backing[: host.size].copy_(torch.from_numpy(host), non_blocking=True)
+        candidates = backing[: count * width].view(count, width)
+        selected = backing[count * width : host.size]
+
+        canvas = CanvasInput(
+            self.input_ids[:total], self.positions[0, :total], staged
+        )
+        inputs = ReadoutInput(
+            canvas,
+            slot_tokens,
+            candidates,
+            selected,
+            tuple(len(row.candidate_ids) for row in rows),
+        )
+        return inputs, (), None
+
+    def _prepare_steps(self, rows, staged):
+        """Stage canvas steps: their sampling coordinates and gathered state.
+
+        Every row's canvas follows the previous one in the packed tokens.
+        The rows' argmax histories are staged at the depth of their shared
+        stability threshold.
+        """
+        state = self._canvas_slots
+        if state is None:
+            raise ValueError("canvas steps require bound sampler state")
+        depths = {row.sampling.stability for row in rows}
+        lengths = {row.canvas_length for row in rows}
+        if len(depths) != 1 or lengths != {state.canvas_length}:
+            raise ValueError(
+                "canvas steps of one call share the resident canvas length "
+                "and one stability threshold"
+            )
+
+        count, length = len(rows), state.canvas_length
+        if count * length > self.max_tokens:
+            raise ValueError("canvas tokens exceed input-buffer capacity")
+        self._stage_positions(
+            tuple(row.positions for row in rows), (length,) * count
+        )
+        # The step columns' rows are ``max_rows`` apart, so the live values
+        # of all four stage with one copy, which also carries the stale
+        # tails of the first three that no reader sees.
+        slot, pinned = self._step_host.acquire()
+        host = pinned.numpy()
+        host[0, :count] = [row.request_pool_idx for row in rows]
+        host[1, :count] = [row.seed for row in rows]
+        host[2, :count] = [row.block for row in rows]
+        host[3, :count] = [row.step for row in rows]
+        size = (len(STEP_COLUMNS) - 1) * self.max_rows + count
+        self.step_columns.view(-1)[:size].copy_(
+            pinned.view(-1)[:size], non_blocking=True
+        )
+        self._step_host.record_copy(slot)
+        vectors = dict(
+            zip(
+                STEP_COLUMNS,
+                self.step_columns[:, :count].unbind(0),
+                strict=True,
+            )
+        )
+
+        # The staged canvases are the model's input tokens, and their
+        # self-conditioning rows its self-conditioning input, back to back.
+        views = state.stage(vectors["step_slots"], depths.pop())
+        self_conditioning = views["self_conditioning"].view(
+            count * length, state.hidden_size
+        )
+        rows_state = CanvasState(
+            seed=vectors["step_seeds"],
+            block=vectors["step_blocks"],
+            step=vectors["step_indices"],
+            canvas=views["canvas"],
+            history=views["history"],
+            self_conditioning=self_conditioning,
+        )
+        canvas = CanvasInput(
+            views["canvas"].view(-1),
+            self.positions[0, : count * length],
+            staged,
+            self_conditioning=self_conditioning,
+        )
+        return CanvasStepInput(
+            canvas,
+            rows_state,
+            views,
+            vectors["step_slots"],
+            tuple(row.sampling for row in rows),
+            first=all(row.step == 0 for row in rows),
+        )
+
+    def _candidate_backing(self, size):
+        """Return candidate storage of at least ``size`` int64 elements.
+
+        Replacing the backing is ordered after earlier readers by the
+        caching allocator, since every reader runs on this staging stream.
+        Serving stages outside inference mode, so the backing is allocated
+        as an ordinary tensor even when startup staging, which runs in
+        inference mode, grows it first.
+        """
+        if self._candidates.numel() < size:
+            with torch.inference_mode(False):
+                self._candidates = torch.empty(
+                    size, dtype=torch.int64, device=self.device
+                )
+        return self._candidates
+
+
 class DiffusionBuffers(AttentionBuffers):
     """Stage spatial attention and solver times without text storage."""
 
@@ -762,12 +1271,12 @@ class DiffusionBuffers(AttentionBuffers):
     def _prepare_inputs(
         self, rows, *, attention=None, cache=None, tables=None, states=None
     ):
-        attention = (
-            columns(rows, cache=cache, tables=tables)
+        staged = (
+            self.stage_rows(rows, tables=tables, cache=cache)
             if attention is None
-            else attention
+            else self.stage_attention(attention)
         )
-        return self._images(rows, self.stage_attention(attention)), (), None
+        return self._images(rows, staged), (), None
 
     def _images(self, rows, attention):
         """Stage denoising positions and timesteps, then bind image inputs.
@@ -789,16 +1298,14 @@ class DiffusionBuffers(AttentionBuffers):
         if sum(lengths) > self.max_tokens:
             raise ValueError("image sequences exceed input-buffer capacity")
 
-        positions, offset = [], 0
-        for index, (row, size, length) in enumerate(
-            zip(rows, sizes, lengths, strict=True)
-        ):
-            if row.timestep is None or row.positions is None:
-                raise ValueError(
-                    "image denoising requires positions and a timestep"
-                )
+        if any(row.timestep is None or row.positions is None for row in rows):
+            raise ValueError(
+                "image denoising requires positions and a timestep"
+            )
+        self._stage_positions(tuple(row.positions for row in rows), lengths)
 
-            self._positions(row.positions, offset, length)
+        positions, offset = [], 0
+        for index, (row, length) in enumerate(zip(rows, lengths, strict=True)):
             positions.append(self.positions[:, offset : offset + length])
             self.timesteps[index].copy_(row.timestep.reshape(()))
             offset += length
@@ -869,6 +1376,10 @@ def input_buffer_config(kind, limits: TokenBufferConfig):
     Raises:
         ValueError: ``kind`` has no fixed row staging.
     """
+    if kind is ForwardMode.TOKEN_DENOISING:
+        return CanvasBuffers, CanvasBufferConfig(
+            limits.max_rows, limits.max_tokens, limits.table_widths
+        )
     if isinstance(kind, ForwardMode):
         return TokenBuffers, limits
     if kind is MediaCall.DENOISING:

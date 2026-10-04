@@ -1,14 +1,16 @@
 """Prepared numerical calls with owned inputs and graph residency.
 
 ``ModelRunner`` is the base of the per-capability runners that
-``runner_type`` selects (text, diffusion, encoder, decoder). The base runner
+``runner_type`` selects (text, canvas, diffusion, encoder, decoder). The base
+runner
 serves two call paths:
 
 - Staged batches: ``prepare_inputs`` stages rows into the runner's
   ``InputBuffers``, and ``run_batch`` replays a graph bucket selected by
   ``select_graph_shape`` or runs eagerly. Buckets are captured during startup
   through ``capture_batch``; once ``ModelExecutor.complete_startup`` seals
-  the runner, no batch graph is captured.
+  the runner, no batch graph is captured, and a batch whose configured
+  bucket is not resident fails instead of running eagerly.
 - Standalone invocations: ``execute_model`` evaluates one module call from
   ``ModelExecutor.run_module``. When graph pools exist, startup captures a
   graph per exact input signature on first use; once startup is sealed, a
@@ -28,6 +30,7 @@ from typing import cast
 import torch
 
 from uniserve.nn.attention import AttentionBatch, PagedInput, SegmentedInput
+from uniserve.profiling import profile_range
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout, TensorOutput
@@ -49,6 +52,27 @@ from .graph_inputs import (
 )
 from .input_batch import InputBatch
 from .output import ExecutionOutput
+
+
+def joining_experts(forward, context):
+    """``forward``, then a join of every expert layer it did not reach.
+
+    Inside an open expert step (see ``ExecutionContext.join_expert_layers``)
+    a graph captured over the returned call carries every exchange of the
+    step; outside one the join does nothing. Each call accounts for the
+    layers it reaches afresh, since a warm-up call and its capture share
+    one step.
+    """
+
+    def call(*args):
+        experts = context.experts
+        if experts is not None and experts.capacity:
+            experts.invoked.clear()
+        result = forward(*args)
+        context.join_expert_layers()
+        return result
+
+    return call
 
 
 def _masked_starts(table):
@@ -79,6 +103,7 @@ class ModelRunner(Execution, ABC):
         storage,
         devices,
         prefill_graph=True,
+        exact_graphs=False,
         cache=None,
         predicates=None,
         rank=0,
@@ -90,7 +115,10 @@ class ModelRunner(Execution, ABC):
         self.call_kinds, self.cuda_stream = tuple(kinds), stream
         self.input_buffers = inputs
         self.graph_storage = storage
-        self.prefill_graph = prefill_graph
+        # Text runners replay prefill buckets only with ``prefill_graph``;
+        # other runners capture exact input signatures only with
+        # ``exact_graphs`` (see ``select_graph_shape``).
+        self.prefill_graph, self.exact_graphs = prefill_graph, exact_graphs
         self.cache, self.decode_predicates = cache, predicates
         self.rank = rank
         self.decode_shapes: tuple[int, ...] = ()
@@ -99,6 +127,10 @@ class ModelRunner(Execution, ABC):
         # ``bootstrap.capacity.graph_table_widths``.
         self.table_widths: tuple[int, ...] = ()
         self._startup_complete = False
+        # Bound by execution when this capability reaches expert layers.
+        self.expert_step = False
+        self.expert_order = 0
+        self.expert_joins = None
 
     @abstractmethod
     def batch_forward(
@@ -119,17 +151,36 @@ class ModelRunner(Execution, ABC):
             rows, forward_mode=forward_mode, **numerical
         )
 
+    def graph_tokens(self, key) -> int:
+        """Tokens this rank's numerical graph computes, including padding."""
+        raise NotImplementedError
+
+    def expert_tokens(self, batch) -> int:
+        """Tokens ``batch``'s forward sends through the expert exchange."""
+        tokens = batch.query_tokens
+        assert tokens is not None
+        return tokens
+
+    def capture_plan(self):
+        """Numerical captures whose startup collectives must pair on peers."""
+        return (
+            tuple(sorted(self.call_kinds)),
+            self.decode_shapes,
+            self.prefill_shapes,
+        )
+
     def select_graph_shape(self, batch, *, eligible):
         """Use the exact numerical signature for non-text graph variants.
 
         Returns ``None`` for eager execution: when the caller marks the batch
-        ineligible, graphs are disabled (no pools), or ``prefill_graph`` is off,
-        which here also disables exact graphs. Otherwise returns ``(key,
-        execution, bucketed)``: the graph key, the batch to replay, and whether
-        the key names a configured bucket that may be captured on first use
-        before startup is sealed. Exact keys are never bucketed.
+        ineligible, graphs are disabled (no pools), or ``exact_graphs`` is
+        off. Otherwise returns ``(key, execution, bucketed)``: the graph key,
+        the batch to replay, and whether the key names a configured bucket
+        that may be captured on first use before startup is sealed. Exact
+        keys are never bucketed. The local numerical shape is independent
+        of the transfer capacity of an expert step.
         """
-        if not eligible or not self.pools or not self.prefill_graph:
+        if not eligible or not self.pools or not self.exact_graphs:
             return None
 
         # Only token and denoising batches reach this point: ``ModelExecutor``
@@ -174,6 +225,15 @@ class ModelRunner(Execution, ABC):
     def resources(self):
         """Numerical constants and workspace borrowed by a standalone call."""
         return {}
+
+    def kernels(self) -> list[dict[str, object]]:
+        """Records of the kernels behind this runner's call sites.
+
+        The prepared context's ``ExecutionContext.kernels`` records; a runner
+        that calls kernels outside its model's layers adds theirs. The worker
+        kernel table (``execution.kernel_table``) gathers them.
+        """
+        return self.context.kernels()
 
     @torch.inference_mode()
     def execute_model(self, *args, **kwargs):
@@ -259,12 +319,27 @@ class ModelRunner(Execution, ABC):
 
     @torch.inference_mode()
     def eager_batch(self, batch, forward):
-        """Run a staged batch eagerly inside its entry's execution context."""
+        """Run a staged batch eagerly inside its entry's execution context.
+
+        Outside an open expert step (a startup call), an expert-parallel
+        runner opens one at the exchange's largest capacity: every rank of
+        the expert group runs the same startup calls in the same order, so
+        the step needs no agreement.
+        """
         with self.context.activate():
             attention = getattr(batch.inputs, "attention", None)
             if attention is not None:
                 self.context.bind_attention(attention)
-            return forward(batch)
+            exchange = self.context.experts if self.expert_step else None
+            if exchange is None or exchange.capacity:
+                return forward(batch)
+            exchange.begin(exchange.max_tokens)
+            try:
+                result = forward(batch)
+                self.context.join_expert_layers()
+            finally:
+                exchange.end()
+            return result
 
     @torch.inference_mode()
     def capture_batch(self, batch, forward):
@@ -272,12 +347,15 @@ class ModelRunner(Execution, ABC):
 
         The lane stream waits for the caller's current stream first, and the
         caller's stream waits for the lane afterwards, also on failure. A
-        batch without a selectable graph shape runs once eagerly instead,
-        and a key that is already resident is not captured again.
+        batch for which ``select_graph_shape`` returns no shape runs once
+        eagerly instead, and a key that is already resident is not captured
+        again.
 
         Raises:
             CUDAGraphError: Startup preparation is sealed, graph residency
-                exceeds its byte budget, or the capture itself fails.
+                exceeds its byte budget, the runner has graphs for the
+                batch's kind but none of its shape, or the capture itself
+                fails.
         """
         context, stream = self.context, self.context.stream
         if stream is not None:
@@ -305,27 +383,104 @@ class ModelRunner(Execution, ABC):
         if key in self.buckets:
             return
 
-        invoke = partial(self.batch_forward, padded=True) if padded else forward
-
         # Text buckets use the entry's stable staging addresses, ordered on
         # its execution stream. Exact calls can include borrowed request
         # latents; own those inputs independently of their pool-slot lifetime.
         with self.graph_storage.allocate(self):
             static = execution if padded else clone_inputs(execution)
-        graph = capture_batch(
+
+        # Each local shape has a variant for every transfer capacity that
+        # holds it. Every rank captures the same pairs in the same order;
+        # their warm-up exchanges therefore pair without an agreement.
+        exchange = self.context.experts if self.expert_step else None
+        capacities = (
+            tuple(
+                value
+                for value in reversed(exchange.capacities)
+                if value >= self.graph_tokens(key)
+            )
+            if exchange is not None
+            else (None,)
+        )
+        if not capacities:
+            raise CUDAGraphError(
+                f"local graph of {self.graph_tokens(key)} tokens exceeds "
+                "the expert exchange capacity"
+            )
+        bucket = GraphBucket()
+        try:
+            for capacity in capacities:
+                if exchange is not None:
+                    exchange.begin(capacity)
+                try:
+                    bucket.graphs[capacity] = self.capture_graph(
+                        key,
+                        static,
+                        partial(self.batch_forward, padded=True)
+                        if padded
+                        else forward,
+                    )
+                    bucket.expert_layers = frozenset(
+                        () if exchange is None else exchange.invoked
+                    )
+                finally:
+                    if exchange is not None:
+                        exchange.end()
+                self.graph_storage.check()
+        except BaseException as error:
+            error.add_note(
+                f"capturing {self.name} bucket {key!r}, "
+                f"expert capacity {capacity}"
+            )
+            bucket.close()
+            raise
+        self.buckets[key] = bucket
+
+    def batch_graph(self, key):
+        """Return the local bucket's variant for the current expert step."""
+        capacity = self.context.experts.capacity if self.expert_step else None
+        return self.buckets[key].graphs[capacity]
+
+    def capture_graph(self, key, execution, forward):
+        """Capture the graph of ``key`` over its fixed input ``execution``.
+
+        ``forward`` evaluates the batch; the graph also computes greedy
+        decoding where ``graph_inputs.greedy_decode`` applies. Inside an
+        expert step the graph also joins every expert layer ``forward`` did
+        not reach, so its replay makes all of the step's exchanges. Runners
+        with other captured computations override this together with
+        ``replay_graph``.
+        """
+        return capture_batch(
             self.context,
-            static,
-            invoke,
+            execution,
+            joining_experts(forward, self.context),
             pools=self.pools,
             cache=self.cache,
             predicates=self.decode_predicates,
         )
-        try:
-            self.graph_storage.check()
-        except BaseException:
-            graph.close()
-            raise
-        self.buckets[key] = GraphBucket({None: graph})
+
+    def replay_graph(self, key, execution, batch, *, borrow):
+        """Replay the resident graph of ``key`` for ``batch``.
+
+        ``execution`` is the batch as the graph's inputs hold it (padded to
+        the bucket for text); outputs of padding rows are dropped. With
+        ``borrow`` the result may view graph storage the next replay
+        overwrites.
+        """
+        result = replay_batch(
+            self.batch_graph(key),
+            execution,
+            rows=batch.row_count,
+            borrow=borrow,
+        )
+        # A decode bucket carries a force-finish column even for a batch
+        # staged without one (see ``TextRunner.select_graph_shape``), so its
+        # graph can return greedy continuations that such a batch did not
+        # request.
+        if batch.decode_force_finish is None:
+            result = replace(result, greedy=None)
+        return result
 
     @torch.inference_mode()
     def run_batch(self, batch, forward, *, eligible, borrow_output=False):
@@ -339,8 +494,10 @@ class ModelRunner(Execution, ABC):
 
         Raises:
             CUDAGraphError: After startup, a configured text bucket that
-                the batch selects is not resident; before startup, capturing
-                a missing text bucket can also fail with it.
+                the batch selects is not resident, or a text runner with
+                prefill graphs has no bucket for a non-decode batch; before
+                startup, capturing a missing text bucket can also fail with
+                it.
         """
         with self.context.activate():
             return self._run_batch(
@@ -352,6 +509,56 @@ class ModelRunner(Execution, ABC):
 
     def _run_batch(self, batch, forward, *, eligible, borrow_output=False):
         selected = self.select_graph_shape(batch, eligible=eligible)
+        exchange = self.context.experts
+        if exchange is None or not self.expert_step:
+            return self._run_forward(
+                batch, forward, selected=selected, borrow_output=borrow_output
+            )
+
+        # Agree on the selected local graph's padded count, not just the
+        # live input count: the transfer must hold every row it sends.
+        tokens = self.expert_tokens(batch)
+        if selected is not None:
+            tokens = max(tokens, self.graph_tokens(selected[0]))
+        while True:
+            with profile_range("uniserve.expert.agree"):
+                capacity = exchange.agree(tokens, kind=self.expert_order)
+            if exchange.kind == self.expert_order:
+                break
+            # Keep this capability's staged input intact while a peer's
+            # different capability runs. The join uses only expert backing,
+            # never this runner's attention, sampling or input buffers.
+            with profile_range(
+                f"uniserve.expert.step tokens=0 capacity={capacity}"
+            ):
+                if self.expert_joins is not None:
+                    self.expert_joins.replay(capacity)
+                else:
+                    exchange.begin(capacity)
+                    try:
+                        self.context.join_expert_layers()
+                    finally:
+                        exchange.end()
+        exchange.begin(capacity)
+        try:
+            # Query tokens describe this rank's input, before graph padding;
+            # capacity is the common transfer size selected by all ranks.
+            with profile_range(
+                f"uniserve.expert.step tokens={batch.query_tokens} "
+                f"capacity={capacity} local_tokens={tokens}"
+            ):
+                result = self._run_forward(
+                    batch,
+                    forward,
+                    selected=selected,
+                    borrow_output=borrow_output,
+                )
+                self.context.join_expert_layers()
+        finally:
+            exchange.end()
+        return result
+
+    def _run_forward(self, batch, forward, *, selected, borrow_output=False):
         if selected is None:
             return replace(
                 self.eager_batch(batch, forward),
@@ -361,7 +568,7 @@ class ModelRunner(Execution, ABC):
         key, execution, bucketed = selected
         captured = False
         if key not in self.buckets:
-            # Only configured text buckets may capture at run time; an exact
+            # Only configured buckets may capture at run time; an exact
             # signature without a resident graph simply runs eager.
             if not bucketed:
                 return replace(
@@ -370,28 +577,9 @@ class ModelRunner(Execution, ABC):
                         cuda_graph_runtime_mode_counts={"eager": 1}
                     ),
                 )
+            # No capture happens after startup, which captured every
+            # configured bucket.
             if self._startup_complete:
-                # No capture happens after startup. A missing decode bucket
-                # (``key[1]`` is the text shape; its last field is the
-                # decode flag), or a missing prefill bucket whose causality
-                # and selection match a configured ``PrefillShape``, is an
-                # error. Only prefill variants matching no configured shape
-                # run eagerly.
-                configured = key[1][-1] or any(
-                    shape.causal
-                    == next(
-                        iter(execution.inputs.attention.entries.values())
-                    ).causal[0]
-                    and shape.selection is execution.token_selections[0]
-                    for shape in self.prefill_shapes
-                )
-                if not configured:
-                    return replace(
-                        self.eager_batch(batch, forward),
-                        stats=ForwardStats(
-                            cuda_graph_runtime_mode_counts={"eager": 1}
-                        ),
-                    )
                 raise CUDAGraphError(
                     f"configured graph bucket is not resident: {key!r}"
                 )
@@ -406,19 +594,11 @@ class ModelRunner(Execution, ABC):
         bucket_tokens = execution.query_tokens
         assert live_tokens is not None and bucket_tokens is not None
 
-        result = replay_batch(
-            self.buckets[key].graphs[None],
-            execution,
-            rows=batch.row_count,
-            borrow=borrow_output,
-        )
-        # A decode bucket carries a force-finish column even for a batch
-        # staged without one (see ``TextRunner.select_graph_shape``), so its
-        # graph can return greedy continuations that such a batch did not
-        # request.
-        if batch.decode_force_finish is None:
-            result = replace(result, greedy=None)
-
+        exchange = self.context.experts
+        if exchange is not None and self.expert_step:
+            # Replayed exchanges run no host code; the bucket names them.
+            exchange.invoked.update(self.buckets[key].expert_layers)
+        result = self.replay_graph(key, execution, batch, borrow=borrow_output)
         return replace(
             result,
             stats=ForwardStats(
@@ -471,6 +651,7 @@ def runner_type(module):
         Denoiser,
         Encoder,
         ImageDecoder,
+        TokenDenoiser,
         VideoDecoder,
         VideoEncoder,
         VideoPostprocessor,
@@ -479,6 +660,7 @@ def runner_type(module):
 
     # The runner modules import ``ModelRunner`` from this module, so they are
     # imported here rather than at module scope.
+    from .canvas_runner import CanvasRunner
     from .decoder_runner import DecoderRunner
     from .diffusion_runner import DiffusionRunner
     from .encoder_runner import EncoderRunner
@@ -488,6 +670,8 @@ def runner_type(module):
         return TextRunner
     if isinstance(module, Denoiser):
         return DiffusionRunner
+    if isinstance(module, TokenDenoiser):
+        return CanvasRunner
     if isinstance(
         module, (AudioDecoder, ImageDecoder, VideoDecoder, VideoPostprocessor)
     ):

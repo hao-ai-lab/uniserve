@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uniserve.tensors import BufferConfig
 
+from ..backends import record_kernel_choice
 from . import capturing
 
 
@@ -24,6 +25,8 @@ class VsaBinding:
         self.backend, self.transient, self.scratch = backend, transient, scratch
         self._shared_buffers, self.exchange = shared_buffers, exchange
         self.operators, self._buffers = operators, {}
+        # Provider name of each prepared operator key.
+        self.providers = {}
 
     def prepare(self, pattern, q):
         key = (q.device, q.dtype, q.shape[1], q.shape[2], pattern)
@@ -43,14 +46,37 @@ class VsaBinding:
                 "dtype": q.dtype,
             }
             requirements = provider.workspace_buffers(pattern, **options)
-            self.operators[key] = provider.prepare(
+            operator = provider.prepare(
                 pattern,
                 **options,
                 workspace=self.scratch(requirements, q.device),
                 transient=self.transient,
             )
+            self.operators[key] = (provider.name, operator)
 
-        return self.operators[key]
+        provider_name, operator = self.operators[key]
+        if key not in self.providers:
+            self.providers[key] = provider_name
+            record_kernel_choice()
+
+        return operator
+
+    def kernels(self):
+        """Describe the block-sparse kernel of each prepared query shape.
+
+        One record per prepared (device, dtype, heads, head dimension,
+        pattern): the provider name, local heads, head dimension and dtype.
+        """
+        return [
+            {
+                "op": "vsa",
+                "provider": name,
+                "heads": heads,
+                "head_dim": head_dim,
+                "dtype": str(dtype).removeprefix("torch."),
+            }
+            for (_, dtype, heads, head_dim, _), name in self.providers.items()
+        ]
 
     def buffers(self, requirements, device):
         key = (device, tuple(requirements.items()))
@@ -72,4 +98,5 @@ class VsaBinding:
     def close(self):
         # The execution context retires shared operators once every call site
         # and graph has finished borrowing them.
+        self.providers.clear()
         self._buffers.clear()
