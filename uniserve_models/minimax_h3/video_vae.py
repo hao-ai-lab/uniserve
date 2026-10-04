@@ -31,7 +31,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve.nn import functional
-from uniserve.nn.attention import Attention, DenseInput
+from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
 from uniserve.nn.functional import (
     qk_bias_rms_norm_rope_,
     scaled_residual_,
@@ -451,7 +451,7 @@ class TransformerLayer(nn.Module):
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
-            DenseInput(causal=False, mask=None),
+            AttentionBatch.single(DenseInput(causal=False, mask=None)),
         )
         attended, bias = _project(
             self.output, attended.transpose(1, 2).reshape(batch, sequence, -1)

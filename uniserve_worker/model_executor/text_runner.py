@@ -13,7 +13,6 @@ from dataclasses import replace
 import torch
 
 from uniserve.model import TextInput, VocabShard
-from uniserve.nn.attention import DenseInput
 from uniserve_worker.model_executor.output import ExecutionOutput
 from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.sampling.metadata import TokenSelection
@@ -81,10 +80,10 @@ class TextRunner(ModelRunner):
         ``batch_forward`` uses this path for padded last-logits buckets.
         """
         hidden = self.model(inputs)
-        attention = inputs.attention
-        if isinstance(attention, DenseInput):
+        queries = inputs.attention.queries
+        if queries is None:
             raise ValueError("final-position logits require sequence offsets")
-        offsets = attention.queries.offsets
+        offsets = queries.offsets
         indices = (offsets[1:].to(torch.int64) - 1).clamp_min(0)
 
         if self.pipeline.rank == self.pipeline.size - 1:
@@ -112,7 +111,7 @@ class TextRunner(ModelRunner):
         raw hidden states. Logit and hidden columns are computed once on the
         last pipeline stage and broadcast so every stage returns the same rows.
         """
-        if isinstance(inputs.attention, DenseInput):
+        if inputs.attention.queries is None:
             count = inputs.input_ids.numel() // inputs.batch_size
             lengths = (count,) * inputs.batch_size
             offsets = (
@@ -303,7 +302,7 @@ class TextRunner(ModelRunner):
             inputs.positions.ndim,
             inputs.embeddings is not None,
             batch.decode_force_finish is not None,
-            inputs.attention.causal[0],
+            next(iter(inputs.attention.entries.values())).causal[0],
             padded.token_selections[0],
         )
         return key, padded, True

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from importlib import import_module
 
 import torch as torch_lib
@@ -14,12 +15,55 @@ from uniserve.nn.attention.inputs import (
     DenseInput,
     PagedInput,
     SegmentedInput,
+    VisibleInput,
 )
+from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 
 
+@dataclass(frozen=True, slots=True)
+class CachePages:
+    """How a layer's paged prefix cache stores its pages.
+
+    ``page_tokens`` is the tokens of one page, ``dtype`` the element type
+    the pages store and ``quantized`` whether they hold per-block FP8
+    values with scales.
+    """
+
+    page_tokens: int
+    dtype: torch_lib.dtype
+    quantized: bool = False
+
+    @classmethod
+    def of(cls, state: mha.State) -> CachePages:
+        """Describe the pages of a bound cache state."""
+        key = state.key
+        return cls(
+            state.block_size, key.dtype, isinstance(key, QuantizedTensor)
+        )
+
+
 class Operator:
-    """One layer invocation's backend state and borrowed numerical resources."""
+    """One layer invocation's backend state and borrowed numerical resources.
+
+    ``window`` is the layer's history bound in tokens (``None`` reads the
+    whole history); its visibility rule is documented on
+    :class:`uniserve.nn.attention.Attention`.
+
+    ``reads_retired_tables`` states whether the provider consumes block
+    tables whose rows start after logical page zero
+    (``BlockTable.start_page``). A provider that does not rejects such a
+    table instead of reading its columns from the wrong logical pages.
+
+    ``builds_launch_plan`` states whether ``bind`` builds a launch plan from
+    the batch, metadata that the provider's launches read and that a
+    captured launch therefore needs rebuilt before every replay. A provider
+    whose kernels read every length, offset and table on the device only
+    checks its inputs in ``bind``.
+    """
+
+    reads_retired_tables = False
+    builds_launch_plan = True
 
     def __init__(
         self,
@@ -31,6 +75,7 @@ class Operator:
         size,
         cache,
         workspace,
+        window=None,
     ):
         if (
             min(num_heads, num_kv_heads, head_dim) < 1
@@ -39,6 +84,11 @@ class Operator:
             raise ValueError(
                 "attention requires compatible positive query and KV heads"
             )
+        if window is not None and (type(window) is not int or window < 0):
+            raise ValueError(
+                "attention windows must be nonnegative token counts"
+            )
+        self.window = window
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -64,17 +114,36 @@ class Operator:
         """
         self._check_batch(batch)
 
-        if self.requires_host_lengths(batch) and any(
-            lengths is not None and lengths.host is None
-            for lengths in (
-                getattr(batch, name, None)
-                for name in ("queries", "keys", "prefixes")
+        table = getattr(batch, "block_table", None)
+        if self.requires_host_lengths(batch) and (
+            any(
+                lengths is not None and lengths.host is None
+                for lengths in (
+                    getattr(batch, name, None)
+                    for name in ("queries", "keys", "prefixes")
+                )
+            )
+            or (
+                table is not None
+                and table.start_page is not None
+                and table.start_page_host is None
             )
         ):
             raise ValueError(
                 "this attention preparation requires exact host sequence "
                 "lengths"
             )
+
+    def selections(self) -> Mapping[str, str]:
+        """Return the provider that served each input class this operator met.
+
+        Keys name an input class by its path and mask semantics, for example
+        ``"paged attention: causal rows"``; values are provider names. Only a
+        dispatching operator, which chooses a provider per input, reports
+        choices; a provider's own operator serves every input itself and
+        returns an empty mapping.
+        """
+        return {}
 
     def requires_host_lengths(self, batch: AttentionInput) -> bool:
         """Whether preparation needs exact CPU sequence lengths.
@@ -87,6 +156,14 @@ class Operator:
     def _check_batch(self, batch):
         if self._closed:
             raise RuntimeError("attention operator is closed")
+
+        if self.window is not None and isinstance(batch, VisibleInput):
+            # Visible inputs carry key endpoints but no query positions, so a
+            # history bound relative to each query is not defined for them.
+            raise ValueError(
+                "windowed attention requires paged, segmented, variable-length "
+                "or dense inputs"
+            )
 
         if not isinstance(batch, DenseInput) and (
             (
@@ -107,6 +184,17 @@ class Operator:
                 raise ValueError(
                     "attention block table and cache block sizes differ"
                 )
+
+        table = getattr(batch, "block_table", None)
+        if (
+            table is not None
+            and table.start_page is not None
+            and not self.reads_retired_tables
+        ):
+            raise ValueError(
+                "this attention provider reads block tables from logical "
+                "page zero and cannot consume retired window pages"
+            )
 
     def update_cache(
         self,
@@ -216,6 +304,25 @@ class Backend:
 
     operator_class: type[Operator]
 
+    def reads_pages(
+        self,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch_lib.dtype,
+        window: int | None,
+        pages: CachePages,
+    ) -> bool:
+        """Report whether the backend serves a cache layer on ``pages``.
+
+        A layer with a paged prefix cache receives causal and non-causal
+        paged calls and segmented reads of its prefix. A backend serving
+        one provider reports True and validates its own page constraints
+        when a layer is prepared.
+        """
+        return True
+
     def workspace_buffers(
         self,
         *,
@@ -225,6 +332,7 @@ class Backend:
         dtype: torch_lib.dtype,
         size: TextSize,
         cache: mha.State | None,
+        window: int | None = None,
     ) -> Mapping[str, BufferConfig]:
         return {}
 
@@ -238,6 +346,7 @@ class Backend:
         size: TextSize,
         cache: mha.State | None,
         workspace: Mapping[str, torch_lib.Tensor],
+        window: int | None = None,
     ) -> Operator:
         return self.operator_class(
             num_heads=num_heads,
@@ -247,6 +356,7 @@ class Backend:
             size=size,
             cache=cache,
             workspace=workspace,
+            window=window,
         )
 
 
@@ -255,8 +365,11 @@ def resolve(
 ) -> Backend:
     """Resolve a provider, preserving an optional configured FlashInfer factory.
 
-    Automatic selection also uses its workspace grant for TensorRT-LLM, whose
-    native kernels consume the same scratch allocation.
+    ``"auto"`` selects native kernels per call (see ``_auto``) and uses the
+    FlashInfer factory's workspace grant for the TensorRT-LLM kernels that
+    ship with FlashInfer. Any other name selects that provider for every
+    call, including the FlashInfer, FlashAttention-2 and portable torch
+    providers that automatic selection never chooses on CUDA.
     """
     if isinstance(backend, Backend):
         return backend
@@ -273,6 +386,7 @@ def resolve(
         "flashinfer",
         "trtllm",
         "sgl_kernel",
+        "prefix_block",
     }:
         raise ValueError(f"unknown attention backend {backend!r}")
 

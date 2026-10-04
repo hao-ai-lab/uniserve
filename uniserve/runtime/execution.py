@@ -570,9 +570,10 @@ class ExecutionContext(Generic[SizeT]):
                     vsa_slot += 1
 
                 if isinstance(child, Attention):
-                    state = None
+                    state = table = None
                     if child.cache_name is not None and self.cache is not None:
                         state = self.cache.state(child.cache_name)
+                        table = self.cache.table(child.cache_name)
                         device, dtype = state.key.device, state.key.dtype
 
                     attention_binding = AttentionBinding(
@@ -584,6 +585,7 @@ class ExecutionContext(Generic[SizeT]):
                         dtype,
                         self._attention_workspace,
                         self._context_transport,
+                        table,
                     )
                     self._attention[id(child)] = attention_binding
 
@@ -706,21 +708,22 @@ class ExecutionContext(Generic[SizeT]):
     def bind_attention(self, batch):
         """Plan one call's attention metadata on every attention layer.
 
-        Required before graph capture. In eager execution the next call of
-        each layer on ``batch`` uses these plans instead of planning again;
-        bind again after changing lengths in place. Exact host lengths are
-        read at most once for all layers.
+        ``batch`` is the call's ``AttentionBatch``; each layer plans its own
+        table's entry. Required before graph capture. In eager execution the
+        next call of each layer on ``batch`` uses these plans instead of
+        planning again; bind again after changing lengths in place. Exact
+        host lengths are read at most once for all layers and tables.
         """
-        from .backends.attention._sequences import host_lengths
+        from .backends.attention._sequences import batch_host_lengths
 
         self._open()
         with self.activate():
             mirrored = batch
             if any(
-                binding.reads_host_lengths(batch)
+                binding.reads_host_lengths(batch.entry(binding.table))
                 for binding in self._attention.values()
             ):
-                mirrored = host_lengths(batch)
+                mirrored = batch_host_lengths(batch)
             for binding in self._attention.values():
                 binding.bind(mirrored, source=batch)
 

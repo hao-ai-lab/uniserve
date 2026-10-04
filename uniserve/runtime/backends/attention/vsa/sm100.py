@@ -46,6 +46,7 @@ class _Operator(BaseOperator):
 
 
 class Backend(BaseBackend):
+    name = "sm100"
     operator_class = _Operator
 
     def prepare(self, pattern, **options):
