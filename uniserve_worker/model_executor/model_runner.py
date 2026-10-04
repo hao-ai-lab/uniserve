@@ -131,6 +131,7 @@ class ModelRunner(Execution, ABC):
         self.expert_step = False
         self.expert_order = 0
         self.expert_joins = None
+        self.microbatch_joins = None
 
     @abstractmethod
     def batch_forward(
@@ -599,6 +600,9 @@ class ModelRunner(Execution, ABC):
 
                 def run(peer, batch, shape):
                     result = None
+                    if batch is None and peer.microbatch_joins is not None:
+                        peer.microbatch_joins.replay(capacity)
+                        return None
                     if batch is not None:
                         result = peer._run_forward(
                             batch,

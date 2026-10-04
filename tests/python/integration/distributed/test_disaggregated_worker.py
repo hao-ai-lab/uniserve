@@ -1,5 +1,7 @@
 """Worker microbatches preserve packed rows, cache state and graph outputs."""
 
+import argparse
+import os
 import socket
 from contextlib import contextmanager
 from dataclasses import replace
@@ -10,7 +12,7 @@ import torch.multiprocessing as mp
 
 from tests.python.fixtures.checkpoints import qwen_moe_checkpoint
 from tests.python.integration.runtime.test_prefill_graphs import _call
-from uniserve.distributed import Communicator
+from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.nn.moe import FusedMoE
 from uniserve.runtime import PrefixCache
 from uniserve.runtime.process_groups import (
@@ -34,13 +36,13 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 @contextmanager
-def _worker(model, config, *, group=None):
+def _worker(model, config, *, group=None, attention_ranks=1):
     expert = config.role == "experts"
     runner = ModelExecutor(
         model,
         config,
         expert_group=group,
-        attention_ranks=0 if group is None else 1,
+        attention_ranks=0 if group is None else attention_ranks,
         bindings={} if expert else None,
         entry_points={} if expert else None,
     )
@@ -100,7 +102,7 @@ def _worker(model, config, *, group=None):
             manager.close()
 
 
-def _inputs():
+def _inputs(replica=0):
     # Reuse resident buckets with different row lengths and counts, including
     # a one-row call that leaves one of two microbatches empty.
     steps = (
@@ -110,6 +112,16 @@ def _inputs():
         ((1, (29,)),),
         ((1, (30,)), (2, (31,)), (3, (32,))),
     )
+    if replica:
+        # Independent replicas can prefill while their peers decode, and
+        # need not leave the same microbatch empty in a shared expert step.
+        steps = (
+            ((1, (2, 3, 4)),),
+            ((1, (9,)), (2, (7, 8))),
+            ((1, (11,)), (2, (12,))),
+            ((2, (13, 14, 15)), (3, (19, 20, 21))),
+            ((1, (16,)), (2, (17,)), (3, (18,))),
+        )
     lengths = {1: 0, 2: 0, 3: 0}
     result = []
     for values in steps:
@@ -138,17 +150,21 @@ def _inputs():
 
 
 @torch.inference_mode()
-def _run(rank, port, root, graphs):
-    device = torch.device("cuda", rank)
+def _run(rank, local_rank, rendezvous, root, graphs, attention_tp, replicas):
+    device = torch.device("cuda", local_rank)
+    attention_ranks = attention_tp * replicas
+    source = rank < attention_ranks
     with initialize_process_groups(
-        rank=0,
-        local_rank=rank,
-        world_size=1,
+        rank=rank % attention_tp,
+        local_rank=local_rank,
+        world_size=attention_tp,
         device=device,
-        experts=(rank, 2, Rendezvous("127.0.0.1", port)),
+        experts=(rank, 2 * attention_ranks, rendezvous),
     ) as groups:
         metadata = models.read_config(root)
         config = WorkerConfig(
+            rank=rank % attention_tp,
+            world_size=attention_tp,
             device=str(device),
             model_dtype="bfloat16",
             block_size=16,
@@ -161,8 +177,8 @@ def _run(rank, port, root, graphs):
             graph_policy="off",
         )
         expected = []
-        inputs = _inputs()
-        if rank == 0:
+        inputs = _inputs(rank // attention_tp if source else 0)
+        if source:
             reference = models.load_model(metadata, device=device).model
             with _worker(reference, config) as (runner, manager):
                 for rows in inputs:
@@ -178,14 +194,33 @@ def _run(rank, port, root, graphs):
             for path, module in description.named_modules()
             if isinstance(module, FusedMoE)
         )
+        mesh = None
+        if source:
+            mesh = groups.bind(
+                DeviceMesh(
+                    ranks=tuple(range(attention_tp)),
+                    shape=(attention_tp,),
+                    axes=("tp",),
+                    rank=rank % attention_tp,
+                ),
+                device=device,
+            )
         model = models.load_model(
             metadata,
             device=device,
-            modules=paths if rank else None,
-            exclude_modules=paths if not rank else frozenset(),
-            experts=Communicator((1,), 0, "experts", device) if rank else None,
+            modules=None if source else paths,
+            exclude_modules=paths if source else frozenset(),
+            meshes={"": mesh} if source else None,
+            experts=None
+            if source
+            else Communicator(
+                tuple(range(attention_ranks, 2 * attention_ranks)),
+                rank - attention_ranks,
+                "experts",
+                device,
+            ),
         ).model
-        if rank:
+        if not source:
             model = torch.nn.ModuleList(
                 module
                 for module in model.modules()
@@ -193,20 +228,35 @@ def _run(rank, port, root, graphs):
             )
         config = replace(
             config,
-            role="experts" if rank else "model",
+            role="model" if source else "experts",
             expert_exchange="deepep",
             expert_microbatches=2,
             graph_policy="full" if graphs else "off",
         )
-        with _worker(model, config, group=groups.experts) as (runner, manager):
-            if rank == 0:
-                for rows, wanted in zip(inputs, expected, strict=True):
-                    output = _call(runner, manager, rows).materialize()
+        with _worker(
+            model, config, group=groups.experts, attention_ranks=attention_ranks
+        ) as (runner, manager):
+            if source:
+                # Retain borrowed decode outputs before their backing is
+                # reused, without synchronizing each forward on the host.
+                observed = [
+                    _call(runner, manager, rows).materialize().clone()
+                    for rows in inputs
+                ]
+                for step, (output, wanted) in enumerate(
+                    zip(observed, expected, strict=True)
+                ):
                     for actual, reference in zip(
                         output.values, wanted, strict=True
                     ):
                         torch.testing.assert_close(
-                            actual.cpu(), reference, rtol=2e-2, atol=2e-2
+                            actual.cpu(),
+                            reference,
+                            rtol=2e-2,
+                            atol=2e-2,
+                            msg=lambda detail: (
+                                f"rank {rank}, step {step}: {detail}"
+                            ),
                         )
                         assert torch.equal(
                             actual.argmax(-1).cpu(), reference.argmax(-1)
@@ -220,10 +270,30 @@ def _run(rank, port, root, graphs):
                 runner.join_expert_step(leaving=True)
 
 
+def _local(rank, port, root, graphs, attention_tp, replicas):
+    _run(
+        rank,
+        rank,
+        Rendezvous("127.0.0.1", port),
+        root,
+        graphs,
+        attention_tp,
+        replicas,
+    )
+
+
 @pytest.mark.parametrize("graphs", [False, True], ids=["eager", "graphs"])
-def test_microbatch_worker_matches_colocated_execution(tmp_path, graphs):
-    if torch.cuda.device_count() < 2:
-        pytest.fail("disaggregated worker correctness requires two GPUs")
+@pytest.mark.parametrize(
+    ("attention_tp", "replicas"),
+    [(1, 1), (2, 1), (1, 2)],
+    ids=["tp1", "tp2", "replicas"],
+)
+def test_microbatch_worker_matches_colocated_execution(
+    tmp_path, graphs, attention_tp, replicas
+):
+    ranks = 2 * attention_tp * replicas
+    if torch.cuda.device_count() < ranks:
+        pytest.fail(f"disaggregated worker correctness requires {ranks} GPUs")
     qwen_moe_checkpoint(
         tmp_path,
         hidden_size=256,
@@ -237,4 +307,35 @@ def test_microbatch_worker_matches_colocated_execution(tmp_path, graphs):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    mp.spawn(_run, args=(port, str(tmp_path), graphs), nprocs=2, join=True)
+    mp.spawn(
+        _local,
+        args=(port, str(tmp_path), graphs, attention_tp, replicas),
+        nprocs=ranks,
+        join=True,
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--attention-tp", type=int, required=True)
+    parser.add_argument("--replicas", type=int, required=True)
+    parser.add_argument(
+        "--graph-policy", choices=("off", "full"), required=True
+    )
+    # The worker owns its union TCPStore; torchrun already owns MASTER_PORT.
+    parser.add_argument("--expert-port", type=int, required=True)
+    arguments = parser.parse_args()
+    if int(os.environ["WORLD_SIZE"]) != (
+        2 * arguments.attention_tp * arguments.replicas
+    ):
+        parser.error("the world must contain equal attention and expert ranks")
+    _run(
+        int(os.environ["RANK"]),
+        int(os.environ["LOCAL_RANK"]),
+        Rendezvous(os.environ["MASTER_ADDR"], arguments.expert_port),
+        arguments.model,
+        arguments.graph_policy == "full",
+        arguments.attention_tp,
+        arguments.replicas,
+    )
