@@ -8,6 +8,7 @@
 //! the engine.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::serving::chat::ChatTemplateContentFormatOption;
@@ -72,6 +73,10 @@ pub struct EngineSettings {
     /// Largest request duration, in seconds, resident media state is sized to
     /// serve. `InputProcessor::video_sampling` rejects longer video requests.
     pub max_video_seconds: f64,
+    /// Most denoiser rows a video request's conditions may take
+    /// (`--max-condition-rows`). Video workers provision their condition
+    /// products for it, and the video service rejects requests above it.
+    pub max_condition_rows: u32,
     /// Static Worker configurations with ordered ranks and named computation components.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
@@ -93,6 +98,7 @@ impl Default for EngineSettings {
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: 15.0,
+            max_condition_rows: EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
             // One local CUDA rank running `DEFAULT_COMPONENT`. The `uniserve`
             // CLI and the Dynamo worker binary both replace this with a
             // placement built from their own arguments.
@@ -121,6 +127,12 @@ pub struct Config {
     /// repository ID or a local model directory. Empty by default; callers
     /// must set it.
     pub model: String,
+    /// Local copy of the base checkpoint that a component export (such as
+    /// FastH3 OmniRef) pins for its other components, verified against the
+    /// pinned revision by its Hugging Face download records. Without it the
+    /// server and the workers read the pinned revision from the Hugging Face
+    /// cache. Only a component export takes a base.
+    pub base_model: Option<PathBuf>,
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
@@ -158,6 +170,56 @@ pub struct Config {
     /// `reasoning_content` from `content`. When `false`, reasoning delimiter
     /// tokens stream verbatim as content text.
     pub reasoning_parsing: bool,
+    /// Where video-request condition media may come from, and how large it
+    /// may be.
+    pub video_media: VideoMediaSettings,
+}
+
+/// Sources and limits of the condition media of video requests.
+///
+/// `data:` URIs are always accepted. Media of one request, decoded from every
+/// source, is bounded per condition type and in total; the HTTP body limit of
+/// the video routes follows the total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VideoMediaSettings {
+    /// The directory `file://` URIs resolve under; `None` refuses them.
+    pub media_directory: Option<PathBuf>,
+    /// Whether `http(s)://` media is fetched.
+    pub remote_media: bool,
+    /// Bytes of media one request may carry across all of its conditions.
+    pub max_request_bytes: u64,
+    /// The `ffprobe` executable that probes video and audio conditions.
+    pub ffprobe: PathBuf,
+}
+
+impl VideoMediaSettings {
+    /// The default request media total, 256 MiB.
+    pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
+
+    /// The HTTP body limit of the video submission routes, in bytes.
+    ///
+    /// A `data:` URI carries its media base64 encoded, four bytes per three,
+    /// so a body holding `max_request_bytes` of media plus the request's own
+    /// fields fits; it never falls below the server-wide 64 MiB limit.
+    pub fn body_limit(&self) -> usize {
+        let encoded = self.max_request_bytes.div_ceil(3) * 4 + (1 << 20);
+        usize::try_from(encoded)
+            .unwrap_or(usize::MAX)
+            .max(crate::http::BODY_LIMIT)
+    }
+}
+
+impl Default for VideoMediaSettings {
+    /// No media directory, remote media enabled, a 256 MiB request total and
+    /// `ffprobe` from `PATH`.
+    fn default() -> Self {
+        Self {
+            media_directory: None,
+            remote_media: true,
+            max_request_bytes: Self::DEFAULT_MAX_REQUEST_BYTES,
+            ffprobe: PathBuf::from("ffprobe"),
+        }
+    }
 }
 
 impl Default for Config {
@@ -167,6 +229,7 @@ impl Default for Config {
         Self {
             engine: EngineSettings::default(),
             model: String::new(),
+            base_model: None,
             served_model_name: None,
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),
@@ -183,17 +246,23 @@ impl Default for Config {
             max_concurrent_requests: None,
             shutdown_timeout: Duration::from_secs(0),
             reasoning_parsing: true,
+            video_media: VideoMediaSettings::default(),
         }
     }
 }
 
 impl Config {
     /// Validates frontend configuration that can be checked before engine
-    /// startup: the listener (`validate_listener`) and the engine settings
-    /// (`EngineSettings::validate`). Returns the first violation found.
+    /// startup: the listener (`validate_listener`), the engine settings
+    /// (`EngineSettings::validate`) and a positive video media total. Returns
+    /// the first violation found.
     pub fn validate(&self) -> Result<()> {
         self.validate_listener()?;
         self.engine.validate()?;
+        anyhow::ensure!(
+            self.video_media.max_request_bytes > 0,
+            "max_request_bytes must be greater than 0"
+        );
         Ok(())
     }
 
@@ -227,6 +296,15 @@ impl EngineSettings {
     /// transport (64 MiB). `build_state` raises the configured capacity to the
     /// model's channel payload capacity when that is larger.
     pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
+
+    /// Default condition capacity in denoiser rows: two keyframes on the
+    /// largest named canvas, 1008 rows each, so every `fl2va` request fits.
+    /// The capacity sizes each request slot's retained conditioning and the
+    /// denoiser's largest layout, so a deployment that also serves `ref2va`
+    /// states the capacity its references need (a five-second reference
+    /// video with its soundtrack takes about 38,000 rows). A checkpoint's own
+    /// sequence capacity bounds requests independently.
+    pub const DEFAULT_MAX_CONDITION_ROWS: u32 = 2048;
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`

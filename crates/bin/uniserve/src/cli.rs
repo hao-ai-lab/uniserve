@@ -24,6 +24,7 @@ use uniserve_engine::{
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, SchedulingPolicy,
+    VideoMediaSettings,
 };
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
@@ -128,6 +129,13 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
 
+    /// Local copy of the base checkpoint that a component export (such as
+    /// FastH3 OmniRef) pins for its other components. The server and the
+    /// workers verify its revision from its Hugging Face download records;
+    /// without it they read the pinned revision from the Hugging Face cache.
+    #[arg(long, value_name = "PATH")]
+    pub base_model: Option<std::path::PathBuf>,
+
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
     #[arg(long = "max-model-len")]
@@ -137,6 +145,32 @@ pub(crate) struct SharedRuntimeArgs {
     /// advertised as `max_seconds`.
     #[arg(long = "max-video-seconds", default_value_t = 15.0)]
     pub max_video_seconds: f64,
+    /// Most denoiser rows the conditions of one video request may take: a
+    /// capacity video workers provision their condition products, request
+    /// slots and largest denoiser layout for, advertised as
+    /// `max_condition_rows`. The default holds two keyframes on the largest
+    /// canvas, every `fl2va` request; a `ref2va` deployment raises it to the
+    /// rows its references take, about 38,000 for a five-second reference
+    /// video with its soundtrack.
+    #[arg(
+        long = "max-condition-rows",
+        default_value_t = uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS
+    )]
+    pub max_condition_rows: u32,
+    /// Directory that `file://` condition media of video requests resolves
+    /// under. Without it, `file://` media is refused.
+    #[arg(long = "media-directory", value_name = "DIR")]
+    pub media_directory: Option<std::path::PathBuf>,
+    /// Whether the server fetches `http(s)://` condition media of video
+    /// requests.
+    #[arg(long = "remote-media", default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub remote_media: bool,
+    /// Bytes of condition media one video request may carry in total.
+    #[arg(long = "max-request-bytes", default_value_t = VideoMediaSettings::DEFAULT_MAX_REQUEST_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_request_bytes: u64,
+    /// `ffprobe` executable that probes video and audio condition media.
+    #[arg(long, default_value = "ffprobe", value_name = "PATH")]
+    pub ffprobe: std::path::PathBuf,
     /// Optional explicit KV token capacity override for the worker.
     #[arg(long = "max-total-tokens")]
     pub kv_token_capacity: Option<u64>,
@@ -315,6 +349,7 @@ impl SharedRuntimeArgs {
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
+        worker_process.base_model = self.base_model.clone();
         let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
         worker_process.resp_slot_cap = self.resp_slot_cap;
@@ -337,6 +372,7 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
+            max_condition_rows: self.max_condition_rows,
             // Without a written configuration a deployment serves one
             // component over every rank. A model whose components are placed
             // differently -- on disjoint ranks, or with distinct partitions --
@@ -368,6 +404,7 @@ impl SharedRuntimeArgs {
         Config {
             engine,
             model,
+            base_model: self.base_model,
             served_model_name: self.served_model_name,
             listener_mode,
             chat_template: self.chat_template,
@@ -381,6 +418,12 @@ impl SharedRuntimeArgs {
             max_concurrent_requests: self.max_concurrent_requests,
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout),
             reasoning_parsing: self.reasoning_parser != "none",
+            video_media: VideoMediaSettings {
+                media_directory: self.media_directory,
+                remote_media: self.remote_media,
+                max_request_bytes: self.max_request_bytes,
+                ffprobe: self.ffprobe,
+            },
         }
     }
 }
@@ -453,6 +496,11 @@ pub(crate) struct WorkerProcessOptions {
     /// 1024 tokens, then steps of 2048 tokens.
     #[arg(long)]
     pub video_text_capacities: Option<String>,
+    /// `ffmpeg` executable the media reader decodes reference videos with.
+    /// The reference conditioning decodes with FFmpeg 8.1.2, whose LANCZOS
+    /// scaler a reference video's pixels depend on.
+    #[arg(long, default_value = "ffmpeg", value_name = "PATH")]
+    pub ffmpeg: std::path::PathBuf,
     #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]
     pub flashinfer_workspace_size: u64,
     #[arg(long, hide = true)]
@@ -491,6 +539,7 @@ impl WorkerProcessOptions {
             flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
             flow_graph_shapes: self.flow_graph_shapes.clone(),
             video_text_capacities: self.video_text_capacities.clone(),
+            ffmpeg: self.ffmpeg.clone(),
             flashinfer_workspace_size: self.flashinfer_workspace_size,
             flashinfer_use_tensor_core: self.flashinfer_use_tensor_core.clone(),
             flashinfer_decode_backend: self.flashinfer_decode_backend,
@@ -790,6 +839,23 @@ mod tests {
             worker.quantization_config["components"]["transformer.mlp"],
             "nvfp4"
         );
+    }
+
+    #[test]
+    fn serve_forwards_a_local_base_checkpoint() {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "/models/FastH3-OmniRef",
+            "--base-model",
+            "/models/MiniMax-H3",
+        ])
+        .expect("component export with a local base");
+        let Command::Serve(args) = parsed.command;
+        let config = args.to_uniserve_config();
+        let base = Some(std::path::PathBuf::from("/models/MiniMax-H3"));
+        assert_eq!(config.base_model, base);
+        assert_eq!(config.engine.worker_process.base_model, base);
     }
 
     #[test]

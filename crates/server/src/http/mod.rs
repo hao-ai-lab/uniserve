@@ -30,6 +30,9 @@ use crate::{Config, build_state};
 pub use crate::openai::ApiError;
 pub use routes::build_router;
 
+/// HTTP body limit of every route but the video submission routes, in bytes.
+pub(crate) const BODY_LIMIT: usize = 64 << 20;
+
 /// Runs the configured HTTP server until the shutdown token is cancelled.
 ///
 /// Shutdown has one budget of `config.shutdown_timeout`, measured from
