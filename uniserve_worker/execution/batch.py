@@ -329,7 +329,6 @@ class BatchState:
             )
 
         values: dict[CallIdentity, bool] = {}
-        generation = buffer.generation
         try:
             for identity, capture, row in sorted(
                 self.predicate_entries, key=lambda entry: entry[2]
@@ -340,7 +339,7 @@ class BatchState:
                         "call predicate is not a canonical boolean"
                     )
                 values[identity] = bool(captured[0])
-                buffer.observe(row, generation)
+                buffer.observe(row)
         except BaseException:
             buffer.abandon()
             raise

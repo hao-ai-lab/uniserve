@@ -65,6 +65,8 @@ __all__ = [
     "LatentImport",
     "LatentPool",
     "LatentUpdate",
+    "OutputBuffer",
+    "OutputPool",
     "Request",
     "RequestPool",
     "ReadReservation",
@@ -84,6 +86,64 @@ __all__ = [
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")
+
+@final
+class OutputBuffer:
+    """One batch's captures and readback fence; only its storage is recycled."""
+
+    event_pool: EventPool
+    devices: tuple[torch.device, ...]
+    logprob_layouts: dict[
+        tuple[int, int],
+        tuple[
+            tuple[int, ...],
+            tuple[int, ...],
+            tuple[tuple[int, ...], ...],
+            int,
+            int,
+        ],
+    ]
+
+    def register_device(self, device: torch.device | str) -> None: ...
+    def begin_device(self, device: torch.device | str) -> None: ...
+    def capture(self, tokens: torch.Tensor) -> tuple[int, int]: ...
+    def capture_bytes(self, value: torch.Tensor) -> torch.Tensor:
+        """Borrow copied bytes; wait for completion and retain CPU readers."""
+    def seal(self) -> None: ...
+    def ready(self) -> bool: ...
+    def completion(self) -> Completion: ...
+    def read_tokens(self, offset: int, count: int) -> tuple[int, ...]: ...
+    def logprob_values(
+        self, span: tuple[int, int, int]
+    ) -> tuple[float, tuple[tuple[int, float, int], ...]]: ...
+    def observe(self, row: int) -> tuple[int, int]: ...
+    def timing(self) -> tuple[int, int, int, int]: ...
+    def discard(self, row: int) -> None: ...
+    def abandon(self) -> None: ...
+    def retain_cpu_reader(self) -> Callable[[], None]:
+        """Return a release callable that the reader must call exactly once."""
+
+@final
+class OutputPool:
+    """Bounded readback storage for sampling, predicates and media."""
+
+    def __new__(
+        cls, *, capacity: int, max_words: int, event_pool: EventPool
+    ) -> Self: ...
+    @property
+    def capacity(self) -> int: ...
+    @property
+    def max_words(self) -> int: ...
+    @property
+    def event_pool(self) -> EventPool: ...
+    def acquire(
+        self,
+        rows: int,
+        *,
+        token_capacity: int,
+        devices: Sequence[torch.device | str] = (),
+    ) -> OutputBuffer: ...
+    def close(self) -> None: ...
 
 class EventPoolError(RuntimeError):
     """Invalid event lease ownership or stream ordering."""

@@ -398,12 +398,9 @@ class PendingOutput:
         # rank can read them.
         self.products: tuple[TensorPublication, ...] = ()
 
-        # `_row` and `_generation` identify this call's row in the leased
-        # `OutputBuffer`. A generation from an earlier lease of the same
-        # buffer makes `OutputBuffer.observe` raise and `discard` a no-op.
+        # Batches have distinct output leases even when storage is reused.
         self._buffer: OutputBuffer | None = buffer
         self._row = int(row)
-        self._generation = int(buffer.generation)
         self._completion_timing: tuple[int, int, int, int] | None = None
         self._observed = False
 
@@ -643,7 +640,7 @@ class PendingOutput:
         buffer = self._buffer
         if buffer is None:
             raise RuntimeError("completion lost its pinned output buffer")
-        buffer.observe(self._row, self._generation)
+        buffer.observe(self._row)
         self._completion_timing = buffer.timing()
         self._observed = True
         self._buffer = None
@@ -731,6 +728,6 @@ class PendingOutput:
         buffer, self._buffer = self._buffer, None
         if buffer is not None and not self._observed:
             self._observed = True
-            actions.append(partial(buffer.discard, self._row, self._generation))
+            actions.append(partial(buffer.discard, self._row))
 
         close_resources(*actions)

@@ -111,6 +111,18 @@ impl Completion {
 }
 
 impl Completion {
+    pub(crate) fn resolve(slf: &Bound<'_, Self>) -> PyResult<()> {
+        if !slf.borrow().done() {
+            let callbacks = slf
+                .borrow()
+                .inner
+                .complete(Ok(()))
+                .map_err(|error| native_error(slf.py(), error))?;
+            Self::notify(slf, callbacks);
+        }
+        Ok(())
+    }
+
     fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Outcome<Py<PyBaseException>>> {
         // The common poll path neither releases the GIL nor enters a condvar.
         if let Some(outcome) = self.inner.outcome() {
