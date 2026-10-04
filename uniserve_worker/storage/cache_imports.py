@@ -105,15 +105,14 @@ class CacheImport:
     """A scheduler-owned KV destination retained through physical input access.
 
     ``tables`` holds the destination's table of every cache group.
-    ``ranges`` maps each destination unit to the ``(offset, count)`` token
-    range the import writes: each group's carried span, or the whole unit
-    for ``initialized_units``, which the import resets before copying.
+    The native cache manager retains each group's destination span, or the
+    whole unit for ``initialized_units``, which is reset before copying.
     ``completion`` is the copy task's future, resolved at reservation when
     there is nothing to copy or reset. ``retirement`` resolves once the
     import is adopted or abandoned and all of its physical access has
     finished; until then the import stays registered and
     `KVCacheManager.require_writable` rejects writes overlapping its
-    ``ranges``. ``cancelled`` marks abandonment; ``released`` marks adoption
+    destination. ``cancelled`` marks abandonment; ``released`` marks adoption
     or abandonment.
 
     The underscored fields track the copy task, its leased workspace and its
@@ -125,7 +124,6 @@ class CacheImport:
     tables: tuple[GroupTable, ...]
     initialized_units: tuple[int, ...]
     publication: KvTransfer
-    ranges: dict[int, tuple[int, int]]
     completion: Future[None] = field(default_factory=Future)
     retirement: Completion = field(default_factory=Completion)
     cancelled: bool = False
@@ -214,26 +212,6 @@ class CacheImports:
         self._wake = wake
         self._tasks.set_completion_wake(wake)
 
-    def __bool__(self) -> bool:
-        # True while any import still holds a destination.
-        with self._condition:
-            return bool(self._writes)
-
-    def dependencies(
-        self, ranges: tuple[tuple[int, int, int], ...]
-    ) -> tuple[Completion, ...]:
-        """Return retirements of imports whose destinations overlap ``ranges``.
-
-        ``ranges`` holds ``(page, offset, count)`` token spans. Each returned
-        completion is a registered import's `CacheImport.retirement`.
-        """
-        with self._condition:
-            return tuple(
-                write.retirement
-                for write in self._writes.values()
-                if self.pool._ranges_overlap(write.ranges, ranges)
-            )
-
     def reserve(
         self,
         publication: KvTransfer,
@@ -245,8 +223,8 @@ class CacheImports:
     ) -> CacheImport:
         """Reserve exact destination ranges before any host or device read.
 
-        Checks with `KVCacheManager.require_reusable` that each destination
-        range is free, registers the import, and submits its copy to the
+        Reserves free destination ranges in the native cache manager,
+        registers the import task, and submits its copy to the
         import lane. An import with no tensors and no units to reset
         completes immediately without using lane capacity. The caller
         (`KVCacheManager.prepare_install`) has already validated the units
@@ -272,13 +250,6 @@ class CacheImports:
             (unit, (offset, count))
             for unit, offset, count in self.pool.unit_spans(initialized_units)
         )
-        self.pool.require_reusable(
-            tuple(
-                (unit, offset, count)
-                for unit, (offset, count) in ranges.items()
-            )
-        )
-
         reservation = (
             self._tasks.reserve()
             if publication.tensors or initialized_units
@@ -289,7 +260,6 @@ class CacheImports:
             tables,
             initialized_units,
             publication,
-            ranges,
         )
 
         buffer = publication.source
@@ -299,6 +269,14 @@ class CacheImports:
                     raise invalid_descriptor(
                         "KV import destination is closed or already reserved"
                     )
+                self.pool._accesses.reserve_import(
+                    buffer,
+                    tuple(
+                        (unit, offset, count)
+                        for unit, (offset, count) in ranges.items()
+                    ),
+                    write.retirement,
+                )
                 self._writes[buffer] = write
             if reservation is None:
                 write._work_finished = True
@@ -312,7 +290,9 @@ class CacheImports:
             if reservation is not None:
                 reservation.abandon()
             with self._condition:
-                self._writes.pop(buffer, None)
+                if self._writes.get(buffer) is write:
+                    del self._writes[buffer]
+                    self.pool._accesses.discard_import(buffer)
             raise
         return write
 
@@ -385,21 +365,6 @@ class CacheImports:
                     and write.publication.source not in retained
                 ):
                     self.abandon(write)
-
-    def retirement_ready(
-        self,
-        buffers: set[BufferId],
-        requests: set[RequestKey],
-        retained: frozenset[BufferId],
-    ) -> bool:
-        # True when no registered import belongs to the selected buffers or,
-        # outside ``retained``, to the selected requests.
-        with self._condition:
-            return not any(
-                buffer in buffers
-                or (buffer.owner in requests and buffer not in retained)
-                for buffer in self._writes
-            )
 
     def stop(self) -> None:
         """Abandon every import and stop the import lane.

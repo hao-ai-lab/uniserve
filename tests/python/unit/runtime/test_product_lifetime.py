@@ -375,16 +375,14 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         pool.cache.state(pool.cache.groups[0].layers[0]).write(
             pages, start=0, key=prefix, value=-prefix
         )
-        source = pool.reserve_publication(
-            buffer, _table(pool, pages).spans(0, 3)
-        )
+        source = pool.reserve_export(buffer, _table(pool, pages).spans(0, 3))
         for tensor in pool.cache.state(pool.cache.groups[0].layers[0]).read(
             pages, start=0, length=3
         ):
             assert tensor is not None
             location = transport.publish(tensor)
             locations.append(location)
-            pool.retain_publication(
+            pool.retain_export(
                 source, transport.publication_retirement(location)
             )
             readers.append(

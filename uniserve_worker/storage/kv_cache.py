@@ -1,29 +1,15 @@
-"""Request unit assignment, cache publications, imports, and retirement.
+"""KV backing tensors, numerical views, transfers, and block-table staging.
 
-``KVCacheManager`` wraps one ``PrefixCache`` unit pool on a worker rank and
-decides when each physical unit interval may be rewritten or reused. Unit
-allocation belongs to the engine scheduler; this manager validates the unit
-ids it assigns and owns the request block tables (``BlockTables``) that model
-calls index. A cache group's logical page occupies ``units_per_page`` units
-that each hold the page's tokens of some of the group's layers, so an
-interval of a page's tokens is retained on every unit of the page. Three
-kinds of owner retain unit intervals, each as ``unit -> (token offset, token
-count)``:
+The engine scheduler assigns physical units. Native KVCacheManager retains
+their token intervals through model execution, exports and imports, and
+decides when writers may reuse them. BlockTables owns request assignments.
+This module binds those owners to the same PrefixCache tensors that public
+numerical computation uses.
 
-- Execution accesses (``CacheAccess``): the units a model call reads or
-  writes, retained until the batch's completion signal succeeds.
-- Publications (``CacheExport``): an immutable token interval exported
-  through transports, retained until the buffer is released and every
-  physical registration has retired.
-- Imports (``CacheImports``): scheduler-assigned destination units that an
-  import stream fills from a publication.
-
-Writers ask ``write_dependencies`` which futures must resolve first, and
-``require_writable`` and ``require_reusable`` reject writes that still
-overlap a retained interval. The manager also keeps the semantic
-publication directory: the ``KvTransfer`` each buffer identity names and,
-per ``(request, destination)``, the lineage base that the next incremental
-publication or installation must extend.
+A group's logical page occupies units_per_page physical units. Each holds
+that page's tokens for a subset of layers, so an access retains its interval
+on every unit. Incremental transfers preserve group intervals and their
+installed bases while Python prepares tensor views and numerical copies.
 """
 
 from __future__ import annotations
@@ -32,14 +18,14 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from threading import RLock
 
 import torch
 
 from uniserve.math import ceil_div
 from uniserve.runtime import PrefixCache
 from uniserve_worker._uniserve_ipc import Completion
-from uniserve_worker.errors import invalid_descriptor, resource_error
+from uniserve_worker._uniserve_ipc import KVCacheManager as NativeKVCacheManager
+from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
     KvGroupTransfer,
@@ -59,44 +45,6 @@ from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.publication import publish_tensor
 
 __all__ = ["KVCacheManager"]
-
-
-@dataclass(slots=True)
-class CacheExport:
-    """An immutable token interval retained by its physical publications.
-
-    Ranges map each physical unit to its token offset and token count. A
-    publication covers every layer's K/V for these ranges, so appends outside
-    the interval remain independent even when they share its final page.
-
-    Attributes:
-        buffer: Buffer identity the publication is registered under.
-        ranges: Retained interval per physical unit.
-        retirements: One future per physical registration, attached through
-            ``KVCacheManager.retain_publication``.
-        released: Whether semantic ownership has been revoked. The entry
-            leaves the manager only when it is released and every retirement
-            has succeeded.
-    """
-
-    buffer: BufferId
-    ranges: dict[int, tuple[int, int]]
-    retirements: tuple[Completion, ...] = ()
-    released: bool = False
-
-
-@dataclass(eq=False, slots=True)
-class CacheAccess:
-    """Physical unit intervals retained by one computation's completion.
-
-    Every model access that shares one ``completion`` future joins one
-    access; ``requests`` names their request keys and ``ranges`` keeps one
-    interval per unit.
-    """
-
-    completion: Completion
-    requests: set[RequestKey]
-    ranges: dict[int, tuple[int, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,15 +159,7 @@ class KVCacheManager:
         # Transport locations of committed exports, updated by the batch
         # commit; publication intervals retained under their buffers.
         self.exports: dict[BufferId, ExportLocations] = {}
-        self._sources: dict[BufferId, CacheExport] = {}
-
-        # Execution accesses by completion signal, indexed by unit.
-        # ``_execution_completed`` runs as an observer on the thread
-        # that resolves the completion, so both maps are mutated under
-        # ``_execution_lock``.
-        self._executions: dict[Completion, CacheAccess] = {}
-        self._execution_units: dict[int, set[CacheAccess]] = {}
-        self._execution_lock = RLock()
+        self._accesses = NativeKVCacheManager()
 
         self.block_tables = BlockTables(
             groups=self.shapes,
@@ -307,10 +247,8 @@ class KVCacheManager:
 
     @property
     def has_pending_accesses(self) -> bool:
-        """Whether any publication, execution access or import is retained."""
-        return (
-            bool(self._sources) or bool(self._executions) or bool(self.imports)
-        )
+        """Whether model execution or transfer still retains cache units."""
+        return self._accesses.has_pending_accesses
 
     def retain_execution(
         self,
@@ -320,173 +258,51 @@ class KVCacheManager:
         length: int,
         completion: Completion,
     ) -> None:
-        """Retain a model access until its device work completes.
+        """Retain model accesses until their physical completion succeeds.
 
-        The access covers the table's tokens from its start page up to
-        ``length``. Model calls are ordered by the runner; this retention
-        keeps independent import streams and unit reuse
-        (``require_reusable``, ``write_dependencies``) away from these ranges
-        while a producer or consumer kernel may still run. An access that
-        reaches no held token retains nothing, and an already resolved
-        ``completion`` retains nothing and re-raises its failure or
-        cancellation.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when the table's units are
-                invalid or ``length`` exceeds its pages.
+        The runner orders model calls. This retention excludes independent
+        import streams and unit reuse while a kernel may still run.
         """
         start = table.start_page * table.shape.page_tokens
         if length <= start:
             return
         self.validate_units(table.units)
-        ranges = table.spans(start, length - start)
-
-        with self._execution_lock:
-            if completion.done():
-                completion.result()
-                return
-
-            execution = self._executions.get(completion)
-            register = execution is None
-            if execution is None:
-                execution = CacheAccess(completion, set(), {})
-                self._executions[completion] = execution
-            execution.requests.add(request)
-
-            # Each unit keeps one interval: the hull of every span retained
-            # on it by this access.
-            for unit, offset, count in ranges:
-                previous = execution.ranges.get(unit)
-                if previous is not None:
-                    end = max(previous[0] + previous[1], offset + count)
-                    offset = min(previous[0], offset)
-                    count = end - offset
-                execution.ranges[unit] = (offset, count)
-                self._execution_units.setdefault(unit, set()).add(execution)
-
-        if register:
-            completion.add_done_callback(self._execution_completed)
-
-    def _execution_completed(self, completion: Completion) -> None:
-        # A failed or cancelled completion leaves its access registered: its
-        # ranges stay blocked, ``retirement_ready`` re-raises the failure for
-        # its requests, and ``close`` refuses to proceed.
-        with self._execution_lock:
-            if not completion.succeeded():
-                return
-            execution = self._executions.pop(completion, None)
-            if execution is None:
-                return
-
-            for unit in execution.ranges:
-                uses = self._execution_units[unit]
-                uses.remove(execution)
-                if not uses:
-                    del self._execution_units[unit]
-
-    def _execution_dependencies(
-        self, ranges: Sequence[tuple[int, int, int]]
-    ) -> tuple[Completion, ...]:
-        """Return completions of accesses that overlap the given spans."""
-        with self._execution_lock:
-            return tuple(
-                {
-                    execution.completion
-                    for unit, offset, count in ranges
-                    for execution in self._execution_units.get(unit, ())
-                    if self._ranges_overlap(
-                        execution.ranges, ((unit, offset, count),)
-                    )
-                }
-            )
+        self._accesses.retain_execution(
+            request, table.spans(start, length - start), completion
+        )
 
     def unit_spans(
         self, units: Iterable[int]
     ) -> tuple[tuple[int, int, int], ...]:
-        """Span every token each unit can hold, in any group.
-
-        A whole-unit reset or import conflicts with any retained interval of
-        the unit, whichever group recorded it.
-        """
+        """Cover every token a unit can hold, regardless of its cache group."""
         return tuple((unit, 0, self._unit_tokens) for unit in units)
 
     def require_reusable(self, ranges: Sequence[tuple[int, int, int]]) -> None:
-        """Authorize unit initialization or stream import before submission.
+        """Reject reuse while any model or transfer still accesses the spans."""
+        self._accesses.require_reusable(ranges)
 
-        ``ranges`` holds ``(unit, token offset, token count)`` spans. Applies
-        ``require_writable`` and also rejects spans that an execution access
-        still retains, including one whose completion failed or was
-        cancelled. ``zero_units``, ``recycle_units`` and
-        ``CacheImports.reserve`` call this before handing units to a writer.
-
-        Raises:
-            WorkerError: A resource error when a span overlaps a publication,
-                an import destination or an execution access.
-        """
-        self._require_unretained(ranges)
-        if self._execution_dependencies(ranges):
-            raise resource_error(
-                "KV interval still has an executing producer or consumer"
-            )
-
-    def reserve_publication(
+    def reserve_export(
         self, buffer: BufferId, ranges: Sequence[tuple[int, int, int]]
-    ) -> CacheExport:
-        """Retain the exact published spans before exporting any view.
+    ) -> BufferId:
+        """Retain an immutable interval before exporting its tensor views.
 
-        The caller attaches every registration's retirement signal with
-        ``retain_publication`` and releases this reservation
-        (``release_buffers``) if publication is abandoned before semantic
-        visibility.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when the spans are empty or
-                ``buffer`` already has a retained interval.
+        The buffer identifies the reservation. Attach each transport's
+        retirement through retain_export and revoke it through
+        release_buffers even if publication fails.
         """
-        self._reap_sources()
-        if not ranges or buffer in self._sources:
-            raise invalid_descriptor(
-                "KV publication has an empty or already registered interval"
-            )
-        source = CacheExport(
-            buffer,
-            {unit: (offset, count) for unit, offset, count in ranges},
-        )
-        self._sources[source.buffer] = source
-        return source
+        self._accesses.reserve_export(buffer, ranges)
+        return buffer
 
-    def retain_publication(
-        self, source: CacheExport, retirement: Completion
-    ) -> None:
-        """Retain the published interval until this registration retires.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when the reservation has been
-                released or is no longer the one registered for its buffer.
-        """
-        if self._sources.get(source.buffer) is not source or source.released:
-            raise invalid_descriptor(
-                "KV publication reservation is no longer active"
-            )
-        source.retirements = (*source.retirements, retirement)
+    def retain_export(self, buffer: BufferId, retirement: Completion) -> None:
+        """Retain the exported interval until its transport retires."""
+        self._accesses.retain_export(buffer, retirement)
 
     def release_buffers(self, buffers: Iterable[BufferId]) -> None:
-        """Revoke semantic ownership while preserving every pending read.
-
-        Committed export registrations stop accepting new readers, imports
-        of these buffers are abandoned, and their publication intervals are
-        marked released. An interval is dropped only once all of its
-        retirements have succeeded.
-        """
+        """Revoke new readers and preserve every pending physical access."""
         selected = tuple(buffers)
         release_exports(self.exports, selected)
         self.imports.release(selected)
-
-        for buffer in selected:
-            source = self._sources.get(buffer)
-            if source is not None:
-                source.released = True
-        self._reap_sources()
+        self._accesses.release_exports(selected)
 
     def retirement_ready(
         self,
@@ -495,158 +311,40 @@ class KVCacheManager:
         requests: Iterable[RequestKey] = (),
         retained: frozenset[BufferId] = frozenset(),
     ) -> bool:
-        """Report whether the selected owners retain no cache interval.
+        """Report physical retirement or raise a selected owner's failure.
 
-        Publication intervals and imports are selected when their buffer is
-        in ``buffers``, or when a request in ``requests`` owns it and it is
-        not in ``retained``. Execution accesses are selected by request only.
-        Failures of the selected publications' retirements and execution
-        completions that have already resolved are re-raised here, so errors
-        surface only for these owners.
+        Buffer release waits for its transfers. Request retirement also
+        waits for that request's model accesses and excludes retained buffers.
         """
-        selected = set(buffers)
-        owners = set(requests)
-        sources = tuple(
-            source
-            for buffer, source in self._sources.items()
-            if buffer in selected
-            or (buffer.owner in owners and buffer not in retained)
-        )
-        for source in sources:
-            for future in source.retirements:
-                if future.done():
-                    future.result()
-        self._reap_sources()
-
-        # Free retires a publication, not the request's resident KV units.
-        # Unrelated products can share that request while later computation
-        # still reads its prefix. Only request retirement waits for all such
-        # call kinds; physical unit reuse separately checks their ranges.
-        with self._execution_lock:
-            executions = tuple(
-                execution
-                for execution in self._executions.values()
-                if execution.requests.intersection(owners)
-            )
-
-        for execution in executions:
-            if execution.completion.done():
-                execution.completion.result()
-
-        return (
-            not executions
-            and all(source.buffer not in self._sources for source in sources)
-            and self.imports.retirement_ready(selected, owners, retained)
-        )
+        return self._accesses.retirement_ready(buffers, requests, retained)
 
     def write_dependencies(
         self, ranges: Sequence[tuple[int, int, int]]
     ) -> tuple[Completion, ...]:
-        """Return the completions that must succeed before writing spans.
-
-        ``ranges`` holds ``(unit, token offset, token count)`` spans. These
-        are the completions of overlapping execution accesses and the
-        retirements of overlapping import destinations and publications.
-        """
-        if not self.has_pending_accesses:
-            return ()
-        self._reap_sources()
-        return (
-            self._execution_dependencies(ranges)
-            + self.imports.dependencies(ranges)
-            + tuple(
-                future
-                for source in self._sources.values()
-                if self._ranges_overlap(source.ranges, ranges)
-                for future in source.retirements
-            )
-        )
+        """Return physical completions of every overlapping access."""
+        return self._accesses.write_dependencies(ranges)
 
     def require_writable(
         self, table: GroupTable, *, start: int, length: int
     ) -> None:
-        """Authorize a table interval before staging a kernel that writes it.
+        """Reject writes overlapping independent imports or immutable exports.
 
-        Device-indexed attention kernels borrow raw cache views. Their caller
-        must validate the scheduler's write interval here before dispatch; no
-        device-to-host read of per-token addresses is needed in the kernel
-        path. When no publication or import is retained, this returns without
-        validating the units.
-
-        Raises:
-            WorkerError: A resource error when the interval overlaps a
-                publication or an import destination; ``invalid_descriptor``
-                when the interval exceeds the table.
+        The runner orders model accesses on its stream. Transfers use other
+        streams or processes, so their ranges must retire before a write.
         """
-        # The runner orders model accesses. Only independent imports and
-        # published immutable ranges add write conflicts at this boundary.
-        if not self._sources and not self.imports:
-            return
-        self._require_unretained(table.spans(start, length))
-
-    def _require_unretained(
-        self, ranges: Sequence[tuple[int, int, int]]
-    ) -> None:
-        """Reject spans overlapping a publication or import destination."""
-        if not self._sources and not self.imports:
-            return
-        self._reap_sources()
-        if any(
-            self._ranges_overlap(source.ranges, ranges)
-            for source in self._sources.values()
-        ):
-            raise resource_error("KV interval still has a published version")
-        if self.imports.dependencies(ranges):
-            raise resource_error("KV interval still has an import destination")
-
-    @staticmethod
-    def _ranges_overlap(
-        left: Mapping[int, tuple[int, int]],
-        right: Sequence[tuple[int, int, int]],
-    ) -> bool:
-        """Whether any ``right`` span meets ``left``'s interval on its unit.
-
-        Intervals overlap only on the same unit and only when their token
-        ranges intersect.
-        """
-        return any(
-            (other := left.get(unit)) is not None
-            and offset < other[0] + other[1]
-            and other[0] < offset + count
-            for unit, offset, count in right
-        )
-
-    def _reap_sources(self) -> None:
-        # A failed or cancelled retirement keeps its interval, so
-        # ``retirement_ready`` re-raises the failure and ``close`` refuses.
-        for buffer, source in tuple(self._sources.items()):
-            if source.released and all(
-                completion.succeeded() for completion in source.retirements
-            ):
-                del self._sources[buffer]
+        if self._accesses.has_transfers:
+            self._accesses.require_writable(table.spans(start, length))
 
     def close(self) -> None:
-        """Release every publication and close the backing cache.
+        """Drain imports and exports before releasing the backing cache.
 
-        Imports are stopped first. The backing cache is closed only when no
-        import, execution access or publication interval remains.
-
-        Raises:
-            WorkerError: A resource error when any of those still retains
-                storage; the cache stays open in that case.
+        Unknown physical completion keeps the cache open and raises a
+        resource error. The caller must retain it through worker shutdown.
         """
         self.imports.stop()
-        self.release_buffers(tuple(self._sources))
+        self.release_buffers(self._accesses.exported_buffers())
         self.imports.require_retired()
-
-        if self._executions:
-            raise resource_error(
-                "KV cache still has executing producers or consumers"
-            )
-        if self._sources:
-            raise resource_error(
-                "KV cache still has unretired physical publications"
-            )
+        self._accesses.require_retired()
 
         self.exports.clear()
         self.block_tables.close()
@@ -805,7 +503,7 @@ class KVCacheManager:
             for table, start in zip(tables, starts, strict=True)
         )
         source = (
-            self.reserve_publication(
+            self.reserve_export(
                 buffer, tuple(span for group in spans for span in group)
             )
             if visible > base_extent
@@ -861,7 +559,7 @@ class KVCacheManager:
         start: int,
         visible: int,
         *,
-        source: CacheExport,
+        source: BufferId,
         transports: Mapping[str, Transport],
         consumers: Sequence[int],
         locators: list[Locator],
@@ -923,7 +621,7 @@ class KVCacheManager:
                 exported = publish_tensor(
                     transports,
                     views,
-                    retain=partial(self.retain_publication, source),
+                    retain=partial(self.retain_export, source),
                     offset=(
                         0,
                         axis.offset + row * columns,
@@ -972,7 +670,7 @@ class KVCacheManager:
                     exported = publish_tensor(
                         transports,
                         views,
-                        retain=partial(self.retain_publication, source),
+                        retain=partial(self.retain_export, source),
                         consumers=consumers,
                         offset=(
                             0,
