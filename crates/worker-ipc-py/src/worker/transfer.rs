@@ -300,7 +300,11 @@ impl TransferTicket {
         Ok(())
     }
 
-    fn add_retirement_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+    pub(crate) fn add_retirement_callback(
+        &self,
+        py: Python<'_>,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
         let immediate = self.lock(py)?.ticket.retirement.subscribe(callback);
         if let Some(callback) = immediate {
             notify(py, vec![callback]);
@@ -479,6 +483,24 @@ impl TransferTicket {
             }
         }
         Ok(())
+    }
+}
+
+impl TransferTicket {
+    /// Block a host-copy thread until a value or error is consumable. Physical
+    /// retirement is separate and remains owned by the ticket's readers.
+    pub(crate) fn wait_ready(&self, py: Python<'_>) -> PyResult<()> {
+        if self.ready(py)? {
+            return Ok(());
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let ready = PyCFunction::new_closure(py, None, None, move |_args, _kwargs| {
+            let _ = sender.send(());
+            Ok::<_, PyErr>(())
+        })?;
+        self.add_done_callback(py, ready.into_any().unbind())?;
+        py.detach(move || receiver.recv())
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 }
 

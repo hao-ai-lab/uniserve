@@ -1036,7 +1036,7 @@ class Worker:
         """Register callbacks used to wake result polling.
 
         ``wake`` is installed on the host lane, every transport and, on a KV
-        worker, the KV imports (`CacheImports`); they call it from their own
+        worker, the KV imports (`KVImporter`); they call it from their own
         threads or callbacks as work completes.
         ``wake_on_stream`` is installed on the device event pool, which calls
         it with the handle of a CUDA stream that waits on a producer event.

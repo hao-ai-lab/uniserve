@@ -67,7 +67,7 @@ impl GroupShape {
 )]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GroupTable {
-    table: Arc<NativeGroupTable>,
+    pub(super) table: Arc<NativeGroupTable>,
 }
 
 #[pymethods]

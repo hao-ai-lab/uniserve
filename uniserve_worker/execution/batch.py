@@ -43,7 +43,7 @@ from uniserve_worker.protocol.output import (
     RequestOutput,
 )
 from uniserve_worker.protocol.transfer import KvTransfer
-from uniserve_worker.storage.cache_imports import CacheImport
+from uniserve_worker.storage.cache_imports import KVImport
 from uniserve_worker.storage.kv_cache import KVCacheManager
 from uniserve_worker.storage.latent_pool import LatentImport, LatentPool
 from uniserve_worker.storage.output import OutputBuffer
@@ -75,7 +75,7 @@ class BatchState:
     # `close_inputs` completes the reads and abandons unadopted imports.
     tensor_reads: dict[BufferId, TensorRead] = field(default_factory=dict)
     latent_imports: dict[BufferId, LatentImport] = field(default_factory=dict)
-    cache_imports: dict[BufferId, CacheImport] = field(default_factory=dict)
+    cache_imports: dict[BufferId, KVImport] = field(default_factory=dict)
     # Media inputs a host call reads in place from their producers' segments
     # at execution; they are neither imported nor staged here.
     borrowed_inputs: set[BufferId] = field(default_factory=set)

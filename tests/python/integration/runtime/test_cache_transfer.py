@@ -135,6 +135,88 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
         events.close()
 
 
+def test_shutdown_retires_running_and_queued_import_destinations() -> None:
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    shape = (256, 2, 1, 2)
+    process = context.Process(
+        target=serve_pending_publication, args=(child, shape)
+    )
+    pool = mha_pool(
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        total_layers=2,
+        total_kv_heads=1,
+        num_pages=6,
+        page_size=256,
+        device="cpu",
+        request_pool_size=5,
+        table_width=1,
+        import_capacity=5,
+    )
+    events = EventPool()
+    consumer = make_transport(
+        "shm", byte_capacity=65536, ticket_capacity=16, event_pool=events
+    )
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(30), "shared-storage publisher did not start"
+        locator = Locator.from_mapping(parent.recv())
+        field = TensorTransfer(shape=shape, locations=(locator,))
+        writes = []
+        for slot in range(1, 6):
+            publication = KvTransfer(
+                groups=(KvGroupTransfer(0, 256, (field, field)),),
+                source=replace(_buffer(slot), owner=RequestKey(1, slot, 1)),
+                destination="consumer",
+                base=None,
+                base_extent=0,
+                published_extent=256,
+                compute_dtype="float32",
+            )
+            writes.append(
+                pool.prepare_install(
+                    publication,
+                    request_pool_idx=slot,
+                    tables=_tables(pool, (slot,), 256),
+                    initialized_units=(slot,),
+                    transports={consumer.name: consumer},
+                )
+            )
+
+        # Five pending copies exceed the import lane's four execution threads.
+        # Cancelling copy tasks leaves running readers for import shutdown to
+        # drain. Queued copies never enter the numerical action at all.
+        assert all(not write.completion.done() for write in writes)
+        for write in writes:
+            write.completion.cancel()
+        pool.imports.stop()
+        consumer.close()
+        for write in writes:
+            assert write.completion.done()
+            write.retirement.result(timeout=5)
+        pool.imports.require_retired()
+        pool.zero_units(tuple(range(1, 6)))
+
+        parent.send("settled")
+        assert parent.poll(5) and parent.recv()
+        parent.send("exit")
+        process.join(30)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(30)
+        parent.close()
+        pool.imports.stop()
+        consumer.close()
+        pool.close()
+        events.close()
+
+
 def _tables(pool, units, allocated):
     """Return the one-group destination tables of an installation."""
     return (GroupTable(pool.shapes[0], 0, tuple(units), int(allocated)),)
@@ -243,7 +325,7 @@ def test_kv_publications_isolate_request_epochs() -> None:
     (
         ("local", "cpu"),
         ("shm", "cpu"),
-        pytest.param("shm", "cuda:0", marks=pytest.mark.gpu),
+        pytest.param("shm", "cuda", marks=pytest.mark.gpu),
         pytest.param("cuda_vmm", "cuda:0", marks=pytest.mark.gpu),
     ),
 )
