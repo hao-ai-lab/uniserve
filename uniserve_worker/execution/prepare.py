@@ -1594,7 +1594,7 @@ def _bind_latent_inputs(
             None,
         )
         committed_step = (
-            int(calls.require_progress(request).flow_step)
+            int(request.progress.flow_step)
             if transferred is None
             else transferred.step
         )
@@ -1673,7 +1673,7 @@ def _validate_sample_params(
             "latent params does not name the pages of its request slot"
         )
 
-    step = int(calls.require_progress(request).flow_step)
+    step = int(request.progress.flow_step)
     if call.kind is MediaCall.LATENT_PREPARATION:
         valid = int(params.start_step) == 0 and int(params.step_count) == 0
     elif call.kind is MediaCall.DENOISING:
@@ -1927,7 +1927,7 @@ def _stage_input_products(
                 )
 
             request = state.pending_output(product.request_key.request_id)
-            if int(calls.require_progress(request).flow_step) != 0:
+            if int(request.progress.flow_step) != 0:
                 raise invalid_descriptor(
                     "latent transfer destination already owns a trajectory"
                 )
@@ -1956,9 +1956,7 @@ def _stage_input_products(
                 width=value.width,
             )
             row.latent.imported = True
-            request.progress = replace(
-                calls.require_progress(request), flow_step=value.step
-            )
+            request.progress = replace(request.progress, flow_step=value.step)
             continue
 
         consumers = tuple(

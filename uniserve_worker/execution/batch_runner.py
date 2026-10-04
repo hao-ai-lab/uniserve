@@ -77,34 +77,6 @@ class BatchRunner:
         if freed:
             self.release_buffers(freed)
 
-    def materialize(self, batch: BatchState) -> bool:
-        """Read numerical outputs and accept completed request progress."""
-        for output in batch.outputs:
-            if isinstance(output, PendingOutput) and output.value is None:
-                for task in output.host.tasks:
-                    task.submit_if_ready()
-
-        outputs = tuple(batch.outputs)
-        if any(value is None for value in outputs):
-            raise RuntimeError("launched batch is missing a call output")
-        if any(
-            isinstance(value, PendingOutput) and not value.ready()
-            for value in outputs
-        ):
-            return False
-
-        pending = tuple(
-            value for value in outputs if isinstance(value, PendingOutput)
-        )
-        values = tuple(
-            value.materialize() if isinstance(value, PendingOutput) else value
-            for value in outputs
-        )
-        for output in pending:
-            self.worker.requests.apply_result(output.request_result())
-        batch.outputs[:] = values
-        return True
-
     def _execute_batch(self, state: BatchState) -> None:
         """Launch a prepared batch and release what its launch consumed.
 

@@ -154,7 +154,6 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
             primed.append((extend, report))
 
         decode_ops = []
-        commits = []
         for index, (admission, (extend, report)) in enumerate(
             zip(admissions, primed, strict=True)
         ):
@@ -169,7 +168,6 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
             )
             decode_ops.append(call)
 
-            commits.append(observation)
         result = finalized_report(
             worker,
             worker.submit(
@@ -177,7 +175,6 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                     batch_id=9,
                     admissions=(),
                     calls=tuple(decode_ops),
-                    commands=tuple(commits),
                 )
             ),
         )

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyType};
+use pyo3::types::{PyDict, PyList, PyType};
 use pythonize::depythonize;
 use uniserve_worker::{
     Backend, Batch, Executor as NativeExecutor, Service, ServiceBackend,
@@ -23,6 +23,7 @@ use super::inputs::BatchInputs;
 use super::kv_cache::KVCacheManager;
 use super::kv_import::KVImporter;
 use super::latent::LatentPool;
+use super::pending::PendingOutput;
 use super::request::RequestPool;
 use super::storage::TensorStore;
 use super::transfer::TransferCapacity;
@@ -103,6 +104,53 @@ impl PythonBackend {
                 .map(Bound::unbind)
                 .map_err(|error| error.into_value(py))
         })
+    }
+
+    fn materialize(&self, py: Python<'_>, batch: &BatchState) -> PyResult<bool> {
+        let outputs = batch
+            .numerical
+            .bind(py)
+            .getattr("outputs")?
+            .cast_into::<PyList>()?;
+        let pending = outputs
+            .iter()
+            .filter_map(|output| output.cast_into::<PendingOutput>().ok())
+            .collect::<Vec<_>>();
+        for output in &pending {
+            PendingOutput::submit_host_tasks(output)?;
+        }
+        if outputs.iter().any(|output| output.is_none()) {
+            return Err(PyRuntimeError::new_err(
+                "launched batch is missing a call output",
+            ));
+        }
+        for output in &pending {
+            if !PendingOutput::ready(output)? {
+                return Ok(false);
+            }
+        }
+
+        // Materialize every row before committing request progress. A failure
+        // cannot leave a partly replaced list of numerical result owners.
+        let values = outputs
+            .iter()
+            .map(|output| {
+                if let Ok(pending) = output.cast::<PendingOutput>() {
+                    PendingOutput::materialize(pending)
+                } else {
+                    Ok(output.unbind())
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        for output in pending {
+            output
+                .borrow()
+                .accept(py, &mut self.requests.borrow_mut(py))?;
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            outputs.set_item(index, value)?;
+        }
+        Ok(true)
     }
 
     fn advance_inputs(
@@ -271,10 +319,8 @@ impl Backend for PythonBackend {
     fn poll(&mut self, batch: &mut Self::Batch) -> Result<(bool, bool), Self::Error> {
         let before = batch.materialized;
         if !batch.materialized {
-            let ready = self.call("materialize", batch)?;
             batch.materialized = Python::attach(|py| {
-                ready
-                    .extract::<bool>(py)
+                self.materialize(py, batch)
                     .map_err(|error| error.into_value(py))
             })?;
         }

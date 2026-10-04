@@ -193,7 +193,7 @@ def prepare_latent(
         raise invalid_descriptor(
             "media preparation has no admitted image parameters"
         )
-    if calls.require_progress(request).flow_step != 0:
+    if request.progress.flow_step != 0:
         raise invalid_descriptor(
             "media preparation repeats an active latent trajectory"
         )

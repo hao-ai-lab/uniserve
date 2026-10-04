@@ -16,7 +16,7 @@ use super::protocol::{call_id, new_request, request_key};
 /// Retain numerical parameters and tensors alongside a native request epoch.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct Request {
-    request: Arc<NativeRequest>,
+    pub(super) request: Arc<NativeRequest>,
     #[pyo3(get)]
     admission: Py<PyAny>,
     #[pyo3(get, set)]
@@ -85,16 +85,7 @@ impl Request {
             .request
             .progress()
             .map_err(|error| native_error(py, error))?;
-        py.import("uniserve_worker.execution.request")?
-            .getattr("RequestProgress")?
-            .call1((
-                progress.logical_position,
-                progress.rng_counter,
-                progress.flow_step,
-                progress.kv_visible_len,
-                progress.kv_computed_len,
-                progress.prompt_logits_ready,
-            ))
+        progress_to_py(py, progress)
     }
 
     #[getter]
@@ -301,14 +292,7 @@ impl RequestPool {
         let progress = if value.is_none() {
             None
         } else {
-            Some(RequestProgress {
-                logical_position: value.getattr("logical_position")?.extract()?,
-                rng_counter: value.getattr("rng_counter")?.extract()?,
-                flow_step: value.getattr("flow_step")?.extract()?,
-                kv_visible_len: value.getattr("kv_visible_len")?.extract()?,
-                kv_computed_len: value.getattr("kv_computed_len")?.extract()?,
-                prompt_logits_ready: value.getattr("prompt_logits_ready")?.extract()?,
-            })
+            Some(progress_from_py(&value)?)
         };
         self.pool
             .apply_result(key, id, status, progress)
@@ -434,4 +418,31 @@ fn pending_calls(calls: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<(RequestKey, Call
             ))
         })
         .collect()
+}
+
+pub(super) fn progress_from_py(value: &Bound<'_, PyAny>) -> PyResult<RequestProgress> {
+    Ok(RequestProgress {
+        logical_position: value.getattr("logical_position")?.extract()?,
+        rng_counter: value.getattr("rng_counter")?.extract()?,
+        flow_step: value.getattr("flow_step")?.extract()?,
+        kv_visible_len: value.getattr("kv_visible_len")?.extract()?,
+        kv_computed_len: value.getattr("kv_computed_len")?.extract()?,
+        prompt_logits_ready: value.getattr("prompt_logits_ready")?.extract()?,
+    })
+}
+
+pub(super) fn progress_to_py(
+    py: Python<'_>,
+    progress: RequestProgress,
+) -> PyResult<Bound<'_, PyAny>> {
+    py.import("uniserve_worker.execution.request")?
+        .getattr("RequestProgress")?
+        .call1((
+            progress.logical_position,
+            progress.rng_counter,
+            progress.flow_step,
+            progress.kv_visible_len,
+            progress.kv_computed_len,
+            progress.prompt_logits_ready,
+        ))
 }
