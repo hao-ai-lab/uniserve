@@ -959,8 +959,6 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
     binding = reserve(product, allocation)
     if isinstance(store, LatentPool):
         target = binding.spans
-    elif isinstance(store, TensorStore):
-        target = binding.buffer_binding.tensor
     else:
         target = store.producer_write_views((binding,))[0]
     shard_shape = (shape[0] // 2, *shape[1:])

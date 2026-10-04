@@ -63,9 +63,9 @@ from uniserve_worker.protocol.transfer import (
 )
 from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.storage.tensor_store import (
+    Buffer,
     FeatureMetadata,
     ImageMetadata,
-    TensorRecord,
 )
 from uniserve_worker.transport.publication import publish_tensor
 
@@ -932,9 +932,7 @@ def defer_image_encoding(
         raise
 
 
-def bound_device_write(
-    reference: TensorRef, *, state: BatchState
-) -> TensorRecord:
+def bound_device_write(reference: TensorRef, *, state: BatchState) -> Buffer:
     """Return the staged device-product write matching a declared output.
 
     Raises:
@@ -954,9 +952,7 @@ def bound_device_write(
     return matches[0]
 
 
-def bound_encoder_write(
-    reference: TensorRef, *, state: BatchState
-) -> TensorRecord:
+def bound_encoder_write(reference: TensorRef, *, state: BatchState) -> Buffer:
     """Return the staged encoder-cache write matching a declared output.
 
     Raises:

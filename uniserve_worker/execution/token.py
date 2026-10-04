@@ -50,7 +50,7 @@ from uniserve_worker.sampling.result import (
     sample_columns,
 )
 from uniserve_worker.sampling.sampler import broadcast_selection
-from uniserve_worker.storage.tensor_store import FeatureMetadata, TensorRecord
+from uniserve_worker.storage.tensor_store import Buffer, FeatureMetadata
 
 if TYPE_CHECKING:
     from uniserve.distributed.mesh import Communicator
@@ -1359,7 +1359,7 @@ def publish_token_products(
     already form one adjacent view.
     """
     for transitions in (True, False):
-        writes: list[TensorRecord] = []
+        writes: list[Buffer] = []
         selected: list[SamplerRow] = []
         for call, sample in zip(calls, samples, strict=True):
             request = state.pending_output(call.request_key.request_id)

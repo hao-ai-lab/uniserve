@@ -678,6 +678,7 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
     buffers = BufferPool(byte_capacity=16, devices=("cpu",))
     store = TensorStore(
         capacity=2,
+        byte_capacity=32 if relay else 16,
         request_capacity=1 if relay else 0,
         relay_depth=2 if relay else 0,
         buffer_pool=buffers,
@@ -697,7 +698,9 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
         return store.bind_outputs(
             tuple((reference, "cpu") for reference in references),
             request_slots={first.request_key: 1} if relay else None,
-            buffer_allocations={
+            buffer_allocations=None
+            if relay
+            else {
                 reference.buffer_id: BufferAllocation(
                     reference.buffer_id, index * 4, 4
                 )
@@ -706,6 +709,8 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
         )
 
     try:
+        with pytest.raises(WorkerError):
+            reserve((first, first))
         writes = reserve((first, second))
         store.publish_write(writes[0], torch.tensor([3.0]))
         with pytest.raises(WorkerError):
@@ -718,6 +723,13 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
                 store.consume(reference, consumer_call_id=consumer)
         store.publish_write(writes[1], torch.tensor([7.0]))
         store.commit_writes(writes)
+        with pytest.raises(WorkerError):
+            store.consume_batch(
+                (
+                    (first, consumer, None),
+                    (replace(second, generation=2), consumer, None),
+                )
+            )
         for reference, expected in ((first, 3.0), (second, 7.0)):
             with pytest.raises(WorkerError):
                 store.consume(
@@ -727,7 +739,7 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
             torch.testing.assert_close(
                 read.tensor, torch.tensor([expected]), rtol=0, atol=0
             )
-            store.complete_reads((read,))
+            store.complete_reads((read, read))
 
         store.release_buffers((first.buffer_id, second.buffer_id))
         replacement = replace(first, generation=2)

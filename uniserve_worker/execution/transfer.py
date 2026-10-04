@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
-    from uniserve_worker.storage.tensor_store import TensorRecord, TensorStore
+    from uniserve_worker.storage.tensor_store import Buffer, TensorStore
     from uniserve_worker.transport.interface import Transport
 
 
@@ -516,7 +516,7 @@ def publish_product(
 
 def publish_deferred_product(
     product: TensorRef,
-    write: TensorRecord,
+    write: Buffer,
     value: torch.Tensor,
     *,
     tensor_store: TensorStore,

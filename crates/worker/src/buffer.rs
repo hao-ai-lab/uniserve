@@ -134,7 +134,7 @@ impl BufferPool {
     /// Bind a scheduler allocation to a typed view. Compact pools use the
     /// first aligned physical gap; other pools preserve the scheduler offset.
     #[pyo3(signature = (reference, allocation, *, device, dtype, shape))]
-    fn bind(
+    pub(crate) fn bind(
         &self,
         py: Python<'_>,
         reference: &Bound<'_, PyAny>,
@@ -250,7 +250,11 @@ impl BufferPool {
 
     /// Release the exact pool-issued binding after every use has retired.
     /// Stale bindings and bindings issued by another pool are rejected.
-    fn release(&self, py: Python<'_>, binding: &Bound<'_, BufferBinding>) -> PyResult<()> {
+    pub(crate) fn release(
+        &self,
+        py: Python<'_>,
+        binding: &Bound<'_, BufferBinding>,
+    ) -> PyResult<()> {
         let value = binding.get();
         let mut state = self.lock(py)?;
         let arena = state

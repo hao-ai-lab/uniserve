@@ -6,6 +6,10 @@ The worker's native `RequestPool` binds each admitted request epoch to the engin
 
 The native `BufferPool` backs scheduler-placed products with fixed device arenas. It rejects overlapping physical ranges and accepts release only for the current binding issued by that pool. Ranks that hold a subset of the logical products can use compact physical placement. Tensor views retain the arena backing; storage owners must retire device accesses and transport readers before releasing a binding for reuse.
 
+The native `TensorStore` owns values that pass between calls. A `Buffer` becomes readable after production and result commit; CUDA consumers wait on its producer fence. A `TensorRead` retains the acquired tensor view through consumer completion; logical release rejects new readers but preserves existing reads. Physical reuse waits for local readers, transfer tickets, remote readers, and producer and consumer CUDA events. Reclamation queries completion without synchronizing unrelated streams.
+
+An import shares resident coverage and fetches only missing regions into the reserved destination. Readers of an earlier shard keep that view while `TensorImport` coordinates the transfers needed by full-tensor consumers. Failed or cancelled imports retain their destinations until physical transfer completion. Request relays use bounded scalar lanes with fixed addresses; the store admits another call into a lane only after every value in that lane retires.
+
 ## Token and canvas calls
 
 Prefill, token decode and token denoising use separate homogeneous numerical calls. A prefill can write context without projecting logits or sampling. Readout canvases attend to that context without changing its KV entries; their candidate probabilities are normalized over the full vocabulary.
