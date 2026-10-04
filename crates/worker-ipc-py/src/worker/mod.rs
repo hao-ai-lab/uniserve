@@ -2,6 +2,7 @@
 
 use pyo3::prelude::*;
 
+mod block_tables;
 mod buffer;
 mod error;
 mod executor;
@@ -14,6 +15,9 @@ mod transfer;
 
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<block_tables::BlockTables>()?;
+    module.add_class::<block_tables::GroupShape>()?;
+    module.add_class::<block_tables::GroupTable>()?;
     module.add_class::<executor::Executor>()?;
     module.add_class::<executor::Submission>()?;
     module.add_class::<buffer::BufferBinding>()?;
