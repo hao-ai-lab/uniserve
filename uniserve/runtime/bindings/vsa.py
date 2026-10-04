@@ -34,7 +34,9 @@ class VsaBinding:
                 )
             from ..backends.attention import vsa
 
-            provider = vsa.resolve(self.backend, device=q.device)
+            provider = vsa.resolve(
+                self.backend, device=q.device, tile=pattern.tile
+            )
             options = {
                 "num_heads": q.shape[1],
                 "head_dim": q.shape[2],

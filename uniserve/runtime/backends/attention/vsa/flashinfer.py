@@ -9,6 +9,9 @@ from . import Backend as BaseBackend
 from . import Operator as BaseOperator
 from . import _flashinfer
 
+# Tile sizes this provider's kernels address.
+TILES = (64,)
+
 
 def available(device):
     return _flashinfer.available(device)
