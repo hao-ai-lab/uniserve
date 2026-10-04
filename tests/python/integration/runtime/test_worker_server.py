@@ -6,7 +6,7 @@ The ownership covers concrete execution and completion resources.
 from __future__ import annotations
 
 import logging
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import replace
 
 import pytest
 
@@ -20,7 +20,6 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.errors import WorkerError
-from uniserve_worker.execution.executor import Submission
 from uniserve_worker.protocol.batch import Batch, Finish, NewRequest
 from uniserve_worker.protocol.call import Call, CallStatus, ForwardMode
 from uniserve_worker.protocol.identity import CallId, RequestKey
@@ -88,10 +87,13 @@ def test_direct_admission_preserves_identity_and_bounded_delivery():
     commands = (Finish(RequestKey(1, 1, 1)),)
     with execution_worker(queue_depth=1) as worker:
         first = worker.submit(Batch(batch_id=7, commands=commands))
-        with pytest.raises(FrozenInstanceError):
+        with pytest.raises(AttributeError):
             first.batch_id = 9
-        with pytest.raises(WorkerError, match="no longer owned"):
-            worker.poll(Submission(first.batch_id))
+        with execution_worker(queue_depth=1) as other:
+            foreign = other.submit(Batch(batch_id=7, commands=commands))
+            with pytest.raises(WorkerError, match="no longer owned"):
+                worker.poll(foreign)
+            assert other.poll(foreign).batch_id == 7
         with pytest.raises(WorkerError, match="admission queue is full"):
             worker.submit(Batch(batch_id=8, commands=commands))
         assert worker.poll(first).batch_id == 7
@@ -539,6 +541,7 @@ def test_successful_manual_warmup_is_retained_by_run(monkeypatch) -> None:
 
 
 def test_startup_failure_keeps_resources_until_scope_exit(monkeypatch) -> None:
+    import gc
     import weakref
 
     import torch
@@ -551,12 +554,18 @@ def test_startup_failure_keeps_resources_until_scope_exit(monkeypatch) -> None:
         raise ValueError("startup unavailable")
 
     monkeypatch.setattr(torch.inference_mode, "__enter__", unavailable)
-    with worker:
-        with pytest.raises(ValueError):
-            worker.warmup()
-        assert model() is not None
+    gc_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with worker:
+            with pytest.raises(ValueError):
+                worker.warmup()
+            assert model() is not None
 
-    assert model() is None
+        assert model() is None
+    finally:
+        if gc_enabled:
+            gc.enable()
     assert not endpoint.closed
 
 

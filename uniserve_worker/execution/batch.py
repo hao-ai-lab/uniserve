@@ -1,4 +1,4 @@
-"""Resources and delivery state owned by one in-flight scheduler submission.
+"""Numerical resources owned by one in-flight scheduler submission.
 
 `Executor.submit` creates one `BatchState` per `Batch` and owns it until
 `Executor.poll` consumes its result, `submit` itself fails, or the worker
@@ -7,8 +7,8 @@ closes. The execution modules fill it in stage order: `prepare_batch` and
 predicate captures, and `image.reserve_images` the host preparation of
 inline input images; `reserve_outputs` binds one `PendingOutput` per call;
 `commit_batch` (or `execute_batch` on failure) records the final outputs.
-The `Executor` begins retiring the batch's commands at launch, materializes
-the outputs, and then completes that retirement. Readiness callbacks
+The native executor owns admission, launch order, failure and delivery.
+The batch runner materializes outputs and retires their resources. Its callbacks
 registered by `on_dependencies_ready` may run on a thread that completes a
 dependency rather than the worker thread.
 """
@@ -26,7 +26,7 @@ from typing import cast
 import torch
 
 from uniserve.runtime.resources import close_resources
-from uniserve_worker.errors import WorkerError, invalid_descriptor
+from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.batch import Batch, TensorPublication
@@ -53,7 +53,7 @@ from uniserve_worker.transport.ticket import TransferTicket
 
 @dataclass(slots=True)
 class BatchState:
-    """Retain inputs, physical dependencies, outputs and delivery position.
+    """Retain numerical inputs, physical dependencies, and outputs.
 
     The `Executor` submits inputs, launches computation, and materializes
     results. This object has no callback that can execute its batch or
@@ -61,8 +61,7 @@ class BatchState:
 
     Every call has the same kind and component, so execution, publication,
     and failure belong to the batch as a whole. Physical retirement remains
-    distinct from making its outputs visible: on a batch that completes
-    without error, ``materialized`` becomes true before ``complete``.
+    distinct from making its outputs visible.
     """
 
     batch: Batch
@@ -111,19 +110,11 @@ class BatchState:
     # ones still queued and drops every result.
     image_tasks: dict[CallId, HostTask] = field(default_factory=dict)
 
-    # Lifecycle flags from preparation through terminal delivery. A batch is
-    # ``prepared`` once its commands are applied and it is validated, and
-    # ``awaiting_reads`` while its preparation waits for read tickets to
-    # return. A batch is ``complete`` once its retirement finishes or
-    # `Executor` records its terminal ``error``; after ``inputs_closed``,
-    # pending readiness callbacks no longer fire.
-    prepared: bool = False
+    # Preparation waits for read tickets while ``awaiting_reads`` is set.
+    # Closing the numerical inputs suppresses their readiness callbacks.
     awaiting_reads: bool = False
     inputs_submitted: bool = False
     inputs_closed: bool = False
-    launched: bool = False
-    complete: bool = False
-    error: WorkerError | None = None
 
     # Final values addressed by original call index: None until
     # `bind_outputs`, then a `PendingOutput`, then the materialized
@@ -165,8 +156,8 @@ class BatchState:
     execution_us: int | None = None
 
     # Retirement of the batch's ``Finish`` and ``Free`` commands, recorded by
-    # `Executor._retire_commands` and advanced by
-    # `Executor._advance_retirement`. ``retirement_events`` fence the device
+    # `BatchRunner.begin_retirement` and advanced by
+    # `BatchRunner.poll`. ``retirement_events`` fence the device
     # work issued up to the batch's launch, including its request-state
     # writes, and ``retirement_cleaned`` is set once the stores have retired
     # the closed requests and freed buffers (at once for a batch without such
@@ -178,9 +169,6 @@ class BatchState:
     retirement_exports: tuple[BufferId, ...] = ()
     retirement_events: tuple[torch.cuda.Event, ...] = ()
     retirement_cleaned: bool = False
-
-    # Whether the batch's single result has been delivered.
-    result_sent: bool = False
 
     def __post_init__(self) -> None:
         self.outputs = [None] * len(self.batch.calls)
@@ -289,22 +277,6 @@ class BatchState:
         """
         calls = self.batch.calls
         return calls[0].kind.value if calls else None
-
-    @property
-    def request_ids(self) -> frozenset[int]:
-        """Ids of every request the batch's admissions, calls or commands name.
-
-        On a single rank, `Executor._can_start_batch` uses it to hold a batch
-        behind an unlaunched earlier batch that shares a request.
-        """
-        return frozenset(
-            key.request_id
-            for key in (
-                *(admission.request_key for admission in self.batch.admissions),
-                *(call.request_key for call in self.batch.calls),
-                *(command.request_key for command in self.batch.commands),
-            )
-        )
 
     def inputs_ready(self) -> bool:
         """Check readiness without submitting inputs or running the model.
@@ -586,18 +558,8 @@ class BatchState:
         self.forward_stats.clear()
         self.component_us.clear()
 
-    def ready(self) -> bool:
-        """Query whether the batch's single result can be delivered.
-
-        True once the batch is complete or has a terminal error, until
-        `take_output` or `take_error` consumes it.
-        """
-        if self.result_sent:
-            return False
-        return self.error is not None or self.complete
-
-    def take_output(self) -> BatchOutput:
-        """Consume the batch's one result.
+    def result(self) -> BatchOutput:
+        """Build the materialized batch result for native delivery.
 
         A batch is one numerical call on one component, so every call it
         carries completes together and its retirement is already applied.
@@ -605,17 +567,8 @@ class BatchState:
         reported.
 
         Raises:
-            RuntimeError: The batch has a terminal error (use `take_error`),
-                is not ready, or holds an unmaterialized output.
+            RuntimeError: An output is not yet materialized.
         """
-        if self.error is not None:
-            raise RuntimeError(
-                "terminal error must be consumed through take_error"
-            )
-        if not self.ready():
-            raise RuntimeError("batch has no ready output")
-        self.result_sent = True
-
         values: list[RequestOutput] = []
         for value in self.outputs:
             if not isinstance(value, RequestOutput):
@@ -644,14 +597,6 @@ class BatchState:
             worker_exec_us=self.execution_us,
             forward_stats=self.stats,
         )
-
-    def take_error(self) -> WorkerError:
-        """Consume the terminal error exactly once."""
-        error = self.error
-        if error is None or self.result_sent:
-            raise RuntimeError("batch has no unread terminal error")
-        self.result_sent = True
-        return error
 
     def close(
         self,

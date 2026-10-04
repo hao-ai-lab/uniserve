@@ -140,7 +140,6 @@ def execute_batch(
         )
 
     if not batch.calls:
-        state.launched = True
         return
 
     # reserve_outputs releases what it bound before re-raising (see its

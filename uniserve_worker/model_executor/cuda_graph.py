@@ -272,7 +272,7 @@ class Execution:
         # ``share`` names another owner whose pools this one borrows; see
         # ``GraphStorage.reserve``.
         self.context = context
-        self.peers = (self,)
+        self.peers: tuple[Execution, ...] = (self,)
         self.microbatches = None
         self.buckets: OrderedDict[object, GraphBucket] = OrderedDict()
         self.storage = storage if storage is not None else GraphStorage()
@@ -362,5 +362,9 @@ class Execution:
                 self.context.close,
             )
         finally:
+            # Peer groups include this execution and retain its model. Break
+            # the cycle after the rotation drains, including failed startup.
+            self.peers = ()
+            self.microbatches = None
             self.storage.release(self)
             self.pools.clear()

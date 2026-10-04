@@ -43,6 +43,7 @@ from uniserve.runtime.process_groups import (
     initialize_process_groups,
 )
 from uniserve.runtime.resources import close_resources
+from uniserve_worker._uniserve_ipc import Executor, Submission
 from uniserve_worker.bootstrap.cache import (
     group_layers,
     plan_cache,
@@ -76,7 +77,6 @@ from uniserve_worker.config.execution import (
 from uniserve_worker.errors import (
     unsupported_setup,
 )
-from uniserve_worker.execution.executor import Executor, Submission
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestPool
@@ -846,7 +846,7 @@ class Worker:
         self._require_open()
         if self._warmed_up:
             return
-        if self.executor._last_batch_id >= 0:
+        if self.executor.started:
             raise RuntimeError(
                 "warmup must precede the first serving submission"
             )
@@ -911,8 +911,7 @@ class Worker:
         # admission and, on a multi-rank worker, a non-increasing collective
         # sequence at launch, so reset both to accept the engine's first
         # batch.
-        self.executor._last_batch_id = -1
-        self.executor._last_collective_seq = -1
+        self.executor.reset()
         check_startup_storage(
             self.worker_config,
             self._layout.arena.device_product_bytes,
@@ -1107,18 +1106,22 @@ class Worker:
         With ``propagate_errors``, a failure recorded during submission is
         raised after the batch is released instead of at poll.
         """
+        self._require_open()
         return self.executor.submit(batch, propagate_errors=propagate_errors)
 
     def advance(self) -> None:
         """Progress accepted work without consuming its results."""
+        self._require_open()
         self.executor.advance()
 
     def poll(self, submission: Submission) -> BatchOutput | None:
         """Consume a result, or return None while the submission is pending."""
+        self._require_open()
         return self.executor.poll(submission)
 
     def drop_request(self, request_id: int) -> None:
         """Release a drained request and remove its admission."""
+        self._require_open()
         self.executor.drop_request(request_id)
 
 

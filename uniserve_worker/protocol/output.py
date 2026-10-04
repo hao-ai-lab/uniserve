@@ -672,7 +672,7 @@ class ForwardStats:
 class BatchOutput:
     """One batch's complete result, carrying only materialized host values.
 
-    `BatchState.take_output` in `uniserve_worker.execution.batch` builds it
+    `BatchState.result` in `uniserve_worker.execution.batch` builds it
     with only the product publications of calls that completed with status
     OK; the record itself does not check this.
     """

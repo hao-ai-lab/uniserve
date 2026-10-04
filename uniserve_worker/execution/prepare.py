@@ -1,6 +1,6 @@
 """Validate execution batches and reserve their input and output resources.
 
-The executor (`uniserve_worker.execution.executor`) drives a batch through
+The native executor and its `BatchRunner` drive a batch through
 these stages, in order:
 
 1. `validate_batch` checks batch-level bounds, routing, and call support

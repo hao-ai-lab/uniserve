@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 
 mod buffer;
 mod error;
+mod executor;
 mod latent;
 mod protocol;
 mod registry;
@@ -13,6 +14,8 @@ mod transfer;
 
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<executor::Executor>()?;
+    module.add_class::<executor::Submission>()?;
     module.add_class::<buffer::BufferBinding>()?;
     module.add_class::<buffer::BufferPool>()?;
     module.add_class::<latent::LatentPool>()?;
