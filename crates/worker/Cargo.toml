@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 indexmap.workspace = true
-pyo3.workspace = true
+thiserror.workspace = true
 uniserve-core.workspace = true
 uniserve-worker-ipc.workspace = true
 

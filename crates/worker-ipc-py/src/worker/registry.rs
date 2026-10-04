@@ -11,8 +11,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 
-use crate::error::{invalid, invariant, resource};
-use crate::transfer::retirement_succeeded;
+use super::error::{invalid, invariant, resource};
+use super::transfer::retirement_succeeded;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum BufferKey {

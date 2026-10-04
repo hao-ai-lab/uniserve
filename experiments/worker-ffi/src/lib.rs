@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use tvm_ffi::derive::{Object, ObjectRef};
 use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFIMethodInfo};
-use tvm_ffi::{Any, Bytes, Function, Object, ObjectArc, ObjectCore, Result, Tensor};
-use uniserve_worker_ipc::{codec, WorkerRequest as Request};
+use tvm_ffi::{Any, Array, Bytes, Function, Object, ObjectArc, ObjectCore, Result, Tensor};
+use uniserve_worker_ipc::{codec, BatchCommand, WorkerRequest as Request};
 
 use execution::{failure, lock};
 
@@ -133,6 +133,80 @@ impl WorkerRequest {
     }
 }
 
+#[repr(C)]
+#[derive(Object)]
+#[type_key = "uniserve.ffi.RequestPool"]
+pub struct RequestPoolObj {
+    object: Object,
+    pool: Mutex<uniserve_worker::RequestPool>,
+}
+
+#[derive(Clone, ObjectRef)]
+pub struct RequestPool {
+    data: ObjectArc<RequestPoolObj>,
+}
+
+impl RequestPool {
+    fn new(capacity: i64) -> Result<Self> {
+        let capacity = usize::try_from(capacity).map_err(|error| failure(error.to_string()))?;
+        let pool = uniserve_worker::RequestPool::new(capacity)
+            .map_err(|error| failure(error.to_string()))?;
+        Ok(Self {
+            data: ObjectArc::new(RequestPoolObj {
+                object: Object::new(),
+                pool: Mutex::new(pool),
+            }),
+        })
+    }
+
+    fn apply_commands(&self, request: &WorkerRequest) -> Result<Array<i64>> {
+        let batch = request
+            .data
+            .request
+            .batch()
+            .ok_or_else(|| failure("request does not contain a batch"))?;
+        let mut pool = lock(&self.data.pool)?;
+        let mut admitted = Vec::new();
+        for command in &batch.commands {
+            match command {
+                BatchCommand::Start { request } => {
+                    if let Some(slot) = pool
+                        .start((**request).clone())
+                        .map_err(|error| failure(error.to_string()))?
+                    {
+                        // Slots originate in the wire's u32 request index.
+                        admitted.push(slot as i64);
+                    }
+                }
+                BatchCommand::Finish { request_key, .. } => {
+                    pool.finish(*request_key)
+                        .map_err(|error| failure(error.to_string()))?;
+                }
+                BatchCommand::Free { .. } => {}
+            }
+        }
+        Ok(admitted.into_iter().collect())
+    }
+
+    fn retire(&self, request_id: i64) -> Result<()> {
+        let request_id = u64::try_from(request_id).map_err(|error| failure(error.to_string()))?;
+        lock(&self.data.pool)?
+            .retire(request_id)
+            .map_err(|error| failure(error.to_string()))
+    }
+
+    fn has_open_requests(&self) -> Result<bool> {
+        lock(&self.data.pool)?
+            .has_open_requests()
+            .map_err(|error| failure(error.to_string()))
+    }
+
+    fn close(&self) -> Result<()> {
+        lock(&self.data.pool)?.close();
+        Ok(())
+    }
+}
+
 extern "C" {
     // The upstream Rust sys crate exposes the metadata struct but not this
     // stable C entry point. Registration copies the name, docs, and function.
@@ -182,6 +256,7 @@ fn register() -> Result<()> {
     object::<ExecutorObj>();
     object::<BatchObj>();
     object::<WorkerRequestObj>();
+    object::<RequestPoolObj>();
 
     method::<ExecutorObj>(
         "__ffi_init__",
@@ -239,6 +314,33 @@ fn register() -> Result<()> {
         "batch_id",
         Function::from_typed(|request: WorkerRequest| request.batch_id()),
         "Read the batch identity from native request state.",
+    )?;
+    method::<RequestPoolObj>(
+        "__ffi_init__",
+        Function::from_typed(RequestPool::new),
+        "Create the production native request pool.",
+    )?;
+    method::<RequestPoolObj>(
+        "apply_commands",
+        Function::from_typed(|pool: RequestPool, request: WorkerRequest| {
+            pool.apply_commands(&request)
+        }),
+        "Apply the native IPC batch's request commands and return admitted slots.",
+    )?;
+    method::<RequestPoolObj>(
+        "retire",
+        Function::from_typed(|pool: RequestPool, request_id: i64| pool.retire(request_id)),
+        "Retire a closed request after its physical readers drain.",
+    )?;
+    method::<RequestPoolObj>(
+        "has_open_requests",
+        Function::from_typed(|pool: RequestPool| pool.has_open_requests()),
+        "Whether the pool holds requests that can accept calls.",
+    )?;
+    method::<RequestPoolObj>(
+        "close",
+        Function::from_typed(|pool: RequestPool| pool.close()),
+        "Release drained request state.",
     )?;
     Ok(())
 }

@@ -16,9 +16,9 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use uniserve_core::CallId;
 use uniserve_worker_ipc::{BufferId, RequestKey};
 
-use crate::buffer::{BufferBinding, BufferPool};
-use crate::error::{invalid, invariant, resource};
-use crate::transfer::retirement_succeeded;
+use super::buffer::{BufferBinding, BufferPool};
+use super::error::{invalid, invariant, resource};
+use super::transfer::retirement_succeeded;
 
 type BufferKey = (RequestKey, CallId, u16);
 type CallKey = (RequestKey, CallId);
@@ -299,7 +299,7 @@ impl StoreState {
         py: Python<'_>,
         reference: &Bound<'_, PyAny>,
     ) -> PyResult<Py<Buffer>> {
-        let id = crate::protocol::buffer_id(&reference.getattr("buffer_id")?)?;
+        let id = super::protocol::buffer_id(&reference.getattr("buffer_id")?)?;
         let buffer = self
             .buffers
             .get(&buffer_key(id))
@@ -613,7 +613,7 @@ impl TensorStore {
         metadata: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Py<TensorRead>> {
         let device = canonical_device(py, &device)?;
-        let id = crate::protocol::buffer_id(&reference.getattr("buffer_id")?)?;
+        let id = super::protocol::buffer_id(&reference.getattr("buffer_id")?)?;
         let key = buffer_key(id);
         let shape: Vec<usize> = tensor.getattr("shape")?.extract()?;
         let mut state = self.lock(py)?;
@@ -1042,7 +1042,7 @@ impl TensorStore {
                         .as_ref()
                         .map(|metadata| metadata.clone_ref(py)),
                     buffer: buffer.clone_ref(py),
-                    consumer: Some(crate::protocol::call_id(&consumer)?),
+                    consumer: Some(super::protocol::call_id(&consumer)?),
                     imported: None,
                     complete: false,
                 },
@@ -1179,8 +1179,8 @@ impl TensorStore {
         for release in releases.try_iter()? {
             let (request, call): (Bound<'_, PyAny>, Bound<'_, PyAny>) = release?.extract()?;
             let key = (
-                crate::protocol::request_key(&request)?,
-                crate::protocol::call_id(&call)?,
+                super::protocol::request_key(&request)?,
+                super::protocol::call_id(&call)?,
             );
             if let Some(buffers) = state.calls.remove(&key) {
                 for key in buffers {
@@ -1703,7 +1703,7 @@ impl TensorStore {
         let mut candidates = Vec::new();
         for (reference, raw_device) in bindings {
             let buffer = reference.getattr("buffer_id")?;
-            let id = crate::protocol::buffer_id(&buffer)?;
+            let id = super::protocol::buffer_id(&buffer)?;
             let key = buffer_key(id);
             if !seen.insert(key) {
                 return Err(invalid(
@@ -1846,7 +1846,7 @@ impl TensorStore {
         let mut buffers = Vec::new();
         let result = (|| -> PyResult<()> {
             for (reference, raw_device) in bindings {
-                let id = crate::protocol::buffer_id(&reference.getattr("buffer_id")?)?;
+                let id = super::protocol::buffer_id(&reference.getattr("buffer_id")?)?;
                 let key = buffer_key(id);
                 if !seen.insert(key) {
                     return Err(invalid(
@@ -2094,7 +2094,7 @@ fn create_buffer<'py>(
     Py::new(
         py,
         Buffer {
-            id: crate::protocol::buffer_id(&reference.getattr("buffer_id")?)?,
+            id: super::protocol::buffer_id(&reference.getattr("buffer_id")?)?,
             reference: reference.clone().unbind(),
             device: tensor.getattr("device")?.str()?.to_str()?.to_owned(),
             logical_shape,
@@ -2140,14 +2140,14 @@ fn current_stream<'py>(py: Python<'py>, device: &Bound<'py, PyAny>) -> PyResult<
 fn buffer_ids(values: &Bound<'_, PyAny>) -> PyResult<HashSet<BufferId>> {
     values
         .try_iter()?
-        .map(|value| crate::protocol::buffer_id(&value?))
+        .map(|value| super::protocol::buffer_id(&value?))
         .collect()
 }
 
 fn request_keys(values: &Bound<'_, PyAny>) -> PyResult<HashSet<RequestKey>> {
     values
         .try_iter()?
-        .map(|value| crate::protocol::request_key(&value?))
+        .map(|value| super::protocol::request_key(&value?))
         .collect()
 }
 

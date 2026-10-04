@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 
-use crate::error::{invalid, invariant, resource, unsupported};
+use super::error::{invalid, invariant, resource, unsupported};
 
 /// Failed or cancelled retirement cannot authorize physical storage reuse.
 pub(crate) fn retirement_succeeded(future: &Bound<'_, PyAny>) -> PyResult<bool> {

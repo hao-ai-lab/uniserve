@@ -1,10 +1,16 @@
 """Explicit request results preserve progress and request-epoch ownership."""
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import replace
+from threading import Event
 
 import pytest
+import torch
 
+from uniserve.media import image
+from uniserve.model import ConditionRole
 from uniserve_worker.errors import WorkerError
+from uniserve_worker.execution.diffusion_state import DiffusionState, SlotLadder
 from uniserve_worker.execution.request import (
     RequestPool,
     RequestProgress,
@@ -21,7 +27,16 @@ from uniserve_worker.protocol.call import (
     TransferMode,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
-from uniserve_worker.protocol.video import VideoAdmission, VideoTask
+from uniserve_worker.protocol.video import (
+    AudioClip,
+    ConditionVision,
+    ImageFit,
+    MediaLocator,
+    VideoAdmission,
+    VideoClip,
+    VideoCondition,
+    VideoTask,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -185,3 +200,93 @@ def test_admission_preserves_live_slot_and_reuses_only_retired_state():
         )
     finally:
         pool.close()
+
+
+def test_video_admission_retains_all_condition_tracks():
+    canvas = image.Config(32, 32)
+    source = MediaLocator("condition-media", 64)
+    audio = AudioClip(32000, 0, 32000, 32000)
+    conditions = (
+        VideoCondition(
+            ConditionRole.REFERENCE,
+            source,
+            image=ImageFit(canvas, 0, 0, canvas),
+            video=None,
+            audio=None,
+            vision=ConditionVision((1, 2, 2), 1, ()),
+            latent_units=(4,),
+            audio_rows=0,
+        ),
+        VideoCondition(
+            ConditionRole.REFERENCE,
+            source,
+            image=None,
+            video=VideoClip(canvas, 0, 2, 1),
+            audio=audio,
+            vision=ConditionVision((1, 2, 2), 1, (0,)),
+            latent_units=(4,),
+            audio_rows=1,
+        ),
+        VideoCondition(
+            ConditionRole.REFERENCE,
+            source,
+            image=None,
+            video=None,
+            audio=audio,
+            vision=None,
+            latent_units=(),
+            audio_rows=1,
+        ),
+    )
+    video = VideoAdmission(VideoTask.REF2VA, (1,), conditions)
+    admission = NewRequest(
+        RequestKey(1, 7, 1),
+        1,
+        diffusion=DiffusionParams(1, 1, 3, 0, 16, 16),
+        prompt_token_ids=(1,),
+        video=video,
+    )
+    pool = RequestPool(1)
+    try:
+        assert pool.start(admission) == 1
+        decoded = NewRequest.from_mapping(admission.to_mapping())
+        assert pool.start(decoded) is None
+        assert pool.get(7).admission.video == video
+        # An admission retry must not silently replace the soundtrack that
+        # this epoch's numerical consumers already retained.
+        changed = replace(conditions[1], audio=replace(audio, start_sample=1))
+        replacement = replace(
+            video, conditions=(conditions[0], changed, conditions[2])
+        )
+        with pytest.raises(WorkerError, match="conflicts"):
+            pool.start(replace(admission, video=replacement))
+    finally:
+        pool.close()
+
+
+def test_diffusion_close_drains_a_failed_host_write():
+    release = Event()
+    destination = torch.zeros(1)
+
+    def stage():
+        if not release.wait(5):
+            raise TimeoutError("host staging was not released")
+        destination.fill_(7)
+        raise RuntimeError("host staging failed after writing")
+
+    with ThreadPoolExecutor(max_workers=2) as tasks:
+        staging = tasks.submit(stage)
+        state = DiffusionState(
+            size=(), schedules={}, slot=SlotLadder(staging=staging)
+        )
+        closing = tasks.submit(state.close)
+        try:
+            with pytest.raises(TimeoutError):
+                closing.result(timeout=0.05)
+        finally:
+            release.set()
+
+        closing.result(timeout=5)
+        assert destination.item() == 7
+        with pytest.raises(RuntimeError, match="host staging failed"):
+            staging.result()

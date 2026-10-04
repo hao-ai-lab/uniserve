@@ -17,6 +17,10 @@ class WorkerRequest(tvm_ffi.Object):
     """The existing Rust worker request, decoded without Python records."""
 
 
+class RequestPool(tvm_ffi.Object):
+    """The production request lifecycle, shared with the numerical worker."""
+
+
 def load_library(filename: str) -> None:
     """Load the explicitly selected library and bind its reflected methods."""
     global _module
@@ -25,3 +29,4 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.Executor")(Executor)
     tvm_ffi.register_object("uniserve.ffi.Batch")(Batch)
     tvm_ffi.register_object("uniserve.ffi.WorkerRequest")(WorkerRequest)
+    tvm_ffi.register_object("uniserve.ffi.RequestPool")(RequestPool)
