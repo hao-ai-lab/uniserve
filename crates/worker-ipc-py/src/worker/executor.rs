@@ -471,11 +471,11 @@ impl Executor {
             .getattr("BatchState")?
             .unbind();
         let cache = worker.getattr("kv_cache")?;
-        let (cache_accesses, cache_imports) = if cache.is_none() {
+        let (cache_manager, cache_imports) = if cache.is_none() {
             (None, None)
         } else {
             (
-                Some(cache.getattr("_accesses")?.extract()?),
+                Some(cache.getattr("_manager")?.extract()?),
                 Some(cache.getattr("imports")?.extract()?),
             )
         };
@@ -510,7 +510,7 @@ impl Executor {
             requests: worker.getattr("requests")?.extract()?,
             tensors: worker.getattr("tensor_store")?.extract()?,
             latents: worker.getattr("latent_pool")?.extract()?,
-            cache: cache_accesses,
+            cache: cache_manager,
             cache_imports,
             events: worker.getattr("device_events")?.extract()?,
             exports,

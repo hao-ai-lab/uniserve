@@ -1,4 +1,4 @@
-//! Python access to native KV storage lifetime management.
+//! Numerical views of native KV transfer state and storage lifetimes.
 
 use std::collections::HashSet;
 
@@ -6,11 +6,12 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use uniserve_worker::KVCacheManager as NativeKVCacheManager;
-use uniserve_worker_ipc::{BufferId, RequestKey};
+use uniserve_worker_ipc::{BufferId, KvTransfer, RequestKey};
 
 use super::completion::{Completion, CompletionRef};
-use super::error::native_error;
-use super::protocol::{buffer_id, request_key};
+use super::error::{invalid, native_error};
+use super::protocol::{buffer_id, call_id, request_key};
+use crate::convert;
 
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct KVCacheManager {
@@ -24,6 +25,82 @@ impl KVCacheManager {
         Self {
             inner: NativeKVCacheManager::default(),
         }
+    }
+
+    fn resident(&self, py: Python<'_>, buffer: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
+        self.inner
+            .resident(buffer_id(buffer)?)
+            .map(|transfer| convert::kv_transfer_to_py(py, transfer).map(Bound::unbind))
+            .transpose()
+    }
+
+    fn destination_base(
+        &self,
+        py: Python<'_>,
+        request: &Bound<'_, PyAny>,
+        destination: &str,
+    ) -> PyResult<Option<(Py<PyAny>, u32)>> {
+        self.inner
+            .destination_base(request_key(request)?, destination)
+            .map(|(buffer, extent)| Ok((convert::buffer_id_to_py(py, &buffer)?.unbind(), extent)))
+            .transpose()
+    }
+
+    fn validate_install(&self, py: Python<'_>, transfer: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.inner
+            .validate_install(&transfer_from_py(transfer)?)
+            .map_err(|error| native_error(py, error))
+    }
+
+    fn validate_publications(
+        &self,
+        py: Python<'_>,
+        publications: &Bound<'_, PyAny>,
+        installations: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        self.inner
+            .validate_publications(
+                &publications_from_py(publications)?,
+                &installations_from_py(installations)?,
+            )
+            .map_err(|error| native_error(py, error))
+    }
+
+    fn apply_publications(
+        &mut self,
+        publications: &Bound<'_, PyAny>,
+        installations: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        self.inner.apply_publications(
+            publications_from_py(publications)?,
+            installations_from_py(installations)?,
+        );
+        Ok(())
+    }
+
+    fn release_calls(&mut self, py: Python<'_>, calls: &Bound<'_, PyAny>) -> PyResult<Py<PyTuple>> {
+        let calls = calls
+            .try_iter()?
+            .map(|call| {
+                let (request, call): (Bound<'_, PyAny>, Bound<'_, PyAny>) = call?.extract()?;
+                Ok((request_key(&request)?, call_id(&call)?))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let buffers = self
+            .inner
+            .release_calls(&calls)
+            .iter()
+            .map(|buffer| convert::buffer_id_to_py(py, buffer))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(PyTuple::new(py, buffers)?.unbind())
+    }
+
+    fn drop_request(&mut self, request_id: u64) {
+        self.inner.drop_request(request_id);
+    }
+
+    fn clear_resident(&mut self) {
+        self.inner.clear_resident();
     }
 
     #[getter]
@@ -175,6 +252,41 @@ impl KVCacheManager {
     fn __clear__(&mut self) {
         self.inner = NativeKVCacheManager::default();
     }
+}
+
+fn transfer_from_py(value: &Bound<'_, PyAny>) -> PyResult<KvTransfer> {
+    convert::kv_transfer_from_py(&value.call_method0("to_mapping")?)
+        .ok_or_else(|| invalid(value.py(), "invalid KV transfer"))
+}
+
+fn publications_from_py(values: &Bound<'_, PyAny>) -> PyResult<Vec<(BufferId, KvTransfer)>> {
+    values
+        .try_iter()?
+        .map(|value| {
+            let (buffer, transfer): (Bound<'_, PyAny>, Bound<'_, PyAny>) = value?.extract()?;
+            Ok((buffer_id(&buffer)?, transfer_from_py(&transfer)?))
+        })
+        .collect()
+}
+
+fn installations_from_py(
+    values: &Bound<'_, PyAny>,
+) -> PyResult<Vec<(BufferId, BufferId, KvTransfer)>> {
+    values
+        .try_iter()?
+        .map(|value| {
+            let (source, installed, transfer): (
+                Bound<'_, PyAny>,
+                Bound<'_, PyAny>,
+                Bound<'_, PyAny>,
+            ) = value?.extract()?;
+            Ok((
+                buffer_id(&source)?,
+                buffer_id(&installed)?,
+                transfer_from_py(&transfer)?,
+            ))
+        })
+        .collect()
 }
 
 fn buffer_set(buffers: &Bound<'_, PyAny>) -> PyResult<HashSet<BufferId>> {

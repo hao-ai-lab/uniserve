@@ -1,13 +1,16 @@
-//! Physical KV intervals retained by model execution and asynchronous transfer.
+//! Resident KV transfers, incremental transfer bases, and physical accesses.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, Range};
+use std::sync::Arc;
 
-use uniserve_worker_ipc::{BufferId, RequestKey};
+use uniserve_core::CallId;
+use uniserve_worker_ipc::{BufferId, KvTransfer, RequestKey};
 
 use crate::{Completion, Error, Result};
 
 type Ranges = HashMap<u32, Range<u64>>;
+type Destinations = HashMap<(RequestKey, String), (BufferId, u32)>;
 
 struct Execution<C> {
     completion: C,
@@ -26,7 +29,7 @@ struct Import<C> {
     retirement: C,
 }
 
-/// Track physical use of scheduler-assigned KV units.
+/// Own resident KV transfers and physical use of scheduler-assigned units.
 ///
 /// A model stream orders its own accesses. Independent imports and immutable
 /// exports prevent overlapping writes; recycling a unit also waits for model
@@ -38,6 +41,9 @@ pub struct KVCacheManager<C> {
     units: HashMap<u32, HashSet<usize>>,
     exports: HashMap<BufferId, Export<C>>,
     imports: HashMap<BufferId, Import<C>>,
+    resident: HashMap<BufferId, Arc<KvTransfer>>,
+    destination_bases: Destinations,
+    installed_bases: Destinations,
 }
 
 impl<C> Default for KVCacheManager<C> {
@@ -47,8 +53,167 @@ impl<C> Default for KVCacheManager<C> {
             units: HashMap::new(),
             exports: HashMap::new(),
             imports: HashMap::new(),
+            resident: HashMap::new(),
+            destination_bases: HashMap::new(),
+            installed_bases: HashMap::new(),
         }
     }
+}
+
+impl<C> KVCacheManager<C> {
+    pub fn resident(&self, buffer: BufferId) -> Option<&KvTransfer> {
+        self.resident.get(&buffer).map(AsRef::as_ref)
+    }
+
+    /// The latest extent sent to this destination, retained even after its
+    /// descriptor is released. The receiver already owns that prefix.
+    pub fn destination_base(
+        &self,
+        request: RequestKey,
+        destination: &str,
+    ) -> Option<(BufferId, u32)> {
+        self.destination_bases
+            .get(&(request, destination.to_owned()))
+            .copied()
+    }
+
+    /// Check the destination's accepted prefix before copying an incremental
+    /// transfer into its assigned physical pages.
+    pub fn validate_install(&self, transfer: &KvTransfer) -> Result<()> {
+        let installed = self
+            .installed_bases
+            .get(&(transfer.source.owner, transfer.destination.clone()))
+            .copied();
+        validate_base(transfer, installed)
+    }
+
+    /// Check all touched versions before any resource owner commits. Updates
+    /// to one destination must form a chain in batch order; rejection leaves
+    /// both resident descriptors and accepted bases unchanged.
+    pub fn validate_publications(
+        &self,
+        publications: &[(BufferId, KvTransfer)],
+        installations: &[(BufferId, BufferId, KvTransfer)],
+    ) -> Result<()> {
+        let mut resident = HashMap::new();
+        let mut destination_bases = Destinations::new();
+        let mut installed_bases = Destinations::new();
+
+        for (buffer, transfer) in publications {
+            if *buffer != transfer.source {
+                return Err(Error::Invalid(
+                    "KV publication buffer differs from its source".into(),
+                ));
+            }
+            let existing = resident
+                .get(buffer)
+                .copied()
+                .or_else(|| self.resident(*buffer));
+            if existing.is_some_and(|existing| existing != transfer) {
+                return Err(Error::Invalid(
+                    "KV publication conflicts with its resident buffer".into(),
+                ));
+            }
+
+            stage_base(transfer, &self.destination_bases, &mut destination_bases)?;
+            resident.insert(*buffer, transfer);
+        }
+
+        for (source, installed, transfer) in installations {
+            if *source != transfer.source || installed.owner != source.owner {
+                return Err(Error::Invalid(
+                    "installed KV buffer does not belong to its source".into(),
+                ));
+            }
+
+            stage_base(transfer, &self.installed_bases, &mut installed_bases)?;
+        }
+        Ok(())
+    }
+
+    /// Commit an already checked batch. The executor must leave this
+    /// directory unchanged between validation and the shared resource commit.
+    pub fn apply_publications(
+        &mut self,
+        publications: Vec<(BufferId, KvTransfer)>,
+        installations: Vec<(BufferId, BufferId, KvTransfer)>,
+    ) {
+        for (buffer, transfer) in publications {
+            self.destination_bases.insert(
+                (buffer.owner, transfer.destination.clone()),
+                (transfer.source, transfer.published_extent),
+            );
+            self.resident.insert(buffer, Arc::new(transfer));
+        }
+
+        for (source, installed, transfer) in installations {
+            self.installed_bases.insert(
+                (installed.owner, transfer.destination.clone()),
+                (transfer.source, transfer.published_extent),
+            );
+            let transfer = Arc::new(transfer);
+            self.resident.insert(source, Arc::clone(&transfer));
+            self.resident.insert(installed, transfer);
+        }
+    }
+
+    /// Remove consumed descriptors and return their buffers for revocation.
+    /// Physical exports and transfer bases have independent lifetimes.
+    pub fn release_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Vec<BufferId> {
+        let calls: HashSet<_> = calls.iter().copied().collect();
+        let mut released = Vec::new();
+        self.resident.retain(|buffer, _| {
+            if calls.contains(&(buffer.owner, buffer.producer_call_id)) {
+                released.push(*buffer);
+                false
+            } else {
+                true
+            }
+        });
+        released
+    }
+
+    /// Forget a retired request after its physical accesses have drained.
+    pub fn drop_request(&mut self, request_id: u64) {
+        self.resident
+            .retain(|buffer, _| buffer.owner.request_id.0 != request_id);
+        self.destination_bases
+            .retain(|(request, _), _| request.request_id.0 != request_id);
+        self.installed_bases
+            .retain(|(request, _), _| request.request_id.0 != request_id);
+    }
+
+    /// Forget transfer descriptions and bases when the cache owner closes.
+    /// Physical access retirement is independent and must already be drained.
+    pub fn clear_resident(&mut self) {
+        self.resident.clear();
+        self.destination_bases.clear();
+        self.installed_bases.clear();
+    }
+}
+
+fn validate_base(transfer: &KvTransfer, current: Option<(BufferId, u32)>) -> Result<()> {
+    let current = current.map_or((None, 0), |(buffer, extent)| (Some(buffer), extent));
+    if current != (transfer.base, transfer.base_extent) {
+        return Err(Error::Invalid(
+            "KV transfer base does not match destination".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn stage_base(
+    transfer: &KvTransfer,
+    resident: &Destinations,
+    staged: &mut Destinations,
+) -> Result<()> {
+    let key = (transfer.source.owner, transfer.destination.clone());
+    validate_base(
+        transfer,
+        staged.get(&key).or_else(|| resident.get(&key)).copied(),
+    )?;
+    staged.insert(key, (transfer.source, transfer.published_extent));
+    Ok(())
 }
 
 impl<E, N, C: Deref<Target = Completion<E, N>>> KVCacheManager<C> {
@@ -375,6 +540,119 @@ mod tests {
             output_index: 0,
             generation: 1,
         }
+    }
+
+    fn empty_transfer(source: BufferId, base: Option<BufferId>) -> KvTransfer {
+        KvTransfer {
+            groups: Vec::new(),
+            source,
+            destination: "decoder".into(),
+            base,
+            base_extent: 0,
+            published_extent: 0,
+            compute_dtype: "bfloat16".into(),
+        }
+    }
+
+    #[test]
+    fn rejected_transfer_chains_leave_the_accepted_base_and_resident_values_unchanged() -> Result<()>
+    {
+        let mut cache = KVCacheManager::<()>::default();
+        let first = empty_transfer(buffer(1), None);
+        let second = empty_transfer(
+            BufferId {
+                producer_call_id: CallId::new(2, 0),
+                ..first.source
+            },
+            Some(first.source),
+        );
+        let mut third = empty_transfer(
+            BufferId {
+                producer_call_id: CallId::new(3, 0),
+                ..first.source
+            },
+            Some(first.source),
+        );
+        cache.validate_publications(&[(first.source, first.clone())], &[])?;
+        cache.apply_publications(vec![(first.source, first.clone())], vec![]);
+
+        // Even an empty suffix advances the accepted transfer base. The
+        // third update cannot skip the second update in the same batch.
+        assert!(
+            cache
+                .validate_publications(
+                    &[
+                        (second.source, second.clone()),
+                        (third.source, third.clone())
+                    ],
+                    &[],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            cache.destination_base(first.source.owner, "decoder"),
+            Some((first.source, 0))
+        );
+        assert_eq!(cache.resident(first.source), Some(&first));
+        assert_eq!(cache.resident(second.source), None);
+
+        third.base = Some(second.source);
+        let batch = vec![
+            (second.source, second.clone()),
+            (third.source, third.clone()),
+        ];
+        cache.validate_publications(&batch, &[])?;
+        cache.apply_publications(batch, vec![]);
+        cache.release_calls(&[
+            (first.source.owner, first.source.producer_call_id),
+            (second.source.owner, second.source.producer_call_id),
+        ]);
+        assert_eq!(cache.resident(first.source), None);
+        assert_eq!(cache.resident(second.source), None);
+        assert_eq!(cache.resident(third.source), Some(&third));
+        assert_eq!(
+            cache.destination_base(first.source.owner, "decoder"),
+            Some((third.source, 0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installed_aliases_and_transfer_bases_retire_with_their_request() -> Result<()> {
+        let mut cache = KVCacheManager::<()>::default();
+        let first = empty_transfer(buffer(1), None);
+        let local = BufferId {
+            producer_call_id: CallId::new(5, 0),
+            ..first.source
+        };
+        let other = empty_transfer(buffer(2), None);
+        let installs = vec![
+            (first.source, local, first.clone()),
+            (other.source, other.source, other.clone()),
+        ];
+        cache.validate_install(&first)?;
+        cache.validate_publications(&[], &installs)?;
+        cache.apply_publications(vec![], installs);
+        cache.release_calls(&[(first.source.owner, first.source.producer_call_id)]);
+        assert_eq!(cache.resident(first.source), None);
+        assert_eq!(cache.resident(local), Some(&first));
+
+        let next = empty_transfer(
+            BufferId {
+                producer_call_id: CallId::new(2, 0),
+                ..first.source
+            },
+            Some(first.source),
+        );
+        cache.validate_install(&next)?;
+        assert!(cache.validate_install(&first).is_err());
+        cache.drop_request(first.source.owner.request_id.0);
+        cache.validate_install(&first)?;
+        assert!(cache.validate_install(&next).is_err());
+        assert_eq!(cache.resident(local), None);
+        assert_eq!(cache.resident(other.source), Some(&other));
+        assert!(cache.validate_install(&other).is_err());
+        Ok(())
     }
 
     #[test]
