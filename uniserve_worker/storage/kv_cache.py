@@ -39,7 +39,7 @@ from uniserve_worker.storage.block_tables import (
     GroupShape,
     GroupTable,
 )
-from uniserve_worker.storage.cache_imports import CacheImport, CacheImports
+from uniserve_worker.storage.cache_imports import KVImport, KVImporter
 from uniserve_worker.transport.exports import ExportLocations, release_exports
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.publication import publish_tensor
@@ -85,7 +85,7 @@ class KVCacheManager:
             group_layers: Global cache-layer ids of every layer of each group
                 across all pipeline stages, in ascending order; defaults to
                 this rank's layers, the complete group without pipelining.
-            import_capacity: Maximum copy tasks ``CacheImports`` admits at
+            import_capacity: Maximum copy tasks ``KVImporter`` admits at
                 once.
             request_pool_size: Request slots of the block tables.
             table_width: Most pages one slot's group table may hold; defaults
@@ -184,7 +184,7 @@ class KVCacheManager:
             tuple[RequestKey, str], tuple[BufferId, int]
         ] = {}
 
-        self.imports = CacheImports(self, capacity=import_capacity)
+        self.imports = KVImporter(self, capacity=import_capacity)
 
     @property
     def row_units(self) -> int:
@@ -812,13 +812,13 @@ class KVCacheManager:
         tables: Sequence[GroupTable],
         initialized_units: tuple[int, ...],
         transports: Mapping[str, Transport],
-    ) -> CacheImport:
+    ) -> KVImport:
         """Reserve scheduler units and start their bounded physical import.
 
         ``tables`` is the destination's table of every group and
         ``initialized_units`` the new units the import resets before copying.
         Units that hold the installed base must stay in place and must not
-        be reset. The copy runs in ``CacheImports``; ``install`` adopts it
+        be reset. The copy runs in ``KVImporter``; ``install`` adopts it
         once complete.
 
         Raises:
@@ -893,7 +893,7 @@ class KVCacheManager:
         self,
         *,
         installed_buffer: BufferId,
-        write: CacheImport,
+        write: KVImport,
     ) -> KvTransfer:
         """Adopt a completed physical import under its source and base.
 

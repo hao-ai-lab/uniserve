@@ -191,7 +191,7 @@ impl HostLane {
         self.lane.reserved()
     }
 
-    fn set_completion_wake(&self, wake: Option<Py<PyAny>>) {
+    pub(crate) fn set_completion_wake(&self, wake: Option<Py<PyAny>>) {
         self.lane.set_wake(wake);
     }
 
@@ -312,7 +312,7 @@ impl HostTask {
             .map_err(|error| PyErr::from_value(error.bind(py).clone().into_any()))
     }
 
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.task.completion.done()
     }
 
@@ -321,7 +321,7 @@ impl HostTask {
     }
 
     #[pyo3(signature = (timeout=None))]
-    fn result(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
+    pub(crate) fn result(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
         match self.outcome(py, timeout)? {
             Outcome::Success(value) => Ok(value.clone_ref(py)),
             Outcome::Failed(error) => Err(PyErr::from_value(error.bind(py).clone().into_any())),

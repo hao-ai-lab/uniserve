@@ -14,7 +14,7 @@ use super::protocol::{buffer_id, request_key};
 
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct KVCacheManager {
-    inner: NativeKVCacheManager<CompletionRef>,
+    pub(super) inner: NativeKVCacheManager<CompletionRef>,
 }
 
 #[pymethods]

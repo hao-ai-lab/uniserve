@@ -18,6 +18,7 @@ from typing import Any, Generic, ParamSpec, Self, TypeVar, final
 
 import torch
 
+import uniserve_worker.storage.kv_cache as kv_cache
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
@@ -34,6 +35,7 @@ from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.output import BatchOutput
 from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import (
+    KvTransfer,
     Locator,
     TensorTransfer,
     WorkerEndpoint,
@@ -61,6 +63,8 @@ __all__ = [
     "HostLane",
     "HostTask",
     "KVCacheManager",
+    "KVImport",
+    "KVImporter",
     "LatentExport",
     "LatentImport",
     "LatentPool",
@@ -257,6 +261,63 @@ class HostTask(Generic[Source]):
         """Cancel only unsubmitted work; submitted readers keep their inputs."""
     def cancel(self) -> bool:
         """Withdraw unsubmitted or queued work; running actions finish."""
+
+@final
+class KVImport:
+    """KV destination retained until release and physical drain."""
+
+    @property
+    def request_pool_idx(self) -> int: ...
+    @property
+    def tables(self) -> tuple[GroupTable, ...]: ...
+    @property
+    def initialized_units(self) -> tuple[int, ...]: ...
+    @property
+    def publication(self) -> KvTransfer: ...
+    @property
+    def completion(self) -> HostTask[None] | Completion: ...
+    @property
+    def retirement(self) -> Completion: ...
+    @property
+    def cancelled(self) -> bool: ...
+    @property
+    def released(self) -> bool: ...
+
+@final
+class KVImporter:
+    """Bounded KV copies sharing conversion storage and native stream waits."""
+
+    def __new__(
+        cls, pool: kv_cache.KVCacheManager, *, capacity: int
+    ) -> Self: ...
+    def set_completion_wake(self, wake: Callable[[], None] | None) -> None: ...
+    def reserve(
+        self,
+        publication: KvTransfer,
+        *,
+        request_pool_idx: int,
+        tables: tuple[GroupTable, ...],
+        initialized_units: tuple[int, ...],
+        transports: Mapping[str, Transport],
+    ) -> KVImport: ...
+    def owns(self, write: KVImport) -> bool: ...
+    def adopt(self, write: KVImport) -> None: ...
+    def abandon(self, write: KVImport) -> None: ...
+    def release(self, buffers: Sequence[BufferId]) -> None: ...
+    def cancel_requests(
+        self,
+        requests: frozenset[RequestKey],
+        *,
+        retained: frozenset[BufferId] = frozenset(),
+    ) -> None: ...
+    def stop(self) -> None: ...
+    def require_retired(self) -> None: ...
+    def _require_active(self, write: KVImport) -> None: ...
+    def _retain(self, write: KVImport, ticket: TransferTicket) -> None: ...
+    def _consume(
+        self, write: KVImport, tickets: Sequence[TransferTicket]
+    ) -> None: ...
+    def _drain(self, write: KVImport) -> None: ...
 
 @final
 class KVCacheManager:

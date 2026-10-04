@@ -606,7 +606,7 @@ def _token_worker_layout(
         # Block tables, decode state and the KV import workspaces are charged
         # to the primary device and shared by every lane. The workspaces are
         # sized by the same unresolved-call window the worker gives
-        # ``CacheImports``, for the largest page of any group.
+        # ``KVImporter``, for the largest page of any group.
         schemas = (
             BlockTables.buffers(
                 groups=tuple(

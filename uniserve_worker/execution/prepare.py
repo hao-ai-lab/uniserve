@@ -1759,7 +1759,7 @@ def _bind_cache_tables(
             )
 
         # A KV import resets the new units it covers before copying into
-        # them (`CacheImport.initialized_units`); every other new unit is
+        # them (`KVImport.initialized_units`); every other new unit is
         # recycled for its new owner below.
         initialized = {
             unit
