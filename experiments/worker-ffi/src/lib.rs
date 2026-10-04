@@ -147,7 +147,7 @@ impl Submission {
     }
 
     fn wait(&self) -> Result<()> {
-        lock(&self.data.batch)?.wait()
+        execution::Batch::wait(&self.data.batch)
     }
 
     fn cancel(&self) -> Result<()> {

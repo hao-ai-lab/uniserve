@@ -111,15 +111,25 @@ def test_ready_result_does_not_wait_for_another_batch():
             executor.poll(warmup)
             pending = executor.submit(2, values)
 
-        ready = executor.submit(3, torch.tensor([2.0]))
-        torch.testing.assert_close(
-            torch.from_dlpack(executor.poll(ready)),
-            torch.tensor([9.0]),
-            rtol=0,
-            atol=0,
-        )
-        assert executor.poll(pending) is None
-        pending.wait()
+        entered = Event()
+
+        def wait_for_pending():
+            entered.set()
+            pending.wait()
+
+        with ThreadPoolExecutor(max_workers=1) as waiter:
+            waiting = waiter.submit(wait_for_pending)
+            assert entered.wait(5)
+            ready = executor.submit(3, torch.tensor([2.0]))
+            torch.testing.assert_close(
+                torch.from_dlpack(executor.poll(ready)),
+                torch.tensor([9.0]),
+                rtol=0,
+                atol=0,
+            )
+            assert executor.poll(pending) is None
+            waiting.result(timeout=5)
+
         torch.testing.assert_close(
             torch.from_dlpack(executor.poll(pending)).cpu(),
             torch.full((16,), 8.0),

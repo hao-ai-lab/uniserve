@@ -21,7 +21,7 @@ pub fn lock<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
 pub struct Batch {
     input: Option<Tensor>,
     output: Option<Result<Tensor>>,
-    event: Result<Option<Event>>,
+    event: Result<Option<Arc<Event>>>,
     cancelled: bool,
 }
 
@@ -49,7 +49,7 @@ impl Batch {
             let event = Event::new(device.device_id, false, false);
             event
                 .record(stream as usize)
-                .map(|()| Some(event))
+                .map(|()| Some(Arc::new(event)))
                 .map_err(failure)
         } else {
             Ok(None)
@@ -68,12 +68,11 @@ impl Batch {
         }
     }
 
-    pub fn wait(&self) -> Result<()> {
-        match &self.event {
-            Ok(Some(event)) => event.wait().map_err(failure),
-            Ok(None) => Ok(()),
-            Err(error) => Err(error.clone()),
-        }
+    pub fn wait(batch: &Mutex<Self>) -> Result<()> {
+        // Waiting must not hold the batch lock: another caller may query or
+        // cancel it while the executor delivers an independent result.
+        let event = lock(batch)?.event.clone();
+        wait(event)
     }
 
     fn result(&mut self) -> Result<Tensor> {
@@ -90,7 +89,7 @@ impl Batch {
 
 impl Drop for Batch {
     fn drop(&mut self) {
-        if self.wait().is_err() {
+        if wait(self.event.clone()).is_err() {
             // Unknown physical completion cannot return DLPack storage for reuse.
             std::mem::forget(self.input.take());
             std::mem::forget(self.output.take());
@@ -168,11 +167,9 @@ impl Backend for NumericalBackend {
     }
 
     fn close(&mut self, batch: &mut Self::Batch) -> Result<()> {
+        Batch::wait(batch)?;
         let tensors = {
             let mut batch = lock(batch)?;
-            if !batch.retired()? {
-                batch.wait()?;
-            }
             batch.event = Ok(None);
             (batch.input.take(), batch.output.take())
         };
@@ -259,6 +256,15 @@ impl Drop for Executor {
             let _ = drain(executor);
         }
     }
+}
+
+fn wait(event: Result<Option<Arc<Event>>>) -> Result<()> {
+    if let Some(event) = event? {
+        if !event.ready().map_err(failure)? {
+            event.wait().map_err(failure)?;
+        }
+    }
+    Ok(())
 }
 
 fn drain(mut executor: NativeExecutor<NumericalBackend>) -> Result<()> {
