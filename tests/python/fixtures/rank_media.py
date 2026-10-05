@@ -4,13 +4,13 @@ import os
 from pathlib import Path
 
 from tests.python.fixtures.depth_one import finalized_report
+from uniserve_worker._uniserve_ipc import publish_media_bytes
 from uniserve_worker.bootstrap.cli import parse_worker_args
 from uniserve_worker.bootstrap.launch import (
     WorkerIpcEndpoint,
     endpoint_name,
     register_endpoint,
 )
-from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.output import MediaOutput, PosixShmArtifact
 from uniserve_worker.worker import Worker
 

@@ -3,14 +3,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
-use pyo3::exceptions::{PyException, PyRuntimeError};
+use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use uniserve_core::MediaSource;
 use uniserve_worker::PendingOutput as NativeOutput;
-use uniserve_worker_ipc::{
-    ArtifactHandle, Call, CallStatus, ErrorCode, MediaOutput, RequestOutput,
-};
+use uniserve_worker_ipc::{Call, CallStatus, ErrorCode, RequestOutput};
 
 use crate::convert;
 
@@ -301,12 +300,6 @@ impl PendingOutput {
         drop(retired);
     }
 
-    fn set_media(&self, media: &Bound<'_, PyAny>) -> PyResult<()> {
-        let value = pythonize::depythonize(&media.call_method0("to_mapping")?)?;
-        self.lock(media.py())?.output.media_output = Some(value);
-        Ok(())
-    }
-
     fn set_kv_output(&self, output: &Bound<'_, PyAny>) -> PyResult<()> {
         let value = convert::kv_transfer_from_py(&output.call_method0("to_mapping")?)
             .ok_or_else(|| PyRuntimeError::new_err("invalid KV output"))?;
@@ -337,14 +330,20 @@ impl PendingOutput {
     fn materialize(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
         Self::resolve(slf)?;
         let value = slf.borrow().result(slf.py())?;
-        convert::request_output_to_py(slf.py(), &value)
+        let result = convert::request_output_to_py(slf.py(), &value)?;
+        slf.borrow().handoff_media(slf.py())?;
+        Ok(result)
     }
 
     pub(super) fn abandon(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let (tasks, finish, buffer, row) = {
             let mut this = slf.borrow_mut();
-            let row = this.lock(py)?.row;
+            let row = {
+                let mut state = this.lock(py)?;
+                state.discard_media();
+                state.row
+            };
             (
                 std::mem::take(&mut this.host_tasks),
                 this.host_finish.take(),
@@ -463,6 +462,15 @@ impl PendingOutput {
     pub(super) fn result(&self, py: Python<'_>) -> PyResult<RequestOutput> {
         let result = self.lock(py)?.result().cloned();
         result.map_err(|error| native_error(py, error))
+    }
+
+    pub(super) fn handoff_media(&self, py: Python<'_>) -> PyResult<()> {
+        self.lock(py)?.handoff_media();
+        Ok(())
+    }
+
+    pub(super) fn take_media(&self, py: Python<'_>) -> PyResult<Option<MediaSource>> {
+        Ok(self.lock(py)?.take_media())
     }
 
     pub(super) fn validate_output(&self, py: Python<'_>, call: &Call) -> PyResult<()> {
@@ -596,39 +604,35 @@ fn resolve_host(output: &Bound<'_, PendingOutput>, reports: bool) -> PyResult<()
         return Ok(());
     }
 
-    for result in results {
-        let result = result.bind(py);
-        let media = if let Ok(bytes) = result.cast::<PyBytes>() {
-            if !reports {
-                continue;
+    if reports {
+        for result in results {
+            if let Ok(bytes) = result.bind(py).cast::<PyBytes>() {
+                // Encoders and muxers return bytes; publication and ownership
+                // stay native. PyBytes keeps this immutable borrow alive while
+                // allocation and the copy run outside the interpreter.
+                let payload = bytes.as_bytes();
+                let source = py.detach(|| MediaSource::publish(payload))?;
+                output
+                    .borrow()
+                    .lock(py)?
+                    .set_media(source)
+                    .map_err(|error| native_error(py, error))?;
             }
-            let name = py
-                .import("uniserve_worker.media.storage")?
-                .call_method1("publish_media_bytes", (result,))?
-                .extract()?;
-            MediaOutput {
-                handle: ArtifactHandle::PosixShm { name },
-                bytes: bytes.as_bytes().len() as u64,
-            }
-        } else {
-            let media_type = py
-                .import("uniserve_worker.protocol.output")?
-                .getattr("MediaOutput")?;
-            if !result.is_instance(&media_type)? {
-                continue;
-            }
-            pythonize::depythonize(&result.call_method0("to_mapping")?)?
-        };
-        let this = output.borrow();
-        let mut state = this.lock(py)?;
-        if state.output.media_output.is_some() {
-            return Err(PyRuntimeError::new_err(
-                "completion produced more than one media output",
-            ));
         }
-        state.output.media_output = Some(media);
     }
     Ok(())
+}
+
+/// Standalone producers hand ownership to their receiving process directly.
+#[pyfunction]
+pub(super) fn publish_media_bytes(py: Python<'_>, payload: &[u8]) -> PyResult<String> {
+    if payload.is_empty() {
+        return Err(PyValueError::new_err("published media must not be empty"));
+    }
+    Ok(py
+        .detach(|| MediaSource::publish(payload))?
+        .into_locator()
+        .name)
 }
 
 fn lost_buffer() -> PyErr {

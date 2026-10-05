@@ -8,7 +8,6 @@ from uniserve.runtime import EventPool
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.request import RequestPool
-from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.batch import NewRequest
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -20,7 +19,6 @@ from uniserve_worker.protocol.call import (
     MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
-from uniserve_worker.protocol.output import MediaOutput, PosixShmArtifact
 from uniserve_worker.storage.output import OutputPool
 
 pytestmark = pytest.mark.unit
@@ -53,24 +51,11 @@ def output(request):
         events.close()
 
 
-@pytest.mark.parametrize("finish_callback", [False, True])
-def test_media_delivery_releases_the_output_row(output, finish_callback):
+def test_media_delivery_releases_the_output_row(output):
     pending, buffer, buffers, lane = output
     payload = b"encoded image bytes"
     task = lane.reserve().configure(lambda: payload)
-    finish = None
-    if finish_callback:
-
-        def finish(results):
-            # The numerical callback may update its own result object.
-            data = b"".join(results)
-            pending.set_media(
-                MediaOutput(
-                    PosixShmArtifact(publish_media_bytes(data)), len(data)
-                )
-            )
-
-    pending.set_host_tasks((task,), finish=finish)
+    pending.set_host_tasks((task,))
 
     task.submit_if_ready()
     task.result(timeout=5)

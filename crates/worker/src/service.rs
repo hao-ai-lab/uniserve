@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use uniserve_worker_ipc::{
-    Batch as BatchPlan, BatchOutput, IpcError, RankServer, RequestKind, WorkerInfo, WorkerRequest,
+    Batch as BatchPlan, IpcError, RankServer, RequestKind, WorkerInfo, WorkerRequest,
     WorkerResponse, WorkerResponseError,
 };
 
-use crate::{Backend, Batch, Error, Executor, Submission};
+use crate::{Backend, Batch, BatchResult, Error, Executor, Submission};
 
 const EXPERT_POLL: Duration = Duration::from_micros(200);
 // Keep a rank with open requests available for its engine's next batch before
@@ -19,7 +19,7 @@ const OWN_STEP_WAIT: Duration = Duration::from_millis(8);
 
 /// Numerical values and resource observations needed by the rank service.
 /// Request correlation, admission, polling and shutdown remain in Service.
-pub trait ServiceBackend: Backend<Output = BatchOutput> {
+pub trait ServiceBackend: Backend<Output = BatchResult> {
     fn batch(&self, plan: &BatchPlan) -> Result<Self::Batch, Self::Error>;
     fn response_error(
         &self,
@@ -184,6 +184,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
     fn send_ready(&mut self) -> Result<bool, B::Error> {
         // A pending transfer or host task must not hold up independent results.
         for index in 0..self.pending.len() {
+            let mut media = Vec::new();
             let response = match &self.pending[index] {
                 PendingResponse::Ready(response) => (**response).clone(),
                 PendingResponse::Batch {
@@ -193,7 +194,13 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
                     let message_id = *message_id;
                     let result = self.executor.poll(submission);
                     match result {
-                        Ok(Some(result)) => WorkerResponse::Result { message_id, result },
+                        Ok(Some(result)) => {
+                            media = result.media;
+                            WorkerResponse::Result {
+                                message_id,
+                                result: result.output,
+                            }
+                        }
                         Ok(None) => continue,
                         Err(error) => self.error_response(message_id, error)?,
                     }
@@ -203,6 +210,11 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
             self.pending.remove(index);
             self.last_result = Instant::now();
             self.respond(&response)?;
+            // A failed response drops the still-owned names. A successful
+            // send leaves them available for the engine's claim.
+            for source in media {
+                source.into_locator();
+            }
             if matches!(response, WorkerResponse::Error { ref error, .. } if error.fatal) {
                 self.closing = true;
             }

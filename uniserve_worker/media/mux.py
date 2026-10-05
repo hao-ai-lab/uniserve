@@ -31,9 +31,7 @@ from uniserve_worker.media.container import (
     encoded_video_bytes,
     require_media_codecs,
 )
-from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.identity import CallId, RequestKey
-from uniserve_worker.protocol.output import MediaOutput, PosixShmArtifact
 
 if TYPE_CHECKING:
     import torch
@@ -362,8 +360,8 @@ class MediaMux:
     ) -> HostTask:
         """Schedule the artifact's assembly after every unit and the audio.
 
-        The task muxes the audio track, publishes the MP4 to shared storage,
-        and results in the artifact's handle. Scheduling checks only that the
+        The task muxes the audio track and returns the MP4 bytes. Native
+        result delivery publishes them. Scheduling checks only that the
         audio encode was scheduled; the task itself fails, for example, when
         the encoded audio is missing or `AvMuxSession.finalize` finds a unit
         missing.
@@ -383,17 +381,13 @@ class MediaMux:
             )
         session.finalized = True
 
-        def finalize() -> MediaOutput:
+        def finalize() -> bytes:
             with session.held() as container:
                 if session.audio is None:
                     raise invalid_descriptor(
                         "artifact assembly has no encoded audio"
                     )
-                payload = container.finalize(session.audio)
-            return MediaOutput(
-                handle=PosixShmArtifact(name=publish_media_bytes(payload)),
-                bytes=len(payload),
-            )
+                return container.finalize(session.audio)
 
         return reservation.configure(
             finalize,

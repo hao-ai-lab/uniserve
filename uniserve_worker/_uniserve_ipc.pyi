@@ -52,7 +52,6 @@ from uniserve_worker.protocol.identity import (
 from uniserve_worker.protocol.output import (
     BatchOutput,
     ForwardStats,
-    MediaOutput,
     RequestOutput,
 )
 from uniserve_worker.protocol.tensor import TensorRef
@@ -79,6 +78,10 @@ class DescriptorGrants:
 
 def fetch_descriptor(endpoint: str, publication: str) -> int:
     """Return an owned descriptor; the caller closes it after CUDA import."""
+    ...
+
+def publish_media_bytes(payload: bytes) -> str:
+    """Publish bytes and hand their segment name to the receiving process."""
     ...
 
 __all__ = [
@@ -128,6 +131,7 @@ __all__ = [
     "TransferTicket",
     "fetch_tensor",
     "fetch_descriptor",
+    "publish_media_bytes",
     "WeightPrefetch",
     "atomic_load_u32",
     "atomic_store_u32",
@@ -395,7 +399,6 @@ class PendingOutput:
         tasks: Sequence[HostTask[Any]],
         finish: Callable[[tuple[object, ...]], None] | None = None,
     ) -> None: ...
-    def set_media(self, media: MediaOutput) -> None: ...
     def set_kv_output(self, output: KvTransfer) -> None: ...
     @property
     def request_key(self) -> RequestKey: ...

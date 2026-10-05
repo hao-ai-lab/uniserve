@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use uniserve_worker::request_output;
+use uniserve_worker::{BatchResult, request_output};
 use uniserve_worker_ipc::{BatchOutput, CallStatus, ErrorCode, RequestOutput};
 
 use super::{BatchState, PythonBackend};
@@ -17,7 +17,7 @@ impl PythonBackend {
         &self,
         py: Python<'_>,
         batch: &BatchState,
-    ) -> PyResult<Option<BatchOutput>> {
+    ) -> PyResult<Option<BatchResult>> {
         let pending = batch.pending_outputs(py);
         for output in &pending {
             PendingOutput::submit_host_tasks(output)?;
@@ -37,12 +37,16 @@ impl PythonBackend {
                 output.borrow().result(py)
             })
             .collect::<PyResult<Vec<_>>>()?;
+        let mut media = Vec::new();
         for output in pending {
-            output
-                .borrow()
-                .accept(py, &mut self.requests.borrow_mut(py))?;
+            let output = output.borrow();
+            output.accept(py, &mut self.requests.borrow_mut(py))?;
+            if let Some(source) = output.take_media(py)? {
+                media.push(source);
+            }
         }
-        self.output(py, batch, completions).map(Some)
+        let output = self.output(py, batch, completions)?;
+        Ok(Some(BatchResult { output, media }))
     }
 
     fn output(

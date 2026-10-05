@@ -49,6 +49,10 @@ def fetch_descriptor(endpoint, publication):
     return _module.fetch_descriptor(endpoint, publication)
 
 
+def publish_media_bytes(payload):
+    return _module.publish_media_bytes(payload)
+
+
 def partition_streams(device, counts, event_slots=2):
     return _module.partition_streams(device, counts, event_slots)
 
