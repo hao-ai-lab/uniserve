@@ -291,7 +291,7 @@ def _outcome(
     if result.stats is None:
         raise RuntimeError("module output has no execution statistics")
     state.forward_stats.append(result.stats)
-    request.products = products
+    request.set_products(products)
     return request
 
 

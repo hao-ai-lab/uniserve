@@ -769,9 +769,8 @@ impl TransferHandle {
 ///
 /// The integer constants are per-record overhead allowances rather than exact
 /// FlatBuffers sizes; only string and list lengths are measured. The Python
-/// worker checks its own estimate, `_tensor_transfers_size`, when it commits a
-/// call's outputs; a Python estimate below this one lets the worker emit a
-/// descriptor that this side rejects.
+/// batch validator uses the corresponding `_tensor_transfers_size` estimate
+/// for inputs. Native output acceptance and the IPC codec share this estimate.
 fn transfer_encoded_size<'a>(tensors: impl IntoIterator<Item = &'a TensorTransfer>) -> usize {
     let mut size = 512usize;
     for tensor in tensors {

@@ -355,10 +355,6 @@ def execute(
         tensor_store.defer_write(write)
 
         def publish(results: tuple[object, ...]) -> None:
-            from uniserve_worker.execution.commit import (
-                _validate_completion_products,
-            )
-
             regions = []
             for index, (row, result) in enumerate(
                 zip(rows.unbind(0), results, strict=True)
@@ -380,12 +376,7 @@ def execute(
                     regions=regions,
                 ),
             )
-            _validate_completion_products(call, products)
-            # The batch recorded its products when the call committed, before
-            # its encodes ran and with none from this call; append these rows
-            # so the batch's result carries them.
-            request.products = products
-            state.products = (*state.products, *products)
+            request.set_products(products)
 
         finish = publish
 
@@ -471,8 +462,6 @@ def execute(
     else:
         raise invalid_descriptor(f"unsupported host media call {call.kind!r}")
 
+    # Video results arrive through finish after their host encodes complete.
     request.set_host_tasks(tasks, finish=finish)
-    # The call has no product at commit; a video encode's ``finish`` sets
-    # them once its encodes complete.
-    request.products = ()
     return request

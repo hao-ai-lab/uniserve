@@ -51,9 +51,6 @@ pub(crate) struct BatchState {
     #[pyo3(get)]
     pub(super) component_us: Py<PyDict>,
     forward_indices: Vec<Vec<usize>>,
-
-    #[pyo3(get, set)]
-    pub(super) products: Py<PyTuple>,
 }
 
 impl BatchState {
@@ -83,7 +80,6 @@ impl BatchState {
             forward_stats: PyList::empty(py).unbind(),
             component_us: PyDict::new(py).unbind(),
             forward_indices,
-            products: PyTuple::empty(py).unbind(),
         })
     }
 
@@ -797,8 +793,7 @@ impl BatchState {
         }
         visit.call(&self.stream)?;
         visit.call(&self.forward_stats)?;
-        visit.call(&self.component_us)?;
-        visit.call(&self.products)
+        visit.call(&self.component_us)
     }
 
     fn __clear__(&mut self, py: Python<'_>) {
@@ -809,6 +804,5 @@ impl BatchState {
         self.predicate_captures.clear();
         self.forward_stats = PyList::empty(py).unbind();
         self.component_us = PyDict::new(py).unbind();
-        self.products = PyTuple::empty(py).unbind();
     }
 }

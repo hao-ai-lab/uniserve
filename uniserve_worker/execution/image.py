@@ -133,7 +133,7 @@ def text(
         raise RuntimeError("module output has no execution statistics")
     state.forward_stats.append(result.stats)
 
-    request.products = products
+    request.set_products(products)
     return request
 
 
@@ -452,7 +452,7 @@ def state_outcome(
 ) -> PendingOutput:
     """Stage the successful outcome of a visual-state call, which wrote KV.
 
-    The reported KV length is the staged ``runtime_cache_length`` when one
+    The reported KV length is the pending ``cache_length`` when one
     exists, otherwise the request's visible KV length as checked against its
     block table by ``PendingOutput.cache_coordinates``.
 
@@ -463,13 +463,13 @@ def state_outcome(
     """
     request = state.pending_output(call.request_key.request_id)
     cache = request.cache_coordinates(request_tables)
-    selected = request.token_update.runtime_cache_length
+    selected = request.token_update.cache_length
     if selected is None:
         selected = cache[1]
     if not isinstance(selected, int):
         raise RuntimeError("visual state completion has a dynamic KV length")
     request.set_cache_length(selected)
-    request.products = products
+    request.set_products(products)
     return request
 
 
@@ -486,7 +486,7 @@ def non_state_outcome(
     before its output is ready.
     """
     request = state.pending_output(call.request_key.request_id)
-    request.products = products
+    request.set_products(products)
     request.set_host_tasks(completion_tasks)
     return request
 

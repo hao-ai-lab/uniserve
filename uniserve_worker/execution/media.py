@@ -1098,7 +1098,7 @@ def execute(
     else:
         raise invalid_descriptor(f"unsupported video call {call.kind!r}")
 
-    request.products = products
+    request.set_products(products)
     return request
 
 

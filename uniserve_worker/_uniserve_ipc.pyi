@@ -19,16 +19,14 @@ from typing import Any, Generic, ParamSpec, Self, TypeVar, final
 import torch
 from typing_extensions import Buffer as BufferProtocol
 
+import uniserve_worker.sampling.result as sampling_result
 import uniserve_worker.storage.block_tables as block_tables
 import uniserve_worker.storage.kv_cache as kv_cache
 from uniserve.runtime.execution import ExecutionContext
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
-from uniserve_worker.execution.output import (
-    LatentResult,
-    TokenUpdate,
-)
+from uniserve_worker.execution.output import LatentResult
 from uniserve_worker.execution.request import RequestResult
 from uniserve_worker.protocol.batch import (
     Batch,
@@ -280,7 +278,6 @@ class BatchState:
     started_ns: int
     forward_stats: list[ForwardStats]
     component_us: dict[str, int]
-    products: tuple[TensorExport, ...]
 
     @property
     def batch_id(self) -> int: ...
@@ -330,6 +327,18 @@ class BatchInputs:
         """Release consumers once, attempting every resource after failures."""
 
 @final
+class TokenUpdate:
+    """Borrowed sampling views and device coordinates awaiting commit."""
+
+    sampled: sampling_result.SamplerRow | None
+    logical_position: int | torch.Tensor
+    sampling_position: int | torch.Tensor
+    penalty_base: torch.Tensor | None
+    decode_increment: bool
+    cache_length: int | torch.Tensor | None
+    prompt_logits: torch.Tensor | None
+
+@final
 class PendingOutput:
     """Own result decoding and output retirement for one numerical call."""
 
@@ -353,7 +362,9 @@ class PendingOutput:
     transition_write: Buffer | None
     completion_write: Buffer | None
     producer_write: Buffer | None
-    products: tuple[TensorExport, ...]
+
+    def set_products(self, products: Sequence[TensorExport]) -> None:
+        """Retain declared tensor results for native batch delivery."""
 
     def set_sampling(
         self,

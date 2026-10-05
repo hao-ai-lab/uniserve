@@ -8,11 +8,6 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
 from uniserve_worker._uniserve_ipc import BatchState
-from uniserve_worker.execution.commit import (
-    apply_decode_state,
-    publish_predicates,
-    validate_outputs,
-)
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.dispatch import execute_calls
 from uniserve_worker.execution.forward import (
@@ -142,14 +137,6 @@ class BatchRunner:
                 config=self.worker.worker_config,
                 state=state,
             )
-
-    def prepare_outputs(self, state: BatchState) -> None:
-        """Write completion predicates and check numerical output bounds."""
-        publish_predicates(state=state, tensor_store=self.worker.tensor_store)
-        validate_outputs(state)
-
-    def apply_outputs(self, state: BatchState) -> None:
-        apply_decode_state(state=state, decode_state=self.worker.decode_state)
 
     def execution_stats(
         self, state: BatchState, started: int, commit_started: int | None

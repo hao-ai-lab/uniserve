@@ -728,10 +728,9 @@ class KvTransfer:
     carries no groups; otherwise there is one entry per cache group, in
     table order. `compute_dtype` is the precision used when reading
     quantized source pages. `__post_init__` does not check the descriptor
-    size bound; the output commit in `uniserve_worker.execution.commit` and
-    `Batch.validate` run `encoded_size_bound`. The worker-ipc crate's
-    `KvTransfer::validate` checks the same relations and the size bound in
-    the crate's codec.
+    size bound; native output commit and `Batch.validate` check it.
+    The worker-ipc crate's `KvTransfer::validate` checks the same relations
+    and the size bound in the crate's codec.
     """
 
     groups: tuple[KvGroupTransfer, ...]

@@ -9,8 +9,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-import torch
-
 from uniserve_worker._uniserve_ipc import PendingOutput
 from uniserve_worker.protocol.batch import LatentParams
 from uniserve_worker.protocol.identity import BufferId
@@ -86,19 +84,6 @@ def capture_samples(
                 details[key] = capture_logprobs(sample.batch.logprobs, output)
             scores = details[key].get(sample.index)
         request.set_sampling((*span, sample.index), scores)
-
-
-@dataclass(slots=True)
-class TokenUpdate:
-    """Borrowed numerical views retained until DecodeState accepts them."""
-
-    sampled: SamplerRow | None = None
-    runtime_logical_position: int | torch.Tensor = 0
-    runtime_sampling_position: int | torch.Tensor = 0
-    runtime_penalty_base: torch.Tensor | None = None
-    runtime_decode_increment: bool = False
-    runtime_cache_length: int | torch.Tensor | None = None
-    runtime_prompt_logits: torch.Tensor | None = None
 
 
 @dataclass(slots=True)

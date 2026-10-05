@@ -5,8 +5,8 @@ continuation state of token calls: the next input token and its
 continuation predicate, the logical position, the sampling counter that
 mirrors the request's ``rng_counter``, committed penalty counts, and, when
 prompt scoring is requested, the last prompt logits of a prefill chunk.
-Execution stages the values on each ``PendingOutput`` and
-``commit._commit_runtime_states`` applies them when the batch commits; the
+Execution supplies the values through each ``PendingOutput.token_update``;
+the native executor applies them when the batch commits. The
 executor resets a slot's rows when a request is admitted to it and when the
 request's storage is released. Input staging (``TokenBuffers``) reads next
 tokens and logical lengths by slot, and token sampling reads the committed
