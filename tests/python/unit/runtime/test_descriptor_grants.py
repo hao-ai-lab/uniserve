@@ -15,6 +15,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -93,6 +94,63 @@ def test_an_endpoint_that_serves_nothing_is_refused() -> None:
         f"uniserve-publications-{uuid.uuid4().hex}", uuid.uuid4().hex
     )
     assert kind == "error" and value == WorkerError.__name__
+
+
+def test_registration_and_receiver_own_their_descriptors() -> None:
+    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+    grants = DescriptorGrants(endpoint)
+    publication = uuid.uuid4().hex
+    try:
+        with tempfile.TemporaryFile() as source:
+            source.write(b"allocation")
+            source.flush()
+            grants.register(publication, source.fileno())
+
+        # Registration retains the open allocation after its caller closes.
+        received = fetch(endpoint, publication)
+        try:
+            grants.release(publication)
+            assert os.pread(received, 10, 0) == b"allocation"
+            assert not os.get_inheritable(received)
+            with pytest.raises(WorkerError):
+                fetch(endpoint, publication)
+        finally:
+            os.close(received)
+    finally:
+        grants.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("release", ("close", "drop"))
+def test_retirement_releases_an_idle_endpoint(release) -> None:
+    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+    owners = [DescriptorGrants(endpoint)]
+
+    def retire():
+        if release == "close":
+            owners[0].close()
+        else:
+            owners.clear()
+
+    with ThreadPoolExecutor(max_workers=1) as thread:
+        thread.submit(retire).result(timeout=5)
+
+    replacement = DescriptorGrants(endpoint)
+    try:
+        with tempfile.TemporaryFile() as source:
+            publication = uuid.uuid4().hex
+            replacement.register(publication, source.fileno())
+            received = fetch(endpoint, publication)
+            try:
+                assert _identity(received) == _identity(source.fileno())
+            finally:
+                os.close(received)
+
+            if release == "close":
+                with pytest.raises(OSError, match="closed"):
+                    owners[0].register(publication, source.fileno())
+    finally:
+        replacement.close()
 
 
 def _fetch_many(endpoint: str, publications: list[str], channel) -> None:

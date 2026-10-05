@@ -1,0 +1,13 @@
+diff --git a/python/tvm_ffi/registry.py b/python/tvm_ffi/registry.py
+--- a/python/tvm_ffi/registry.py
++++ b/python/tvm_ffi/registry.py
+@@ -408,7 +408,8 @@ def _add_class_attrs(type_cls: type, type_info: TypeInfo) -> type:
+             _install_ffi_init_attr(type_cls, type_info, method.func)
+             has_ffi_init = True
+             continue
+-        if not hasattr(type_cls, name):
++        # Metaclass methods such as ABCMeta.register are not instance methods.
++        if not any(name in base.__dict__ for base in type_cls.__mro__):
+             setattr(type_cls, name, method.as_callable(type_cls))
+     # Also check TypeAttrColumn for auto-generated __ffi_init__.
+     if not has_ffi_init:

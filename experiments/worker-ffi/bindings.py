@@ -41,6 +41,14 @@ class CUDAEvent(tvm_ffi.Object):
     """A native device dependency that retains its producer's SM partition."""
 
 
+class DescriptorGrants(tvm_ffi.Object):
+    """Allocation descriptors served by the shared native transport owner."""
+
+
+def fetch_descriptor(endpoint, publication):
+    return _module.fetch_descriptor(endpoint, publication)
+
+
 def partition_streams(device, counts, event_slots=2):
     return _module.partition_streams(device, counts, event_slots)
 
@@ -59,3 +67,4 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.HostBuffers")(HostBuffers)
     tvm_ffi.register_object("uniserve.ffi.CUDAStream")(CUDAStream)
     tvm_ffi.register_object("uniserve.ffi.CUDAEvent")(CUDAEvent)
+    tvm_ffi.register_object("uniserve.ffi.DescriptorGrants")(DescriptorGrants)
