@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Final
 
 import torch
 
@@ -26,15 +25,6 @@ __all__ = [
     "PendingOutput",
 ]
 
-# The sampler packs one sampled batch's completion column as four consecutive
-# fields, [valid | active | token | accepted], each `count` rows wide
-# (`sampling_columns` in `uniserve_worker.sampling.sampler`). `valid` marks a
-# usable sampling distribution, `active` the resolved device predicate, `token`
-# the selected token, and `accepted` the number of accepted draft tokens (zero
-# without speculation). This must equal `SAMPLING_COMPLETION_FIELDS`, which
-# `reserve_outputs` uses to size completion storage.
-_SAMPLING_FIELDS_PER_CALL: Final[int] = 4
-
 
 def capture_logprobs(
     details: LogprobValues | None,
@@ -42,9 +32,7 @@ def capture_logprobs(
 ) -> dict[int, tuple[int, int, int]]:
     """Capture one packed logprob column into completion storage.
 
-    The column's row layout is recorded in `output.logprob_layouts` under the
-    capture span so `OutputBuffer.logprob_values` can decode it after the copy
-    completes.
+    Rust retains the row layout and decodes the column after its copy finishes.
 
     Returns:
         A map from each sampler row index that carries logprobs to its
@@ -54,15 +42,15 @@ def capture_logprobs(
         return {}
     packed, rows, counts, requested_ids, max_count, max_requested = details
     capture = output.capture(packed)
-    key = capture
-    output.logprob_layouts[key] = (
+    output.register_logprobs(
+        capture,
         rows,
         counts,
         requested_ids,
         max_count,
         max_requested,
     )
-    return {index: (*key, index) for index in rows}
+    return {index: (*capture, index) for index in rows}
 
 
 def capture_samples(
@@ -76,21 +64,12 @@ def capture_samples(
     protects all sampling and score ranges until their PendingOutput retires.
 
     Raises:
-        RuntimeError: A completion column is not a whole number of
-            `_SAMPLING_FIELDS_PER_CALL` fields or a row index lies outside
-            it. Errors from `OutputBuffer.capture` also propagate.
         ValueError: `samples` and `requests` differ in length.
     """
     spans: dict[int, tuple[int, int]] = {}
     details: dict[int, dict[int, tuple[int, int, int]]] = {}
     for sample, request in zip(samples, requests, strict=True):
         metadata = sample.batch.completion
-        count = int(metadata.numel()) // _SAMPLING_FIELDS_PER_CALL
-        if metadata.numel() != count * _SAMPLING_FIELDS_PER_CALL or not (
-            0 <= sample.index < count
-        ):
-            raise RuntimeError("sampling completion vectors do not align")
-
         # Rows of a shared batch reference one completion column; capture it
         # on first encounter and hand each request its row span. Columns are
         # keyed by object identity, which stays unique because `samples`
@@ -108,23 +87,6 @@ def capture_samples(
             if key not in details:
                 details[key] = capture_logprobs(sample.batch.logprobs, output)
             request.token.logprob_range = details[key].get(sample.index)
-
-
-def logprob_entries(record: PendingOutput, span: tuple[int, int, int]) -> int:
-    """Return the number of score entries one logprob row can report.
-
-    The count is the sampled entry plus the row's top-k count plus its
-    explicitly requested token ids. `uniserve_worker.execution.commit` uses it
-    to bound the logprob payload against `max_completion_bytes`.
-    """
-    if record._buffer is None:
-        raise RuntimeError("logprob output lost its pinned range")
-    offset, count, index = span
-    rows, counts, requested_ids, _max_count, _max_requested = (
-        record._buffer.logprob_layouts[(offset, count)]
-    )
-    local = rows.index(index)
-    return 1 + counts[local] + len(requested_ids[local])
 
 
 @dataclass(slots=True)

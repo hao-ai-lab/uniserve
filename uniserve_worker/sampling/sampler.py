@@ -1214,8 +1214,8 @@ def logprob_details(
         bits, selected rank, top token ids, top score bits, top ranks,
         requested score bits, and requested ranks. Top fields are
         ``max_count`` wide and requested fields ``max_requested`` wide.
-        ``decode_logprobs`` in ``uniserve_worker.sampling.output`` reverses
-        this layout. None when no call requests logprobs.
+        The native output buffer decodes this layout after readback. None
+        when no call requests logprobs.
     """
     vocab = int(work.shape[1])
     requested_rows = tuple(

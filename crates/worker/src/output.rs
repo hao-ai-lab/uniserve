@@ -1,10 +1,17 @@
 //! Bounded host output storage and per-batch readback lifetimes.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use uniserve_core::TokenLogprob;
+
 use crate::cuda::{DeviceGuard, Event};
 use crate::{Error, EventPool, Result};
+
+mod logprobs;
+
+pub use logprobs::LogprobLayout;
 
 /// The numerical backend supplies the host allocation. Only storage is reused;
 /// each batch receives a distinct OutputBuffer and completion signal.
@@ -29,6 +36,9 @@ pub struct OutputBuffer<A> {
     rows: Vec<bool>,
     remaining: usize,
     tokens: usize,
+    readback: Option<Vec<i64>>,
+    logprob_layouts: HashMap<(usize, usize), LogprobLayout>,
+    logprobs: HashMap<(usize, usize), HashMap<usize, Vec<TokenLogprob>>>,
     bytes: usize,
     devices: Vec<DeviceEvents>,
     sealed: bool,
@@ -51,6 +61,9 @@ impl<A> OutputBuffer<A> {
             rows: vec![false; rows],
             remaining: rows,
             tokens: 0,
+            readback: None,
+            logprob_layouts: HashMap::new(),
+            logprobs: HashMap::new(),
             bytes: 0,
             devices: devices
                 .iter()
@@ -125,6 +138,81 @@ impl<A> OutputBuffer<A> {
             ));
         }
         Ok(())
+    }
+
+    /// Snapshot completed words once, before the pinned allocation can be
+    /// recycled. The backend reads exactly `count` initialized int64 words;
+    /// byte captures retain their separate CPU-reader lifetime.
+    pub fn readback(&mut self, read: impl FnOnce(&A, usize) -> Vec<i64>) -> Result<()> {
+        if self.readback.is_some() {
+            return Ok(());
+        }
+        if self.ready_at()?.is_none() {
+            return Err(Error::Invariant(
+                "completion storage was observed before its copy event was ready".into(),
+            ));
+        }
+
+        self.readback = Some(read(&self.storage()?.value, self.tokens));
+        Ok(())
+    }
+
+    pub fn read_tokens(&self, offset: usize, count: usize) -> Result<&[i64]> {
+        self.token_range(offset, count)?;
+        self.readback
+            .as_ref()
+            .and_then(|words| words.get(offset..offset + count))
+            .ok_or(Error::State("completion words have not been read back"))
+    }
+
+    pub fn register_logprobs(
+        &mut self,
+        offset: usize,
+        count: usize,
+        layout: LogprobLayout,
+    ) -> Result<()> {
+        self.require_open()?;
+        self.token_range(offset, count)?;
+        layout.validate(count)?;
+        self.logprob_layouts.insert((offset, count), layout);
+        Ok(())
+    }
+
+    /// Upper bound before token deduplication, used for output-byte admission.
+    pub fn logprob_entries(&self, span: (usize, usize, usize)) -> Result<usize> {
+        let (offset, count, row) = span;
+        self.logprob_layouts
+            .get(&(offset, count))
+            .ok_or(Error::State("logprob capture has no row layout"))?
+            .entries(row)
+    }
+
+    /// IPC encodes a 4-byte row length and 12 bytes per token score. Admission
+    /// uses the count before deduplication, so selected/top/requested overlap
+    /// can only reduce the eventual payload.
+    pub fn logprob_bytes(&self, spans: &[(usize, usize, usize)]) -> Result<usize> {
+        spans.iter().try_fold(0, |bytes, &span| {
+            Ok(bytes + 4 + 12 * self.logprob_entries(span)?)
+        })
+    }
+
+    /// Selected token first, then top and explicitly requested tokens. The
+    /// packed column is decoded once for all of its consuming request rows.
+    pub fn logprob_values(&mut self, span: (usize, usize, usize)) -> Result<&[TokenLogprob]> {
+        let (offset, count, row) = span;
+        let key = (offset, count);
+        if !self.logprobs.contains_key(&key) {
+            let layout = self
+                .logprob_layouts
+                .get(&key)
+                .ok_or(Error::State("logprob capture has no row layout"))?;
+            let values = layout.decode(self.read_tokens(offset, count)?)?;
+            self.logprobs.insert(key, values);
+        }
+        self.logprobs[&key]
+            .get(&row)
+            .map(Vec::as_slice)
+            .ok_or(Error::State("logprob capture has no requested row"))
     }
 
     pub fn register_device(&self, device: Option<i32>) -> Result<()> {
