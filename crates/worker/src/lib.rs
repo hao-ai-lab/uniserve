@@ -13,6 +13,7 @@ mod kv_cache;
 mod kv_import;
 mod latent;
 mod output;
+mod profiling;
 mod registry;
 mod request;
 mod service;

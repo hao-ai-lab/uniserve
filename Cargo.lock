@@ -3108,7 +3108,7 @@ dependencies = [
  "fastrand",
  "futures-core",
  "futures-sink",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -5341,7 +5341,7 @@ dependencies = [
  "httparse",
  "memchr",
  "mime",
- "spin",
+ "spin 0.9.9",
  "version_check",
 ]
 
@@ -5687,6 +5687,29 @@ name = "number_prefix"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
+
+[[package]]
+name = "nvtx"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d1e5e2177aff9fd71177136dffc40d44d10e9228cf4584ba6ecaa60f77b214e"
+dependencies = [
+ "libc",
+ "nvtx-sys",
+ "spin 0.10.1",
+ "widestring",
+]
+
+[[package]]
+name = "nvtx-sys"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9d27db0c4b06b35ff598e53093f6c050df4b10dbda5f397f5ee39fbc5890498"
+dependencies = [
+ "bindgen 0.72.1",
+ "cc",
+ "widestring",
+]
 
 [[package]]
 name = "objc2"
@@ -8271,6 +8294,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9605,6 +9637,7 @@ dependencies = [
  "indexmap 2.14.0",
  "libc",
  "libloading 0.8.9",
+ "nvtx",
  "thiserror 2.0.18",
  "uniserve-core",
  "uniserve-worker-ipc",
@@ -10093,6 +10126,12 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+
+[[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "winapi"

@@ -57,6 +57,7 @@ indexmap = "2.13.0"
 itertools = "0.14.0"
 libc = "0.2.177"
 libloading = "0.8.9"
+nvtx = { version = "2.0.0", default-features = false, features = ["std"] }
 llm-multimodal = { git = "https://github.com/vllm-project/llm-multimodal", rev = "5b558989844d1c7af3e43d0f604069ffd9c06320" }
 # Keep scheduler heap mappings out of transparent-huge-page collapse.
 mimalloc = { version = "0.1.52", features = ["no_thp"] }
