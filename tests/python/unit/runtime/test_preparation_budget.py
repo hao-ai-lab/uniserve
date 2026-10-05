@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
+
 import pytest
 
 from tests.python.fixtures.device_storage import (
@@ -37,3 +40,37 @@ def test_bound_budget_charges_storage_prepared_outside_the_pools(
     # belongs to the worker's grant, not to graph residency.
     graphs.seal()
     graphs.check()
+
+
+def test_graph_storage_releases_unreachable_execution_owners():
+    class Execution:
+        pass
+
+    storage = GraphStorage()
+    owner = Execution()
+    owner.storage = storage
+    storage.reserve(owner, ("cpu",))
+    observed = weakref.ref(owner)
+    del owner, storage
+
+    gc.collect()
+    assert observed() is None
+
+
+def test_owner_finalization_can_observe_closed_storage():
+    storage = GraphStorage()
+    observed = []
+
+    class Execution:
+        def __del__(self):
+            try:
+                observed.append(storage.pool_bytes())
+            except Exception as error:
+                observed.append(error)
+
+    owner = Execution()
+    storage.reserve(owner, ("cpu",))
+    del owner
+    storage.close()
+
+    assert observed == [{}]
