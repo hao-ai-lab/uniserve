@@ -357,9 +357,9 @@ class BlockTables:
     def retain_prefix(self, request_key: RequestKey, slot: int) -> None:
         """Record that a request epoch uses another slot as a prefix row.
 
-        `execution.prepare` calls this for forward rows whose slot differs
-        from the request's own slot, such as a CFG branch prefix. The slot is
-        cleared by `release_prefixes` for the same `RequestKey`.
+        Forward rows can use slots other than their request's own slot,
+        such as a CFG branch prefix. The slot is cleared by `release_prefixes`
+        for the same `RequestKey`.
         """
         self._tables.retain_prefix(request_key, slot)
 

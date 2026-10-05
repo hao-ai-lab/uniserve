@@ -630,9 +630,8 @@ class Worker:
 
             # `max_words` bounds a batch's completion lease. Each call takes
             # `SAMPLING_COMPLETION_FIELDS` (4) int64 words plus its payload
-            # bytes counted at 4 bytes per word; `_completion_words` in
-            # `uniserve_worker.execution.prepare` sizes each lease by the
-            # same rule, so the two change together.
+            # bytes counted at 4 bytes per word. Native batch preparation
+            # sizes each lease by the same rule, so the two change together.
             self.output_pool = OutputPool(
                 capacity=int(queue_depth) * int(info.max_batch_calls),
                 max_words=int(info.max_batch_calls)

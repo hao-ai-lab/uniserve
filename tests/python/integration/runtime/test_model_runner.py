@@ -1267,6 +1267,108 @@ def test_rejected_interval_preserves_unequal_denoising_trajectories() -> None:
     assert run(4, reject_interval=True) == run(1)
 
 
+def test_partial_host_reservation_releases_capacity() -> None:
+    def run(exhaust: bool) -> tuple[bytes, ...]:
+        worker = execution_worker(max_request_pool_size=4, max_batch_calls=2)
+        held = []
+        trajectories = []
+        batch_id = 1
+        try:
+            for index in range(2):
+                admission = umm_params(
+                    index,
+                    ImageParams(steps=1, height=16, width=16, seed=31 + index),
+                )
+                conditioning = _publish_conditioning(
+                    worker,
+                    admission,
+                    call_id=CallId(batch_id, 0),
+                    batch_id=batch_id,
+                )
+                batch_id += 1
+                latent, observation = _prepare_media(
+                    worker,
+                    admission,
+                    conditioning,
+                    call_id=CallId(batch_id, 0),
+                    predecessor=root_parent(admission),
+                    batch_id=batch_id,
+                    seed=31 + index,
+                )
+                batch_id += 1
+                step, latent = diffusion_step_call(
+                    admission.request_key,
+                    call_id=CallId(batch_id, 0),
+                    predecessor=observation.call_id,
+                    conditioning=conditioning,
+                    latent=latent,
+                    steps=1,
+                )
+                report = finalized_report(
+                    worker,
+                    worker.submit(
+                        execution_batch(batch_id=batch_id, calls=(step,))
+                    ),
+                )
+                trajectories.append(
+                    (admission, latent, record_completion(step, report))
+                )
+                batch_id += 1
+
+            calls = tuple(
+                diffusion_finalize_call(
+                    admission.request_key,
+                    call_id=CallId(batch_id, index),
+                    predecessor=observation.call_id,
+                    latent=latent,
+                )
+                for index, (admission, latent, observation) in enumerate(
+                    trajectories
+                )
+            )
+            if exhaust:
+                # Leave one task slot for a batch that needs two. The retry
+                # keeps this pressure, so leaked capacity remains observable.
+                held.extend(
+                    worker.host_tasks.reserve()
+                    for _ in range(worker.host_tasks.max_inflight - 1)
+                )
+            report = finalized_report(
+                worker,
+                worker.submit(execution_batch(batch_id=batch_id, calls=calls)),
+            )
+            if not exhaust:
+                return tuple(
+                    _media_bytes(record_completion(call, report))
+                    for call in calls
+                )
+
+            assert len(report.completions) == 2
+            for output in report.completions:
+                assert output.status is CallStatus.ERROR
+                assert output.num_completed_steps == 1
+            batch_id += 1
+            return tuple(
+                _finalized_artifact(
+                    worker,
+                    admission,
+                    latent,
+                    observation,
+                    call_id=CallId(batch_id + index, 0),
+                    batch_id=batch_id + index,
+                )
+                for index, (admission, latent, observation) in enumerate(
+                    trajectories
+                )
+            )
+        finally:
+            for task in held:
+                task.abandon()
+            worker.close()
+
+    assert run(True) == run(False)
+
+
 @pytest.mark.parametrize(
     "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
 )

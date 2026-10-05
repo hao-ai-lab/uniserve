@@ -20,7 +20,6 @@ from uniserve_worker.execution.forward import (
     initialize_trajectories,
 )
 from uniserve_worker.execution.image import reserve_images
-from uniserve_worker.execution.prepare import reserve_outputs
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.output import ForwardStats
 
@@ -61,23 +60,6 @@ class BatchRunner:
                 f"batch:{first.kind}:{first.component}"
             )
         return nullcontext()
-
-    def reserve(self, state: BatchState) -> None:
-        reserve_outputs(
-            state.batch,
-            state.predicate_values(),
-            kv_cache=self.worker.kv_cache,
-            host_tasks=self.worker.host_tasks,
-            tensor_store=self.worker.tensor_store,
-            worker_info=self.worker.info,
-            latent_pool=self.worker.latent_pool,
-            output_pool=self.worker.output_pool,
-            request_tables=self.worker.block_tables,
-            request_pool=self.worker.requests,
-            model_runner=self.worker.runner,
-            config=self.worker.worker_config,
-            state=state,
-        )
 
     def execute(self, state: BatchState, indices: Sequence[int]) -> None:
         """Launch the selected homogeneous calls into reserved output views."""

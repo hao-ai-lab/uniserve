@@ -100,6 +100,12 @@ pub(crate) struct Buffer {
     views: Mutex<BufferViews>,
 }
 
+impl Buffer {
+    pub(super) fn id(&self, py: Python<'_>) -> BufferId {
+        lock(py, &self.inner).id
+    }
+}
+
 #[pymethods]
 impl Buffer {
     #[getter]
@@ -959,7 +965,7 @@ impl TensorStore {
     }
 
     #[pyo3(signature = (write, value, *, producer_event=None))]
-    fn write_scalar<'py>(
+    pub(super) fn write_scalar<'py>(
         &self,
         py: Python<'py>,
         write: Bound<'py, Buffer>,
@@ -1290,7 +1296,7 @@ impl TensorStore {
     }
 
     #[pyo3(signature = (bindings, *, buffer_allocations, regions=None, shapes=None))]
-    fn reserve_features<'py>(
+    pub(super) fn reserve_features<'py>(
         &self,
         py: Python<'py>,
         bindings: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
@@ -1312,7 +1318,7 @@ impl TensorStore {
     }
 
     #[pyo3(signature = (groups, *, request_slots=None, buffer_allocations=None, regions=None, shapes=None))]
-    fn bind_output_groups<'py>(
+    pub(super) fn bind_output_groups<'py>(
         &self,
         py: Python<'py>,
         groups: Vec<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>>,

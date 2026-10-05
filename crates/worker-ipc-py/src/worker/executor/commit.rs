@@ -6,7 +6,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use uniserve_worker_ipc::{CallKind, MediaCall};
 
 use super::{BatchState, PythonBackend};
-use crate::worker::error::{native_error, unsupported};
+use crate::worker::error::native_error;
 use crate::worker::exports;
 use crate::worker::host::with_context;
 use crate::worker::latent::{LatentUpdate, lower_updates};
@@ -63,30 +63,9 @@ impl PythonBackend {
             let tensor_exports = PyDict::new(py);
             let cache_exports = PyDict::new(py);
             let latent_exports = PyDict::new(py);
-            let rank: usize = self
-                .worker
-                .bind(py)
-                .getattr("worker_config")?
-                .getattr("rank")?
-                .extract()?;
-            // All calls share one component. Its first rank reports host
-            // results; every participating rank retains its score rows.
-            let component_name = &batch.plan.calls[0].component;
-            let component = self
-                .info
-                .components
-                .iter()
-                .find(|component| &component.name == component_name);
-            let reports_output = match component {
-                Some(component) => component.config.ranks.first() == Some(&rank),
-                None if self.info.world_size == 1 => rank == 0,
-                None => {
-                    return Err(unsupported(
-                        py,
-                        format!("component {component_name:?} has no export owner",),
-                    ));
-                }
-            };
+            // Host results belong to the component's first member rank.
+            let reports_output = self.info.endpoint.rank as usize
+                == self.output_rank(py, &batch.plan.calls[0].component)?;
             for output in &outputs {
                 let pending = output.borrow();
                 pending.lock(py)?.reports_output = reports_output;

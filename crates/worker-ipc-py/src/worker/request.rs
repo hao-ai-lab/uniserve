@@ -87,7 +87,7 @@ impl RequestProgress {
 pub(crate) struct Request {
     pub(super) request: Arc<NativeRequest>,
     #[pyo3(get)]
-    admission: Py<PyAny>,
+    pub(super) admission: Py<PyAny>,
     #[pyo3(get, set)]
     pub(super) diffusion: Option<Py<PyAny>>,
 }

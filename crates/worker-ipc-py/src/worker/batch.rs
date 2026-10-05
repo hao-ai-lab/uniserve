@@ -30,7 +30,6 @@ pub(crate) struct BatchState {
     request_indexes: HashMap<u64, usize>,
     pub(super) outputs: Vec<Py<PendingOutput>>,
     pub(super) buffer: Option<Py<OutputBuffer>>,
-    predicate_values: Option<Py<PyDict>>,
 
     #[pyo3(get)]
     pub(super) batch: Py<PyAny>,
@@ -42,7 +41,7 @@ pub(crate) struct BatchState {
     pub(super) predicate_captures: Vec<(usize, Option<(usize, usize)>)>,
 
     #[pyo3(get, set)]
-    stream: Option<Py<PyAny>>,
+    pub(super) stream: Option<Py<PyAny>>,
     // Python perf_counter_ns at reservation, shared with numerical timers.
     #[pyo3(get)]
     pub(super) started_ns: u64,
@@ -76,7 +75,6 @@ impl BatchState {
             request_indexes,
             outputs: Vec::new(),
             buffer: None,
-            predicate_values: None,
             batch,
             inputs: Py::new(py, BatchInputs::new())?,
             predicate_captures: Vec::new(),
@@ -125,26 +123,10 @@ impl BatchState {
     }
 }
 
-#[pymethods]
 impl BatchState {
-    #[getter]
-    fn batch_id(&self) -> u64 {
-        self.plan.batch_id
-    }
-
-    /// Return numerical forward rows in their scheduler-supplied order.
-    fn forward_rows<'py>(&self, py: Python<'py>, request_id: u64) -> PyResult<Bound<'py, PyTuple>> {
-        let rows = self
-            .request_indexes
-            .get(&request_id)
-            .map_or(&[][..], |&index| self.forward_indices[index].as_slice());
-        PyTuple::new(py, rows)
-    }
-
     /// Complete ready inputs for active numerical consumers. The executor
     /// establishes readiness; owners order device fences and propagate failures.
-    #[pyo3(signature = (tensors, latents, cache))]
-    fn complete_inputs(
+    pub(super) fn complete_inputs(
         slf: &Bound<'_, Self>,
         tensors: &TensorStore,
         latents: Option<&Bound<'_, LatentPool>>,
@@ -267,8 +249,7 @@ impl BatchState {
 
     /// Bind active trajectory intervals and their numerical latent views.
     /// Model callbacks describe shapes; the batch owns progress and selection.
-    #[pyo3(signature = (pool, image_builder, media_builder))]
-    fn bind_latents(
+    pub(super) fn bind_latents(
         slf: &Bound<'_, Self>,
         pool: Option<&Bound<'_, LatentPool>>,
         image_builder: Option<&Bound<'_, PyAny>>,
@@ -462,7 +443,7 @@ impl BatchState {
 
     /// Install active calls' KV assignments and retain their physical access.
     /// Callbacks only copy numerical tables and reset recycled cache units.
-    fn bind_cache(
+    pub(super) fn bind_cache(
         &self,
         py: Python<'_>,
         cache: &Bound<'_, KVCacheManager>,
@@ -631,36 +612,8 @@ impl BatchState {
         Ok(())
     }
 
-    #[getter]
-    pub(super) fn route(&self) -> Option<&'static str> {
-        self.plan.calls.first().map(|call| call.code.as_str())
-    }
-
-    /// Enter the numerical stream, or retain the caller's current stream.
-    pub(super) fn scope(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        let py = slf.py();
-        let stream = slf
-            .borrow()
-            .stream
-            .as_ref()
-            .map(|stream| stream.clone_ref(py));
-        match stream {
-            Some(stream) => py.import("torch.cuda")?.call_method1("stream", (stream,)),
-            None => py.import("contextlib")?.call_method0("nullcontext"),
-        }
-        .map(Bound::unbind)
-    }
-
-    #[getter]
-    pub(super) fn output_buffer(&self, py: Python<'_>) -> PyResult<Py<OutputBuffer>> {
-        self.buffer
-            .as_ref()
-            .map(|buffer| buffer.clone_ref(py))
-            .ok_or_else(|| PyRuntimeError::new_err("batch has no reserved output buffer"))
-    }
-
     /// Bind all output rows before exposing any to numerical execution.
-    fn bind_outputs(
+    pub(super) fn bind_outputs(
         slf: &Bound<'_, Self>,
         requests: &Bound<'_, RequestPool>,
         buffer: Py<OutputBuffer>,
@@ -718,6 +671,102 @@ impl BatchState {
         Ok(())
     }
 
+    /// Read completed U8 predicates once. Device-gated predicates remain tensors.
+    pub(super) fn resolve_predicates(slf: &Bound<'_, Self>) -> PyResult<HashSet<u64>> {
+        let py = slf.py();
+        let (inputs, plan, captures) = {
+            let this = slf.borrow();
+            (
+                this.inputs.clone_ref(py),
+                Arc::clone(&this.plan),
+                this.predicate_captures.clone(),
+            )
+        };
+        let Some(buffer) = inputs.borrow(py).predicate(py) else {
+            return Ok(HashSet::new());
+        };
+        if !buffer.get().ready(py)? {
+            return Err(PyRuntimeError::new_err(
+                "prepared predicates were observed before readiness",
+            ));
+        }
+
+        let mut predicated = HashSet::new();
+        let read = (|| -> PyResult<()> {
+            for (row, (index, span)) in captures.into_iter().enumerate() {
+                let (offset, count) = span.ok_or_else(|| {
+                    PyRuntimeError::new_err("sealed predicate buffer has an uncaptured row")
+                })?;
+                let value = buffer.get().with_readback(py, |buffer| {
+                    match buffer.read_tokens(offset, count)? {
+                        [0] => Ok(false),
+                        [1] => Ok(true),
+                        _ => Err(uniserve_worker::Error::Invalid(
+                            "call predicate is not a canonical boolean".into(),
+                        )),
+                    }
+                })?;
+                if !value {
+                    predicated.insert(plan.calls[index].request_key.request_id.0);
+                }
+                buffer.get().observe(py, row)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = read {
+            OutputBuffer::abandon(buffer.bind(py))?;
+            return Err(error);
+        }
+
+        inputs.borrow_mut(py).set_predicate(None);
+        Ok(predicated)
+    }
+}
+
+#[pymethods]
+impl BatchState {
+    #[getter]
+    fn batch_id(&self) -> u64 {
+        self.plan.batch_id
+    }
+
+    /// Return numerical forward rows in their scheduler-supplied order.
+    fn forward_rows<'py>(&self, py: Python<'py>, request_id: u64) -> PyResult<Bound<'py, PyTuple>> {
+        let rows = self
+            .request_indexes
+            .get(&request_id)
+            .map_or(&[][..], |&index| self.forward_indices[index].as_slice());
+        PyTuple::new(py, rows)
+    }
+
+    #[getter]
+    pub(super) fn route(&self) -> Option<&'static str> {
+        self.plan.calls.first().map(|call| call.code.as_str())
+    }
+
+    /// Enter the numerical stream, or retain the caller's current stream.
+    pub(super) fn scope(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let stream = slf
+            .borrow()
+            .stream
+            .as_ref()
+            .map(|stream| stream.clone_ref(py));
+        match stream {
+            Some(stream) => py.import("torch.cuda")?.call_method1("stream", (stream,)),
+            None => py.import("contextlib")?.call_method0("nullcontext"),
+        }
+        .map(Bound::unbind)
+    }
+
+    #[getter]
+    pub(super) fn output_buffer(&self, py: Python<'_>) -> PyResult<Py<OutputBuffer>> {
+        self.buffer
+            .as_ref()
+            .map(|buffer| buffer.clone_ref(py))
+            .ok_or_else(|| PyRuntimeError::new_err("batch has no reserved output buffer"))
+    }
+
     /// Borrow the complete set of output rows in scheduler call order.
     fn pending_outputs(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         if self.outputs.len() != self.plan.calls.len() {
@@ -739,64 +788,6 @@ impl BatchState {
             .ok_or_else(|| PyRuntimeError::new_err("request has no reserved pending output"))
     }
 
-    /// Read completed U8 predicates once. Device-gated predicates remain tensors.
-    fn predicate_values(slf: &Bound<'_, Self>) -> PyResult<Py<PyDict>> {
-        let py = slf.py();
-        let (inputs, batch, captures) = {
-            let this = slf.borrow();
-            if let Some(values) = &this.predicate_values {
-                return Ok(values.clone_ref(py));
-            }
-            (
-                this.inputs.clone_ref(py),
-                this.batch.clone_ref(py),
-                this.predicate_captures.clone(),
-            )
-        };
-        let Some(buffer) = inputs.borrow(py).predicate(py) else {
-            return Ok(PyDict::new(py).unbind());
-        };
-        if !buffer.get().ready(py)? {
-            return Err(PyRuntimeError::new_err(
-                "prepared predicates were observed before readiness",
-            ));
-        }
-
-        let values = PyDict::new(py);
-        let read = (|| -> PyResult<()> {
-            let calls = batch.bind(py).getattr("calls")?;
-            for (row, (index, span)) in captures.into_iter().enumerate() {
-                let (offset, count) = span.ok_or_else(|| {
-                    PyRuntimeError::new_err("sealed predicate buffer has an uncaptured row")
-                })?;
-                let value = buffer.get().with_readback(py, |buffer| {
-                    match buffer.read_tokens(offset, count)? {
-                        [0] => Ok(false),
-                        [1] => Ok(true),
-                        _ => Err(uniserve_worker::Error::Invalid(
-                            "call predicate is not a canonical boolean".into(),
-                        )),
-                    }
-                })?;
-                let call = calls.get_item(index)?;
-                values.set_item(
-                    (call.getattr("request_key")?, call.getattr("call_id")?),
-                    value,
-                )?;
-                buffer.get().observe(py, row)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = read {
-            OutputBuffer::abandon(buffer.bind(py))?;
-            return Err(error);
-        }
-
-        slf.borrow_mut().predicate_values = Some(values.clone().unbind());
-        inputs.borrow_mut(py).set_predicate(None);
-        Ok(values.unbind())
-    }
-
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.batch)?;
         visit.call(&self.inputs)?;
@@ -804,7 +795,6 @@ impl BatchState {
         for output in &self.outputs {
             visit.call(output)?;
         }
-        visit.call(&self.predicate_values)?;
         visit.call(&self.stream)?;
         visit.call(&self.forward_stats)?;
         visit.call(&self.component_us)?;
@@ -815,7 +805,6 @@ impl BatchState {
         self.batch = py.None();
         self.outputs.clear();
         self.buffer = None;
-        self.predicate_values = None;
         self.stream = None;
         self.predicate_captures.clear();
         self.forward_stats = PyList::empty(py).unbind();

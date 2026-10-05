@@ -45,7 +45,6 @@ if TYPE_CHECKING:
     import torch
 
     from uniserve_worker._uniserve_ipc import SharedRead
-    from uniserve_worker.config.deployment import ComponentConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.protocol.batch import TensorExport
     from uniserve_worker.storage.tensor_store import TensorStore
@@ -58,28 +57,6 @@ __all__ = ["HOST_MEDIA_CALLS", "execute"]
 HOST_MEDIA_CALLS = frozenset(
     {MediaCall.VIDEO_ENCODING, MediaCall.AUDIO_ENCODING, MediaCall.MUXING}
 )
-
-
-def encoded_unit_positions(
-    call: Call, *, state: BatchState, component: ComponentConfig, rank: int
-) -> tuple[int, ...]:
-    """Return the positions within the decode round this rank encodes.
-
-    A round's units are dealt to the encoder's ranks in order, each taking
-    ``units_per_rank`` consecutive positions, the same order the engine used
-    to project the call onto its ranks. The result is empty for a rank whose
-    first position is at or past the round's ``max_units``.
-
-    Raises:
-        ValueError: When ``rank`` is not one of the component's ranks.
-    """
-    from uniserve_worker.execution.media import decode_range
-
-    params = decode_range(call, state=state)
-    per_rank = max(1, int(component.units_per_rank))
-    position = component.ranks.index(rank)
-    first = position * per_rank
-    return tuple(range(first, min(first + per_rank, int(params.max_units))))
 
 
 def _input_export(
@@ -290,18 +267,7 @@ def execute(
     tasks: tuple[HostTask, ...] = ()
     finish: Callable[[tuple[object, ...]], None] | None = None
     if call.kind is MediaCall.VIDEO_ENCODING:
-        binding = model_runner.bindings[call.component]
-        positions = encoded_unit_positions(
-            call,
-            state=state,
-            component=binding.config,
-            rank=model_runner.worker_config.rank,
-        )
-        if len(positions) != len(reservations):
-            raise invalid_descriptor(
-                "video encoding reserved a different number of lane slots "
-                "than the media units it takes"
-            )
+        positions = request.media_units
         from uniserve_worker.execution.media import decode_range
 
         cursor = int(decode_range(call, state=state).cursor)

@@ -140,9 +140,8 @@ def _validate_completion_products(
 def publish_predicates(*, state: BatchState, tensor_store: TensorStore) -> None:
     """Publish true into the completion outputs of calls that ran.
 
-    Predicated calls already published false through
-    ``prepare._publish_predicated_outputs``, and a call whose execution wrote
-    its own completion output is skipped.
+    Native batch preparation writes false for predicated calls. A call whose
+    execution wrote its own completion output is skipped.
     """
     writes = tuple(
         request.completion_write

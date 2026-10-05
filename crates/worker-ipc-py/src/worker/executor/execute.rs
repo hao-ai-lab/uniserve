@@ -31,7 +31,7 @@ impl PythonBackend {
         with_context(&scope, || {
             let mut phase = "batch registration";
             let executed = (|| {
-                runner.call_method1("reserve", (&numerical,))?;
+                self.reserve_batch(py, batch)?;
                 phase = "batch execution";
                 self.execute_calls(py, batch)?;
                 phase = "batch commit";

@@ -30,8 +30,6 @@ from uniserve_worker.execution.output import (
     TokenUpdate,
 )
 from uniserve_worker.execution.request import RequestResult
-from uniserve_worker.model_executor.diffusion_inputs import ImageBuilder
-from uniserve_worker.model_executor.media_inputs import MediaBuilder
 from uniserve_worker.protocol.batch import (
     Batch,
     BufferAllocation,
@@ -49,7 +47,6 @@ from uniserve_worker.protocol.call import (
 from uniserve_worker.protocol.identity import (
     BufferId,
     CallId,
-    CallIdentity,
     RequestKey,
 )
 from uniserve_worker.protocol.output import (
@@ -294,40 +291,8 @@ class BatchState:
     def scope(self) -> AbstractContextManager[None]: ...
     def forward_rows(self, request_id: int) -> tuple[int, ...]:
         """Return numerical forward rows in scheduler order."""
-    def bind_cache(
-        self,
-        cache: KVCacheManager,
-        tables: BlockTables,
-        copy: Callable[..., None],
-        recycle: Callable[[tuple[int, ...]], None],
-    ) -> None:
-        """Install active KV assignments and retain physical accesses."""
-    def bind_outputs(
-        self,
-        requests: RequestPool,
-        buffer: OutputBuffer,
-        started_ns: int,
-        predicated: set[int],
-    ) -> None:
-        """Bind all output rows atomically in scheduler call order."""
-    def complete_inputs(
-        self,
-        tensors: TensorStore,
-        latents: LatentPool | None,
-        cache: KVCacheManager | None,
-    ) -> None:
-        """Adopt active prepared inputs after ordering their producer fences."""
-    def bind_latents(
-        self,
-        pool: LatentPool | None,
-        image_builder: ImageBuilder | None,
-        media_builder: MediaBuilder | None,
-    ) -> None:
-        """Bind active intervals and latent views from model dimensions."""
     def pending_outputs(self) -> tuple[PendingOutput, ...]: ...
     def pending_output(self, request_id: int) -> PendingOutput: ...
-    def predicate_values(self) -> dict[CallIdentity, bool]:
-        """Read completed U8 predicates once, retaining device predicates."""
 
 @final
 class BatchInputs:
@@ -382,6 +347,7 @@ class PendingOutput:
     device_reads: list[TensorRead]
     feature_reads: list[TensorRead]
     writes: list[Buffer]
+    media_units: tuple[int, ...]
     predicate: tuple[torch.Tensor, bool] | None
     token_write: Buffer | None
     transition_write: Buffer | None
