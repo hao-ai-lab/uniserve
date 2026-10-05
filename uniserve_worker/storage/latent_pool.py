@@ -60,10 +60,10 @@ def _allocate(
     timesteps = torch.empty(
         (request_pool_size + 1, 1), dtype=torch.float32, device=device
     )
-    page_staging = HostBuffers(
+    page_host = HostBuffers(
         num_pages - 1, dtype=torch.int64, depth=1, device=device
     )
-    return storage, step_buffer, page_table_buffer, timesteps, page_staging
+    return storage, step_buffer, page_table_buffer, timesteps, page_host
 
 
 @contextmanager
@@ -83,15 +83,15 @@ def _stage(
     page_units: int,
     page_table_buffer: torch.Tensor,
     step_buffer: torch.Tensor,
-    page_staging: HostBuffers,
+    page_host: HostBuffers,
 ) -> tuple[LatentStaging, ...]:
     pages = tuple(page for table in page_tables for page in table)
-    slot, host = page_staging.acquire()
+    slot, host = page_host.acquire()
     fill_cpu_ints(host, pages)
     page_table_buffer[page_offset : page_offset + len(pages)].copy_(
         host[: len(pages)], non_blocking=page_table_buffer.is_cuda
     )
-    page_staging.record_copy(slot)
+    page_host.record_copy(slot)
 
     result = []
     for table in page_tables:

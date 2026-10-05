@@ -18,6 +18,66 @@ mod host;
 
 #[repr(C)]
 #[derive(Object)]
+#[type_key = "uniserve.ffi.HostBuffers"]
+pub struct HostBuffersObj {
+    object: Object,
+    buffers: Mutex<uniserve_worker::HostBuffers<Tensor>>,
+}
+
+#[derive(Clone, ObjectRef)]
+pub struct HostBuffers {
+    data: ObjectArc<HostBuffersObj>,
+}
+
+impl HostBuffers {
+    fn new(buffers: Array<Tensor>, device: Option<i64>) -> Result<Self> {
+        let device = device
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|error| failure(error.to_string()))?;
+        let buffers = uniserve_worker::HostBuffers::new(buffers.iter().collect(), device)
+            .map_err(|error| failure(error.to_string()))?;
+        Ok(Self {
+            data: ObjectArc::new(HostBuffersObj {
+                object: Object::new(),
+                buffers: Mutex::new(buffers),
+            }),
+        })
+    }
+
+    fn acquire(&self) -> Result<Array<Any>> {
+        let mut buffers = lock(&self.data.buffers)?;
+        let (slot, tensor) = buffers
+            .acquire()
+            .map_err(|error| failure(error.to_string()))?;
+        Ok([(slot as i64).into(), tensor.clone().into()]
+            .into_iter()
+            .collect())
+    }
+
+    fn record_copy(&self, slot: i64) -> Result<()> {
+        let slot = usize::try_from(slot).map_err(|error| failure(error.to_string()))?;
+        let mut buffers = lock(&self.data.buffers)?;
+        let stream = match buffers.device() {
+            Some(device) => unsafe { tvm_ffi::tvm_ffi_sys::TVMFFIEnvGetStream(2, device) as usize },
+            None => 0,
+        };
+        buffers
+            .record_copy(slot, stream)
+            .map_err(|error| failure(error.to_string()))
+    }
+
+    fn close(&self) -> Result<()> {
+        let retired = lock(&self.data.buffers)?
+            .close()
+            .map_err(|error| failure(error.to_string()))?;
+        drop(retired);
+        Ok(())
+    }
+}
+
+#[repr(C)]
+#[derive(Object)]
 #[type_key = "uniserve.ffi.HostLane"]
 pub struct HostLaneObj {
     object: Object,
@@ -366,6 +426,28 @@ fn register() -> Result<()> {
     object::<RequestPoolObj>();
     object::<HostLaneObj>();
     object::<HostTaskObj>();
+    object::<HostBuffersObj>();
+
+    method::<HostBuffersObj>(
+        "__ffi_init__",
+        Function::from_typed(HostBuffers::new),
+        "Own host input tensors and their copy fences for an optional CUDA device.",
+    )?;
+    method::<HostBuffersObj>(
+        "acquire",
+        Function::from_typed(|buffers: HostBuffers| buffers.acquire()),
+        "Wait for the next slot's previous copy and return its index and tensor.",
+    )?;
+    method::<HostBuffersObj>(
+        "record_copy",
+        Function::from_typed(|buffers: HostBuffers, slot: i64| buffers.record_copy(slot)),
+        "Fence this slot's copy on the CUDA stream selected through TVM-FFI.",
+    )?;
+    method::<HostBuffersObj>(
+        "close",
+        Function::from_typed(|buffers: HostBuffers| buffers.close()),
+        "Drain copies and release host inputs.",
+    )?;
 
     method::<HostLaneObj>(
         "__ffi_init__",

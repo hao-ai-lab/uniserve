@@ -16,6 +16,7 @@ use uniserve_worker_ipc::{BufferId, LatentParams, RequestKey};
 
 use super::completion::{Completion, CompletionRef};
 use super::error::{invalid, native_error};
+use super::host_buffers::HostBuffers;
 use super::protocol::{buffer_id, call_id, request_key};
 use super::transfer::{TransferRef, TransferTicket};
 
@@ -197,7 +198,7 @@ pub(crate) struct LatentPool {
     page_table_buffer: Py<PyAny>,
     #[pyo3(get)]
     timesteps: Py<PyAny>,
-    page_staging: Py<PyAny>,
+    page_host: Py<HostBuffers>,
     inner: NativeLatentPool<ImportRef, ExportRef>,
     #[pyo3(get)]
     exports: Py<PyDict>,
@@ -249,7 +250,7 @@ impl LatentPool {
             step_buffer: allocated.get_item(1)?.unbind(),
             page_table_buffer: allocated.get_item(2)?.unbind(),
             timesteps: allocated.get_item(3)?.unbind(),
-            page_staging: allocated.get_item(4)?.unbind(),
+            page_host: allocated.get_item(4)?.extract()?,
             inner,
             exports: PyDict::new(py).unbind(),
         })
@@ -363,7 +364,7 @@ impl LatentPool {
                 self.inner.page_units(),
                 &self.page_table_buffer,
                 &self.step_buffer,
-                &self.page_staging,
+                &self.page_host,
             ))?
             .cast_into::<PyTuple>()?
             .unbind())
@@ -790,7 +791,7 @@ impl LatentPool {
         let py = slf.py();
         let buffers = {
             let owner = slf.borrow();
-            owner.page_staging.bind(py).call_method0("close")?;
+            owner.page_host.get().close(py)?;
             owner
                 .inner
                 .exports()
@@ -837,10 +838,10 @@ impl LatentPool {
             &self.step_buffer,
             &self.page_table_buffer,
             &self.timesteps,
-            &self.page_staging,
         ] {
             visit.call(value)?;
         }
+        visit.call(&self.page_host)?;
         visit.call(&self.exports)?;
         for write in self.inner.imports() {
             visit.call(&write.owner)?;

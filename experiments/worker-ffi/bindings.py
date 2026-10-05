@@ -29,6 +29,10 @@ class HostTask(tvm_ffi.Object):
     """A native host result; numerical tensors remain inside the callback."""
 
 
+class HostBuffers(tvm_ffi.Object):
+    """Host input tensors and native copy fences shared with production."""
+
+
 def load_library(filename: str) -> None:
     """Load the explicitly selected library and bind its reflected methods."""
     global _module
@@ -40,3 +44,4 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.RequestPool")(RequestPool)
     tvm_ffi.register_object("uniserve.ffi.HostLane")(HostLane)
     tvm_ffi.register_object("uniserve.ffi.HostTask")(HostTask)
+    tvm_ffi.register_object("uniserve.ffi.HostBuffers")(HostBuffers)
