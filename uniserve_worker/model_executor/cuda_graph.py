@@ -323,7 +323,7 @@ class Execution:
         if self.microbatches is None:
             return call(value)
         for peer in self.peers:
-            peer.context.experts.invoked.clear()
+            peer.context.experts.reset_layers()
         results = self.microbatches(
             [
                 (lambda: call(value))

@@ -82,6 +82,7 @@ __all__ = [
     "EventPool",
     "EventPoolError",
     "Executor",
+    "ExpertExchange",
     "GraphStorage",
     "GroupShape",
     "GroupTable",
@@ -121,6 +122,49 @@ __all__ = [
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")
+
+@final
+class ExpertExchange:
+    """Rank readiness, expert-step selection and layer participation."""
+
+    def __init__(
+        self,
+        ranks: Sequence[int],
+        rank: int,
+        memberships: Sequence[Sequence[int]],
+        *,
+        attention_ranks: int,
+        max_tokens: int,
+        fused: bool,
+        local: object,
+        records: object,
+        gather: Callable[[], None],
+        prepare: Callable[[], None] | None,
+        broadcast: Callable[[], None] | None,
+    ) -> None: ...
+    def agree(
+        self, tokens: int, *, kind: int = 0, leaving: bool = False
+    ) -> int: ...
+    def warmup(self, capacity: int) -> int: ...
+    def begin(self, capacity: int) -> None: ...
+    def end(self) -> None: ...
+    def enter(self, module: int) -> None: ...
+    def pending_layers(self, modules: Sequence[int]) -> list[int]: ...
+    def reset_layers(self) -> None: ...
+    def record_layers(self, modules: Iterable[int]) -> None: ...
+    @property
+    def invoked(self) -> frozenset[int]: ...
+    @property
+    def capacities(self) -> tuple[int, ...]: ...
+    @property
+    def capacity(self) -> int: ...
+    @property
+    def kind(self) -> int: ...
+    @property
+    def active(self) -> bool: ...
+    @property
+    def released(self) -> bool: ...
+    def close(self) -> None: ...
 
 @final
 class WeightPrefetch:

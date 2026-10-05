@@ -180,6 +180,25 @@ def _run(rank, port, grouped=False):
         else:
             assert eager.shape == captured.shape == (0, HIDDEN)
 
+        if grouped:
+            # One source group cannot mix forwards from different runners.
+            assert exchange.agree(40, kind=rank) == 0
+            assert not exchange.active
+            assert exchange.agree(40, kind=0) == CAPACITY
+            assert exchange.active
+        else:
+            # Independent sources retain their work until their kind is next.
+            for kind in (1, 0, 1):
+                assert exchange.agree(40, kind=rank) == CAPACITY
+                assert exchange.kind == kind
+                assert exchange.active == (rank == kind)
+
+        assert exchange.agree(0, leaving=rank == 0) == 0
+        assert not exchange.released
+        assert exchange.agree(0, leaving=True) == 0
+        assert exchange.released
+        exchange.close()
+
 
 def _free_port():
     with socket.socket() as probe:

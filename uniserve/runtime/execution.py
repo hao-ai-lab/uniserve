@@ -704,25 +704,14 @@ class ExecutionContext(Generic[SizeT]):
         exchange = self.experts
         if exchange is None or not exchange.capacity:
             return
-        invoked = exchange.invoked
-        pending = [
-            binding
-            for binding in self._moe.values()
+        modules = [
+            module
+            for module, binding in self._moe.items()
             if binding.exchange is exchange
-            and id(binding.module) not in invoked
         ]
-        if not pending:
-            return
-        # The reached layers precede the skipped ones in module order.
-        order = list(self._moe.values())
-        if any(
-            id(binding.module) in invoked
-            for binding in order[order.index(pending[0]) :]
-        ):
-            raise RuntimeError(
-                "a forward skipped an expert layer before one it reached"
-            )
-        for binding in pending:
+
+        for module in exchange.pending_layers(modules):
+            binding = self._moe[module]
             binding.join(binding.module.hidden_size, self._dtype)
 
     def bind_attention(self, batch, *, replay=False):
