@@ -8,7 +8,7 @@ import torch
 from uniserve.nn import Linear
 from uniserve.runtime import CUDAStream, ExecutionContext
 from uniserve.runtime.cuda import CUDAError, verify_graph_context
-from uniserve.runtime.cuda_graph import CUDAGraph
+from uniserve.runtime.cuda_graph import CUDAGraph, CUDAGraphError
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -71,6 +71,43 @@ def test_closing_a_graph_keeps_its_siblings_replayable():
     finally:
         for graph in graphs:
             graph.close()
+        torch.cuda.synchronize(device)
+        context.close()
+        stream.close()
+
+
+@torch.inference_mode()
+def test_capture_can_retry_after_a_failed_call():
+    device = torch.device("cuda:0")
+    stream = CUDAStream.external(torch.cuda.Stream(device=device))
+    module = Linear(256, 256, bias=False).to(
+        device=device, dtype=torch.bfloat16
+    )
+    context = ExecutionContext(module, stream=stream)
+    context.prepare(None)
+    x = torch.randn(64, 256, device=device, dtype=torch.bfloat16)
+    pool = torch.cuda.MemPool()
+    graph = CUDAGraph(context=context, pools={device: pool})
+    failure = ValueError("numerical call failed")
+
+    def rejected():
+        module(x)
+        raise failure
+
+    try:
+        with context.activate():
+            expected = module(x).clone()
+
+        with pytest.raises(CUDAGraphError) as raised:
+            graph.capture(rejected)
+        assert raised.value.__cause__ is failure
+
+        graph.capture(lambda: module(x))
+        actual = graph.replay()
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        graph.close()
         torch.cuda.synchronize(device)
         context.close()
         stream.close()

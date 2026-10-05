@@ -188,6 +188,9 @@ class CUDAGraph(Generic[ResultT]):
                     # would defeat their shared allocation lifetime.
                     torch.cuda.synchronize(device)
                     torch.cuda.empty_cache()
+                    # Like torch.cuda.graph, retire unused pinned-host pools
+                    # before reusing a pool whose last graph was reset.
+                    torch._C._host_emptyCache()
                     # Warmup can run on a different host thread. cuBLAS
                     # handles are thread-local and must be created before
                     # capture, on the stream that will use their workspace.
