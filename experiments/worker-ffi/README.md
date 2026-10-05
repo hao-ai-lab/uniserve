@@ -14,24 +14,43 @@ Public objects and methods are registered in `src/lib.rs` and `src/stream.rs`; P
 
 `CUDAStream(device, handle, event_slots)` binds native submission fences to a borrowed numerical stream; `partition_streams(device, sm_counts)` creates owned Green Context streams. Both use the production stream owner. `fork()` retains the partition independently, and `handle()` supplies a PyTorch `ExternalStream` view. `wait()` orders execution after the producer selected by `tvm_ffi.use_torch_stream`; `record()` returns a native event for a later consumer join. The event retains its producer's SM partition after the stream closes. Event waits and readiness queries use the same native CUDA implementation as production.
 
-Call `close()` before releasing the final owner of resources with outstanding GPU work. FFI method calls release the GIL, but TVM-FFI 0.1.12's object deallocation holds it. Native destructors still drain device accesses; if their completion requires another Python thread to run, implicit destruction can deadlock. This applies to `Executor`, `HostBuffers` and `CUDAStream`. A production replacement needs final-reference disposal that releases the GIL while preserving shared ownership. Closing from a Python wrapper finalizer would prematurely retire resources still owned by native references.
+Resource destruction must let independent Python work proceed while draining GPU accesses. The experiment builds TVM-FFI v0.1.12 with `tvm-ffi-object-release.patch`: ordinary objects and `CAny` release their native references outside the GIL. `CAny` also takes the owned result of argument conversion directly, avoiding an extra reference that prevents destruction. Native shared ownership determines when resources close, including through FFI containers; Python wrapper finalizers do not close resources. Explicit `close()` remains available for deterministic shutdown. Unmodified TVM-FFI 0.1.12 holds the GIL during object disposal and can deadlock when device completion needs another Python thread.
 
 The `Executor` numerical callback runs on the submitting thread. It must run one homogeneous batch on CPU or on the selected CUDA stream and device. For CUDA, enter both `torch.cuda.stream(stream)` and `tvm_ffi.use_torch_stream(stream)` around submission. The callback receives ordinary `torch.Tensor` arguments through `convert_func(..., tensor_cls=torch.Tensor)`. Polling only queries completion; it does not synchronize the host with pending GPU work. Delivered tensors are physically complete and can be consumed on another CUDA stream. Explicit waits and shutdown drain pending accesses. Tensor references retain allocations, while native executor delivery returns admission capacity.
 
 Internal execution ownership uses ordinary Rust `Arc` and `Mutex`; it does not depend on the reflected object hierarchy. The pinned Rust SDK makes `Function` implement `Send` and `Sync`, which permits native host threads to invoke Python callbacks through TVM-FFI's interpreter entry. Its tensor, byte and error handles do not have those Rust traits. The experiment adds no `Send` or `Sync` implementations. FFI return values are converted on the host thread, and task results retain ordinary Rust bytes and error strings. Error transfer follows TVM-FFI's serialization representation: kind, message and backtrace. It preserves the exception type and callback frames, without retaining arbitrary native error payloads across threads. The Rust SDK has no public string constructor for `ErrorKind`, so the binding reconstructs the error through the stable C API on the observing thread.
 
-The Rust dependency is pinned to upstream commit `df463f9bd269867fc7f4d578d62d80cc2a11d004`. The published `0.1.0-alpha.0` export macro lacks the unmangled symbol required for a loadable module; the pinned upstream macro exports it and contains panic-to-error handling. The Python environment remains at the repository-locked `apache-tvm-ffi==0.1.12` and `torch==2.13.0+cu130`.
+The Rust dependency is pinned to upstream commit `df463f9bd269867fc7f4d578d62d80cc2a11d004`. The published `0.1.0-alpha.0` export macro lacks the unmangled symbol required for a loadable module; the pinned upstream macro exports it and contains panic-to-error handling. The isolated environment uses the repository's locked dependencies, including PyTorch, with only TVM-FFI replaced by the patched source build. Its wheel has a development version assigned by upstream's build system. The production environment and lockfile retain `apache-tvm-ffi==0.1.12` and `torch==2.13.0+cu130`.
 
 From the repository root:
 
 ```bash
-export PATH="$PWD/.venv/bin:$PATH"
-cargo build --locked --manifest-path experiments/worker-ffi/Cargo.toml --target-dir artifacts/rust-worker/tvm-ffi/target
-cargo run --locked --manifest-path experiments/worker-ffi/Cargo.toml --target-dir artifacts/rust-worker/tvm-ffi/target --example wire_fixture > artifacts/rust-worker/tvm-ffi/request.bin
-.venv/bin/python -m pytest -q experiments/worker-ffi --ffi-library "$PWD/artifacts/rust-worker/tvm-ffi/target/debug/libuniserve_worker_ffi.so" --ffi-request "$PWD/artifacts/rust-worker/tvm-ffi/request.bin"
+FFI_EXPERIMENT="$PWD/artifacts/rust-worker/ffi-retirement"
+UV_PROJECT_ENVIRONMENT="$FFI_EXPERIMENT/venv" uv sync --locked --python /usr/bin/python3.12 --extra dev --extra test --extra bench --extra gpu --no-install-project
+git clone --branch v0.1.12 --depth 1 --recurse-submodules --shallow-submodules https://github.com/apache/tvm-ffi "$FFI_EXPERIMENT/tvm-ffi"
+git -C "$FFI_EXPERIMENT/tvm-ffi" apply "$PWD/experiments/worker-ffi/tvm-ffi-object-release.patch"
+uv build --python "$FFI_EXPERIMENT/venv/bin/python" --wheel --out-dir "$FFI_EXPERIMENT/wheels" "$FFI_EXPERIMENT/tvm-ffi"
+uv pip install --python "$FFI_EXPERIMENT/venv/bin/python" --no-deps "$FFI_EXPERIMENT"/wheels/*.whl
+
+export PATH="$FFI_EXPERIMENT/venv/bin:$PATH"
+cargo build --locked --manifest-path experiments/worker-ffi/Cargo.toml --target-dir "$FFI_EXPERIMENT/target"
+cargo run --locked --manifest-path experiments/worker-ffi/Cargo.toml --target-dir "$FFI_EXPERIMENT/target" --example wire_fixture > "$FFI_EXPERIMENT/request.bin"
+"$FFI_EXPERIMENT/venv/bin/python" -m pytest -q experiments/worker-ffi --ffi-library "$FFI_EXPERIMENT/target/debug/libuniserve_worker_ffi.so" --ffi-request "$FFI_EXPERIMENT/request.bin"
 ```
 
 The full suite requires CUDA. It exercises CPU and GPU module execution, strided shared tensor storage, callback failure after device submission, cross-stream consumption, cancellation, capacity through result delivery, independent completion, concurrent Python callers, shutdown and executor destruction, and native request admission and retirement from an IPC message. The host tests cover native-thread PyTorch execution, byte and staging results, input reclamation, exception type and traceback, reentrant observers, and shutdown while Python work is pending. Warmup precedes checks that require outstanding GPU work, so first-use allocation or kernel loading does not turn them into synchronous calls. Generated libraries, messages, and logs belong under `artifacts/`.
+
+Final-owner tests hold a CUDA stream behind a device gate. `HostBuffers`, `Executor` and `CUDAStream` must drain outstanding work during destruction while another Python thread releases that gate. Each resource is exercised through a direct reference, `Array` and `CAny`. A separate process contains deadlocks because an in-process timeout cannot reliably run when a native destructor holds the GIL. Existing shared-owner tests ensure that releasing one wrapper does not close another owner's resource.
+
+`profile_retirement.py` captures the same lifetime boundary after CUDA Graph replay, using finite device work so both patched and unmodified dependencies can finish. Run the workload serially in each environment and inspect the `gil-held-wait` rule as described in [Execution profiling](../../docs/profiling.md):
+
+```bash
+nsys profile --trace=cuda,nvtx,python-gil --cuda-trace-all-apis=true --cuda-graph-trace=graph --sample=process-tree --cudabacktrace=sync:0,memory:0 --python-backtrace=cuda --export=sqlite --output="$FFI_EXPERIMENT/retirement" \
+  "$FFI_EXPERIMENT/venv/bin/python" experiments/worker-ffi/profile_retirement.py --ffi-library "$FFI_EXPERIMENT/target/debug/libuniserve_worker_ffi.so"
+.venv/bin/python -m uniserve.sanitizer trace "$FFI_EXPERIMENT/retirement.sqlite" --rule gil-held-wait
+```
+
+This capture diagnoses GIL ownership during GPU retirement; it is not a throughput measurement. Inspect recorded synchronization coverage as well as hints: a leaked reference can suppress destruction entirely and produce no wait to analyze.
 
 This is a feasibility experiment, not a serving implementation or throughput result. Numerical callbacks execute through the production native executor, but consume prepared tensors rather than IPC call plans. Native request commands and host execution are exercised separately. Host callbacks produce completed CPU outputs; the experiment does not move owning FFI tensor handles or outstanding CUDA accesses into host tasks. The experiment does not replace production KV/latent pools, transfers, the IPC service loop, graphs, distributed collectives, or model loading. Adopting TVM-FFI for the worker requires moving those owners to native state and replacing their consumers together; forwarding their current Python attribute operations through callbacks would preserve the interpreter dependency this interface is intended to remove. End-to-end model, graph, cancellation, and AFD validation remains necessary for that replacement.
 

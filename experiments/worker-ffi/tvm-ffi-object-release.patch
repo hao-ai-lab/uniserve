@@ -1,0 +1,55 @@
+diff --git a/python/tvm_ffi/cython/object.pxi b/python/tvm_ffi/cython/object.pxi
+index c564b42..373735d 100644
+--- a/python/tvm_ffi/cython/object.pxi
++++ b/python/tvm_ffi/cython/object.pxi
+@@ -103,9 +103,15 @@ cdef class CObject:
+         self.chandle = NULL
+
+     def __dealloc__(self):
+-        if self.chandle != NULL:
+-            CHECK_CALL(TVMFFIObjectDecRef(self.chandle))
++        cdef TVMFFIObjectHandle handle = self.chandle
++        cdef int ret_code
++
++        if handle != NULL:
+             self.chandle = NULL
++            # Native destruction may wait for work on another Python thread.
++            with nogil:
++                ret_code = TVMFFIObjectDecRef(handle)
++            CHECK_CALL(ret_code)
+
+     def __ctypes_handle__(self) -> object:
+         return ctypes_handle(self.chandle)
+@@ -803,8 +809,7 @@ cdef class CAny:
+     def __init__(self, value=None):
+         """Pack a Python value into an owned :c:type:`TVMFFIAny`.
+
+-        Uses ``TVMFFIPyPyObjectToFFIAny`` to produce a non-owning AnyView,
+-        then ``TVMFFIAnyViewToOwnedAny`` to convert to an owned Any.
++        Uses ``TVMFFIPyPyObjectToFFIAny`` to produce an owned Any.
+
+         Parameters
+         ----------
+@@ -824,14 +829,20 @@ cdef class CAny:
+             &c_api_ret_code
+         )
+         CHECK_CALL(c_api_ret_code)
+-        CHECK_CALL(TVMFFIAnyViewToOwnedAny(&temp, &self.cdata))
++        self.cdata = temp
+
+     def __dealloc__(self):
+         """Release owned object reference, if any."""
++        cdef TVMFFIObjectHandle handle
++        cdef int ret_code
++
+         if self.cdata.type_index >= kTVMFFIStaticObjectBegin:
+             if self.cdata.v_obj != NULL:
+-                CHECK_CALL(TVMFFIObjectDecRef(<TVMFFIObjectHandle>self.cdata.v_obj))
++                handle = <TVMFFIObjectHandle>self.cdata.v_obj
+                 self.cdata.v_obj = NULL
++                with nogil:
++                    ret_code = TVMFFIObjectDecRef(handle)
++                CHECK_CALL(ret_code)
+
+     @property
+     def type_index(self) -> int:
