@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use uniserve_worker_ipc::{Batch, CallStatus, DType};
 
-use super::block_tables::{BlockTables, GroupTable};
+use super::block_tables::BlockTables;
 use super::completion::CompletionRef;
 use super::error::{invalid, native_error};
 use super::inputs::BatchInputs;
@@ -43,11 +43,6 @@ pub(crate) struct BatchState {
     predicate_entries: Py<PyList>,
     #[pyo3(get, set)]
     predicate_transfers: Py<PyTuple>,
-
-    #[pyo3(get, set)]
-    pub(super) input_products: Py<PyTuple>,
-    #[pyo3(get, set)]
-    pub(super) kv_inputs: Py<PyTuple>,
 
     #[pyo3(get, set)]
     stream: Option<Py<PyAny>>,
@@ -89,8 +84,6 @@ impl BatchState {
             inputs: Py::new(py, BatchInputs::new())?,
             predicate_entries: PyList::empty(py).unbind(),
             predicate_transfers: PyTuple::empty(py).unbind(),
-            input_products: PyTuple::empty(py).unbind(),
-            kv_inputs: PyTuple::empty(py).unbind(),
             stream: None,
             started_ns: 0,
             forward_stats: PyList::empty(py).unbind(),
@@ -141,23 +134,6 @@ impl BatchState {
     #[getter]
     fn batch_id(&self) -> u64 {
         self.plan.batch_id
-    }
-
-    fn slot_tables(
-        &self,
-        py: Python<'_>,
-        tables: &BlockTables,
-        slot: u32,
-    ) -> PyResult<Py<PyTuple>> {
-        let tables = tables
-            .tables
-            .for_batch(slot, &self.plan.block_tables)
-            .map_err(|error| native_error(py, error))?;
-        let views = tables
-            .into_iter()
-            .map(|table| Py::new(py, GroupTable { table }))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, views)?.unbind())
     }
 
     /// Return numerical forward rows in their scheduler-supplied order.
@@ -509,8 +485,6 @@ impl BatchState {
         visit.call(&self.predicate_entries)?;
         visit.call(&self.predicate_transfers)?;
         visit.call(&self.predicate_values)?;
-        visit.call(&self.input_products)?;
-        visit.call(&self.kv_inputs)?;
         visit.call(&self.stream)?;
         visit.call(&self.forward_stats)?;
         visit.call(&self.component_us)?;
@@ -525,8 +499,6 @@ impl BatchState {
         self.stream = None;
         self.predicate_entries = PyList::empty(py).unbind();
         self.predicate_transfers = PyTuple::empty(py).unbind();
-        self.input_products = PyTuple::empty(py).unbind();
-        self.kv_inputs = PyTuple::empty(py).unbind();
         self.forward_stats = PyList::empty(py).unbind();
         self.component_us = PyDict::new(py).unbind();
         self.products = PyTuple::empty(py).unbind();

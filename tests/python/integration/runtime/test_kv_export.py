@@ -23,6 +23,7 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.shared_storage import open_shared_storage
 from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.errors import WorkerError, WorkerErrorCode
 from uniserve_worker.protocol.batch import (
     BlockTable,
     CacheUnitAllocation,
@@ -681,6 +682,141 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         producer.close()
         consumer.close()
         released_consumer.close()
+
+
+def test_failed_batch_import_releases_earlier_destinations() -> None:
+    with (
+        execution_worker(transfer_backends=("shm",)) as producer,
+        execution_worker(transfer_backends=("shm",)) as consumer,
+    ):
+        admissions = tuple(
+            ar_params(51 + index, block_ids=(index,)) for index in range(2)
+        )
+        exports = []
+        for index, admission in enumerate(admissions):
+            extend = token_call(
+                admission.request_key,
+                call_id=CallId(2 * index + 1, 0),
+                predecessor=root_parent(admission),
+                mode=ForwardMode.PREFILL,
+                tokens=(3, 4),
+            )
+            extended = finalized_report(
+                producer,
+                producer.submit(
+                    execution_batch(
+                        batch_id=extend.call_id.batch_id,
+                        admissions=(admission,),
+                        calls=(extend,),
+                    )
+                ),
+            )
+            observation = record_completion(extend, extended)
+            export, _ = _export_call(
+                admission.request_key,
+                call_id=CallId(2 * index + 2, 0),
+                predecessor=observation.call_id,
+            )
+            published = (
+                finalized_report(
+                    producer,
+                    producer.submit(
+                        execution_batch(
+                            batch_id=export.call_id.batch_id,
+                            calls=(export,),
+                        )
+                    ),
+                )
+                .completions[0]
+                .kv_output
+            )
+            assert isinstance(published, KvTransfer)
+            exports.append(published)
+
+        # The first import can neither finish nor free its destination by
+        # observing producer readiness. The second requires a missing base.
+        locator, storage = _gated_copy(exports[0].tensors[0].locations[0])
+        try:
+            pending = _map_locations(
+                exports[0],
+                lambda tensor: (
+                    (locator,)
+                    if tensor is exports[0].tensors[0]
+                    else tensor.locations
+                ),
+            )
+            missing_base = replace(
+                exports[1].source, producer_call_id=CallId(3, 0)
+            )
+            transfers = (pending, replace(exports[1], base=missing_base))
+            calls = tuple(
+                _installation_call(
+                    admission,
+                    call_id=CallId(5, index),
+                    predecessor=root_parent(admission),
+                    source=export.source,
+                )[0]
+                for index, (admission, export) in enumerate(
+                    zip(admissions, exports, strict=True)
+                )
+            )
+            with pytest.raises(WorkerError) as failure:
+                finalized_report(
+                    consumer,
+                    consumer.submit(
+                        execution_batch(
+                            batch_id=5,
+                            admissions=admissions,
+                            calls=calls,
+                            kv_inputs=transfers,
+                            block_tables=tuple(
+                                BlockTable(
+                                    admission.request_pool_idx,
+                                    0,
+                                    0,
+                                    (index + 1,),
+                                    2,
+                                )
+                                for index, admission in enumerate(admissions)
+                            ),
+                            new_cache_units=tuple(
+                                CacheUnitAllocation(
+                                    admission.request_pool_idx, 0, (index + 1,)
+                                )
+                                for index, admission in enumerate(admissions)
+                            ),
+                        )
+                    ),
+                )
+            assert failure.value.code is WorkerErrorCode.INVALID_DESCRIPTOR
+
+            # Retry into the same physical page, while the abandoned source
+            # remains pending. Its cancelled reservation must not block reuse.
+            retry, _ = _installation_call(
+                admissions[0],
+                call_id=CallId(6, 0),
+                predecessor=root_parent(admissions[0]),
+                source=exports[0].source,
+            )
+            accepted = finalized_report(
+                consumer,
+                consumer.submit(
+                    execution_batch(
+                        batch_id=6,
+                        calls=(retry,),
+                        kv_inputs=(exports[0],),
+                        **_installation_allocation(retry, 2),
+                    )
+                ),
+            )
+            assert accepted.completions[0].status is CallStatus.OK
+            assert accepted.completions[0].kv_visible_len == 2
+        finally:
+            # Drain readers before unmapping their external shared segment.
+            segment.set_state(storage.buf, segment.READY)
+            consumer.close()
+            storage.close()
+            storage.unlink()
 
 
 def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> (  # noqa: E501

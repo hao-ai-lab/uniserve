@@ -279,8 +279,6 @@ class BatchState:
     inputs: BatchInputs
     predicate_entries: list[tuple[CallIdentity, tuple[int, int], int]]
     predicate_transfers: tuple[tuple[CallIdentity, BufferId, int], ...]
-    input_products: tuple[TensorExport, ...]
-    kv_inputs: tuple[KvTransfer, ...]
     stream: torch.cuda.Stream | None
     started_ns: int
     forward_stats: list[ForwardStats]
@@ -294,10 +292,6 @@ class BatchState:
     @property
     def output_buffer(self) -> OutputBuffer: ...
     def scope(self) -> AbstractContextManager[None]: ...
-    def slot_tables(
-        self, tables: BlockTables, slot: int
-    ) -> tuple[GroupTable, ...]:
-        """Borrow supplied page assignments or the resident groups."""
     def forward_rows(self, request_id: int) -> tuple[int, ...]:
         """Return numerical forward rows in scheduler order."""
     def bind_cache(

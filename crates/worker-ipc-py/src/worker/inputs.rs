@@ -6,6 +6,7 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use uniserve_worker::{BatchInputs as NativeInputs, InputReady, InputWait as NativeWait};
+use uniserve_worker_ipc::BufferId;
 
 use super::completion::Completion;
 use super::host::HostTask;
@@ -167,6 +168,10 @@ pub(crate) struct BatchInputs {
 }
 
 impl BatchInputs {
+    pub(super) fn add_cache(&mut self, buffer: BufferId, write: Py<KVImport>) {
+        self.inner.inputs.insert(buffer, Input::Cache(write));
+    }
+
     pub(super) fn awaiting_reads(&self) -> bool {
         self.inner.awaiting_reads
     }

@@ -5,14 +5,13 @@ use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
 use uniserve_core::CallId;
 use uniserve_worker_ipc::{BatchCommand, CallKind, MediaCall, TransferMode};
 
-use super::super::error::{invalid, native_error};
+use super::super::error::{invalid, native_error, unsupported};
 use super::super::inputs::BatchInputs;
+use super::super::kv_import::KVImporter;
 use super::{BatchState, PythonBackend};
-use crate::convert;
 
 impl PythonBackend {
     pub(super) fn prepare_batch(&self, py: Python<'_>, batch: &mut BatchState) -> PyResult<()> {
@@ -267,29 +266,88 @@ impl PythonBackend {
         batch.imports =
             !plan.input_products.is_empty() || !plan.kv_inputs.is_empty() || !resident.is_empty();
         batch.inputs.borrow_mut(py).set_dependencies(dependencies);
-        let numerical_batch = batch.numerical.borrow(py).batch.clone_ref(py);
-        let inputs = numerical_batch
-            .bind(py)
-            .getattr("input_products")?
-            .extract()?;
-        let supplied: Py<PyTuple> = numerical_batch.bind(py).getattr("kv_inputs")?.extract()?;
-        let kv_inputs = if resident.is_empty() {
-            supplied
-        } else {
-            let additional = resident
+        batch.resident_kv = resident;
+        Ok(())
+    }
+
+    /// Start KV copies after storage dependencies and tensor input admission.
+    /// Record each accepted import immediately so failure of a later import
+    /// releases earlier destinations through the same batch input owner.
+    pub(super) fn prepare_kv(&self, py: Python<'_>, batch: &BatchState) -> PyResult<()> {
+        let plan = &batch.plan;
+        if plan.kv_inputs.is_empty() && batch.resident_kv.is_empty() {
+            return Ok(());
+        }
+
+        let transports = self.worker.bind(py).getattr("transports")?;
+        if !transports.is_truthy()? {
+            return Err(unsupported(
+                py,
+                "cross-call input requires a configured transport",
+            ));
+        }
+        let (imports, tables) = self
+            .cache_imports
+            .as_ref()
+            .zip(self.tables.as_ref())
+            .ok_or_else(|| invalid(py, "KV input requires physical cache storage"))?;
+
+        // IPC admission checks supplied descriptors. Resident exports are
+        // resolved afterward and must also have one installation consumer.
+        if !batch.resident_kv.is_empty() {
+            let mut consumers = HashMap::new();
+            for call in &plan.calls {
+                if let Some(source) = call.kv_input {
+                    *consumers.entry(source).or_insert(0) += 1;
+                }
+            }
+            if batch
+                .resident_kv
                 .iter()
-                .map(|export| convert::kv_transfer_to_py(py, export))
-                .collect::<PyResult<Vec<_>>>()?;
-            let values = supplied
-                .bind(py)
+                .any(|transfer| consumers.get(&transfer.source) != Some(&1))
+            {
+                return Err(invalid(py, "KV input requires one installation consumer"));
+            }
+        }
+
+        let transfers = plan
+            .kv_inputs
+            .iter()
+            .cloned()
+            .map(Arc::new)
+            .chain(batch.resident_kv.iter().cloned());
+        for transfer in transfers {
+            let source = transfer.source;
+            // Starts were installed before dependency resolution. The native
+            // request pool is the sole source of a batch consumer's slot.
+            let slot = self
+                .requests
+                .borrow(py)
+                .pool
+                .get(source.owner.request_id.0)
+                .map_err(|error| native_error(py, error))?
+                .slot() as u32;
+            let tables = tables
+                .borrow(py)
+                .tables
+                .for_batch(slot, &plan.block_tables)
+                .map_err(|error| native_error(py, error))?;
+            let initialized = plan
+                .new_cache_units
                 .iter()
-                .chain(additional)
-                .collect::<Vec<_>>();
-            PyTuple::new(py, values)?.unbind()
-        };
-        let mut numerical = batch.numerical.borrow_mut(py);
-        numerical.input_products = inputs;
-        numerical.kv_inputs = kv_inputs;
+                .filter(|allocation| allocation.request_pool_idx == slot)
+                .flat_map(|allocation| allocation.unit_ids.iter().map(|unit| unit.0))
+                .collect();
+            let write = KVImporter::reserve(
+                imports.bind(py),
+                transfer,
+                slot,
+                tables,
+                initialized,
+                transports.clone().unbind(),
+            )?;
+            batch.inputs.borrow_mut(py).add_cache(source, write);
+        }
         Ok(())
     }
 

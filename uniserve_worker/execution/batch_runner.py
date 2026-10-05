@@ -56,11 +56,9 @@ class BatchRunner:
         """Bind tensor views and submit copies into reserved destinations."""
         prepare_inputs(
             state,
-            kv_cache=self.worker.kv_cache,
             tensor_store=self.worker.tensor_store,
             latent_pool=self.worker.latent_pool,
             output_pool=self.worker.output_pool,
-            request_tables=self.worker.block_tables,
             request_pool=self.worker.requests,
             model_runner=self.worker.runner,
             transfer_backends=self.worker.transports,

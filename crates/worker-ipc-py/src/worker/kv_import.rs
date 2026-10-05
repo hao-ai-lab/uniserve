@@ -45,7 +45,7 @@ pub(crate) struct KVImport {
     inner: Arc<NativeImport<TransferRef, Workspace>>,
     tables: Vec<Arc<NativeGroupTable>>,
     pub(super) initialized_units: Vec<u32>,
-    export: KvTransfer,
+    export: Arc<KvTransfer>,
     task: Option<Arc<CopyTask>>,
     #[pyo3(get)]
     retirement: Py<Completion>,
@@ -200,6 +200,128 @@ pub(crate) struct KVImporter {
     wake: Mutex<Option<Py<PyAny>>>,
 }
 
+impl KVImporter {
+    /// Share reservation and copy ownership between native batches and direct
+    /// Python callers. Only the numerical copy materializes Python views.
+    pub(super) fn reserve(
+        slf: &Bound<'_, Self>,
+        export: Arc<KvTransfer>,
+        request_pool_idx: u32,
+        tables: Vec<Arc<NativeGroupTable>>,
+        initialized_units: Vec<u32>,
+        transports: Py<PyAny>,
+    ) -> PyResult<Py<KVImport>> {
+        let py = slf.py();
+        let this = slf.borrow();
+        this.accesses
+            .borrow(py)
+            .inner
+            .validate_install(&export)
+            .map_err(|error| native_error(py, error))?;
+        for (group, shape) in export.groups.iter().zip(&this.transfer_shapes) {
+            let expected = [
+                u64::from(export.exported_extent.saturating_sub(group.start)),
+                shape[0],
+                shape[1],
+                shape[2],
+            ];
+            if group
+                .tensors
+                .first()
+                .is_some_and(|tensor| tensor.shape != expected)
+            {
+                return Err(invalid(
+                    py,
+                    "KV transfer shape does not match destination layers",
+                ));
+            }
+        }
+
+        let ranges = this
+            .tables
+            .borrow(py)
+            .tables
+            .import_spans(request_pool_idx, &tables, &export, &initialized_units)
+            .map_err(|error| native_error(py, error))?;
+        let source = export.source;
+        let copy = !initialized_units.is_empty()
+            || export.groups.iter().any(|group| !group.tensors.is_empty());
+
+        let retirement = Py::new(py, Completion::new())?;
+        let task = copy
+            .then(|| this.tasks.reserve())
+            .transpose()
+            .map_err(|error| native_error(py, error))?;
+        let write = Py::new(
+            py,
+            KVImport {
+                inner: Arc::new(NativeImport::new(source, request_pool_idx as usize, copy)),
+                tables,
+                initialized_units,
+                export,
+                task: task.clone(),
+                retirement,
+            },
+        );
+        let write = match write {
+            Ok(write) => write,
+            Err(error) => {
+                if let Some(task) = task
+                    && let Err(cleanup) = task.cancel(true)
+                {
+                    Copy::report(cleanup);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(task) = &task {
+            let configured = task.configure(ImportCopy::new(
+                Arc::clone(&this.inner),
+                Arc::clone(&write.get().inner),
+                Copy {
+                    owner: slf.clone().unbind(),
+                    write: write.clone_ref(py),
+                    transports,
+                },
+            ));
+            if let Err(error) = configured {
+                task.cancel(true)
+                    .map_err(|cause| PyErr::from_value(cause.bind(py).clone().into_any()))?;
+                return Err(native_error(py, error));
+            }
+        }
+
+        let retirement = CompletionRef::new(py, write.get().retirement.clone_ref(py));
+        let reserved = {
+            let mut accesses = this.accesses.borrow_mut(py);
+            this.inner.reserve(
+                ImportRef {
+                    owner: write.clone_ref(py),
+                    inner: Arc::clone(&write.get().inner),
+                },
+                || accesses.inner.reserve_import(source, &ranges, retirement),
+            )
+        };
+        if let Err(error) = reserved {
+            if let Some(task) = &task {
+                task.cancel(true)
+                    .map_err(|cause| PyErr::from_value(cause.bind(py).clone().into_any()))?;
+            }
+            return Err(native_error(py, error));
+        }
+
+        if let Some(task) = task
+            && let Err(error) = task.submit()
+        {
+            task.cancel(true)
+                .map_err(|cause| PyErr::from_value(cause.bind(py).clone().into_any()))?;
+            this.abandon(py, write.get())?;
+            return Err(native_error(py, error));
+        }
+        Ok(write)
+    }
+}
+
 #[pymethods]
 impl KVImporter {
     #[new]
@@ -302,8 +424,8 @@ impl KVImporter {
         drop(previous);
     }
 
-    #[pyo3(signature = (export, *, request_pool_idx, tables, initialized_units, transports))]
-    fn reserve(
+    #[pyo3(name = "reserve", signature = (export, *, request_pool_idx, tables, initialized_units, transports))]
+    fn reserve_py(
         slf: &Bound<'_, Self>,
         export: &Bound<'_, PyAny>,
         request_pool_idx: u32,
@@ -311,119 +433,19 @@ impl KVImporter {
         initialized_units: Vec<u32>,
         transports: Py<PyAny>,
     ) -> PyResult<Py<KVImport>> {
-        let py = slf.py();
-        let this = slf.borrow();
-        let export = transfer_from_py(export)?;
-        this.accesses
-            .borrow(py)
-            .inner
-            .validate_install(&export)
-            .map_err(|error| native_error(py, error))?;
-        for (group, shape) in export.groups.iter().zip(&this.transfer_shapes) {
-            let expected = [
-                u64::from(export.exported_extent.saturating_sub(group.start)),
-                shape[0],
-                shape[1],
-                shape[2],
-            ];
-            if group
-                .tensors
-                .first()
-                .is_some_and(|tensor| tensor.shape != expected)
-            {
-                return Err(invalid(
-                    py,
-                    "KV transfer shape does not match destination layers",
-                ));
-            }
-        }
-
+        let export = Arc::new(transfer_from_py(export)?);
         let tables = tables
             .iter()
             .map(|table| Ok(Arc::clone(&table.extract::<PyRef<'_, GroupTable>>()?.table)))
             .collect::<PyResult<Vec<_>>>()?;
-        let ranges = this
-            .tables
-            .borrow(py)
-            .tables
-            .import_spans(request_pool_idx, &tables, &export, &initialized_units)
-            .map_err(|error| native_error(py, error))?;
-        let source = export.source;
-        let copy = !initialized_units.is_empty()
-            || export.groups.iter().any(|group| !group.tensors.is_empty());
-
-        let retirement = Py::new(py, Completion::new())?;
-        let task = copy
-            .then(|| this.tasks.reserve())
-            .transpose()
-            .map_err(|error| native_error(py, error))?;
-        let write = Py::new(
-            py,
-            KVImport {
-                inner: Arc::new(NativeImport::new(source, request_pool_idx as usize, copy)),
-                tables,
-                initialized_units,
-                export,
-                task: task.clone(),
-                retirement,
-            },
-        );
-        let write = match write {
-            Ok(write) => write,
-            Err(error) => {
-                if let Some(task) = task
-                    && let Err(cleanup) = task.cancel(true)
-                {
-                    Copy::report(cleanup);
-                }
-                return Err(error);
-            }
-        };
-        if let Some(task) = &task {
-            let configured = task.configure(ImportCopy::new(
-                Arc::clone(&this.inner),
-                Arc::clone(&write.get().inner),
-                Copy {
-                    owner: slf.clone().unbind(),
-                    write: write.clone_ref(py),
-                    transports,
-                },
-            ));
-            if let Err(error) = configured {
-                task.cancel(true)
-                    .map_err(|cause| PyErr::from_value(cause.bind(py).clone().into_any()))?;
-                return Err(native_error(py, error));
-            }
-        }
-
-        let retirement = CompletionRef::new(py, write.get().retirement.clone_ref(py));
-        let reserved = {
-            let mut accesses = this.accesses.borrow_mut(py);
-            this.inner.reserve(
-                ImportRef {
-                    owner: write.clone_ref(py),
-                    inner: Arc::clone(&write.get().inner),
-                },
-                || accesses.inner.reserve_import(source, &ranges, retirement),
-            )
-        };
-        if let Err(error) = reserved {
-            if let Some(task) = &task {
-                task.cancel(true)
-                    .map_err(|cause| PyErr::from_value(cause.bind(py).clone().into_any()))?;
-            }
-            return Err(native_error(py, error));
-        }
-
-        if let Some(task) = task
-            && let Err(error) = task.submit()
-        {
-            task.cancel(true)
-                .map_err(|cause| PyErr::from_value(cause.bind(py).clone().into_any()))?;
-            this.abandon(py, write.get())?;
-            return Err(native_error(py, error));
-        }
-        Ok(write)
+        Self::reserve(
+            slf,
+            export,
+            request_pool_idx,
+            tables,
+            initialized_units,
+            transports,
+        )
     }
 
     fn owns(&self, write: &KVImport) -> bool {

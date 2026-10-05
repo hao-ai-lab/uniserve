@@ -706,15 +706,12 @@ class KVCacheManager:
         *,
         request_pool_idx: int,
         visible_length: int,
-        export: KvTransfer | None = None,
     ) -> KvTransfer:
         """Verify that a request's allocation still covers an export.
 
         ``buffer`` must belong to ``request_key``, the published extent must
         lie within both ``visible_length`` and the slot's allocated length,
         and the slot must have an installed table for every group.
-        ``export`` skips the directory lookup when the caller already
-        holds it.
 
         Returns:
             The export.
@@ -723,7 +720,7 @@ class KVCacheManager:
             WorkerError: ``invalid_descriptor`` when any check fails or the
                 export is not resident.
         """
-        export = self.get_export(buffer) if export is None else export
+        export = self.get_export(buffer)
         if buffer.owner != request_key:
             raise invalid_descriptor(
                 "KV conditioning buffer belongs to another request"
