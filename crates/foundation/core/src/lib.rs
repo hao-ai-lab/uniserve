@@ -24,8 +24,10 @@ mod events;
 /// Handing a bound socket to a rank process at its launch.
 pub mod launch;
 mod media;
+mod shared_memory;
 mod video;
 pub use media::{MediaSource, SharedMedia};
+pub use shared_memory::SharedMemory;
 pub use video::{
     AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
     VideoCondition, VisionGrid,

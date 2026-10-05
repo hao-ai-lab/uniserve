@@ -49,6 +49,8 @@ struct Driver {
     stream_green: unsafe extern "C" fn(Handle, *mut Handle) -> Status,
     create_green_stream: unsafe extern "C" fn(*mut Handle, Handle, u32, i32) -> Status,
     launch: unsafe extern "C" fn(Handle, unsafe extern "C" fn(Handle), Handle) -> Status,
+    register_host: unsafe extern "C" fn(Handle, usize, u32) -> Status,
+    unregister_host: unsafe extern "C" fn(Handle) -> Status,
 }
 
 fn driver() -> Result<&'static Driver, String> {
@@ -60,6 +62,12 @@ fn driver() -> Result<&'static Driver, String> {
             unsafe {
                 let library = Library::new("libcuda.so.1").map_err(|e| e.to_string())?;
                 let driver = Driver {
+                    register_host: *library
+                        .get(b"cuMemHostRegister_v2\0")
+                        .map_err(|e| e.to_string())?,
+                    unregister_host: *library
+                        .get(b"cuMemHostUnregister\0")
+                        .map_err(|e| e.to_string())?,
                     push: *library
                         .get(b"cuCtxPushCurrent_v2\0")
                         .map_err(|e| e.to_string())?,
@@ -770,7 +778,7 @@ pub fn schedule_completion_wake(stream: usize, wake: Wake) -> Result<(), String>
 
 // Only native notification actions enter this helper. CUDA host functions must
 // not call CUDA or acquire the GIL; either can deadlock outstanding device work.
-fn launch<F: FnOnce() + Send + 'static>(stream: usize, action: F) -> Result<(), String> {
+pub(crate) fn launch<F: FnOnce() + Send + 'static>(stream: usize, action: F) -> Result<(), String> {
     unsafe extern "C" fn invoke<F: FnOnce()>(data: Handle) {
         // SAFETY: launch transfers one boxed action to this single invocation.
         let action = unsafe { Box::from_raw(data.cast::<F>()) };
@@ -788,4 +796,24 @@ fn launch<F: FnOnce() + Send + 'static>(stream: usize, action: F) -> Result<(), 
     }
 
     check(status, "cuLaunchHostFunc")
+}
+
+/// Register a live host mapping for DMA. Its owner must drain all device
+/// accesses before unregistering or unmapping it.
+pub(crate) unsafe fn register_host(address: usize, size: usize) -> Result<(), String> {
+    unsafe {
+        check(
+            (driver()?.register_host)(address as Handle, size, 0),
+            "cuMemHostRegister",
+        )
+    }
+}
+
+pub(crate) unsafe fn unregister_host(address: usize) -> Result<(), String> {
+    unsafe {
+        check(
+            (driver()?.unregister_host)(address as Handle),
+            "cuMemHostUnregister",
+        )
+    }
 }

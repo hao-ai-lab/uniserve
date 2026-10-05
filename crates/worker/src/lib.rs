@@ -23,6 +23,7 @@ mod profiling;
 mod registry;
 mod request;
 mod service;
+mod shared_buffer;
 mod stream;
 pub mod tensor;
 mod transfer;
@@ -49,6 +50,7 @@ pub use pending::{BatchResult, PendingOutput, request_output};
 pub use registry::{BufferRegistry, RegisteredBuffer};
 pub use request::{Request, RequestPool, RequestProgress};
 pub use service::{Service, ServiceBackend};
+pub use shared_buffer::{SHM_HEADER_BYTES, SharedBuffer, SharedMapping};
 pub use stream::CUDAStream;
 pub use transfer::{
     ReadRegion, ReadReservation, TransferCapacity, TransferPool, TransferTicket, plan_reads,

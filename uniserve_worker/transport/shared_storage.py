@@ -1,10 +1,7 @@
-"""Physically backed shared allocations used by media and transport owners.
+"""Reader mappings of native media and tensor shared-memory allocations.
 
-A producer creates a POSIX shared-memory segment with
-`allocate_shared_storage` (used by `ShmTransport`), and
-a reader on the same host maps it by name with `open_shared_storage`, which
-resolves the name with `shm_open`. Both operations use POSIX segment names;
-the mount path of the shared-memory filesystem is not needed.
+Readers resolve POSIX names with ``shm_open``; no shared-memory mount path
+is required. The native producer owns allocation and unlinking.
 """
 
 from __future__ import annotations
@@ -12,38 +9,6 @@ from __future__ import annotations
 import ctypes
 import mmap
 import os
-from multiprocessing import shared_memory
-
-
-def allocate_shared_storage(size: int) -> shared_memory.SharedMemory:
-    """Allocate physically backed POSIX storage or raise before a mapped write.
-
-    The caller owns close/unlink and any ownership transfer after export.
-    Reserving tmpfs pages avoids an uncatchable SIGBUS from a later copy when
-    the shared storage filesystem is full.
-
-    Raises:
-        ValueError: When `size` is not positive.
-        OSError: When the segment cannot be created or its pages cannot be
-            reserved; a segment already created is closed and unlinked
-            first.
-    """
-    if size < 1:
-        raise ValueError("shared storage capacity must be positive")
-
-    storage = shared_memory.SharedMemory(create=True, size=size)
-    try:
-        descriptor = _open_descriptor(storage.name)
-        try:
-            os.posix_fallocate(descriptor, 0, size)
-        finally:
-            os.close(descriptor)
-    except BaseException:
-        storage.close()
-        storage.unlink()
-        raise
-    return storage
-
 
 _SHM_LIBC = ctypes.CDLL(None, use_errno=True)
 _SHM_LIBC.shm_open.restype = ctypes.c_int
