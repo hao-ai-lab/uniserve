@@ -1,10 +1,8 @@
-"""Product, KV, and latent movement with no model call.
+"""Tensor and latent movement with no model call.
 
-``execute`` runs the ``TransferMode`` calls that ``schedule`` dispatches: KV
-export and installation through ``KVCacheManager``, and product
-transfers that republish one resident tensor or the committed trajectory's
-current latent pages. The export helpers are shared with the image,
-media, diffusion and host-media call paths.
+``execute`` transfers one resident tensor or the committed trajectory's
+current latent pages. The native executor handles KV export and installation.
+The export helpers are shared with image, media, diffusion and host-media calls.
 
 Every tensor export checks the physical tensor against the product's
 declared shape bound, dtype and byte size before exporting it. Exports made
@@ -29,7 +27,7 @@ from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls as calls
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.batch import TensorExport
-from uniserve_worker.protocol.call import Call, TransferMode
+from uniserve_worker.protocol.call import Call
 from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import (
     DeviceProductTransferValue,
@@ -49,8 +47,6 @@ from uniserve_worker.transport.exports import export_tensor
 
 if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.storage.block_tables import BlockTables
-    from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
     from uniserve_worker.storage.tensor_store import Buffer, TensorStore
     from uniserve_worker.transport.interface import Transport
@@ -60,27 +56,12 @@ def execute(
     call: Call,
     *,
     state: BatchState,
-    kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     export_transports: Mapping[str, Transport],
-    request_tables: BlockTables | None,
     model_runner: ModelExecutor,
 ) -> PendingOutput:
-    """Execute one transfer call and stage its outcome.
-
-    ``KV_EXPORT`` exports the request's visible KV extent under the call's
-    KV output identity. ``KV_INSTALL`` adopts the physical import reserved
-    for the call's KV input and sets the staged visible and computed KV
-    lengths to its published extent. Any other mode republishes the call's
-    single tensor input as its single output.
-
-    Raises:
-        WorkerError: ``unsupported_setup`` when no export transport or,
-            for a latent transfer, no latent pool is configured;
-            ``invalid_descriptor`` when, for example, KV storage, a declared
-            identity or a reserved input is missing.
-    """
+    """Transfer one tensor or latent value through its numerical storage."""
     from uniserve_worker.execution import image
 
     transports = export_transports
@@ -88,107 +69,45 @@ def execute(
         raise unsupported_setup(
             "product transfer requires a configured transport"
         )
-    request_id = call.request_key.request_id
-    mode = call.kind
-    if mode is TransferMode.KV_EXPORT:
-        exports = kv_cache
-        if exports is None:
-            raise invalid_descriptor("KV export requires cache storage")
-        output = call.kv_output
-        if output is None:
-            raise invalid_descriptor(
-                "KV export requires a cache output identity"
-            )
-        request = state.pending_output(request_id)
-
-        # (request slot, accepted visible length, capacity).
-        cache = request.cache_coordinates(request_tables)
-        snapshot = exports.export(
-            request_pool_idx=request.request.request_pool_idx,
-            visible_length=cache[1],
-            destination="gen",
-            buffer=output,
-            transports=transports,
-            consumers=call.consumer_slots,
+    inputs = call.tensor_inputs()
+    outputs = call.tensor_outputs()
+    if len(inputs) != 1 or len(outputs) != 1:
+        raise invalid_descriptor(
+            "product transfer requires one physical input and one output"
         )
-        request.cache_export = (output, snapshot)
-
-        for tensor in snapshot.tensors:
-            for locator in tensor.locations:
-                request.exported_locators.append(locator)
-
-        request.cache_exports[output] = tuple(
-            (transports[location.backend], location)
-            for tensor in snapshot.tensors
-            for location in tensor.locations
-        )
-
-        outcome = image.non_state_outcome(call, state=state)
-        outcome.set_kv_output(snapshot)
-    elif mode is TransferMode.KV_INSTALL:
-        exports = kv_cache
-        if exports is None:
-            raise invalid_descriptor("KV installation requires cache storage")
-        source = call.kv_input
-        output = call.kv_output
-        if source is None or output is None:
-            raise invalid_descriptor(
-                "KV installation requires source and output identities"
+    if call.latent_input is not None:
+        if latent_pool is None:
+            raise unsupported_setup(
+                "latent transfer requires a physical latent pool"
             )
-        request = state.pending_output(request_id)
-        write = state.inputs.cache(source)
-        if write is None:
-            raise invalid_descriptor(
-                "KV installation has no reserved physical input"
-            )
-        installed = exports.install(
-            installed_buffer=output,
-            write=write,
-        )
-        request.cache_installation = (source, output, installed)
-
-        outcome = image.non_state_outcome(call, state=state)
-        outcome.set_cache_length(int(installed.exported_extent))
-    else:
-        inputs = call.tensor_inputs()
-        outputs = call.tensor_outputs()
-        if len(inputs) != 1 or len(outputs) != 1:
-            raise invalid_descriptor(
-                "product transfer requires one physical input and one output"
-            )
-        if call.latent_input is not None:
-            if latent_pool is None:
-                raise unsupported_setup(
-                    "latent transfer requires a physical latent pool"
-                )
-            tensor_export = _publish_current_latent(
-                call,
-                inputs[0],
-                outputs[0],
-                latent_pool=latent_pool,
-                export_transports=export_transports,
-                state=state,
-            )
-        else:
-            value, metadata = fetch_product(
-                call,
-                tensor_store=tensor_store,
-                model_runner=model_runner,
-                state=state,
-            )
-            tensor_export = export_product(
-                outputs[0],
-                value,
-                metadata,
-                tensor_store=tensor_store,
-                export_transports=export_transports,
-                state=state,
-            )
-        outcome = image.non_state_outcome(
+        tensor_export = _publish_current_latent(
             call,
-            products=(tensor_export,),
+            inputs[0],
+            outputs[0],
+            latent_pool=latent_pool,
+            export_transports=export_transports,
             state=state,
         )
+    else:
+        value, metadata = fetch_product(
+            call,
+            tensor_store=tensor_store,
+            model_runner=model_runner,
+            state=state,
+        )
+        tensor_export = export_product(
+            outputs[0],
+            value,
+            metadata,
+            tensor_store=tensor_store,
+            export_transports=export_transports,
+            state=state,
+        )
+    outcome = image.non_state_outcome(
+        call,
+        products=(tensor_export,),
+        state=state,
+    )
     return outcome
 
 

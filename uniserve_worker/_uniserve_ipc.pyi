@@ -367,8 +367,6 @@ class PendingOutput:
     tensor_exports: dict[BufferId, ExportLocations]
     cache_exports: dict[BufferId, ExportLocations]
     exported_locators: list[Locator]
-    cache_export: tuple[BufferId, KvTransfer] | None
-    cache_installation: tuple[BufferId, BufferId, KvTransfer] | None
     device_reads: list[TensorRead]
     feature_reads: list[TensorRead]
     writes: list[Buffer]
@@ -417,7 +415,6 @@ class PendingOutput:
         tasks: Sequence[HostTask[Any]],
         finish: Callable[[tuple[object, ...]], None] | None = None,
     ) -> None: ...
-    def set_kv_output(self, output: KvTransfer) -> None: ...
     @property
     def request_key(self) -> RequestKey: ...
     @property
@@ -820,7 +817,9 @@ class KVImporter:
         transports: Mapping[str, Transport],
     ) -> KVImport: ...
     def owns(self, write: KVImport) -> bool: ...
-    def adopt(self, write: KVImport, installed_buffer: BufferId) -> None: ...
+    def adopt(
+        self, write: KVImport, installed_buffer: BufferId
+    ) -> KvTransfer: ...
     def abandon(self, write: KVImport) -> None: ...
     def release(self, buffers: Sequence[BufferId]) -> None: ...
     def cancel_requests(
@@ -842,7 +841,22 @@ class KVImporter:
 class KVCacheManager:
     """Resident KV transfers, incremental bases, and physical accesses."""
 
-    def __new__(cls) -> Self: ...
+    def __new__(
+        cls,
+        tables: BlockTables,
+        compute_dtype: str,
+        export_group: Callable[..., tuple[TensorTransfer, ...]],
+    ) -> Self: ...
+    def export(
+        self,
+        *,
+        request_pool_idx: int,
+        visible_length: int,
+        destination: str,
+        buffer: BufferId,
+        transports: Mapping[str, Transport],
+        consumers: Sequence[int] = (),
+    ) -> KvTransfer: ...
     def resident(self, buffer: BufferId) -> KvTransfer | None: ...
     def destination_base(
         self, request: RequestKey, destination: str

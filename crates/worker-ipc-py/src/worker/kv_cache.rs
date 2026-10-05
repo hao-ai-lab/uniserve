@@ -4,10 +4,11 @@ use std::collections::HashSet;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyDict, PyList, PyTuple};
 use uniserve_worker::KVCacheManager as NativeKVCacheManager;
-use uniserve_worker_ipc::{BufferId, KvTransfer, RequestKey};
+use uniserve_worker_ipc::{BufferId, KvGroupTransfer, KvTransfer, RequestKey};
 
+use super::block_tables::{BlockTables, GroupTable};
 use super::completion::{Completion, CompletionRef};
 use super::error::{invalid, native_error};
 use super::protocol::{buffer_id, call_id, request_key};
@@ -16,15 +17,167 @@ use crate::convert;
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct KVCacheManager {
     pub(super) inner: NativeKVCacheManager<CompletionRef>,
+    tables: Py<BlockTables>,
+    compute_dtype: String,
+    export_group: Py<PyAny>,
+}
+
+impl KVCacheManager {
+    /// Reserve the visible suffix before exposing numerical page views.
+    /// Completed descriptions stay native until a direct Python caller asks
+    /// for one; serving retains them through batch commit and IPC delivery.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn export(
+        slf: &Bound<'_, Self>,
+        slot: u32,
+        visible: u64,
+        destination: &str,
+        buffer: BufferId,
+        transports: &Bound<'_, PyAny>,
+        consumers: &[u32],
+    ) -> PyResult<(KvTransfer, Py<PyList>)> {
+        let py = slf.py();
+        let (mut transfer, tables, export_group) = {
+            let mut owner = slf.borrow_mut();
+            let (base, base_extent) = owner
+                .inner
+                .destination_base(buffer.owner, destination)
+                .map_or((None, 0), |(buffer, extent)| (Some(buffer), extent));
+            let (tables, groups, spans) = {
+                let tables = owner.tables.borrow(py);
+                let tables = &tables.tables;
+                if visible > u64::from(tables.allocated_length(slot)) {
+                    return Err(invalid(py, "KV export exceeds its scheduler block table"));
+                }
+                if visible < u64::from(base_extent) {
+                    return Err(invalid(py, "KV export destination is ahead of its source"));
+                }
+
+                let mut selected = Vec::new();
+                let mut groups = Vec::new();
+                let mut spans = Vec::new();
+                for group in 0..tables.groups().len() {
+                    let table = tables
+                        .table(slot, group as u32)
+                        .map_err(|error| native_error(py, error))?;
+                    let start = table.shape.window.map_or(base_extent, |window| {
+                        base_extent.max((visible as u32).saturating_sub(window))
+                    });
+                    spans.extend(
+                        table
+                            .spans(u64::from(start), visible - u64::from(start))
+                            .map_err(|error| native_error(py, error))?,
+                    );
+                    if visible > u64::from(base_extent) {
+                        groups.push(KvGroupTransfer {
+                            start,
+                            page_tokens: table.shape.page_tokens,
+                            tensors: Vec::new(),
+                        });
+                    }
+                    selected.push(table);
+                }
+                (selected, groups, spans)
+            };
+            if visible > u64::from(base_extent) {
+                owner
+                    .inner
+                    .reserve_export(buffer, &spans)
+                    .map_err(|error| native_error(py, error))?;
+            }
+            (
+                KvTransfer {
+                    source: buffer,
+                    destination: destination.to_owned(),
+                    base,
+                    base_extent,
+                    exported_extent: visible as u32,
+                    compute_dtype: owner.compute_dtype.clone(),
+                    groups,
+                },
+                tables,
+                owner.export_group.clone_ref(py),
+            )
+        };
+
+        // A transport can expose a locator before a later group fails. Keep
+        // every locator in one list so failure revokes all accepted exports.
+        let locators = PyList::empty(py);
+        let result = (|| -> PyResult<()> {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("source", convert::buffer_id_to_py(py, &buffer)?)?;
+            kwargs.set_item("transports", transports)?;
+            kwargs.set_item("consumers", consumers)?;
+            kwargs.set_item("locators", &locators)?;
+            for (index, (group, table)) in transfer.groups.iter_mut().zip(tables).enumerate() {
+                let table = Py::new(py, GroupTable { table })?;
+                let tensors = export_group
+                    .bind(py)
+                    .call((index, table, group.start, visible), Some(&kwargs))?;
+                group.tensors = tensors
+                    .try_iter()?
+                    .map(|tensor| {
+                        convert::tensor_transfer_from_py(&tensor?.call_method0("to_mapping")?)
+                            .ok_or_else(|| invalid(py, "invalid exported KV tensor"))
+                    })
+                    .collect::<PyResult<_>>()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for locator in &locators {
+                let released = (|| -> PyResult<()> {
+                    transports
+                        .get_item(locator.getattr("backend")?)?
+                        .call_method1("release", (locator,))?;
+                    Ok(())
+                })();
+                if let Err(cleanup) = released {
+                    let _ = error
+                        .value(py)
+                        .call_method1("add_note", (cleanup.to_string(),));
+                }
+            }
+            slf.borrow_mut().inner.release_exports(&[buffer]);
+            return Err(error);
+        }
+        Ok((transfer, locators.unbind()))
+    }
 }
 
 #[pymethods]
 impl KVCacheManager {
     #[new]
-    fn new() -> Self {
+    fn new(tables: Py<BlockTables>, compute_dtype: String, export_group: Py<PyAny>) -> Self {
         Self {
             inner: NativeKVCacheManager::default(),
+            tables,
+            compute_dtype,
+            export_group,
         }
+    }
+
+    #[pyo3(name = "export", signature = (*, request_pool_idx, visible_length, destination, buffer, transports, consumers=Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
+    fn export_py(
+        slf: &Bound<'_, Self>,
+        request_pool_idx: u32,
+        visible_length: u64,
+        destination: &str,
+        buffer: &Bound<'_, PyAny>,
+        transports: &Bound<'_, PyAny>,
+        consumers: Vec<u32>,
+    ) -> PyResult<Py<PyAny>> {
+        let (transfer, _) = Self::export(
+            slf,
+            request_pool_idx,
+            visible_length,
+            destination,
+            buffer_id(buffer)?,
+            transports,
+            &consumers,
+        )?;
+        convert::kv_transfer_to_py(slf.py(), &transfer).map(Bound::unbind)
     }
 
     fn resident(&self, py: Python<'_>, buffer: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
@@ -237,14 +390,17 @@ impl KVCacheManager {
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.tables)?;
+        visit.call(&self.export_group)?;
         for completion in self.inner.completions() {
             visit.call(&completion.owner)?;
         }
         Ok(())
     }
 
-    fn __clear__(&mut self) {
+    fn __clear__(&mut self, py: Python<'_>) {
         self.inner = NativeKVCacheManager::default();
+        self.export_group = py.None();
     }
 }
 

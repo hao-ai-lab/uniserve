@@ -9,7 +9,6 @@ use super::{BatchState, PythonBackend};
 use crate::worker::error::{native_error, unsupported};
 use crate::worker::exports;
 use crate::worker::host::with_context;
-use crate::worker::kv_cache::{exports_from_py, installations_from_py};
 use crate::worker::latent::{LatentUpdate, lower_updates};
 use crate::worker::output::OutputBuffer;
 use crate::worker::pending::PendingOutput;
@@ -59,8 +58,8 @@ impl PythonBackend {
             OutputBuffer::seal(buffer.bind(py))?;
 
             let products = PyList::empty(py);
-            let exports = PyList::empty(py);
-            let installations = PyList::empty(py);
+            let mut exports = Vec::new();
+            let mut installations = Vec::new();
             let tensor_exports = PyDict::new(py);
             let cache_exports = PyDict::new(py);
             let latent_exports = PyDict::new(py);
@@ -94,11 +93,11 @@ impl PythonBackend {
                 for product in pending.products.bind(py) {
                     products.append(product)?;
                 }
-                if let Some(value) = &pending.cache_export {
-                    exports.append(value)?;
+                if let Some(transfer) = &pending.cache_export {
+                    exports.push((transfer.source, (**transfer).clone()));
                 }
-                if let Some(value) = &pending.cache_installation {
-                    installations.append(value)?;
+                if let Some((buffer, transfer)) = &pending.cache_installation {
+                    installations.push((transfer.source, *buffer, (**transfer).clone()));
                 }
                 tensor_exports.update(pending.tensor_exports.bind(py).as_mapping())?;
                 cache_exports.update(pending.cache_exports.bind(py).as_mapping())?;
@@ -119,8 +118,6 @@ impl PythonBackend {
                 .runner
                 .bind(py)
                 .call_method1("execution_stats", (&numerical, started_ns, started))?;
-            let exports = exports_from_py(exports.as_any())?;
-            let installations = installations_from_py(installations.as_any())?;
             if let Some(cache) = &self.cache {
                 cache
                     .borrow(py)

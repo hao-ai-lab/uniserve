@@ -1,4 +1,4 @@
-"""Raw KV import contracts over real physical transport boundaries."""
+"""KV transfer values and storage lifetime over real transports."""
 
 from __future__ import annotations
 
@@ -252,6 +252,73 @@ def _buffer(call: int) -> BufferId:
         output_index=0,
         generation=call,
     )
+
+
+def test_failed_kv_export_releases_partial_views_and_source_reservation() -> (
+    None
+):
+    pool = mha_pool(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=1,
+        dtype=torch.float32,
+        total_layers=1,
+        total_kv_heads=1,
+        num_pages=2,
+        page_size=4,
+        device="cpu",
+        request_pool_size=1,
+        table_width=1,
+    )
+    pool.block_tables.install(((1, 0, 0, (1,), 4),))
+    pool.cache.planes_of(0, "key").fill_(3.0)
+    pool.cache.planes_of(0, "value").fill_(7.0)
+    events = EventPool()
+    # Four float32 keys fit; exporting their values exhausts the transport.
+    transport = make_transport(
+        "local", byte_capacity=16, ticket_capacity=2, event_pool=events
+    )
+    source = _buffer(1)
+    try:
+        with pytest.raises(WorkerError) as failure:
+            pool.export(
+                request_pool_idx=1,
+                visible_length=4,
+                destination="consumer",
+                buffer=source,
+                transports={"local": transport},
+            )
+        assert failure.value.code is WorkerErrorCode.RESOURCE_ERROR
+        pool.require_writable(pool.block_tables.table(1, 0), start=0, length=4)
+
+        # Retrying the same buffer with a smaller extent requires both the
+        # cache reservation and the first export's transport bytes to be free.
+        exported = pool.export(
+            request_pool_idx=1,
+            visible_length=2,
+            destination="consumer",
+            buffer=source,
+            transports={"local": transport},
+        )
+        for tensor, expected in zip(exported.tensors, (3.0, 7.0), strict=True):
+            for locator in tensor.locations:
+                ticket = transport.fetch(locator, device=torch.device("cpu"))
+                try:
+                    value = ticket.result()
+                    if isinstance(value, tuple):
+                        value = torch.cat(value, dim=0)
+                    torch.testing.assert_close(
+                        value,
+                        torch.full((2, 1, 1, 1), expected),
+                        rtol=0,
+                        atol=0,
+                    )
+                finally:
+                    ticket.close()
+    finally:
+        transport.close()
+        pool.close()
+        events.close()
 
 
 def test_kv_exports_isolate_request_epochs() -> None:

@@ -133,11 +133,9 @@ def _execute_actions(
             if isinstance(call.kind, TransferMode):
                 transfer.execute(
                     call,
-                    kv_cache=kv_cache,
                     tensor_store=tensor_store,
                     latent_pool=latent_pool,
                     export_transports=export_transports,
-                    request_tables=request_tables,
                     model_runner=model_runner,
                     state=state,
                 )

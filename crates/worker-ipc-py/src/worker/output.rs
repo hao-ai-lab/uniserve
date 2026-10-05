@@ -60,7 +60,7 @@ impl OutputBuffer {
             .map_err(|error| native_error(py, error))
     }
 
-    fn begin_device(&self, py: Python<'_>, device: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub(super) fn begin_device(&self, py: Python<'_>, device: &Bound<'_, PyAny>) -> PyResult<()> {
         let (device, stream) = stream(py, device)?;
         let mut buffer = self.lock(py)?;
         self.event_pool
