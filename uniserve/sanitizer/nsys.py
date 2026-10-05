@@ -10,7 +10,7 @@ from dataclasses import replace
 from urllib.parse import quote
 
 from . import Copy, Event, Report, Scope
-from .rules import inspect_events
+from .rules import inspect_events, is_host_wait
 
 
 def analyze(
@@ -61,12 +61,108 @@ def analyze(
 
         events = _events(db, tables, scopes, scope_prefix, report)
         events = _copies(db, tables, events, report)
+        events = _gil(db, events, report)
         report.hints = inspect_events(events)
         report.notes.append(
             "Hints are candidates for inspection, not errors. Trace timing "
             "includes profiler overhead; it is not a speedup measurement."
         )
         return report
+
+
+def _gil(
+    db: sqlite3.Connection, events: list[Event], report: Report
+) -> list[Event]:
+    # Nsight emits GIL ownership and contention as synchronous NVTX ranges.
+    # Domain IDs are process-local; application ranges with the same labels
+    # must not be mistaken for profiler evidence.
+    domains = {
+        (row["globalTid"] & ~0xFFFFFF, row["domainId"])
+        for row in db.execute(
+            "SELECT n.globalTid, n.domainId FROM NVTX_EVENTS n "
+            "LEFT JOIN StringIds s ON s.id = n.textId "
+            "WHERE n.eventType = 75 "
+            "AND coalesce(n.text, s.value) = 'GIL Trace'"
+        )
+    }
+    report.coverage.update(gil_holds=0, gil_waits=0, gil_open_ranges=0)
+    if not domains:
+        report.notes.append(
+            "No Python GIL trace; GIL ownership during waits is unknown. "
+            "Capture with --trace=cuda,nvtx,python-gil."
+        )
+        return events
+
+    states = []
+    rows = db.execute(
+        "SELECT n.*, coalesce(n.text, s.value) AS name "
+        "FROM NVTX_EVENTS n LEFT JOIN StringIds s ON s.id = n.textId "
+        "WHERE n.eventType = 59 "
+        "AND coalesce(n.text, s.value) IN ('Holding GIL', 'Waiting for GIL') "
+        "ORDER BY n.start"
+    )
+    for row in rows:
+        tid = row["globalTid"]
+        if (tid & ~0xFFFFFF, row["domainId"]) not in domains:
+            continue
+        if row["end"] is None:
+            report.coverage["gil_open_ranges"] += 1
+            continue
+
+        state = Scope(row["name"], row["start"], row["end"], tid)
+        states.append(state)
+        kind = "gil_holds" if state.name == "Holding GIL" else "gil_waits"
+        report.coverage[kind] += 1
+
+    if report.coverage["gil_open_ranges"]:
+        report.notes.append(
+            "Unclosed GIL ranges were omitted; capture boundaries may hide "
+            "ownership or contention."
+        )
+    if not report.coverage["gil_holds"]:
+        report.notes.append("No closed GIL ownership intervals were captured.")
+
+    # Both lists are time ordered. Advance once through the GIL timeline,
+    # retaining intervals that can overlap the current or a nested CUDA wait.
+    position = 0
+    active: list[Scope] = []
+    result = []
+    for event in events:
+        if not is_host_wait(event.name):
+            result.append(event)
+            continue
+
+        while position < len(states):
+            state = states[position]
+            if state.start_ns >= event.end_ns:
+                break
+            if state.end_ns > event.start_ns:
+                active.append(state)
+            position += 1
+        active = [s for s in active if s.end_ns > event.start_ns]
+
+        holds = [
+            s
+            for s in active
+            if s.name == "Holding GIL"
+            and s.global_tid == event.global_tid
+            and s.start_ns < event.end_ns
+        ]
+        waiters = [
+            s
+            for s in active
+            if s.name == "Waiting for GIL"
+            and s.global_tid != event.global_tid
+            and s.global_tid & ~0xFFFFFF == event.global_tid & ~0xFFFFFF
+            and any(
+                max(event.start_ns, h.start_ns, s.start_ns)
+                < min(event.end_ns, h.end_ns, s.end_ns)
+                for h in holds
+            )
+        ]
+        result.append(replace(event, gil=tuple(holds + waiters)))
+
+    return result
 
 
 def _scopes(db: sqlite3.Connection, prefix: str) -> dict[int, list[Scope]]:
