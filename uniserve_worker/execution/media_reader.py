@@ -40,7 +40,7 @@ from uniserve_worker.execution.conditions import (
 )
 from uniserve_worker.execution.image import bound_device_write
 from uniserve_worker.media.reader import (
-    media_path,
+    open_media,
     read_audio,
     read_bytes,
     read_image,
@@ -100,9 +100,8 @@ def read_conditions(
         if condition.image is not None:
             frames = read_image(read_bytes(source), condition.image)
         elif condition.video is not None:
-            frames = read_video(
-                media_path(source), condition.video, ffmpeg=ffmpeg
-            )
+            with open_media(source) as media:
+                frames = read_video(media, condition.video, ffmpeg=ffmpeg)
 
         if frames is not None:
             # The video encoder encodes a video's leading frames.
@@ -131,13 +130,12 @@ def read_conditions(
         if condition.audio is not None:
             # An audio reference's track is its file's; a video's
             # soundtrack is its container's first audio stream.
-            fill(
-                "samples",
-                samples,
-                read_audio(
-                    media_path(source), condition.audio, rate=sample_rate
-                ),
-            )
+            with open_media(source) as media:
+                fill(
+                    "samples",
+                    samples,
+                    read_audio(media, condition.audio, rate=sample_rate),
+                )
 
     for name, target in (
         ("pixels", pixels),

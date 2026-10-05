@@ -49,12 +49,20 @@ class SharedBuffer(tvm_ffi.Object):
     """Native shared host allocation with a borrowed DLPack payload view."""
 
 
+class SharedRead(tvm_ffi.Object):
+    """Native reader claim, readiness wait and DLPack payload view."""
+
+
 def fetch_descriptor(endpoint, export):
     return _module.fetch_descriptor(endpoint, export)
 
 
 def store_media_bytes(payload):
     return _module.store_media_bytes(payload)
+
+
+def open_shared_memory(name):
+    return _module.open_shared_memory(name)
 
 
 def partition_streams(device, counts, event_slots=2):
@@ -77,3 +85,4 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.CUDAEvent")(CUDAEvent)
     tvm_ffi.register_object("uniserve.ffi.DescriptorGrants")(DescriptorGrants)
     tvm_ffi.register_object("uniserve.ffi.SharedBuffer")(SharedBuffer)
+    tvm_ffi.register_object("uniserve.ffi.SharedRead")(SharedRead)

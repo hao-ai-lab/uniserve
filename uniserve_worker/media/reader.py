@@ -25,13 +25,15 @@ the server probed fails the request instead of misaligning its rows.
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import tempfile
-from pathlib import Path
+from typing import BinaryIO, cast
 
 import numpy as np
 import torch
 
+from uniserve_worker._uniserve_ipc import open_shared_memory
 from uniserve_worker.protocol.video import (
     AudioClip,
     ImageFit,
@@ -39,20 +41,17 @@ from uniserve_worker.protocol.video import (
     VideoClip,
 )
 
-#: Where Linux mounts POSIX shared memory: a published object's file path.
-SHARED_MEMORY = Path("/dev/shm")
-
 #: The frame rate the model conditions on, and video references resample to.
 FRAME_RATE = 24
 
 
-def media_path(locator: MediaLocator) -> Path:
-    """Return the file path of a published condition's bytes.
+def open_media(locator: MediaLocator) -> BinaryIO:
+    """Open condition bytes by POSIX name without depending on a mount path.
 
     The publisher keeps the object until the request retires, so readers
     open it by name for the request's lifetime and never unlink it.
     """
-    return SHARED_MEMORY / locator.name
+    return os.fdopen(open_shared_memory(locator.name), "rb")
 
 
 def read_bytes(locator: MediaLocator) -> bytes:
@@ -61,7 +60,7 @@ def read_bytes(locator: MediaLocator) -> bytes:
     Raises:
         ValueError: The object holds fewer bytes than its locator states.
     """
-    with media_path(locator).open("rb") as file:
+    with open_media(locator) as file:
         data = file.read(locator.bytes)
     if len(data) != locator.bytes:
         raise ValueError("condition media is shorter than its locator")
@@ -95,12 +94,13 @@ def read_image(data: bytes, fit: ImageFit) -> np.ndarray:
     return pixels[None]
 
 
-def read_video(path: Path, clip: VideoClip, *, ffmpeg: str) -> np.ndarray:
+def read_video(source: BinaryIO, clip: VideoClip, *, ffmpeg: str) -> np.ndarray:
     """Decode a reference video's kept frames on its planned canvas.
 
     The video is resampled to 24 fps before its start frames are skipped,
     so the offset counts frames of the 24 fps timeline. Scaling follows the
     trim and is per frame, so it never sees a skipped frame.
+    ``source`` supplies a seekable file descriptor, including a POSIX segment.
 
     Returns:
         ``[frames, height, width, 3]`` uint8 RGB, ``clip.frames`` frames at
@@ -115,7 +115,7 @@ def read_video(path: Path, clip: VideoClip, *, ffmpeg: str) -> np.ndarray:
         "-v",
         "error",
         "-i",
-        str(path),
+        "fd:",
         "-map",
         "0:v:0",
         "-an",
@@ -138,19 +138,20 @@ def read_video(path: Path, clip: VideoClip, *, ffmpeg: str) -> np.ndarray:
     with (
         tempfile.TemporaryFile() as errors,
         subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=errors
+            command, stdin=source, stdout=subprocess.PIPE, stderr=errors
         ) as process,
     ):
         assert process.stdout is not None
+        output = cast(io.BufferedReader, process.stdout)
         target = memoryview(frames).cast("B")
         filled = 0
         while filled < len(target):
-            count = process.stdout.readinto(target[filled:])
+            count = output.readinto(target[filled:])
             if not count:
                 break
             filled += count
         # ``-frames:v`` stops the output at the planned count.
-        trailing = process.stdout.read()
+        trailing = output.read()
         code = process.wait()
         errors.seek(0)
         message = errors.read().decode(errors="replace").strip()
@@ -166,10 +167,10 @@ def read_video(path: Path, clip: VideoClip, *, ffmpeg: str) -> np.ndarray:
     return frames
 
 
-def read_audio(source: bytes | Path, clip: AudioClip, *, rate: int):
+def read_audio(source: bytes | BinaryIO, clip: AudioClip, *, rate: int):
     """Decode an audio track's kept samples at the model's rate.
 
-    ``source`` is an audio file's bytes or a video file's path; the first
+    ``source`` contains encoded bytes or an open binary file; the first
     audio stream is read. Decoding keeps the native rate and channel layout
     as planar float; the planned native samples are kept, a mono track is
     duplicated to stereo, and one resample brings the track to ``rate``.
@@ -184,7 +185,7 @@ def read_audio(source: bytes | Path, clip: AudioClip, *, rate: int):
     import av
 
     container = av.open(
-        io.BytesIO(source) if isinstance(source, bytes) else str(source)
+        io.BytesIO(source) if isinstance(source, bytes) else source, mode="r"
     )
     with container:
         if not container.streams.audio:
@@ -201,7 +202,7 @@ def read_audio(source: bytes | Path, clip: AudioClip, *, rate: int):
         resampler = av.audio.resampler.AudioResampler(
             format="fltp", layout=stream.layout, rate=native
         )
-        chunks = []
+        chunks: list[torch.Tensor] = []
         for frame in container.decode(stream):
             chunks.extend(
                 torch.from_numpy(part.to_ndarray())
@@ -233,8 +234,7 @@ def read_audio(source: bytes | Path, clip: AudioClip, *, rate: int):
 
 __all__ = [
     "FRAME_RATE",
-    "SHARED_MEMORY",
-    "media_path",
+    "open_media",
     "read_audio",
     "read_bytes",
     "read_image",

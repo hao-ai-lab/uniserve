@@ -11,12 +11,11 @@ products sized as the engine reserves them.
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from fractions import Fraction
+from multiprocessing import shared_memory
 from pathlib import Path
 
 import torch
@@ -28,7 +27,6 @@ from uniserve_models.minimax_h3 import processing, video_vae
 from uniserve_models.minimax_h3.encoder import TextEncoderConfig
 from uniserve_models.minimax_h3.encoding import VideoEncoder
 from uniserve_worker.execution.media_reader import read_conditions
-from uniserve_worker.media.reader import SHARED_MEMORY
 from uniserve_worker.protocol.video import (
     AudioClip,
     ConditionVision,
@@ -64,19 +62,21 @@ def published() -> Iterator:
     Yields a function from a file path to its ``MediaLocator``; every
     object it published is unlinked on exit.
     """
-    names = []
+    segments = []
 
     def publish(path: Path) -> MediaLocator:
-        name = f"uniserve-test-media-{uuid.uuid4().hex}"
-        shutil.copyfile(path, SHARED_MEMORY / name)
-        names.append(name)
-        return MediaLocator(name, path.stat().st_size)
+        data = path.read_bytes()
+        storage = shared_memory.SharedMemory(create=True, size=len(data))
+        segments.append(storage)
+        storage.buf[:] = data
+        return MediaLocator(storage.name, len(data))
 
     try:
         yield publish
     finally:
-        for name in names:
-            (SHARED_MEMORY / name).unlink(missing_ok=True)
+        for storage in segments:
+            storage.close()
+            storage.unlink()
 
 
 def media_file(root: Path, uri: str) -> Path:

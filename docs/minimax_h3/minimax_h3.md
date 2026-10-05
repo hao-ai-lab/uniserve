@@ -6,7 +6,7 @@ UniServe serves the MiniMax-H3 video-and-audio models: text-to-video (`t2va`), k
 
 - Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Blackwell GPUs. Four GB200 GPUs on one host are the validated setup for every checkpoint in this guide. FastH3 OmniRef's sparse attention uses 128-row tiles, which have a data-center Blackwell (SM100) kernel only; on other devices the server refuses an OmniRef deployment at startup, before loading weights.
 - The MiniMax-H3 diffusers root (`MiniMaxAI/MiniMax-H3`), or a FastH3 OmniRef component export together with the base revision it pins.
-- FFmpeg for video and audio conditions: the server probes condition media with `ffprobe` and the worker decodes reference videos with `ffmpeg`, the executables on `PATH` unless `--ffprobe` and `--ffmpeg` name others.
+- FFmpeg with [seekable file descriptor input](https://ffmpeg.org/ffmpeg-protocols.html#fd) for video and audio conditions: the server probes condition media with `ffprobe` and the worker decodes reference videos with `ffmpeg`, the executables on `PATH` unless `--ffprobe` and `--ffmpeg` name others.
 - Shared storage and pinned-storage access for worker IPC, as for FastH3.
 
 ## Install

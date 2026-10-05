@@ -4,8 +4,8 @@
 engine's requests and publishes the worker's responses over iceoryx2 shared
 storage or a TCP socket. ``StreamSignal`` turns CUDA stream completion into a
 readable descriptor for selector loops. ``atomic_store_u32`` and
-``atomic_load_u32`` order the header words of shared-storage segments, which
-``uniserve_worker.transport.segment`` reads and writes across processes.
+``atomic_load_u32`` order shared host words used by external transfer peers.
+``SharedBuffer`` and ``SharedRead`` own native shared tensor exports and reads.
 ``Request`` and ``RequestPool`` own the lifecycle shared by serving and direct
 numerical execution. ``BufferPool`` binds scheduler-assigned storage and issues
 its numerical ``BufferBinding`` views.
@@ -85,6 +85,10 @@ def store_media_bytes(payload: bytes) -> str:
     """Publish bytes and hand their segment name to the receiving process."""
     ...
 
+def open_shared_memory(name: str) -> int:
+    """Open a read-only POSIX descriptor; its caller owns closing it."""
+    ...
+
 __all__ = [
     "BatchInputs",
     "BatchState",
@@ -123,6 +127,8 @@ __all__ = [
     "ReadReservation",
     "Server",
     "SharedBuffer",
+    "SharedRead",
+    "SHM_HEADER_BYTES",
     "StreamSignal",
     "Submission",
     "TensorImport",
@@ -134,6 +140,7 @@ __all__ = [
     "fetch_tensor",
     "fetch_descriptor",
     "store_media_bytes",
+    "open_shared_memory",
     "WeightPrefetch",
     "atomic_load_u32",
     "atomic_store_u32",
@@ -145,6 +152,7 @@ __all__ = [
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")
+SHM_HEADER_BYTES: int
 
 @final
 class ExpertExchange:
@@ -618,6 +626,37 @@ class SharedBuffer(BufferProtocol):
     def settled(self) -> bool: ...
     def synchronize(self) -> None: ...
     def close(self) -> None: ...
+
+@final
+class SharedRead(BufferProtocol):
+    """Claim a payload, await native readiness, and retain its mapped view.
+
+    Offsets are relative to the payload, excluding the segment header. The
+    caller ends all reading before release acknowledges its rank's slot.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        nbytes: int,
+        slot: int,
+        *,
+        offset: int = 0,
+        ticket: TransferTicket | None = None,
+        timeout: float = 120.0,
+    ) -> None: ...
+    def __buffer__(self, flags: int) -> memoryview: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        kind: type[BaseException] | None,
+        value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+    @property
+    def nbytes(self) -> int: ...
+    def truncate(self, nbytes: int) -> None: ...
+    def release(self) -> None: ...
 
 @final
 class HostLane:

@@ -12,19 +12,60 @@ from multiprocessing import shared_memory
 import pytest
 import torch
 
+from tests.python.fixtures import segment
 from tests.python.fixtures.cuda_stream import blocked_stream
+from tests.python.fixtures.shared_storage import open_shared_storage
 from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import (
     SharedBuffer,
+    SharedRead,
     atomic_load_u32,
     atomic_store_u32,
 )
-from uniserve_worker.errors import ResourceError
+from uniserve_worker.errors import ResourceError, WorkerError
 from uniserve_worker.protocol.transfer import Locator
-from uniserve_worker.transport import make_transports, segment
-from uniserve_worker.transport.shared_storage import open_shared_storage
+from uniserve_worker.transport import make_transports
 
 pytestmark = pytest.mark.integration
+
+
+def test_shared_read_views_retain_their_claim_and_selected_bytes():
+    storage = SharedBuffer(16, (0,))
+    payload = torch.frombuffer(
+        memoryview(storage)[segment.HEADER_BYTES :], dtype=torch.int32
+    )
+    payload.copy_(torch.arange(4, dtype=torch.int32))
+    storage.mark_ready()
+    try:
+        read = SharedRead(storage.name, 12, 0, offset=4)
+        read.truncate(8)
+        with pytest.raises(WorkerError, match="borrowed range"):
+            read.truncate(12)
+        view = torch.frombuffer(read, dtype=torch.int32)
+        del read
+        assert not storage.settled()
+        torch.testing.assert_close(
+            view, torch.tensor([1, 2], dtype=torch.int32)
+        )
+        del view
+        assert storage.settled()
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("ending", ("timeout", "failure", "short_segment"))
+def test_refused_shared_read_leaves_no_reader_claim(ending):
+    storage = SharedBuffer(4, (0,))
+    try:
+        if ending == "failure":
+            segment.set_state(memoryview(storage), segment.FAILED)
+        size = 8 if ending == "short_segment" else 4
+        with pytest.raises(WorkerError, match="readiness|shorter"):
+            SharedRead(storage.name, size, 0, timeout=0)
+        storage.mark_ready()
+        assert storage.settled()
+    finally:
+        storage.close()
 
 
 def test_borrowed_tensor_survives_shared_buffer_close():

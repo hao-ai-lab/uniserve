@@ -1,13 +1,23 @@
 //! Borrowed Python views of native shared host buffers.
 
+use std::os::fd::IntoRawFd;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
-use pyo3::exceptions::PyBufferError;
+use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
-use uniserve_worker::{SharedBuffer as NativeBuffer, SharedMapping};
+use uniserve_worker::{SharedBuffer as NativeBuffer, SharedMapping, SharedRead as NativeRead};
 
-use super::error::{invariant, resource};
+use super::error::{invariant, native_error, resource};
+use super::transfer::TransferTicket;
+
+/// Hand an open POSIX descriptor to a codec's ordinary file interface.
+#[pyfunction]
+pub(super) fn open_shared_memory(py: Python<'_>, name: &str) -> PyResult<i32> {
+    py.detach(|| uniserve_core::SharedMemory::open(name, false).map(IntoRawFd::into_raw_fd))
+        .map_err(PyErr::from)
+}
 
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct SharedBuffer {
@@ -92,21 +102,8 @@ impl SharedBuffer {
             .map_err(PyBufferError::new_err)?;
         // Each exported view keeps the mapping alive independently of close.
         // CUDA registration remains with the producer, whose close drains DMA.
-        unsafe {
-            if pyo3::ffi::PyBuffer_FillInfo(
-                view,
-                slf.as_ptr(),
-                mapping.address() as *mut _,
-                mapping.size() as isize,
-                0,
-                flags,
-            ) != 0
-            {
-                return Err(PyErr::fetch(slf.py()));
-            }
-            (*view).internal = Arc::into_raw(mapping) as *mut _;
-        }
-        Ok(())
+        let size = mapping.size();
+        unsafe { export_mapping(slf.into_any(), mapping, 0, size, view, flags) }
     }
 
     unsafe fn __releasebuffer__(&self, view: *mut pyo3::ffi::Py_buffer) {
@@ -135,4 +132,129 @@ impl Drop for SharedBuffer {
             }
         });
     }
+}
+
+/// A shared read claims and waits without Python; numerical consumers borrow
+/// only its payload range through the ordinary buffer protocol.
+#[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
+pub(crate) struct SharedRead {
+    inner: Mutex<NativeRead>,
+}
+
+#[pymethods]
+impl SharedRead {
+    #[new]
+    #[pyo3(signature = (name, nbytes, slot, *, offset=0, ticket=None, timeout=120.0))]
+    fn new(
+        py: Python<'_>,
+        name: &str,
+        nbytes: usize,
+        slot: usize,
+        offset: usize,
+        ticket: Option<&TransferTicket>,
+        timeout: f64,
+    ) -> PyResult<Self> {
+        let timeout = Duration::try_from_secs_f64(timeout).map_err(|_| {
+            PyValueError::new_err("readiness timeout must be finite and nonnegative")
+        })?;
+        let inner = py
+            .detach(|| {
+                let read = NativeRead::open(name, offset, nbytes, slot)?;
+                read.wait(timeout, || {
+                    ticket.map_or(Ok(()), TransferTicket::check_active)
+                })?;
+                Ok::<_, uniserve_worker::Error>(read)
+            })
+            .map_err(|error| native_error(py, error))?;
+
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    #[getter]
+    fn nbytes(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.lock(py)?.nbytes())
+    }
+
+    fn truncate(&self, py: Python<'_>, nbytes: usize) -> PyResult<()> {
+        self.lock(py)?
+            .truncate(nbytes)
+            .map_err(|error| native_error(py, error))
+    }
+
+    fn release(&self, py: Python<'_>) -> PyResult<()> {
+        self.lock(py)?.release();
+        Ok(())
+    }
+
+    fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _kind: &Bound<'_, PyAny>,
+        _value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        self.release(py)
+    }
+
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut pyo3::ffi::Py_buffer,
+        flags: std::ffi::c_int,
+    ) -> PyResult<()> {
+        let read = slf.get().lock(slf.py())?;
+        let mapping = read
+            .mapping()
+            .map_err(|error| native_error(slf.py(), error))?;
+        let offset = read.offset();
+        let size = read.nbytes();
+        drop(read);
+
+        unsafe { export_mapping(slf.into_any(), mapping, offset, size, view, flags) }
+    }
+
+    unsafe fn __releasebuffer__(&self, view: *mut pyo3::ffi::Py_buffer) {
+        // SAFETY: export_mapping retained one reference in this view.
+        drop(unsafe { Arc::from_raw((*view).internal as *const SharedMapping) });
+    }
+}
+
+impl SharedRead {
+    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, NativeRead>> {
+        self.inner
+            .lock_py_attached(py)
+            .map_err(|_| invariant(py, "shared read lock is poisoned"))
+    }
+}
+
+/// Export an already bounded range while retaining both its Python owner and
+/// mapping. A view remains valid even if explicit release unlinks its source.
+unsafe fn export_mapping(
+    owner: Bound<'_, PyAny>,
+    mapping: Arc<SharedMapping>,
+    offset: usize,
+    size: usize,
+    view: *mut pyo3::ffi::Py_buffer,
+    flags: std::ffi::c_int,
+) -> PyResult<()> {
+    unsafe {
+        if pyo3::ffi::PyBuffer_FillInfo(
+            view,
+            owner.as_ptr(),
+            (mapping.address() + offset) as *mut _,
+            size as isize,
+            0,
+            flags,
+        ) != 0
+        {
+            return Err(PyErr::fetch(owner.py()));
+        }
+        (*view).internal = Arc::into_raw(mapping) as *mut _;
+    }
+    Ok(())
 }

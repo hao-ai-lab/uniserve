@@ -596,3 +596,13 @@ fn store_media_bytes(payload: Bytes) -> Result<tvm_ffi::String> {
 }
 
 tvm_ffi::tvm_ffi_dll_export_typed_func!(store_media_bytes, store_media_bytes);
+
+fn open_shared_memory(name: tvm_ffi::String) -> Result<i32> {
+    use std::os::fd::IntoRawFd;
+
+    uniserve_core::SharedMemory::open(name.as_str(), false)
+        .map(IntoRawFd::into_raw_fd)
+        .map_err(|error| failure(error.to_string()))
+}
+
+tvm_ffi::tvm_ffi_dll_export_typed_func!(open_shared_memory, open_shared_memory);

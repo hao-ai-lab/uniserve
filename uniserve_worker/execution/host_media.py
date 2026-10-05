@@ -44,12 +44,13 @@ from uniserve_worker.protocol.transfer import (
 if TYPE_CHECKING:
     import torch
 
+    from uniserve_worker._uniserve_ipc import SharedRead
     from uniserve_worker.config.deployment import ComponentConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.protocol.batch import TensorExport
     from uniserve_worker.storage.tensor_store import TensorStore
     from uniserve_worker.transport.interface import Transport
-    from uniserve_worker.transport.shm import HostBorrow, ShmTransport
+    from uniserve_worker.transport.shm import ShmTransport
 
 __all__ = ["BORROWED_INPUT_CALLS", "HOST_MEDIA_CALLS", "execute"]
 
@@ -126,7 +127,7 @@ def _borrow(
     row: int,
     *,
     transports: Mapping[str, Transport],
-) -> HostBorrow:
+) -> SharedRead:
     """Borrow one leading-axis row of a product in place.
 
     The location holding the row must be a shared-storage segment on this
@@ -174,7 +175,6 @@ def read_encoded_units(
     """
     import torch
 
-    from uniserve_worker.transport.shared_storage import open_shared_storage
     from uniserve_worker.transport.shm import ShmTransport
 
     if len(tensor.shape) != 2 or tensor.dtype != "uint8":
@@ -221,12 +221,7 @@ def read_encoded_units(
             assert isinstance(shm, ShmTransport)
             borrow = shm.borrow(location)
             try:
-                with open_shared_storage(
-                    borrow.segment, borrow.offset + borrow.nbytes
-                ) as mapping:
-                    raw = bytearray(
-                        mapping[borrow.offset : borrow.offset + borrow.nbytes]
-                    )
+                raw = bytearray(borrow)
             finally:
                 borrow.release()
         else:
@@ -333,7 +328,7 @@ def execute(
             imported_units = imported_read.tensor
         encoder = MediaEncoder(rank=model_runner.worker_config.rank)
         scheduled: list[HostTask] = []
-        borrows: list[HostBorrow] = []
+        borrows: list[SharedRead] = []
         try:
             for position, reservation in zip(
                 positions, reservations, strict=True
@@ -345,7 +340,7 @@ def execute(
                 frames = config.video_unit_frames[unit]
                 # RGB24: three bytes per pixel.
                 expected = frames * config.height * config.width * 3
-                source: HostBorrow | np.ndarray
+                source: SharedRead | np.ndarray
                 if imported_units is None:
                     borrow = _borrow(export, position, transports=transports)
                     borrows.append(borrow)
@@ -355,7 +350,7 @@ def execute(
                             "frames"
                         )
                     # Narrow the borrow to this unit's own frames.
-                    borrow.nbytes = expected
+                    borrow.truncate(expected)
                     source = borrow
                 else:
                     if position >= int(imported_units.shape[0]):

@@ -15,6 +15,24 @@ pub struct SharedMemory {
 }
 
 impl SharedMemory {
+    /// Open an existing segment without taking responsibility for unlinking.
+    pub fn open(name: &str, writable: bool) -> io::Result<File> {
+        let name = CString::new(format!("/{}", name.trim_start_matches('/')))?;
+        let access = if writable {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+
+        // SAFETY: name is NUL-terminated; a successful call returns an owned fd.
+        let descriptor = unsafe { libc::shm_open(name.as_ptr(), access | libc::O_CLOEXEC, 0) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
     /// Allocate physical storage and return its writable descriptor. The
     /// caller may close the descriptor as soon as writing or mapping ends.
     pub fn create(size: usize) -> io::Result<(Self, File)> {

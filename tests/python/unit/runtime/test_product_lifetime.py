@@ -1136,8 +1136,8 @@ def test_unacknowledged_latent_export_retains_its_pages_without_poisoning_other_
     """
     from contextlib import suppress
 
-    from uniserve_worker.transport import segment
-    from uniserve_worker.transport.shared_storage import open_shared_storage
+    from tests.python.fixtures import segment
+    from tests.python.fixtures.shared_storage import open_shared_storage
 
     events = EventPool()
     transport = make_transport(
@@ -1422,9 +1422,10 @@ def test_fp8_export_preserves_values_before_a_later_block_scale_growth():
 
 def test_a_host_product_is_published_where_its_consumers_are() -> None:
     """Each host mechanism carries a product only to consumers it reaches."""
-    from uniserve_worker.transport import make_transports, segment
+    from tests.python.fixtures import segment
+    from tests.python.fixtures.shared_storage import open_shared_storage
+    from uniserve_worker.transport import make_transports
     from uniserve_worker.transport.exports import export_tensor
-    from uniserve_worker.transport.shared_storage import open_shared_storage
 
     events = EventPool()
     # Slots 0 and 1 share this host; slot 2 is on another host.

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from multiprocessing import shared_memory
 
+from tests.python.fixtures import segment
 from uniserve_worker.protocol.transfer import (
     Locator,
     PosixShmTransfer,
     WorkerEndpoint,
 )
-from uniserve_worker.transport import segment
 
 
 def serve_pending_export(channel, shape=(1024,)) -> None:

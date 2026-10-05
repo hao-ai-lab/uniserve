@@ -12,8 +12,6 @@ length-prefixed rows of the encode call's product (`frame_encoded_unit`,
 
 from __future__ import annotations
 
-import mmap
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -36,8 +34,8 @@ from uniserve_worker.protocol.identity import CallId, RequestKey
 if TYPE_CHECKING:
     import torch
 
+    from uniserve_worker._uniserve_ipc import SharedRead
     from uniserve_worker.execution.host import HostTask
-    from uniserve_worker.transport.shm import HostBorrow
 
 __all__ = [
     "AvMuxConfig",
@@ -107,52 +105,21 @@ def read_encoded_unit(row: torch.Tensor) -> bytes:
     return values[_LENGTH_BYTES : _LENGTH_BYTES + length].tobytes()
 
 
-def _pixels(source: HostBorrow | np.ndarray, config: AvMuxConfig) -> np.ndarray:
+def _pixels(source: SharedRead | np.ndarray, config: AvMuxConfig) -> np.ndarray:
     """Return a media unit's RGB24 frames without copying borrowed bytes.
 
     A borrowed unit stays in its producer's shared-storage segment, mapped
-    read-only for as long as the returned view lives.
+    for as long as the returned view lives.
     """
-    raw = source if isinstance(source, np.ndarray) else _map(source)
+    raw = (
+        source
+        if isinstance(source, np.ndarray)
+        else np.frombuffer(source, dtype=np.uint8)
+    )
     raster = config.height * config.width * 3
     if raw.size % raster != 0:
         raise invalid_descriptor("video capture has invalid RGB24 dimensions")
     return raw.reshape(-1, config.height, config.width, 3)
-
-
-def _map(source: HostBorrow) -> np.ndarray:
-    """Map a borrowed region of a shared-storage segment read-only.
-
-    The returned array keeps the ``mmap`` object, and so the mapping, alive
-    until the array and its views are collected; closing the descriptor
-    right after mapping does not invalidate it.
-
-    Raises:
-        WorkerError: When the region is negative or extends past the
-            segment's size.
-        OSError: When the segment cannot be opened or mapped.
-    """
-    if source.offset < 0 or source.nbytes < 0:
-        raise invalid_descriptor(
-            "media unit lies outside its shared-storage segment"
-        )
-    name = source.segment.removeprefix("/")
-    descriptor = os.open(f"/dev/shm/{name}", os.O_RDONLY)
-    try:
-        if source.offset + source.nbytes > os.fstat(descriptor).st_size:
-            raise invalid_descriptor(
-                "media unit lies outside its shared-storage segment"
-            )
-        # The mapping starts at offset zero and the array view below selects
-        # the region, so ``source.offset`` need not be page-aligned.
-        mapping = mmap.mmap(
-            descriptor, source.offset + source.nbytes, prot=mmap.PROT_READ
-        )
-    finally:
-        os.close(descriptor)
-    return np.frombuffer(
-        mapping, dtype=np.uint8, count=source.nbytes, offset=source.offset
-    )
 
 
 @dataclass(slots=True)
@@ -225,7 +192,7 @@ class MediaEncoder:
         *,
         config: AvMuxConfig,
         unit_index: int,
-        source: HostBorrow | np.ndarray,
+        source: SharedRead | np.ndarray,
         reservation: HostTask,
         call_id: CallId,
     ) -> HostTask:

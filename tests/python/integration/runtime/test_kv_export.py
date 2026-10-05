@@ -8,6 +8,7 @@ from multiprocessing import shared_memory
 import pytest
 import torch
 
+from tests.python.fixtures import segment
 from tests.python.fixtures.depth_one import (
     ar_params,
     execution_batch,
@@ -20,6 +21,7 @@ from tests.python.fixtures.depth_one import (
     kv_export_call as _export_call,
 )
 from tests.python.fixtures.execution_worker import execution_worker
+from tests.python.fixtures.shared_storage import open_shared_storage
 from uniserve_worker.protocol.batch import (
     BlockTable,
     CacheUnitAllocation,
@@ -42,8 +44,6 @@ from uniserve_worker.protocol.transfer import (
     Locator,
     PosixShmTransfer,
 )
-from uniserve_worker.transport import segment
-from uniserve_worker.transport.shared_storage import open_shared_storage
 
 pytestmark = pytest.mark.integration
 
