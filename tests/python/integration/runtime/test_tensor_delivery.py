@@ -5,9 +5,9 @@ Real CUDA VMM endpoints deliver the coverage as well.
 
 from __future__ import annotations
 
-import errno
 import multiprocessing as mp
-import os
+import resource
+import signal
 import threading
 
 import pytest
@@ -16,7 +16,7 @@ import torch
 from tests.python.fixtures.cuda_stream import blocked_stream
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
-from uniserve_worker.errors import WorkerError
+from uniserve_worker.errors import ResourceError, WorkerError
 from uniserve_worker.protocol.batch import BufferAllocation
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.tensor import (
@@ -1031,9 +1031,7 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
         arena.close()
 
 
-def test_shm_allocation_failure_preserves_export_capacity(
-    monkeypatch,
-) -> None:
+def _shm_allocation_failure_preserves_export_capacity() -> None:
     events = EventPool()
     transport = make_transport(
         "shm", byte_capacity=16, ticket_capacity=1, event_pool=events
@@ -1044,15 +1042,19 @@ def test_shm_allocation_failure_preserves_export_capacity(
     source = torch.arange(4, dtype=torch.float32)
     locator = None
 
-    def exhausted_filesystem(*_args):
-        raise OSError(errno.ENOSPC, "shared-storage filesystem is full")
-
     try:
-        with monkeypatch.context() as filesystem:
-            filesystem.setattr(os, "posix_fallocate", exhausted_filesystem)
-            with pytest.raises(OSError) as failure:
+        # Limit only this child process. The allocation must fail before a
+        # mapped write, and a later export must be able to reuse its budget.
+        previous_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
+        previous_handler = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        try:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, previous_limit[1]))
+            with pytest.raises(ResourceError):
                 transport.export(source)
-            assert failure.value.errno == errno.ENOSPC
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, previous_limit)
+            signal.signal(signal.SIGXFSZ, previous_handler)
+
         locator = transport.export(source)
         destination = torch.empty_like(source)
         ticket = consumer.fetch(
@@ -1066,6 +1068,22 @@ def test_shm_allocation_failure_preserves_export_capacity(
         consumer.close()
         transport.close()
         events.close()
+
+
+def test_shm_allocation_failure_preserves_export_capacity() -> None:
+    process = mp.get_context("spawn").Process(
+        target=_shm_allocation_failure_preserves_export_capacity
+    )
+    process.start()
+    try:
+        process.join(timeout=30)
+        assert not process.is_alive(), "allocation failure did not return"
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
+        process.close()
 
 
 @pytest.mark.parametrize("backend", ("shm", "cuda_vmm"))

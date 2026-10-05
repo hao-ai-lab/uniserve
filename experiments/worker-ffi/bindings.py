@@ -33,6 +33,14 @@ class HostBuffers(tvm_ffi.Object):
     """Host input tensors and native copy fences shared with production."""
 
 
+class TransferPool(tvm_ffi.Object):
+    """Native reads, copy streams and physical credit returns."""
+
+
+class TransferTicket(tvm_ffi.Object):
+    """Native read readiness and retirement with a DLPack destination view."""
+
+
 class CUDAStream(tvm_ffi.Object):
     """Native stream, SM partition and submission fences."""
 
@@ -89,6 +97,8 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.HostLane")(HostLane)
     tvm_ffi.register_object("uniserve.ffi.HostTask")(HostTask)
     tvm_ffi.register_object("uniserve.ffi.HostBuffers")(HostBuffers)
+    tvm_ffi.register_object("uniserve.ffi.TransferPool")(TransferPool)
+    tvm_ffi.register_object("uniserve.ffi.TransferTicket")(TransferTicket)
     tvm_ffi.register_object("uniserve.ffi.CUDAStream")(CUDAStream)
     tvm_ffi.register_object("uniserve.ffi.CUDAEvent")(CUDAEvent)
     tvm_ffi.register_object("uniserve.ffi.DescriptorGrants")(DescriptorGrants)
