@@ -886,11 +886,11 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         write = pool.reserve_import(
             product, request_pool_idx=1, page_table=(3, 1, 4), latent_units=11
         )
-        staging = pool.stage(((3, 1, 4),), (11,))[0]
+        buffer = pool.bind(((3, 1, 4),), (11,))[0]
         with pytest.raises(WorkerError, match="committed trajectory"):
             pool.gather_current(
                 1,
-                staging,
+                buffer,
                 generation=3,
                 step=2,
                 latent_units=11,
@@ -907,7 +907,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         pool.adopt_import(write, generation=3, step=2, height=16, width=176)
         actual = pool.gather_current(
             1,
-            staging,
+            buffer,
             generation=3,
             step=2,
             latent_units=11,
@@ -918,7 +918,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         with pytest.raises(WorkerError, match="page table does not match"):
             pool.gather_current(
                 1,
-                pool.stage(((1, 3, 4),), (11,))[0],
+                pool.bind(((1, 3, 4),), (11,))[0],
                 generation=3,
                 step=2,
                 latent_units=11,
@@ -986,13 +986,13 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         shape_bound=ShapeBound((StaticDim(11), StaticDim(4))),
     )
     pages = (3, 1, 4)
-    staging = pool.stage((pages,), (11,))[0]
+    buffer = pool.bind((pages,), (11,))[0]
     commit = latent_output(1, pages, 11, 16, 176)
     locations = []
     readers = []
     try:
-        staging.value.fill_(1)
-        pool.initialize(1, staging, latent_units=11)
+        buffer.value.fill_(1)
+        pool.initialize(1, buffer, latent_units=11)
         if committed:
             pool.validate_updates((commit,))
             pool.apply_updates((commit,))
@@ -1025,10 +1025,10 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             pool.apply_updates((commit,))
 
         # The next step uses the other bank and can proceed during fan-out.
-        staging.value.fill_(2)
+        buffer.value.fill_(2)
         pool.write_inactive(
             1,
-            staging,
+            buffer,
             expected_step=0,
             expected_generation=1,
             latent_units=11,
@@ -1048,7 +1048,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         torch.testing.assert_close(
             pool.gather_current(
                 1,
-                staging,
+                buffer,
                 generation=2,
                 step=1,
                 latent_units=11,
@@ -1067,11 +1067,11 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             reader.close()
         dependencies = pool.write_dependencies(1, pages)
         assert any(not dependency.done() for dependency in dependencies)
-        staging.value.fill_(3)
+        buffer.value.fill_(3)
         with pytest.raises(WorkerError, match="published version"):
             pool.write_inactive(
                 1,
-                staging,
+                buffer,
                 expected_step=1,
                 expected_generation=2,
                 latent_units=11,
@@ -1086,7 +1086,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             dependency.result(timeout=5)
         pool.write_inactive(
             1,
-            staging,
+            buffer,
             expected_step=1,
             expected_generation=2,
             latent_units=11,
@@ -1103,7 +1103,7 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         torch.testing.assert_close(
             pool.gather_current(
                 1,
-                staging,
+                buffer,
                 generation=3,
                 step=2,
                 latent_units=11,
@@ -1159,9 +1159,9 @@ def test_unacknowledged_latent_export_retains_its_pages_without_poisoning_other_
         dtype=DType.F32,
         shape_bound=ShapeBound((StaticDim(4), StaticDim(4))),
     )
-    staging = pool.stage(((1,),), (4,))[0]
-    staging.value.fill_(1)
-    pool.initialize(1, staging, latent_units=4)
+    buffer = pool.bind(((1,),), (4,))[0]
+    buffer.value.fill_(1)
+    pool.initialize(1, buffer, latent_units=4)
     source = pool.reserve_export(
         product, request_pool_idx=1, page_table=(1,), latent_units=4
     )
@@ -1198,7 +1198,7 @@ def test_unacknowledged_latent_export_retains_its_pages_without_poisoning_other_
                 latent_units=4,
             )
 
-        independent = pool.stage(((2,),), (4,))[0]
+        independent = pool.bind(((2,),), (4,))[0]
         independent.value.fill_(7)
         pool.initialize(2, independent, latent_units=4)
         next_commit = latent_output(2, (2,), 4, 16, 64)
@@ -1283,14 +1283,14 @@ def test_unknown_latent_reader_completion_retains_only_its_pages(
         pool.retirement_ready((product.request_key,))
 
     # An independent trajectory can still commit and expose its values.
-    staging = pool.stage(((2,),), (4,))[0]
-    staging.value.fill_(7)
-    pool.initialize(2, staging, latent_units=4)
+    buffer = pool.bind(((2,),), (4,))[0]
+    buffer.value.fill_(7)
+    pool.initialize(2, buffer, latent_units=4)
     update = latent_output(2, (2,), 4, 16, 64)
     pool.validate_updates((update,))
     pool.apply_updates((update,))
     actual = pool.gather_current(
-        2, staging, generation=1, step=0, latent_units=4, height=16, width=64
+        2, buffer, generation=1, step=0, latent_units=4, height=16, width=64
     )
     torch.testing.assert_close(actual, torch.full((4, 4), 7.0), rtol=0, atol=0)
     assert pool.retirement_ready((update.params.request_key,))
@@ -1299,7 +1299,7 @@ def test_unknown_latent_reader_completion_retains_only_its_pages(
     assert closing.value.code is WorkerErrorCode.RESOURCE_ERROR
 
 
-def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
+def test_latent_buffer_preserves_live_trajectories(latent_output) -> None:
     pool = LatentPool(
         request_pool_size=2,
         num_pages=5,
@@ -1309,15 +1309,15 @@ def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
         device="cpu",
     )
     try:
-        first = pool.stage(((3, 1),), (7,))[0]
+        first = pool.bind(((3, 1),), (7,))[0]
         first.value.fill_(7)
-        second = pool.stage(((4, 2),), (7,), occupied=(first,))[0]
+        second = pool.bind(((4, 2),), (7,), occupied=(first,))[0]
         second.value.fill_(9)
         with pytest.raises(WorkerError, match="overlap"):
-            pool.stage(((1,),), (4,), occupied=(first, second))
+            pool.bind(((1,),), (4,), occupied=(first, second))
 
         # Both consumers run after both inputs were staged. Their original
-        # values and page order must survive staging an independent call.
+        # values and page order must survive binding an independent call.
         pool.initialize(1, first, latent_units=7)
         pool.initialize(2, second, latent_units=7)
         updates = (
@@ -1326,10 +1326,10 @@ def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
         )
         pool.validate_updates(updates)
         pool.apply_updates(updates)
-        for slot, staging, expected in ((1, first, 7), (2, second, 9)):
+        for slot, buffer, expected in ((1, first, 7), (2, second, 9)):
             actual = pool.gather_current(
                 slot,
-                staging,
+                buffer,
                 step=0,
                 generation=1,
                 latent_units=7,

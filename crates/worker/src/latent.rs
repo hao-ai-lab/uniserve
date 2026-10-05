@@ -177,7 +177,7 @@ impl<I, S> LatentPool<I, S> {
     /// Return page tables and their contiguous scratch offset. Occupied views
     /// supply their logical pages and offset in the shared page-index buffer;
     /// callers retain them through numerical completion.
-    pub fn stage(
+    pub fn bind(
         &self,
         page_tables: &[Vec<i64>],
         latent_units: &[i64],
@@ -185,7 +185,7 @@ impl<I, S> LatentPool<I, S> {
     ) -> Result<(Vec<Vec<usize>>, usize)> {
         if page_tables.is_empty() || page_tables.len() != latent_units.len() {
             return Err(Error::Invalid(
-                "latent staging columns are not aligned".into(),
+                "latent buffer columns are not aligned".into(),
             ));
         }
         let tables = page_tables
@@ -196,21 +196,21 @@ impl<I, S> LatentPool<I, S> {
         let total: usize = tables.iter().map(Vec::len).sum();
         if total >= self.num_pages {
             return Err(Error::Invalid(
-                "latent staging exceeds the fixed step buffer".into(),
+                "latent buffer exceeds the fixed step buffer".into(),
             ));
         }
 
         let mut pages = HashSet::new();
         for &page in tables.iter().flatten() {
             if !pages.insert(page) {
-                return Err(Error::Invalid("latent staging page tables overlap".into()));
+                return Err(Error::Invalid("latent buffer page tables overlap".into()));
             }
         }
         let mut ranges = Vec::with_capacity(occupied.len());
         for (held, start) in occupied {
             if held.iter().any(|page| pages.contains(page)) {
                 return Err(Error::Invalid(
-                    "latent staging page tables overlap live calls".into(),
+                    "latent buffer page tables overlap live calls".into(),
                 ));
             }
             ranges.push((*start, held.len()));
@@ -226,7 +226,7 @@ impl<I, S> LatentPool<I, S> {
         }
         if offset + total >= self.num_pages {
             return Err(Error::Resource(
-                "live latent staging exceeds the fixed step buffer",
+                "live latent buffer exceeds the fixed step buffer",
             ));
         }
         Ok((tables, offset))

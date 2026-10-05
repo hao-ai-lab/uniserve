@@ -381,7 +381,7 @@ impl RequestPool {
         self.pool.remove(request_id);
     }
 
-    /// The execution owner drains numerical staging before retiring this slot.
+    /// The execution owner drains numerical work before retiring this slot.
     pub(super) fn retire(&mut self, py: Python<'_>, request_id: u64) -> PyResult<()> {
         self.pool
             .retire(request_id)

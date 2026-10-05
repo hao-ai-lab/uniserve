@@ -537,7 +537,7 @@ class Worker:
                         planes,
                         max_sequence_tokens=worker_config.max_sequence_tokens,
                     ),
-                    staging_depth=int(queue_depth),
+                    host_buffer_depth=int(queue_depth),
                 )
                 startup.callback(self.kv_cache.close)
 
@@ -590,7 +590,7 @@ class Worker:
                     dtype=plan.dtype,
                     device=worker_config.generation_device
                     or worker_config.device,
-                    staging=plan.staging,
+                    with_workspace=plan.with_workspace,
                 )
                 startup.callback(self.latent_pool.close)
             if runner.denoises:

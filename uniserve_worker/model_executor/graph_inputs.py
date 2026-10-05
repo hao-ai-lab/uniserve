@@ -2,7 +2,7 @@
 
 Text calls replay graphs captured at configured bucket shapes. Selection
 (``text_shape``) picks a bucket for a staged batch, ``pad_text`` widens the
-batch's views of the runner's fixed staging to that bucket and makes the
+batch's views of the runner's fixed buffers to that bucket and makes the
 padding inert. Decode buckets capture the call together with
 graph-capturable greedy decoding (``capture_batch``/``replay_batch``);
 prefill buckets capture the backbone's hidden states alone
@@ -105,7 +105,7 @@ def select_flow_captures(
     physical_tokens: Callable[[int, int], int],
     image_tokens: Callable[[int, int], int],
 ) -> tuple[DiffusionShape, ...]:
-    """Keep the configured shape combinations that fit staging capacity.
+    """Keep the configured shape combinations that fit buffer capacity.
 
     Every combination of image shape, request count and guidance-branch
     count is kept when the request count is positive and at most
@@ -155,7 +155,7 @@ def select_prefill_captures(
 
     Token buckets are the configured sizes up to ``max_tokens`` and
     ``max_tokens`` itself, the most tokens one staged call holds, so every
-    call the staging accepts fits a bucket. ``text_shape`` routes a batch
+    call the buffers hold fits a bucket. ``text_shape`` routes a batch
     only to a row bucket strictly larger than its row count, leaving room
     for the padding sequence, so row sizes of one are dropped and each
     bucket's ``live_rows`` is the next smaller configured row size (one for
@@ -412,7 +412,7 @@ def _fixed_view(tensor, shape):
     """Borrow a view of ``shape`` from where ``tensor`` starts in storage.
 
     The view keeps ``tensor``'s strides and may extend past its extent into
-    the fixed staging buffer it views, which is how a live batch grows to
+    the fixed buffer it views, which is how a live batch grows to
     its bucket shape without a copy.
 
     Raises:
@@ -444,7 +444,7 @@ def _stage_offsets(offsets: torch.Tensor, lengths: tuple[int, ...]) -> None:
     )
 
 
-def pad_text(batch, rows, tokens, widths, decode, *, staging):
+def pad_text(batch, rows, tokens, widths, decode, *, buffers):
     """Borrow a fixed bucket and make padding inert, including cache writes.
 
     Physical unit zero is valid storage. Padding queries read disposable
@@ -453,8 +453,8 @@ def pad_text(batch, rows, tokens, widths, decode, *, staging):
     one additional numerical sequence. ``widths[t]`` is the staged width of
     numerical table ``t``.
 
-    The batch's tensors must be views of ``staging``, the runner's fixed
-    staging (``AttentionBuffers``): padding is written in place past the
+    The batch's tensors must be views of ``buffers``, the runner's fixed
+    buffers (``AttentionBuffers``): padding is written in place past the
     live extents, and the returned batch views the same storage at the
     bucket shape. Padding rows use request slot zero, which the block tables
     reserve for padding. Lengths and offsets derive from the host lengths
@@ -509,7 +509,7 @@ def pad_text(batch, rows, tokens, widths, decode, *, staging):
 
     # Tables staged together share one prefix column, padded once; every
     # table's page columns and write addresses pad with one launch each.
-    staging.clear_padding(
+    buffers.clear_padding(
         live_rows=live_rows, rows=rows, live_tokens=live_tokens, tokens=tokens
     )
     flags = None

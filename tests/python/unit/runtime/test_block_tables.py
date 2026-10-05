@@ -25,7 +25,7 @@ def test_table_updates_and_release_preserve_all_queued_snapshots(device, depth):
         request_pool_size=3,
         width=3,
         device=device,
-        staging_depth=depth,
+        host_buffer_depth=depth,
     )
     expected_units = torch.zeros((3, 4, 3), dtype=torch.int32)
     expected_starts = torch.zeros((2, 4), dtype=torch.int32)
@@ -124,7 +124,7 @@ def test_release_bursts_do_not_wait_for_queued_device_work():
         request_pool_size=3,
         width=3,
         device="cuda:0",
-        staging_depth=1,
+        host_buffer_depth=1,
     )
     try:
         tables.install(

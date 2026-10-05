@@ -252,7 +252,7 @@ class GraphBucket:
 class Execution:
     """Own a prepared context, graph buckets and their allocation pools.
 
-    Capability-specific buckets may retain padding or solver staging. All
+    Capability-specific buckets may retain padding or solver buffers. All
     variants retire before the context and pools supplying their resources.
     Callers drain external readers before closing this owner.
 

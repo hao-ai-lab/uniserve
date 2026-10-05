@@ -41,15 +41,15 @@ fn initial(slot: i64, pages: &[u32], units: u32) -> LatentUpdate {
 }
 
 #[test]
-fn staging_preserves_page_order_and_rejected_commits_leave_slots_available() -> Result<()> {
+fn buffer_preserves_page_order_and_rejected_commits_leave_slots_available() -> Result<()> {
     let mut pool = Pool::new(2, 5, 4)?;
-    let (first, offset) = pool.stage(&[vec![3, 1]], &[7], &[])?;
+    let (first, offset) = pool.bind(&[vec![3, 1]], &[7], &[])?;
     let occupied = [(first[0].clone(), offset)];
-    let (second, second_offset) = pool.stage(&[vec![4, 2]], &[7], &occupied)?;
+    let (second, second_offset) = pool.bind(&[vec![4, 2]], &[7], &occupied)?;
     assert_eq!(first, [vec![3, 1]]);
     assert_eq!(second, [vec![4, 2]]);
     assert!(second_offset >= offset + 2);
-    assert!(pool.stage(&[vec![1]], &[4], &occupied).is_err());
+    assert!(pool.bind(&[vec![1]], &[4], &occupied).is_err());
 
     let rejected = [initial(1, &[3, 1], 7), initial(2, &[1], 4)];
     assert!(pool.validate_updates(&rejected).is_err());

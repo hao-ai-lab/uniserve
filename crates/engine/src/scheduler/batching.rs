@@ -230,12 +230,12 @@ impl Scheduler {
             0
         };
         // Context calls expand into one forward row per text/image segment.
-        // Both staging and the reported prefill graph capacity bound those
+        // Both input buffers and the reported prefill graph capacity bound those
         // numerical rows, independently of the number of requests batched.
-        let row_staging = (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
+        let row_capacity = (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
         let mut rows_left = PassRows {
-            canvas: row_staging,
-            context: row_staging.min(self.call_limit(CallKind::Forward(ForwardMode::Prefill))),
+            canvas: row_capacity,
+            context: row_capacity.min(self.call_limit(CallKind::Forward(ForwardMode::Prefill))),
         };
         let limits = [
             CallKind::Forward(ForwardMode::Prefill),

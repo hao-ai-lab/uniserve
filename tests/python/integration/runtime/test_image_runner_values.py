@@ -1,4 +1,4 @@
-"""Worker image staging preserves public numerical predictions.
+"""Worker image preparation preserves public numerical predictions.
 
 It also preserves cache state.
 """
@@ -428,7 +428,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
     # declares their injection and startup captures the feature rows.
     processor = ImageProcessor(
         vit=PatchTransform(2, 2, PixelBounds(16, 256)),
-        staging_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
         feature_injection=FeatureInjection(
             FeatureLayout.DIRECT, PositionLayout.SEQUENTIAL
         ),

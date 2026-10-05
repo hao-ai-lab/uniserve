@@ -186,7 +186,7 @@ class ModelRunner(Execution, ABC):
 
         # Only token and denoising batches reach this point: ``ModelExecutor``
         # marks only those eligible, and startup captures only those. Their
-        # attention staging provides each table's ``table_widths``.
+        # attention buffers provide each table's ``table_widths``.
         execution = widen_prefix(batch, self.input_buffers.table_widths)
         attention = getattr(execution.inputs, "attention", None)
 
@@ -386,7 +386,7 @@ class ModelRunner(Execution, ABC):
         if key in self.buckets:
             return
 
-        # Text buckets use the entry's stable staging addresses, ordered on
+        # Text buckets use the entry's stable buffer addresses, ordered on
         # its execution stream. Exact calls can include borrowed request
         # latents; own those inputs independently of their pool-slot lifetime.
         with self.graph_storage.allocate(self):

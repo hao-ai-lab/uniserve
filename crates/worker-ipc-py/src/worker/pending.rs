@@ -482,7 +482,7 @@ impl PendingOutput {
         let latent = self.latent.bind(py);
         latent.getattr("exports")?.call_method0("clear")?;
         latent.setattr("input_params", py.None())?;
-        latent.setattr("staging", py.None())?;
+        latent.setattr("buffer", py.None())?;
 
         self.predicate = None;
         self.token_write = None;

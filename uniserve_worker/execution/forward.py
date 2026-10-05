@@ -422,7 +422,7 @@ def prepare_diffusion_step(
         value, _sampling_index, _selection, _layout = numerical_result
         # The prefix fills a guidance branch's KV slot rather than extending
         # the request's own sequence, so its extent is validated without
-        # staging a runtime cache length for the request.
+        # preparing a runtime cache length for the request.
         token.commit_kv(
             task,
             task.query_tokens,
@@ -478,18 +478,18 @@ def prepare_forward_rows(
             guide, timestep, _step = step_inputs[index]
             row = state.pending_output(call.request_key.request_id)
             params = row.latent.input_params
-            staging = row.latent.staging
-            if params is None or staging is None:
+            buffer = row.latent.buffer
+            if params is None or buffer is None:
                 raise invalid_descriptor(
                     "trajectory call has no staged latent inputs"
                 )
 
             # The model sees only the first ``latent_units`` rows of the
-            # page-sized staging.
+            # page-sized buffer.
             rows = diffusion.flow_rows(
                 diffusion.require_inputs(model_runner),
                 trajectories[index],
-                staging.value[: int(params.latent_units)],
+                buffer.value[: int(params.latent_units)],
                 guide,
                 timestep,
                 conditioning_position=int(row.progress.logical_position),
@@ -582,8 +582,8 @@ def prepare_forward_rows(
             )
             row = state.pending_output(call.request_key.request_id)
             params = row.latent.input_params
-            staging = row.latent.staging
-            if params is None or staging is None:
+            buffer = row.latent.buffer
+            if params is None or buffer is None:
                 raise invalid_descriptor(
                     "trajectory call has no staged latent inputs"
                 )
@@ -673,7 +673,7 @@ def publish_forward_values(
             if graph_sample is not None:
                 # A graph-sampled decode commits its one token as
                 # ``token.prepare_sampling`` does for an eager decode: without
-                # staging a runtime cache length.
+                # preparing a runtime cache length.
                 request = state.pending_output(call.request_key.request_id)
                 token.commit_kv(
                     task,
@@ -783,17 +783,17 @@ def integrate_predictions(
         _, timestep, step = step_inputs[index]
         row = state.pending_output(call.request_key.request_id)
         params = row.latent.input_params
-        staging = row.latent.staging
-        if params is None or staging is None:
+        buffer = row.latent.buffer
+        if params is None or buffer is None:
             raise invalid_descriptor(
                 "trajectory call has no staged latent inputs"
             )
 
         # The solver updates only the model-visible portion of this
-        # call's staging, preserving page padding.
+        # call's buffer, preserving page padding.
         model_runner.diffusion_entry(call).integrate(
             trajectories[index],
-            staging.value[: int(params.latent_units)],
+            buffer.value[: int(params.latent_units)],
             timestep,
             tuple(values),
             step,

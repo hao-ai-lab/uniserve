@@ -59,7 +59,7 @@ from uniserve_worker.protocol.transfer import (
     TensorTransfer,
     WorkerEndpoint,
 )
-from uniserve_worker.storage.latent_pool import LatentStaging
+from uniserve_worker.storage.latent_pool import LatentBuffer
 from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
@@ -1131,7 +1131,7 @@ class LatentPool:
         latent_width: int,
         dtype: torch.dtype,
         device: torch.device | str,
-        staging: bool = True,
+        with_workspace: bool = True,
     ) -> Self: ...
     @property
     def request_pool_size(self) -> int: ...
@@ -1164,20 +1164,20 @@ class LatentPool:
     def startup_values(
         self, rows: int, units: int
     ) -> AbstractContextManager[tuple[torch.Tensor, ...]]: ...
-    def _startup_staging(
+    def _startup_buffers(
         self, rows: int, units: int
     ) -> tuple[torch.Tensor, ...]: ...
-    def stage(
+    def bind(
         self,
         page_tables: Sequence[Sequence[int]],
         latent_units: Sequence[int],
         *,
-        occupied: Sequence[LatentStaging] = (),
-    ) -> tuple[LatentStaging, ...]: ...
+        occupied: Sequence[LatentBuffer] = (),
+    ) -> tuple[LatentBuffer, ...]: ...
     def initialize(
         self,
         request_pool_idx: int,
-        staging: LatentStaging,
+        buffer: LatentBuffer,
         *,
         latent_units: int,
     ) -> None: ...
@@ -1205,7 +1205,7 @@ class LatentPool:
     def gather_current(
         self,
         request_pool_idx: int,
-        staging: LatentStaging,
+        buffer: LatentBuffer,
         *,
         step: int,
         generation: int,
@@ -1216,7 +1216,7 @@ class LatentPool:
     def write_inactive(
         self,
         request_pool_idx: int,
-        staging: LatentStaging,
+        buffer: LatentBuffer,
         *,
         expected_step: int,
         expected_generation: int,
@@ -1700,7 +1700,7 @@ class RequestPool:
     def retirement_ready(self, request_key: RequestKey) -> bool: ...
     def drop(self, request_id: int) -> None: ...
     def retire(self, request_id: int) -> None:
-        """Retire a closed request after device and host staging drain."""
+        """Retire a closed request after device and host writes finish."""
         ...
 
 @final

@@ -2970,7 +2970,7 @@ impl Scheduler {
             self.record_worker_forward_stats(Some(stats));
         }
 
-        // Staging decouples executor arrival order from request-local dependency
+        // Queuing decouples executor arrival order from request-local dependency
         // order. `take_ready_completions` releases only completions whose call
         // is at the front of its request's queue, or independent media calls
         // whose input producers have resolved; applying one can make others

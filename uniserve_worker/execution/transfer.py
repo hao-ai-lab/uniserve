@@ -135,8 +135,8 @@ def _publish_current_latent(
 
     row = state.pending_output(call.request_key.request_id)
     params = row.latent.input_params
-    staging = row.latent.staging
-    if params is None or staging is None:
+    buffer = row.latent.buffer
+    if params is None or buffer is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
     source = latent_pool.reserve_current_export(

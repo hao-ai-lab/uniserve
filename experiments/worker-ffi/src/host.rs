@@ -68,7 +68,7 @@ impl HostAction for Action {
 
     fn run(&self) -> Result<Self::Output, CallbackError> {
         // FFI values stay on the calling thread. Host outputs are completed
-        // bytes (encoded media) or None (in-place staging), owned by Rust here.
+        // bytes (encoded media) or None (in-place tensor writes), owned by Rust here.
         let output = self.0.call_tuple(()).and_then(Option::<Bytes>::try_from)?;
         Ok(output.map(|bytes| bytes.as_slice().to_vec()))
     }

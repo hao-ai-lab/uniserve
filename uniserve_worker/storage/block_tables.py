@@ -61,7 +61,7 @@ class BlockTables:
       ``(group, page_tokens, window)``, with window ``-1`` for full
       attention; constant after construction.
 
-    The device staging tensors are single-buffered and reused by every
+    The device buffers are single-buffered and reused by every
     `install` and `release`. Nothing but the order of the CUDA stream current
     at each call separates one use from the next.
     """
@@ -74,19 +74,19 @@ class BlockTables:
         width: int,
         num_units: int,
         device: torch.device | str,
-        staging_depth: int = 1,
+        host_buffer_depth: int = 1,
     ) -> None:
-        """Allocate device unit tables and bounded host staging.
+        """Allocate device unit tables and bounded host buffers.
 
         ``width`` is the most pages one slot's group table may hold.
         ``num_units`` is the backing KV pool's unit count, including padding.
-        ``staging_depth`` is the number of pinned host staging generations
-        per staging tensor; an update blocks only when it reuses a generation
-        whose previous host-to-device copy has not completed.
+        ``host_buffer_depth`` is the number of pinned host copies of each device
+        buffer. An update blocks only when it reuses a host buffer whose
+        previous host-to-device copy has not completed.
 
         Raises:
             WorkerError: ``invalid_descriptor`` when a dimension is below 1.
-            ValueError: When ``staging_depth`` is below 1.
+            ValueError: When ``host_buffer_depth`` is below 1.
         """
         self.groups = tuple(groups)
         self.request_pool_size = int(request_pool_size)
@@ -97,7 +97,7 @@ class BlockTables:
         self.first_table = self._tables.first_table
         self.table_count = sum(group.units_per_page for group in self.groups)
 
-        # One installation can touch every (slot, table) pair; the staging
+        # One installation can touch every (slot, table) pair; the buffer
         # tensors are sized for that worst case.
         self._row_capacity = self.request_pool_size * self.table_count
         self._entry_capacity = self.request_pool_size * len(self.groups)
@@ -136,28 +136,28 @@ class BlockTables:
         self.verified_lengths = tensors["verified_lengths"]
         self.alloced_lens = tensors["alloced_lens"]
         self.table_shapes = tensors["table_shapes"]
-        self._row_staging = tensors["_row_staging"]
-        self._index_staging = tensors["_index_staging"]
-        self._value_staging = tensors["_value_staging"]
+        self._row_buffer = tensors["_row_buffer"]
+        self._index_buffer = tensors["_index_buffer"]
+        self._value_buffer = tensors["_value_buffer"]
 
         # Generation-safe pinned rings retain CPU sources until asynchronous
-        # copies into the device staging tensors have completed.
+        # copies into the device buffers have completed.
         self._row_host = HostBuffers(
             (self._row_capacity, self.width),
             dtype=torch.int32,
-            depth=staging_depth,
+            depth=host_buffer_depth,
             device=self.unit_tables.device,
         )
         self._index_host = HostBuffers(
             (5, max(self._row_capacity, self._entry_capacity)),
             dtype=torch.int64,
-            depth=staging_depth,
+            depth=host_buffer_depth,
             device=self.unit_tables.device,
         )
         self._value_host = HostBuffers(
             (2, self._entry_capacity),
             dtype=torch.int32,
-            depth=staging_depth,
+            depth=host_buffer_depth,
             device=self.unit_tables.device,
         )
 
@@ -193,17 +193,17 @@ class BlockTables:
             "alloced_lens": BufferConfig((rows,), torch.int32),
             # [table, 3]: (group, page tokens, window or -1) per table.
             "table_shapes": BufferConfig((tables, 3), torch.int32),
-            # Device staging targets for one full installation. In `install`,
-            # row 0 of ``_index_staging`` holds the tables and row 1 the slots
+            # Device buffer targets for one full installation. In `install`,
+            # row 0 of ``_index_buffer`` holds the tables and row 1 the slots
             # of changed unit rows, rows 2 and 3 the groups and slots of
             # changed start pages, and row 4 the slots whose allocated length
-            # changed; ``_value_staging`` holds those start pages (row 0) and
+            # changed; ``_value_buffer`` holds those start pages (row 0) and
             # lengths (row 1). `release` stages its slots in row 1.
-            "_row_staging": BufferConfig((row_capacity, width), torch.int32),
-            "_index_staging": BufferConfig(
+            "_row_buffer": BufferConfig((row_capacity, width), torch.int32),
+            "_index_buffer": BufferConfig(
                 (5, max(row_capacity, entry_capacity)), torch.int64
             ),
-            "_value_staging": BufferConfig((2, entry_capacity), torch.int32),
+            "_value_buffer": BufferConfig((2, entry_capacity), torch.int32),
         }
 
     def install(
@@ -217,8 +217,8 @@ class BlockTables:
         units of pages ``start_page..`` page-major. Only table rows, start
         pages and lengths that differ from the host mirror are copied. On
         CUDA the device writes are enqueued asynchronously on the current
-        stream; the host blocks only when a pinned staging generation is
-        reused before its previous copy has completed.
+        stream; the host blocks only when a pinned host buffer is reused
+        before its previous copy has completed.
 
         Slots and groups must be in range, and unique units in
         ``[1, num_units)`` must form whole pages that fit the width.
@@ -259,23 +259,23 @@ class BlockTables:
             fill_cpu_ints(index_host[4, : len(length_slots)], length_slots)
             fill_cpu_ints(value_host[0, : len(start_values)], start_values)
             fill_cpu_ints(value_host[1, : len(length_slots)], length_values)
-            self._index_staging.copy_(index_host, non_blocking=non_blocking)
-            self._value_staging.copy_(value_host, non_blocking=non_blocking)
+            self._index_buffer.copy_(index_host, non_blocking=non_blocking)
+            self._value_buffer.copy_(value_host, non_blocking=non_blocking)
             self._index_host.record_copy(index_slot)
             self._value_host.record_copy(value_slot)
 
         if rows:
             row_slot, row_host = self._row_host.acquire()
             staged = row_host[: len(rows)]
-            # Rows are written through a NumPy view of the pinned staging. A
-            # large torch fill would run in torch's intra-op OpenMP pool,
+            # Rows are written through a NumPy view of the pinned host buffer.
+            # A large torch fill would run in torch's intra-op OpenMP pool,
             # whose barrier stalls this thread when the host is contended;
             # NumPy fills stay on the calling thread.
             view = staged.numpy()
             view.fill(0)
             for index, units in enumerate(rows):
                 view[index, : len(units)] = units
-            self._row_staging[: len(rows)].copy_(
+            self._row_buffer[: len(rows)].copy_(
                 staged, non_blocking=non_blocking
             )
             self._row_host.record_copy(row_slot)
@@ -283,21 +283,21 @@ class BlockTables:
             # staged row is zero past its units, which clears a longer
             # previous row.
             self.unit_tables[
-                self._index_staging[0, : len(rows)],
-                self._index_staging[1, : len(rows)],
-            ] = self._row_staging[: len(rows)]
+                self._index_buffer[0, : len(rows)],
+                self._index_buffer[1, : len(rows)],
+            ] = self._row_buffer[: len(rows)]
 
         if start_values:
             self.start_pages[
-                self._index_staging[2, : len(start_values)],
-                self._index_staging[3, : len(start_values)],
-            ] = self._value_staging[0, : len(start_values)]
+                self._index_buffer[2, : len(start_values)],
+                self._index_buffer[3, : len(start_values)],
+            ] = self._value_buffer[0, : len(start_values)]
 
         if length_slots:
             self.alloced_lens.index_copy_(
                 0,
-                self._index_staging[4, : len(length_slots)],
-                self._value_staging[1, : len(length_slots)],
+                self._index_buffer[4, : len(length_slots)],
+                self._value_buffer[1, : len(length_slots)],
             )
 
     def table(self, request_pool_idx: int, group_id: int) -> GroupTable:
@@ -341,9 +341,9 @@ class BlockTables:
         self.verified_lengths.index_copy_(0, slots, lengths)
 
     def close(self) -> None:
-        """Release pinned staging sources and clear host bookkeeping.
+        """Release pinned host buffers and clear host bookkeeping.
 
-        Waits for outstanding host-to-device staging copies and drops the
+        Waits for outstanding host-to-device copies and drops the
         pinned sources; call it while the CUDA streams those copies ran on
         still exist. The device tensors are not freed here.
         """
@@ -398,7 +398,7 @@ class BlockTables:
 
         # Requests finish in bursts while later batches are already queued.
         # A fresh pinned source per release never waits for them, where a
-        # reused staging generation would wait for its copy queued behind
+        # reused host buffer would wait for its copy queued behind
         # those batches.
         indices = async_tensor_h2d(
             values, dtype=torch.int64, device=self.unit_tables.device

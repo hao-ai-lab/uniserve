@@ -73,10 +73,10 @@ def media_state_buffers(
     bindings: Mapping[str, ComponentBinding],
     builder: MediaBuilder | None,
 ) -> dict[str, BufferConfig]:
-    """Reserve per-request state and transfer staging on participating ranks.
+    """Reserve per-request state and transfer buffers on participating ranks.
 
     A rank that denoises holds the denoiser's tables, conditioning and host
-    staging, and a rank that post-processes video holds its overlap state.
+    buffers, and a rank that post-processes video holds its overlap state.
     The denoiser's samples live in the latent pool instead. Returns an empty
     mapping without a media builder.
 

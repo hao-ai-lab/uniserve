@@ -484,7 +484,7 @@ def _log_failure(
     )
     # A queued log record may outlive the worker. Keep the traceback locations
     # and exception chain, but do not let diagnostic frames retain borrowed
-    # staging tensors after their CUDA stream has been closed.
+    # buffer tensors after their CUDA stream has been closed.
     seen: set[int] = set()
     while cause is not None and id(cause) not in seen:
         seen.add(id(cause))

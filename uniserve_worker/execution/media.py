@@ -761,7 +761,7 @@ def begin_noise(
         slot.tensors["denoising"] = request_pool.storage.tensors(
             request.request_pool_idx
         ).view(runner.media_builder.buffers(trajectory.size))
-    slot.staging = runner.noise_draws.reserve().submit(
+    slot.preparation = runner.noise_draws.reserve().submit(
         runner.media_builder.stage_request,
         trajectory.size,
         slot.tensors["denoising"],
@@ -847,14 +847,14 @@ def execute(
             )
         conditioning = reads[0]
 
-        # Without a staging task from ``begin_noise``, the seeded draw and
+        # Without a preparation task from ``begin_noise``, the seeded draw and
         # the request's tables are staged here on the service thread.
         encoded = conditioning.tensor
-        staging = slot_ladder(trajectory).staging
-        if staging is None:
+        preparation = slot_ladder(trajectory).preparation
+        if preparation is None:
             builder.stage_request(numerical_shape, slot, seed=media.seed)
         else:
-            staging.result()
+            preparation.result()
 
         # The initial samples are copied straight into the request's pages
         # of the bank a fresh trajectory starts in, overlapping the

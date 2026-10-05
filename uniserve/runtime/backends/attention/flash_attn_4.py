@@ -82,7 +82,7 @@ def _visible_options(
                 query_lengths=batch.queries.values,
                 key_lengths=keys.values,
                 max_key_length=key_capacity,
-                # Match the compiled SM100 query staging to its full launch
+                # Match the compiled SM100 query buffer to its full launch
                 # capacity; live sequence boundaries can change on replay.
                 query_tile=(
                     256

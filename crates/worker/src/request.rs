@@ -348,7 +348,7 @@ impl RequestPool {
     }
 
     /// Mark a closed epoch reusable after its physical readers have drained.
-    /// The execution owner must finish device and host staging before calling.
+    /// The execution owner must finish device and host writes before calling.
     pub fn retire(&mut self, request_id: u64) -> Result<()> {
         let mut state = self.get(request_id)?.state()?;
         if !state.closed || !state.pending.is_empty() {

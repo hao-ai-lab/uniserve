@@ -1,4 +1,4 @@
-"""Execution staging envelopes and completion results around numerical calls."""
+"""Numerical call inputs and completion results."""
 
 from __future__ import annotations
 

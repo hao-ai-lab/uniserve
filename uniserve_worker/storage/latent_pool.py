@@ -25,7 +25,7 @@ from uniserve_worker.storage.host_buffers import HostBuffers
 
 
 @dataclass(frozen=True, slots=True)
-class LatentStaging:
+class LatentBuffer:
     """A fixed page-index view and its contiguous, padded latent values."""
 
     page_table: tuple[int, ...]
@@ -42,7 +42,7 @@ def _allocate(
     latent_width: int,
     dtype: torch.dtype,
     device: torch.device,
-    staging: bool,
+    with_workspace: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, HostBuffers]:
     capacity_units = (num_pages - 1) * page_units
     # Bank zero and bank one alternate across steps; page zero is padding.
@@ -50,7 +50,7 @@ def _allocate(
         (2, num_pages, page_units, latent_width), dtype=dtype, device=device
     )
     step_buffer = torch.empty(
-        (capacity_units if staging else 0, latent_width),
+        (capacity_units if with_workspace else 0, latent_width),
         dtype=dtype,
         device=device,
     )
@@ -68,7 +68,7 @@ def _allocate(
 
 @contextmanager
 def _startup_values(pool: LatentPool, rows: int, units: int):
-    views = pool._startup_staging(rows, units)
+    views = pool._startup_buffers(rows, units)
     try:
         yield views
     finally:
@@ -77,14 +77,14 @@ def _startup_values(pool: LatentPool, rows: int, units: int):
             torch.cuda.current_stream(pool.device).synchronize()
 
 
-def _stage(
+def _bind(
     page_tables: Sequence[Sequence[int]],
     page_offset: int,
     page_units: int,
     page_table_buffer: torch.Tensor,
     step_buffer: torch.Tensor,
     page_host: HostBuffers,
-) -> tuple[LatentStaging, ...]:
+) -> tuple[LatentBuffer, ...]:
     pages = tuple(page for table in page_tables for page in table)
     slot, host = page_host.acquire()
     fill_cpu_ints(host, pages)
@@ -97,7 +97,7 @@ def _stage(
     for table in page_tables:
         end = page_offset + len(table)
         result.append(
-            LatentStaging(
+            LatentBuffer(
                 tuple(table),
                 page_table_buffer[page_offset:end],
                 step_buffer[page_offset * page_units : end * page_units],
@@ -107,51 +107,51 @@ def _stage(
     return tuple(result)
 
 
-def _check_staging(
-    staging: LatentStaging, units: int, storage: torch.Tensor
+def _check_buffer(
+    buffer: LatentBuffer, units: int, storage: torch.Tensor
 ) -> None:
     page_units, width = storage.shape[-2:]
     pages = (units + page_units - 1) // page_units
     if (
-        staging.pages.device != storage.device
-        or staging.pages.dtype != torch.int64
+        buffer.pages.device != storage.device
+        or buffer.pages.dtype != torch.int64
     ):
         raise invalid_descriptor(
-            "latent page table is not in fixed device staging"
+            "latent page table is not in fixed device buffers"
         )
     if (
-        staging.value.device != storage.device
-        or staging.value.dtype != storage.dtype
-        or staging.value.ndim != 2
-        or staging.value.shape[1] != width
+        buffer.value.device != storage.device
+        or buffer.value.dtype != storage.dtype
+        or buffer.value.ndim != 2
+        or buffer.value.shape[1] != width
     ):
-        raise invalid_descriptor("latent value is not in fixed device staging")
+        raise invalid_descriptor("latent value is not in fixed device buffers")
     if (
-        staging.pages.numel() != pages
-        or staging.value.shape[0] != pages * page_units
+        buffer.pages.numel() != pages
+        or buffer.value.shape[0] != pages * page_units
     ):
         raise invalid_descriptor(
-            "latent staging does not establish its logical extent"
+            "latent buffer does not establish its logical extent"
         )
 
 
 def _gather(
-    storage: torch.Tensor, bank: int, staging: LatentStaging, units: int
+    storage: torch.Tensor, bank: int, buffer: LatentBuffer, units: int
 ) -> torch.Tensor:
     torch.index_select(
         storage[bank],
         0,
-        staging.pages,
-        out=staging.value.view(len(staging.page_table), *storage.shape[-2:]),
+        buffer.pages,
+        out=buffer.value.view(len(buffer.page_table), *storage.shape[-2:]),
     )
-    return staging.value[:units]
+    return buffer.value[:units]
 
 
-def _scatter(storage: torch.Tensor, bank: int, staging: LatentStaging) -> None:
+def _scatter(storage: torch.Tensor, bank: int, buffer: LatentBuffer) -> None:
     storage[bank].index_copy_(
         0,
-        staging.pages,
-        staging.value.view(len(staging.page_table), *storage.shape[-2:]),
+        buffer.pages,
+        buffer.value.view(len(buffer.page_table), *storage.shape[-2:]),
     )
 
 
@@ -176,7 +176,7 @@ def _empty_storage(dtype: torch.dtype, device: torch.device):
 
 __all__ = [
     "LatentPool",
-    "LatentStaging",
+    "LatentBuffer",
     "LatentImport",
     "LatentExport",
     "LatentUpdate",

@@ -236,15 +236,15 @@ def test_diffusion_close_drains_a_failed_host_write():
 
     def stage():
         if not release.wait(5):
-            raise TimeoutError("host staging was not released")
+            raise TimeoutError("host preparation was not released")
         destination.fill_(7)
-        raise RuntimeError("host staging failed after writing")
+        raise RuntimeError("host preparation failed after writing")
 
     lane = HostLane(max_inflight=1, workers=1)
     try:
-        staging = lane.reserve().submit(stage)
+        preparation = lane.reserve().submit(stage)
         state = DiffusionState(
-            size=(), schedules={}, slot=SlotLadder(staging=staging)
+            size=(), schedules={}, slot=SlotLadder(preparation=preparation)
         )
         with ThreadPoolExecutor(max_workers=1) as tasks:
             closing = tasks.submit(state.close)
@@ -256,21 +256,21 @@ def test_diffusion_close_drains_a_failed_host_write():
 
             closing.result(timeout=5)
         assert destination.item() == 7
-        with pytest.raises(RuntimeError, match="host staging failed"):
-            staging.result()
+        with pytest.raises(RuntimeError, match="host preparation failed"):
+            preparation.result()
     finally:
         release.set()
         lane.close()
 
 
-def test_diffusion_close_retires_cancelled_host_staging():
+def test_diffusion_close_retires_cancelled_host_preparation():
     destination = torch.zeros(1)
     lane = HostLane(max_inflight=1, workers=1)
     try:
-        staging = lane.reserve().configure(lambda: destination.fill_(7))
-        staging.cancel()
+        preparation = lane.reserve().configure(lambda: destination.fill_(7))
+        preparation.cancel()
         state = DiffusionState(
-            size=(), schedules={}, slot=SlotLadder(staging=staging)
+            size=(), schedules={}, slot=SlotLadder(preparation=preparation)
         )
         state.close()
         assert destination.item() == 0

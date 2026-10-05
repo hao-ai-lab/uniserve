@@ -65,7 +65,7 @@ def _pool(slots, *, device):
         latent_width=1,
         dtype=torch.float32,
         device=device,
-        staging=False,
+        with_workspace=False,
     )
 
 

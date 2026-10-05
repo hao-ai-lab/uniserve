@@ -1,4 +1,4 @@
-"""Image decoding and staging for model-owned processing policy.
+"""Image decoding and input preparation for model-owned processing policy.
 
 The model declares its image policy as a ``uniserve.processing``
 ``ImageProcessor``; this module applies it for the worker. An inline base64
@@ -71,11 +71,11 @@ class PreparedImage:
 
 @dataclass(frozen=True, slots=True)
 class HostImage:
-    """A request input image prepared on the host, before device staging.
+    """A request input image prepared on the host for transfer to the device.
 
     ``pixels`` and ``grid`` hold exactly the values ``PreparedImage.pixels``
     and ``PreparedImage.grid`` receive, the pixels already in the
-    processor's staging dtype, both in page-locked memory when the image is
+    processor's output dtype, both in page-locked memory when the image is
     prepared for a CUDA device (see ``prepare_host_image``). ``grid_shape``,
     ``height`` and ``width`` are as on ``PreparedImage``.
     """
@@ -243,9 +243,9 @@ def prepare_host_image(
 
     pixels, grid_shape = _packed_pixels(transform, pixels)
 
-    # The staging dtype conversion runs on the host, where a host-to-device
+    # The output dtype conversion runs on the host, where a host-to-device
     # copy with a dtype change performs it as well, so the rounding matches.
-    dtype = _staging_dtype(processor)
+    dtype = _output_dtype(processor)
     if dtype is not None:
         pixels = pixels.to(dtype)
     pixels = pixels.contiguous()
@@ -306,7 +306,7 @@ def _resample_bytes(image: Image.Image, size: tuple[int, int]) -> torch.Tensor:
     the antialiased bicubic filter runs on it only when the size changes,
     rounding back to 8 bits. torchvision picks its interpolation kernel by
     host architecture and memory format, so the same calls on the host
-    reproduce the reference pixels independently of the staging device.
+    reproduce the reference pixels independently of the destination device.
     """
     pixels = tensor_vision.pil_to_tensor(image)
     if tuple(pixels.shape[1:]) == size:
@@ -340,7 +340,7 @@ def prepare_tensor_image(
     if value.ndim == 4:
         if int(value.shape[0]) != 1:
             raise invalid_descriptor(
-                "generated image staging accepts one image"
+                "generated image preparation accepts one image"
             )
         value = value[0]
     if value.ndim != 3 or int(value.shape[0]) != 3:
@@ -499,25 +499,25 @@ def _resize_tensor(
     )[0]
 
 
-def _staging_dtype(processor: ImageProcessor) -> torch.dtype | None:
-    """Return the declared staging dtype, or None to keep FP32.
+def _output_dtype(processor: ImageProcessor) -> torch.dtype | None:
+    """Return the declared output dtype, or None to keep FP32.
 
     Raises:
         WorkerError: An ``invalid_descriptor`` error for a declaration that
             is not a ``torch.dtype``.
     """
-    dtype = processor.staging_dtype
+    dtype = processor.output_dtype
     if dtype is not None and not isinstance(dtype, torch.dtype):
-        raise invalid_descriptor(f"unknown image staging dtype {dtype!r}")
+        raise invalid_descriptor(f"unknown image output dtype {dtype!r}")
     return dtype
 
 
 def _stage(
     value: torch.Tensor, processor: ImageProcessor, device: torch.device
 ) -> torch.Tensor:
-    """Convert preprocessing output to the staging dtype and device."""
+    """Copy preprocessed pixels to the requested dtype and device."""
     return value.to(
-        device=device, dtype=_staging_dtype(processor), non_blocking=True
+        device=device, dtype=_output_dtype(processor), non_blocking=True
     )
 
 

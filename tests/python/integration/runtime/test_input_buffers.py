@@ -1,4 +1,4 @@
-"""Model input staging preserves columns supplied by host producers.
+"""Model input buffers preserve columns supplied by host producers.
 
 Columns supplied by device producers are preserved too.
 """

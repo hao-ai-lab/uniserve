@@ -77,7 +77,7 @@ def test_encoded_pixels_match_channel_normalization(
         else TowerTransform(StrideResize(32, 24, 1, 24 * 32), normalization)
     )
     processor = ImageProcessor(
-        vit=transform, staging_dtype=getattr(torch, dtype)
+        vit=transform, output_dtype=getattr(torch, dtype)
     )
 
     result = prepare_image(
@@ -126,7 +126,7 @@ def test_image_sources_preserve_the_same_model_canvas(kind):
     processor = ImageProcessor(
         vae=TowerTransform(StrideResize(64, 32, 16, 4096)),
         vit=TowerTransform(StrideResize(64, 48, 16, 4096)),
-        staging_dtype=torch.float32,
+        output_dtype=torch.float32,
     )
     arguments = {"device": torch.device("cpu")}
     uploaded = prepare_image(
@@ -306,7 +306,7 @@ def _diffusion_gemma_processor(root) -> ImageProcessor:
     ),
     ids=lambda value: str(value),
 )
-def test_gemma4_staging_matches_the_transformers_processor(
+def test_gemma4_preprocessing_matches_the_transformers_processor(
     tmp_path, height, width, mode
 ):
     # Random bytes exercise every filter tap; 672x960 already fills the
@@ -385,7 +385,7 @@ def test_alpha_policy_sets_the_color_of_transparent_pixels(alpha):
     raw[:, :16, 3] = 255
     processor = ImageProcessor(
         vit=TowerTransform(StrideResize(32, 24, 1, 24 * 32), "signed_unit"),
-        staging_dtype=torch.float32,
+        output_dtype=torch.float32,
         alpha=alpha,
     )
 

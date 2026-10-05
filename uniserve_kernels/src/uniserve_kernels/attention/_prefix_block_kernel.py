@@ -93,14 +93,14 @@ _LN_2 = math.log(2.0)
 _TMEM_COLUMNS = 512
 # Named barriers: 1 publishes the tensor-memory allocation; 2 and 3 pair
 # softmax warps (0, 2) and (1, 3), whose lanes share rows at head dim 512;
-# 4 orders the correction warps' accesses to the output staging buffer.
+# 4 orders the correction warps' accesses to the output buffer.
 _TMEM_BARRIER = 1
 _PAIR_BARRIER = 2
 _OUTPUT_BARRIER = 4
 # Dynamic SMEM bytes that Q, the ring, the probability tiles and the output
-# staging buffer may use together: the 227 KiB per-CTA limit less 3 KiB for
+# buffer may use together: the 227 KiB per-CTA limit less 3 KiB for
 # the barriers, row statistics and alignment.
-_STAGING_SMEM_LIMIT = 224 * 1024
+_OUTPUT_SMEM_LIMIT = 224 * 1024
 # Tensor-memory addresses carry the lane above bit 16 and the column below.
 _TMEM_LANE = 1 << 16
 # The running row maximum used for the probabilities is only raised when a
@@ -272,7 +272,7 @@ class PrefixBlockAttentionSm100:
         # A tensor-memory lane holds (part of) one output row, so storing
         # rows straight from registers writes 16 bytes to a different row
         # per thread. When SMEM has room next to Q, the ring and the
-        # probability tiles, each output chunk goes through a staging buffer
+        # probability tiles, each output chunk goes through a buffer
         # and leaves in whole row segments; otherwise (head dim 512) it is
         # stored from registers.
         row_bytes = self.cta_rows * 2
@@ -282,7 +282,7 @@ class PrefixBlockAttentionSm100:
             + (0 if self.p_in_tmem else self.s_stage * row_bytes * 128)
         )
         self.stage_output = (
-            smem_bytes + row_bytes * self.chunk <= _STAGING_SMEM_LIMIT
+            smem_bytes + row_bytes * self.chunk <= _OUTPUT_SMEM_LIMIT
         )
 
         self.softmax_warps = (0, 1, 2, 3)
@@ -496,7 +496,7 @@ class PrefixBlockAttentionSm100:
         p_layout = sm100_utils.make_smem_layout_a(
             pv_mma, self.pv_mma_tiler, dtype, self.s_stage
         )
-        # Output staging buffer: this CTA's rows of one 128-column chunk,
+        # Output buffer: this CTA's rows of one 128-column chunk,
         # row-major in 128-byte swizzle atoms.
         out_layout = sm100_utils.make_smem_layout_epi(
             self.o_dtype, utils.LayoutEnum.ROW_MAJOR, self.pv_block_tiler, 1
@@ -2275,7 +2275,7 @@ class PrefixBlockAttentionSm100:
 
         CTA row ``r`` is packed row ``cta_block * R + r`` of the sequence (R
         rows per CTA); the packed view maps it to query position ``row // G``
-        of head ``kv_head * G + row % G``. With a staging buffer ``s_out``,
+        of head ``kv_head * G + row % G``. With a buffer ``s_out``,
         each 128-column chunk is written there by its rows' threads and
         stored by :meth:`store_rows`; the output accumulator is released as
         soon as its last chunk is in registers. Otherwise each thread stores

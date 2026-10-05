@@ -1,4 +1,4 @@
-"""Bind the worker's input staging to a model's declared capabilities.
+"""Bind the worker's input buffers to a model's declared capabilities.
 
 The worker finds a model's capabilities (``ImageDenoiser``, ``VideoDenoiser``,
 ``VideoPostprocessor``, ...) by type within its ordinary module tree rather

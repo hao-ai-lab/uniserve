@@ -19,7 +19,7 @@ from . import Operator
 
 
 class Buffer:
-    """Collective staging for one microbatch's ordered expert calls.
+    """Collective buffers for one microbatch's ordered expert calls.
 
     Attention ranks precede expert ranks in ``group``. The first preparation
     allocates the encoding-specific symmetric layout on every rank. Calls
@@ -434,7 +434,7 @@ class _SplitOperator(Operator):
         output = torch.empty(
             (count, buffer.hidden), dtype=torch.bfloat16, device=buffer.device
         )
-        # external_quant consumes the encoded staging, so hidden's argument
+        # external_quant consumes the encoded buffer, so hidden's argument
         # only supplies the BF16 shape expected by the native launch contract.
         buffer.attention(output, output, topk_ids, topk_weights, phase=1)
         yield_microbatch()

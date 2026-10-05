@@ -219,8 +219,8 @@ def from_tables(
     that graph padding in ``graph_inputs.pad_text`` also relies on. When no
     row writes, each entry is a ``SegmentedInput`` in which each query sees
     its prefix and its whole current segment; that form requires every row
-    to be noncausal. Tensors are built on the host for later staging, and
-    every entry shares one pair of query and prefix lengths.
+    to be noncausal. Tensors are built on the host for transfer to the device.
+    Every entry shares one pair of query and prefix lengths.
 
     Raises:
         ValueError: If a read-only call has a causal row or no host query

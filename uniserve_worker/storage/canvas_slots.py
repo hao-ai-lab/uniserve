@@ -7,7 +7,7 @@ one row per canvas). ``CanvasSlots`` keeps these rows for every request-pool
 slot in one device bank per field, with a leading slot axis. A pass gathers
 the rows of its slots into its own contiguous input buffers (``stage``),
 the sampler steps them in place, and ``commit`` writes them back.
-Concurrent executions own separate staging and sampler workspaces while
+Concurrent executions own separate input buffers and sampler workspaces while
 sharing these banks for disjoint request slots. Slot ``0`` is the padding
 sentinel, as in ``DecodeState``.
 
@@ -200,7 +200,7 @@ class CanvasSlots:
         """Device bytes of the slots ``for_denoiser`` allocates.
 
         Startup sizing charges the banks without an instance. Per-execution
-        staging and sampler workspaces are charged by ``CanvasRunner``.
+        input buffers and sampler workspaces are charged by ``CanvasRunner``.
         """
         fields = denoiser_fields(denoiser)
         tokens = fields.pop("tokens")

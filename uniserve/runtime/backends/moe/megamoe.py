@@ -26,7 +26,7 @@ Weights stay one resident copy: preparation places ``up_gate`` in
 ``RowOrder.INTERLEAVED_16`` (each 16-row gate block followed by its up
 block, as the fused gated epilogue reads) and ``down`` linearly, both with
 128x4-swizzled block scales, and the kernel reads K-major transposed views
-of them. ``MegaMoEBuffer`` holds the worker's symmetric staging and compiled
+of them. ``MegaMoEBuffer`` holds the worker's symmetric buffers and compiled
 kernel for the group; every expert layer on the worker's stream shares it.
 """
 
@@ -87,7 +87,7 @@ def _initialize_nvshmem(group: Communicator, device: torch.device) -> None:
 
 
 class MegaMoEBuffer:
-    """One worker's MegaMoE symmetric staging and kernel for an expert group.
+    """One worker's MegaMoE symmetric buffers and kernel for an expert group.
 
     Construction is collective over ``group``: NVSHMEM initialization and
     the symmetric allocation run on every rank at the same point of its
@@ -205,7 +205,7 @@ class _MegaMoE(NVFP4Operator):
             )
         self._validate(hidden, topk_ids, topk_weights)
         if hidden.shape[0] > self.buffer.max_tokens:
-            raise ValueError("routed tokens exceed the MegaMoE staging")
+            raise ValueError("routed tokens exceed the MegaMoE buffer")
         from uniserve_kernels.megamoe import note_staged_tokens
 
         # Stage this rank's rows in the experts' input encoding, as FlashInfer's
@@ -232,7 +232,7 @@ class _MegaMoE(NVFP4Operator):
         if not tokens:
             symmetric.topk_idx[:1].fill_(-1)
         note_staged_tokens(symmetric.topk_idx, tokens)
-        # The staging's per-expert scales are shared by every layer.
+        # The buffer's per-expert scales are shared by every layer.
         symmetric.fc1_alpha.copy_(self._fc1_alpha)
         symmetric.fc2_alpha.copy_(self._fc2_alpha)
         symmetric.fc1_norm_const.copy_(self._fc1_norm)

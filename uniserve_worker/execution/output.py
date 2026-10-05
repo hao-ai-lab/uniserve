@@ -13,7 +13,7 @@ from uniserve_worker._uniserve_ipc import PendingOutput
 from uniserve_worker.protocol.batch import LatentParams
 from uniserve_worker.protocol.identity import BufferId
 from uniserve_worker.sampling.result import LogprobValues, SamplerRow
-from uniserve_worker.storage.latent_pool import LatentStaging, LatentUpdate
+from uniserve_worker.storage.latent_pool import LatentBuffer, LatentUpdate
 from uniserve_worker.storage.output import OutputBuffer
 from uniserve_worker.transport.exports import ExportLocations
 
@@ -92,5 +92,5 @@ class LatentResult:
 
     update: LatentUpdate
     input_params: LatentParams | None = None
-    staging: LatentStaging | None = None
+    buffer: LatentBuffer | None = None
     exports: dict[BufferId, ExportLocations] = field(default_factory=dict)
