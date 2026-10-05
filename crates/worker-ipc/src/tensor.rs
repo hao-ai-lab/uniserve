@@ -17,6 +17,51 @@
 //! two sides must change together.
 
 use super::*;
+use std::ops::Range;
+
+/// Split a tensor region around its intersection with another region.
+///
+/// Both regions use the same logical axes and nonnegative half-open bounds.
+/// Append disjoint uncovered slabs to `remaining` and return the intersection.
+/// Empty regions contribute neither an intersection nor an uncovered slab.
+pub fn subtract_region(
+    region: &[Range<u64>],
+    covered: &[Range<u64>],
+    remaining: &mut Vec<Vec<Range<u64>>>,
+) -> Option<Vec<Range<u64>>> {
+    if region.iter().any(Range::is_empty) {
+        return None;
+    }
+
+    let overlap: Vec<_> = region
+        .iter()
+        .zip(covered)
+        .map(|(left, right)| left.start.max(right.start)..left.end.min(right.end))
+        .collect();
+    if overlap.iter().any(Range::is_empty) {
+        remaining.push(region.to_vec());
+        return None;
+    }
+
+    // Peel each axis around the intersection. Narrow the middle before the
+    // next axis so slabs from different axes never overlap.
+    let mut middle = region.to_vec();
+    for (axis, bounds) in overlap.iter().enumerate() {
+        if middle[axis].start < bounds.start {
+            let mut slab = middle.clone();
+            slab[axis].end = bounds.start;
+            remaining.push(slab);
+        }
+        if bounds.end < middle[axis].end {
+            let mut slab = middle.clone();
+            slab[axis].start = bounds.end;
+            remaining.push(slab);
+        }
+        middle[axis] = bounds.clone();
+    }
+
+    Some(overlap)
+}
 
 /// Element type of a tensor's backing storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -319,47 +364,22 @@ impl TensorTransfer {
             return false;
         }
 
-        // Box subtraction: `uncovered` holds disjoint half-open boxes
-        // `(start, end)` not yet covered by any locator. Each locator splits
-        // every box it intersects into at most two slabs per axis outside the
-        // intersection, and the intersection itself is discarded.
-        let mut uncovered = vec![(vec![0; self.shape.len()], self.shape.clone())];
+        let mut uncovered = vec![
+            self.shape
+                .iter()
+                .map(|&extent| 0..extent)
+                .collect::<Vec<_>>(),
+        ];
         for location in &self.locations {
+            let covered: Vec<_> = location
+                .offset
+                .iter()
+                .zip(&location.shape)
+                .map(|(&start, &extent)| start..start + extent)
+                .collect();
             let mut remaining = Vec::new();
-            for (start, end) in uncovered {
-                let lower = start
-                    .iter()
-                    .zip(&location.offset)
-                    .map(|(a, b)| (*a).max(*b))
-                    .collect::<Vec<_>>();
-                let upper = end
-                    .iter()
-                    .zip(&location.offset)
-                    .zip(&location.shape)
-                    .map(|((end, offset), extent)| (*end).min(offset.saturating_add(*extent)))
-                    .collect::<Vec<_>>();
-                if lower.iter().zip(&upper).any(|(a, b)| a >= b) {
-                    remaining.push((start, end));
-                    continue;
-                }
-                // Peel off the part of the box below and above the
-                // intersection on each axis in turn; after the last axis the
-                // middle box equals the intersection and is dropped.
-                let (mut middle_start, mut middle_end) = (start, end);
-                for axis in 0..self.shape.len() {
-                    if middle_start[axis] < lower[axis] {
-                        let mut slab_end = middle_end.clone();
-                        slab_end[axis] = lower[axis];
-                        remaining.push((middle_start.clone(), slab_end));
-                        middle_start[axis] = lower[axis];
-                    }
-                    if upper[axis] < middle_end[axis] {
-                        let mut slab_start = middle_start.clone();
-                        slab_start[axis] = upper[axis];
-                        remaining.push((slab_start, middle_end.clone()));
-                        middle_end[axis] = upper[axis];
-                    }
-                }
+            for region in uncovered {
+                subtract_region(&region, &covered, &mut remaining);
             }
             if remaining.is_empty() {
                 return true;

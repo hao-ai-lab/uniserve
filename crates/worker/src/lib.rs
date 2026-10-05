@@ -48,5 +48,7 @@ pub use registry::{BufferRegistry, RegisteredBuffer};
 pub use request::{Request, RequestPool, RequestProgress};
 pub use service::{Service, ServiceBackend};
 pub use stream::CUDAStream;
-pub use transfer::{ReadReservation, TransferCapacity, TransferPool, TransferTicket};
+pub use transfer::{
+    ReadRegion, ReadReservation, TransferCapacity, TransferPool, TransferTicket, plan_reads,
+};
 pub use weight_prefetch::WeightPrefetch;

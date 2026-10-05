@@ -158,7 +158,11 @@ pub(crate) struct ReadReservation {
 #[pymethods]
 impl ReadReservation {
     #[new]
-    fn new(py: Python<'_>, capacity: Py<TransferCapacity>, count: isize) -> PyResult<Self> {
+    pub(super) fn new(
+        py: Python<'_>,
+        capacity: Py<TransferCapacity>,
+        count: isize,
+    ) -> PyResult<Self> {
         let inner =
             NativeReadReservation::new(Arc::clone(&capacity.get().inner), read_count(count)?)
                 .map_err(|error| {
@@ -179,7 +183,7 @@ impl ReadReservation {
             .map_err(|error| native_error(py, error))
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.inner.close().map_err(|error| native_error(py, error))
     }
 

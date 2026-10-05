@@ -31,7 +31,12 @@ from uniserve_worker.storage.buffer_pool import BufferPool
 from uniserve_worker.storage.tensor_store import FeatureMetadata, TensorStore
 from uniserve_worker.transport import make_transports
 from uniserve_worker.transport.fetch import fetch_tensor
-from uniserve_worker.transport.pool import TransferCapacity, TransferPool
+from uniserve_worker.transport.pool import (
+    ReadBackpressureError,
+    ReadReservation,
+    TransferCapacity,
+    TransferPool,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -311,6 +316,128 @@ def test_explicit_replica_binding_can_use_an_independent_live_publication() -> (
     finally:
         second.release(available)
         second.close()
+        events.close()
+
+
+def test_local_replica_precedes_an_unavailable_remote_copy() -> None:
+    events = EventPool()
+    transports = make_transports(
+        ("local", "shm"),
+        byte_capacity=16384,
+        ticket_capacity=2,
+        event_pool=events,
+    )
+    expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    remote = transports["shm"].publish(expected)
+    local = transports["local"].publish(expected)
+    transports["shm"].release(remote)
+    destination = torch.empty_like(expected)
+    try:
+        _consume(
+            fetch_tensor(
+                TensorTransfer(shape=(3, 4), locations=(remote, local)),
+                destination,
+                bindings={
+                    (location.source, location.backend): transports[
+                        location.backend
+                    ]
+                    for location in (remote, local)
+                },
+            )
+        )
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+    finally:
+        transports["local"].release(local)
+        for transport in transports.values():
+            transport.close()
+        events.close()
+
+
+def test_fetch_backpressure_preserves_the_complete_destination() -> None:
+    events = EventPool()
+    transport = make_transport(
+        "local", byte_capacity=16384, ticket_capacity=2, event_pool=events
+    )
+    expected = torch.arange(8, dtype=torch.float32)
+    locations = tuple(
+        transport.publish(expected[start : start + 4], offset=(start,))
+        for start in (0, 4)
+    )
+    tensor = TensorTransfer(shape=(8,), locations=locations)
+    bindings = {(locations[0].source, "local"): transport}
+    destination = torch.full_like(expected, -1)
+    try:
+        with ReadReservation(transport.capacity, 1):
+            with pytest.raises(ReadBackpressureError):
+                fetch_tensor(tensor, destination, bindings=bindings)
+            torch.testing.assert_close(
+                destination, torch.full_like(expected, -1), rtol=0, atol=0
+            )
+
+        _consume(fetch_tensor(tensor, destination, bindings=bindings))
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+    finally:
+        for location in locations:
+            transport.release(location)
+        transport.close()
+        events.close()
+
+
+@pytest.mark.parametrize("failure", ("source", "observer"))
+def test_failed_fetch_retires_submitted_reads_and_returns_unused_credits(
+    failure: str,
+) -> None:
+    events = EventPool()
+    transport = make_transport(
+        "local", byte_capacity=16384, ticket_capacity=2, event_pool=events
+    )
+    expected = torch.arange(8, dtype=torch.float32)
+    locations = [
+        transport.publish(expected[start : start + 4], offset=(start,))
+        for start in (0, 4)
+    ]
+    bindings = {(locations[0].source, "local"): transport}
+    destination = torch.empty_like(expected)
+    retained = []
+
+    def retain(ticket):
+        retained.append(ticket)
+        if failure == "observer":
+            raise ValueError("consumer closed")
+
+    try:
+        if failure == "source":
+            transport.release(locations[1])
+
+        with pytest.raises(WorkerError if failure == "source" else ValueError):
+            fetch_tensor(
+                TensorTransfer(shape=(8,), locations=tuple(locations)),
+                destination,
+                bindings=bindings,
+                retain=retain,
+            )
+
+        for ticket in retained:
+            retired = threading.Event()
+            ticket.add_retirement_callback(retired.set)
+            assert retired.wait(5), "cancelled read did not retire"
+
+        if failure == "source":
+            locations[1] = transport.publish(expected[4:], offset=(4,))
+
+        # Both credits must be available again, including the unused one.
+        _consume(
+            fetch_tensor(
+                TensorTransfer(shape=(8,), locations=tuple(locations)),
+                destination,
+                bindings=bindings,
+            )
+        )
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+    finally:
+        for location in locations:
+            transport.release(location)
+        transport.close()
         events.close()
 
 
