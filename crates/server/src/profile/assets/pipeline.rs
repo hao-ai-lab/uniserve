@@ -10,11 +10,7 @@
 //! from that base, which it resolves by the rules the worker's loader
 //! (`uniserve_models.loading`) applies:
 //!
-//! * a configured local copy is read in place once every file under its base
-//!   components carries a Hugging Face download record naming the pinned
-//!   commit. `hf download --local-dir` writes the record of `<path>` to
-//!   `.cache/huggingface/download/<path>.metadata`, whose first line is the
-//!   commit the file was downloaded at;
+//! * a configured local directory supplies the base components in place;
 //! * otherwise the base is the Hub cache's snapshot of the pinned commit,
 //!   and a file the snapshot lacks is downloaded into it at that commit.
 
@@ -35,13 +31,6 @@ pub const BASE_COMPONENTS: [&str; 5] =
 
 /// Inference contract a FastVideo export publishes at its root.
 const INFERENCE_CONTRACT: &str = "fastvideo_inference.json";
-
-/// Directory, relative to a local download root, of the download records
-/// `huggingface_hub` keeps for the files it downloaded there.
-const DOWNLOAD_RECORDS: &str = ".cache/huggingface/download";
-
-/// Files a refusal names before it counts the rest.
-const NAMED_FILES: usize = 4;
 
 /// A Hugging Face repository pinned at one commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,8 +81,7 @@ impl fmt::Display for BaseRevision {
 
 /// Where a component export's base components are read.
 enum BaseCheckpoint {
-    /// A local copy whose download records place every file of its base
-    /// components at the pinned revision.
+    /// A caller-supplied directory holding the base components.
     Local(PathBuf),
     /// The Hub cache's snapshot of the pinned revision.
     Hub {
@@ -105,22 +93,18 @@ enum BaseCheckpoint {
 }
 
 impl BaseCheckpoint {
-    /// Accepts the local copy at `root` as the base `pin` names.
+    /// Resolves a local directory supplying the base components.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Invalid`] when `root` is not a directory, lacks a base
-    /// component's folder, or holds a file under one whose download record is
-    /// missing or names another commit, and [`Error::Io`] when a folder or a
-    /// record cannot be read.
-    fn local(root: &Path, pin: &BaseRevision) -> Result<Self> {
+    /// Returns [`Error::Invalid`] when `root` is not a directory.
+    fn local(root: &Path) -> Result<Self> {
         if !root.is_dir() {
             return Err(Error::invalid(format!(
                 "base checkpoint {} is not a directory",
                 root.display()
             )));
         }
-        verify_revision(root, pin)?;
         Ok(Self::Local(root.to_path_buf()))
     }
 
@@ -133,107 +117,6 @@ impl BaseCheckpoint {
     }
 }
 
-/// Refuses a local base whose files are not those of the pinned revision.
-///
-/// Every file under each of [`BASE_COMPONENTS`], hidden entries excepted,
-/// must have a download record whose first line is `pin.revision`.
-fn verify_revision(root: &Path, pin: &BaseRevision) -> Result<()> {
-    let records = root.join(DOWNLOAD_RECORDS);
-    let mut unrecorded = Vec::new();
-    let mut mismatched = Vec::new();
-    for component in BASE_COMPONENTS {
-        if !root.join(component).is_dir() {
-            return Err(Error::invalid(format!(
-                "base checkpoint {} has no {component} directory",
-                root.display()
-            )));
-        }
-        for name in folder_files(root, component)? {
-            let record = records.join(format!("{name}.metadata"));
-            let content = match std::fs::read_to_string(&record) {
-                Ok(content) => content,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    unrecorded.push(name);
-                    continue;
-                }
-                Err(source) => {
-                    return Err(Error::Io {
-                        path: record,
-                        source,
-                    });
-                }
-            };
-            let commit = content.lines().next().unwrap_or_default().trim();
-            if commit != pin.revision {
-                let commit = if commit.is_empty() {
-                    "no commit"
-                } else {
-                    commit
-                };
-                mismatched.push(format!("{name} at {commit}"));
-            }
-        }
-    }
-
-    if !mismatched.is_empty() {
-        return Err(Error::invalid(format!(
-            "base checkpoint {} is not {pin}: its download records place {}",
-            root.display(),
-            named(&mismatched)
-        )));
-    }
-    if !unrecorded.is_empty() {
-        return Err(Error::invalid(format!(
-            "base checkpoint {} has no Hugging Face download record for {}, \
-             so it cannot be verified as {pin}",
-            root.display(),
-            named(&unrecorded)
-        )));
-    }
-    Ok(())
-}
-
-/// Joins the first [`NAMED_FILES`] entries and counts the rest.
-fn named(entries: &[String]) -> String {
-    let mut text = entries[..entries.len().min(NAMED_FILES)].join(", ");
-    if entries.len() > NAMED_FILES {
-        text.push_str(&format!(" and {} more", entries.len() - NAMED_FILES));
-    }
-    text
-}
-
-/// Lists the files under `root/folder` as sorted `/`-separated paths relative
-/// to `root`.
-///
-/// Hidden entries (names starting with `.`) are skipped, symbolic links to
-/// files count as files, and symbolic links to directories are not followed.
-fn folder_files(root: &Path, folder: &str) -> Result<Vec<String>> {
-    let io_error = |path: &Path| {
-        let path = path.to_path_buf();
-        move |source| Error::Io { path, source }
-    };
-    let mut files = Vec::new();
-    let mut pending = vec![folder.to_owned()];
-    while let Some(relative) = pending.pop() {
-        let directory = root.join(&relative);
-        for entry in std::fs::read_dir(&directory).map_err(io_error(&directory))? {
-            let entry = entry.map_err(io_error(&directory))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            let child = format!("{relative}/{name}");
-            if entry.file_type().map_err(io_error(&entry.path()))?.is_dir() {
-                pending.push(child);
-            } else if entry.path().is_file() {
-                files.push(child);
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
 /// Returns `filename` from the Hub cache's snapshot of `pin`, downloading it
 /// at that commit when the snapshot lacks it.
 ///
@@ -244,8 +127,7 @@ fn folder_files(root: &Path, folder: &str) -> Result<Vec<String>> {
 /// # Errors
 ///
 /// Returns [`Error::MissingFile`] when the Hub does not publish `filename` at
-/// `pin`, and [`Error::Remote`] when a Hub request fails or the Hub serves
-/// the file from another commit.
+/// `pin`, and [`Error::Remote`] when a Hub request fails.
 async fn pinned_file(client: &HubClient, pin: &BaseRevision, filename: &str) -> Result<PathBuf> {
     let repo = Repo::with_revision(
         pin.repository.clone(),
@@ -258,21 +140,7 @@ async fn pinned_file(client: &HubClient, pin: &BaseRevision, filename: &str) -> 
         return Ok(cached);
     }
 
-    // The client files a download under the commit the Hub reports for it,
-    // so a file outside the pinned snapshot came from another commit.
-    let path = fetch_file(&client.api.repo(repo), &pin.to_string(), filename).await?;
-    if !path.starts_with(&snapshot) {
-        let commit = snapshot
-            .parent()
-            .and_then(|snapshots| path.strip_prefix(snapshots).ok())
-            .and_then(|relative| relative.iter().next())
-            .map_or_else(String::new, |commit| commit.to_string_lossy().into_owned());
-        return Err(Error::Remote {
-            model: pin.to_string(),
-            message: format!("the Hub served '{filename}' from commit {commit}"),
-        });
-    }
-    Ok(path)
+    fetch_file(&client.api.repo(repo), &pin.to_string(), filename).await
 }
 
 /// Reads the base a component export pins.
@@ -322,16 +190,15 @@ impl PipelineCheckpoint {
     ///
     /// `model_id` is a local directory or a Hub repository, as for
     /// [`resolve_model_file`](super::resolve_model_file). `base_model` names
-    /// a local copy of the base a component export pins, verified against
-    /// the pinned revision; without it a component export's base is the Hub
-    /// cache's snapshot of that revision. Returns `None` for a checkpoint
+    /// a local directory supplying the base components; without it the base
+    /// comes from the declared Hub revision. Returns `None` for a checkpoint
     /// that publishes no pipeline index.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Invalid`] when `base_model` is given for a checkpoint
     /// that pins no base, when the export's pin is malformed, or when the
-    /// local copy is not the pinned revision; and the errors of
+    /// local base is not a directory; and the errors of
     /// [`resolve_pipeline_index`](super::resolve_pipeline_index) for the root
     /// index and the inference contract.
     pub async fn resolve(model_id: &str, base_model: Option<&Path>) -> Result<Option<Self>> {
@@ -362,7 +229,7 @@ impl PipelineCheckpoint {
         let base = match (pinned_base(&root).await?, base_model) {
             (None, None) => None,
             (None, Some(base)) => return Err(takes_no_base(&root, base)),
-            (Some(pin), Some(base)) => Some(BaseCheckpoint::local(base, &pin)?),
+            (Some(_), Some(base)) => Some(BaseCheckpoint::local(base)?),
             (Some(pin), None) => Some(BaseCheckpoint::Hub {
                 client: hub()?,
                 pin,
@@ -407,7 +274,6 @@ mod tests {
 
     const BASE: &str = "org/base";
     const PIN: &str = "9bfb6693f2cf6de171db46d1aa586f67d773a1da";
-    const OTHER: &str = "0c0ffee0";
 
     /// Index of a component export: every MiniMax-H3 component, of which the
     /// export holds only `transformer_ref`.
@@ -441,31 +307,16 @@ mod tests {
         root
     }
 
-    /// A local download of the base's components, each file recorded at
-    /// `commit`, as `hf download --revision <commit> --local-dir` leaves it.
-    fn base_copy(commit: &str) -> TempDir {
+    /// Local component files, independent of how the directory was populated.
+    fn base_copy() -> TempDir {
         let root = tempdir().unwrap();
         for component in BASE_COMPONENTS {
             let name = format!("{component}/config.json");
             write(&root.path().join(&name), &format!("base {component}"));
-            write(
-                &root
-                    .path()
-                    .join(DOWNLOAD_RECORDS)
-                    .join(format!("{name}.metadata")),
-                &format!("{commit}\n\"etag\"\n1790937684.3\n"),
-            );
         }
         write(
             &root.path().join("tokenizer/tokenizer.json"),
             "base tokenizer",
-        );
-        write(
-            &root
-                .path()
-                .join(DOWNLOAD_RECORDS)
-                .join("tokenizer/tokenizer.json.metadata"),
-            &format!("{commit}\n"),
         );
         root
     }
@@ -474,12 +325,11 @@ mod tests {
         fs::read_to_string(path).unwrap()
     }
 
-    /// With a local base copy at the pinned revision, the components the
-    /// base supplies are read from the copy and the export's own DiT from
-    /// the export.
+    /// Read local base components and the export's own DiT from their
+    /// respective directories.
     #[tokio::test]
     async fn a_component_export_reads_its_base_components_from_a_local_copy() {
-        let (export, base) = (export(), base_copy(PIN));
+        let (export, base) = (export(), base_copy());
 
         let checkpoint =
             PipelineCheckpoint::resolve(export.path().to_str().unwrap(), Some(base.path()))
@@ -516,44 +366,6 @@ mod tests {
         assert!(matches!(
             checkpoint.component_file("processor", "absent.json").await,
             Err(Error::MissingFile { .. })
-        ));
-    }
-
-    /// A local copy is refused unless every file under the base components
-    /// has a download record naming the pinned commit.
-    #[tokio::test]
-    async fn a_local_base_off_the_pinned_revision_is_refused() {
-        let export = export();
-        let model = export.path().to_str().unwrap();
-
-        let moved = base_copy(OTHER);
-        let error = PipelineCheckpoint::resolve(model, Some(moved.path()))
-            .await
-            .err()
-            .unwrap();
-        assert!(
-            matches!(&error, Error::Invalid(message)
-            if message.contains(&format!("is not {BASE}@{PIN}")) && message.contains(OTHER)),
-            "{error}"
-        );
-
-        let unrecorded = base_copy(PIN);
-        write(&unrecorded.path().join("vae/extra.safetensors"), "weights");
-        let error = PipelineCheckpoint::resolve(model, Some(unrecorded.path()))
-            .await
-            .err()
-            .unwrap();
-        assert!(
-            matches!(&error, Error::Invalid(message)
-            if message.contains("no Hugging Face download record for vae/extra.safetensors")),
-            "{error}"
-        );
-
-        let partial = base_copy(PIN);
-        fs::remove_dir_all(partial.path().join("audio_vae")).unwrap();
-        assert!(matches!(
-            PipelineCheckpoint::resolve(model, Some(partial.path())).await,
-            Err(Error::Invalid(_))
         ));
     }
 
@@ -597,7 +409,6 @@ mod tests {
             .component_file("processor", "config.json")
             .await
             .unwrap();
-        assert!(processor.starts_with(&snapshot), "{}", processor.display());
         assert_eq!(read(processor), "downloaded");
         assert_eq!(
             read(
@@ -610,42 +421,11 @@ mod tests {
         );
     }
 
-    /// A file the Hub serves from a commit other than the pinned one is
-    /// refused.
-    #[tokio::test]
-    async fn a_hub_base_served_from_another_commit_is_refused() {
-        let (export, cache) = (export(), tempdir().unwrap());
-        let client = HubStub {
-            commit: Some(OTHER),
-            ..HubStub::with_files(&[("tokenizer/tokenizer.json", "moved")])
-        }
-        .client(cache.path())
-        .await;
-
-        let checkpoint = PipelineCheckpoint::locate(
-            ModelSource::Local(export.path().to_path_buf()),
-            None,
-            || Ok(client),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        let error = checkpoint
-            .component_file("tokenizer", "tokenizer.json")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&error, Error::Remote { message, .. } if message.contains(OTHER)),
-            "{error}"
-        );
-    }
-
     /// A base is refused for a checkpoint that pins none: a pipeline that
     /// holds every component, and a checkpoint that is no pipeline.
     #[tokio::test]
     async fn a_base_for_a_checkpoint_that_pins_none_is_refused() {
-        let base = base_copy(PIN);
+        let base = base_copy();
         let pipeline = tempdir().unwrap();
         write(&pipeline.path().join("model_index.json"), INDEX);
         let text = tempdir().unwrap();

@@ -406,12 +406,6 @@ class WorkerInfo:
     attention_backend: str = ""
     weight_formats: tuple[str, ...] = ()
     activation_formats: tuple[str, ...] = ()
-    # Identity of the loaded checkpoint files, distinct from the resolved
-    # execution configuration: a lowercase hex SHA-256, or empty for a model
-    # loaded without a checkpoint. The worker-ipc crate's
-    # `WorkerInfo::validate` accepts an empty identity only from the weightless
-    # stub model.
-    checkpoint_identity: str = ""
     components: tuple[ComponentInfo, ...] = ()
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
@@ -461,13 +455,11 @@ class WorkerInfo:
 
         Covers transfer backends, scheduling bounds, the endpoint rank, the
         KV cache that autoregressive calls require, pool sizes, supported and
-        media calls, latent pool completeness, the model name, and the
-        checkpoint identity format. The KV layout validates itself in
+        media calls, latent pool completeness and the model name.
+        The KV layout validates itself in
         `KVCacheInfo`. The worker-ipc crate's `WorkerInfo::validate` checks
         most of the same relations; it also checks the components (unique
-        names, membership within the world, and parallel degrees) and
-        refuses an empty checkpoint identity from any model but the
-        weightless stub.
+        names, membership within the world, and parallel degrees).
         """
         if (
             not self.device
@@ -558,12 +550,6 @@ class WorkerInfo:
 
         if not self.model_name:
             raise invalid_descriptor("worker model name is empty")
-        if self.checkpoint_identity and not _is_sha256_hex(
-            self.checkpoint_identity
-        ):
-            raise invalid_descriptor(
-                "worker checkpoint identity must be a lowercase hex SHA-256"
-            )
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "info") -> WorkerInfo:
@@ -609,10 +595,6 @@ class WorkerInfo:
                 for value in _seq(
                     data.get("weight_formats", ()), f"{where}.weight_formats"
                 )
-            ),
-            checkpoint_identity=_str(
-                data.get("checkpoint_identity", ""),
-                f"{where}.checkpoint_identity",
             ),
             components=tuple(
                 ComponentInfo.from_mapping(item, f"{where}.components[{index}]")
@@ -713,7 +695,6 @@ class WorkerInfo:
             "attention_backend": self.attention_backend,
             "weight_formats": list(self.weight_formats),
             "activation_formats": list(self.activation_formats),
-            "checkpoint_identity": self.checkpoint_identity,
             "components": [
                 component.to_mapping() for component in self.components
             ],
@@ -794,13 +775,6 @@ def _str(value: object, where: str) -> str:
     if not isinstance(value, str):
         raise invalid_descriptor(f"{where} must be a string")
     return value
-
-
-def _is_sha256_hex(value: str) -> bool:
-    """Report whether text is the lowercase hex form of one SHA-256 digest."""
-    return len(value) == 64 and all(
-        character in "0123456789abcdef" for character in value
-    )
 
 
 __all__ = [

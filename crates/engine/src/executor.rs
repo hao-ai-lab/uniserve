@@ -64,7 +64,7 @@ impl ExecutorInfo {
     /// Validates and constructs capability information for multiple pools.
     ///
     /// Fails when `pools` is empty, repeats a pool id, contains a record that
-    /// fails `WorkerInfo::validate`, mixes models or checkpoint identities, or
+    /// fails `WorkerInfo::validate`, mixes models, or
     /// holds replicas of one component that expose different numerical
     /// outputs.
     pub fn from_workers(pools: Vec<(WorkerId, WorkerInfo)>) -> anyhow::Result<Self> {
@@ -75,13 +75,12 @@ impl ExecutorInfo {
         let mut ids = std::collections::HashSet::new();
         let mut components: BTreeMap<&str, &uniserve_worker_ipc::ComponentInfo> = BTreeMap::new();
         let model_name = &pools[0].1.model_name;
-        let checkpoint = &pools[0].1.checkpoint_identity;
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "executor info repeats pool id {id}");
             info.validate()?;
             anyhow::ensure!(
-                &info.model_name == model_name && &info.checkpoint_identity == checkpoint,
-                "worker {id} loaded a different model or checkpoint"
+                &info.model_name == model_name,
+                "worker {id} loaded a different model"
             );
             for component in &info.components {
                 if let Some(other) = components.get(component.name.as_str()) {

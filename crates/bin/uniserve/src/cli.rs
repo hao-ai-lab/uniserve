@@ -157,10 +157,9 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
 
-    /// Local copy of the base checkpoint that a component export (such as
-    /// FastH3 OmniRef) pins for its other components. The server and the
-    /// workers verify its revision from its Hugging Face download records;
-    /// without it they read the pinned revision from the Hugging Face cache.
+    /// Local base directory supplying a component export's missing modules,
+    /// such as FastH3 OmniRef's text encoder and VAEs. Without it, load the
+    /// base revision declared by the export from the Hugging Face cache.
     #[arg(long, value_name = "PATH")]
     pub base_model: Option<std::path::PathBuf>,
 

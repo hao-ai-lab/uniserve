@@ -260,10 +260,6 @@ table WorkerInfo {
   media_components:[MediaComponent];
   num_inference_steps:uint;
   host_lane_capacity:uint = 1;
-  /// Identity of the loaded checkpoint files. Empty only for the weightless
-  /// stub model; the engine refuses ranks or pools that report different
-  /// values.
-  checkpoint_identity:string;
   video_denoiser:VideoDenoiserInfo;
   /// Maximum calls in one prefill run, the rows the rank's captured prefill
   /// graphs hold; zero leaves prefill runs bounded by `max_batch_calls`.

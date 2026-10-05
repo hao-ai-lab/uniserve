@@ -1154,7 +1154,7 @@ fn error_call_from_table(call: fbs::ErrorCallIdentity<'_>) -> CodecResult<ErrorC
 
 /// Decodes worker capabilities and validates them with `WorkerInfo::validate`.
 ///
-/// Absent `model_dtype`, `attention_backend`, and `checkpoint_identity` decode
+/// Absent `model_dtype` and `attention_backend` decode
 /// as empty strings, and absent optional vectors as empty. A media call bound
 /// more than once is a malformed frame.
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
@@ -1180,7 +1180,6 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .activation_formats()
             .map(|values| values.iter().map(str::to_owned).collect())
             .unwrap_or_default(),
-        checkpoint_identity: info.checkpoint_identity().unwrap_or_default().to_owned(),
         components: info
             .components()
             .map(|items| {

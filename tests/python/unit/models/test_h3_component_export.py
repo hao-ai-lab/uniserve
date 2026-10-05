@@ -1,10 +1,4 @@
-"""A component export loads its other components from its pinned base.
-
-FastH3 OmniRef ships its DiT partition and schedulers and pins the MiniMax-H3
-revision that supplies the text encoder, tokenizer, processor and VAEs. A
-local copy of that base is accepted only when its Hugging Face download
-records place every supplied file at the pinned revision.
-"""
+"""Component exports read a caller-supplied local base or a pinned Hub base."""
 
 import json
 import shutil
@@ -19,20 +13,11 @@ from uniserve_models.minimax_h3 import PddGrid, SparseAttention
 pytestmark = pytest.mark.unit
 
 REVISION = "9bfb6693f2cf6de171db46d1aa586f67d773a1da"
-SUPPLIED = ("text_encoder", "vae", "audio_vae", "tokenizer", "processor")
-
-
-def _record(root: Path, name: str, commit: str) -> None:
-    # huggingface_hub's local-directory download record: commit, etag and
-    # timestamp lines.
-    path = root / ".cache" / "huggingface" / "download" / f"{name}.metadata"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{commit}\n0123abcd\n1790914448.68\n")
 
 
 @pytest.fixture
 def checkpoints(tmp_path):
-    """An OmniRef-like export and a local base recorded at its revision."""
+    """An OmniRef-like export and local component configurations."""
     fixture = Path(__file__).parents[2] / "fixtures/models/fasth3"
     base, export = tmp_path / "base", tmp_path / "export"
     shutil.copytree(fixture, base)
@@ -48,9 +33,6 @@ def checkpoints(tmp_path):
     for directory in ("tokenizer", "processor"):
         (base / directory).mkdir()
         (base / directory / "tokenizer_config.json").write_text("{}")
-    for directory in SUPPLIED:
-        for path in sorted((base / directory).rglob("*")):
-            _record(base, path.relative_to(base).as_posix(), REVISION)
 
     export.mkdir()
     for directory in ("scheduler", "audio_scheduler"):
@@ -97,7 +79,7 @@ def _read(export, base):
     )
 
 
-def test_export_reads_its_other_components_from_the_base(checkpoints):
+def test_export_reads_local_components_without_hub_metadata(checkpoints):
     export, base = checkpoints
     config = _read(export, base)
 
@@ -109,23 +91,7 @@ def test_export_reads_its_other_components_from_the_base(checkpoints):
     )
     assert denoiser.max_sequence_rows == 131_072
     assert config.tokenizer == base / "tokenizer"
-    # The identity names the export; the base is pinned by its revision.
-    assert config.checkpoint_identity == models.checkpoint_identity(export)
     assert set(config.entry_points) >= {"text_encoder", "reference_denoiser"}
-
-
-def test_base_recorded_at_another_revision_is_refused(checkpoints):
-    export, base = checkpoints
-    _record(base, "vae/config.json", "42ed227ee7df40d41602854ae760620d6eb651fe")
-    with pytest.raises(ValueError, match="vae/config.json at 42ed227e"):
-        _read(export, base)
-
-
-def test_base_without_download_records_is_refused(checkpoints):
-    export, base = checkpoints
-    (base / "text_encoder" / "extra.json").write_text("{}")
-    with pytest.raises(ValueError, match="no Hugging Face download record"):
-        _read(export, base)
 
 
 def test_checkpoint_without_a_pinned_base_takes_none(checkpoints):
@@ -144,7 +110,7 @@ def test_export_without_a_local_base_reads_the_pinned_hub_revision(
     published = sorted(
         path.relative_to(base).as_posix()
         for path in base.rglob("*")
-        if path.is_file() and path.relative_to(base).parts[0] != ".cache"
+        if path.is_file()
     )
 
     # The Hub is an external service: it serves the base's files at the

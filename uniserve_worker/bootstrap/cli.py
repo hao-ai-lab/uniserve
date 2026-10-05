@@ -20,10 +20,8 @@ from pathlib import Path
 
 from uniserve_worker.config.deployment import WorkerProcessArgs
 
-# Keys ``read_launch_descriptor`` requires the descriptor to carry. A launch
-# that omits one is a contract violation rather than something to paper over
-# with a local default. Optional keys such as ``checkpoint_identity`` and
-# ``base_model`` are absent when the launcher has no value for them.
+# Required launch fields. Optional values, such as ``base_model``, are
+# absent when the launcher has no value for them.
 REQUIRED_FIELDS = (
     "registration_address",
     "channel_transport",

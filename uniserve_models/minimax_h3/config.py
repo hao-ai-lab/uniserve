@@ -434,7 +434,7 @@ class Config:
                 raise ValueError(
                     "H3 audio latent channels must match the denoiser"
                 )
-        # Packing, attention, native reconstruction and checkpoint identity
+        # Packing, attention and native reconstruction
         # implement this architecture; typed configs do not imply arbitrary
         # variants. The latent statistics come from each checkpoint and are
         # exempt, as are the PDD output heads and the checkpoint family's
@@ -917,8 +917,7 @@ def read_config(root: Path, io, *, sources, base: Path | None = None) -> Config:
     ``root`` is the checkpoint directory, whose sidecars the loader has
     already fetched; ``io`` and ``sources`` (the resolved ``config_sources``,
     of which H3 declares none) are part of the package interface. ``base``
-    is the directory of the base checkpoint a component export pins
-    (``checkpoint.base_checkpoint``), which the loader resolved and verified;
+    supplies the base components of a component export, resolved by the loader;
     the export's text encoder and VAE sidecars are read from it, and its
     schedulers and DiT partition from ``root``. Every other layout has no
     base.
