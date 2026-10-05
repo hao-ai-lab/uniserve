@@ -81,8 +81,16 @@ def test_copy_finishes_before_source_reuse_or_release(operation):
 
                 pending = threads.submit(reuse_or_close)
                 assert entered.wait(5)
-                with pytest.raises(TimeoutError):
-                    pending.result(timeout=0.1)
+                if operation == "drop":
+                    # Destruction may wait or defer allocation release. Both
+                    # must let Python run while the GPU copy is pending.
+                    try:
+                        pending.result(timeout=0.1)
+                    except TimeoutError:
+                        pass
+                else:
+                    with pytest.raises(TimeoutError):
+                        pending.result(timeout=0.1)
 
             pending.result(timeout=5)
         assert output.cpu().tolist() == [13] * 32
