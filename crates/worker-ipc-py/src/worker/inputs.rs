@@ -223,7 +223,7 @@ impl BatchInputs {
         self.inner.predicate = buffer.map(Dependency::Predicate);
     }
 
-    fn set_dependencies(&mut self, dependencies: Vec<Py<Completion>>) {
+    pub(super) fn set_dependencies(&mut self, dependencies: Vec<Py<Completion>>) {
         self.inner.dependencies = dependencies
             .into_iter()
             .map(Dependency::Completion)

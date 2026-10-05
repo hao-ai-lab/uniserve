@@ -22,6 +22,7 @@ use uniserve_worker_ipc::{
     Batch as BatchPlan, ForwardStats, RequestKind, WorkerInfo, WorkerResponseError,
 };
 
+use super::block_tables::BlockTables;
 use super::events::EventPool;
 use super::host::with_context;
 use super::inputs::BatchInputs;
@@ -63,6 +64,7 @@ struct PythonBackend {
     latents: Option<Py<LatentPool>>,
     cache: Option<Py<KVCacheManager>>,
     cache_imports: Option<Py<KVImporter>>,
+    tables: Option<Py<BlockTables>>,
     events: Py<EventPool>,
     exports: Vec<Py<PyDict>>,
     retirement_devices: Vec<Py<PyAny>>,
@@ -521,6 +523,12 @@ impl Executor {
             )
         };
         let mut exports = Vec::new();
+        let tables = worker.getattr("block_tables")?;
+        let tables = if tables.is_none() {
+            None
+        } else {
+            Some(tables.getattr("_tables")?.extract()?)
+        };
         for name in ["tensor_store", "kv_cache", "latent_pool"] {
             let store = worker.getattr(name)?;
             if !store.is_none() {
@@ -552,6 +560,7 @@ impl Executor {
             latents: worker.getattr("latent_pool")?.extract()?,
             cache: cache_manager,
             cache_imports,
+            tables,
             events: worker.getattr("device_events")?.extract()?,
             exports,
             retirement_devices,
@@ -681,6 +690,7 @@ impl Executor {
             visit.call(&executor.backend().latents)?;
             visit.call(&executor.backend().cache)?;
             visit.call(&executor.backend().cache_imports)?;
+            visit.call(&executor.backend().tables)?;
             visit.call(&executor.backend().events)?;
             for directory in &executor.backend().exports {
                 visit.call(directory)?;

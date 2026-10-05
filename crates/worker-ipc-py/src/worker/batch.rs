@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use uniserve_worker_ipc::{Batch, CallStatus};
 
+use super::block_tables::{BlockTables, GroupTable};
 use super::error::{invalid, native_error};
 use super::inputs::BatchInputs;
 use super::kv_import::KVImporter;
@@ -41,9 +42,9 @@ pub(crate) struct BatchState {
     predicate_transfers: Py<PyTuple>,
 
     #[pyo3(get, set)]
-    input_products: Py<PyTuple>,
+    pub(super) input_products: Py<PyTuple>,
     #[pyo3(get, set)]
-    kv_inputs: Py<PyTuple>,
+    pub(super) kv_inputs: Py<PyTuple>,
 
     #[pyo3(get, set)]
     stream: Option<Py<PyAny>>,
@@ -133,6 +134,23 @@ impl BatchState {
     #[getter]
     fn batch_id(&self) -> u64 {
         self.plan.batch_id
+    }
+
+    fn slot_tables(
+        &self,
+        py: Python<'_>,
+        tables: &BlockTables,
+        slot: u32,
+    ) -> PyResult<Py<PyTuple>> {
+        let tables = tables
+            .tables
+            .for_batch(slot, &self.plan.block_tables)
+            .map_err(|error| native_error(py, error))?;
+        let views = tables
+            .into_iter()
+            .map(|table| Py::new(py, GroupTable { table }))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(PyTuple::new(py, views)?.unbind())
     }
 
     #[getter]

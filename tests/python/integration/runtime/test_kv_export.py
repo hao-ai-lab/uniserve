@@ -463,6 +463,69 @@ def test_tail_closure_precedes_exact_incremental_export() -> None:
     assert incremental_snapshot.exported_extent == 4
 
 
+def test_local_kv_install_resolves_resident_export() -> None:
+    with execution_worker() as worker:
+        source = ar_params(47, block_ids=(0,))
+        extend = token_call(
+            source.request_key,
+            call_id=CallId(1, 0),
+            predecessor=root_parent(source),
+            mode=ForwardMode.PREFILL,
+            tokens=(3, 4),
+        )
+        extended = finalized_report(
+            worker,
+            worker.submit(
+                execution_batch(
+                    batch_id=1, admissions=(source,), calls=(extend,)
+                )
+            ),
+        )
+        observation = record_completion(extend, extended)
+        export, buffer = _export_call(
+            source.request_key,
+            call_id=CallId(2, 0),
+            predecessor=observation.call_id,
+        )
+        exported = finalized_report(
+            worker,
+            worker.submit(execution_batch(batch_id=2, calls=(export,))),
+        )
+        assert exported.completions[0].status is CallStatus.OK
+
+        install, _ = _installation_call(
+            source,
+            call_id=CallId(3, 0),
+            predecessor=observation.call_id,
+            source=buffer,
+        )
+        # A local source needs only its buffer reference; the worker retains
+        # the export's transfer description until the scheduler releases it.
+        installed = finalized_report(
+            worker,
+            worker.submit(
+                execution_batch(
+                    batch_id=3,
+                    calls=(install,),
+                    block_tables=(
+                        BlockTable(source.request_pool_idx, 0, 0, (2,), 2),
+                    ),
+                    new_cache_units=(
+                        CacheUnitAllocation(source.request_pool_idx, 0, (2,)),
+                    ),
+                )
+            ),
+        )
+        assert installed.completions[0].status is CallStatus.OK
+        assert installed.completions[0].kv_visible_len == 2
+        for layer in worker.kv_cache.cache.config.layers:
+            state = worker.kv_cache.cache.state(layer)
+            expected = state.read((1,), start=0, length=2)
+            actual = state.read((2,), start=0, length=2)
+            for left, right in zip(actual, expected, strict=True):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+
 def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))

@@ -295,6 +295,10 @@ class BatchState:
     @property
     def output_buffer(self) -> OutputBuffer: ...
     def scope(self) -> AbstractContextManager[None]: ...
+    def slot_tables(
+        self, tables: BlockTables, slot: int
+    ) -> tuple[GroupTable, ...]:
+        """Borrow supplied page assignments or the resident groups."""
     def bind_outputs(
         self,
         requests: RequestPool,
