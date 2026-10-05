@@ -1991,20 +1991,35 @@ impl Batch {
 
         // Each input product payload must be valid, declared as an input or
         // predicate by some call, and supplied at most once.
-        for payload in &self.input_products {
-            payload.validate()?;
-        }
-
-        let declared_inputs = self
-            .calls()
-            .flat_map(|call| call.tensor_inputs().chain(call.predicate.as_ref()))
-            .collect::<HashSet<_>>();
-
         let mut supplied_inputs = HashSet::with_capacity(self.input_products.len());
         for payload in &self.input_products {
             ensure_valid!(
-                declared_inputs.contains(&payload.product),
-                "an input product payload is not declared by any call"
+                self.calls().any(|call| match &payload.value {
+                    TransferHandle::Encoder {
+                        payload_kind: FeatureKind::Vision,
+                        ..
+                    } => {
+                        call.vision_inputs
+                            .iter()
+                            .any(|block| block.feature == payload.product)
+                    }
+                    TransferHandle::Encoder {
+                        payload_kind: FeatureKind::Latent,
+                        ..
+                    } => {
+                        call.latent_feature_input.as_ref() == Some(&payload.product)
+                    }
+                    TransferHandle::DeviceProduct { .. } => {
+                        call.inputs.contains(&payload.product)
+                            || [&call.token_input, &call.image_input, &call.predicate]
+                                .into_iter()
+                                .any(|input| input.as_ref() == Some(&payload.product))
+                    }
+                    TransferHandle::Latent { .. } => {
+                        call.latent_input.as_ref() == Some(&payload.product)
+                    }
+                }),
+                "an input transfer has no consumer for its payload kind"
             );
             ensure_valid!(
                 supplied_inputs.insert(&payload.product),

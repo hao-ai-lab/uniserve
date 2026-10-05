@@ -17,7 +17,7 @@ from uniserve_worker.execution.dispatch import execute_calls
 from uniserve_worker.execution.image import reserve_images
 from uniserve_worker.execution.prepare import (
     capture_predicates,
-    prepare_inputs,
+    prepare_predicates,
     reserve_outputs,
 )
 from uniserve_worker.profiling import _forward_stats, record_component
@@ -52,17 +52,13 @@ class BatchRunner:
             model_runner=self.worker.runner,
         )
 
-    def prepare_inputs(self, state: BatchState) -> None:
-        """Bind tensor views and submit copies into reserved destinations."""
-        prepare_inputs(
+    def prepare_predicates(self, state: BatchState) -> None:
+        """Bind predicate views after native input admission."""
+        prepare_predicates(
             state,
             tensor_store=self.worker.tensor_store,
-            latent_pool=self.worker.latent_pool,
             output_pool=self.worker.output_pool,
-            request_pool=self.worker.requests,
             model_runner=self.worker.runner,
-            transfer_backends=self.worker.transports,
-            config=self.worker.worker_config,
         )
 
     def capture_predicates(self, state: BatchState) -> None:

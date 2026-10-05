@@ -17,7 +17,7 @@ use super::protocol::{buffer_id, call_id};
 use super::storage::{TensorRead, TensorStore};
 use super::transfer::TransferTicket;
 
-enum Input {
+pub(super) enum Input {
     Tensor(Py<TensorRead>),
     Latent(Py<LatentImport>),
     Cache(Py<KVImport>),
@@ -168,8 +168,20 @@ pub(crate) struct BatchInputs {
 }
 
 impl BatchInputs {
-    pub(super) fn add_cache(&mut self, buffer: BufferId, write: Py<KVImport>) {
-        self.inner.inputs.insert(buffer, Input::Cache(write));
+    pub(super) fn insert(&mut self, buffer: BufferId, input: Input) {
+        self.inner.inputs.insert(buffer, input);
+    }
+
+    pub(super) fn remove(&mut self, buffer: BufferId) {
+        self.inner.inputs.remove(&buffer);
+    }
+
+    pub(super) fn started(&self) -> usize {
+        self.inner.started
+    }
+
+    pub(super) fn set_started(&mut self, started: usize) {
+        self.inner.started = started;
     }
 
     pub(super) fn awaiting_reads(&self) -> bool {
@@ -193,16 +205,6 @@ impl BatchInputs {
     #[getter]
     pub(super) fn closed(&self) -> bool {
         self.inner.closed()
-    }
-
-    #[getter]
-    fn started(&self) -> usize {
-        self.inner.started
-    }
-
-    #[setter]
-    fn set_started(&mut self, started: usize) {
-        self.inner.started = started;
     }
 
     #[getter]
@@ -273,12 +275,7 @@ impl BatchInputs {
             }
             Some(value) => Input::Cache(value.extract()?),
         };
-        self.inner.inputs.insert(buffer_id(buffer)?, value);
-        Ok(())
-    }
-
-    fn remove(&mut self, buffer: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.inner.inputs.remove(&buffer_id(buffer)?);
+        self.insert(buffer_id(buffer)?, value);
         Ok(())
     }
 

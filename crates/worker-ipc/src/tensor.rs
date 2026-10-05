@@ -1081,8 +1081,10 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
         } => ensure_valid!(
             // Height and width are both positive for an image, or both zero
             // for a non-image tensor, which then carries no value range.
-            (*height == 0) == (*width == 0) && (*height > 0 || value_range.is_empty()),
-            "device-product transfer geometry is incomplete"
+            (*height == 0) == (*width == 0)
+                && (*height > 0 || value_range.is_empty())
+                && matches!(value_range.as_str(), "" | "signed_unit" | "unit"),
+            "device-product image dimensions or value range are invalid"
         ),
         TransferHandle::Latent {
             height,
@@ -1133,19 +1135,6 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
         );
     }
 
-    // Logical byte sizes count each replicated region once.
-    let mut total_bytes = 0_u64;
-    for tensor in handle.tensors() {
-        total_bytes = total_bytes.saturating_add(tensor.validate()?);
-    }
-    let byte_bound = product
-        .shape_bound
-        .max_elements()
-        .saturating_mul(tensor_dtype(product.dtype).1);
-    ensure_valid!(
-        total_bytes <= byte_bound,
-        "transfer values exceed their product byte bound"
-    );
     ensure_valid!(
         handle.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
         "transfer handle exceeds its byte bound"
