@@ -1,6 +1,7 @@
-"""Numerical microbatches retire suspended calls after a host failure."""
+"""Numerical microbatch results, stream ordering and host retirement."""
 
 from contextlib import ExitStack
+from contextvars import ContextVar
 
 import pytest
 import torch
@@ -12,13 +13,13 @@ from uniserve.runtime.microbatches import yield_microbatch
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
-@torch.inference_mode()
-def test_failed_microbatch_releases_peers_and_preserves_the_exception():
+@pytest.fixture
+def numerical_calls():
     device = torch.device("cuda", 0)
     module = torch.nn.Linear(16, 8, bias=False, device=device)
-    module.weight.fill_(0.125)
+    with torch.inference_mode():
+        module.weight.fill_(0.125)
     inputs = torch.ones(2, 16, device=device)
-    failure = ValueError("invalid numerical input")
     with ExitStack() as scope:
         contexts = []
         for _ in range(2):
@@ -32,26 +33,91 @@ def test_failed_microbatch_releases_peers_and_preserves_the_exception():
             contexts.append(context)
         run = Microbatches(contexts)
         scope.callback(run.close)
+        yield module, inputs, run
 
-        def suspended():
-            hidden = module(inputs)
+
+def test_failed_microbatch_releases_peers_and_preserves_the_exception(
+    numerical_calls,
+):
+    module, inputs, run = numerical_calls
+    failure = ValueError("invalid numerical input")
+
+    def suspended():
+        hidden = module(inputs)
+        yield_microbatch()
+        return hidden + 1
+
+    def invalid():
+        raise failure
+
+    with pytest.raises(ValueError) as raised:
+        run((suspended, invalid))
+    assert raised.value is failure
+
+    # Both host turns retired before the caller received the failure;
+    # the same owner can run a later independent numerical invocation.
+    outputs = run((suspended, lambda: module(inputs * 2)))
+    torch.testing.assert_close(outputs[0].cpu(), torch.full((2, 8), 3.0))
+    torch.testing.assert_close(outputs[1].cpu(), torch.full((2, 8), 4.0))
+
+
+def test_uneven_calls_join_the_caller_stream_and_isolate_contexts(
+    numerical_calls,
+):
+    module, inputs, run = numerical_calls
+    request = ContextVar("request", default="unset")
+    request.set("caller")
+
+    def first():
+        assert request.get() == "caller"
+        request.set("first")
+        hidden = module(inputs)
+        for _ in range(3):
             yield_microbatch()
-            return hidden + 1
+            hidden = hidden + 1
+        return hidden, request.get()
 
-        def invalid():
-            raise failure
+    def second():
+        hidden = module(inputs * 2)
+        yield_microbatch()
+        return hidden, request.get()
 
-        with pytest.raises(ValueError) as raised:
-            run((suspended, invalid))
-        assert raised.value is failure
+    caller = torch.cuda.Stream(device=inputs.device)
+    caller.wait_stream(torch.cuda.current_stream(inputs.device))
+    with torch.cuda.stream(caller):
+        inputs.fill_(5)
+        outputs = run((first, second))
+        # Copy from the caller stream without a device-wide synchronization.
+        # It must see writes made by both borrowed context streams.
+        values = [hidden.cpu() for hidden, _ in outputs]
 
-        # Both host turns retired before the caller received the failure;
-        # the same owner can run a later independent numerical invocation.
-        outputs = run((suspended, lambda: module(inputs * 2)))
-        torch.cuda.synchronize(device)
-        torch.testing.assert_close(
-            outputs[0], torch.full((2, 8), 3.0, device=device)
-        )
-        torch.testing.assert_close(
-            outputs[1], torch.full((2, 8), 4.0, device=device)
-        )
+    torch.testing.assert_close(values[0], torch.full((2, 8), 13.0))
+    torch.testing.assert_close(values[1], torch.full((2, 8), 20.0))
+    assert [label for _, label in outputs] == ["first", "caller"]
+    assert request.get() == "caller"
+
+
+def test_running_and_closed_owners_reject_new_invocations(numerical_calls):
+    module, inputs, run = numerical_calls
+
+    def forward():
+        return module(inputs)
+
+    def reentrant():
+        with pytest.raises(RuntimeError, match="already running"):
+            run((forward, forward))
+        with pytest.raises(RuntimeError, match="cannot close running"):
+            run.close()
+        yield_microbatch()
+        return forward()
+
+    with pytest.raises(ValueError, match="one numerical call"):
+        run((forward,))
+
+    outputs = run((reentrant, forward))
+    for output in outputs:
+        torch.testing.assert_close(output.cpu(), torch.full((2, 8), 2.0))
+
+    run.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        run((forward, forward))

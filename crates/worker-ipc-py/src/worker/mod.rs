@@ -17,6 +17,7 @@ mod inputs;
 mod kv_cache;
 mod kv_import;
 mod latent;
+mod microbatches;
 mod output;
 mod pending;
 mod protocol;
@@ -33,6 +34,8 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_class::<graph_storage::GraphStorage>()?;
+    module.add_function(wrap_pyfunction!(microbatches::yield_microbatch, module)?)?;
+    module.add_class::<microbatches::Microbatches>()?;
     module.add_class::<batch::BatchState>()?;
     module.add_class::<block_tables::BlockTables>()?;
     module.add_class::<block_tables::GroupShape>()?;
