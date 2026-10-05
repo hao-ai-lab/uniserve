@@ -19,8 +19,6 @@ pub struct RegisteredBuffer<S, C> {
     source: S,
     retirement: C,
     readers: usize,
-    pending: bool,
-    failed: bool,
     status: Status,
 }
 
@@ -39,10 +37,6 @@ impl<S, E, N, C: Deref<Target = Completion<E, N>>> RegisteredBuffer<S, C> {
                 "buffer is no longer available for reading".into(),
             ));
         }
-        if self.failed {
-            return Err(Error::Resource("buffer producer failed before readiness"));
-        }
-
         self.readers += 1;
         Ok(&self.source)
     }
@@ -56,42 +50,21 @@ impl<S, E, N, C: Deref<Target = Completion<E, N>>> RegisteredBuffer<S, C> {
         Ok(())
     }
 
-    /// Report the producer's outcome. Unknown device completion fails the
-    /// retirement signal and retains storage; a drained failure can retire.
-    /// Dispatch returned observers after releasing the registry owner's lock.
-    pub fn complete(&mut self, error: Option<E>, producer_completed: bool) -> Result<Vec<N>> {
-        if !producer_completed && error.is_none() {
-            return Err(Error::Invalid(
-                "unknown producer completion requires a failure".into(),
-            ));
-        }
-
-        self.pending = !producer_completed;
-        self.failed = error.is_some();
-        if !producer_completed
-            && !self.retirement.done()
-            && let Some(error) = error
-        {
-            return self.retirement.complete(Err(error));
-        }
-
-        Ok(Vec::new())
-    }
-
     pub fn release(&mut self) {
         if self.status == Status::Active {
             self.status = Status::Revoked;
         }
     }
 
-    /// Check remote acknowledgments before handing storage to the reclaimer.
+    /// Check producer completion and remote acknowledgments before handing
+    /// storage to the reclaimer.
     /// The query runs under the owner's lock so another reaper cannot unmap
     /// its backing. It must be read-only and must not invoke observers.
     pub fn begin_reclaim<F>(
         &mut self,
         settled: impl FnOnce(&S) -> std::result::Result<bool, F>,
     ) -> std::result::Result<Option<(&S, &C)>, F> {
-        if self.status != Status::Revoked || self.pending || self.readers != 0 {
+        if self.status != Status::Revoked || self.readers != 0 {
             return Ok(None);
         }
         if !settled(&self.source)? {
@@ -125,7 +98,7 @@ impl<K: Eq + Hash, S, E, N, C: Deref<Target = Completion<E, N>>> BufferRegistry<
         })
     }
 
-    pub fn register(&mut self, key: K, source: S, retirement: C, pending: bool) -> Result<()> {
+    pub fn register(&mut self, key: K, source: S, retirement: C) -> Result<()> {
         if self.closing || self.buffers.len() >= self.capacity {
             return Err(Error::Resource("transport buffer capacity is unavailable"));
         }
@@ -139,8 +112,6 @@ impl<K: Eq + Hash, S, E, N, C: Deref<Target = Completion<E, N>>> BufferRegistry<
                 source,
                 retirement,
                 readers: 0,
-                pending,
-                failed: false,
                 status: Status::Active,
             },
         );
@@ -162,17 +133,10 @@ impl<K: Eq + Hash, S, E, N, C: Deref<Target = Completion<E, N>>> BufferRegistry<
             .map(|(key, _)| key)
     }
 
-    pub fn draining(&self) -> impl Iterator<Item = &S> {
-        self.buffers
-            .values()
-            .filter(|buffer| buffer.status == Status::Reclaiming)
-            .map(|buffer| &buffer.source)
-    }
-
     pub fn awaiting_acknowledgment(&self) -> bool {
         self.buffers
             .values()
-            .any(|buffer| buffer.status == Status::Revoked && !buffer.pending)
+            .any(|buffer| buffer.status == Status::Revoked)
     }
 
     /// Return successfully retired buffers for destruction outside the owner

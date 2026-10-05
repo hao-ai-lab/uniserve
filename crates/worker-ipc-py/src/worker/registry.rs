@@ -3,7 +3,7 @@
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
-use pyo3::exceptions::{PyBaseException, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 use uniserve_worker::{BufferRegistry as NativeBufferRegistry, RegisteredBuffer};
@@ -65,16 +65,8 @@ impl BufferRegistry {
         })
     }
 
-    /// Register backing storage. A pending producer must call `complete`
-    /// before the buffer can retire, including after a failed write.
-    #[pyo3(signature = (locator, source, *, pending=false))]
-    fn register(
-        &self,
-        py: Python<'_>,
-        locator: Py<PyAny>,
-        source: Py<PyAny>,
-        pending: bool,
-    ) -> PyResult<()> {
+    /// Register backing storage; the backend observes producer completion.
+    fn register(&self, py: Python<'_>, locator: Py<PyAny>, source: Py<PyAny>) -> PyResult<()> {
         let key = self.key(locator.bind(py))?;
         self.remove_finished(py)?;
         let retirement = Py::new(py, Completion::new())?;
@@ -86,7 +78,6 @@ impl BufferRegistry {
                     value: source,
                 },
                 CompletionRef::new(py, retirement),
-                pending,
             )
             .map_err(|error| native_error(py, error))
     }
@@ -120,29 +111,6 @@ impl BufferRegistry {
             .release_reader()
             .map_err(|error| native_error(py, error))?;
         drop(state);
-        self.reclaim_buffer(py, &key)
-    }
-
-    /// A failed producer with unknown completion retains its storage. Reporting
-    /// the error must not release bytes that a device may still be writing.
-    #[pyo3(signature = (locator, *, error=None, producer_completed=true))]
-    fn complete(
-        &self,
-        py: Python<'_>,
-        locator: &Bound<'_, PyAny>,
-        error: Option<Py<PyBaseException>>,
-        producer_completed: bool,
-    ) -> PyResult<()> {
-        let key = self.key(locator)?;
-        let mut state = self.lock(py)?;
-        let buffer = Self::buffer(&mut state, &key, locator)?;
-        let callbacks = buffer
-            .complete(error, producer_completed)
-            .map_err(|error| native_error(py, error))?;
-        let retirement = buffer.retirement().owner.clone_ref(py);
-        drop(state);
-
-        Completion::notify(retirement.bind(py), callbacks);
         self.reclaim_buffer(py, &key)
     }
 
@@ -192,15 +160,17 @@ impl BufferRegistry {
         self.lock(py)?.close();
         self.reap(py)?;
 
+        // A producer can still be writing before backend reclamation begins.
+        // Drain those writes as well as already scheduled reader retirement.
         let sources: Vec<_> = self
             .lock(py)?
-            .draining()
-            .map(|source| source.value.clone_ref(py))
+            .buffers()
+            .map(|buffer| buffer.source().value.clone_ref(py))
             .collect();
         for source in sources {
             self.drain.bind(py).call1((source,))?;
         }
-        self.remove_finished(py)?;
+        self.reap(py)?;
         self.lock(py)?
             .require_retired()
             .map_err(|error| native_error(py, error))

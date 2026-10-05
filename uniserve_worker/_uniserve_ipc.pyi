@@ -17,6 +17,7 @@ from types import TracebackType
 from typing import Any, Generic, ParamSpec, Self, TypeVar, final
 
 import torch
+from typing_extensions import Buffer as BufferProtocol
 
 import uniserve_worker.storage.block_tables as block_tables
 import uniserve_worker.storage.kv_cache as kv_cache
@@ -121,6 +122,7 @@ __all__ = [
     "RequestPool",
     "ReadReservation",
     "Server",
+    "SharedBuffer",
     "StreamSignal",
     "Submission",
     "TensorImport",
@@ -562,6 +564,9 @@ class EventPool:
     def schedule_completion_wake(
         self, device: torch.device | str, event: CUDAEvent
     ) -> None: ...
+    def notify_stream(self, stream: int) -> None:
+        """Wake the worker after already submitted stream work completes."""
+        ...
     def acquire(
         self,
         device: torch.device | str,
@@ -585,6 +590,33 @@ class EventPool:
         completed: Callable[[], None] | None = None,
     ) -> None: ...
     def reap(self) -> None: ...
+    def close(self) -> None: ...
+
+@final
+class SharedBuffer(BufferProtocol):
+    """A shared tensor export with native allocation and CUDA readiness.
+
+    The writable buffer contains the segment header followed by tensor bytes.
+    Borrowed views keep the mapping alive after close unlinks its name.
+    """
+
+    def __init__(
+        self,
+        nbytes: int,
+        consumers: Sequence[int],
+        device: tuple[int, int] | None = None,
+    ) -> None: ...
+    def __buffer__(self, flags: int) -> memoryview: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def nbytes(self) -> int: ...
+    @property
+    def is_cuda(self) -> bool: ...
+    def begin_copy(self) -> None: ...
+    def mark_ready(self) -> None: ...
+    def settled(self) -> bool: ...
+    def synchronize(self) -> None: ...
     def close(self) -> None: ...
 
 @final
@@ -800,8 +832,9 @@ class BufferRegistry(Generic[Source]):
     """Retain registered storage until its producer and readers finish.
 
     Reclaim hands the source back and completes its retirement signal. Drain
-    waits for an in-flight reclamation at shutdown. Settled inspects backend
-    acknowledgments; it must not mutate the registry or invoke observers.
+    waits for producer writes and in-flight reclamation at shutdown. Settled
+    inspects completion and backend acknowledgments; it must not mutate the
+    registry or invoke observers.
     """
 
     def __new__(
@@ -814,19 +847,10 @@ class BufferRegistry(Generic[Source]):
     ) -> Self: ...
     @property
     def name(self) -> str: ...
-    def register(
-        self, locator: Locator, source: Source, *, pending: bool = False
-    ) -> None: ...
+    def register(self, locator: Locator, source: Source) -> None: ...
     def source(self, locator: Locator) -> Source: ...
     def acquire(self, locator: Locator) -> Source: ...
     def release_reader(self, locator: Locator) -> None: ...
-    def complete(
-        self,
-        locator: Locator,
-        *,
-        error: BaseException | None = None,
-        producer_completed: bool = True,
-    ) -> None: ...
     def release(self, locator: Locator) -> Completion | None: ...
     def retirement(self, locator: Locator) -> Completion: ...
     def awaiting_acknowledgment(self) -> bool: ...

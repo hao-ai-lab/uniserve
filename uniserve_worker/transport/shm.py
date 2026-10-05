@@ -12,19 +12,19 @@ named consumer is still reading it.
 
 from __future__ import annotations
 
-import ctypes
-import queue
-import selectors
-import socket
-import threading
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from uniserve.runtime import EventPool
-from uniserve_worker._uniserve_ipc import Completion
-from uniserve_worker.errors import invalid_descriptor, resource_error
+from uniserve_worker._uniserve_ipc import (
+    Completion,
+    HostLane,
+    HostTask,
+    SharedBuffer,
+)
+from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     Locator,
     PosixShmTransfer,
@@ -47,10 +47,7 @@ from uniserve_worker.transport.pool import (
     TransferCapacity,
     TransferPool,
 )
-from uniserve_worker.transport.shared_storage import (
-    allocate_shared_storage,
-    open_shared_storage,
-)
+from uniserve_worker.transport.shared_storage import open_shared_storage
 from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
@@ -59,56 +56,13 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class _ShmSource:
-    """Own a shared segment and any unfinished device-to-host export.
-
-    The segment begins with a readiness word and one acknowledgment word
-    per instance rank.
-    ``consumers`` are the slots whose words return the segment.
-    """
-
-    shm: Any
-    nbytes: int
-    consumers: tuple[int, ...]
-    #: `StreamSignal` of an unfinished device-to-host copy into the segment,
-    #: cleared by the export thread once the signal fires.
-    signal: Any = None
-    #: Address of the segment's mapping while it is registered with the
-    #: CUDA driver, so a device-to-host copy lands in it directly.
-    registered: int | None = None
-
-
-def _register_segment(buffer: memoryview) -> int:
-    """Page-lock a segment's mapping so device copies land in it directly.
-
-    Returns the mapping's address, which the unregistration needs. The
-    registered range is the whole mapping, which starts on a page boundary
-    as every mmap does.
-
-    Raises:
-        WorkerError: `resource_error` when the driver refuses the range.
-    """
-    import torch
-
-    address = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
-    status = torch.cuda.cudart().cudaHostRegister(address, len(buffer), 0)
-    if int(status) != 0:
-        raise resource_error(
-            f"registering a shared storage segment with the CUDA driver "
-            f"failed with status {int(status)}"
-        )
-    return address
-
-
-def _unregister_segment(address: int) -> None:
-    """Undo `_register_segment`; the driver's status is not checked."""
-    import torch
-
-    torch.cuda.cudart().cudaHostUnregister(address)
+    storage: SharedBuffer
+    retirement: HostTask[None] | None = None
 
 
 @dataclass(slots=True)
 class HostBorrow:
-    """A consumer's direct view of a exported segment's bytes.
+    """A consumer's direct view of an exported segment's bytes.
 
     The bytes stay in the producer's segment: a reader on this host, such as
     a media unit encode task, maps them by name and offset. ``release``
@@ -200,34 +154,21 @@ class ShmTransport(Transport):
         # Slots of the ranks on this host: the only ones a segment named in
         # this host's namespace can reach.
         self._host_slots = frozenset(int(slot) for slot in host_slots)
-        # `_reclaim` completes a retirement before returning, so `close` has
-        # no in-flight reclamation to drain.
+        # CUDA host unregistration may wait on unrelated device work. Keep it
+        # off the execution loop, using the shared native host executor.
+        self._retirements = HostLane(
+            max_inflight=256, workers=1, name="uniserve-shm-retire"
+        )
         self._buffers = BufferRegistry(
             capacity=256,
             reclaim=self._reclaim,
-            drain=lambda source: None,
-            settled=self._settled,
+            drain=self._drain,
+            settled=lambda source: source.storage.settled(),
         )
         # This rank's own word in the header of every segment it reads.
         self._acknowledgment_slot = int(acknowledgment_slot)
         self.source = source or WorkerEndpoint.local()
-        # Device exports reach the export thread through this
-        # queue; a byte on the socket pair wakes that thread's selector, and
-        # a None item asks it to exit once every queued copy has signaled.
-        self._export_queue: queue.Queue[tuple[Locator, _ShmSource] | None] = (
-            queue.Queue()
-        )
-        self._export_control_rx, self._export_control_tx = socket.socketpair()
-        self._export_control_rx.setblocking(False)
-        self._export_control_tx.setblocking(False)
-        self._completion_wake: Any = None
-        self._closed = False
-        self._export_worker = threading.Thread(
-            target=self._complete_buffers,
-            name="uniserve-shm-export",
-            daemon=True,
-        )
-        self._export_worker.start()
+        self._events = event_pool
         self._reads = TransferPool(
             workers=2,
             capacity=capacity,
@@ -247,127 +188,37 @@ class ShmTransport(Transport):
         return self._buffers.retirement(locator)
 
     def set_completion_wake(self, wake: Any) -> None:
-        self._completion_wake = wake
         self._reads.set_completion_wake(wake)
+        self._retirements.set_completion_wake(wake)
 
     def _reclaim(self, source: _ShmSource, retirement: Completion) -> None:
-        # Producer completion and reader acknowledgments have both arrived.
-        self._free_segment(source.shm, source.nbytes, source.registered)
-        source.registered = None
-        retirement.set_result(None)
+        if source.storage.is_cuda:
+            source.retirement = self._retirements.reserve()
+            source.retirement.submit(self._retire, source.storage, retirement)
+        else:
+            self._retire(source.storage, retirement)
 
-    def _free_segment(
-        self, shm: Any, nbytes: int, registered: int | None
-    ) -> None:
-        """Hand one segment and its bytes back.
-
-        The CUDA registration covers the mapping, so it is removed first;
-        the mapping is then closed, the name unlinked and the bytes returned
-        to the rank's budget. The caller must hold no view of the mapping:
-        `SharedMemory.close` raises `BufferError` while one is alive, which
-        would leave the segment linked and its bytes reserved.
-        """
-        if registered is not None:
-            _unregister_segment(registered)
-        shm.close()
+    def _retire(self, storage: SharedBuffer, retirement: Completion) -> None:
         try:
-            shm.unlink()
-        except FileNotFoundError:
-            pass
-        self.capacity.release(nbytes)
+            storage.close()
+            self.capacity.release(storage.nbytes)
+        except BaseException as error:
+            retirement.set_exception(error)
+            raise
+        else:
+            retirement.set_result(None)
 
-    @staticmethod
-    def _settled(source: _ShmSource) -> bool:
-        """Report whether no named consumer is still reading the segment.
-
-        A retired segment returns once every consumer that began reading has
-        acknowledged; a consumer that never began, such as the reader of a
-        request cancelled before its call was submitted, holds nothing.
-        """
-        if not source.consumers:
-            return True
-        return segment.settled(source.shm.buf, source.consumers)
+    def _drain(self, source: _ShmSource) -> None:
+        source.storage.synchronize()
+        self._buffers.reap()
+        if source.retirement is not None:
+            source.retirement.result()
 
     def reap(self) -> None:
         self._buffers.reap()
 
     def awaiting_acknowledgment(self) -> bool:
         return self._buffers.awaiting_acknowledgment()
-
-    def _queue_export(self, item: tuple[Locator, _ShmSource] | None) -> None:
-        self._export_queue.put(item)
-        try:
-            self._export_control_tx.send(b"P")
-        except BlockingIOError:
-            pass
-
-    def _complete_buffers(self) -> None:
-        """Export completed host bytes without waiting in the Worker thread.
-
-        Runs on the export thread. Each queued device export's
-        stream signal is watched until its device-to-host copy completes;
-        the segment's readiness word is then set and the export marked
-        complete. After the exit request, the loop keeps running until every
-        watched signal has fired, so no segment is left pending.
-        """
-        selector = selectors.DefaultSelector()
-        selector.register(self._export_control_rx, selectors.EVENT_READ)
-        closing = False
-        try:
-            while not closing or len(selector.get_map()) > 1:
-                for key, _events in selector.select():
-                    if key.fileobj is self._export_control_rx:
-                        # Drain the wakeup, then register each queued
-                        # export's stream signal for readiness.
-                        while True:
-                            try:
-                                if not self._export_control_rx.recv(4096):
-                                    closing = True
-                                    break
-                            except BlockingIOError:
-                                break
-                        while True:
-                            try:
-                                item = self._export_queue.get_nowait()
-                            except queue.Empty:
-                                break
-                            if item is None:
-                                closing = True
-                            else:
-                                selector.register(
-                                    item[1].signal, selectors.EVENT_READ, item
-                                )
-                        continue
-
-                    # A stream signal fired: the device-to-host DMA into the
-                    # segment is done, so expose (or fail) the export.
-                    locator, source = key.data
-                    selector.unregister(source.signal)
-                    failure = None
-                    try:
-                        source.signal.consume()
-                    except BaseException as error:
-                        device_completed = False
-                        failure = error
-                    else:
-                        device_completed = True
-                    source.signal = None
-                    # The readiness word is written after the payload, with
-                    # release ordering, so a consumer that sees it sees the
-                    # bytes it announces.
-                    segment.set_state(
-                        source.shm.buf,
-                        segment.READY if failure is None else segment.FAILED,
-                    )
-                    self._buffers.complete(
-                        locator,
-                        error=failure,
-                        producer_completed=device_completed,
-                    )
-                    if self._completion_wake is not None:
-                        self._completion_wake()
-        finally:
-            selector.close()
 
     def export(
         self,
@@ -376,55 +227,38 @@ class ShmTransport(Transport):
         offset: tuple[int, ...] | None = None,
         consumers: Sequence[int] = (),
     ) -> Locator:
-        """Export into a segment whose header carries its readiness.
+        """Copy tensor spans into native shared storage and return its locator.
 
-        A host source is copied synchronously and the segment is ready on
-        return. A device source is copied into the page-locked segment on the
-        current stream; the export thread marks the segment ready once
-        that copy completes, and the source is recorded on the stream so its
-        storage outlives the copy. ``consumers`` names the acknowledgment
-        slots whose words must settle before the segment is unlinked.
-
-        Raises:
-            WorkerError: `invalid_descriptor` when `export_views`
-                refuses the source or the locator's identity is already
-                registered; `resource_error` when transfer bytes or
-                the export table are exhausted, the table is closing,
-                or the CUDA driver refuses to register the segment.
-                Allocation and copy errors propagate.
+        CUDA copies land directly in the registered mapping. A native callback
+        marks the bytes readable after DMA, without entering Python. Reaping
+        returns capacity after producer completion and reader acknowledgments.
         """
         import torch
 
         source, shape, offset = export_views(tensor, offset)
         first = source[0] if isinstance(source, tuple) else source
         nbytes = tensor_nbytes(source)
-        # Capacity acknowledged since the last sweep is reclaimed first.
         self._buffers.reap()
         self.capacity.acquire(nbytes)
 
-        shm = None
-        address = None
+        storage = None
         registered = False
-        submitted = False
-        # Views of the segment's mapping. A failure drops them before any
-        # cleanup: `SharedMemory.close` raises `BufferError` while one is
-        # alive, which would replace the original error and leave the
-        # segment linked and its bytes reserved.
-        payload: memoryview | None = None
-        packed: torch.Tensor | None = None
-        target: torch.Tensor | None = None
         try:
-            shm = allocate_shared_storage(segment.HEADER_BYTES + max(1, nbytes))
-            buffer = shm.buf
-            if buffer is None:
-                raise RuntimeError(
-                    "shared storage export has no writable buffer"
-                )
+            stream = (
+                torch.cuda.current_stream(first.device)
+                if first.is_cuda
+                else None
+            )
+            device = (
+                None
+                if stream is None
+                else (stream.device.index, int(stream.cuda_stream))
+            )
+            storage = SharedBuffer(nbytes, tuple(consumers), device)
             locator = Locator(
                 source=self.source,
                 transport=PosixShmTransfer(
-                    endpoint=self.endpoint(),
-                    name=shm.name,
+                    endpoint=self.endpoint(), name=storage.name
                 ),
                 nbytes=nbytes,
                 dtype=dtype_name(first.dtype),
@@ -432,69 +266,41 @@ class ShmTransport(Transport):
                 offset=offset,
                 device=str(first.device),
             )
-            segment.initialize(buffer)
-            payload = buffer[segment.HEADER_BYTES :]
-
-            packed = torch.frombuffer(payload, dtype=first.dtype).reshape(shape)
-            if first.is_cuda:
-                # Device bytes land in the segment itself: its mapping is
-                # page-locked for the copy, and the stream signal marks the
-                # DMA complete on the export thread.
-                from uniserve_worker._uniserve_ipc import StreamSignal
-
-                address = _register_segment(buffer)
-                signal = StreamSignal()
-            else:
-                signal = None
-                for target, value in copy_pairs(source, packed):
-                    target.copy_(value)
-                segment.set_state(buffer, segment.READY)
-
-            export = _ShmSource(
-                shm,
-                nbytes,
-                tuple(int(slot) for slot in consumers),
-                signal,
-                address,
-            )
-            self._buffers.register(locator, export, pending=first.is_cuda)
+            packed = torch.frombuffer(
+                memoryview(storage)[segment.HEADER_BYTES :], dtype=first.dtype
+            ).reshape(shape)
+            self._buffers.register(locator, _ShmSource(storage))
             registered = True
 
-            if first.is_cuda:
-                assert signal is not None
-                submitted = True
+            if stream is None:
+                for target, value in copy_pairs(source, packed):
+                    target.copy_(value)
+            else:
                 from uniserve_kernels.peer_storage import copy_host_device
 
-                stream = torch.cuda.current_stream(first.device)
+                storage.begin_copy()
                 for target, value in copy_pairs(source, packed):
                     copy_host_device(target, value, stream)
                     value.record_stream(stream)
-                signal.schedule(int(stream.cuda_stream))
-                self._queue_export((locator, export))
-            return locator
-        except BaseException:
-            # The table may reclaim the segment synchronously below, and the
-            # unregistered path closes it here, so no view of the mapping
-            # may outlive this point.
-            payload = packed = target = None
 
-            # Once registered, the export table owns the segment: the
-            # export is retired, and a device export is marked
-            # failed and complete so `_reclaim` can unlink it. Before that,
-            # the segment, its CUDA registration and its bytes are returned
-            # here.
+            storage.mark_ready()
+            if stream is not None:
+                self._events.notify_stream(int(stream.cuda_stream))
+            return locator
+        except BaseException as error:
+            # A failed copy can leave earlier spans in flight. Native close
+            # drains those accesses before unregistering and unlinking storage;
+            # a failed drain retains the mapping and its byte reservation.
+            if storage is not None:
+                try:
+                    storage.close()
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        f"shared buffer cleanup failed: {cleanup_error}"
+                    )
+                    raise error from cleanup_error
             if registered:
                 self._buffers.release(locator)
-                if submitted:
-                    # The segment stays mapped and registered until the copy
-                    # into it has retired.
-                    torch.cuda.current_stream(first.device).synchronize()
-                if first.is_cuda:
-                    assert buffer is not None
-                    segment.set_state(buffer, segment.FAILED)
-                    self._buffers.complete(locator)
-            elif shm is not None:
-                self._free_segment(shm, nbytes, address)
             else:
                 self.capacity.release(nbytes)
             raise
@@ -631,17 +437,12 @@ class ShmTransport(Transport):
         return self._buffers.release(locator)
 
     def close(self) -> None:
-        # Reads drain first, then the export thread exits once every
-        # pending device copy has signaled, and only then are the
-        # exports retired; `BufferRegistry.close` raises `resource_error`
-        # when any source is still retained.
+        # Drain reads first. Registry close finishes producer copies, then
+        # reaps buffers whose granted readers have all acknowledged.
         try:
             self._reads.close()
         finally:
-            if not self._closed:
-                self._queue_export(None)
-                self._export_worker.join()
-                self._export_control_rx.close()
-                self._export_control_tx.close()
-                self._closed = True
-            self._buffers.close()
+            try:
+                self._buffers.close()
+            finally:
+                self._retirements.close()

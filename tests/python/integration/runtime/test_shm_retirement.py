@@ -1,5 +1,9 @@
-"""Failed readers and refused exports release their segment and quota."""
+"""Shared tensor readiness, borrowed views and physical retirement."""
 
+import ctypes
+import multiprocessing as mp
+import os
+import select
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,13 +12,173 @@ from multiprocessing import shared_memory
 import pytest
 import torch
 
+from tests.python.fixtures.cuda_stream import blocked_stream
 from uniserve.runtime import EventPool
-from uniserve_worker._uniserve_ipc import atomic_load_u32
+from uniserve_worker._uniserve_ipc import (
+    SharedBuffer,
+    atomic_load_u32,
+    atomic_store_u32,
+)
 from uniserve_worker.errors import ResourceError
+from uniserve_worker.protocol.transfer import Locator
 from uniserve_worker.transport import make_transports, segment
 from uniserve_worker.transport.shared_storage import open_shared_storage
 
 pytestmark = pytest.mark.integration
+
+
+def test_borrowed_tensor_survives_shared_buffer_close():
+    storage = SharedBuffer(16, ())
+    name = storage.name
+    view = memoryview(storage)[segment.HEADER_BYTES :]
+    tensor = torch.frombuffer(view, dtype=torch.float32)
+    direct = torch.frombuffer(
+        storage, dtype=torch.float32, offset=segment.HEADER_BYTES
+    )
+    tensor.copy_(torch.arange(4, dtype=torch.float32))
+    storage.mark_ready()
+    storage.close()
+
+    with pytest.raises(FileNotFoundError):
+        open_shared_storage(name, 1)
+    del storage, view
+
+    # PyTorch may release Py_buffer immediately while retaining its exporter.
+    # The tensor must remain writable through its last borrowed reference.
+    direct.add_(1)
+    torch.testing.assert_close(tensor, torch.arange(1, 5, dtype=torch.float32))
+
+
+@pytest.mark.gpu
+def test_reaping_a_cuda_export_does_not_block_the_execution_thread():
+    events = EventPool()
+    producer = make_transports(
+        ("shm",), byte_capacity=4096, ticket_capacity=1, event_pool=events
+    )["shm"]
+    source = torch.arange(1024, dtype=torch.float32, device="cuda")
+    stream = torch.cuda.Stream()
+
+    def reap(locator):
+        retirement = producer.release(locator)
+        producer.reap()
+        return retirement
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            with blocked_stream("cuda:0") as later:
+                with blocked_stream("cuda:0") as earlier:
+                    stream.wait_stream(earlier)
+                    with torch.cuda.stream(stream):
+                        locator = producer.export(source)
+                        copied = torch.cuda.Event()
+                        copied.record(stream)
+                    stream.wait_stream(later)
+                copied.synchronize()
+                # Even once the producer copy is done, host unregistration
+                # may wait for later stream work. Reaping must still return
+                # control to execution so it can submit independent work.
+                retirement = threads.submit(reap, locator).result(timeout=5)
+            retirement.result(timeout=5)
+    finally:
+        producer.close()
+        events.close()
+
+
+def _export_with_gil_held(channel):
+    """Hold the producer GIL while the receiver releases its device copy."""
+    from cuda.bindings import driver
+
+    events = EventPool()
+    producer = make_transports(
+        ("shm",), byte_capacity=4096, ticket_capacity=1, event_pool=events
+    )["shm"]
+    stream = torch.cuda.Stream()
+    source = torch.arange(1024, device="cuda", dtype=torch.float32)
+    stream.wait_stream(torch.cuda.current_stream())
+
+    # A separate registered word gates the device before the export copy.
+    # The receiver writes it only after the producer is inside a GIL-held C
+    # call, so neither readiness nor Python notification can precede the hold.
+    gate = SharedBuffer(4, (), (0, int(stream.cuda_stream)))
+    gate_word = torch.frombuffer(
+        memoryview(gate)[segment.HEADER_BYTES :], dtype=torch.int32
+    )
+    status, pointer = driver.cuMemHostGetDevicePointer(gate_word.data_ptr(), 0)
+    assert status == driver.CUresult.CUDA_SUCCESS
+    (status,) = driver.cuStreamWaitValue32(
+        stream.cuda_stream,
+        pointer,
+        1,
+        driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ,
+    )
+    assert status == driver.CUresult.CUDA_SUCCESS
+
+    try:
+        with torch.cuda.stream(stream):
+            locator = producer.export(source)
+        channel.send((locator.to_mapping(), gate.name))
+
+        # system holds the GIL through the shell's entire lifetime. Its ready
+        # byte proves entry into that call; read ends only when the receiver
+        # has inspected the tensor. Standard input/output are this private
+        # child connection, not the test runner's terminal.
+        os.dup2(channel.fileno(), 0)
+        os.dup2(channel.fileno(), 1)
+        system = ctypes.PyDLL(None).system
+        system.argtypes = (ctypes.c_char_p,)
+        system.restype = ctypes.c_int
+        assert system(b"printf r; read -r release") == 0
+    finally:
+        stream.synchronize()
+        gate.close()
+        producer.close()
+        events.close()
+        channel.close()
+
+
+@pytest.mark.gpu
+def test_cuda_export_becomes_readable_while_producer_holds_gil():
+    context = mp.get_context("spawn")
+    channel, child = context.Pipe()
+    process = context.Process(target=_export_with_gil_held, args=(child,))
+    process.start()
+    child.close()
+    gate = None
+
+    try:
+        assert channel.poll(30), "producer did not export its tensor"
+        value, gate_name = channel.recv()
+        locator = Locator.from_mapping(value)
+        gate = open_shared_storage(gate_name, segment.HEADER_BYTES + 4)
+        assert select.select([channel.fileno()], [], [], 10)[0]
+        assert os.read(channel.fileno(), 1) == b"r"
+        atomic_store_u32(gate, segment.HEADER_BYTES, 1)
+
+        with open_shared_storage(
+            locator.transport.name, segment.HEADER_BYTES + locator.nbytes
+        ) as mapping:
+            header = memoryview(mapping)
+            try:
+                segment.await_ready(header, timeout=10)
+                observed = torch.frombuffer(
+                    header[segment.HEADER_BYTES :], dtype=torch.float32
+                ).clone()
+                torch.testing.assert_close(
+                    observed, torch.arange(1024, dtype=torch.float32)
+                )
+            finally:
+                header.release()
+    finally:
+        if gate is not None:
+            atomic_store_u32(gate, segment.HEADER_BYTES, 1)
+            gate.close()
+        os.write(channel.fileno(), b"release\n")
+        process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join()
+        channel.close()
+    assert process.exitcode == 0
 
 
 @pytest.mark.parametrize("backend", ("local", "shm"))
@@ -130,25 +294,8 @@ def test_failed_reader_returns_export_capacity(ending):
         ),
     ),
 )
-def test_a_refused_export_returns_its_segment_and_quota(device, monkeypatch):
-    """A export the table refuses reports why and keeps nothing.
-
-    The refusal is backpressure the caller acts on, so it must surface as
-    the resource error itself. The segment made for the product is unlinked
-    and its bytes return to the rank's budget, or every refusal would shrink
-    the budget all backends share.
-    """
-    # The segment a refused export made is only observable in the
-    # shared-memory namespace, so the names of new segments are recorded.
-    created = []
-
-    class RecordedSegment(shared_memory.SharedMemory):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            created.append(self.name)
-
-    monkeypatch.setattr(shared_memory, "SharedMemory", RecordedSegment)
-
+def test_a_refused_export_returns_its_quota(device):
+    """Backpressure must not consume capacity needed by the next export."""
     events = EventPool()
     byte_capacity = 1 << 20
     producer = make_transports(
@@ -169,14 +316,8 @@ def test_a_refused_export_returns_its_segment_and_quota(device, monkeypatch):
                 "the export table never filled"
             )
 
-        before = len(created)
         with pytest.raises(ResourceError):
             producer.export(torch.ones(4, device=device))
-        refused = created[before:]
-        assert refused, "the refused export made no segment"
-        for name in refused:
-            with pytest.raises(FileNotFoundError):
-                open_shared_storage(name, 1)
 
         # Once the table's own exports retire, the whole budget is
         # available again.

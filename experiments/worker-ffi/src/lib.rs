@@ -16,6 +16,7 @@ use execution::{failure, lock};
 mod descriptor_grants;
 mod execution;
 mod host;
+mod shared_buffer;
 mod stream;
 
 #[repr(C)]
@@ -423,6 +424,7 @@ fn method<T: ObjectCore>(name: &str, function: Function, doc: &str) -> Result<()
 
 fn register() -> Result<()> {
     descriptor_grants::register()?;
+    shared_buffer::register()?;
     stream::register()?;
     object::<ExecutorObj>();
     object::<SubmissionObj>();

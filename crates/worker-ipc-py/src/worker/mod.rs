@@ -26,6 +26,7 @@ mod pending;
 mod protocol;
 mod registry;
 mod request;
+mod shared_buffer;
 mod storage;
 mod stream;
 mod transfer;
@@ -81,6 +82,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<output::OutputPool>()?;
     module.add_class::<pending::PendingOutput>()?;
     module.add_class::<registry::BufferRegistry>()?;
+    module.add_class::<shared_buffer::SharedBuffer>()?;
     module.add_class::<request::Request>()?;
     module.add_class::<request::RequestProgress>()?;
     module.add_class::<request::RequestPool>()?;

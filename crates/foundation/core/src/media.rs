@@ -14,9 +14,9 @@
 //! the worker's media reader opens it by name.
 
 use std::ffi::CString;
-use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+
+use crate::SharedMemory;
 
 /// Read-only mapping of one claimed shared-memory media export.
 ///
@@ -184,8 +184,7 @@ impl Drop for SharedMedia {
 /// request's exports until the request retires, after its last call.
 #[derive(Debug)]
 pub struct MediaSource {
-    name: String,
-    bytes: u64,
+    storage: SharedMemory,
 }
 
 impl MediaSource {
@@ -199,75 +198,32 @@ impl MediaSource {
     /// Returns an I/O error when `bytes` is empty or storage allocation or
     /// writing fails; no object is left behind.
     pub fn publish(bytes: &[u8]) -> io::Result<Self> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        // Names are unique per process; the process id separates processes.
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-
         if bytes.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "published media must not be empty",
             ));
         }
-        let length = libc::off_t::try_from(bytes.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "published media is too large")
-        })?;
-        let name = format!(
-            "uniserve-media-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = CString::new(format!("/{name}"))?;
-
-        // SAFETY: path is a valid NUL-terminated POSIX shm name.
-        let descriptor = unsafe {
-            libc::shm_open(
-                path.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: shm_open returned an open descriptor owned by this call.
-        let mut file = unsafe { File::from_raw_fd(descriptor) };
-
-        // From here the object exists; constructing the owner first unlinks
-        // it on every failure below.
-        let source = Self {
-            name,
-            bytes: bytes.len() as u64,
-        };
-
-        // Reserve physical pages before export. ftruncate alone can
-        // leave a sparse tmpfs object whose later mapped writes raise SIGBUS.
-        // posix_fallocate returns its error number directly, without errno.
-        // SAFETY: file owns a writable descriptor and length is positive.
-        let error = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
-        if error != 0 {
-            return Err(io::Error::from_raw_os_error(error));
-        }
+        let (storage, mut file) = SharedMemory::create(bytes.len())?;
         file.write_all(bytes)?;
-        Ok(source)
+        Ok(Self { storage })
     }
 
     /// The object's name without its leading `/` and its byte count.
     pub fn locator(&self) -> crate::MediaLocator {
         crate::MediaLocator {
-            name: self.name.clone(),
-            bytes: self.bytes,
+            name: self.storage.name().to_owned(),
+            bytes: self.storage.size() as u64,
         }
     }
 
     /// Hand the named object to its receiving process. The receiver must
     /// claim it with `SharedMedia::open`, which unlinks it on receipt.
     /// Dropping this publisher afterwards leaves the name available.
-    pub fn into_locator(mut self) -> crate::MediaLocator {
+    pub fn into_locator(self) -> crate::MediaLocator {
         crate::MediaLocator {
-            name: std::mem::take(&mut self.name),
-            bytes: self.bytes,
+            bytes: self.storage.size() as u64,
+            name: self.storage.into_name(),
         }
     }
 }
@@ -275,25 +231,11 @@ impl MediaSource {
 impl PartialEq for MediaSource {
     /// Two exports are equal when they name the same object.
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
+        self.storage.name() == other.storage.name()
     }
 }
 
 impl Eq for MediaSource {}
-
-impl Drop for MediaSource {
-    /// Unlinks the name; readers that still map the object keep its bytes.
-    fn drop(&mut self) {
-        if self.name.is_empty() {
-            return;
-        }
-
-        if let Ok(path) = CString::new(format!("/{}", self.name)) {
-            // SAFETY: path is a valid NUL-terminated POSIX shm name.
-            unsafe { libc::shm_unlink(path.as_ptr()) };
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

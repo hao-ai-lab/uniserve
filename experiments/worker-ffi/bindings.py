@@ -45,6 +45,10 @@ class DescriptorGrants(tvm_ffi.Object):
     """Allocation descriptors served by the shared native transport owner."""
 
 
+class SharedBuffer(tvm_ffi.Object):
+    """Native shared host allocation with a borrowed DLPack payload view."""
+
+
 def fetch_descriptor(endpoint, export):
     return _module.fetch_descriptor(endpoint, export)
 
@@ -72,3 +76,4 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.CUDAStream")(CUDAStream)
     tvm_ffi.register_object("uniserve.ffi.CUDAEvent")(CUDAEvent)
     tvm_ffi.register_object("uniserve.ffi.DescriptorGrants")(DescriptorGrants)
+    tvm_ffi.register_object("uniserve.ffi.SharedBuffer")(SharedBuffer)
