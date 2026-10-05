@@ -58,7 +58,7 @@ class DecodeState:
                 extra leading row for the slot ``0`` sentinel.
             vocab_size: Width of the penalty-count and prompt-logit rows.
             continuation_width: Token slots per row in
-                ``future_input_tokens``. Token publication writes only column
+                ``future_input_tokens``. Token export writes only column
                 ``0``; a reset fills the whole row.
             device: Device of every tensor.
             logits_dtype: Floating dtype of ``prompt_logits``.
@@ -142,7 +142,7 @@ class DecodeState:
             and launchable(self.device)
         )
 
-        # Prepare the same capacity-bounded kernel used by live publications.
+        # Prepare the same capacity-bounded kernel used by live exports.
         # A zero count leaves all request rows unchanged, and the row reset
         # rewrites the sentinel with its initial values.
         if self._fused_reset:
@@ -364,8 +364,7 @@ class DecodeState:
                 or sampling_position is None
             ):
                 raise ValueError(
-                    "explicit token publication requires one complete "
-                    "request row"
+                    "explicit token export requires one complete request row"
                 )
             slot = indices[0]
             future_token = self.future_input_tokens[slot, :1]

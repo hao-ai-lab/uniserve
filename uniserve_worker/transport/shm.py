@@ -1,7 +1,7 @@
-"""POSIX segment publication, direct host borrowing, and acknowledgment.
+"""POSIX segment export, direct host borrowing, and acknowledgment.
 
-`ShmTransport` publishes a host product, or a device product copied to the
-host, into a fresh POSIX shared-memory segment per publication, laid out as
+`ShmTransport` exports a host product, or a device product copied to the
+host, into a fresh POSIX shared-memory segment per export, laid out as
 `segment` describes. Readers on the producer's host open the segment by name:
 `fetch` copies the payload out on a `TransferPool` thread, and `borrow`
 exposes it in place to a reader such as a media unit encode task. Neither
@@ -36,7 +36,7 @@ from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     copy_pairs,
     dtype_name,
-    publication_views,
+    export_views,
     read_destination,
     resolve_dtype,
     row_span,
@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class _ShmSource:
-    """Own a shared segment and any unfinished device-to-host publication.
+    """Own a shared segment and any unfinished device-to-host export.
 
     The segment begins with a readiness word and one acknowledgment word
     per instance rank.
@@ -70,7 +70,7 @@ class _ShmSource:
     nbytes: int
     consumers: tuple[int, ...]
     #: `StreamSignal` of an unfinished device-to-host copy into the segment,
-    #: cleared by the publication thread once the signal fires.
+    #: cleared by the export thread once the signal fires.
     signal: Any = None
     #: Address of the segment's mapping while it is registered with the
     #: CUDA driver, so a device-to-host copy lands in it directly.
@@ -108,7 +108,7 @@ def _unregister_segment(address: int) -> None:
 
 @dataclass(slots=True)
 class HostBorrow:
-    """A consumer's direct view of a published segment's bytes.
+    """A consumer's direct view of a exported segment's bytes.
 
     The bytes stay in the producer's segment: a reader on this host, such as
     a media unit encode task, maps them by name and offset. ``release``
@@ -177,7 +177,7 @@ def _shared_read(locator: Locator, slot: int, *, check=None):
 
 
 class ShmTransport(Transport):
-    """Shared storage publication whose segment carries its own readiness.
+    """Shared storage export whose segment carries its own readiness.
 
     A consumer opens the segment by name, waits on readiness and writes its own
     acknowledgment word once it has copied the payload out. The producer
@@ -211,25 +211,23 @@ class ShmTransport(Transport):
         # This rank's own word in the header of every segment it reads.
         self._acknowledgment_slot = int(acknowledgment_slot)
         self.source = source or WorkerEndpoint.local()
-        # Device publications reach the publication thread through this
+        # Device exports reach the export thread through this
         # queue; a byte on the socket pair wakes that thread's selector, and
         # a None item asks it to exit once every queued copy has signaled.
-        self._publication_queue: queue.Queue[
-            tuple[Locator, _ShmSource] | None
-        ] = queue.Queue()
-        self._publication_control_rx, self._publication_control_tx = (
-            socket.socketpair()
+        self._export_queue: queue.Queue[tuple[Locator, _ShmSource] | None] = (
+            queue.Queue()
         )
-        self._publication_control_rx.setblocking(False)
-        self._publication_control_tx.setblocking(False)
+        self._export_control_rx, self._export_control_tx = socket.socketpair()
+        self._export_control_rx.setblocking(False)
+        self._export_control_tx.setblocking(False)
         self._completion_wake: Any = None
         self._closed = False
-        self._publication_worker = threading.Thread(
+        self._export_worker = threading.Thread(
             target=self._complete_buffers,
-            name="uniserve-shm-publication",
+            name="uniserve-shm-export",
             daemon=True,
         )
-        self._publication_worker.start()
+        self._export_worker.start()
         self._reads = TransferPool(
             workers=2,
             capacity=capacity,
@@ -245,7 +243,7 @@ class ShmTransport(Transport):
             int(slot) in self._host_slots for slot in consumers
         )
 
-    def publication_retirement(self, locator: Locator) -> Completion:
+    def retirement(self, locator: Locator) -> Completion:
         return self._buffers.retirement(locator)
 
     def set_completion_wake(self, wake: Any) -> None:
@@ -296,43 +294,41 @@ class ShmTransport(Transport):
     def awaiting_acknowledgment(self) -> bool:
         return self._buffers.awaiting_acknowledgment()
 
-    def _queue_publication(
-        self, item: tuple[Locator, _ShmSource] | None
-    ) -> None:
-        self._publication_queue.put(item)
+    def _queue_export(self, item: tuple[Locator, _ShmSource] | None) -> None:
+        self._export_queue.put(item)
         try:
-            self._publication_control_tx.send(b"P")
+            self._export_control_tx.send(b"P")
         except BlockingIOError:
             pass
 
     def _complete_buffers(self) -> None:
-        """Publish completed host bytes without waiting in the Worker thread.
+        """Export completed host bytes without waiting in the Worker thread.
 
-        Runs on the publication thread. Each queued device publication's
+        Runs on the export thread. Each queued device export's
         stream signal is watched until its device-to-host copy completes;
-        the segment's readiness word is then set and the publication marked
+        the segment's readiness word is then set and the export marked
         complete. After the exit request, the loop keeps running until every
         watched signal has fired, so no segment is left pending.
         """
         selector = selectors.DefaultSelector()
-        selector.register(self._publication_control_rx, selectors.EVENT_READ)
+        selector.register(self._export_control_rx, selectors.EVENT_READ)
         closing = False
         try:
             while not closing or len(selector.get_map()) > 1:
                 for key, _events in selector.select():
-                    if key.fileobj is self._publication_control_rx:
+                    if key.fileobj is self._export_control_rx:
                         # Drain the wakeup, then register each queued
-                        # publication's stream signal for readiness.
+                        # export's stream signal for readiness.
                         while True:
                             try:
-                                if not self._publication_control_rx.recv(4096):
+                                if not self._export_control_rx.recv(4096):
                                     closing = True
                                     break
                             except BlockingIOError:
                                 break
                         while True:
                             try:
-                                item = self._publication_queue.get_nowait()
+                                item = self._export_queue.get_nowait()
                             except queue.Empty:
                                 break
                             if item is None:
@@ -344,7 +340,7 @@ class ShmTransport(Transport):
                         continue
 
                     # A stream signal fired: the device-to-host DMA into the
-                    # segment is done, so expose (or fail) the publication.
+                    # segment is done, so expose (or fail) the export.
                     locator, source = key.data
                     selector.unregister(source.signal)
                     failure = None
@@ -373,33 +369,33 @@ class ShmTransport(Transport):
         finally:
             selector.close()
 
-    def publish(
+    def export(
         self,
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
         consumers: Sequence[int] = (),
     ) -> Locator:
-        """Publish into a segment whose header carries its readiness.
+        """Export into a segment whose header carries its readiness.
 
         A host source is copied synchronously and the segment is ready on
         return. A device source is copied into the page-locked segment on the
-        current stream; the publication thread marks the segment ready once
+        current stream; the export thread marks the segment ready once
         that copy completes, and the source is recorded on the stream so its
         storage outlives the copy. ``consumers`` names the acknowledgment
         slots whose words must settle before the segment is unlinked.
 
         Raises:
-            WorkerError: `invalid_descriptor` when `publication_views`
+            WorkerError: `invalid_descriptor` when `export_views`
                 refuses the source or the locator's identity is already
                 registered; `resource_error` when transfer bytes or
-                the publication table are exhausted, the table is closing,
+                the export table are exhausted, the table is closing,
                 or the CUDA driver refuses to register the segment.
                 Allocation and copy errors propagate.
         """
         import torch
 
-        source, shape, offset = publication_views(tensor, offset)
+        source, shape, offset = export_views(tensor, offset)
         first = source[0] if isinstance(source, tuple) else source
         nbytes = tensor_nbytes(source)
         # Capacity acknowledged since the last sweep is reclaimed first.
@@ -422,7 +418,7 @@ class ShmTransport(Transport):
             buffer = shm.buf
             if buffer is None:
                 raise RuntimeError(
-                    "shared storage publication has no writable buffer"
+                    "shared storage export has no writable buffer"
                 )
             locator = Locator(
                 source=self.source,
@@ -443,7 +439,7 @@ class ShmTransport(Transport):
             if first.is_cuda:
                 # Device bytes land in the segment itself: its mapping is
                 # page-locked for the copy, and the stream signal marks the
-                # DMA complete on the publication thread.
+                # DMA complete on the export thread.
                 from uniserve_worker._uniserve_ipc import StreamSignal
 
                 address = _register_segment(buffer)
@@ -454,14 +450,14 @@ class ShmTransport(Transport):
                     target.copy_(value)
                 segment.set_state(buffer, segment.READY)
 
-            publication = _ShmSource(
+            export = _ShmSource(
                 shm,
                 nbytes,
                 tuple(int(slot) for slot in consumers),
                 signal,
                 address,
             )
-            self._buffers.register(locator, publication, pending=first.is_cuda)
+            self._buffers.register(locator, export, pending=first.is_cuda)
             registered = True
 
             if first.is_cuda:
@@ -474,7 +470,7 @@ class ShmTransport(Transport):
                     copy_host_device(target, value, stream)
                     value.record_stream(stream)
                 signal.schedule(int(stream.cuda_stream))
-                self._queue_publication((locator, publication))
+                self._queue_export((locator, export))
             return locator
         except BaseException:
             # The table may reclaim the segment synchronously below, and the
@@ -482,8 +478,8 @@ class ShmTransport(Transport):
             # may outlive this point.
             payload = packed = target = None
 
-            # Once registered, the publication table owns the segment: the
-            # publication is retired, and a device publication is marked
+            # Once registered, the export table owns the segment: the
+            # export is retired, and a device export is marked
             # failed and complete so `_reclaim` can unlink it. Before that,
             # the segment, its CUDA registration and its bytes are returned
             # here.
@@ -558,12 +554,12 @@ class ShmTransport(Transport):
         region: tuple[slice, ...] | None = None,
         reservation: ReadReservation | None = None,
     ) -> TransferTicket:
-        """Submit a read of a segment published on this node.
+        """Submit a read of a segment exported on this node.
 
         Raises:
-            WorkerError: `invalid_descriptor` when the publication lies on
+            WorkerError: `invalid_descriptor` when the export lies on
                 another node or, with a `destination`, when `region` exceeds
-                the published view or `destination` does not match it;
+                the exported view or `destination` does not match it;
                 without one, those errors fail the ticket instead. Errors
                 from `TransferPool.submit` propagate.
         """
@@ -590,7 +586,7 @@ class ShmTransport(Transport):
     def borrow(
         self, locator: Locator, region: tuple[slice, ...] | None = None
     ) -> HostBorrow:
-        """Expose a published payload in place for a reader on this host.
+        """Expose a exported payload in place for a reader on this host.
 
         The reader is told the segment's name and the byte span of ``region``,
         a span of whole leading-axis rows, and reads it through its own
@@ -635,17 +631,17 @@ class ShmTransport(Transport):
         return self._buffers.release(locator)
 
     def close(self) -> None:
-        # Reads drain first, then the publication thread exits once every
+        # Reads drain first, then the export thread exits once every
         # pending device copy has signaled, and only then are the
-        # publications retired; `BufferRegistry.close` raises `resource_error`
+        # exports retired; `BufferRegistry.close` raises `resource_error`
         # when any source is still retained.
         try:
             self._reads.close()
         finally:
             if not self._closed:
-                self._queue_publication(None)
-                self._publication_worker.join()
-                self._publication_control_rx.close()
-                self._publication_control_tx.close()
+                self._queue_export(None)
+                self._export_worker.join()
+                self._export_control_rx.close()
+                self._export_control_tx.close()
                 self._closed = True
             self._buffers.close()

@@ -1976,7 +1976,7 @@ fn admission_carries_the_request_input_image_count() {
 /// text, and ends at its 200-token text bound. Its text and image sequence is
 /// identical at queue depths 1 and 2.
 #[test]
-fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
+fn gen_branch_round_trip_preserves_export_and_step_invariants() {
     let mut signatures = Vec::new();
     for queue_depth in [1, 2] {
         let mut sim = SimEngine::new();

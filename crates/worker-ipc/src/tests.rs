@@ -114,7 +114,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         }),
         kv_output: matches!(
             kind,
-            CallKind::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
+            CallKind::Transfer(TransferMode::KvExport | TransferMode::KvInstall)
         )
         .then_some(BufferId {
             owner: request_key(),
@@ -485,7 +485,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
 fn lane_report(
     batch_id: u64,
     completions: Vec<RequestOutput>,
-    products: Vec<TensorPublication>,
+    products: Vec<TensorExport>,
     worker_exec_us: Option<u64>,
     forward_stats: Option<ForwardStats>,
 ) -> BatchOutput {
@@ -904,7 +904,7 @@ fn windowed_block_table_round_trips_its_start_page_and_units() {
 }
 
 #[test]
-fn publication_round_trips_its_registered_view_and_endpoint() {
+fn export_round_trips_its_registered_view_and_endpoint() {
     let mut product = output_product(CallId::new(11, 0));
     product.dtype = DType::F32;
     product.shape_bound = ShapeBound {
@@ -913,7 +913,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
     for transport in [
         TransferTransport::CudaVmm {
             endpoint: "uniserve-cuda-physical-incarnation".into(),
-            publication_id: "0123456789abcdef0123456789abcdef".into(),
+            export_id: "0123456789abcdef0123456789abcdef".into(),
             storage_size_bytes: 4096,
             storage_offsets_bytes: vec![128, 64],
             span_lengths: vec![2],
@@ -925,13 +925,13 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
         },
         TransferTransport::PosixShm {
             endpoint: "uniserve-shm-physical-incarnation".into(),
-            name: "uniserve-publication".into(),
+            name: "uniserve-export".into(),
         },
     ] {
         let mut report = lane_report(
             5,
             vec![completion_record()],
-            vec![TensorPublication {
+            vec![TensorExport {
                 product: product.clone(),
                 value: TransferHandle::DeviceProduct {
                     height: 0,
@@ -957,7 +957,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
 
         // A replica differs only in its source rank. A report for another
         // generation names a different identity: merging it fails and leaves
-        // the publication unchanged.
+        // the export unchanged.
         let original = &mut report.products[0];
         let mut replica = original.clone();
         if let TransferHandle::DeviceProduct { tensor, .. } = &mut replica.value {
@@ -1001,7 +1001,7 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
 /// extent, and a second extent within the maximum. Rebinding the same tensor to
 /// flat capacity accepts any rank whose element count fits.
 #[test]
-fn tensor_publication_preserves_static_axes_within_dynamic_capacity() {
+fn tensor_export_preserves_static_axes_within_dynamic_capacity() {
     let mut reference = output_product(CallId::new(11, 0));
     reference.dtype = DType::F32;
     reference.shape_bound.dims = vec![DimBound::Static(2), DimBound::Device { max: 4 }];
@@ -1012,7 +1012,7 @@ fn tensor_publication_preserves_static_axes_within_dynamic_capacity() {
         (vec![2, 5], false),
         (vec![8], false),
     ] {
-        let publication = TensorPublication {
+        let export = TensorExport {
             product: reference.clone(),
             value: TransferHandle::DeviceProduct {
                 height: 0,
@@ -1035,8 +1035,8 @@ fn tensor_publication_preserves_static_axes_within_dynamic_capacity() {
                 },
             },
         };
-        assert_eq!(publication.validate().is_ok(), valid);
-        let mut flat = publication;
+        assert_eq!(export.validate().is_ok(), valid);
+        let mut flat = export;
         flat.product.shape_bound.dims = vec![DimBound::Device { max: 8 }];
         assert_eq!(
             flat.validate().is_ok(),
@@ -1046,7 +1046,7 @@ fn tensor_publication_preserves_static_axes_within_dynamic_capacity() {
 }
 
 #[test]
-fn unchanged_kv_publication_round_trips_without_physical_tensors() {
+fn unchanged_kv_export_round_trips_without_physical_tensors() {
     let source = BufferId {
         owner: request_key(),
         producer_call_id: CallId::new(11, 0),
@@ -1056,14 +1056,14 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     let mut report = lane_report(
         5,
         vec![RequestOutput {
-            code: CallKind::Transfer(TransferMode::KvPublish),
+            code: CallKind::Transfer(TransferMode::KvExport),
             kv_output: Some(KvTransfer {
                 groups: Vec::new(),
                 source,
                 destination: "decoder".into(),
                 base: Some(source),
                 base_extent: 16,
-                published_extent: 16,
+                exported_extent: 16,
                 compute_dtype: "bfloat16".into(),
             }),
             ..completion_record()
@@ -1079,9 +1079,9 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
 
     // A grown extent must carry the tensors of its suffix.
     let KvTransfer {
-        published_extent, ..
+        exported_extent, ..
     } = report.completions[0].kv_output.as_mut().unwrap();
-    *published_extent = 17;
+    *exported_extent = 17;
     assert!(encode_response(&WorkerResponse::result(report)).is_err());
 }
 
@@ -1118,7 +1118,7 @@ fn tensor_coverage_preserves_replicas_and_detects_missing_regions() {
 }
 
 #[test]
-fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
+fn raw_kv_export_round_trips_page_representation_and_exact_request() {
     let source = BufferId {
         owner: request_key(),
         producer_call_id: CallId::new(11, 0),
@@ -1169,7 +1169,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         let report = lane_report(
             5,
             vec![RequestOutput {
-                code: CallKind::Transfer(TransferMode::KvPublish),
+                code: CallKind::Transfer(TransferMode::KvExport),
                 kv_output: Some(KvTransfer {
                     groups: vec![
                         KvGroupTransfer {
@@ -1187,7 +1187,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
                     destination: "decoder".into(),
                     base: Some(source),
                     base_extent: 3,
-                    published_extent: 8,
+                    exported_extent: 8,
                     compute_dtype: "bfloat16".into(),
                 }),
                 ..completion_record()
@@ -1210,7 +1210,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
                 source,
                 base,
                 base_extent,
-                published_extent,
+                exported_extent,
                 groups,
                 ..
             } = invalid.completions[0].kv_output.as_mut().unwrap();
@@ -1219,7 +1219,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
                 "base" => base.as_mut().unwrap().generation = 0,
                 "page_tokens" => groups[0].page_tokens = 0,
                 "start" => groups[1].start = 2,
-                "extent" => *base_extent = *published_extent,
+                "extent" => *base_extent = *exported_extent,
                 "scales" if dtype == "float8_e4m3fn" => {
                     groups[0].tensors[2] = tensor("scales", "float32", vec![1, 2, 2], 4);
                 }
@@ -1855,7 +1855,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             }),
             kv_output: matches!(
                 kind,
-                CallKind::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
+                CallKind::Transfer(TransferMode::KvExport | TransferMode::KvInstall)
             )
             .then_some(BufferId {
                 owner: key,
@@ -2246,7 +2246,7 @@ fn a_channel_product_of_media_size_fits_the_transfer_handle_bound() {
         },
         DimBound::Static(2),
     ];
-    let publication = TensorPublication {
+    let export = TensorExport {
         product: reference,
         value: TransferHandle::DeviceProduct {
             height: 0,
@@ -2269,6 +2269,6 @@ fn a_channel_product_of_media_size_fits_the_transfer_handle_bound() {
             },
         },
     };
-    assert!(publication.validate().is_ok());
-    assert!(publication.value.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES);
+    assert!(export.validate().is_ok());
+    assert!(export.value.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES);
 }

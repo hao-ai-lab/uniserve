@@ -1,4 +1,4 @@
-"""Failed readers and refused publications release their segment and quota."""
+"""Failed readers and refused exports release their segment and quota."""
 
 import threading
 import time
@@ -28,10 +28,10 @@ def test_retirement_observer_can_publish_into_returned_capacity(backend):
     )[backend]
     replacement = []
     try:
-        locator = producer.publish(torch.tensor([1.0]))
-        retirement = producer.publication_retirement(locator)
+        locator = producer.export(torch.tensor([1.0]))
+        retirement = producer.retirement(locator)
         retirement.add_done_callback(
-            lambda _: replacement.append(producer.publish(torch.tensor([2.0])))
+            lambda _: replacement.append(producer.export(torch.tensor([2.0])))
         )
         producer.release(locator)
 
@@ -48,7 +48,7 @@ def test_retirement_observer_can_publish_into_returned_capacity(backend):
 
 
 @pytest.mark.parametrize("ending", ("cancel", "failed_fetch", "failed_borrow"))
-def test_failed_reader_returns_publication_capacity(ending):
+def test_failed_reader_returns_export_capacity(ending):
     events = EventPool()
     producer = make_transports(
         ("shm",),
@@ -64,7 +64,7 @@ def test_failed_reader_returns_publication_capacity(ending):
         event_pool=events,
         acknowledgment_slot=0,
     )["shm"]
-    locator = producer.publish(torch.tensor([1.0]), consumers=(0,))
+    locator = producer.export(torch.tensor([1.0]), consumers=(0,))
     header = shared_memory.SharedMemory(name=locator.transport.name)
     try:
         # Model a publisher whose external readiness word is still pending.
@@ -82,7 +82,7 @@ def test_failed_reader_returns_publication_capacity(ending):
                 != segment.CLAIMED
             ):
                 assert time.monotonic() < deadline, (
-                    "reader did not claim publication"
+                    "reader did not claim export"
                 )
                 time.sleep(0.001)
             if ending == "cancel":
@@ -99,7 +99,7 @@ def test_failed_reader_returns_publication_capacity(ending):
         completion = producer.release(locator)
         producer.reap()
         completion.result(timeout=5)
-        replacement = producer.publish(torch.tensor([2.0]), consumers=(0,))
+        replacement = producer.export(torch.tensor([2.0]), consumers=(0,))
         value = consumer.borrow(replacement)
         assert value.nbytes == 4
         value.release()
@@ -124,23 +124,21 @@ def test_failed_reader_returns_publication_capacity(ending):
                 pytest.mark.gpu,
                 pytest.mark.skipif(
                     not torch.cuda.is_available(),
-                    reason="a device publication requires a CUDA device",
+                    reason="a device export requires a CUDA device",
                 ),
             ),
         ),
     ),
 )
-def test_a_refused_publication_returns_its_segment_and_quota(
-    device, monkeypatch
-):
-    """A publication the table refuses reports why and keeps nothing.
+def test_a_refused_export_returns_its_segment_and_quota(device, monkeypatch):
+    """A export the table refuses reports why and keeps nothing.
 
     The refusal is backpressure the caller acts on, so it must surface as
     the resource error itself. The segment made for the product is unlinked
     and its bytes return to the rank's budget, or every refusal would shrink
     the budget all backends share.
     """
-    # The segment a refused publication made is only observable in the
+    # The segment a refused export made is only observable in the
     # shared-memory namespace, so the names of new segments are recorded.
     created = []
 
@@ -161,32 +159,32 @@ def test_a_refused_publication_returns_its_segment_and_quota(
     )["shm"]
     published = []
     try:
-        # Host publications that nothing retires fill the publication table.
+        # Host exports that nothing retires fill the export table.
         while True:
             try:
-                published.append(producer.publish(torch.tensor([1.0])))
+                published.append(producer.export(torch.tensor([1.0])))
             except ResourceError:
                 break
             assert len(published) * 4 < byte_capacity, (
-                "the publication table never filled"
+                "the export table never filled"
             )
 
         before = len(created)
         with pytest.raises(ResourceError):
-            producer.publish(torch.ones(4, device=device))
+            producer.export(torch.ones(4, device=device))
         refused = created[before:]
-        assert refused, "the refused publication made no segment"
+        assert refused, "the refused export made no segment"
         for name in refused:
             with pytest.raises(FileNotFoundError):
                 open_shared_storage(name, 1)
 
-        # Once the table's own publications retire, the whole budget is
+        # Once the table's own exports retire, the whole budget is
         # available again.
         for locator in published:
             producer.release(locator)
         published.clear()
         producer.reap()
-        whole = producer.publish(torch.zeros(byte_capacity // 4))
+        whole = producer.export(torch.zeros(byte_capacity // 4))
         producer.release(whole)
     finally:
         for locator in published:

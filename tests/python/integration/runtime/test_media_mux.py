@@ -186,7 +186,7 @@ def test_encoded_units_cross_hosts_without_transferring_reserved_padding(
         ):
             framed = frame_encoded_unit(payload, storage[index])
             locations.append(
-                transports[backend].publish(
+                transports[backend].export(
                     framed.unsqueeze(0), offset=(index, 0), consumers=(0,)
                 )
             )

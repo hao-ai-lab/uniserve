@@ -1813,7 +1813,7 @@ impl Scheduler {
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => Phase::PublishKv,
-                CallKind::Transfer(TransferMode::KvPublish) => Phase::PrepareGen,
+                CallKind::Transfer(TransferMode::KvExport) => Phase::PrepareGen,
                 CallKind::Media(MediaCall::LatentPreparation)
                 | CallKind::Media(MediaCall::Denoising) => Phase::DenoiseGen,
                 CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
@@ -1982,10 +1982,10 @@ impl Scheduler {
             return false;
         };
 
-        // A KV publication is never queued behind an unresolved call, and a
+        // A KV export is never queued behind an unresolved call, and a
         // request with a `RoundCloseThenSuffix` image trigger queues no
         // successor at all.
-        if target == CallKind::Transfer(TransferMode::KvPublish) {
+        if target == CallKind::Transfer(TransferMode::KvExport) {
             return false;
         }
         if matches!(
@@ -2127,7 +2127,7 @@ impl Scheduler {
         Some(match self.next_generation_phase(id)? {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::CloseKv | Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
-            Phase::PublishKv => CallKind::Transfer(TransferMode::KvPublish),
+            Phase::PublishKv => CallKind::Transfer(TransferMode::KvExport),
             Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
             Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
             Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),

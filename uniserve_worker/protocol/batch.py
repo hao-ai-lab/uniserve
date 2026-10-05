@@ -4,7 +4,7 @@ A `Batch` is one numerical call on one component together with everything a
 rank needs to run it: the per-request `Call` descriptors, the lifecycle
 commands (`Start`, `Finish`, `Free`) applied with it, the KV unit tables and
 latent, decode, and persistent-buffer allocations the scheduler chose, and
-host-supplied input tensors (`TensorPublication`). The records mirror the
+host-supplied input tensors (`TensorExport`). The records mirror the
 Rust `Batch` in `uniserve_worker_ipc`, whose `Batch::validate` is the
 authoritative check; `Batch.validate` here re-implements part of it.
 
@@ -968,7 +968,7 @@ class Batch:
     decode_ranges: tuple[DecodeRange, ...] = ()
     buffer_allocations: tuple[BufferAllocation, ...] = ()
     commands: tuple[BatchCommand, ...] = ()
-    input_products: tuple[TensorPublication, ...] = ()
+    input_products: tuple[TensorExport, ...] = ()
     kv_inputs: tuple[transfer.KvTransfer, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1097,15 +1097,13 @@ class Batch:
         # its source must be unique. It installs into exactly one
         # ``KV_INSTALL`` call whose transfer-byte bound covers its tensors.
         sources: set[identity.BufferId] = set()
-        for publication in self.kv_inputs:
-            publication.encoded_size_bound()
-            if publication.source in sources:
+        for export in self.kv_inputs:
+            export.encoded_size_bound()
+            if export.source in sources:
                 raise invalid_descriptor("batch repeats a KV input")
-            sources.add(publication.source)
+            sources.add(export.source)
             consumers = tuple(
-                call
-                for call in self.calls
-                if call.kv_input == publication.source
+                call for call in self.calls if call.kv_input == export.source
             )
             if (
                 len(consumers) != 1
@@ -1115,7 +1113,7 @@ class Batch:
                     "KV transfer requires one installation consumer"
                 )
             if (
-                sum(tensor.nbytes for tensor in publication.tensors)
+                sum(tensor.nbytes for tensor in export.tensors)
                 > consumers[0].bounds.max_transfer_bytes
             ):
                 raise invalid_descriptor(
@@ -1151,7 +1149,7 @@ class Batch:
             )
         )
         input_products = tuple(
-            TensorPublication.from_mapping(
+            TensorExport.from_mapping(
                 item, f"execute batch.input_products[{index}]"
             )
             for index, item in enumerate(
@@ -1284,11 +1282,11 @@ class Batch:
 
 
 @dataclass(frozen=True, slots=True)
-class TensorPublication:
-    """A tensor identity and the physical metadata needed by its consumer.
+class TensorExport:
+    """A tensor result and the locations from which consumers can read it.
 
     Batches carry these as host-supplied ``input_products``, and a rank
-    reports the products it published in its `BatchOutput`.
+    reports its exported results in `BatchOutput`.
     """
 
     product: tensor.TensorRef
@@ -1309,8 +1307,8 @@ class TensorPublication:
 
     @classmethod
     def from_mapping(
-        cls, value: object, where: str = "tensor publication"
-    ) -> TensorPublication:
+        cls, value: object, where: str = "tensor export"
+    ) -> TensorExport:
         """Parse a tensor identity and its tagged transfer value.
 
         The value's kind is ``encoder``, ``device_product``, or ``latent``.

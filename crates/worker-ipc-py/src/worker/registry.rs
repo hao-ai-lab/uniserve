@@ -240,9 +240,7 @@ impl BufferRegistry {
         match locator.getattr("backend")?.extract::<String>()?.as_str() {
             "local" => Ok(BufferKey::Local(handle.getattr("key")?.extract()?)),
             "shm" => Ok(BufferKey::Shm(handle.getattr("name")?.extract()?)),
-            "cuda_vmm" => Ok(BufferKey::Cuda(
-                handle.getattr("publication_id")?.extract()?,
-            )),
+            "cuda_vmm" => Ok(BufferKey::Cuda(handle.getattr("export_id")?.extract()?)),
             _ => Err(invalid(py, "transport does not register source storage")),
         }
     }

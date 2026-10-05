@@ -15,7 +15,7 @@
 //! submission order.
 //!
 //! The executor also holds the head's copy of every cross-worker product
-//! publication until the scheduler frees the buffer or its request finishes
+//! export until the scheduler frees the buffer or its request finishes
 //! without retaining it, and on a `WorkerFailure` computes the calls,
 //! requests, and buffers the failure invalidates.
 
@@ -32,7 +32,7 @@ use anyhow::Context;
 use uniserve_core::CommandWaker;
 use uniserve_worker_ipc::{
     BatchCommand, BufferAllocation, BufferId, Call, KvTransfer, NewRequest, RequestKey,
-    TensorPublication, TensorRef,
+    TensorExport, TensorRef,
 };
 
 /// One worker's outstanding submission; returned calls leave this record.
@@ -81,11 +81,11 @@ impl PendingBatch {
 #[derive(Clone)]
 struct WorkerSubmission {
     /// The calls routed to this worker, with its commands and the external
-    /// publications it reads.
+    /// exports it reads.
     batch: ExecutionBatch,
     /// Products this worker reads that another worker, or a component of this
     /// worker that does not share the reader's storage, produces. The
-    /// submission stays at its queue head until each has a publication in
+    /// submission stays at its queue head until each has an export in
     /// `transfer_products` or `kv_transfers`.
     dependencies: Vec<BufferId>,
 }
@@ -102,7 +102,7 @@ impl WorkerSubmission {
         batch_id: u64,
         calls: Vec<(Call, RequestPlacement)>,
         commands: Vec<BatchCommand>,
-        inputs: Vec<TensorPublication>,
+        inputs: Vec<TensorExport>,
         kv_inputs: Vec<KvTransfer>,
         dependencies: Vec<BufferId>,
     ) -> Self {
@@ -121,7 +121,7 @@ impl WorkerSubmission {
         let mut batch = ExecutionBatch::new(batch_id, calls, commands, input_transfers);
         batch.kv_inputs = kv_inputs
             .into_iter()
-            .filter(|publication| consumed.contains(&publication.source))
+            .filter(|export| consumed.contains(&export.source))
             .collect();
         Self {
             batch,
@@ -186,12 +186,12 @@ pub struct WorkerExecutor {
     buffer_allocations: HashMap<(usize, BufferId), BufferAllocation>,
     /// Every worker that produces or reads a buffer: the targets of its `Free`.
     buffer_workers: HashMap<BufferId, HashSet<usize>>,
-    /// Tensor publications returned by producing workers, merged across the
+    /// Tensor exports returned by producing workers, merged across the
     /// ranks that publish parts of one product. A `channel` locator carries
     /// the product's bytes, which the head therefore holds until the buffer
     /// is freed or its request finishes without retaining it.
-    transfer_products: HashMap<BufferId, TensorPublication>,
-    /// KV publications returned by producing workers.
+    transfer_products: HashMap<BufferId, TensorExport>,
+    /// KV exports returned by producing workers.
     kv_transfers: HashMap<BufferId, KvTransfer>,
     /// Per-worker FIFO of submissions the `WorkerGroup` has not yet accepted.
     worker_submissions: Vec<VecDeque<WorkerSubmission>>,
@@ -426,7 +426,7 @@ impl WorkerExecutor {
                         );
                         // Each mechanism decides for itself how far it reaches.
                         // An edge it cannot serve would fail on its first
-                        // publication, so it is refused here by name instead.
+                        // export, so it is refused here by name instead.
                         let (source_host, destination_host) =
                             (&source.endpoint.node, &destination.endpoint.node);
                         let crosses_hosts = source_host != destination_host;
@@ -535,7 +535,7 @@ impl WorkerExecutor {
     ///
     /// A failure is one of two kinds. With endpoints it is a loss: the
     /// `WorkerGroup` terminated its ranks and holds none of its resident
-    /// requests, buffers, or publications. Without endpoints the group is
+    /// requests, buffers, or exports. Without endpoints the group is
     /// intact and only the named calls, requests or batch failed; the calls
     /// of a named request still queued are retired here.
     ///
@@ -577,7 +577,7 @@ impl WorkerExecutor {
         let mut requests = loss.requests.iter().copied().collect::<HashSet<_>>();
         let mut buffers = loss.buffers.iter().cloned().collect::<HashSet<_>>();
 
-        // A lost incarnation's locations are gone. A publication that no longer
+        // A lost incarnation's locations are gone. An export that no longer
         // covers its whole value is invalid; one that other ranks or workers
         // still cover in full stays usable.
         if lost {
@@ -595,13 +595,13 @@ impl WorkerExecutor {
             }
         }
         if lost {
-            for (buffer, publication) in &mut self.kv_transfers {
-                for tensor in publication.tensors_mut() {
+            for (buffer, export) in &mut self.kv_transfers {
+                for tensor in export.tensors_mut() {
                     tensor
                         .locations
                         .retain(|location| !loss.endpoints.contains(&location.source));
                 }
-                if publication
+                if export
                     .tensors()
                     .any(|tensor| !tensor.has_complete_coverage())
                 {
@@ -916,7 +916,7 @@ impl WorkerExecutor {
             // the same order to the same ranks, and of a sequence-parallel one,
             // whose ranks each write their shard; a tensor-parallel or pipelined
             // component publishes it from its output ranks alone, so its other
-            // ranks read the product's publication. Without a description of
+            // ranks read the product's export. Without a description of
             // the component, its ranks are taken to hold their own copies.
             return !producer.declared_output
                 || source.is_none_or(|source| source.config.publishes_on_every_rank());
@@ -931,7 +931,7 @@ impl WorkerExecutor {
     /// Submits or queues one worker-local batch while preserving collective order.
     ///
     /// Prepends the `Start` of every request among its calls that the worker
-    /// has not yet admitted, attaches the publications of the submission's
+    /// has not yet admitted, attaches the exports of the submission's
     /// dependencies, which the caller has checked are published, and lowers
     /// the batch to the wire. Returns `Deferred` when the group refuses it
     /// with `WouldBlock` (not ready, or no free slot), and `Refused` when the
@@ -962,12 +962,12 @@ impl WorkerExecutor {
         let mut inputs = batch.input_transfers.clone();
         let mut kv_inputs = batch.kv_inputs.clone();
         for dependency in &submission.dependencies {
-            if let Some(publication) = self.kv_transfers.get(dependency) {
+            if let Some(export) = self.kv_transfers.get(dependency) {
                 anyhow::ensure!(
                     !kv_inputs.iter().any(|input| input.source == *dependency),
                     "KV input is supplied more than once"
                 );
-                kv_inputs.push(publication.clone());
+                kv_inputs.push(export.clone());
                 continue;
             }
             anyhow::ensure!(
@@ -1048,7 +1048,7 @@ impl WorkerExecutor {
             .chain(
                 wire.kv_inputs
                     .iter_mut()
-                    .flat_map(|publication| publication.tensors_mut()),
+                    .flat_map(|export| export.tensors_mut()),
             );
         for tensor in tensors {
             tensor.locations.retain(|location| {
@@ -1219,7 +1219,7 @@ impl WorkerExecutor {
     /// Routes a worker result into its worker aggregate and publishes transferable products.
     ///
     /// Validates the report against the worker's pending calls, stores the
-    /// product and KV publications it returns, and publishes its completions.
+    /// product and KV exports it returns, and publishes its completions.
     /// When some calls failed, the report, failed completions included, is
     /// still published and the method then returns a `WorkerFailure` naming
     /// the failed calls' requests and the buffers those calls would have
@@ -1299,7 +1299,7 @@ impl WorkerExecutor {
             );
         }
 
-        // Store returned publications. Each must come from its buffer's
+        // Store returned exports. Each must come from its buffer's
         // producing worker; a later report for the same buffer adds locations.
         for product in report.products.drain(..) {
             let route = self
@@ -1323,29 +1323,28 @@ impl WorkerExecutor {
                     .insert(product.product.buffer_id(), product.clone());
             }
         }
-        for publication in report
+        for export in report
             .results
             .iter()
             .filter_map(|completion| completion.output.kv_output.as_ref())
         {
             let route = self
                 .buffer_routes
-                .get(&publication.source)
-                .context("worker returned an unplanned KV publication")?;
+                .get(&export.source)
+                .context("worker returned an unplanned KV export")?;
             anyhow::ensure!(
                 route.worker_index == worker_index,
-                "KV publication was returned by another owner"
+                "KV export was returned by another owner"
             );
-            if let Some(stored) = self.kv_transfers.get_mut(&publication.source) {
-                stored.merge_locations(publication)?;
+            if let Some(stored) = self.kv_transfers.get_mut(&export.source) {
+                stored.merge_locations(export)?;
             } else {
-                self.kv_transfers
-                    .insert(publication.source, publication.clone());
+                self.kv_transfers.insert(export.source, export.clone());
             }
         }
 
         // Keep outstanding identities available to recovery until all returned
-        // publications have passed their owner and layout checks.
+        // exports have passed their owner and layout checks.
         let pending = self
             .pending
             .get_mut(&batch_id)
@@ -1553,7 +1552,7 @@ impl Executor for WorkerExecutor {
                 .collect::<Vec<Vec<(Call, RequestPlacement)>>>();
             let mut worker_inputs = (0..self.workers.len())
                 .map(|_| Vec::new())
-                .collect::<Vec<Vec<TensorPublication>>>();
+                .collect::<Vec<Vec<TensorExport>>>();
             let mut worker_kv_inputs: Vec<Vec<KvTransfer>> =
                 (0..self.workers.len()).map(|_| Vec::new()).collect();
             let mut worker_dependencies = (0..self.workers.len())
@@ -1647,7 +1646,7 @@ impl Executor for WorkerExecutor {
                 }
             }
 
-            // External publications go to every worker with a call reading them.
+            // External exports go to every worker with a call reading them.
             for payload in &batch.input_transfers {
                 let worker_indices =
                     input_routes
@@ -1662,12 +1661,12 @@ impl Executor for WorkerExecutor {
                     worker_inputs[worker_index].push(payload.clone());
                 }
             }
-            for publication in &batch.kv_inputs {
+            for export in &batch.kv_inputs {
                 let workers = input_routes
-                    .get(&publication.source)
+                    .get(&export.source)
                     .context("cannot route undeclared KV input")?;
                 for &worker_index in workers {
-                    worker_kv_inputs[worker_index].push(publication.clone());
+                    worker_kv_inputs[worker_index].push(export.clone());
                 }
             }
 
@@ -1688,8 +1687,8 @@ impl Executor for WorkerExecutor {
                                 .any(|payload| payload.product.buffer_id() == input)
                                 || worker_kv_inputs[consumer_worker]
                                     .iter()
-                                    .any(|publication| publication.source == input),
-                            "input {:?} has no registered producer or supplied publication",
+                                    .any(|export| export.source == input),
+                            "input {:?} has no registered producer or supplied export",
                             input
                         );
                         continue;
@@ -1705,7 +1704,7 @@ impl Executor for WorkerExecutor {
                             .any(|existing| existing.product.buffer_id() == input)
                             && !worker_kv_inputs[consumer_worker]
                                 .iter()
-                                .any(|publication| publication.source == input),
+                                .any(|export| export.source == input),
                         "transfer descriptor must be supplied by its producing worker"
                     );
                     if !worker_dependencies[consumer_worker].contains(&input) {
@@ -1820,9 +1819,9 @@ impl Executor for WorkerExecutor {
                 })?;
             }
 
-            // A freed buffer loses its producer route and publications now, so
+            // A freed buffer loses its producer route and exports now, so
             // a later call that reads it is refused unless its batch supplies
-            // a publication. Its holders and allocations stay indexed until the
+            // an export. Its holders and allocations stay indexed until the
             // `Free` completes, and remain if the release fails.
             for command in &batch.commands {
                 if let BatchCommand::Free { buffer } = command {

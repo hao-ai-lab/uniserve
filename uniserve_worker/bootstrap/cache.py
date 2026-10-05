@@ -222,7 +222,7 @@ def group_layers(
     A logical cache layer joins the group whose history window, logical K/V
     heads and head width it shares; the decoder records these for every
     layer, including those resident on other stages. A group's layers in
-    ascending global order form its publication layer axis.
+    ascending global order form its export layer axis.
 
     Raises:
         ValueError: A resident group's layers are not the logical layers of

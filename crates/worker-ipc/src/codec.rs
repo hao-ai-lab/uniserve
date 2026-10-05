@@ -47,7 +47,7 @@ use crate::{
     DrawLayout, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
     ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
     MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
-    SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
+    SamplingState, ShapeBound, TensorExport, TensorRef, TensorTransfer, TimingCounters,
     TransferHandle, TransferMode, TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint,
     WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
@@ -310,7 +310,7 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
 /// Decodes a submitted batch and validates it with `Batch::validate`.
 ///
 /// Absent vectors decode as empty. Calls, admissions, commands, tensor
-/// references, and publications are also validated individually as they are
+/// references, and exports are also validated individually as they are
 /// decoded.
 fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
     // Every collection keeps its wire order: `ForwardBatch::call_indices`
@@ -422,7 +422,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             .map(|items| {
                 items
                     .iter()
-                    .map(tensor_publication_from_table)
+                    .map(tensor_export_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
@@ -1016,7 +1016,7 @@ fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutpu
             .map(|items| {
                 items
                     .iter()
-                    .map(tensor_publication_from_table)
+                    .map(tensor_export_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
@@ -1123,16 +1123,14 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
     Ok(record)
 }
 
-/// Decodes a tensor publication and its declared reference.
-fn tensor_publication_from_table(
-    payload: fbs::TensorPublication<'_>,
-) -> CodecResult<TensorPublication> {
+/// Decodes a tensor export and its declared reference.
+fn tensor_export_from_table(payload: fbs::TensorExport<'_>) -> CodecResult<TensorExport> {
     let value = transfer_handle_from_table(
         payload
             .value()
-            .context("tensor publication has no transfer descriptor")?,
+            .context("tensor export has no transfer descriptor")?,
     )?;
-    let payload = TensorPublication {
+    let payload = TensorExport {
         product: tensor_ref_from_table(
             payload
                 .product()
@@ -1670,7 +1668,7 @@ fn media_call_from_fb(value: fbs::MediaCall) -> CodecResult<MediaCall> {
 fn transfer_mode_to_fb(value: TransferMode) -> fbs::TransferMode {
     match value {
         TransferMode::Tensor => fbs::TransferMode::Tensor,
-        TransferMode::KvPublish => fbs::TransferMode::KvPublish,
+        TransferMode::KvExport => fbs::TransferMode::KvExport,
         TransferMode::KvInstall => fbs::TransferMode::KvInstall,
     }
 }
@@ -1678,7 +1676,7 @@ fn transfer_mode_to_fb(value: TransferMode) -> fbs::TransferMode {
 fn transfer_mode_from_fb(value: fbs::TransferMode) -> CodecResult<TransferMode> {
     Ok(match value {
         fbs::TransferMode::Tensor => TransferMode::Tensor,
-        fbs::TransferMode::KvPublish => TransferMode::KvPublish,
+        fbs::TransferMode::KvExport => TransferMode::KvExport,
         fbs::TransferMode::KvInstall => TransferMode::KvInstall,
         _ => codec_bail!("unknown transfer_mode {}", value.0),
     })
@@ -1748,9 +1746,9 @@ fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> 
                 .endpoint()
                 .context("CUDA VMM endpoint is missing")?
                 .to_owned(),
-            publication_id: value
-                .publication_id()
-                .context("CUDA VMM publication identity is missing")?
+            export_id: value
+                .export_id()
+                .context("CUDA VMM export identity is missing")?
                 .to_owned(),
             storage_size_bytes: value.storage_size_bytes(),
             storage_offsets_bytes: value
@@ -2037,7 +2035,7 @@ fn response_kind_from_fb(kind: fbs::RespKind) -> CodecResult<ResponseKind> {
     }
 }
 
-/// Decodes a KV publication descriptor.
+/// Decodes a KV export descriptor.
 ///
 /// Its buffer identities and tensor transfers are validated as they are
 /// decoded; the descriptor as a whole is validated by its container:
@@ -2062,7 +2060,7 @@ fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransf
             .to_owned(),
         base: transfer.base().map(buffer_id_from_table).transpose()?,
         base_extent: transfer.base_extent(),
-        published_extent: transfer.published_extent(),
+        exported_extent: transfer.exported_extent(),
         compute_dtype: transfer
             .compute_dtype()
             .context("KV transfer compute dtype is missing")?
@@ -2070,7 +2068,7 @@ fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransf
     })
 }
 
-/// Decodes one cache group's share of a KV publication, preserving the key,
+/// Decodes one cache group's share of a KV export, preserving the key,
 /// value, scale tensor order.
 fn kv_group_transfer_from_table(group: fbs::KvGroupTransfer<'_>) -> CodecResult<KvGroupTransfer> {
     Ok(KvGroupTransfer {

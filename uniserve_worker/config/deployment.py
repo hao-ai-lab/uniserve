@@ -52,7 +52,7 @@ SUPPORTED_CALL_GROUPS: dict[str, tuple[CallKind, ...]] = {
     "encoder_latent": (MediaCall.LATENT_ENCODING,),
     "encoder_text": (MediaCall.TEXT_ENCODING,),
     "transfer_product": (TransferMode.TENSOR,),
-    "transfer_kv_publish": (TransferMode.KV_PUBLISH,),
+    "transfer_kv_export": (TransferMode.KV_EXPORT,),
     "transfer_kv_install": (TransferMode.KV_INSTALL,),
     "diffusion_prepare": (MediaCall.LATENT_PREPARATION,),
     "diffusion_step": (MediaCall.DENOISING,),
@@ -423,15 +423,15 @@ class ModelLaunchConfig:
 
 @dataclass(frozen=True)
 class DataPlaneConfig:
-    """Bind receive and required publication mechanisms for a rank.
+    """Bind receive and required export mechanisms for a rank.
 
-    ``WorkerProcessArgs.from_namespace`` requires ``publication_backends`` to
+    ``WorkerProcessArgs.from_namespace`` requires ``export_backends`` to
     be a subset of ``backends``: a rank publishes only over mechanisms it also
     binds.
     """
 
     backends: tuple[str, ...]
-    publication_backends: tuple[str, ...]
+    export_backends: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -507,9 +507,7 @@ class WorkerProcessArgs:
             device=device,
         )
         backends = _parse_transfer_backends(namespace.transfer_backends)
-        publication_backends = _parse_transfer_backends(
-            namespace.publish_backends
-        )
+        export_backends = _parse_transfer_backends(namespace.export_backends)
         model_path = str(namespace.model or "").strip()
 
         _validate_scalars(namespace)
@@ -524,8 +522,8 @@ class WorkerProcessArgs:
         if not use_stub_model and not model_path:
             raise ValueError("--model is required for a model worker")
 
-        if not set(publication_backends).issubset(backends):
-            raise ValueError("publication backends must be bound transports")
+        if not set(export_backends).issubset(backends):
+            raise ValueError("export backends must be bound transports")
         if "cuda_vmm" in backends and not device.startswith("cuda:"):
             raise ValueError("CUDA VMM requires a CUDA worker device")
         if device.startswith("cuda") or (
@@ -564,7 +562,7 @@ class WorkerProcessArgs:
             ),
             data_plane=DataPlaneConfig(
                 backends=backends,
-                publication_backends=publication_backends,
+                export_backends=export_backends,
             ),
             execution=worker_config_from_namespace(
                 namespace, device=device, generation_device=generation_device

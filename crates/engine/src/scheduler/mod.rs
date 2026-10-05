@@ -542,7 +542,7 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
         )
         | CallKind::Media(MediaCall::ImageDecoding)
         | CallKind::Transfer(TransferMode::Tensor)
-        | CallKind::Transfer(TransferMode::KvPublish)
+        | CallKind::Transfer(TransferMode::KvExport)
         | CallKind::Transfer(TransferMode::KvInstall) => BatchKind::Media,
     }
 }
@@ -574,7 +574,7 @@ const OUTPUT_TERMINAL_RESERVE: usize = 2;
 struct KvLengths {
     /// Tokens the call's KV-writing forward row appends: the prompt slice
     /// length, the feature write's token capacity, or one for other prefills,
-    /// decode, and verify. Zero for KV publication, latent preparation, and
+    /// decode, and verify. Zero for KV export, latent preparation, and
     /// denoising, which only read the request's KV.
     input: u32,
     /// Scheduled visible KV length before the call.

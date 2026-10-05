@@ -62,7 +62,7 @@ def encoded_unit_bytes(frames: int, height: int, width: int) -> int:
 def frame_encoded_unit(
     payload: bytes, destination: torch.Tensor
 ) -> torch.Tensor:
-    """Write a framed unit and return its initialized prefix for publication.
+    """Write a framed unit and return its initialized prefix for export.
 
     ``destination`` is a 1-D uint8 row sized by `encoded_unit_bytes`. Bytes
     past the returned view are left untouched; the caller

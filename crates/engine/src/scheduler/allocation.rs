@@ -1,4 +1,4 @@
-//! Request backing and retained encoder publications owned by the scheduler.
+//! Request backing and retained encoder exports owned by the scheduler.
 //!
 //! The scheduler owns the logical allocation of worker-side storage: it
 //! chooses request rows, KV pages, latent pages, and buffer byte spans, and
@@ -12,7 +12,7 @@
 use super::*;
 use uniserve_worker_ipc::BufferId;
 
-/// Logical storage reservations and retained publications owned by the engine.
+/// Logical storage reservations and retained exports owned by the engine.
 pub(super) struct Storage {
     /// Text KV pages and prefix cache; `None` when the runtime has no KV cache.
     pub(super) cache: Option<KVCacheManager>,

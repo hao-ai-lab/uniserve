@@ -7,7 +7,7 @@ batches take, on CUDA devices only:
 
 - a token scenario: one PREFILL call followed, when supported, by a DECODE
   call that consumes the prefill's device token;
-- a flow scenario per configured guidance-branch count: a KV_PUBLISH of the
+- a flow scenario per configured guidance-branch count: a KV_EXPORT of the
   conditioning, a LATENT_PREPARATION, and two chained DENOISING calls.
 
 No engine scheduler is present at startup, so this module takes over the
@@ -50,7 +50,7 @@ from uniserve_worker.protocol.batch import (
     LatentParams,
     NewRequest,
     Start,
-    TensorPublication,
+    TensorExport,
 )
 from uniserve_worker.protocol.call import (
     Call,
@@ -319,7 +319,7 @@ def _warmup_batch(
     ],
     latent_params: dict[tuple[RequestKey, CallId], LatentParams],
     buffer_allocations: tuple[BufferAllocation, ...],
-    input_products: tuple[TensorPublication, ...] = (),
+    input_products: tuple[TensorExport, ...] = (),
 ) -> Batch:
     """Assemble warmup calls and their physical input columns.
 
@@ -520,7 +520,7 @@ def _build_warmup_batch(
     *,
     admissions: tuple[NewRequest, ...],
     calls: tuple[Call, ...],
-    input_products: tuple[TensorPublication, ...] = (),
+    input_products: tuple[TensorExport, ...] = (),
     image_size: tuple[int, int] | None = None,
 ) -> Batch:
     """Derive allocations for a warmup submission and assemble its batch.
@@ -590,7 +590,7 @@ def _build_warmup_batch(
             ForwardMode.DECODE,
             ForwardMode.VERIFY,
             ForwardMode.TOKEN_DENOISING,
-            TransferMode.KV_PUBLISH,
+            TransferMode.KV_EXPORT,
             TransferMode.KV_INSTALL,
             MediaCall.LATENT_PREPARATION,
             MediaCall.DENOISING,
@@ -1332,9 +1332,9 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         # Publish one conditioning KV product per request, in the batch that
         # admits the requests.
         conditionings: list[BufferId] = []
-        publications: list[Call] = []
+        exports: list[Call] = []
         for key, root in zip(keys, roots, strict=True):
-            call_id = CallId(requests._batch_id + 1, len(publications))
+            call_id = CallId(requests._batch_id + 1, len(exports))
             conditioning = BufferId(
                 owner=key,
                 producer_call_id=call_id,
@@ -1343,12 +1343,12 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
             )
             next_generation += 1
             conditionings.append(conditioning)
-            publications.append(
+            exports.append(
                 Call(
                     request_key=key,
                     call_id=call_id,
                     coordinates=CallCoordinates(),
-                    kind=TransferMode.KV_PUBLISH,
+                    kind=TransferMode.KV_EXPORT,
                     bounds=Bounds(max_transfer_bytes=1 << 20),
                     kv_output=conditioning,
                 )
@@ -1358,7 +1358,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
             _build_warmup_batch(
                 requests,
                 admissions=admissions,
-                calls=tuple(publications),
+                calls=tuple(exports),
                 image_size=(height, width),
             ),
         )

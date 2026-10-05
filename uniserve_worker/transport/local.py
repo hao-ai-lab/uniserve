@@ -1,10 +1,10 @@
-"""In-process tensor publication and borrowed consumer views.
+"""In-process tensor export and borrowed consumer views.
 
-A `local` publication is read only within the producer's own address space
-and on the source device. Its locator carries the publishing instance's
+A `local` export is read only within the producer's own address space
+and on the source device. Its locator carries the exporting instance's
 endpoint name and an integer key into that instance's table; a reader finds
 the owning instance through the process-wide `_endpoints` registry, so any
-`LocalTransport` in the process can read another's publications.
+`LocalTransport` in the process can read another's exports.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from uniserve_worker.transport.endpoint import (
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     dtype_name,
-    publication_views,
+    export_views,
     read_destination,
     region_view,
     tensor_nbytes,
@@ -57,9 +57,9 @@ class _LocalSource:
 
 
 class LocalTransport(Transport):
-    """Publications read in the producer's process through a local table.
+    """Exports read in the producer's process through a local table.
 
-    A read without a destination borrows the published views themselves and
+    A read without a destination borrows the exported views themselves and
     copies nothing; a read with one copies into it on the read pool.
     """
 
@@ -100,14 +100,14 @@ class LocalTransport(Transport):
         """Expose the process-unique endpoint encoded into local locators."""
         return self._buffers.name
 
-    def publication_retirement(self, locator: Locator) -> Completion:
+    def retirement(self, locator: Locator) -> Completion:
         """Retain the allocation ownership shared by local calls.
 
         Local copies and borrowed views use the same ownership.
         """
         return self._buffers.retirement(locator)
 
-    def publish(
+    def export(
         self,
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
@@ -120,7 +120,7 @@ class LocalTransport(Transport):
 
         Return its locator.
         """
-        t, shape, offset = publication_views(tensor, offset)
+        t, shape, offset = export_views(tensor, offset)
         first = t[0] if isinstance(t, tuple) else t
         self._events.reap()
         nbytes = tensor_nbytes(t)
@@ -166,9 +166,9 @@ class LocalTransport(Transport):
         region: tuple[slice, ...] | None = None,
         reservation: ReadReservation | None = None,
     ) -> TransferTicket:
-        """Borrow or copy from a verified publisher in this address space.
+        """Borrow or copy from a verified producer in this address space.
 
-        The producer owns publication bytes and their event. The destination
+        The producer owns export bytes and their event. The destination
         owns copy capacity; a borrowed view retains its producer's event pool
         until consumer completion returns the source grant.
         """
@@ -193,7 +193,7 @@ class LocalTransport(Transport):
             if region is not None:
                 if not _slices.within(region, locator.shape):
                     raise invalid_descriptor(
-                        "read region exceeds the published view"
+                        "read region exceeds the exported view"
                     )
                 tensor = region_view(tensor, region)
             target = (

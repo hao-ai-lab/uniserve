@@ -571,7 +571,7 @@ def _devices(
 def loaded_worker_config(
     model: nn.Module, config: WorkerConfig, queue_depth: int
 ) -> WorkerConfig:
-    """Resolve media request slots from the worker's publication lifetime.
+    """Resolve media request slots from the worker's export lifetime.
 
     A resident media slot occupies three positions of the worker's batch
     queue, one reserved pipeline position and two unresolved outputs, and a

@@ -62,7 +62,7 @@ pub(super) fn plan_reads<'py>(
         .getattr("validate_destination")?
         .call((destination,), Some(&kwargs))?;
 
-    // Prefer a process-local replica; other locations keep publication order.
+    // Prefer a process-local replica; other locations keep export order.
     let mut ordered = tensor
         .getattr("locations")?
         .try_iter()?

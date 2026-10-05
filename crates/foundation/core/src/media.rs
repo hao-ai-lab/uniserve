@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 
-/// Read-only mapping of one claimed shared-memory media publication.
+/// Read-only mapping of one claimed shared-memory media export.
 ///
 /// The mapping covers exactly the published byte count and is unmapped on
 /// drop. Share it with `Arc` rather than reopening: the name no longer exists
@@ -30,7 +30,7 @@ pub struct SharedMedia {
 }
 
 // The pointer refers to a `PROT_READ` mapping that no process writes after
-// publication (the `open` contract) and that stays mapped until this value
+// export (the `open` contract) and that stays mapped until this value
 // drops, so moving or sharing it across threads cannot race.
 unsafe impl Send for SharedMedia {}
 unsafe impl Sync for SharedMedia {}
@@ -63,7 +63,7 @@ impl SharedMedia {
 
         // Reject a malformed locator before touching any object: the name must
         // be one non-empty component (the leading `/` is added below), and a
-        // publication is never empty.
+        // export is never empty.
         if bytes == 0 || name.is_empty() || name.contains('/') {
             return Err("generated media has an invalid shared-storage locator".to_string());
         }
@@ -107,7 +107,7 @@ impl SharedMedia {
         // SAFETY: fstat initialized stat on success.
         let extent = unsafe { stat.assume_init() }.st_size;
 
-        // A publication shorter than its locator is incomplete; reject it
+        // An export shorter than its locator is incomplete; reject it
         // rather than map past the object's end.
         if extent < 0
             || u64::try_from(extent)
@@ -154,7 +154,7 @@ impl SharedMedia {
 
     /// Borrows the immutable published extent for validation or response output.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: the mapping remains live for this borrow and is immutable after publication.
+        // SAFETY: the mapping remains live for this borrow and is immutable after export.
         unsafe { std::slice::from_raw_parts(self.address.cast(), self.bytes) }
     }
 }
@@ -181,7 +181,7 @@ impl Drop for SharedMedia {
 /// reader opens the object by name, reads it and never unlinks it. The
 /// publisher keeps the name: dropping the value unlinks it, and the kernel
 /// frees the storage once no reader still maps it. The engine holds a
-/// request's publications until the request retires, after its last call.
+/// request's exports until the request retires, after its last call.
 #[derive(Debug)]
 pub struct MediaSource {
     name: String,
@@ -241,7 +241,7 @@ impl MediaSource {
             bytes: bytes.len() as u64,
         };
 
-        // Reserve physical pages before publication. ftruncate alone can
+        // Reserve physical pages before export. ftruncate alone can
         // leave a sparse tmpfs object whose later mapped writes raise SIGBUS.
         // posix_fallocate returns its error number directly, without errno.
         // SAFETY: file owns a writable descriptor and length is positive.
@@ -273,7 +273,7 @@ impl MediaSource {
 }
 
 impl PartialEq for MediaSource {
-    /// Two publications are equal when they name the same object.
+    /// Two exports are equal when they name the same object.
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
     }
@@ -299,7 +299,7 @@ impl Drop for MediaSource {
 mod tests {
     use super::*;
 
-    /// A publication is readable by name while it lives and unlinked once
+    /// An export is readable by name while it lives and unlinked once
     /// it drops.
     #[test]
     fn a_published_source_is_readable_until_dropped() {

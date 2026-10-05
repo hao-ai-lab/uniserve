@@ -146,7 +146,7 @@ impl MediaCall {
 #[repr(u8)]
 pub enum TransferMode {
     Tensor,
-    KvPublish,
+    KvExport,
     KvInstall,
 }
 
@@ -155,12 +155,12 @@ impl TransferMode {
     ///
     /// `worker-ipc-py` indexes a Python enum table built from this array with
     /// `mode as usize`, so the order must match the declaration order.
-    pub const ALL: [Self; 3] = [Self::Tensor, Self::KvPublish, Self::KvInstall];
+    pub const ALL: [Self; 3] = [Self::Tensor, Self::KvExport, Self::KvInstall];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tensor => "tensor",
-            Self::KvPublish => "kv_publish",
+            Self::KvExport => "kv_export",
             Self::KvInstall => "kv_install",
         }
     }
@@ -315,7 +315,7 @@ impl CallKind {
         Self::Media(MediaCall::AudioEncoding),
         Self::Media(MediaCall::Muxing),
         Self::Transfer(TransferMode::Tensor),
-        Self::Transfer(TransferMode::KvPublish),
+        Self::Transfer(TransferMode::KvExport),
         Self::Transfer(TransferMode::KvInstall),
     ];
 
@@ -712,7 +712,7 @@ impl Call {
     /// Validates the invariants one call carries on its own.
     ///
     /// Checks identity, component, coordinates, the token bound, canonical
-    /// sampling-state sets, the encoded-image source, KV publication
+    /// sampling-state sets, the encoded-image source, KV export
     /// identities, product ownership, generations, output indices, dtypes and
     /// byte bounds, cross-request inputs, and the predicate. `rng` is not
     /// checked. Relationships to other calls and to the batch's allocation
@@ -793,11 +793,11 @@ impl Call {
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
         let publishes_kv = matches!(
             self.code,
-            CallKind::Transfer(TransferMode::KvPublish | TransferMode::KvInstall)
+            CallKind::Transfer(TransferMode::KvExport | TransferMode::KvInstall)
         );
         ensure_valid!(
             self.kv_output.is_some() == publishes_kv,
-            "KV publication or installation requires one cache output identity"
+            "KV export or installation requires one cache output identity"
         );
         if let Some(output) = self.kv_output {
             output.validate()?;
@@ -821,7 +821,7 @@ impl Call {
         }
         ensure_valid!(
             self.code != CallKind::Transfer(TransferMode::KvInstall) || self.kv_input.is_some(),
-            "KV installation requires a source publication"
+            "KV installation requires a source export"
         );
 
         for output in self.tensor_outputs() {
@@ -1036,7 +1036,7 @@ pub struct RequestOutput {
     pub finish_flags: FinishFlags,
     /// Completed artifact and its external storage lifetime, when produced.
     pub media_output: Option<MediaOutput>,
-    /// Physical KV publication, including this rank's tensor locations.
+    /// Physical KV export, including this rank's tensor locations.
     pub kv_output: Option<KvTransfer>,
 }
 
@@ -1047,14 +1047,14 @@ impl RequestOutput {
             self.call_id.batch_id > 0,
             "completion call id must be positive"
         );
-        if let Some(publication) = &self.kv_output {
-            publication.validate()?;
+        if let Some(export) = &self.kv_output {
+            export.validate()?;
             ensure_valid!(
                 self.status == CallStatus::Ok
-                    && self.code == CallKind::Transfer(TransferMode::KvPublish)
-                    && publication.source.owner == self.request_key
-                    && publication.source.producer_call_id == self.call_id,
-                "KV publication does not belong to its successful completion"
+                    && self.code == CallKind::Transfer(TransferMode::KvExport)
+                    && export.source.owner == self.request_key
+                    && export.source.producer_call_id == self.call_id,
+                "KV export does not belong to its successful completion"
             );
         }
 
@@ -1656,8 +1656,8 @@ pub struct Batch {
     /// Ordered request-state and buffer-lifetime commands.
     pub commands: Vec<BatchCommand>,
     /// Host-supplied input product values matched by `TensorRef` identity.
-    pub input_products: Vec<TensorPublication>,
-    /// Imported KV publications consumed by explicit cache installation call kinds.
+    pub input_products: Vec<TensorExport>,
+    /// Imported KV exports consumed by explicit cache installation call kinds.
     pub kv_inputs: Vec<KvTransfer>,
 }
 
@@ -1713,7 +1713,7 @@ impl Batch {
     }
 
     /// Attaches resolved input products to the run.
-    pub fn with_input_products(mut self, input_products: Vec<TensorPublication>) -> Self {
+    pub fn with_input_products(mut self, input_products: Vec<TensorExport>) -> Self {
         self.input_products = input_products;
         self
     }
@@ -2013,25 +2013,22 @@ impl Batch {
             payload.validate()?;
         }
 
-        // Each imported KV publication feeds exactly one installation call and
+        // Each imported KV export feeds exactly one installation call and
         // fits that call's transfer-byte bound.
         let mut kv_sources = HashSet::new();
-        for publication in &self.kv_inputs {
-            publication.validate()?;
-            ensure_valid!(
-                kv_sources.insert(publication.source),
-                "run repeats a KV input"
-            );
+        for export in &self.kv_inputs {
+            export.validate()?;
+            ensure_valid!(kv_sources.insert(export.source), "run repeats a KV input");
             let consumers = self
                 .calls()
-                .filter(|call| call.kv_input == Some(publication.source))
+                .filter(|call| call.kv_input == Some(export.source))
                 .collect::<Vec<_>>();
             ensure_valid!(
                 consumers.len() == 1
                     && consumers[0].code == CallKind::Transfer(TransferMode::KvInstall),
                 "KV transfer requires one installation consumer"
             );
-            let bytes = publication.tensors().try_fold(0_u64, |sum, tensor| {
+            let bytes = export.tensors().try_fold(0_u64, |sum, tensor| {
                 Ok::<_, ValidationError>(sum.saturating_add(tensor.validate()?))
             })?;
             ensure_valid!(
@@ -2052,7 +2049,7 @@ pub struct BatchOutput {
     /// Call completions, one per call the batch carried.
     pub completions: Vec<RequestOutput>,
     /// Product values published by completed calls.
-    pub products: Vec<TensorPublication>,
+    pub products: Vec<TensorExport>,
     /// Aggregate worker execution time in microseconds, when measured.
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported by the worker.
@@ -2066,7 +2063,7 @@ impl BatchOutput {
     }
 
     /// Iterates over resolved product payloads in report order.
-    pub fn products(&self) -> impl Iterator<Item = &TensorPublication> {
+    pub fn products(&self) -> impl Iterator<Item = &TensorExport> {
         self.products.iter()
     }
 

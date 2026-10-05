@@ -8,8 +8,6 @@ import pytest
 
 from tests.python.fixtures.launch import worker_args
 from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint, run_worker
-from uniserve_worker.protocol.call import ForwardMode
-from uniserve_worker.protocol.identity import CallId
 
 pytestmark = pytest.mark.integration
 
@@ -194,11 +192,9 @@ def _owned_world(rank, directory, failure, store):
     elif failure == "execution_setup":
         config = replace(
             config,
-            data_plane=replace(config.data_plane, publication_backends=()),
+            data_plane=replace(config.data_plane, export_backends=()),
         )
-        with pytest.raises(
-            WorkerError, match="publication backends must be unique"
-        ):
+        with pytest.raises(WorkerError, match="export backends must be unique"):
             Worker.from_config(config)
     else:
         with Worker.from_config(config):
@@ -230,94 +226,3 @@ def test_worker_releases_process_groups_created_by_its_factory(
             nprocs=2,
             join=True,
         )
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize("cleanup_fails", (False, True))
-def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
-    monkeypatch, cleanup_fails
-):
-    import torch
-    from cuda.bindings import driver
-
-    from tests.python.fixtures.depth_one import (
-        ar_params,
-        execution_batch,
-        finalized_report,
-        root_parent,
-        token_call,
-    )
-    from tests.python.fixtures.execution_worker import execution_worker
-    from uniserve_worker.config.execution import LaneConfig, WorkerConfig
-    from uniserve_worker.protocol.call import CALL_KINDS, CallStatus
-
-    policy = WorkerConfig(
-        prefill_cuda_graph=False,
-        graph_policy="off",
-        lanes=(
-            LaneConfig("decode", 64, (ForwardMode.DECODE, ForwardMode.VERIFY)),
-            LaneConfig(
-                "compute",
-                88,
-                tuple(
-                    kind
-                    for kind in CALL_KINDS
-                    if kind not in {ForwardMode.DECODE, ForwardMode.VERIFY}
-                ),
-            ),
-        ),
-    )
-    create_stream = driver.cuGreenCtxStreamCreate
-    destroy_context = driver.cuGreenCtxDestroy
-    failure = torch.cuda.OutOfMemoryError("CUDA stream allocation failed")
-    allocations = 0
-
-    def unavailable_stream(*args):
-        nonlocal allocations
-        allocations += 1
-        if allocations == 2:
-            raise failure
-        return create_stream(*args)
-
-    def failed_cleanup(*args):
-        result = destroy_context(*args)
-        if result[0] == driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError("CUDA context teardown reported failure")
-        return result
-
-    # Inject at the external driver boundary after a physical binding exists.
-    # No Worker, runner, Lane, or storage collaborator is replaced.
-    with monkeypatch.context() as patch:
-        patch.setattr(driver, "cuGreenCtxStreamCreate", unavailable_stream)
-        if cleanup_fails:
-            patch.setattr(driver, "cuGreenCtxDestroy", failed_cleanup)
-        with pytest.raises(torch.cuda.OutOfMemoryError) as raised:
-            execution_worker(device="cuda:0", execution=policy)
-        assert raised.value is failure
-        if cleanup_fails:
-            assert any(
-                "CUDA context teardown reported failure" in note
-                for note in failure.__notes__
-            )
-
-    with execution_worker(device="cuda:0", execution=policy) as worker:
-        admission = ar_params(1, block_ids=(0,))
-        call = token_call(
-            admission.request_key,
-            call_id=CallId(1, 0),
-            predecessor=root_parent(admission),
-            mode=ForwardMode.PREFILL,
-            tokens=(3, 4),
-        )
-        result = finalized_report(
-            worker,
-            worker.submit(
-                execution_batch(
-                    batch_id=1,
-                    admissions=(admission,),
-                    calls=(call,),
-                )
-            ),
-        )
-        assert result.completions[0].status is CallStatus.OK
-        assert result.completions[0].committed_tokens

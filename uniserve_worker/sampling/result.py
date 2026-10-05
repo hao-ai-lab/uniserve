@@ -48,7 +48,7 @@ LogprobValues: TypeAlias = tuple[
 class SamplerOutput:
     """Numerical selections with shared completion storage and logprobs.
 
-    Row selections retain this complete batch so device and host publication
+    Row selections retain this complete batch so device and host export
     can consume its columns without splitting and reconstructing tensor views.
     No request state, storage owner, or host completion is carried here.
 

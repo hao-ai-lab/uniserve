@@ -13,7 +13,7 @@
 //! Faults and delays are injected at the OS boundary:
 //! `/proc/thread-self/children` and `/proc/<pid>/cmdline` locate a rank
 //! process, `PausedProcess` stops, resumes or kills it with signals, and
-//! `SlowShmPublication` supplies an external producer's POSIX segment.
+//! `SlowShmExport` supplies an external producer's POSIX segment.
 //! These are Linux interfaces, and the file compiles only on Linux.
 
 #![cfg(target_os = "linux")]
@@ -42,7 +42,7 @@ use uniserve_engine::{
 use uniserve_worker_ipc::{
     ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call, CallId,
     CallKind, CallStatus, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest,
-    RequestKey, ShapeBound, TensorPublication, TensorRef, TransferHandle, TransferTransport,
+    RequestKey, ShapeBound, TensorExport, TensorRef, TransferHandle, TransferTransport,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -613,7 +613,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
         // republished by a tensor transfer on the backbone's rank (call 2) and
         // copied by a transfer on the patch encoder's rank (call 3). Each step
         // names a new producer and generation for its output.
-        let publication = TensorRef {
+        let export = TensorRef {
             producer_call_id: CallId::new(2, 0),
             generation: 2,
             ..value.clone()
@@ -622,7 +622,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             consumer_slots: Vec::new(),
             coordinates: CallCoordinates::default(),
             token_input: Some(value.clone()),
-            token_output: Some(publication.clone()),
+            token_output: Some(export.clone()),
             vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
@@ -656,12 +656,12 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
         let copy = TensorRef {
             producer_call_id: CallId::new(3, 0),
             generation: 3,
-            ..publication.clone()
+            ..export.clone()
         };
         let consume = Call {
             consumer_slots: Vec::new(),
             coordinates: CallCoordinates::default(),
-            token_input: Some(publication.clone()),
+            token_input: Some(export.clone()),
             token_output: Some(copy.clone()),
             vision_inputs: Vec::new(),
             latent_feature_input: None,
@@ -684,7 +684,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             component: "vision_encoder".into(),
             code: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
-                max_transfer_bytes: publication.max_bytes(),
+                max_transfer_bytes: export.max_bytes(),
                 ..Bounds::default()
             },
             inputs: Vec::new(),
@@ -1178,7 +1178,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         .find(|(id, _)| id.0 == "producer")
         .map(|(_, info)| info.endpoint.clone())
         .context("producer instance is not bound")?;
-    let bind = |mut batch: Batch, input_products: Vec<TensorPublication>| {
+    let bind = |mut batch: Batch, input_products: Vec<TensorExport>| {
         let call = batch.calls.remove(0);
         ExecutionBatch::new(
             batch.batch_id,
@@ -1214,7 +1214,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         },
     };
     // The producer's own address space is the product's only location.
-    let local_only = TensorPublication {
+    let local_only = TensorExport {
         product: value.clone(),
         value: TransferHandle::DeviceProduct {
             height: 0,
@@ -1416,7 +1416,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         let published_name = std::fs::read_to_string(&name_path)?;
         // The receiver claims the POSIX name even when correlation, rank ownership,
         // or extent validation rejects the result. Retained mappings keep the bytes.
-        // SAFETY: the fixture handed off an immutable, completed publication.
+        // SAFETY: the fixture handed off an immutable, completed export.
         assert!(
             unsafe { SharedMedia::open(published_name.trim(), 1) }.is_err(),
             "unclaimed media in {case}"
@@ -1783,7 +1783,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
 }
 
 /// Drives one two-rank stub group through logprob results, refused
-/// resubmissions, epoch-scoped retirement, KV publication, and close.
+/// resubmissions, epoch-scoped retirement, KV export, and close.
 fn check_rank_ipc() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let info = executor.info();
@@ -1964,7 +1964,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Publishes a prefilled request's KV with a `TransferMode::KvPublish` call and
+/// Publishes a prefilled request's KV with a `TransferMode::KvExport` call and
 /// requires every published tensor to name a location on each rank.
 fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
     let admission = text_admission(13, 1, 3)?;
@@ -1985,7 +1985,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
     let first = execute(executor, initial)?;
     assert_eq!(first.results[0].output.status, CallStatus::Ok);
 
-    // The publication locates the request's cache through the same block
+    // The export locates the request's cache through the same block
     // tables the prefill wrote it with.
     let buffer = uniserve_worker_ipc::BufferId {
         owner: request_key,
@@ -2017,7 +2017,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         request_key,
         call_id: CallId::new(10, 0),
         component: "model".into(),
-        code: CallKind::Transfer(TransferMode::KvPublish),
+        code: CallKind::Transfer(TransferMode::KvExport),
         bounds: Bounds {
             max_transfer_bytes: 4096,
             ..Bounds::default()
@@ -2033,13 +2033,13 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
 
     let report = execute(executor, publish.clone())?;
     assert_eq!(report.results[0].output.status, CallStatus::Ok);
-    let publication = report.results[0]
+    let export = report.results[0]
         .output
         .kv_output
         .as_ref()
-        .context("KV publication has no physical locations")?;
-    assert_eq!(publication.source, buffer);
-    for tensor in publication.tensors() {
+        .context("KV export has no physical locations")?;
+    assert_eq!(export.source, buffer);
+    for tensor in export.tensors() {
         let ranks = tensor
             .locations
             .iter()
@@ -2254,7 +2254,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         max_batch_calls: 256,
         max_batch_tokens: 256,
         attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
-        // `publisher` is the worker id `SlowShmPublication` names as the
+        // `publisher` is the worker id `SlowShmExport` names as the
         // source of its segment.
         transfer: uniserve_engine::TransferConfig::parse("publisher->worker=shm")?,
         ..config
@@ -2281,12 +2281,12 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         shape_bound: ShapeBound::default(),
     };
     // The slow call's predicate is the external segment, which stays pending
-    // until `SlowShmPublication::publish` runs.
-    let publication = SlowShmPublication::start(executor.info().endpoint.node.clone())?;
+    // until `SlowShmExport::publish` runs.
+    let export = SlowShmExport::start(executor.info().endpoint.node.clone())?;
     slow.calls[0].predicate = Some(predicate.clone());
-    slow.input_products.push(TensorPublication {
+    slow.input_products.push(TensorExport {
         product: predicate,
-        value: publication.descriptor()?,
+        value: export.descriptor()?,
     });
 
     let fast_admission = text_admission(32, 1, 2)?;
@@ -2315,12 +2315,12 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     // head of the channel, so nothing behind it runs until its dependency is
     // readable, and neither batch completes meanwhile.
     assert!(executor.poll_batch(Duration::from_millis(50))?.is_none());
-    assert!(!publication.published.load(Ordering::Acquire));
+    assert!(!export.published.load(Ordering::Acquire));
 
     // Waiting does not submit the slow batch again. Its original result becomes
     // available once the external publisher makes the dependency readable, and
     // the batch behind it follows in the order the channel delivered them.
-    publication.publish()?;
+    export.publish()?;
     let first = executor
         .poll_batch(Duration::from_secs(30))?
         .ok_or_else(|| anyhow::anyhow!("blocked submission did not complete"))?;
@@ -2394,9 +2394,9 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
             bytes: product.max_bytes(),
         })
         .collect();
-    batch.input_products.push(TensorPublication {
+    batch.input_products.push(TensorExport {
         product: input,
-        value: publication.descriptor()?,
+        value: export.descriptor()?,
     });
     executor.submit_batch(batch, &CallReaders::new())?;
     let transferred = executor
@@ -2405,15 +2405,15 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     assert_eq!(transferred.results[0].output.status, CallStatus::Ok);
     assert_eq!(transferred.products[0].product, output);
     let TransferHandle::DeviceProduct { tensor, .. } = &transferred.products[0].value else {
-        anyhow::bail!("tensor output has no physical publication");
+        anyhow::bail!("tensor output has no physical export");
     };
     assert_eq!(tensor.shape, vec![1]);
     assert_eq!(tensor.locations.len(), WORLD_SIZE);
 
     // The ranks only read the external segment; it survives their close and
-    // is removed when `publication` drops.
+    // is removed when `export` drops.
     executor.close()?;
-    assert_eq!(publication.file.metadata()?.nlink(), 1);
+    assert_eq!(export.file.metadata()?.nlink(), 1);
     Ok(())
 }
 
@@ -2573,7 +2573,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     executor.submit(bind(shared, "encoder-0"))?;
     let produced = poll_logical(&mut executor)?.context("source did not complete")?;
     assert!(produced.done);
-    let publication = TensorRef {
+    let export = TensorRef {
         producer_call_id: CallId::new(6, 0),
         generation: 2,
         ..source.clone()
@@ -2582,7 +2582,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         consumer_slots: Vec::new(),
         coordinates: coordinates_after(&produced.results[0].output),
         token_input: Some(source.clone()),
-        token_output: Some(publication.clone()),
+        token_output: Some(export.clone()),
         vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
@@ -2615,18 +2615,18 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     let publish = Batch::new(6, Vec::new(), vec![publish]);
 
     executor.submit(bind(publish, "encoder-0"))?;
-    let published = poll_logical(&mut executor)?.context("source publication did not complete")?;
+    let published = poll_logical(&mut executor)?.context("source export did not complete")?;
     assert!(published.done);
     assert_eq!(published.results[0].output.status, CallStatus::Ok);
     let copy = TensorRef {
         producer_call_id: CallId::new(7, 0),
         generation: 3,
-        ..publication.clone()
+        ..export.clone()
     };
     let transfer = Call {
         consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
-        token_input: Some(publication.clone()),
+        token_input: Some(export.clone()),
         token_output: Some(copy.clone()),
         vision_inputs: Vec::new(),
         latent_feature_input: None,
@@ -2649,7 +2649,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         component: "model".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
-            max_transfer_bytes: publication.max_bytes(),
+            max_transfer_bytes: export.max_bytes(),
             ..Bounds::default()
         },
         inputs: Vec::new(),
@@ -2947,7 +2947,7 @@ impl Drop for PausedProcess {
 /// An external shared-storage publisher the test controls.
 ///
 /// The reader waits on a readiness word, written after the payload.
-struct SlowShmPublication {
+struct SlowShmExport {
     name: CString,
     endpoint: String,
     node: String,
@@ -2955,13 +2955,13 @@ struct SlowShmPublication {
     published: Arc<AtomicBool>,
 }
 
-/// Byte layout of a shared-storage publication's header, as the worker's
+/// Byte layout of a shared-storage export's header, as the worker's
 /// `uniserve_worker.transport.segment` module lays it out.
 const SEGMENT_HEADER_BYTES: u64 = 512;
 const SEGMENT_STATE_OFFSET: u64 = 0;
 const SEGMENT_READY: u32 = 1;
 
-impl SlowShmPublication {
+impl SlowShmExport {
     fn start(node: String) -> anyhow::Result<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let name = format!("uniserve-transfer-{}-{nonce}", std::process::id());
@@ -2979,7 +2979,7 @@ impl SlowShmPublication {
             return Err(std::io::Error::last_os_error().into());
         }
 
-        let publication = Self {
+        let export = Self {
             name,
             endpoint,
             node,
@@ -2990,8 +2990,8 @@ impl SlowShmPublication {
         // A one-byte payload after the header. The file starts zero-filled,
         // which leaves the readiness word pending and every acknowledgment
         // word unclaimed.
-        publication.file.set_len(SEGMENT_HEADER_BYTES + 1)?;
-        Ok(publication)
+        export.file.set_len(SEGMENT_HEADER_BYTES + 1)?;
+        Ok(export)
     }
 
     fn address_space(&self) -> String {
@@ -3038,7 +3038,7 @@ impl SlowShmPublication {
     }
 }
 
-impl Drop for SlowShmPublication {
+impl Drop for SlowShmExport {
     fn drop(&mut self) {
         // SAFETY: the name remains valid and identifies this fixture's segment.
         unsafe {
@@ -3160,7 +3160,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "deployment_components": ["model"],
     "supported_calls": null,
     "transfer_backends": "local",
-    "publish_backends": "local",
+    "export_backends": "local",
     "rendezvous_address": null,
     "rendezvous_listen_fd": null,
     "distributed_backend": null,

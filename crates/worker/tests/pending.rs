@@ -71,7 +71,7 @@ fn a_second_media_result_is_rejected_without_leaking_its_storage()
     let second = source.locator();
     assert!(output.set_media(source).is_err());
 
-    // SAFETY: both publications are immutable; the refused source was dropped.
+    // SAFETY: both exports are immutable; the refused source was dropped.
     assert!(unsafe { SharedMedia::open(&second.name, second.bytes) }.is_err());
     output.handoff_media();
     drop(output);
@@ -99,7 +99,7 @@ fn handed_off_media_survives_output_retirement() -> Result<(), Box<dyn std::erro
     );
     drop(output);
 
-    // SAFETY: result delivery relinquished the immutable publication.
+    // SAFETY: result delivery relinquished the immutable export.
     let media = unsafe { SharedMedia::open(&locator.name, locator.bytes) }?;
     assert_eq!(media.as_bytes(), b"encoded image");
     Ok(())

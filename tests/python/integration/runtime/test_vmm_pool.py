@@ -30,7 +30,7 @@ def test_a_pool_exports_one_handle_for_every_chunk_it_hands_out(
 ) -> None:
     """Consumers import a producing device once, not once per product.
 
-    The pool's handle is what a publication carries, so two products from one
+    The pool's handle is what an export carries, so two products from one
     device name the same allocation at different offsets.
     """
     first = pool.reserve(4096)
@@ -47,7 +47,7 @@ def test_a_product_that_does_not_fit_is_refused_by_size(pool: VmmPool) -> None:
     """A product larger than the pool keeps its own allocation.
 
     The pool reports that it cannot hold the product rather than failing the
-    publication, so the caller decides what to do instead.
+    export, so the caller decides what to do instead.
     """
     with pytest.raises(PoolExhaustedError, match="does not fit"):
         pool.reserve(pool.capacity * 2)
@@ -64,7 +64,7 @@ def test_a_chunk_is_held_only_by_the_slots_reading_it(pool: VmmPool) -> None:
     named = (3, 7)
 
     # A chunk whose consumers never began reading holds nothing: the producer
-    # sweeps only after the engine retired the publication, and no consumer
+    # sweeps only after the engine retired the export, and no consumer
     # claims it after that.
     assert chunk.settled(named), "an unclaimed chunk is free"
 
@@ -89,7 +89,7 @@ def test_a_chunk_is_held_only_by_the_slots_reading_it(pool: VmmPool) -> None:
 def test_a_consumer_addresses_its_word_by_slot_from_the_chunk_offset(
     pool: VmmPool,
 ) -> None:
-    """A consumer locates its word from the offset the publication carries.
+    """A consumer locates its word from the offset the export carries.
 
     It maps the producer's allocation and knows only the chunk's offset and its
     own slot, so the header must be addressable by that arithmetic alone.
@@ -111,7 +111,7 @@ def test_a_consumer_addresses_its_word_by_slot_from_the_chunk_offset(
 def test_a_reused_chunk_starts_unclaimed(pool: VmmPool) -> None:
     """A chunk's words are cleared when its span is handed out again.
 
-    A stale acknowledgment would let the next publication's reader appear
+    A stale acknowledgment would let the next export's reader appear
     finished before it had read, so the pool clears the words at reservation
     rather than at release.
     """

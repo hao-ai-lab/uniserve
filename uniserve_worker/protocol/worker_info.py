@@ -436,9 +436,7 @@ class WorkerInfo:
                 return candidate.config.ranks[0]
         if self.world_size == 1:
             return 0
-        raise unsupported_setup(
-            f"component {component!r} has no publication owner"
-        )
+        raise unsupported_setup(f"component {component!r} has no export owner")
 
     @property
     def latent_capacity_units(self) -> int:

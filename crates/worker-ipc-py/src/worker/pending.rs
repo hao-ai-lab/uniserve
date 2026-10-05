@@ -45,7 +45,7 @@ pub(crate) struct PendingOutput {
     #[pyo3(get)]
     pub(super) exported_locators: Py<PyList>,
     #[pyo3(get, set)]
-    pub(super) cache_publication: Option<Py<PyAny>>,
+    pub(super) cache_export: Option<Py<PyAny>>,
     #[pyo3(get, set)]
     pub(super) cache_installation: Option<Py<PyAny>>,
     #[pyo3(get)]
@@ -114,7 +114,7 @@ impl PendingOutput {
             tensor_exports: PyDict::new(py).unbind(),
             cache_exports: PyDict::new(py).unbind(),
             exported_locators: PyList::empty(py).unbind(),
-            cache_publication: None,
+            cache_export: None,
             cache_installation: None,
             device_reads: PyList::empty(py).unbind(),
             feature_reads: PyList::empty(py).unbind(),
@@ -387,7 +387,7 @@ impl PendingOutput {
         visit.call(&self.tensor_exports)?;
         visit.call(&self.cache_exports)?;
         visit.call(&self.exported_locators)?;
-        visit.call(&self.cache_publication)?;
+        visit.call(&self.cache_export)?;
         visit.call(&self.cache_installation)?;
         visit.call(&self.device_reads)?;
         visit.call(&self.feature_reads)?;
@@ -414,7 +414,7 @@ impl PendingOutput {
         self.tensor_exports.bind(py).clear();
         self.cache_exports.bind(py).clear();
         self.exported_locators.bind(py).call_method0("clear")?;
-        self.cache_publication = None;
+        self.cache_export = None;
         self.cache_installation = None;
 
         let latent = self.latent.bind(py);
@@ -607,7 +607,7 @@ fn resolve_host(output: &Bound<'_, PendingOutput>, reports: bool) -> PyResult<()
     if reports {
         for result in results {
             if let Ok(bytes) = result.bind(py).cast::<PyBytes>() {
-                // Encoders and muxers return bytes; publication and ownership
+                // Encoders and muxers return bytes; export and ownership
                 // stay native. PyBytes keeps this immutable borrow alive while
                 // allocation and the copy run outside the interpreter.
                 let payload = bytes.as_bytes();
@@ -625,7 +625,7 @@ fn resolve_host(output: &Bound<'_, PendingOutput>, reports: bool) -> PyResult<()
 
 /// Standalone producers hand ownership to their receiving process directly.
 #[pyfunction]
-pub(super) fn publish_media_bytes(py: Python<'_>, payload: &[u8]) -> PyResult<String> {
+pub(super) fn store_media_bytes(py: Python<'_>, payload: &[u8]) -> PyResult<String> {
     if payload.is_empty() {
         return Err(PyValueError::new_err("published media must not be empty"));
     }

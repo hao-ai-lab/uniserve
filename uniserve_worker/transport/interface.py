@@ -1,10 +1,10 @@
-"""Physical product publication and asynchronous read contracts.
+"""Physical product export and asynchronous read contracts.
 
-A producer publishes a product through a `Transport` and receives a `Locator`
+A producer exports a product through a `Transport` and receives a `Locator`
 naming where its bytes are. The engine carries that locator to consumers,
 whose own transport of the same kind reads from it into a destination and
-returns a `TransferTicket`. The producer keeps the published storage
-unwritten until the publication's retirement signal completes after the
+returns a `TransferTicket`. The producer keeps the exported storage
+unwritten until the export's retirement signal completes after the
 engine releases it.
 """
 
@@ -42,7 +42,7 @@ TRANSPORTS = tuple(kind.value for kind in TransportKind)
 
 
 class Transport(ABC):
-    """Bounded physical publications and asynchronous reads per endpoint.
+    """Bounded physical exports and asynchronous reads per endpoint.
 
     ``capacity`` is the rank's byte and read-ticket budget, which every
     transport `make_transports` builds for the rank shares.
@@ -56,13 +56,13 @@ class Transport(ABC):
     def endpoint(self) -> str:
         """Return this instance's unique endpoint name.
 
-        Every locator the instance publishes carries it: a release refuses a
+        Every locator the instance exports carries it: a release refuses a
         locator from another instance, and a `local` or `cuda_vmm` read in
-        the publishing address space finds the owning instance by it.
+        the exporting address space finds the owning instance by it.
         """
 
     @abstractmethod
-    def publish(
+    def export(
         self,
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
@@ -71,17 +71,17 @@ class Transport(ABC):
     ) -> Locator:
         """Expose a descriptor and producer fence for an immutable version.
 
-        The allocation owner must retain the published range, without writes,
-        until publication_retirement() completes after release(). Keeping a
+        The allocation owner must retain the exported range, without writes,
+        until retirement() completes after release(). Keeping a
         tensor reference does not authorize reuse of an arena or page range.
 
         `consumers` are the acknowledgment slots of the ranks that read this
-        publication, as the head stated them on the producing call. A
+        export, as the head stated them on the producing call. A
         mechanism that holds storage another process reads returns it once
         each has acknowledged; a mechanism whose consumers are in this process
         or hold their own copy has nothing to wait for and ignores them.
 
-        Every implementation reserves the publication's bytes against the
+        Every implementation reserves the export's bytes against the
         rank's shared `TransferCapacity` for as long as it holds the source,
         and raises `resource_error` when that budget is exhausted.
         """
@@ -89,9 +89,9 @@ class Transport(ABC):
     def serves(self, consumers: Sequence[int]) -> bool:
         """Whether this mechanism reaches the named consumers.
 
-        A publication is made over each mechanism that reaches one of the
+        An export is made over each mechanism that reaches one of the
         acknowledgment slots the producing call names; a call that names none
-        is published over every mechanism the rank binds. A mechanism that
+        is exported over every mechanism the rank binds. A mechanism that
         reaches every consumer wherever it runs serves any call.
         """
         del consumers
@@ -113,38 +113,38 @@ class Transport(ABC):
         without dtype conversion. Backend layout restrictions are checked before
         submission. One ticket and one completion fence cover the whole read.
         An omitted destination lets the backend allocate one, or, for `local`,
-        borrow the published views themselves. The read uses a ticket of
+        borrow the exported views themselves. The read uses a ticket of
         ``reservation``, or takes one of ``capacity``'s without one, and
         raises `ReadBackpressureError` when none is free.
         """
 
     @abstractmethod
     def release(self, locator: Locator) -> Completion | None:
-        """Revoke new reads of a publication and return its retirement.
+        """Revoke new reads of an export and return its retirement.
 
-        The returned signal completes once the owner may reuse the published
+        The returned signal completes once the owner may reuse the exported
         storage. `None` means this instance holds no registration for the
         locator; `channel` always returns `None`, since it retains nothing
-        after publishing.
+        after exporting.
         """
 
     @abstractmethod
-    def publication_retirement(self, locator: Locator) -> Completion:
+    def retirement(self, locator: Locator) -> Completion:
         """Observe physical ownership completion.
 
-        The publication is not revoked.
+        The export is not revoked.
         """
 
     def reap(self) -> None:
-        """Release publications their consumers have finished acknowledging.
+        """Release exports their consumers have finished acknowledging.
 
         A consumer acknowledges a product by writing into the storage it read,
         which reaches the producer with no local notification. A transport
-        whose publications retire with their own producer has nothing to sweep.
+        whose exports retire with their own producer has nothing to sweep.
         """
 
     def awaiting_acknowledgment(self) -> bool:
-        """Report whether a retired publication still waits on a consumer.
+        """Report whether a retired export still waits on a consumer.
 
         An acknowledgment arrives with no notification, so a producer with one
         outstanding sweeps on a short period rather than on its next event.

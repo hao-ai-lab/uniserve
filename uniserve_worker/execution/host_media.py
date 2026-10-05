@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 
     from uniserve_worker.config.deployment import ComponentConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.protocol.batch import TensorPublication
+    from uniserve_worker.protocol.batch import TensorExport
     from uniserve_worker.storage.tensor_store import TensorStore
     from uniserve_worker.transport.interface import Transport
     from uniserve_worker.transport.shm import HostBorrow, ShmTransport
@@ -83,10 +83,10 @@ def encoded_unit_positions(
     return tuple(range(first, min(first + per_rank, int(params.max_units))))
 
 
-def _input_publication(
+def _input_export(
     call: Call, state: BatchState, index: int = 0
-) -> TensorPublication:
-    """Return the publication carrying one of the call's inputs."""
+) -> TensorExport:
+    """Return the export carrying one of the call's inputs."""
     if len(call.inputs) <= index:
         raise invalid_descriptor("host media call lacks its input product")
     product = call.inputs[index]
@@ -109,9 +109,9 @@ def _shm(transports: Mapping[str, Transport]) -> ShmTransport:
     return transport
 
 
-def _locations(publication: TensorPublication) -> str:
-    """Describe a publication's locations for an error naming them."""
-    tensor = publication.value.tensor
+def _locations(export: TensorExport) -> str:
+    """Describe an export's locations for an error naming them."""
+    tensor = export.value.tensor
     return "shape {} locations {}".format(
         tuple(tensor.shape),
         [
@@ -122,7 +122,7 @@ def _locations(publication: TensorPublication) -> str:
 
 
 def _borrow(
-    publication: TensorPublication,
+    export: TensorExport,
     row: int,
     *,
     transports: Mapping[str, Transport],
@@ -135,7 +135,7 @@ def _borrow(
     extent; the caller releases it, or hands it to the encode task that does.
     """
     shm = _shm(transports)
-    tensor = publication.value.tensor
+    tensor = export.value.tensor
     for location in tensor.locations:
         if not isinstance(location.transport, PosixShmTransfer):
             continue
@@ -148,7 +148,7 @@ def _borrow(
             return shm.borrow(location, region)
     raise invalid_descriptor(
         f"media unit {row} is not published over shared storage on this host: "
-        + _locations(publication)
+        + _locations(export)
     )
 
 
@@ -161,7 +161,7 @@ def read_encoded_units(
     framed bytes. Shared storage reaches this host and channel bytes reach
     other hosts. Never import the uninitialized remainder of a logical row.
 
-    Locations are tried in publication order and skipped when their
+    Locations are tried in export order and skipped when their
     mechanism is not reachable from this rank (shared storage when this rank
     binds none or it lies on another node, a local transfer when this rank
     binds none or it lies in another address space, or any other mechanism
@@ -262,7 +262,7 @@ def execute(
     state: BatchState,
     tensor_store: TensorStore,
     media_mux: MediaMux | None,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     transports: Mapping[str, Transport],
     model_runner: ModelExecutor,
 ) -> PendingOutput:
@@ -313,7 +313,7 @@ def execute(
 
         cursor = int(decode_range(call, state=state).cursor)
         config = mux_config(model_runner, media)
-        publication = _input_publication(call, state)
+        export = _input_export(call, state)
         # Batch preparation borrows the round only when it is published over
         # shared storage on this node; otherwise the tensor store holds it.
         imported = not state.inputs.is_borrowed(call.inputs[0].buffer_id)
@@ -347,9 +347,7 @@ def execute(
                 expected = frames * config.height * config.width * 3
                 source: HostBorrow | np.ndarray
                 if imported_units is None:
-                    borrow = _borrow(
-                        publication, position, transports=transports
-                    )
+                    borrow = _borrow(export, position, transports=transports)
                     borrows.append(borrow)
                     if borrow.nbytes < expected:
                         raise invalid_descriptor(
@@ -413,12 +411,12 @@ def execute(
                     (slice(index, index + 1), slice(0, framed.numel()))
                 )
             products = (
-                transfer.publish_deferred_product(
+                transfer.export_deferred_product(
                     call.outputs[0],
                     write,
                     rows,
                     tensor_store=tensor_store,
-                    publication_transports=publication_transports,
+                    export_transports=export_transports,
                     consumers=call.consumer_slots,
                     regions=regions,
                 ),
@@ -471,11 +469,11 @@ def execute(
         units: list[bytes] = []
         for index, product in enumerate(call.inputs):
             if state.inputs.is_borrowed(product.buffer_id):
-                publication = _input_publication(call, state, index)
+                export = _input_export(call, state, index)
                 units.extend(
                     read_encoded_units(
-                        publication.value.tensor,
-                        transports=publication_transports,
+                        export.value.tensor,
+                        transports=export_transports,
                     )
                 )
                 continue

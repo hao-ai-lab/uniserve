@@ -3,7 +3,7 @@
 //! A request advances through context ingestion, then either understanding
 //! decode, image generation and optional feedback, block-diffusion canvases
 //! of text, or, for a readout, canvas denoising, and finally terminal
-//! publication ([`GenerationPhase`]).
+//! export ([`GenerationPhase`]).
 //! [`RequestState`] holds the accepted progress of one admitted token request.
 //!
 //! Each `plan_*` builder returns one call whose identities are placeholders
@@ -406,7 +406,7 @@ impl RequestState {
                 self.readout_logprobs
                     .extend_from_slice(&record.candidate_logprobs);
             }
-            CallKind::Transfer(TransferMode::KvPublish) => {
+            CallKind::Transfer(TransferMode::KvExport) => {
                 self.image_conditioning = call.kv_output;
                 self.phase = GenerationPhase::PrepareGen;
             }
@@ -810,7 +810,7 @@ pub(super) fn plan_encode(
     finish_plan(request, call, 0)
 }
 
-/// Writes the closing token into KV before publication, without sampling another token.
+/// Writes the closing token into KV before export, without sampling another token.
 pub(super) fn plan_close_kv(
     request: &GenerationRequest,
     token: u32,
@@ -826,20 +826,20 @@ pub(super) fn plan_close_kv(
 
 /// Declares the physically visible KV range as a transferable input to diffusion.
 ///
-/// `publication_bytes` bounds the publication of the visible extent over
-/// every cache group (`KvCacheInfo::publication_bytes`); it also makes the
+/// `transfer_bytes` bounds the export of the visible extent over
+/// every cache group (`KvCacheInfo::transfer_bytes`); it also makes the
 /// call hold one of the scheduler's transfer reservations. Fails with
 /// `MissingProductBound` when it is zero, which includes an empty extent.
-pub(super) fn plan_kv_publish(
-    publication_bytes: u64,
+pub(super) fn plan_kv_export(
+    transfer_bytes: u64,
     request: &GenerationRequest,
 ) -> Result<Call, PlanningError> {
-    if publication_bytes == 0 {
+    if transfer_bytes == 0 {
         return Err(PlanningError::MissingProductBound);
     }
-    let mut call = computation(request, CallKind::Transfer(TransferMode::KvPublish));
+    let mut call = computation(request, CallKind::Transfer(TransferMode::KvExport));
     call.bounds.max_tokens = 0;
-    call.bounds.max_transfer_bytes = publication_bytes;
+    call.bounds.max_transfer_bytes = transfer_bytes;
     // Owner and producer are the placeholders from `computation`;
     // `register_call` stamps them.
     call.kv_output = Some(BufferId {

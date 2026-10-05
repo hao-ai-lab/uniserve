@@ -34,7 +34,7 @@ DEFAULTS: dict[str, Any] = {
     "deployment_components": ["model"],
     "supported_calls": None,
     "transfer_backends": "local",
-    "publish_backends": "local",
+    "export_backends": "local",
     "rendezvous_address": None,
     "rendezvous_listen_fd": None,
     "distributed_backend": None,

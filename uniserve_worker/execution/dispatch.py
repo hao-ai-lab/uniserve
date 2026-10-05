@@ -45,7 +45,7 @@ def execute_calls(
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -74,7 +74,7 @@ def execute_calls(
             tensor_store=tensor_store,
             worker_info=worker_info,
             latent_pool=latent_pool,
-            publication_transports=publication_transports,
+            export_transports=export_transports,
             request_tables=request_tables,
             model_runner=model_runner,
             decode_state=decode_state,
@@ -91,7 +91,7 @@ def execute_calls(
             worker_info=worker_info,
             latent_pool=latent_pool,
             media_mux=media_mux,
-            publication_transports=publication_transports,
+            export_transports=export_transports,
             transports=transports,
             request_tables=request_tables,
             request_pool=request_pool,
@@ -109,7 +109,7 @@ def _execute_actions(
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -136,7 +136,7 @@ def _execute_actions(
                     kv_cache=kv_cache,
                     tensor_store=tensor_store,
                     latent_pool=latent_pool,
-                    publication_transports=publication_transports,
+                    export_transports=export_transports,
                     request_tables=request_tables,
                     model_runner=model_runner,
                     state=state,
@@ -153,7 +153,7 @@ def _execute_actions(
                     kv_cache=kv_cache,
                     worker_info=worker_info,
                     latent_pool=latent_pool,
-                    publication_transports=publication_transports,
+                    export_transports=export_transports,
                     request_tables=request_tables,
                     model_runner=model_runner,
                     config=config,
@@ -163,7 +163,7 @@ def _execute_actions(
                 media_reader.execute(
                     call,
                     tensor_store=tensor_store,
-                    publication_transports=publication_transports,
+                    export_transports=export_transports,
                     model_runner=model_runner,
                     state=state,
                 )
@@ -174,7 +174,7 @@ def _execute_actions(
                 conditions.encode_vision(
                     call,
                     tensor_store=tensor_store,
-                    publication_transports=publication_transports,
+                    export_transports=export_transports,
                     model_runner=model_runner,
                     state=state,
                 )
@@ -185,7 +185,7 @@ def _execute_actions(
                 conditions.encode_latents(
                     call,
                     tensor_store=tensor_store,
-                    publication_transports=publication_transports,
+                    export_transports=export_transports,
                     model_runner=model_runner,
                     state=state,
                 )
@@ -193,7 +193,7 @@ def _execute_actions(
                 image.text(
                     call,
                     tensor_store=tensor_store,
-                    publication_transports=publication_transports,
+                    export_transports=export_transports,
                     model_runner=model_runner,
                     state=state,
                 )
@@ -202,7 +202,7 @@ def _execute_actions(
                     call,
                     tensor_store=tensor_store,
                     media_mux=media_mux,
-                    publication_transports=publication_transports,
+                    export_transports=export_transports,
                     transports=transports,
                     model_runner=model_runner,
                     state=state,
@@ -211,7 +211,7 @@ def _execute_actions(
                 media.execute(
                     call,
                     tensor_store=tensor_store,
-                    publication_transports=publication_transports,
+                    export_transports=export_transports,
                     request_pool=request_pool,
                     model_runner=model_runner,
                     state=state,

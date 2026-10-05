@@ -153,7 +153,7 @@ def execute(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     model_runner: ModelExecutor,
 ) -> PendingOutput:
     """Schedule one request's media reading on the rank's host lane.
@@ -221,12 +221,12 @@ def execute(
         )
 
         published = tuple(
-            transfer.publish_deferred_product(
+            transfer.export_deferred_product(
                 output,
                 write,
                 write.tensor,
                 tensor_store=tensor_store,
-                publication_transports=publication_transports,
+                export_transports=export_transports,
                 consumers=call.consumer_slots,
             )
             for output, write in products.values()

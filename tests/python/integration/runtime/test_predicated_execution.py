@@ -9,7 +9,7 @@ from tests.python.fixtures.depth_one import (
     diffusion_prepare_call,
     execution_batch,
     finalized_report,
-    kv_publication_call,
+    kv_export_call,
     record_completion,
     root_parent,
     token_call,
@@ -279,7 +279,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     )
     initial_report = finalized_report(worker, initial_report)
     initial_observation = record_completion(initial, initial_report)
-    publication, conditioning = kv_publication_call(
+    export, conditioning = kv_export_call(
         admission.request_key,
         call_id=CallId(2, 0),
         predecessor=initial_observation.call_id,
@@ -289,7 +289,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         worker.submit(
             execution_batch(
                 batch_id=2,
-                calls=(publication,),
+                calls=(export,),
                 commands=(),
             )
         ),

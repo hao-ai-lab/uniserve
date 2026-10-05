@@ -9,7 +9,7 @@ use super::{BatchState, PythonBackend};
 use crate::worker::error::{native_error, unsupported};
 use crate::worker::exports;
 use crate::worker::host::with_context;
-use crate::worker::kv_cache::{installations_from_py, publications_from_py};
+use crate::worker::kv_cache::{exports_from_py, installations_from_py};
 use crate::worker::latent::{LatentUpdate, lower_updates};
 use crate::worker::output::OutputBuffer;
 use crate::worker::pending::PendingOutput;
@@ -52,14 +52,14 @@ impl PythonBackend {
                 latents.borrow_mut(py).validate(py, &updates)?;
             } else if updates.iter().any(|update| update.params.is_some()) {
                 return Err(PyRuntimeError::new_err(
-                    "latent publication has no physical pool",
+                    "latent export has no physical pool",
                 ));
             }
             let buffer = numerical.borrow(py).output_buffer(py)?;
             OutputBuffer::seal(buffer.bind(py))?;
 
             let products = PyList::empty(py);
-            let publications = PyList::empty(py);
+            let exports = PyList::empty(py);
             let installations = PyList::empty(py);
             let tensor_exports = PyDict::new(py);
             let cache_exports = PyDict::new(py);
@@ -84,7 +84,7 @@ impl PythonBackend {
                 None => {
                     return Err(unsupported(
                         py,
-                        format!("component {component_name:?} has no publication owner",),
+                        format!("component {component_name:?} has no export owner",),
                     ));
                 }
             };
@@ -94,8 +94,8 @@ impl PythonBackend {
                 for product in pending.products.bind(py) {
                     products.append(product)?;
                 }
-                if let Some(value) = &pending.cache_publication {
-                    publications.append(value)?;
+                if let Some(value) = &pending.cache_export {
+                    exports.append(value)?;
                 }
                 if let Some(value) = &pending.cache_installation {
                     installations.append(value)?;
@@ -119,17 +119,17 @@ impl PythonBackend {
                 .runner
                 .bind(py)
                 .call_method1("execution_stats", (&numerical, started_ns, started))?;
-            let publications = publications_from_py(publications.as_any())?;
+            let exports = exports_from_py(exports.as_any())?;
             let installations = installations_from_py(installations.as_any())?;
             if let Some(cache) = &self.cache {
                 cache
                     .borrow(py)
                     .inner
-                    .validate_publications(&publications, &installations)
+                    .validate_exports(&exports, &installations)
                     .map_err(|error| native_error(py, error))?;
-            } else if !publications.is_empty() || !installations.is_empty() {
+            } else if !exports.is_empty() || !installations.is_empty() {
                 return Err(PyRuntimeError::new_err(
-                    "cache publication has no backing KV resources",
+                    "cache export has no backing KV resources",
                 ));
             }
 
@@ -180,7 +180,7 @@ impl PythonBackend {
                 cache
                     .borrow_mut(py)
                     .inner
-                    .apply_publications(publications, installations);
+                    .apply_exports(exports, installations);
             }
             for (resident, exports) in directories {
                 resident.update(exports.as_mapping())?;

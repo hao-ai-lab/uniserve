@@ -75,7 +75,7 @@ def execute_forward(
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
     decode_state: DecodeState | None,
@@ -163,7 +163,7 @@ def execute_forward(
             state=state,
             tensor_store=tensor_store,
             worker_info=worker_info,
-            publication_transports=publication_transports,
+            export_transports=export_transports,
             model_runner=model_runner,
             request_tables=request_tables,
             decode_state=decode_state,
@@ -183,7 +183,7 @@ def execute_forward(
                 state=state,
                 worker_info=worker_info,
                 latent_pool=latent_pool,
-                publication_transports=publication_transports,
+                export_transports=export_transports,
                 request_tables=request_tables,
                 model_runner=model_runner,
                 config=config,
@@ -703,7 +703,7 @@ def publish_forward_values(
     state: BatchState,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
     decode_state: DecodeState | None,
@@ -791,13 +791,13 @@ def publish_forward_values(
                 else:
                     samples.append((index, task, value, selection, None))
         elif index in images:
-            image.publish_features(
+            image.export_features(
                 call,
                 images[index],
                 value,
                 tensor_store=tensor_store,
                 worker_info=worker_info,
-                publication_transports=publication_transports,
+                export_transports=export_transports,
                 config=config,
                 state=state,
             )
@@ -807,7 +807,7 @@ def publish_forward_values(
                 raise ValueError(
                     "image decoder must declare its numerical range"
                 )
-            image.publish_image(
+            image.export_image(
                 call,
                 value.detach(),
                 layout.value_range,
@@ -839,7 +839,7 @@ def publish_forward_values(
     completed.update(index for index, _value in steps)
 
     for index, readout_values in readouts.items():
-        canvas.publish(
+        canvas.capture_readout(
             scheduled[index],
             readout_values,
             request_tables=request_tables,
@@ -872,7 +872,7 @@ def integrate_predictions(
     state: BatchState,
     worker_info: WorkerInfo,
     latent_pool: LatentPool,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
     config: WorkerConfig,
@@ -915,7 +915,7 @@ def integrate_predictions(
                 trajectories[index],
                 worker_info=worker_info,
                 latent_pool=latent_pool,
-                publication_transports=publication_transports,
+                export_transports=export_transports,
                 request_tables=request_tables,
                 config=config,
                 state=state,

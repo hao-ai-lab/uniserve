@@ -8,7 +8,7 @@ import torch
 
 from uniserve.tensors import concatenate_views
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.batch import TensorExport
 from uniserve_worker.protocol.call import Call, CallStatus
 from uniserve_worker.sampling.result import sample_columns
 
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 def validate_outputs(state: BatchState) -> None:
-    """Check numerical publications against their requested tensor views."""
+    """Check numerical exports against their requested tensor views."""
     for call, outcome in zip(
         state.batch.calls, state.pending_outputs(), strict=True
     ):
@@ -46,9 +46,7 @@ def apply_decode_state(
             or request.token_update.runtime_cache_length is not None
             for request in requests
         ):
-            raise RuntimeError(
-                "runtime state publication has no backing storage"
-            )
+            raise RuntimeError("runtime state export has no backing storage")
         return
 
     # Install lengths before advancing tokens. Decode rows share one update;
@@ -121,7 +119,7 @@ def apply_decode_state(
 
 def _validate_completion_products(
     call: Call,
-    products: tuple[TensorPublication, ...],
+    products: tuple[TensorExport, ...],
 ) -> None:
     """Require each completion product to be declared by its call.
 
@@ -160,7 +158,7 @@ def publish_predicates(*, state: BatchState, tensor_store: TensorStore) -> None:
     first = views[0]
 
     # Resolved predicates publish as 1, one scalar per producer view.
-    tensor_store.publish_writes(
+    tensor_store.write_scalars(
         writes,
         torch.ones(
             (len(writes),),

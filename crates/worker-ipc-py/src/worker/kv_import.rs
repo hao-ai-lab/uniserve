@@ -68,7 +68,7 @@ pub(crate) struct KVImport {
     #[pyo3(get)]
     initialized_units: Py<PyTuple>,
     #[pyo3(get)]
-    publication: Py<PyAny>,
+    export: Py<PyAny>,
     pub(super) completion: CopyCompletion,
     #[pyo3(get)]
     retirement: Py<Completion>,
@@ -99,7 +99,7 @@ impl KVImport {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.tables)?;
         visit.call(&self.initialized_units)?;
-        visit.call(&self.publication)?;
+        visit.call(&self.export)?;
         visit.call(&self.retirement)?;
         match &self.completion {
             CopyCompletion::Task(task) => visit.call(task)?,
@@ -212,10 +212,10 @@ impl KVImporter {
         drop(previous);
     }
 
-    #[pyo3(signature = (publication, *, request_pool_idx, tables, initialized_units, transports))]
+    #[pyo3(signature = (export, *, request_pool_idx, tables, initialized_units, transports))]
     fn reserve(
         slf: &Bound<'_, Self>,
-        publication: Py<PyAny>,
+        export: Py<PyAny>,
         request_pool_idx: usize,
         tables: Py<PyTuple>,
         initialized_units: Py<PyTuple>,
@@ -223,12 +223,9 @@ impl KVImporter {
     ) -> PyResult<Py<KVImport>> {
         let py = slf.py();
         let this = slf.borrow();
-        let source = buffer_id(&publication.bind(py).getattr("source")?)?;
-        let extent: u64 = publication
-            .bind(py)
-            .getattr("published_extent")?
-            .extract()?;
-        let groups = publication.bind(py).getattr("groups")?;
+        let source = buffer_id(&export.bind(py).getattr("source")?)?;
+        let extent: u64 = export.bind(py).getattr("exported_extent")?.extract()?;
+        let groups = export.bind(py).getattr("groups")?;
         let mut ranges = HashMap::new();
         for (table, group) in tables.bind(py).iter().zip(groups.try_iter()?) {
             let start: u64 = group?.getattr("start")?.extract()?;
@@ -259,7 +256,7 @@ impl KVImporter {
             .map(|(unit, (offset, count))| (unit, offset, count))
             .collect();
         let copy = !initialized_units.bind(py).is_empty()
-            || publication.bind(py).getattr("tensors")?.is_truthy()?;
+            || export.bind(py).getattr("tensors")?.is_truthy()?;
 
         let completion = if copy {
             CopyCompletion::Task(this.tasks.borrow(py).reserve(py)?)
@@ -274,7 +271,7 @@ impl KVImporter {
                 inner: Arc::new(NativeImport::new(source, request_pool_idx, copy)),
                 tables,
                 initialized_units,
-                publication,
+                export,
                 completion,
                 retirement: Py::new(py, Completion::new())?,
             },

@@ -52,27 +52,27 @@ impl KVCacheManager {
             .map_err(|error| native_error(py, error))
     }
 
-    fn validate_publications(
+    fn validate_exports(
         &self,
         py: Python<'_>,
-        publications: &Bound<'_, PyAny>,
+        exports: &Bound<'_, PyAny>,
         installations: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         self.inner
-            .validate_publications(
-                &publications_from_py(publications)?,
+            .validate_exports(
+                &exports_from_py(exports)?,
                 &installations_from_py(installations)?,
             )
             .map_err(|error| native_error(py, error))
     }
 
-    fn apply_publications(
+    fn apply_exports(
         &mut self,
-        publications: &Bound<'_, PyAny>,
+        exports: &Bound<'_, PyAny>,
         installations: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        self.inner.apply_publications(
-            publications_from_py(publications)?,
+        self.inner.apply_exports(
+            exports_from_py(exports)?,
             installations_from_py(installations)?,
         );
         Ok(())
@@ -259,9 +259,7 @@ fn transfer_from_py(value: &Bound<'_, PyAny>) -> PyResult<KvTransfer> {
         .ok_or_else(|| invalid(value.py(), "invalid KV transfer"))
 }
 
-pub(super) fn publications_from_py(
-    values: &Bound<'_, PyAny>,
-) -> PyResult<Vec<(BufferId, KvTransfer)>> {
+pub(super) fn exports_from_py(values: &Bound<'_, PyAny>) -> PyResult<Vec<(BufferId, KvTransfer)>> {
     values
         .try_iter()?
         .map(|value| {

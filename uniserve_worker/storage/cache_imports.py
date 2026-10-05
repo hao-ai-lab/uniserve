@@ -120,12 +120,12 @@ def _copy(
     transports: Mapping[str, Transport],
     workspace: KVWorkspace,
 ) -> None:
-    publication = write.publication
-    for index, group in enumerate(publication.groups):
+    export = write.export
+    for index, group in enumerate(export.groups):
         if not group.tensors:
             continue
 
-        if _direct(pool, publication, group, index):
+        if _direct(pool, export, group, index):
             _copy_direct(pool, importer, write, index, group, transports)
         else:
             _copy_converted(
@@ -161,7 +161,7 @@ def _fetch(
 
 def _direct(
     pool: KVCacheManager,
-    publication: KvTransfer,
+    export: KvTransfer,
     group: KvGroupTransfer,
     index: int,
 ) -> bool:
@@ -185,7 +185,7 @@ def _direct(
         # A partial installed page owns its destination scale. Its base
         # may have arrived through another TP layout.
         and group.start % page_tokens == 0
-        and publication.compute_dtype
+        and export.compute_dtype
         == str(pool.compute_dtypes[index]).removeprefix("torch.")
         and advertised.kv_head_offset // group.scale_head_size
         == (advertised.kv_head_offset + advertised.num_kv_heads - 1)
@@ -204,11 +204,11 @@ def _copy_direct(
     """Fetch one group's source values, and FP8 scales, into its units.
 
     The fetch region selects each of this worker's layers and KV heads
-    by their offsets on the publication's group layer and head axes.
+    by their offsets on the export's group layer and head axes.
     """
-    publication = write.publication
+    export = write.export
     table = write.tables[index]
-    carried = publication.published_extent - group.start
+    carried = export.exported_extent - group.start
     advertised = pool.info.groups[index]
     axis = pool.axes[index]
     cache_group = pool.cache.groups[index]
@@ -217,15 +217,13 @@ def _copy_direct(
     # Pages the carried tokens touch, as (absolute page, offset, count).
     pages = []
     position = group.start
-    while position < publication.published_extent:
+    while position < export.exported_extent:
         page, offset = divmod(position, page_tokens)
-        count = min(
-            publication.published_extent - position, page_tokens - offset
-        )
+        count = min(export.exported_extent - position, page_tokens - offset)
         pages.append((page, offset, count))
         position += count
 
-    # ``layer`` indexes the publication's group layer axis.
+    # ``layer`` indexes the export's group layer axis.
     for column_index, name in enumerate(cache_group.layers):
         row = column_index // columns
         units = table.row(row)
@@ -332,10 +330,10 @@ def _copy_converted(
     sources are copied as fetched. Each layer is then written through
     `mha.State.copy_region`, which applies the destination encoding.
     """
-    publication = write.publication
+    export = write.export
     table = write.tables[index]
     start = group.start
-    carried = publication.published_extent - start
+    carried = export.exported_extent - start
     advertised = pool.info.groups[index]
     axis = pool.axes[index]
     cache_group = pool.cache.groups[index]
@@ -387,7 +385,7 @@ def _copy_converted(
             head_end = (
                 advertised.kv_head_offset + num_heads - 1
             ) // group.scale_head_size + 1
-            # Source scale rows cover the publication pages this span
+            # Source scale rows cover the export pages this span
             # touches, counted from the source page holding the first
             # carried token.
             scale_start = (
@@ -421,7 +419,7 @@ def _copy_converted(
                 values = workspace.values[:elements].view(count, *trailing)
                 # Intersect source scale pages and head groups here; the
                 # numerical cache library owns decoding and rounding.
-                compute_dtype = getattr(torch, publication.compute_dtype)
+                compute_dtype = getattr(torch, export.compute_dtype)
                 # Rounding scratch lies in the raw page past the FP8
                 # input, which occupies at most its first eighth. FP32 and
                 # FP64 compute dtypes need no rounding scratch.

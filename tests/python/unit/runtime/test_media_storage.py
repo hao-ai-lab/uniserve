@@ -6,7 +6,7 @@ from multiprocessing import shared_memory
 
 import pytest
 
-from uniserve_worker._uniserve_ipc import publish_media_bytes
+from uniserve_worker._uniserve_ipc import store_media_bytes
 
 pytestmark = pytest.mark.unit
 
@@ -16,8 +16,8 @@ def test_media_remains_available_after_its_publisher_exits():
         [
             sys.executable,
             "-c",
-            "from uniserve_worker._uniserve_ipc import publish_media_bytes; "
-            "print(publish_media_bytes(b'encoded media'))",
+            "from uniserve_worker._uniserve_ipc import store_media_bytes; "
+            "print(store_media_bytes(b'encoded media'))",
         ],
         check=True,
         capture_output=True,
@@ -34,4 +34,4 @@ def test_media_remains_available_after_its_publisher_exits():
 
 def test_empty_media_is_refused():
     with pytest.raises(ValueError, match="empty"):
-        publish_media_bytes(b"")
+        store_media_bytes(b"")

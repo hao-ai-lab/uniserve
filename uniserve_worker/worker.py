@@ -267,7 +267,7 @@ class Worker:
                 flow_prompt=loaded.flow_prompt,
                 allowed_calls=config.supported_calls,
                 transfer_backends=config.data_plane.backends,
-                publication_backends=config.data_plane.publication_backends,
+                export_backends=config.data_plane.export_backends,
                 worker_id=config.worker_id,
                 model_name=loaded.model_name,
                 attention_ranks=0
@@ -306,7 +306,7 @@ class Worker:
         products_cross_hosts: bool = False,
         attention: str | None = None,
         transfer_backends: tuple[str, ...] = ("local",),
-        publication_backends: tuple[str, ...] = ("local",),
+        export_backends: tuple[str, ...] = ("local",),
         worker_id: str = "worker",
         image_processor: ImageProcessor | None = None,
         flow_prompt: FlowPrompt | None = None,
@@ -357,12 +357,12 @@ class Worker:
                 )
 
             if (
-                not publication_backends
-                or len(set(publication_backends)) != len(publication_backends)
-                or not set(publication_backends).issubset(transfer_backends)
+                not export_backends
+                or len(set(export_backends)) != len(export_backends)
+                or not set(export_backends).issubset(transfer_backends)
             ):
                 raise unsupported_setup(
-                    "publication backends must be unique bound transports"
+                    "export backends must be unique bound transports"
                 )
 
             if (
@@ -690,12 +690,12 @@ class Worker:
                 or runner.state_buffers
             ):
                 # Each live request tensor reserves one credit per
-                # publication representation and one read credit on every
+                # export representation and one read credit on every
                 # possible remote rank. These credits bound ownership
                 # lifetimes. The CUDA VMM transport also sizes its device
                 # pool (``VmmPool``) from them, reserved on a device's first
-                # publication of storage that cannot be exported in place.
-                transfer_byte_capacity *= len(publication_backends) + max(
+                # export of storage that cannot be exported in place.
+                transfer_byte_capacity *= len(export_backends) + max(
                     0, int(worker_config.world_size) - 1
                 )
 
@@ -712,8 +712,8 @@ class Worker:
             for transport in self.transports.values():
                 startup.callback(transport.close)
 
-            self.publication_transports = {
-                name: self.transports[name] for name in publication_backends
+            self.export_transports = {
+                name: self.transports[name] for name in export_backends
             }
 
             if owns_kv:
@@ -1017,7 +1017,7 @@ class Worker:
                 self.device_events,
                 self.host_tasks,
                 self.transports,
-                self.publication_transports,
+                self.export_transports,
             )
 
     def set_completion_wake(

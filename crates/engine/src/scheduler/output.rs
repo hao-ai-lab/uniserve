@@ -1,4 +1,4 @@
-//! Client-visible event publication and per-request output accounting.
+//! Client-visible event export and per-request output accounting.
 //!
 //! Events accumulate in request-local journals when the bounded consumer channel
 //! is full, preserving order without blocking the engine owner thread.
@@ -83,7 +83,7 @@ pub(super) struct RequestOutput {
     pub(super) prompt_logprobs_emitted: usize,
     /// Ends of the tokens each resolved token-producing call published,
     /// awaiting a stop-string decoder decision, as `tokens_sent` values in
-    /// publication order. Populated only for requests with stop strings;
+    /// export order. Populated only for requests with stop strings;
     /// `usize::MAX` marks the call being resolved. `can_schedule_next`
     /// refuses another call while the queue holds `max_unresolved_calls`
     /// entries; acknowledgements drain it, and a non-error finish waits until
@@ -105,7 +105,7 @@ impl RequestOutput {
     }
 }
 
-/// Ordered publication shared by token and media requests. Progress can be
+/// Ordered export shared by token and media requests. Progress can be
 /// coalesced while terminal events retain their place until the caller reads.
 ///
 /// The journal holds at most `OUTPUT_JOURNAL_CAPACITY` events beyond what the
@@ -357,7 +357,7 @@ impl Scheduler {
     /// accepted progress, so the cursors, encoder indices, denoising step count,
     /// and phase read here reflect this completion. Resolution adds the
     /// remaining effects for the call's kind, such as stop conditions,
-    /// image-branch triggers, prefix- and encoder-cache publication, feedback
+    /// image-branch triggers, prefix- and encoder-cache export, feedback
     /// state, and public events. `media`
     /// carries the base64 PNG artifact of an image-decoding completion.
     ///
@@ -943,7 +943,7 @@ impl Scheduler {
             | CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::VideoEncoding)
             | CallKind::Transfer(TransferMode::Tensor)
-            | CallKind::Transfer(TransferMode::KvPublish)
+            | CallKind::Transfer(TransferMode::KvExport)
             | CallKind::Transfer(TransferMode::KvInstall) => {}
         }
     }
@@ -1635,7 +1635,7 @@ impl Scheduler {
             return;
         };
 
-        // The request's prompt, hashes and publication progress are borrowed
+        // The request's prompt, hashes and export progress are borrowed
         // beside its tables for the duration of the update.
         let prompt = std::mem::take(&mut state.req.prompt_token_ids);
         let hashes = std::mem::take(&mut state.prefix_page_hashes);

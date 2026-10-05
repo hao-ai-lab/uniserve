@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     from uniserve_worker.model_executor.output import ExecutionOutput
     from uniserve_worker.protocol.batch import (
         DecodeRange,
-        TensorPublication,
+        TensorExport,
     )
     from uniserve_worker.protocol.call import Call
     from uniserve_worker.protocol.tensor import OutputInfo
@@ -283,7 +283,7 @@ def _consume_whole(
 def _outcome(
     call: Call,
     request: PendingOutput,
-    products: tuple[TensorPublication, ...],
+    products: tuple[TensorExport, ...],
     result: ExecutionOutput,
     state: BatchState,
 ) -> PendingOutput:
@@ -300,7 +300,7 @@ def encode_vision(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     model_runner: ModelExecutor,
 ) -> PendingOutput:
     """Encode a request's vision blocks into one row per placeholder.
@@ -327,11 +327,11 @@ def encode_vision(
         model_runner=model_runner,
     )
     features, result = vision_features(video, patches, model_runner)
-    products = transfer.publish_tensors(
+    products = transfer.export_tensors(
         call,
         (features,),
         tensor_store=tensor_store,
-        publication_transports=publication_transports,
+        export_transports=export_transports,
         state=state,
     )
     return _outcome(call, request, products, result, state)
@@ -550,7 +550,7 @@ def encode_latents(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     model_runner: ModelExecutor,
 ) -> PendingOutput:
     """Encode one round of a request's condition latents.
@@ -595,11 +595,11 @@ def encode_latents(
         rows, result = encode_units(video, run, source, model_runner)
     else:
         rows, result = encode_tracks(video, source, model_runner)
-    products = transfer.publish_tensors(
+    products = transfer.export_tensors(
         call,
         (rows,),
         tensor_store=tensor_store,
-        publication_transports=publication_transports,
+        export_transports=export_transports,
         state=state,
     )
     return _outcome(call, request, products, result, state)

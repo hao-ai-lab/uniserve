@@ -46,7 +46,7 @@ from uniserve_worker.protocol.batch import (
     DecodeRange,
     MediaTrack,
     NewRequest,
-    TensorPublication,
+    TensorExport,
 )
 from uniserve_worker.protocol.call import Call, MediaCall
 from uniserve_worker.storage.latent_pool import LatentUpdate
@@ -666,7 +666,7 @@ def sample_generation(step: int) -> int:
 def sample_update(
     slot: int, params, *, step: int, previous: int | None
 ) -> LatentUpdate:
-    """Describe the pool publication of a trajectory's successor.
+    """Describe the pool export of a trajectory's successor.
 
     ``previous`` is the committed step the successor advances, or ``None``
     for the prepared trajectory at step zero.
@@ -774,7 +774,7 @@ def execute(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     request_pool: RequestPool,
     model_runner: ModelExecutor,
 ) -> PendingOutput:
@@ -788,7 +788,7 @@ def execute(
     returned output, which the batch commit applies to the latent pool; a
     denoising step also advances the output's ``flow_step``. Nothing here
     commits request progress. Returns the call's ``PendingOutput`` with an
-    ``OK`` status and its publications. Raises ``invalid_descriptor`` when
+    ``OK`` status and its exports. Raises ``invalid_descriptor`` when
     the call, its inputs, parameters or progress disagree with the admitted
     request or this rank's model, and ``RuntimeError`` when the rank lacks
     the call's storage or capability or a module returns no statistics;
@@ -818,7 +818,7 @@ def execute(
     builder = model_runner.media_builder
     pool = model_runner.latent_pool
     slot_index = request.request.request_pool_idx
-    products: tuple[TensorPublication, ...] = ()
+    products: tuple[TensorExport, ...] = ()
     if call.kind is MediaCall.LATENT_PREPARATION:
         # Batch preparation validated the call's pages and interval.
         params = trajectory_params(call, state=state)
@@ -984,11 +984,11 @@ def execute(
                 raise invalid_descriptor(
                     "final latent products require completed denoising"
                 )
-            products = transfer.publish_tensors(
+            products = transfer.export_tensors(
                 call,
                 result.values,
                 tensor_store=tensor_store,
-                publication_transports=publication_transports,
+                export_transports=export_transports,
                 state=state,
             )
 
@@ -1087,11 +1087,11 @@ def execute(
         # Decoded media units are host products: a host rank's encoder reads
         # them in place from the segment this rank publishes, over the host
         # mechanism of its edges.
-        products = transfer.publish_tensors(
+        products = transfer.export_tensors(
             call,
             values,
             tensor_store=tensor_store,
-            publication_transports=publication_transports,
+            export_transports=export_transports,
             state=state,
             host=True,
         )

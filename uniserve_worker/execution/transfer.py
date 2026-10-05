@@ -1,16 +1,16 @@
 """Product, KV, and latent movement with no model call.
 
 ``execute`` runs the ``TransferMode`` calls that ``schedule`` dispatches: KV
-publication and installation through ``KVCacheManager``, and product
+export and installation through ``KVCacheManager``, and product
 transfers that republish one resident tensor or the committed trajectory's
-current latent pages. The publication helpers are shared with the image,
+current latent pages. The export helpers are shared with the image,
 media, diffusion and host-media call paths.
 
-Every tensor publication checks the physical tensor against the product's
-declared shape bound, dtype and byte size before exporting it. Publications made
+Every tensor export checks the physical tensor against the product's
+declared shape bound, dtype and byte size before exporting it. Exports made
 during execution record their locators on the call's ``PendingOutput``:
 The native executor commits the exports or releases them after a failed batch.
-``publish_deferred_product`` runs after its call committed and registers and
+``export_deferred_product`` runs after its call committed and registers and
 commits its export with ``TensorStore`` directly.
 """
 
@@ -28,7 +28,7 @@ from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls as calls
 from uniserve_worker.execution.output import PendingOutput
-from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.batch import TensorExport
 from uniserve_worker.protocol.call import Call, TransferMode
 from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import (
@@ -45,7 +45,7 @@ from uniserve_worker.storage.tensor_store import (
     ImageMetadata,
     device_product_storage,
 )
-from uniserve_worker.transport.publication import publish_tensor
+from uniserve_worker.transport.exports import export_tensor
 
 if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
@@ -63,47 +63,47 @@ def execute(
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
 ) -> PendingOutput:
     """Execute one transfer call and stage its outcome.
 
-    ``KV_PUBLISH`` exports the request's visible KV extent under the call's
+    ``KV_EXPORT`` exports the request's visible KV extent under the call's
     KV output identity. ``KV_INSTALL`` adopts the physical import reserved
     for the call's KV input and sets the staged visible and computed KV
     lengths to its published extent. Any other mode republishes the call's
     single tensor input as its single output.
 
     Raises:
-        WorkerError: ``unsupported_setup`` when no publication transport or,
+        WorkerError: ``unsupported_setup`` when no export transport or,
             for a latent transfer, no latent pool is configured;
             ``invalid_descriptor`` when, for example, KV storage, a declared
             identity or a reserved input is missing.
     """
     from uniserve_worker.execution import image
 
-    transports = publication_transports
+    transports = export_transports
     if not transports:
         raise unsupported_setup(
             "product transfer requires a configured transport"
         )
     request_id = call.request_key.request_id
     mode = call.kind
-    if mode is TransferMode.KV_PUBLISH:
-        publications = kv_cache
-        if publications is None:
-            raise invalid_descriptor("KV publication requires cache storage")
+    if mode is TransferMode.KV_EXPORT:
+        exports = kv_cache
+        if exports is None:
+            raise invalid_descriptor("KV export requires cache storage")
         output = call.kv_output
         if output is None:
             raise invalid_descriptor(
-                "KV publication requires a cache output identity"
+                "KV export requires a cache output identity"
             )
         request = state.pending_output(request_id)
 
         # (request slot, accepted visible length, capacity).
         cache = request.cache_coordinates(request_tables)
-        snapshot = publications.publish(
+        snapshot = exports.export(
             request_pool_idx=request.request.request_pool_idx,
             visible_length=cache[1],
             destination="gen",
@@ -111,7 +111,7 @@ def execute(
             transports=transports,
             consumers=call.consumer_slots,
         )
-        request.cache_publication = (output, snapshot)
+        request.cache_export = (output, snapshot)
 
         for tensor in snapshot.tensors:
             for locator in tensor.locations:
@@ -126,8 +126,8 @@ def execute(
         outcome = image.non_state_outcome(call, state=state)
         outcome.set_kv_output(snapshot)
     elif mode is TransferMode.KV_INSTALL:
-        publications = kv_cache
-        if publications is None:
+        exports = kv_cache
+        if exports is None:
             raise invalid_descriptor("KV installation requires cache storage")
         source = call.kv_input
         output = call.kv_output
@@ -141,14 +141,14 @@ def execute(
             raise invalid_descriptor(
                 "KV installation has no reserved physical input"
             )
-        installed = publications.install(
+        installed = exports.install(
             installed_buffer=output,
             write=write,
         )
         request.cache_installation = (source, output, installed)
 
         outcome = image.non_state_outcome(call, state=state)
-        outcome.set_cache_length(int(installed.published_extent))
+        outcome.set_cache_length(int(installed.exported_extent))
     else:
         inputs = call.tensor_inputs()
         outputs = call.tensor_outputs()
@@ -161,12 +161,12 @@ def execute(
                 raise unsupported_setup(
                     "latent transfer requires a physical latent pool"
                 )
-            tensor_publication = _publish_current_latent(
+            tensor_export = _publish_current_latent(
                 call,
                 inputs[0],
                 outputs[0],
                 latent_pool=latent_pool,
-                publication_transports=publication_transports,
+                export_transports=export_transports,
                 state=state,
             )
         else:
@@ -176,17 +176,17 @@ def execute(
                 model_runner=model_runner,
                 state=state,
             )
-            tensor_publication = publish_product(
+            tensor_export = export_product(
                 outputs[0],
                 value,
                 metadata,
                 tensor_store=tensor_store,
-                publication_transports=publication_transports,
+                export_transports=export_transports,
                 state=state,
             )
         outcome = image.non_state_outcome(
             call,
-            products=(tensor_publication,),
+            products=(tensor_export,),
             state=state,
         )
     return outcome
@@ -199,14 +199,14 @@ def _publish_current_latent(
     *,
     state: BatchState,
     latent_pool: LatentPool,
-    publication_transports: Mapping[str, Transport],
-) -> TensorPublication:
+    export_transports: Mapping[str, Transport],
+) -> TensorExport:
     """Publish the committed trajectory's current latent pages as a product.
 
     ``LatentPool.reserve_current_export`` requires the staged start
     step, the input's generation, units, raster and pages to match the
     slot's committed trajectory. The product must be the call's declared
-    latent output, and publication leaves the request's generation and step
+    latent output, and export leaves the request's generation and step
     unchanged.
     """
     if product != call.latent_output:
@@ -231,18 +231,18 @@ def _publish_current_latent(
         width=params.width,
     )
 
-    return publish_latent_source(
+    return export_latent_source(
         product,
         source,
         row,
         step=params.start_step,
         latent_pool=latent_pool,
-        publication_transports=publication_transports,
+        export_transports=export_transports,
         state=state,
     )
 
 
-def publish_latent_source(
+def export_latent_source(
     product: TensorRef,
     source: LatentExport,
     row: PendingOutput,
@@ -250,8 +250,8 @@ def publish_latent_source(
     state: BatchState,
     step: int,
     latent_pool: LatentPool,
-    publication_transports: Mapping[str, Transport],
-) -> TensorPublication:
+    export_transports: Mapping[str, Transport],
+) -> TensorExport:
     """Publish reserved latent page spans as one latent product.
 
     The spans are published as a ``[latent_units, latent_width]`` tensor in
@@ -262,14 +262,12 @@ def publish_latent_source(
     """
     params = row.latent.input_params
     if params is None:
-        raise invalid_descriptor("latent publication has no staged parameters")
+        raise invalid_descriptor("latent export has no staged parameters")
 
     request = state.pending_output(product.request_key.request_id)
-    transports = publication_transports
+    transports = export_transports
     if not transports:
-        raise unsupported_setup(
-            "latent publication requires a configured transport"
-        )
+        raise unsupported_setup("latent export requires a configured transport")
 
     pool = latent_pool
     shape = (params.latent_units, pool.latent_width)
@@ -281,10 +279,10 @@ def publish_latent_source(
         product,
     ):
         raise invalid_descriptor(
-            "latent publication disagrees with its declared representation"
+            "latent export disagrees with its declared representation"
         )
 
-    locations = publish_tensor(
+    locations = export_tensor(
         transports,
         source.spans,
         retain=partial(pool.retain_export, source),
@@ -302,22 +300,22 @@ def publish_latent_source(
         step=step,
         tensor=TensorTransfer(shape=shape, locations=locations),
     )
-    return TensorPublication(product=product, value=descriptor)
+    return TensorExport(product=product, value=descriptor)
 
 
-def publish_tensors(
+def export_tensors(
     call: Call,
     values: tuple[torch.Tensor, ...],
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     host: bool = False,
-) -> tuple[TensorPublication, ...]:
+) -> tuple[TensorExport, ...]:
     """Publish each numerical result from the rank owning its assigned region.
 
     Only outputs for which this rank holds a non-feature write are published;
-    the others are skipped, so the result may hold fewer publications than
+    the others are skipped, so the result may hold fewer exports than
     ``values``. A product published as `host` travels as host bytes over the
     host mechanism of the rank's edges, whatever device produced it.
     """
@@ -329,12 +327,12 @@ def publish_tensors(
     request = state.pending_output(call.request_key.request_id)
     owned = {write.reference for write in request.writes if not write.feature}
     return tuple(
-        publish_product(
+        export_product(
             output,
             value,
             None,
             tensor_store=tensor_store,
-            publication_transports=publication_transports,
+            export_transports=export_transports,
             state=state,
             consumers=call.consumer_slots,
             host=host,
@@ -344,17 +342,17 @@ def publish_tensors(
     )
 
 
-def publish_product(
+def export_product(
     product: TensorRef,
     value: torch.Tensor,
     source_metadata: ImageMetadata | FeatureMetadata | None,
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     consumers: Sequence[int] = (),
     host: bool = False,
-) -> TensorPublication:
+) -> TensorExport:
     """Publish one encoder-feature or device product from ``value``.
 
     A product the call reserved as a feature write carries its spatial
@@ -362,23 +360,23 @@ def publish_product(
     producing call's vision or latent feature input. Any other product
     fills its bound device write, possibly as a region of a larger logical
     tensor. The value is validated against the declared representation,
-    written through ``TensorStore.publish_write`` and exported; the locators
+    written through ``TensorStore.write`` and exported; the locators
     are recorded on the product's pending output.
 
     `consumers` are the acknowledgment slots the producing call names; a
     `host` product is published as host bytes.
 
     Raises:
-        WorkerError: ``unsupported_setup`` without a publication transport;
+        WorkerError: ``unsupported_setup`` without an export transport;
             ``invalid_descriptor`` when the metadata, region or
             representation disagrees with the product.
     """
     from uniserve_worker.execution.image import bound_device_write
 
-    transports = publication_transports
+    transports = export_transports
     if not transports:
         raise unsupported_setup(
-            "product publication requires a configured transport"
+            "product export requires a configured transport"
         )
 
     request = state.pending_output(product.request_key.request_id)
@@ -445,9 +443,7 @@ def publish_product(
         else tuple(value.shape)
     )
     if shape is None:
-        raise invalid_descriptor(
-            "tensor region publication has no logical shape"
-        )
+        raise invalid_descriptor("tensor region export has no logical shape")
 
     if not _representation_matches_product(
         shape,
@@ -459,12 +455,12 @@ def publish_product(
             "product transfer changes its declared representation"
         )
     if encoder_write is not None:
-        value = tensor_store.publish_write(
+        value = tensor_store.write(
             encoder_write, value, metadata=source_metadata
         )
     else:
         assert device_write is not None
-        value = tensor_store.publish_write(
+        value = tensor_store.write(
             device_write,
             value,
             metadata=source_metadata,
@@ -476,7 +472,7 @@ def publish_product(
         assert device_write is not None
         retain = partial(tensor_store.retain_export, device_write)
 
-    locations = publish_tensor(
+    locations = export_tensor(
         transports,
         value,
         retain=retain,
@@ -504,33 +500,33 @@ def publish_product(
             tensor=TensorTransfer(shape=shape, locations=locations),
         )
 
-    return TensorPublication(product=product, value=descriptor)
+    return TensorExport(product=product, value=descriptor)
 
 
-def publish_deferred_product(
+def export_deferred_product(
     product: TensorRef,
     write: Buffer,
     value: torch.Tensor,
     *,
     tensor_store: TensorStore,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     consumers: Sequence[int],
     regions: Sequence[tuple[slice, ...]] | None = None,
-) -> TensorPublication:
+) -> TensorExport:
     """Publish a product whose write host work filled after its call committed.
 
     The committed call released its execution references, so the caller
     hands over the write it retained. The product is published as host
     bytes, registered for retirement, and committed here; the caller reports
-    the publication with the completion the work belongs to. If only regions
+    the export with the completion the work belongs to. If only regions
     are initialized, publish those views at their logical offsets. Consumers
     must read these regions rather than the uninitialized reserved capacity.
     If publishing any view fails, the views already published are released
     before the error propagates.
     """
-    if not publication_transports:
+    if not export_transports:
         raise unsupported_setup(
-            "product publication requires a configured transport"
+            "product export requires a configured transport"
         )
     region = write.region
     if region is not None and tuple(value.shape) != _slices.shape(region):
@@ -539,9 +535,7 @@ def publish_deferred_product(
         )
     shape = write.logical_shape if region is not None else tuple(value.shape)
     if shape is None:
-        raise invalid_descriptor(
-            "tensor region publication has no logical shape"
-        )
+        raise invalid_descriptor("tensor region export has no logical shape")
     if not _representation_matches_product(
         shape,
         str(value.dtype).removeprefix("torch."),
@@ -551,7 +545,7 @@ def publish_deferred_product(
         raise invalid_descriptor(
             "product transfer changes its declared representation"
         )
-    value = tensor_store.publish_write(write, value, metadata=None)
+    value = tensor_store.write(write, value, metadata=None)
     views = (
         regions
         if regions is not None
@@ -562,12 +556,10 @@ def publish_deferred_product(
     try:
         for view in views:
             if not _slices.within(view, value.shape):
-                raise invalid_descriptor(
-                    "publication exceeds its product region"
-                )
+                raise invalid_descriptor("export exceeds its product region")
             locations.extend(
-                publish_tensor(
-                    publication_transports,
+                export_tensor(
+                    export_transports,
                     value[view],
                     retain=partial(tensor_store.retain_export, write),
                     offset=tuple(
@@ -582,14 +574,14 @@ def publish_deferred_product(
             )
     except BaseException:
         for location in locations:
-            publication_transports[location.backend].release(location)
+            export_transports[location.backend].release(location)
         raise
     tensor_store.exports[product.buffer_id] = tuple(
-        (publication_transports[location.backend], location)
+        (export_transports[location.backend], location)
         for location in locations
     )
     tensor_store.commit_writes((write,))
-    return TensorPublication(
+    return TensorExport(
         product=product,
         value=DeviceProductTransferValue(
             height=0,
