@@ -166,7 +166,7 @@ def prepare_latent(
             "latent output"
         )
     request = state.pending_output(request_id)
-    cache = calls.cache_coordinates(request, tables=request_tables)
+    cache = request.cache_coordinates(request_tables)
     publications = kv_cache
     if publications is None:
         raise invalid_descriptor(
@@ -267,7 +267,7 @@ def prepare_latent(
         config=config,
         state=state,
     )
-    request.progress = calls.execution_runtime(request, cache, flow_step=0)
+    request.set_cache_length(cache[1])
     request.products = products
     return request
 
@@ -301,7 +301,7 @@ def initialize(
             "input/output generation"
         )
     request = state.pending_output(request_id)
-    cache = calls.cache_coordinates(request, tables=request_tables)
+    cache = request.cache_coordinates(request_tables)
     publications = kv_cache
     if publications is None:
         raise invalid_descriptor(
@@ -593,11 +593,7 @@ def finish(
         state=state,
     )
     kv = kv_conditioning(trajectory)
-    request.progress = calls.execution_runtime(
-        request,
-        kv.cache,
-        flow_step=final_step,
-    )
+    request.set_cache_length(kv.cache[1])
     request.products = products
 
     # Branch prefixes live in pool slots separate from the request's own KV;

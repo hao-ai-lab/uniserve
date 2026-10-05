@@ -28,7 +28,6 @@ import math
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
@@ -1848,7 +1847,7 @@ def _stage_input_products(
                 width=value.width,
             )
             row.latent.imported = True
-            request.progress = replace(request.progress, flow_step=value.step)
+            request.set_flow_step(value.step)
             continue
 
         consumers = tuple(

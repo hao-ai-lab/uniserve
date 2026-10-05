@@ -6,7 +6,7 @@ use uniserve_worker_ipc::{
     TimingCounters,
 };
 
-use crate::{Error, OutputBuffer, RequestPool, RequestProgress, Result};
+use crate::{Error, LatentUpdate, OutputBuffer, RequestPool, RequestProgress, Result};
 
 // sampling_columns packs [valid | active | token | accepted draft count],
 // with one word per row in each field. Canvas completion starts with its outcome.
@@ -81,6 +81,42 @@ impl PendingOutput {
             return Err(Error::State("call output is not resolved"));
         }
         Ok(&self.output)
+    }
+
+    /// Advance token execution before numerical state is committed. M-RoPE
+    /// consumers may supply an absolute position instead of a token offset.
+    pub fn advance_tokens(
+        &mut self,
+        tokens: u64,
+        cache_length: Option<u64>,
+        position: Option<u64>,
+        sampled: bool,
+    ) {
+        self.progress.logical_position =
+            position.unwrap_or_else(|| self.progress.logical_position + tokens);
+        self.progress.rng_counter += u64::from(sampled);
+        if let Some(length) = cache_length {
+            self.set_cache_length(length);
+        }
+    }
+
+    /// Ordinary forwards and imported KV expose their complete written extent.
+    /// Speculative verification retains its distinct initialized extent.
+    pub fn set_cache_length(&mut self, length: u64) {
+        self.progress.kv_visible_len = length;
+        self.progress.kv_computed_len = length;
+    }
+
+    /// Mirror a validated physical trajectory commit in the call's progress.
+    /// Releasing the trajectory ends its solver sequence.
+    pub fn apply_latent_update(&mut self, update: &LatentUpdate) {
+        if update.params.is_some() {
+            self.progress.flow_step = if update.release {
+                0
+            } else {
+                update.step as u64
+            };
+        }
     }
 
     /// Verification initializes KV for the full draft. Acceptance later makes

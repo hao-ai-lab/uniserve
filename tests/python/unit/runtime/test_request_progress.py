@@ -61,11 +61,13 @@ def test_late_result_cannot_regress_progress_or_retire_pending_work():
         pool.finish(key)
         assert not pool.retirement_ready(key)
 
+        initial = pool.get(key.request_id).accepted_progress
         accepted = RequestProgress(flow_step=2)
         pool.apply_result(
             RequestResult(key, second.call_id, CallStatus.OK, accepted)
         )
         assert pool.get(key.request_id).accepted_progress == accepted
+        assert initial == RequestProgress()
         assert not pool.retirement_ready(key)
 
         pool.apply_result(

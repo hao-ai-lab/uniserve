@@ -16,7 +16,6 @@ the ``*_outcome`` helpers stage a call's successful ``PendingOutput``.
 from __future__ import annotations
 
 import math
-from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
@@ -31,7 +30,7 @@ from uniserve.processing import (
 )
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import calls, transfer
+from uniserve_worker.execution import transfer
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.codec import (
@@ -439,7 +438,6 @@ def publish_image(
         max_bytes=int(call.bounds.max_completion_bytes),
         state=state,
     )
-    request.progress = replace(request.progress, flow_step=0)
     request.latent.update.params = params
     request.latent.update.generation = int(latent_input.generation)
     request.latent.update.step = int(params.start_step)
@@ -458,23 +456,21 @@ def state_outcome(
 
     The reported KV length is the staged ``runtime_cache_length`` when one
     exists, otherwise the request's visible KV length as checked against its
-    block table by ``calls.cache_coordinates``.
+    block table by ``PendingOutput.cache_coordinates``.
 
     Raises:
-        WorkerError: When ``calls.cache_coordinates`` rejects the request's
+        WorkerError: When the native cache query rejects the request's
             KV coordinates.
         RuntimeError: When the staged length is a device tensor.
     """
     request = state.pending_output(call.request_key.request_id)
-    cache = calls.cache_coordinates(request, tables=request_tables)
+    cache = request.cache_coordinates(request_tables)
     selected = request.token_update.runtime_cache_length
     if selected is None:
         selected = cache[1]
     if not isinstance(selected, int):
         raise RuntimeError("visual state completion has a dynamic KV length")
-    cache = (cache[0], selected, cache[2])
-
-    request.progress = calls.execution_runtime(request, cache)
+    request.set_cache_length(selected)
     request.products = products
     return request
 
@@ -583,10 +579,10 @@ def vision_state_row(
     Raises:
         WorkerError: When the model declares no feature injection, the
             features are not ``[tokens, hidden]``, or ``seq_len`` exceeds
-            the request's allocated KV (``calls.cache_coordinates``).
+            the request's allocated KV (``PendingOutput.cache_coordinates``).
     """
     request = state.pending_output(call.request_key.request_id)
-    cache = calls.cache_coordinates(request, tables=request_tables)
+    cache = request.cache_coordinates(request_tables)
     if seq_len < cache[1] or seq_len > cache[2]:
         raise invalid_descriptor(
             "vision row prefix lies outside the request's KV extent"
@@ -787,9 +783,8 @@ def latent_state_row(
     positions[0, 0] = conditioning_position
     positions[0, -1] = conditioning_position + builder.rope_advance
 
-    cache = calls.cache_coordinates(
-        state.pending_output(call.request_key.request_id),
-        tables=request_tables,
+    cache = state.pending_output(call.request_key.request_id).cache_coordinates(
+        request_tables
     )
     return DiffusionRow(
         forward_mode=MediaCall.DENOISING,

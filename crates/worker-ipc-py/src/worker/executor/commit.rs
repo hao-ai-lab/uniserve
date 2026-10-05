@@ -171,6 +171,11 @@ impl PythonBackend {
             if let Some(latents) = &self.latents {
                 latents.borrow_mut(py).apply(py, &updates)?;
             }
+
+            for (output, update) in outputs.iter().zip(&updates) {
+                output.borrow().lock(py)?.apply_latent_update(update);
+            }
+
             if let Some(cache) = &self.cache {
                 cache
                     .borrow_mut(py)

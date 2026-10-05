@@ -135,7 +135,7 @@ impl GroupTable {
 
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct BlockTables {
-    tables: NativeBlockTables,
+    pub(super) tables: NativeBlockTables,
 }
 
 #[pymethods]

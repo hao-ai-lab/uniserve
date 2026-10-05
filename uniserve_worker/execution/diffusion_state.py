@@ -34,7 +34,7 @@ class KVConditioning:
     # ``ImageBuilder.positions`` coordinates keyed by temporal position.
     positions: dict[int, torch.Tensor] = field(default_factory=dict)
     # The request's conditioning KV as (slot, visible length, token
-    # capacity), from ``calls.cache_coordinates``.
+    # capacity), from ``PendingOutput.cache_coordinates``.
     cache: tuple[int, int, int] = (0, 0, 0)
     # Each branch's prefix as (slot, materialized prefix length, token
     # capacity); the slot is the request's own or an alternative-prefix slot.
