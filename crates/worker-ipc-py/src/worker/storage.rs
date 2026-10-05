@@ -221,7 +221,7 @@ fn import_view<'a>(py: Python<'_>, imported: &'a ImportHandle) -> ImportAccess<'
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct TensorRead {
     #[pyo3(get)]
-    tensor: Py<PyAny>,
+    pub(super) tensor: Py<PyAny>,
     #[pyo3(get)]
     region: Option<Py<PyAny>>,
     #[pyo3(get)]
@@ -817,7 +817,7 @@ impl TensorStore {
 
     /// Tickets must be ready before this call; result() orders the current
     /// stream after their transfer fences and propagates transport failures.
-    fn wait_import(&self, py: Python<'_>, read: &Bound<'_, TensorRead>) -> PyResult<()> {
+    pub(super) fn wait_import(&self, py: Python<'_>, read: &Bound<'_, TensorRead>) -> PyResult<()> {
         let state = self.lock(py)?;
         self.wait_imported(py, &state, read)
     }
@@ -1000,7 +1000,7 @@ impl TensorStore {
 
     /// Resolve and validate the whole batch before acquiring any read lease.
     #[pyo3(signature = (requests, *, device=None))]
-    fn consume_batch<'py>(
+    pub(super) fn consume_batch<'py>(
         &self,
         py: Python<'py>,
         requests: Vec<ReadRequest<'py>>,

@@ -1988,11 +1988,14 @@ def test_tensor_import_preserves_values_through_output_release(
         events.close()
 
 
-def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
-    None
-):
-    producer = execution_worker(transfer_backends=("shm",))
-    consumer = execution_worker(transfer_backends=("shm",))
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
+def test_local_and_imported_completion_predicates_keep_request_progress(
+    device: str,
+) -> None:
+    producer = execution_worker(device=device, transfer_backends=("shm",))
+    consumer = execution_worker(device=device, transfer_backends=("shm",))
     generation = umm_params(
         79, ImageParams(steps=1, height=16, width=16, seed=31)
     )
@@ -2008,6 +2011,39 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
         page_ids=(1,),
     )
     try:
+        local = ar_params(80, block_ids=(1,))
+        local_source = token_call(
+            local.request_key,
+            call_id=CallId(1, 0),
+            predecessor=root_parent(local),
+            mode=ForwardMode.PREFILL,
+            tokens=(3, 4),
+        )
+        local_predicate = TensorRef(
+            request_key=local.request_key,
+            producer_call_id=local_source.call_id,
+            output_index=3,
+            generation=508,
+            dtype=DType.U8,
+            shape_bound=ShapeBound(),
+        )
+        local_source = replace(
+            local_source,
+            transition_output=local_predicate,
+            sampling_state=SamplingState(
+                transition_token_ids=(expected_successor(4) + 1,),
+            ),
+        )
+        local_report = finalized_report(
+            consumer,
+            consumer.submit(
+                execution_batch(
+                    batch_id=1, admissions=(local,), calls=(local_source,)
+                )
+            ),
+        )
+        local_progress = record_completion(local_source, local_report)
+
         conditioning = _publish_conditioning(
             producer, admission, call_id=CallId(1, 0), batch_id=1
         )
@@ -2059,19 +2095,35 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
             tokens=(9,),
             predicate=transferred,
         )
+        skipped = token_call(
+            local.request_key,
+            call_id=CallId(4, 1),
+            predecessor=local_source.call_id,
+            mode=ForwardMode.PREFILL,
+            tokens=(6,),
+            predicate=local_predicate,
+        )
+        # The imported row precedes the already resident false predicate.
+        # Their readiness and readback order must not exchange the decisions.
         prepared = consumer.submit(
             execution_batch(
                 batch_id=4,
                 admissions=(admission,),
-                calls=(consume,),
+                calls=(consume, skipped),
                 input_products=(payload,),
             )
         )
         assert prepared is not None
         prepared = finalized_report(consumer, prepared)
-        consumed = prepared
-        assert consumed.completions[0].status is CallStatus.OK
-        assert consumed.completions[0].kv_visible_len == 1
+        consumed = {row.request_key: row for row in prepared.completions}
+        assert consumed[admission.request_key].status is CallStatus.OK
+        assert consumed[admission.request_key].kv_visible_len == 1
+        assert consumed[local.request_key].status is CallStatus.PREDICATED
+        assert consumed[local.request_key].position == local_progress.position
+        assert (
+            consumed[local.request_key].kv_visible_len
+            == local_progress.kv_visible_len
+        )
     finally:
         producer.close()
         consumer.close()
