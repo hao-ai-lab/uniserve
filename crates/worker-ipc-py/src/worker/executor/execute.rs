@@ -1,10 +1,11 @@
 //! Select active calls and launch the batch's numerical operations.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySet, PyTuple};
-use uniserve_worker_ipc::{CallKind, CallStatus, TransferMode};
+use uniserve_worker_ipc::{CallKind, CallStatus, MediaCall, TransferMode};
 
 use super::{BatchState, PythonBackend};
 use crate::convert;
@@ -117,10 +118,79 @@ impl PythonBackend {
         ) {
             let scope = super::super::batch::BatchState::scope(batch.numerical.bind(py))?;
             with_context(scope.bind(py), || self.execute_kv(py, batch, &active))?;
+        } else if self.forward_calls.contains(&batch.plan.calls[0].code) {
+            self.execute_forward(py, batch, &active)?;
         } else {
             self.runner
                 .bind(py)
                 .call_method1("execute", (&batch.numerical, active))?;
+        }
+        Ok(())
+    }
+
+    /// Run one homogeneous numerical batch at a time. Denoising intervals
+    /// may have different lengths; only calls with another step participate.
+    /// Request progress remains provisional until the entire batch commits.
+    fn execute_forward(
+        &self,
+        py: Python<'_>,
+        batch: &BatchState,
+        active: &[usize],
+    ) -> PyResult<()> {
+        let runner = self.runner.bind(py);
+        let denoising = batch.plan.calls[0].code == CallKind::Media(MediaCall::Denoising);
+        let mut intervals = vec![(0, 0); batch.plan.calls.len()];
+        if denoising {
+            let params: HashMap<_, _> = batch
+                .plan
+                .latent_params
+                .iter()
+                .map(|params| ((params.request_key, params.call_id), params))
+                .collect();
+            for &index in active {
+                let call = &batch.plan.calls[index];
+                // IPC requires an interval for each trajectory; numerical
+                // reservation checks it against the admitted solver schedule.
+                let params = params[&(call.request_key, call.call_id)];
+                intervals[index] = (params.start_step, params.step_count);
+            }
+        } else {
+            for &index in active {
+                intervals[index] = (0, 1);
+            }
+        }
+        let trajectories = if denoising {
+            runner.call_method1("prepare_diffusion", (&batch.numerical, active))?
+        } else {
+            PyDict::new(py).into_any()
+        };
+        let step_count = intervals.iter().map(|&(_, count)| count).max().unwrap_or(0);
+
+        for offset in 0..step_count {
+            let steps: Vec<_> = intervals
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(_, count))| offset < count)
+                .map(|(index, &(start, _))| (index, start + offset))
+                .collect();
+            let integrated =
+                runner.call_method1("forward", (&batch.numerical, steps, &trajectories))?;
+
+            if denoising {
+                // Pipeline ranks without a numerical output have no latent
+                // result to capture, even on the interval's final step.
+                let finished: Vec<_> = integrated
+                    .extract::<Vec<usize>>()?
+                    .into_iter()
+                    .filter(|&index| offset + 1 == intervals[index].1)
+                    .collect();
+                if !finished.is_empty() {
+                    runner.call_method1(
+                        "finish_diffusion",
+                        (&batch.numerical, finished, &trajectories),
+                    )?;
+                }
+            }
         }
         Ok(())
     }
