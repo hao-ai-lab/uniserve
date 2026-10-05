@@ -40,28 +40,21 @@ from uniserve_worker.model_executor.diffusion_inputs import (
     resolve_prefix,
 )
 from uniserve_worker.model_executor.input_batch import TokenRow
-from uniserve_worker.protocol.batch import TensorExport
 from uniserve_worker.protocol.call import (
     Call,
     DrawLayout,
     ForwardMode,
     ImageParams,
 )
-from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.sampling.metadata import TokenSelection
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from transformers import PreTrainedTokenizerBase
 
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
-    from uniserve_worker.transport.interface import Transport
 
 
 def _to_device(
@@ -126,14 +119,11 @@ def prepare_latent(
     *,
     state: BatchState,
     kv_cache: KVCacheManager | None,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool,
-    export_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
-    config: WorkerConfig,
 ) -> PendingOutput:
-    """Seed a diffusion request's trajectory and stage its first latent.
+    """Seed a diffusion request's trajectory in its latent buffer.
 
     Validates the call's conditioning export, flow-noise RNG coordinates
     and output generation, opens the request's ``DiffusionState``, draws the
@@ -142,13 +132,13 @@ def prepare_latent(
     ``output.generation`` at step zero is applied by the batch commit.
 
     Returns:
-        The call's ``PendingOutput`` with status OK and the latent product
-        when ``export_latent_transfer`` publishes one.
+        The call's ``PendingOutput`` with its completed numerical state.
+        The native executor supplies its latent export before batch commit.
 
     Raises:
         WorkerError: For example when the worker has no image builder or KV
             storage, the conditioning export, image parameters, RNG
-            coordinates, output generation or staged latent do not match the
+            coordinates, output generation or latent inputs do not match the
             call, or the request's trajectory has already started.
     """
     require_inputs(model_runner)
@@ -240,19 +230,7 @@ def prepare_latent(
     # batch cannot expose a partially initialized trajectory.
     state.complete_latent(call.request_key.request_id)
 
-    products = export_latent_transfer(
-        call,
-        output,
-        request,
-        step=0,
-        worker_info=worker_info,
-        latent_pool=latent_pool,
-        export_transports=export_transports,
-        config=config,
-        state=state,
-    )
     request.set_cache_length(cache[1])
-    request.set_products(products)
     return request
 
 
@@ -507,21 +485,16 @@ def finish(
     trajectory: DiffusionState,
     *,
     state: BatchState,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool,
-    export_transports: Mapping[str, Transport],
-    request_tables: BlockTables | None,
-    config: WorkerConfig,
 ) -> PendingOutput:
-    """Write a denoising call's integrated latent and stage its export.
+    """Write a denoising call's integrated latent and report completion.
 
     The native executor selects completed intervals after their final
     prediction has been integrated. This scatters the numerical values to
     the inactive bank and records the ``LatentUpdate`` that
     advances the request from ``params.start_step`` by ``params.step_count``
-    steps at the batch commit. When that final step reaches the admitted
-    ``image.steps``, the alternative-prefix slots of the guidance branches
-    are released here, before the batch commit.
+    steps at the batch commit. Rust exports the bank and retires completed
+    guidance prefixes after all numerical writes have been submitted.
     """
     request = state.pending_output(call.request_key.request_id)
     params = request.latent_params
@@ -541,7 +514,6 @@ def finish(
         raise invalid_descriptor("flow completion lost its trajectory state")
 
     start_step = int(params.start_step)
-    final_step = start_step + int(params.step_count)
     latent_pool.write_inactive(
         request.request.request_pool_idx,
         buffer,
@@ -553,88 +525,10 @@ def finish(
     )
     state.complete_latent(call.request_key.request_id)
 
-    products = export_latent_transfer(
-        call,
-        latent_output,
-        request,
-        step=final_step,
-        worker_info=worker_info,
-        latent_pool=latent_pool,
-        export_transports=export_transports,
-        config=config,
-        state=state,
-    )
     kv = kv_conditioning(trajectory)
     request.set_cache_length(kv.cache[1])
-    request.set_products(products)
 
-    # Branch prefixes live in pool slots separate from the request's own KV;
-    # they are retired once the trajectory has written its final step.
-    main_slot = int(request.request.request_pool_idx)
-    alternative_slots = {
-        int(entry[0])
-        for entry in kv.entries.values()
-        if int(entry[0]) != main_slot
-    }
-    if alternative_slots and final_step >= int(request.request.image.steps):
-        page_tables = request_tables
-        if page_tables is None:
-            raise RuntimeError(
-                "flow prefix retirement lost its request page tables"
-            )
-        page_tables.release_prefixes(call.request_key, tuple(alternative_slots))
     return request
-
-
-def export_latent_transfer(
-    call: Call,
-    product: TensorRef,
-    row: PendingOutput,
-    *,
-    state: BatchState,
-    step: int,
-    worker_info: WorkerInfo,
-    latent_pool: LatentPool,
-    export_transports: Mapping[str, Transport],
-    config: WorkerConfig,
-) -> tuple[TensorExport, ...]:
-    """Publish the latent bank a call wrote as a transport product.
-
-    Returns no product unless a transport other than ``local`` is configured
-    and this rank is the component's output rank. Otherwise the written bank
-    is reserved through ``LatentPool.reserve_export`` and published by
-    ``transfer.export_latent_source``.
-    """
-    params = row.latent_params
-    if params is None:
-        raise invalid_descriptor("latent export has no bound parameters")
-
-    transports = export_transports
-    if not any(name != "local" for name in transports) or (
-        config.rank != worker_info.output_rank(call.component)
-    ):
-        return ()
-
-    pool = latent_pool
-    source = pool.reserve_export(
-        product,
-        request_pool_idx=row.request.request_pool_idx,
-        page_table=params.page_table,
-        latent_units=params.latent_units,
-    )
-    from uniserve_worker.execution.transfer import export_latent_source
-
-    return (
-        export_latent_source(
-            product,
-            source,
-            row,
-            step=step,
-            latent_pool=latent_pool,
-            export_transports=export_transports,
-            state=state,
-        ),
-    )
 
 
 def initial_latent(

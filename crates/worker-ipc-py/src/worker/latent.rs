@@ -12,7 +12,7 @@ use uniserve_worker::{
     LatentExport as NativeLatentExport, LatentImport as NativeLatentImport,
     LatentPool as NativeLatentPool, LatentUpdate as NativeLatentUpdate,
 };
-use uniserve_worker_ipc::{BufferId, LatentParams, RequestKey, TensorTransfer};
+use uniserve_worker_ipc::{BufferId, LatentParams, RequestKey, TensorRef, TensorTransfer};
 
 use crate::convert;
 
@@ -172,7 +172,7 @@ pub(crate) struct LatentExport {
     #[pyo3(get)]
     buffer: Py<PyAny>,
     #[pyo3(get)]
-    spans: Py<PyTuple>,
+    pub(super) spans: Py<PyTuple>,
 }
 
 #[pymethods]
@@ -234,7 +234,7 @@ impl Deref for ExportRef {
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct LatentPool {
     #[pyo3(get)]
-    latent_width: usize,
+    pub(super) latent_width: usize,
     #[pyo3(get)]
     dtype: Py<PyAny>,
     #[pyo3(get)]
@@ -646,7 +646,8 @@ impl LatentPool {
         let pages = self.validate_pages(py, &page_table, latent_units)?;
         let bank = self.inner.next_bank(slot);
         self.require_writable(py, bank, &pages)?;
-        self.reserve_source(py, product, slot, bank, pages, latent_units)
+        let id = buffer_id(&product.getattr("buffer_id")?)?;
+        self.reserve_source(py, id, slot, bank, pages, latent_units)
     }
 
     /// Export the committed bank without advancing the trajectory. Multiple
@@ -678,10 +679,11 @@ impl LatentPool {
             width,
             &pages,
         )?;
-        self.reserve_source(py, product, slot, bank, pages, latent_units)
+        let id = buffer_id(&product.getattr("buffer_id")?)?;
+        self.reserve_source(py, id, slot, bank, pages, latent_units)
     }
 
-    fn retain_export(
+    pub(super) fn retain_export(
         &self,
         py: Python<'_>,
         source: &Bound<'_, LatentExport>,
@@ -954,6 +956,61 @@ impl LatentPool {
 }
 
 impl LatentPool {
+    /// Reserve an export from a bound native call. A supplied generation
+    /// selects the committed bank; otherwise the call wrote its successor.
+    pub(super) fn reserve(
+        &mut self,
+        py: Python<'_>,
+        product: &TensorRef,
+        slot: usize,
+        params: &LatentParams,
+        generation: Option<u32>,
+    ) -> PyResult<Py<LatentExport>> {
+        let shape = [u64::from(params.latent_units), self.latent_width as u64];
+        let dtype = self.dtype.bind(py).str()?;
+        if !product.shape_bound.contains_shape(&shape)
+            || dtype.to_str()?.trim_start_matches("torch.") != product.dtype.storage_name()
+        {
+            return Err(invalid(
+                py,
+                "latent export disagrees with its declared representation",
+            ));
+        }
+
+        self.inner.reap();
+        let slot = self.slot(py, slot as i64)?;
+        // Batch binding already checked these immutable page coordinates.
+        let pages: Vec<_> = params
+            .page_table
+            .iter()
+            .map(|&page| page as usize)
+            .collect();
+        let bank = if let Some(generation) = generation {
+            self.current_bank(
+                py,
+                slot,
+                i64::from(params.start_step),
+                i64::from(generation),
+                i64::from(params.latent_units),
+                i64::from(params.height),
+                i64::from(params.width),
+                &pages,
+            )?
+        } else {
+            let bank = self.inner.next_bank(slot);
+            self.require_writable(py, bank, &pages)?;
+            bank
+        };
+        self.reserve_source(
+            py,
+            product.buffer_id(),
+            slot,
+            bank,
+            pages,
+            i64::from(params.latent_units),
+        )
+    }
+
     /// IPC validates the source bounds; the receiving pool fixes its layout.
     pub(super) fn validate_transfer(
         &self,
@@ -1085,16 +1142,15 @@ impl LatentPool {
     fn reserve_source(
         &mut self,
         py: Python<'_>,
-        product: &Bound<'_, PyAny>,
+        buffer: BufferId,
         slot: usize,
         bank: u8,
         pages: Vec<usize>,
         units: i64,
     ) -> PyResult<Py<LatentExport>> {
-        let buffer = product.getattr("buffer_id")?;
         let inner = Arc::new(
             self.inner
-                .prepare_export(buffer_id(&buffer)?, slot, bank, pages)
+                .prepare_export(buffer, slot, bank, pages)
                 .map_err(|error| native_error(py, error))?,
         );
         let spans = self.spans(py, bank, &inner.pages, units)?;
@@ -1102,7 +1158,7 @@ impl LatentPool {
             py,
             LatentExport {
                 inner: Arc::clone(&inner),
-                buffer: buffer.unbind(),
+                buffer: convert::buffer_id_to_py(py, &buffer)?.unbind(),
                 spans,
             },
         )?;

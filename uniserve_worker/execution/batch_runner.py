@@ -64,7 +64,6 @@ class BatchRunner:
             scheduled,
             kv_cache=self.worker.kv_cache,
             tensor_store=self.worker.tensor_store,
-            worker_info=self.worker.info,
             latent_pool=self.worker.latent_pool,
             media_mux=self.worker.media_mux,
             export_transports=self.worker.export_transports,
@@ -72,7 +71,6 @@ class BatchRunner:
             request_tables=self.worker.block_tables,
             request_pool=self.worker.requests,
             model_runner=self.worker.runner,
-            config=self.worker.worker_config,
             state=state,
         )
 
@@ -130,11 +128,7 @@ class BatchRunner:
             diffusion.finish(
                 state.batch.calls[index],
                 trajectories[index],
-                worker_info=self.worker.info,
                 latent_pool=self.worker.latent_pool,
-                export_transports=self.worker.export_transports,
-                request_tables=self.worker.block_tables,
-                config=self.worker.worker_config,
                 state=state,
             )
 

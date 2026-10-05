@@ -86,6 +86,11 @@ pub enum DType {
 }
 
 impl DType {
+    /// Name used by physical tensor storage and transfer locators.
+    pub fn storage_name(self) -> &'static str {
+        tensor_dtype(self).0
+    }
+
     /// Storage width of one element in bytes.
     pub fn element_bytes(self) -> u64 {
         tensor_dtype(self).1
@@ -116,6 +121,25 @@ pub struct ShapeBound {
 }
 
 impl ShapeBound {
+    /// Whether a positive physical shape fits these logical dimensions.
+    /// A single device dimension bounds flat capacity, irrespective of rank.
+    pub fn contains_shape(&self, shape: &[u64]) -> bool {
+        let Ok(elements) = tensor_elements(shape) else {
+            return false;
+        };
+        match self.dims.as_slice() {
+            [] => elements == 1,
+            [DimBound::Device { max }] => elements <= u64::from(*max),
+            bounds => {
+                shape.len() == bounds.len()
+                    && shape.iter().zip(bounds).all(|(&size, bound)| match bound {
+                        DimBound::Static(expected) => size == u64::from(*expected),
+                        DimBound::Device { max } => size <= u64::from(*max),
+                    })
+            }
+        }
+    }
+
     /// Rejects more than one device-actual dimension and any zero extent.
     pub fn validate(&self) -> ValidationResult<()> {
         let device_dims = self
@@ -1108,28 +1132,8 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
                 && tensor_elements(&tensor.shape)?.checked_mul(element_bytes) == Some(nbytes),
             "transfer tensor dtype disagrees with its product"
         );
-        let bounds = &product.shape_bound.dims;
-        let shape_matches = match bounds.as_slice() {
-            [] => tensor_elements(&tensor.shape)? == 1,
-            // A single device-actual extent describes flat capacity, such as
-            // encoder features, latents, and feedback images, which the
-            // engine's planner bounds by bytes; the transfer publishes the
-            // actual rank, and only its element count is bounded.
-            [DimBound::Device { max }] => tensor_elements(&tensor.shape)? <= u64::from(*max),
-            _ => {
-                tensor.shape.len() == bounds.len()
-                    && tensor
-                        .shape
-                        .iter()
-                        .zip(bounds)
-                        .all(|(&size, bound)| match bound {
-                            DimBound::Static(expected) => size == u64::from(*expected),
-                            DimBound::Device { max } => size <= u64::from(*max),
-                        })
-            }
-        };
         ensure_valid!(
-            shape_matches,
+            product.shape_bound.contains_shape(&tensor.shape),
             "transfer tensor shape disagrees with its product"
         );
     }

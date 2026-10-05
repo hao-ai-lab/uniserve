@@ -1,7 +1,7 @@
-"""Tensor and latent movement with no model call.
+"""Numerical tensor movement and export helpers.
 
-``execute`` transfers one resident tensor or the committed trajectory's
-current latent pages. The native executor handles KV export and installation.
+``execute`` transfers one resident tensor. The native executor handles latent
+and KV export and installation.
 The export helpers are shared with image, media, diffusion and host-media calls.
 
 Every tensor export checks the physical tensor against the product's
@@ -32,12 +32,10 @@ from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import (
     DeviceProductTransferValue,
     EncoderTransferValue,
-    LatentTransferValue,
     Locator,
     TensorTransfer,
     TransferValue,
 )
-from uniserve_worker.storage.latent_pool import LatentExport
 from uniserve_worker.storage.tensor_store import (
     FeatureMetadata,
     ImageMetadata,
@@ -47,7 +45,6 @@ from uniserve_worker.transport.exports import export_tensor
 
 if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.storage.latent_pool import LatentPool
     from uniserve_worker.storage.tensor_store import Buffer, TensorStore
     from uniserve_worker.transport.interface import Transport
 
@@ -57,11 +54,10 @@ def execute(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    latent_pool: LatentPool | None,
     export_transports: Mapping[str, Transport],
     model_runner: ModelExecutor,
 ) -> PendingOutput:
-    """Transfer one tensor or latent value through its numerical storage."""
+    """Transfer one resident tensor through its numerical storage."""
     from uniserve_worker.execution import image
 
     transports = export_transports
@@ -75,151 +71,26 @@ def execute(
         raise invalid_descriptor(
             "product transfer requires one physical input and one output"
         )
-    if call.latent_input is not None:
-        if latent_pool is None:
-            raise unsupported_setup(
-                "latent transfer requires a physical latent pool"
-            )
-        tensor_export = _publish_current_latent(
-            call,
-            inputs[0],
-            outputs[0],
-            latent_pool=latent_pool,
-            export_transports=export_transports,
-            state=state,
-        )
-    else:
-        value, metadata = fetch_product(
-            call,
-            tensor_store=tensor_store,
-            model_runner=model_runner,
-            state=state,
-        )
-        tensor_export = export_product(
-            outputs[0],
-            value,
-            metadata,
-            tensor_store=tensor_store,
-            export_transports=export_transports,
-            state=state,
-        )
+    value, metadata = fetch_product(
+        call,
+        tensor_store=tensor_store,
+        model_runner=model_runner,
+        state=state,
+    )
+    tensor_export = export_product(
+        outputs[0],
+        value,
+        metadata,
+        tensor_store=tensor_store,
+        export_transports=export_transports,
+        state=state,
+    )
     outcome = image.non_state_outcome(
         call,
         products=(tensor_export,),
         state=state,
     )
     return outcome
-
-
-def _publish_current_latent(
-    call: Call,
-    reference: TensorRef,
-    product: TensorRef,
-    *,
-    state: BatchState,
-    latent_pool: LatentPool,
-    export_transports: Mapping[str, Transport],
-) -> TensorExport:
-    """Publish the committed trajectory's current latent pages as a product.
-
-    ``LatentPool.reserve_current_export`` requires the bound start
-    step, the input's generation, units, raster and pages to match the
-    slot's committed trajectory. The product must be the call's declared
-    latent output, and export leaves the request's generation and step
-    unchanged.
-    """
-    if product != call.latent_output:
-        raise invalid_descriptor(
-            "product transfer changes the physical product kind"
-        )
-
-    row = state.pending_output(call.request_key.request_id)
-    params = row.latent_params
-    buffer = row.latent_buffer
-    if params is None or buffer is None:
-        raise invalid_descriptor("trajectory call has no bound latent inputs")
-
-    source = latent_pool.reserve_current_export(
-        product,
-        request_pool_idx=row.request.request_pool_idx,
-        page_table=params.page_table,
-        generation=reference.generation,
-        step=params.start_step,
-        latent_units=params.latent_units,
-        height=params.height,
-        width=params.width,
-    )
-
-    return export_latent_source(
-        product,
-        source,
-        row,
-        step=params.start_step,
-        latent_pool=latent_pool,
-        export_transports=export_transports,
-        state=state,
-    )
-
-
-def export_latent_source(
-    product: TensorRef,
-    source: LatentExport,
-    row: PendingOutput,
-    *,
-    state: BatchState,
-    step: int,
-    latent_pool: LatentPool,
-    export_transports: Mapping[str, Transport],
-) -> TensorExport:
-    """Publish reserved latent page spans as one latent product.
-
-    The spans are published as a ``[latent_units, latent_width]`` tensor in
-    the pool's storage dtype. Each export's completion is
-    attached through ``LatentPool.retain_export``, which keeps the page
-    bank until its readers retire. The locators are recorded on the
-    product's pending output.
-    """
-    params = row.latent_params
-    if params is None:
-        raise invalid_descriptor("latent export has no bound parameters")
-
-    request = state.pending_output(product.request_key.request_id)
-    transports = export_transports
-    if not transports:
-        raise unsupported_setup("latent export requires a configured transport")
-
-    pool = latent_pool
-    shape = (params.latent_units, pool.latent_width)
-    assert shape is not None
-    if not _representation_matches_product(
-        shape,
-        str(pool.storage.dtype).removeprefix("torch."),
-        math.prod(shape) * pool.storage.element_size(),
-        product,
-    ):
-        raise invalid_descriptor(
-            "latent export disagrees with its declared representation"
-        )
-
-    locations = export_tensor(
-        transports,
-        source.spans,
-        retain=partial(pool.retain_export, source),
-        consumers=row.call.consumer_slots,
-    )
-    request.exported_locators.extend(locations)
-    request.latent_exports[product.buffer_id] = tuple(
-        (transports[location.backend], location) for location in locations
-    )
-
-    descriptor = LatentTransferValue(
-        height=params.height,
-        width=params.width,
-        latent_units=params.latent_units,
-        step=step,
-        tensor=TensorTransfer(shape=shape, locations=locations),
-    )
-    return TensorExport(product=product, value=descriptor)
 
 
 def export_tensors(

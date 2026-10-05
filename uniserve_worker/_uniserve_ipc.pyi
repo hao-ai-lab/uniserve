@@ -369,7 +369,6 @@ class PendingOutput:
     def latent_params(self) -> LatentParams | None: ...
     @property
     def latent_buffer(self) -> LatentBuffer | None: ...
-    latent_exports: dict[BufferId, ExportLocations]
     tensor_exports: dict[BufferId, ExportLocations]
     cache_exports: dict[BufferId, ExportLocations]
     exported_locators: list[Locator]

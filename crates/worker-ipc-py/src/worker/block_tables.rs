@@ -9,7 +9,7 @@ use uniserve_worker::{
     BlockTables as NativeBlockTables, GroupShape as NativeGroupShape,
     GroupTable as NativeGroupTable,
 };
-use uniserve_worker_ipc::BlockTable;
+use uniserve_worker_ipc::{BlockTable, RequestKey};
 
 use super::error::{invalid, native_error};
 use super::protocol::request_key;
@@ -231,11 +231,7 @@ impl BlockTables {
                 .release_slots(&self.tables.prefix_slots(key))
                 .map_err(|error| native_error(py, error))?,
         };
-        if !slots.is_empty() {
-            copy.call1((&slots,))?;
-        }
-        self.tables.release_prefixes(key, &slots);
-        Ok(())
+        self.clear_prefixes(key, &slots, copy)
     }
 
     fn release(
@@ -258,6 +254,21 @@ impl BlockTables {
 }
 
 impl BlockTables {
+    /// Clear bound prefix slots after their final numerical use. The caller
+    /// supplies validated slots; device clears precede host-table removal.
+    pub(super) fn clear_prefixes(
+        &mut self,
+        key: RequestKey,
+        slots: &[u32],
+        copy: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if !slots.is_empty() {
+            copy.call1((slots,))?;
+        }
+        self.tables.release_prefixes(key, slots);
+        Ok(())
+    }
+
     pub(super) fn install(
         &mut self,
         py: Python<'_>,
