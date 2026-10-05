@@ -48,23 +48,25 @@ def test_consumed_lease_cannot_retire_or_complete_a_subsequent_batch():
     try:
         first = outputs.acquire(1, token_capacity=8)
         first_done = first.completion()
-        span = first.capture(torch.tensor([3]))
+        span = first.capture(torch.tensor([3, 5]))
         first.seal()
-        assert first.read_tokens(*span) == (3,)
+        assert first.read_tokens(span[0], 1) == (3,)
         first.observe(0)
 
         second = outputs.acquire(1, token_capacity=8)
+        second.capture(torch.tensor([7, 11]))
         second_done = second.completion()
         first.discard(0)
         first.abandon()
         assert first_done.done()
         assert not second_done.done()
-        assert first.read_tokens(*span) == (3,)
+        # Recycled storage cannot change an earlier result, including a range
+        # whose values were not individually requested before retirement.
+        assert first.read_tokens(*span) == (3, 5)
         with pytest.raises(WorkerError, match="leases are active"):
             outputs.acquire(1, token_capacity=8)
 
         # Shutdown seals accepted captures and resolves their physical fence.
-        second.capture(torch.tensor([7]))
         outputs.close()
         assert second_done.done()
         with pytest.raises(WorkerError, match="closed"):
@@ -120,6 +122,8 @@ def test_multiple_device_readbacks_keep_values_and_cpu_readers(
             events.reap()
             assert not completion.done()
             assert not buffer.ready()
+            with pytest.raises(WorkerError, match="before"):
+                buffer.read_tokens(*tokens)
         release = buffer.retain_cpu_reader()
         for stream in streams:
             stream.synchronize()

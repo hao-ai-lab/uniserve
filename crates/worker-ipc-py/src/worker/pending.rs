@@ -4,7 +4,7 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
-use uniserve_core::{CallId, TokenLogprob};
+use uniserve_core::CallId;
 use uniserve_worker::RequestProgress;
 use uniserve_worker_ipc::{
     Call, CallKind, CallStatus, ErrorCode, RequestKey, RequestOutput, TimingCounters,
@@ -453,28 +453,35 @@ impl PendingOutput {
                         .getattr("sampling_range")?
                         .extract::<Option<(usize, usize, usize)>>()?
                     {
-                        let values = buffer.get().read_tokens(py, offset, extent)?;
-                        let values = values.bind(py).cast::<PyTuple>()?;
-                        let count = extent / SAMPLING_FIELDS;
+                        let (valid, active, sampled, accepted) =
+                            buffer.get().with_readback(py, |buffer| {
+                                let values = buffer.read_tokens(offset, extent)?;
+                                let count = extent / SAMPLING_FIELDS;
+                                if extent % SAMPLING_FIELDS != 0 || row >= count {
+                                    return Err(uniserve_worker::Error::State(
+                                        "sampling completion vectors do not align",
+                                    ));
+                                }
+                                Ok((
+                                    values[row],
+                                    values[count + row],
+                                    values[count * 2 + row],
+                                    values[count * 3 + row],
+                                ))
+                            })?;
 
-                        // Rows share the cached [valid | active | token | accepted]
-                        // column. Read this row only, without converting the
-                        // entire sampled batch again for each result.
+                        // Rows borrow the same native completion snapshot.
                         // The predicate wins over an invalid distribution in
                         // an inactive graph row: that row never sampled.
-                        if values.get_item(count + row)?.extract::<i64>()? == 0 {
+                        if active == 0 {
                             status = CallStatus::Predicated;
                             suppressed = true;
-                        } else if values.get_item(row)?.extract::<i64>()? == 0 {
+                        } else if valid == 0 {
                             status = CallStatus::Error;
                             error_code = Some(ErrorCode::InvalidCall);
                             suppressed = true;
                         } else {
-                            tokens = accepted_tokens(
-                                token,
-                                values.get_item(count * 2 + row)?.extract()?,
-                                values.get_item(count * 3 + row)?.extract()?,
-                            )?;
+                            tokens = accepted_tokens(token, sampled, accepted)?;
                             accept_speculation(token, tokens.len(), &mut progress)?;
                         }
                     }
@@ -624,49 +631,43 @@ fn decode_scores(
     buffer: &OutputBuffer,
     output: &mut RequestOutput,
 ) -> PyResult<Option<(i64, Vec<i64>)>> {
-    if let Some(span) = token.getattr("logprob_range")?.extract()? {
-        let values = buffer.logprob_values(py, span)?;
-        output.sampled_logprob = values.bind(py).get_item(0)?.extract()?;
-        output.top_logprobs = logprobs(&values.bind(py).get_item(1)?)?;
-    }
+    let sampled: Option<(usize, usize, usize)> = token.getattr("logprob_range")?.extract()?;
     let spans: Vec<(usize, usize, usize)> = token.getattr("prompt_logprob_ranges")?.extract()?;
-    output.prompt_logprobs = spans
-        .into_iter()
-        .map(|span| logprobs(&buffer.logprob_values(py, span)?.bind(py).get_item(1)?))
-        .collect::<PyResult<_>>()?;
+    let candidates: Option<(usize, usize)> = token.getattr("candidate_range")?.extract()?;
+    let canvas: Option<(usize, usize)> = token.getattr("canvas_range")?.extract()?;
+    if sampled.is_none() && spans.is_empty() && candidates.is_none() && canvas.is_none() {
+        return Ok(None);
+    }
 
-    if let Some((offset, count)) = token.getattr("candidate_range")?.extract()? {
-        let words: Vec<i64> = buffer.read_tokens(py, offset, count)?.extract(py)?;
-        // Candidate scores are float32 bits sign-extended from int32.
-        output.candidate_logprobs = words
+    buffer.with_readback(py, |buffer| {
+        if let Some(span) = sampled {
+            let values = buffer.logprob_values(span)?;
+            output.sampled_logprob = values.first().map(|entry| entry.logprob);
+            output.top_logprobs = values.to_vec();
+        }
+        output.prompt_logprobs = spans
             .into_iter()
-            .map(|word| f32::from_bits(word as u32))
-            .collect();
-    }
-    if let Some((offset, count)) = token.getattr("canvas_range")?.extract()? {
-        let words: Vec<i64> = buffer.read_tokens(py, offset, count)?.extract(py)?;
-        let Some((&outcome, tokens)) = words.split_first() else {
-            return Err(PyRuntimeError::new_err(
-                "canvas completion has no step outcome",
-            ));
-        };
-        return Ok(Some((outcome, tokens.to_vec())));
-    }
-    Ok(None)
-}
+            .map(|span| buffer.logprob_values(span).map(<[_]>::to_vec))
+            .collect::<uniserve_worker::Result<_>>()?;
 
-fn logprobs(values: &Bound<'_, PyAny>) -> PyResult<Vec<TokenLogprob>> {
-    values
-        .try_iter()?
-        .map(|value| {
-            let (token_id, logprob, rank) = value?.extract()?;
-            Ok(TokenLogprob {
-                token_id,
-                logprob,
-                rank,
-            })
-        })
-        .collect()
+        if let Some((offset, count)) = candidates {
+            output.candidate_logprobs = buffer
+                .read_tokens(offset, count)?
+                .iter()
+                .map(|&word| f32::from_bits(word as u32))
+                .collect();
+        }
+        if let Some((offset, count)) = canvas {
+            let words = buffer.read_tokens(offset, count)?;
+            let Some((&outcome, tokens)) = words.split_first() else {
+                return Err(uniserve_worker::Error::State(
+                    "canvas completion has no step outcome",
+                ));
+            };
+            return Ok(Some((outcome, tokens.to_vec())));
+        }
+        Ok(None)
+    })
 }
 
 /// Initialize the wire result from accepted request coordinates. Numerical

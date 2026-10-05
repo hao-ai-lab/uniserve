@@ -8,7 +8,6 @@ import torch
 
 from uniserve.tensors import concatenate_views
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution.output import logprob_entries
 from uniserve_worker.protocol.batch import TensorPublication
 from uniserve_worker.protocol.call import Call, CallStatus
 from uniserve_worker.sampling.result import sample_columns
@@ -43,23 +42,20 @@ def validate_outputs(state: BatchState) -> None:
             # transport.
             outcome.kv_output.encoded_size_bound()
 
-        # The bound covers score values and prompt-position counts; framing
-        # is owned by the single IPC result message, not by stored products.
-        # Each entry is one 12-byte ``TokenLogprob`` of the IPC schema and
-        # each reported row adds 4 bytes, the same costs the engine's
-        # ``logprob_result_bytes`` uses to size ``max_completion_bytes``.
-        logprob_bytes = (
-            0
-            if outcome.token.logprob_range is None
-            else 4 + 12 * logprob_entries(outcome, outcome.token.logprob_range)
-        ) + sum(
-            4 + 12 * logprob_entries(outcome, span)
-            for span in outcome.token.prompt_logprob_ranges
-        )
-        if logprob_bytes > call.bounds.max_completion_bytes:
-            raise invalid_descriptor(
-                "logprob result exceeds its registered completion capacity"
-            )
+        score_spans = outcome.token.prompt_logprob_ranges
+        if outcome.token.logprob_range is not None:
+            score_spans = (outcome.token.logprob_range, *score_spans)
+        if score_spans:
+            buffer = outcome._buffer
+            if buffer is None:
+                raise RuntimeError("logprob output lost its pinned range")
+            if (
+                buffer.logprob_bytes(score_spans)
+                > call.bounds.max_completion_bytes
+            ):
+                raise invalid_descriptor(
+                    "logprob result exceeds its registered completion capacity"
+                )
 
 
 def apply_decode_state(

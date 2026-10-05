@@ -1,7 +1,7 @@
 """Numerical copies into Rust-owned output storage.
 
 The native pool owns capacity, result rows, device fences and CPU readers.
-These functions only allocate host tensors and copy or decode their values.
+These functions allocate host tensors and submit numerical copies.
 """
 
 from __future__ import annotations
@@ -43,9 +43,3 @@ def _copy_bytes(
     )
     capture.copy_(value, non_blocking=value.is_cuda)
     return capture
-
-
-def _read_tokens(
-    host: torch.Tensor, offset: int, count: int
-) -> tuple[int, ...]:
-    return tuple(host[offset : offset + count].tolist())

@@ -373,16 +373,6 @@ class OutputBuffer:
 
     event_pool: EventPool
     devices: tuple[torch.device, ...]
-    logprob_layouts: dict[
-        tuple[int, int],
-        tuple[
-            tuple[int, ...],
-            tuple[int, ...],
-            tuple[tuple[int, ...], ...],
-            int,
-            int,
-        ],
-    ]
 
     def register_device(self, device: torch.device | str) -> None: ...
     def begin_device(self, device: torch.device | str) -> None: ...
@@ -393,9 +383,17 @@ class OutputBuffer:
     def ready(self) -> bool: ...
     def completion(self) -> Completion: ...
     def read_tokens(self, offset: int, count: int) -> tuple[int, ...]: ...
-    def logprob_values(
-        self, span: tuple[int, int, int]
-    ) -> tuple[float, tuple[tuple[int, float, int], ...]]: ...
+    def register_logprobs(
+        self,
+        span: tuple[int, int],
+        rows: tuple[int, ...],
+        counts: tuple[int, ...],
+        requested_ids: tuple[tuple[int, ...], ...],
+        max_count: int,
+        max_requested: int,
+    ) -> None:
+        """Describe one captured score column before sealing the buffer."""
+    def logprob_bytes(self, spans: Sequence[tuple[int, int, int]]) -> int: ...
     def observe(self, row: int) -> tuple[int, int]: ...
     def timing(self) -> tuple[int, int, int, int]: ...
     def discard(self, row: int) -> None: ...

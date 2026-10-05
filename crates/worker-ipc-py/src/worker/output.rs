@@ -6,14 +6,35 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
-use pyo3::types::{PyDict, PyTuple};
-use uniserve_worker::{OutputBuffer as NativeBuffer, OutputPool as NativePool, OutputStorage};
+use pyo3::types::PyTuple;
+use uniserve_worker::{
+    LogprobLayout, OutputBuffer as NativeBuffer, OutputPool as NativePool, OutputStorage,
+};
 
 use super::completion::Completion;
 use super::error::{invariant, native_error};
 use super::events::EventPool;
 
-type Buffer = Arc<Mutex<NativeBuffer<Py<PyAny>>>>;
+/// The private allocator creates a contiguous CPU int64 tensor and never
+/// resizes it. Retaining that tensor keeps its address valid across copies.
+pub(super) struct HostAllocation {
+    tensor: Py<PyAny>,
+    address: usize,
+}
+
+impl HostAllocation {
+    fn read(&self, count: usize) -> Vec<i64> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        // OutputBuffer checked its producer fences and captured extent. Its
+        // mutex prevents recycling the allocation while this snapshot reads it.
+        unsafe { std::slice::from_raw_parts(self.address as *const i64, count).to_vec() }
+    }
+}
+
+type Buffer = Arc<Mutex<NativeBuffer<HostAllocation>>>;
 
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct OutputBuffer {
@@ -23,10 +44,6 @@ pub(crate) struct OutputBuffer {
     #[pyo3(get)]
     devices: Py<PyTuple>,
     completion: Py<Completion>,
-    #[pyo3(get)]
-    logprob_layouts: Py<PyDict>,
-    tokens: Py<PyDict>,
-    logprobs: Py<PyDict>,
 }
 
 #[pymethods]
@@ -67,7 +84,10 @@ impl OutputBuffer {
             .reserve_tokens(count)
             .map_err(|error| native_error(py, error))?;
         let storage = buffer.storage().map_err(|error| native_error(py, error))?;
-        numerical.call_method1("_copy_tokens", (storage.value.bind(py), offset, value))?;
+        numerical.call_method1(
+            "_copy_tokens",
+            (storage.value.tensor.bind(py), offset, value),
+        )?;
         Ok((offset, count))
     }
 
@@ -87,7 +107,10 @@ impl OutputBuffer {
             .map_err(|error| native_error(py, error))?;
         let storage = buffer.storage().map_err(|error| native_error(py, error))?;
         Ok(numerical
-            .call_method1("_copy_bytes", (storage.value.bind(py), offset, value))?
+            .call_method1(
+                "_copy_bytes",
+                (storage.value.tensor.bind(py), offset, value),
+            )?
             .unbind())
     }
 
@@ -143,61 +166,43 @@ impl OutputBuffer {
         Ok(self.completion.clone_ref(py))
     }
 
-    pub(super) fn read_tokens(
-        &self,
-        py: Python<'_>,
-        offset: usize,
-        count: usize,
-    ) -> PyResult<Py<PyAny>> {
-        if let Some(cached) = self.tokens.bind(py).get_item((offset, count))? {
-            return Ok(cached.unbind());
-        }
-
-        if !self.ready(py)? {
-            return Err(invariant(
-                py,
-                "completion storage was observed before its copy event was ready",
-            ));
-        }
-        let buffer = self.lock(py)?;
-        buffer
-            .token_range(offset, count)
-            .map_err(|error| native_error(py, error))?;
-        let host = &buffer
-            .storage()
-            .map_err(|error| native_error(py, error))?
-            .value;
-        let values = py
-            .import("uniserve_worker.storage.output")?
-            .call_method1("_read_tokens", (host.bind(py), offset, count))?;
-        self.tokens.bind(py).set_item((offset, count), &values)?;
-        Ok(values.unbind())
+    fn read_tokens(&self, py: Python<'_>, offset: usize, count: usize) -> PyResult<Py<PyAny>> {
+        let words = self.with_readback(py, |buffer| {
+            buffer.read_tokens(offset, count).map(<[i64]>::to_vec)
+        })?;
+        Ok(PyTuple::new(py, words)?.into_any().unbind())
     }
 
-    pub(super) fn logprob_values(
+    #[allow(clippy::too_many_arguments)]
+    fn register_logprobs(
         &self,
         py: Python<'_>,
-        span: (usize, usize, usize),
-    ) -> PyResult<Py<PyAny>> {
-        let (offset, count, row) = span;
-        let key = (offset, count);
-        let details = match self.logprobs.bind(py).get_item(key)? {
-            Some(details) => details,
-            None => {
-                let values = self.read_tokens(py, offset, count)?;
-                let layout = self
-                    .logprob_layouts
-                    .bind(py)
-                    .get_item(key)?
-                    .ok_or_else(|| invariant(py, "logprob capture has no row layout"))?;
-                let details = py
-                    .import("uniserve_worker.sampling.output")?
-                    .call_method1("decode_logprobs", (values, layout))?;
-                self.logprobs.bind(py).set_item(key, &details)?;
-                details
-            }
-        };
-        Ok(details.get_item(row)?.unbind())
+        span: (usize, usize),
+        rows: Vec<usize>,
+        counts: Vec<usize>,
+        requested_ids: Vec<Vec<u32>>,
+        max_count: usize,
+        max_requested: usize,
+    ) -> PyResult<()> {
+        self.lock(py)?
+            .register_logprobs(
+                span.0,
+                span.1,
+                LogprobLayout {
+                    rows,
+                    counts,
+                    requested_ids,
+                    max_count,
+                    max_requested,
+                },
+            )
+            .map_err(|error| native_error(py, error))
+    }
+
+    fn logprob_bytes(&self, py: Python<'_>, spans: Vec<(usize, usize, usize)>) -> PyResult<usize> {
+        self.lock(py)?
+            .logprob_bytes(&spans)
+            .map_err(|error| native_error(py, error))
     }
 
     pub(super) fn observe(&self, py: Python<'_>, row: usize) -> PyResult<(u64, u64)> {
@@ -251,22 +256,38 @@ impl OutputBuffer {
         visit.call(&self.event_pool)?;
         visit.call(&self.devices)?;
         visit.call(&self.completion)?;
-        visit.call(&self.logprob_layouts)?;
-        visit.call(&self.tokens)?;
-        visit.call(&self.logprobs)?;
         let buffer = match self.inner.try_lock() {
             Ok(buffer) => buffer,
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
             Err(TryLockError::WouldBlock) => return Ok(()),
         };
         if let Ok(storage) = buffer.storage() {
-            visit.call(&storage.value)?;
+            visit.call(&storage.value.tensor)?;
         }
         Ok(())
     }
 }
 
 impl OutputBuffer {
+    /// Resolve completed host values without the interpreter lock. Completion
+    /// observers run first, outside the buffer mutex, and may reenter callers.
+    pub(super) fn with_readback<R: Send>(
+        &self,
+        py: Python<'_>,
+        read: impl FnOnce(&mut NativeBuffer<HostAllocation>) -> uniserve_worker::Result<R> + Send,
+    ) -> PyResult<R> {
+        self.ready(py)?;
+        py.detach(|| {
+            let mut buffer = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            buffer.readback(HostAllocation::read)?;
+            read(&mut buffer)
+        })
+        .map_err(|error| native_error(py, error))
+    }
+
     /// Observe copy fences without dispatching completion callbacks. Batch
     /// readiness borrows its input set; the event pool notifies its observers.
     pub(crate) fn query_ready(&self, py: Python<'_>) -> PyResult<bool> {
@@ -277,7 +298,7 @@ impl OutputBuffer {
             .is_some())
     }
 
-    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, NativeBuffer<Py<PyAny>>>> {
+    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, NativeBuffer<HostAllocation>>> {
         self.inner
             .lock_py_attached(py)
             .map_err(|_| invariant(py, "output buffer lock poisoned"))
@@ -286,7 +307,7 @@ impl OutputBuffer {
 
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct OutputPool {
-    state: Mutex<NativePool<Py<PyAny>, Py<OutputBuffer>>>,
+    state: Mutex<NativePool<HostAllocation, Py<OutputBuffer>>>,
     #[pyo3(get)]
     event_pool: Py<EventPool>,
 }
@@ -371,14 +392,20 @@ impl OutputPool {
             Some(storage) if storage.words >= token_capacity && (!pinned || storage.pinned) => {
                 storage
             }
-            _ => OutputStorage {
-                value: py
+            _ => {
+                let tensor = py
                     .import("uniserve_worker.storage.output")?
-                    .call_method1("_allocate", (token_capacity, pinned))?
-                    .unbind(),
-                words: token_capacity,
-                pinned,
-            },
+                    .call_method1("_allocate", (token_capacity, pinned))?;
+                let address = tensor.call_method0("data_ptr")?.extract()?;
+                OutputStorage {
+                    value: HostAllocation {
+                        tensor: tensor.unbind(),
+                        address,
+                    },
+                    words: token_capacity,
+                    pinned,
+                }
+            }
         };
 
         let inner = Arc::new(Mutex::new(NativeBuffer::new(
@@ -391,9 +418,6 @@ impl OutputPool {
                 event_pool: self.event_pool.clone_ref(py),
                 devices: PyTuple::new(py, normalized)?.unbind(),
                 completion: Py::new(py, Completion::new())?,
-                logprob_layouts: PyDict::new(py).unbind(),
-                tokens: PyDict::new(py).unbind(),
-                logprobs: PyDict::new(py).unbind(),
             },
         )?;
         pool.insert(inner, buffer.clone_ref(py));
@@ -440,7 +464,7 @@ impl OutputPool {
             visit.call(owner)?;
         }
         for storage in pool.storages() {
-            visit.call(&storage.value)?;
+            visit.call(&storage.value.tensor)?;
         }
         Ok(())
     }
@@ -456,7 +480,7 @@ impl OutputPool {
     fn lock(
         &self,
         py: Python<'_>,
-    ) -> PyResult<MutexGuard<'_, NativePool<Py<PyAny>, Py<OutputBuffer>>>> {
+    ) -> PyResult<MutexGuard<'_, NativePool<HostAllocation, Py<OutputBuffer>>>> {
         self.state
             .lock_py_attached(py)
             .map_err(|_| invariant(py, "output pool lock poisoned"))

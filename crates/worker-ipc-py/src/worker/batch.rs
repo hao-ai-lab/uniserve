@@ -270,16 +270,16 @@ impl BatchState {
             let mut entries: Vec<(Py<PyAny>, (usize, usize), usize)> = entries.extract(py)?;
             entries.sort_by_key(|entry| entry.2);
             for (identity, (offset, count), row) in entries {
-                let captured = buffer.get().read_tokens(py, offset, count)?;
-                let captured = captured.bind(py).cast::<PyTuple>()?;
-                if captured.len() != 1 {
-                    return Err(invalid(py, "call predicate is not a canonical boolean"));
-                }
-                let value: i64 = captured.get_item(0)?.extract()?;
-                if value != 0 && value != 1 {
-                    return Err(invalid(py, "call predicate is not a canonical boolean"));
-                }
-                values.set_item(identity, value != 0)?;
+                let value = buffer.get().with_readback(py, |buffer| {
+                    match buffer.read_tokens(offset, count)? {
+                        [0] => Ok(false),
+                        [1] => Ok(true),
+                        _ => Err(uniserve_worker::Error::Invalid(
+                            "call predicate is not a canonical boolean".into(),
+                        )),
+                    }
+                })?;
+                values.set_item(identity, value)?;
                 buffer.get().observe(py, row)?;
             }
             Ok(())
