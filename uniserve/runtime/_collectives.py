@@ -24,13 +24,9 @@ from typing import Protocol
 import torch
 import torch.distributed as dist
 
-from uniserve.runtime.cuda import (
-    create_sibling_stream,
-    cuda_value,
-    destroy_stream,
-    driver,
-)
+from uniserve.runtime.cuda import create_sibling_stream
 from uniserve.runtime.resources import close_resources
+from uniserve_worker._uniserve_ipc import CUDAStream as NativeStream
 
 
 def _forbid_implicit_registration() -> None:
@@ -57,10 +53,7 @@ def _forbid_implicit_registration() -> None:
 
 
 class _CollectiveWork:
-    """A published transfer with a consumer-supplied dependency.
-
-    A published transfer whose consumer supplies the final stream dependency.
-    """
+    """A transfer whose consumer supplies the final stream dependency."""
 
     def __init__(self, event: torch.cuda.Event, owner: NcclCommunicator):
         self.event, self.owner = event, owner
@@ -83,16 +76,19 @@ class NcclCommunicator:
     group; the model Communicator handles logical membership ordering.
     """
 
-    def __init__(self, group, stream: torch.cuda.Stream) -> None:
+    def __init__(
+        self, group, stream: torch.cuda.Stream, owner: NativeStream
+    ) -> None:
         import nccl.bindings.nccl as nccl
 
         # Before this communicator can take part in any captured collective.
         _forbid_implicit_registration()
         self._nccl = nccl
         self._stream = stream
+        self._stream_owner = owner
         # The owned publication stream exists from construction until close.
         self._transfer: torch.cuda.ExternalStream | None = None
-        self._raw_transfer = None
+        self._transfer_owner = None
         self._pending: _CollectiveWork | None = None
         self._comm = c_void_p()
         self._windows: dict[tuple[int, int], tuple[c_void_p, torch.Tensor]] = {}
@@ -110,18 +106,11 @@ class NcclCommunicator:
 
         try:
             with torch.cuda.device(stream.device):
-                cu = driver()
-                origin = cu.CUstream(stream.cuda_stream)
-                green = cuda_value(
-                    cu.cuStreamGetGreenCtx(origin),
-                    "query communication context",
-                )
-
                 config = nccl.Config()
                 # The deployed Green Context driver cannot batch-copy mapped
                 # peer windows. Keep NCCL's native CTA algorithms on that
                 # partition's SMs; ordinary contexts can use copy engines.
-                config.cta_policy = 0 if int(green) else 0x02  # DEFAULT or ZERO
+                config.cta_policy = 0x02 if owner.full_device else 0
                 nccl.comm_init_rank_config(
                     addressof(self._comm),
                     self._size,
@@ -133,21 +122,21 @@ class NcclCommunicator:
                 # Reuse the computation's actual context, including its SM
                 # partition. Communication owns a stream, not another resource
                 # partition, and every transfer rejoins its numerical consumer.
-                self._raw_transfer, self._transfer = create_sibling_stream(
-                    stream, "communication"
+                self._transfer_owner, self._transfer = create_sibling_stream(
+                    stream, owner
                 )
         except BaseException as error:
             # Partial construction still attempts every acquired resource's
             # release, recording cleanup failures on the original error.
-            if self._raw_transfer is not None:
+            if self._transfer_owner is not None:
                 try:
-                    destroy_stream(self._raw_transfer, "communication")
+                    self._transfer_owner.close()
                 except BaseException as cleanup_error:
                     error.add_note(
                         f"Communication stream cleanup failed: "
                         f"{cleanup_error!r}"
                     )
-                self._raw_transfer = None
+                self._transfer_owner = None
             if self._comm.value:
                 try:
                     nccl.comm_abort(self._comm.value)
@@ -170,11 +159,7 @@ class NcclCommunicator:
         *,
         asynchronous: bool = False,
     ) -> tuple[int, int]:
-        """Validate operands for a launch.
-
-        Validate operands and return the communicator and stream for a
-        launch.
-        """
+        """Validate operands and return the launch's communicator and stream."""
         if not self._comm.value:
             raise RuntimeError("computation collective is closed")
         if value.device != self._stream.device or not value.is_contiguous():
@@ -204,10 +189,7 @@ class NcclCommunicator:
         return self._comm.value, self._stream.cuda_stream
 
     def _start(self, call, *args) -> _CollectiveWork:
-        """Launch on the transfer stream.
-
-        Launch on the transfer stream after the computation stream's inputs.
-        """
+        """Launch on the transfer stream after the computation's inputs."""
         transfer = self._transfer
         if transfer is None:
             raise RuntimeError("computation collective is closed")
@@ -420,9 +402,7 @@ class NcclCommunicator:
             self._nccl.group_end()
 
     def register_buffers(self, *buffers: torch.Tensor) -> None:
-        """Register matching VMM allocations.
-
-        Register matching VMM allocations collectively before their first use.
+        """Register matching VMM allocations collectively before first use.
 
         Every rank supplies the same buffer sequence and byte capacities. Both
         sides of a symmetric exchange must use registered allocations; mixing
@@ -446,9 +426,8 @@ class NcclCommunicator:
             self._windows[key] = window, value
 
     def close(self) -> None:
-        """Destroy the communicator.
+        """Destroy the communicator after its runner has retired all graph use.
 
-        Destroy the communicator after its runner has retired all graph use.
         Destruction is collective: it completes only once every rank of the
         communicator calls it, so this belongs on a path all of them reach.
         A rank releasing after a failure calls ``abort`` instead.
@@ -484,9 +463,9 @@ class NcclCommunicator:
 
     def _release_stream(self) -> None:
         """Destroy the communication stream this communicator owns."""
-        if self._raw_transfer is not None:
-            destroy_stream(self._raw_transfer, "communication")
-            self._raw_transfer = None
+        if self._transfer_owner is not None:
+            self._transfer_owner.close()
+            self._transfer_owner = None
             self._transfer = self._pending = None
 
 
@@ -564,8 +543,9 @@ class StreamCommunication:
     closes the stream on a path all members reach.
     """
 
-    def __init__(self, stream: torch.cuda.Stream) -> None:
+    def __init__(self, stream: torch.cuda.Stream, owner: NativeStream) -> None:
         self.stream = stream
+        self._stream_owner = owner
         self._communicators: dict[str, NcclCommunicator] = {}
         self._gather_pools: dict[object, GatherPool] = {}
         self._windows: dict[
@@ -607,7 +587,9 @@ class StreamCommunication:
                     and name not in self._communicators
                     and name not in created
                 ):
-                    created[name] = NcclCommunicator(group, self.stream)
+                    created[name] = NcclCommunicator(
+                        group, self.stream, self._stream_owner
+                    )
         except BaseException as error:
             for binding in reversed(tuple(created.values())):
                 try:

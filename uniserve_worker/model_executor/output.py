@@ -10,6 +10,7 @@ import torch
 
 from uniserve.model.logits import Logits, VocabShard
 from uniserve.tensors import OutputLayout, adjacent_view
+from uniserve_worker._uniserve_ipc import CUDAEvent
 from uniserve_worker.model_executor.input_batch import InputBatch
 from uniserve_worker.protocol.output import ForwardStats
 
@@ -37,7 +38,7 @@ class ExecutionOutput:
     values: tuple[torch.Tensor, ...]
     vocabularies: tuple[VocabShard | None, ...] = ()
     request_pool_indices: torch.Tensor | None = None
-    output_event: torch.cuda.Event | None = None
+    output_event: CUDAEvent | None = None
     stats: ForwardStats | None = None
     greedy: SamplerOutput | None = None
 
@@ -124,8 +125,8 @@ class ExecutionOutput:
                 raise RuntimeError(
                     "forward output has a fence without a producer tensor"
                 )
-            torch.cuda.current_stream(self.values[0].device).wait_event(
-                self.output_event
+            self.output_event.wait(
+                torch.cuda.current_stream(self.values[0].device)
             )
 
         if not any(self.vocabularies):
@@ -186,8 +187,8 @@ class ExecutionOutput:
                 raise RuntimeError(
                     "forward output has a fence without a producer tensor"
                 )
-            torch.cuda.current_stream(self.values[0].device).wait_event(
-                self.output_event
+            self.output_event.wait(
+                torch.cuda.current_stream(self.values[0].device)
             )
 
         # Tensors sharing a device and dtype copy through one flat allocation.

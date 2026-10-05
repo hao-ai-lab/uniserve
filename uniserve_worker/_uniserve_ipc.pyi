@@ -79,6 +79,7 @@ __all__ = [
     "BufferRegistry",
     "Completion",
     "CUDAEvent",
+    "CUDAStream",
     "EventPool",
     "EventPoolError",
     "Executor",
@@ -449,12 +450,43 @@ class HostBuffers:
     def close(self) -> None:
         """Wait for copies and release storage; subsequent acquire fails."""
 
+@final
+class CUDAStream:
+    """Native stream ownership, SM partitions and reusable execution fences."""
+
+    def __new__(
+        cls, device: int, handle: int, event_slots: int = 2
+    ) -> Self: ...
+    @staticmethod
+    def sibling(
+        device: int, origin: int, event_slots: int = 2
+    ) -> CUDAStream: ...
+    @staticmethod
+    def partition(
+        device: int, counts: Sequence[int], slots: Sequence[int]
+    ) -> list[CUDAStream]: ...
+    @property
+    def device(self) -> int: ...
+    @property
+    def handle(self) -> int: ...
+    @property
+    def sm_count(self) -> int: ...
+    @property
+    def full_device(self) -> bool: ...
+    @property
+    def closed(self) -> bool: ...
+    def fork(self) -> CUDAStream: ...
+    def wait(self, producer: int) -> None: ...
+    def record(self, consumer: int) -> CUDAEvent | None: ...
+    def synchronize(self) -> None: ...
+    def close(self, *, aborted: bool = False) -> None: ...
+
 class EventPoolError(RuntimeError):
     """Invalid event lease ownership or stream ordering."""
 
 @final
 class CUDAEvent:
-    """A native CUDA event borrowed from a pool or imported through IPC."""
+    """A native completion event from execution, a pool or CUDA IPC."""
 
     def query(self) -> bool: ...
     def synchronize(self) -> None: ...

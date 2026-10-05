@@ -15,6 +15,7 @@ use execution::{failure, lock};
 
 mod execution;
 mod host;
+mod stream;
 
 #[repr(C)]
 #[derive(Object)]
@@ -420,6 +421,7 @@ fn method<T: ObjectCore>(name: &str, function: Function, doc: &str) -> Result<()
 }
 
 fn register() -> Result<()> {
+    stream::register()?;
     object::<ExecutorObj>();
     object::<SubmissionObj>();
     object::<WorkerRequestObj>();
@@ -580,3 +582,4 @@ fn register() -> Result<()> {
 }
 
 tvm_ffi::tvm_ffi_dll_export_typed_func!(register, register);
+tvm_ffi::tvm_ffi_dll_export_typed_func!(partition_streams, stream::partition_streams);

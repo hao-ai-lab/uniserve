@@ -152,6 +152,7 @@ from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.sampling.metadata import TokenSelection
 
 if TYPE_CHECKING:
+    from uniserve.runtime.weight_prefetch import WeightPrefetch
     from uniserve_worker.model_executor.canvas_runner import CanvasRunner
     from uniserve_worker.model_executor.media_inputs import MediaBuilder
     from uniserve_worker.storage.block_tables import BlockTables
@@ -317,7 +318,7 @@ class ModelExecutor:
         self.experts = None
         self._expert_exchanges = ()
         self._microbatch_streams = []
-        self.expert_weights = None
+        self.expert_weights: WeightPrefetch | None = None
         self._expert_runners: list[ModelRunner] = []
         # With graphs, a rank without a forward of its own joins each expert
         # step by replaying the captured join of the step's capacity
@@ -586,12 +587,8 @@ class ModelExecutor:
                     "numerical entry has no initialized execution partition"
                 )
             else:
-                owner = CUDAStream(
-                    device=binding.device,
-                    stream=torch.cuda.Stream(device=binding.device),
-                    sm_count=torch.cuda.get_device_properties(
-                        binding.device
-                    ).multi_processor_count,
+                owner = CUDAStream.external(
+                    torch.cuda.Stream(device=binding.device)
                 )
             # Weights and runtime backing are initialized before their first
             # borrowed use. Later calls depend on tensor fences, not other
@@ -717,12 +714,8 @@ class ModelExecutor:
                     self._lane_streams.append(
                         (
                             None,
-                            CUDAStream(
-                                device=target,
-                                stream=torch.cuda.Stream(device=target),
-                                sm_count=torch.cuda.get_device_properties(
-                                    target
-                                ).multi_processor_count,
+                            CUDAStream.external(
+                                torch.cuda.Stream(device=target),
                                 event_slots=event_slots,
                             ),
                         )
@@ -1988,15 +1981,12 @@ class ModelExecutor:
                 entry.peers[index].microbatch_joins = joins
 
     def complete_startup(self):
-        """Seal startup: check captured-graph storage budgets and stream grants.
+        """Check graph storage budgets and end startup capture.
 
-        Afterwards no runner captures: the staged entries capture no
-        further batch graphs, module entries, including ones prepared later,
-        evaluate signatures without a resident graph eagerly, and the
-        denoiser runner refuses capture (see ``ModelRunner``), so the graph
-        storage is sealed (``GraphStorage.seal``). Raises ``CUDAGraphError``
-        when graph residency exceeds its budget, and ``CUDAError`` when a
-        lane stream has lost its SM partition.
+        Prepared batch shapes are fixed after this call. Module signatures
+        without a resident graph execute eagerly; denoiser runners reject
+        further capture. Raises ``CUDAGraphError`` if resident graph storage
+        exceeds its budget.
         """
         self.graph_storage.check()
         # Resident storage by device and, for graph pools, by runner kind,
@@ -2033,8 +2023,6 @@ class ModelExecutor:
                 used / 2**30,
             )
 
-        for _, stream in self._lane_streams:
-            stream.verify()
         self.graph_storage.seal()
 
         # Warmup and capture have now prepared the call sites and resolved
@@ -2381,9 +2369,9 @@ class ModelExecutor:
                 # Join the lane stream's output fence so later control-stream
                 # work observes this group's writes in order.
                 if result.output_event is not None:
-                    torch.cuda.current_stream(
-                        bindings[indexes[0]].device
-                    ).wait_event(result.output_event)
+                    result.output_event.wait(
+                        torch.cuda.current_stream(bindings[indexes[0]].device)
+                    )
 
                 if all(row.forward_mode is ForwardMode.DECODE for row in rows):
                     if result.stats is None:
@@ -2528,7 +2516,7 @@ class ModelExecutor:
                     None if lane_runtime is None else lane_runtime.record()
                 )
                 if output_event is not None:
-                    torch.cuda.current_stream(target).wait_event(output_event)
+                    output_event.wait(torch.cuda.current_stream(target))
                 raise _input_failure(error, forward_mode, call_keys) from error
 
             output_event = None
@@ -2600,7 +2588,7 @@ class ModelExecutor:
                         None if lane_runtime is None else lane_runtime.record()
                     )
                 if output_event is not None:
-                    torch.cuda.current_stream(target).wait_event(output_event)
+                    output_event.wait(torch.cuda.current_stream(target))
                 raise _execution_failure(
                     error, forward_mode, call_keys
                 ) from error

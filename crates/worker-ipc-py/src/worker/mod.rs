@@ -25,6 +25,7 @@ mod protocol;
 mod registry;
 mod request;
 mod storage;
+mod stream;
 mod transfer;
 mod weight_prefetch;
 
@@ -46,6 +47,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<block_tables::GroupTable>()?;
     module.add_class::<completion::Completion>()?;
     module.add_class::<events::CUDAEvent>()?;
+    module.add_class::<stream::CUDAStream>()?;
     module.add_class::<events::EventPool>()?;
     module.add(
         "EventPoolError",

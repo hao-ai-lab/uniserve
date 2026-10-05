@@ -8,13 +8,7 @@ from typing import Generic, TypeVar
 
 import torch
 
-from .cuda import (
-    create_sibling_stream,
-    cuda_value,
-    destroy_stream,
-    driver,
-    verify_graph_context,
-)
+from .cuda import create_sibling_stream
 from .execution import ExecutionContext
 from .resources import streams_idle
 
@@ -124,8 +118,9 @@ class CUDAGraph(Generic[ResultT]):
             context._graph_streams.add(self._computation)
         # A driver stream is never one of the pool's, so no context or lane
         # stream can coincide with it.
-        self._raw_capture, self._capture = create_sibling_stream(
-            self._computation, "graph capture"
+        self._capture_owner, self._capture = create_sibling_stream(
+            self._computation,
+            context.stream._native if context.stream is not None else None,
         )
         # The captured graph, its retained output views and the captured call.
         self._captured: (
@@ -213,31 +208,6 @@ class CUDAGraph(Generic[ResultT]):
                     for graph in captured.graphs:
                         graph.instantiate()
 
-                    if context.stream is not None:
-                        cu = driver()
-                        transfers = context._transfers
-                        streams = (
-                            self._capture,
-                            self._computation,
-                            *(
-                                transfers.streams.values()
-                                if transfers is not None
-                                else ()
-                            ),
-                        )
-                        expected = frozenset(
-                            int(
-                                cuda_value(
-                                    cu.cuStreamGetCtx(
-                                        cu.CUstream(stream.cuda_stream)
-                                    ),
-                                    "query capture stream context",
-                                )
-                            )
-                            for stream in streams
-                        )
-                        for graph in captured.graphs:
-                            verify_graph_context(graph, expected)
                 finally:
                     if restore is not None:
                         with context.activate():
@@ -295,13 +265,10 @@ class CUDAGraph(Generic[ResultT]):
             self.pools.clear()
             if self._context is not None:
                 self._context._graph_streams.discard(self._computation)
+            # Only capture bookkeeping was ever launched here, and the
+            # caller has ordered its final readers before closing.
+            self._capture_owner.close()
             self._context = None
-            if self._raw_capture is not None:
-                # Only capture bookkeeping was ever launched here, and the
-                # caller has ordered its final readers before closing.
-                self._capture.synchronize()
-                destroy_stream(self._raw_capture, "graph capture")
-                self._raw_capture = None
 
     def __enter__(self):
         if self._closed:
