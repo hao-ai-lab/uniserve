@@ -69,7 +69,7 @@ def allocate(
     list of handles, one per owner allocating the same shape and dtype, into
     one tensor whose first dimension is ``shape[0] * len(handles)``. Both
     mappings retain the originating allocation, keeping its exported handle
-    importable until the tensor retires. Handle transport, publication,
+    importable until the tensor retires. Handle exchange, buffer readiness,
     reuse, and retirement belong to the distributed runtime.
     """
     return _extension().PeerAllocation(
@@ -137,8 +137,8 @@ def export_handle(tensor: torch.Tensor) -> tuple[bytes, int, int] | None:
 
     The handle is the device's probed type: a fabric handle where the driver
     exports one, which another host inside the fabric domain can import, and a
-    process descriptor otherwise. Both travel as bytes so one publication
-    shape carries either.
+    process descriptor otherwise. Both travel as bytes through the same
+    export interface.
 
     The capacity is the byte size of the tensor's whole storage and the
     offset is the byte offset of the tensor's first element within it.
