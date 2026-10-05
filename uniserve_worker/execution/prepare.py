@@ -7,8 +7,8 @@ these stages, in order:
    and collects storage completions in `BatchInputs` before this batch writes.
 2. The native executor reserves tensor, latent and KV imports once storage
    dependencies are done. `BatchInputs` retains accepted inputs through
-   consumption or failure. `prepare_predicates` binds completion-valued
-   predicates; later advances call `capture_predicates` as sources become ready.
+   consumption or failure. Rust prepares completion-predicate readback and
+   captures imported sources once their transfer fences can be consumed.
 3. `reserve_outputs` runs under the native executor once inputs
    are ready. It creates the batch's `PendingOutput` records and completion
    buffer, then reserves host tasks, cache tables, latent buffers, and device
@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import defaultdict
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
@@ -43,11 +42,10 @@ from uniserve_worker.protocol.call import (
     MediaCall,
     TransferMode,
 )
-from uniserve_worker.protocol.identity import BufferId, CallId, CallIdentity
+from uniserve_worker.protocol.identity import CallId, CallIdentity
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 from uniserve_worker.sampling.result import SAMPLING_COMPLETION_FIELDS
 from uniserve_worker.storage.output import OutputBuffer
-from uniserve_worker.storage.tensor_store import TensorRead
 
 if TYPE_CHECKING:
     from uniserve_worker.config.execution.execution import WorkerConfig
@@ -63,131 +61,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-
-def prepare_predicates(
-    state: BatchState,
-    *,
-    tensor_store: TensorStore,
-    output_pool: OutputPool,
-    model_runner: ModelExecutor,
-) -> None:
-    """Capture completion-valued (U8) predicates into one completion buffer.
-
-    Each such call owns one row of the buffer. Local sources are
-    consumed and captured now; transferred sources (those with a prepared
-    batch-owned tensor import) are recorded in `state.predicate_transfers`
-    for `capture_predicates`. The buffer is sealed once every row is
-    captured, and `BatchState.predicate_values` reads it after the copies
-    complete. I64 relay predicates are not captured here; `_consume_predicates`
-    hands them to execution as device tensors. Nor are the predicates of
-    calls gated on the device (`calls.device_gated`).
-    """
-    # Predicate rows occupy one compact completion buffer regardless of whether
-    # their source is already local or will arrive through a prepared transfer.
-    scheduled = tuple(
-        call
-        for call in state.batch.calls
-        if call.predicate is not None
-        and call.predicate.dtype is DType.U8
-        and not calls.device_gated(call)
-    )
-    if not scheduled:
-        return
-
-    buffer = output_pool.acquire(
-        len(scheduled),
-        token_capacity=len(scheduled),
-        devices=tuple(model_runner.call_devices(call)[0] for call in scheduled),
-    )
-    captures: list[tuple[CallIdentity, tuple[int, int], int]] = []
-    pending: list[tuple[CallIdentity, BufferId, int]] = []
-    recorded: list[TensorRead] = []
-    try:
-        # Local sources are consumed in device batches and captured directly;
-        # transferred sources retain their target row for later completion.
-        grouped: dict[torch.device, list[Call]] = defaultdict(list)
-        rows = {
-            calls.call_identity(call): row for row, call in enumerate(scheduled)
-        }
-        for call in scheduled:
-            source = cast(TensorRef, call.predicate).buffer_id
-            if state.inputs.tensor(source) is None:
-                grouped[model_runner.call_devices(call)[0]].append(call)
-            else:
-                pending.append(
-                    (
-                        calls.call_identity(call),
-                        source,
-                        rows[calls.call_identity(call)],
-                    )
-                )
-
-        for device, device_calls in grouped.items():
-            reads = tensor_store.consume_batch(
-                tuple(
-                    (
-                        cast(TensorRef, call.predicate),
-                        call.call_id,
-                        device,
-                    )
-                    for call in device_calls
-                ),
-                device=device,
-            )
-            recorded.extend(reads)
-            for call, read in zip(device_calls, reads, strict=True):
-                identity = calls.call_identity(call)
-                captures.append(
-                    (identity, buffer.capture(read.tensor), rows[identity])
-                )
-            tensor_store.complete_reads(reads, device=device)
-
-        # Sealing forbids further captures, so seal now only when no
-        # transferred row remains for `capture_predicates`.
-        if not pending:
-            buffer.seal()
-    except BaseException:
-        # Every acquired read must receive a reader event even when preparation
-        # fails before all device groups are captured; `complete_reads` skips
-        # reads already completed above.
-        unrecorded = tuple(recorded)
-        if unrecorded:
-            tensor_store.complete_reads(unrecorded)
-        buffer.abandon()
-        raise
-    state.inputs.predicate = buffer
-    state.predicate_entries = captures
-    state.predicate_transfers = tuple(pending)
-
-
-def capture_predicates(state: BatchState, tensor_store: TensorStore) -> None:
-    """Submit transferred predicate copies on the worker execution thread.
-
-    Does nothing when there is no predicate buffer, it is already sealed, or
-    any transferred predicate source is not yet ready; the executor calls it
-    again on later advances. On failure the predicate buffer is abandoned.
-    """
-    buffer = state.inputs.predicate
-    if buffer is None or buffer.sealed:
-        return
-    if not all(
-        state.inputs.input_ready(source)
-        for _, source, _ in state.predicate_transfers
-    ):
-        return
-
-    try:
-        for identity, source, row in state.predicate_transfers:
-            read = cast(TensorRead, state.inputs.tensor(source))
-            tensor_store.wait_import(read)
-            state.predicate_entries.append(
-                (identity, buffer.capture(read.tensor), row)
-            )
-        buffer.seal()
-    except BaseException:
-        buffer.abandon()
-        raise
 
 
 def reserve_outputs(
@@ -220,19 +93,6 @@ def reserve_outputs(
     If creating the records fails, the local completion buffer is abandoned.
     Once records are bound, the native executor owns failure cleanup.
     """
-    required_predicates = {
-        calls.call_identity(call)
-        for call in batch.calls
-        if call.predicate is not None
-        and call.predicate.dtype is DType.U8
-        and not calls.device_gated(call)
-    }
-    if required_predicates != set(predicate_values):
-        raise invalid_descriptor(
-            "completion-predicated calls require exact prepared "
-            "predicate values"
-        )
-
     scheduled = state.batch.calls
 
     # Predicated rows remain in aligned output/state tables but do not reserve

@@ -69,7 +69,11 @@ impl OutputBuffer {
             .map_err(|error| native_error(py, error))
     }
 
-    fn capture(&self, py: Python<'_>, tokens: &Bound<'_, PyAny>) -> PyResult<(usize, usize)> {
+    pub(super) fn capture(
+        &self,
+        py: Python<'_>,
+        tokens: &Bound<'_, PyAny>,
+    ) -> PyResult<(usize, usize)> {
         let numerical = py.import("uniserve_worker.storage.output")?;
         let value = numerical.call_method1("_tokens", (tokens,))?;
         let count = value.call_method0("numel")?.extract()?;
@@ -334,7 +338,7 @@ impl OutputPool {
     }
 
     #[pyo3(signature = (rows, *, token_capacity, devices=Vec::new()))]
-    fn acquire(
+    pub(super) fn acquire(
         &self,
         py: Python<'_>,
         rows: usize,

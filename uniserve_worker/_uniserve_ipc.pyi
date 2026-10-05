@@ -279,8 +279,6 @@ class BatchState:
 
     batch: Batch
     inputs: BatchInputs
-    predicate_entries: list[tuple[CallIdentity, tuple[int, int], int]]
-    predicate_transfers: tuple[tuple[CallIdentity, BufferId, int], ...]
     stream: torch.cuda.Stream | None
     started_ns: int
     forward_stats: list[ForwardStats]

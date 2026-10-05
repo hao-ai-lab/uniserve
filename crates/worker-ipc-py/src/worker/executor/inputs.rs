@@ -309,9 +309,7 @@ impl PythonBackend {
                 self.prepare_products(py, batch)?;
                 resumable = false;
                 self.prepare_kv(py, batch)?;
-                self.runner
-                    .bind(py)
-                    .call_method1("prepare_predicates", (&batch.numerical,))?;
+                self.prepare_predicates(py, batch)?;
                 Ok(())
             })();
             if let Err(error) = prepared {
@@ -358,9 +356,7 @@ impl PythonBackend {
 
         // Numerical callbacks may acquire or close inputs. Never retain an
         // input-set borrow across a callback or notification registration.
-        self.runner
-            .bind(py)
-            .call_method1("capture_predicates", (&batch.numerical,))?;
+        self.capture_predicates(py, batch)?;
         Ok(())
     }
 

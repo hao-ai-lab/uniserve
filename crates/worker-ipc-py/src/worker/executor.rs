@@ -4,6 +4,7 @@ mod commit;
 mod execute;
 mod inputs;
 mod output;
+mod predicates;
 mod prepare;
 mod retirement;
 
@@ -32,6 +33,7 @@ use super::inputs::BatchInputs;
 use super::kv_cache::KVCacheManager;
 use super::kv_import::KVImporter;
 use super::latent::LatentPool;
+use super::output::OutputPool;
 use super::pending::PendingOutput;
 use super::request::RequestPool;
 use super::storage::TensorStore;
@@ -63,6 +65,7 @@ struct PythonBackend {
     read_backpressure: Py<PyType>,
     requests: Py<RequestPool>,
     tensors: Py<TensorStore>,
+    output_pool: Py<OutputPool>,
     latents: Option<Py<LatentPool>>,
     cache: Option<Py<KVCacheManager>>,
     cache_imports: Option<Py<KVImporter>>,
@@ -507,6 +510,7 @@ impl Executor {
                 .unbind(),
             requests: worker.getattr("requests")?.extract()?,
             tensors: worker.getattr("tensor_store")?.extract()?,
+            output_pool: worker.getattr("output_pool")?.extract()?,
             latents: worker.getattr("latent_pool")?.extract()?,
             cache: cache_manager,
             cache_imports,
@@ -638,6 +642,7 @@ impl Executor {
             visit.call(&executor.backend().read_backpressure)?;
             visit.call(&executor.backend().requests)?;
             visit.call(&executor.backend().tensors)?;
+            visit.call(&executor.backend().output_pool)?;
             visit.call(&executor.backend().latents)?;
             visit.call(&executor.backend().cache)?;
             visit.call(&executor.backend().cache_imports)?;

@@ -20,11 +20,7 @@ from uniserve_worker.execution.forward import (
     initialize_trajectories,
 )
 from uniserve_worker.execution.image import reserve_images
-from uniserve_worker.execution.prepare import (
-    capture_predicates,
-    prepare_predicates,
-    reserve_outputs,
-)
+from uniserve_worker.execution.prepare import reserve_outputs
 from uniserve_worker.profiling import _forward_stats, record_component
 from uniserve_worker.protocol.output import ForwardStats
 
@@ -56,18 +52,6 @@ class BatchRunner:
             request_pool=self.worker.requests,
             model_runner=self.worker.runner,
         )
-
-    def prepare_predicates(self, state: BatchState) -> None:
-        """Bind predicate views after native input admission."""
-        prepare_predicates(
-            state,
-            tensor_store=self.worker.tensor_store,
-            output_pool=self.worker.output_pool,
-            model_runner=self.worker.runner,
-        )
-
-    def capture_predicates(self, state: BatchState) -> None:
-        capture_predicates(state, self.worker.tensor_store)
 
     def profile_step(self, state: BatchState) -> AbstractContextManager[None]:
         """Scope one numerical step without advancing on lifecycle batches."""

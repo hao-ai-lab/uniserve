@@ -37,12 +37,9 @@ pub(crate) struct BatchState {
     #[pyo3(get)]
     pub(super) inputs: Py<BatchInputs>,
 
-    // Each predicate capture names a call, an (offset, word count) span and
-    // its output row. Deferred transfers fill the remaining rows before sealing.
-    #[pyo3(get, set)]
-    predicate_entries: Py<PyList>,
-    #[pyo3(get, set)]
-    predicate_transfers: Py<PyTuple>,
+    // Rows name native call indices and their readback spans. A missing span
+    // waits for an imported source; all rows are filled before sealing.
+    pub(super) predicate_captures: Vec<(usize, Option<(usize, usize)>)>,
 
     #[pyo3(get, set)]
     stream: Option<Py<PyAny>>,
@@ -82,8 +79,7 @@ impl BatchState {
             predicate_values: None,
             batch,
             inputs: Py::new(py, BatchInputs::new())?,
-            predicate_entries: PyList::empty(py).unbind(),
-            predicate_transfers: PyTuple::empty(py).unbind(),
+            predicate_captures: Vec::new(),
             stream: None,
             started_ns: 0,
             forward_stats: PyList::empty(py).unbind(),
@@ -746,14 +742,15 @@ impl BatchState {
     /// Read completed U8 predicates once. Device-gated predicates remain tensors.
     fn predicate_values(slf: &Bound<'_, Self>) -> PyResult<Py<PyDict>> {
         let py = slf.py();
-        let (inputs, entries) = {
+        let (inputs, batch, captures) = {
             let this = slf.borrow();
             if let Some(values) = &this.predicate_values {
                 return Ok(values.clone_ref(py));
             }
             (
                 this.inputs.clone_ref(py),
-                this.predicate_entries.clone_ref(py),
+                this.batch.clone_ref(py),
+                this.predicate_captures.clone(),
             )
         };
         let Some(buffer) = inputs.borrow(py).predicate(py) else {
@@ -767,9 +764,11 @@ impl BatchState {
 
         let values = PyDict::new(py);
         let read = (|| -> PyResult<()> {
-            let mut entries: Vec<(Py<PyAny>, (usize, usize), usize)> = entries.extract(py)?;
-            entries.sort_by_key(|entry| entry.2);
-            for (identity, (offset, count), row) in entries {
+            let calls = batch.bind(py).getattr("calls")?;
+            for (row, (index, span)) in captures.into_iter().enumerate() {
+                let (offset, count) = span.ok_or_else(|| {
+                    PyRuntimeError::new_err("sealed predicate buffer has an uncaptured row")
+                })?;
                 let value = buffer.get().with_readback(py, |buffer| {
                     match buffer.read_tokens(offset, count)? {
                         [0] => Ok(false),
@@ -779,7 +778,11 @@ impl BatchState {
                         )),
                     }
                 })?;
-                values.set_item(identity, value)?;
+                let call = calls.get_item(index)?;
+                values.set_item(
+                    (call.getattr("request_key")?, call.getattr("call_id")?),
+                    value,
+                )?;
                 buffer.get().observe(py, row)?;
             }
             Ok(())
@@ -801,8 +804,6 @@ impl BatchState {
         for output in &self.outputs {
             visit.call(output)?;
         }
-        visit.call(&self.predicate_entries)?;
-        visit.call(&self.predicate_transfers)?;
         visit.call(&self.predicate_values)?;
         visit.call(&self.stream)?;
         visit.call(&self.forward_stats)?;
@@ -816,8 +817,7 @@ impl BatchState {
         self.buffer = None;
         self.predicate_values = None;
         self.stream = None;
-        self.predicate_entries = PyList::empty(py).unbind();
-        self.predicate_transfers = PyTuple::empty(py).unbind();
+        self.predicate_captures.clear();
         self.forward_stats = PyList::empty(py).unbind();
         self.component_us = PyDict::new(py).unbind();
         self.products = PyTuple::empty(py).unbind();
