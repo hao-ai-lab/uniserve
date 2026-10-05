@@ -11,6 +11,7 @@ import pytest
 import torch
 from PIL import Image
 
+from tests.python.fixtures import segment
 from tests.python.fixtures.depth_one import (
     ar_params,
     bind_request_allocation,
@@ -29,6 +30,7 @@ from tests.python.fixtures.depth_one import (
     visual_state_call,
 )
 from tests.python.fixtures.execution_worker import execution_worker
+from tests.python.fixtures.shared_storage import open_shared_storage
 from tests.python.fixtures.simulation import expected_successor
 from uniserve.model import Logits
 from uniserve_models.stub import Model
@@ -69,8 +71,6 @@ from uniserve_worker.protocol.transfer import (
     EncoderTransferValue,
     TensorTransfer,
 )
-from uniserve_worker.transport import segment
-from uniserve_worker.transport.shared_storage import open_shared_storage
 
 pytestmark = pytest.mark.integration
 

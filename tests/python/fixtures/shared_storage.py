@@ -1,7 +1,8 @@
-"""Reader mappings of native media and tensor shared-memory allocations.
+"""External reader mappings for shared-memory transfer tests.
 
 Readers resolve POSIX names with ``shm_open``; no shared-memory mount path
-is required. The native producer owns allocation and unlinking.
+is required. This reader can inspect headers and inject peer failures without
+replacing the production transport's native ownership.
 """
 
 from __future__ import annotations

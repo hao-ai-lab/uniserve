@@ -596,8 +596,8 @@ def _read_shm_export(channel, slot: int) -> None:
     and holds the claim across the producer's release so retirement is
     observed to wait for it.
     """
-    from uniserve_worker.transport import segment
-    from uniserve_worker.transport.shared_storage import open_shared_storage
+    from tests.python.fixtures import segment
+    from tests.python.fixtures.shared_storage import open_shared_storage
 
     channel.send("ready")
     locator = Locator.from_mapping(channel.recv())

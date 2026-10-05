@@ -15,6 +15,7 @@
 
 use std::ffi::CString;
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 
 use crate::SharedMemory;
 
@@ -67,55 +68,25 @@ impl SharedMedia {
         if bytes == 0 || name.is_empty() || name.contains('/') {
             return Err("generated media has an invalid shared-storage locator".to_string());
         }
-        let name = CString::new(format!("/{}", name))
+        let canonical_name = CString::new(format!("/{name}"))
             .map_err(|_| "generated media has an invalid shared-storage name".to_string())?;
+        let file = SharedMemory::open(name, false)
+            .map_err(|error| format!("failed to open generated media shared storage: {error}"))?;
 
-        // SAFETY: name is a valid NUL-terminated POSIX shm name.
-        let descriptor = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
-        if descriptor < 0 {
+        // Claim the name immediately; the descriptor retains the bytes even
+        // if subsequent inspection or mapping fails.
+        if unsafe { libc::shm_unlink(canonical_name.as_ptr()) } != 0 {
             return Err(format!(
-                "failed to open generated media shared storage: {}",
-                std::io::Error::last_os_error()
+                "failed to claim generated media shared storage: {}",
+                io::Error::last_os_error()
             ));
         }
 
-        // Unlink the name as soon as the object is open so no other consumer can
-        // claim it and the storage is freed with its last reference even if a
-        // later step fails. The descriptor, and then the mapping, keeps the
-        // bytes alive.
-        // SAFETY: name identifies the object opened above.
-        if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
-            let error = std::io::Error::last_os_error();
-            // SAFETY: descriptor is open.
-            unsafe { libc::close(descriptor) };
-            return Err(format!(
-                "failed to claim generated media shared storage: {error}"
-            ));
-        }
-
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: descriptor is open and stat points to writable storage.
-        let stat_result = unsafe { libc::fstat(descriptor, stat.as_mut_ptr()) };
-        if stat_result != 0 {
-            let error = std::io::Error::last_os_error();
-            // SAFETY: descriptor is open.
-            unsafe { libc::close(descriptor) };
-            return Err(format!(
-                "failed to inspect generated media shared storage: {error}"
-            ));
-        }
-        // SAFETY: fstat initialized stat on success.
-        let extent = unsafe { stat.assume_init() }.st_size;
-
-        // An export shorter than its locator is incomplete; reject it
-        // rather than map past the object's end.
-        if extent < 0
-            || u64::try_from(extent)
-                .ok()
-                .is_none_or(|value| value < num_bytes)
-        {
-            // SAFETY: descriptor is open.
-            unsafe { libc::close(descriptor) };
+        let extent = file
+            .metadata()
+            .map_err(|error| format!("failed to inspect generated media shared storage: {error}"))?
+            .len();
+        if extent < num_bytes {
             return Err("generated media shared storage is shorter than its locator".to_string());
         }
 
@@ -126,13 +97,10 @@ impl SharedMedia {
                 bytes,
                 libc::PROT_READ,
                 libc::MAP_SHARED,
-                descriptor,
+                file.as_raw_fd(),
                 0,
             )
         };
-        // SAFETY: this scope exclusively owns the valid descriptor; the mapping retains its
-        // kernel object independently after the descriptor is closed.
-        unsafe { libc::close(descriptor) };
         if address == libc::MAP_FAILED {
             return Err(format!(
                 "failed to map generated media shared storage: {}",

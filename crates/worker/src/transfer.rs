@@ -354,6 +354,10 @@ impl<V, E, C> TransferTicket<V, E, C> {
         }
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
     /// Expose a completed view without replacing an earlier error or result.
     pub fn complete(&mut self, value: V, producer: Option<Arc<Event>>) -> Vec<C> {
         self.producer = producer;

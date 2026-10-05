@@ -4,17 +4,21 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use uniserve_core::SharedMemory;
 
 use crate::cuda::{self, DeviceGuard, Event, Stream};
+use crate::{Error, Result};
 
 pub const SHM_HEADER_BYTES: usize = 512;
 const ACK_OFFSET: usize = 64;
 const ACK_SLOTS: usize = 64;
 const PENDING: u32 = 0;
 const READY: u32 = 1;
+const FAILED: u32 = 2;
 const CLAIMED: u32 = 1;
+const ACKNOWLEDGED: u32 = 2;
 
 /// A mapping can outlive its producer while a borrowed tensor view or a CUDA
 /// host function still uses it. It owns no CUDA resources: its final release
@@ -25,6 +29,18 @@ pub struct SharedMapping {
 }
 
 impl SharedMapping {
+    pub fn open(name: &str, size: usize) -> io::Result<Self> {
+        let file = SharedMemory::open(name, true)?;
+        if file.metadata()?.len() < size as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared buffer is shorter than its locator",
+            ));
+        }
+
+        Self::new(&file, size)
+    }
+
     fn new(file: &std::fs::File, size: usize) -> io::Result<Self> {
         // SAFETY: storage is physically backed for the full writable extent.
         let address = unsafe {
@@ -90,7 +106,7 @@ impl SharedBuffer {
         bytes: usize,
         consumers: Vec<usize>,
         device: Option<(i32, usize)>,
-    ) -> Result<Self, String> {
+    ) -> std::result::Result<Self, String> {
         if consumers.iter().any(|slot| *slot >= ACK_SLOTS) {
             return Err("shared buffer acknowledgment slot is out of range".into());
         }
@@ -120,12 +136,12 @@ impl SharedBuffer {
         })
     }
 
-    pub fn mapping(&self) -> Result<Arc<SharedMapping>, String> {
+    pub fn mapping(&self) -> std::result::Result<Arc<SharedMapping>, String> {
         self.name()?;
         Ok(Arc::clone(&self.mapping))
     }
 
-    pub fn name(&self) -> Result<&str, String> {
+    pub fn name(&self) -> std::result::Result<&str, String> {
         self.storage
             .as_ref()
             .map(SharedMemory::name)
@@ -145,7 +161,7 @@ impl SharedBuffer {
     /// memory; it neither enters Python nor calls CUDA.
     /// The caller submits exactly one copy sequence per buffer and must not
     /// modify its payload after announcing readiness.
-    pub fn mark_ready(&mut self) -> Result<(), String> {
+    pub fn mark_ready(&mut self) -> std::result::Result<(), String> {
         let mapping = self.mapping()?;
 
         if let Some((device, stream)) = self.device {
@@ -184,7 +200,7 @@ impl SharedBuffer {
 
     /// Shutdown and failed submission must finish DMA even if readiness was
     /// never scheduled. Normal retirement observes READY and does not wait.
-    pub fn synchronize(&self) -> Result<(), String> {
+    pub fn synchronize(&self) -> std::result::Result<(), String> {
         if self.submitted
             && let Some((device, stream)) = self.device
             && self.mapping.word(0).load(Ordering::Acquire) == PENDING
@@ -201,7 +217,7 @@ impl SharedBuffer {
         Ok(())
     }
 
-    pub fn close(&mut self) -> Result<(), String> {
+    pub fn close(&mut self) -> std::result::Result<(), String> {
         if self.storage.is_none() {
             return Ok(());
         }
@@ -229,5 +245,114 @@ impl Drop for SharedBuffer {
             std::mem::forget(Arc::clone(&self.mapping));
             std::mem::forget(self.storage.take());
         }
+    }
+}
+
+/// A claimed payload range on the reader's host. Its mapping stays alive
+/// through borrowed tensor views; release acknowledges the end of reading.
+pub struct SharedRead {
+    mapping: Arc<SharedMapping>,
+    slot: Option<usize>,
+    offset: usize,
+    bytes: usize,
+}
+
+impl SharedRead {
+    /// Map and claim one byte range. The caller must wait for readiness
+    /// before accessing the payload and end all reads before releasing it.
+    pub fn open(name: &str, offset: usize, bytes: usize, slot: usize) -> Result<Self> {
+        if slot >= ACK_SLOTS {
+            return Err(Error::Invalid(
+                "shared buffer acknowledgment slot is out of range".into(),
+            ));
+        }
+        let offset = SHM_HEADER_BYTES
+            .checked_add(offset)
+            .ok_or_else(|| Error::Invalid("shared read offset is too large".into()))?;
+        let size = offset
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Invalid("shared read is too large".into()))?;
+        let mapping = SharedMapping::open(name, size).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => {
+                Error::Invalid("shared buffer is no longer available".into())
+            }
+            io::ErrorKind::InvalidInput => Error::Invalid(error.to_string()),
+            _ => Error::Transport(error.to_string()),
+        })?;
+        mapping
+            .word(ACK_OFFSET + slot * size_of::<u32>())
+            .store(CLAIMED, Ordering::Release);
+
+        Ok(Self {
+            mapping: Arc::new(mapping),
+            slot: Some(slot),
+            offset,
+            bytes,
+        })
+    }
+
+    /// Poll shared host memory without interpreter calls. `check` observes
+    /// the consuming transfer's native cancellation state between polls.
+    /// Failure or timeout leaves the claim held until release or destruction.
+    pub fn wait(&self, timeout: Duration, mut check: impl FnMut() -> Result<()>) -> Result<()> {
+        let started = Instant::now();
+        let mut pause = Duration::ZERO;
+
+        loop {
+            check()?;
+            match self.mapping.word(0).load(Ordering::Acquire) {
+                READY => return Ok(()),
+                FAILED => return Err(Error::Resource("export producer failed before readiness")),
+                _ => {}
+            }
+            if started.elapsed() >= timeout {
+                return Err(Error::Resource("export endpoint was lost before readiness"));
+            }
+
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+            pause = (pause + Duration::from_micros(50)).min(Duration::from_millis(1));
+        }
+    }
+
+    pub fn mapping(&self) -> Result<Arc<SharedMapping>> {
+        if self.slot.is_none() {
+            return Err(Error::State("shared read is released"));
+        }
+        Ok(Arc::clone(&self.mapping))
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub fn nbytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Limit a padded media row to its actual frame bytes before encoding.
+    pub fn truncate(&mut self, bytes: usize) -> Result<()> {
+        if bytes > self.bytes {
+            return Err(Error::Invalid(
+                "shared read exceeds its borrowed range".into(),
+            ));
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    pub fn release(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            self.mapping
+                .word(ACK_OFFSET + slot * size_of::<u32>())
+                .store(ACKNOWLEDGED, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for SharedRead {
+    fn drop(&mut self) {
+        self.release();
     }
 }

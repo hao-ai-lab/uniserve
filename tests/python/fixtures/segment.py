@@ -1,4 +1,4 @@
-"""Layout of a shared storage export's segment.
+"""External producers and readers of the shared tensor wire layout.
 
 A host product exported over shared storage carries everything a consumer
 needs inside the segment itself, so that no connection to the producer is
@@ -12,7 +12,8 @@ begins reading after that. The words are written and read with release and
 acquire ordering, because the readiness word announces the payload written
 before it and the two live in different processes.
 
-`ShmTransport` writes the header as producer and reads it as consumer. The
+Production uses native `SharedBuffer` and `SharedRead`. These test peers can
+withhold readiness, fail a producer, or hold a reader acknowledgment. The
 acknowledgment slot count and word size are shared with the device pool's
 chunk header in `vmm_pool`, so one slot numbering serves both mechanisms.
 """
@@ -20,7 +21,7 @@ chunk header in `vmm_pool`, so one slot numbering serves both mechanisms.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 from uniserve_worker._uniserve_ipc import atomic_load_u32, atomic_store_u32
 from uniserve_worker.errors import resource_error
@@ -62,8 +63,8 @@ def ack_offset(slot: int) -> int:
 def initialize(buffer: memoryview) -> None:
     """Initialize pending readiness and unclaimed reader slots.
 
-    The producer calls this before the locator naming the segment leaves
-    `ShmTransport.export`, so no consumer can observe a partial header.
+    The test producer calls this before sending its locator, so no consumer
+    can observe a partial header.
     """
     for slot in range(MAX_ACKNOWLEDGMENT_SLOTS):
         atomic_store_u32(buffer, ack_offset(slot), 0)
@@ -88,25 +89,20 @@ def await_ready(
     buffer: memoryview,
     *,
     timeout: float = READINESS_TIMEOUT_S,
-    check: Callable[[], None] | None = None,
 ) -> None:
     """Wait until the producer announces the payload, failing on its failure.
 
     The first turn polls without sleeping; later turns sleep for a pause
     that grows linearly up to one millisecond, so a long wait does not
-    occupy a core. `check` runs on every turn, so a cancelled read stops
-    waiting within one turn of its cancellation.
+    occupy a core.
 
     Raises:
         WorkerError: `resource_error` when the producer marks the segment
-            `FAILED` or `timeout` seconds pass before `READY`. Whatever
-            `check` raises propagates.
+            `FAILED` or `timeout` seconds pass before `READY`.
     """
     deadline = time.monotonic() + timeout
     pause = 0.0
     while True:
-        if check is not None:
-            check()
         current = state(buffer)
         if current == READY:
             return

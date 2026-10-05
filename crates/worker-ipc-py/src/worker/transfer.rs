@@ -252,6 +252,21 @@ impl TransferRef {
     }
 }
 
+impl TransferTicket {
+    /// Inspect cancellation while a native transport wait has released the GIL.
+    pub(super) fn check_active(&self) -> uniserve_worker::Result<()> {
+        let state = self.state.lock().map_err(|_| {
+            uniserve_worker::Error::Invariant("transfer ticket lock is poisoned".into())
+        })?;
+        if state.ticket.is_cancelled() {
+            return Err(uniserve_worker::Error::Resource(
+                "transfer read was cancelled",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Deref for TransferRef {
     type Target = uniserve_worker::Completion<Py<PyAny>, Py<PyAny>>;
 
