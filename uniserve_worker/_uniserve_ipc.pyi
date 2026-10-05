@@ -69,6 +69,18 @@ from uniserve_worker.transport.exports import ExportLocations
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.worker import Worker
 
+class DescriptorGrants:
+    """Own local allocation grants and their native socket service."""
+
+    def __init__(self, endpoint: str) -> None: ...
+    def register(self, publication: str, descriptor: int) -> None: ...
+    def release(self, publication: str) -> None: ...
+    def close(self) -> None: ...
+
+def fetch_descriptor(endpoint: str, publication: str) -> int:
+    """Return an owned descriptor; the caller closes it after CUDA import."""
+    ...
+
 __all__ = [
     "BatchInputs",
     "BatchState",
@@ -80,6 +92,7 @@ __all__ = [
     "Completion",
     "CUDAEvent",
     "CUDAStream",
+    "DescriptorGrants",
     "EventPool",
     "EventPoolError",
     "Executor",
@@ -114,6 +127,7 @@ __all__ = [
     "TransferPool",
     "TransferTicket",
     "fetch_tensor",
+    "fetch_descriptor",
     "WeightPrefetch",
     "atomic_load_u32",
     "atomic_store_u32",

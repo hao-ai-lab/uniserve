@@ -6,6 +6,7 @@ mod batch;
 mod block_tables;
 mod buffer;
 mod completion;
+mod descriptor_grants;
 mod error;
 mod events;
 mod executor;
@@ -32,6 +33,11 @@ mod weight_prefetch;
 
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<descriptor_grants::DescriptorGrants>()?;
+    module.add_function(wrap_pyfunction!(
+        descriptor_grants::fetch_descriptor,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(fetch::fetch_tensor, module)?)?;
     module.add_function(wrap_pyfunction!(exports::release_exports, module)?)?;
     module.add_function(wrap_pyfunction!(

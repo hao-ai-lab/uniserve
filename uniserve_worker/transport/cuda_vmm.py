@@ -690,7 +690,9 @@ class CudaVmmTransport(Transport):
                         granted = descriptor_grants.fetch(
                             handle.endpoint, handle.publication_id
                         )
-                        exported = descriptor_grants.descriptor_bytes(granted)
+                        exported = granted.to_bytes(
+                            DESCRIPTOR_HANDLE_BYTES, sys.byteorder
+                        )
                     else:
                         exported = handle.allocation_handle
                     try:

@@ -13,6 +13,7 @@ use uniserve_worker_ipc::{codec, BatchCommand, WorkerRequest as Request};
 
 use execution::{failure, lock};
 
+mod descriptor_grants;
 mod execution;
 mod host;
 mod stream;
@@ -421,6 +422,7 @@ fn method<T: ObjectCore>(name: &str, function: Function, doc: &str) -> Result<()
 }
 
 fn register() -> Result<()> {
+    descriptor_grants::register()?;
     stream::register()?;
     object::<ExecutorObj>();
     object::<SubmissionObj>();
@@ -583,3 +585,4 @@ fn register() -> Result<()> {
 
 tvm_ffi::tvm_ffi_dll_export_typed_func!(register, register);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(partition_streams, stream::partition_streams);
+tvm_ffi::tvm_ffi_dll_export_typed_func!(fetch_descriptor, descriptor_grants::fetch_descriptor);

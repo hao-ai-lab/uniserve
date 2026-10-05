@@ -10,6 +10,7 @@ indexmap.workspace = true
 libc.workspace = true
 libloading.workspace = true
 nvtx.workspace = true
+rustix.workspace = true
 thiserror.workspace = true
 uniserve-core.workspace = true
 uniserve-worker-ipc.workspace = true
