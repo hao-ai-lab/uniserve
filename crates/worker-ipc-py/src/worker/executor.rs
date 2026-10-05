@@ -3,6 +3,7 @@
 mod commit;
 mod execute;
 mod inputs;
+mod latents;
 mod output;
 mod predicates;
 mod prepare;

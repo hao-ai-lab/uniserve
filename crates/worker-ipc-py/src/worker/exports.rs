@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker_ipc::{BufferId, RequestKey};
 
+use super::completion::Completion;
 use super::error::{resource, unsupported};
 use super::protocol::buffer_id;
 use super::vmm_pool::PoolExhaustedError;
@@ -25,6 +26,22 @@ pub(super) fn export_tensor<'py>(
     offset: Option<&Bound<'py, PyAny>>,
     consumers: Vec<u32>,
     host: bool,
+) -> PyResult<Bound<'py, PyTuple>> {
+    export(transports, source, offset, &consumers, host, |retirement| {
+        retain.call1((retirement,))?;
+        Ok(())
+    })
+}
+
+/// Native storage owners retain completions directly; Python callers enter
+/// through export_tensor and share the same selection and failure cleanup.
+pub(super) fn export<'py>(
+    transports: &Bound<'py, PyAny>,
+    source: &Bound<'py, PyAny>,
+    offset: Option<&Bound<'py, PyAny>>,
+    consumers: &[u32],
+    host: bool,
+    mut retain: impl FnMut(Py<Completion>) -> PyResult<()>,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let py = transports.py();
     if !transports.is_truthy()? {
@@ -66,7 +83,7 @@ pub(super) fn export_tensor<'py>(
     let result = (|| -> PyResult<()> {
         for transport in selected {
             match transport.call_method("export", (source,), Some(&kwargs)) {
-                Ok(location) => retain_location(&transport, location, retain, &mut locations)?,
+                Ok(location) => retain_location(&transport, location, &mut retain, &mut locations)?,
                 Err(error) if error.is_instance_of::<PoolExhaustedError>(py) => {
                     // A device payload that cannot fit its VMM allocation
                     // travels over the host mechanisms reaching its readers.
@@ -83,7 +100,7 @@ pub(super) fn export_tensor<'py>(
                             continue;
                         }
                         let location = fallback.call_method("export", (source,), Some(&kwargs))?;
-                        retain_location(&fallback, location, retain, &mut locations)?;
+                        retain_location(&fallback, location, &mut retain, &mut locations)?;
                     }
                     if locations.is_empty() {
                         let failure = resource(
@@ -112,14 +129,14 @@ pub(super) fn export_tensor<'py>(
 fn retain_location<'py>(
     transport: &Bound<'py, PyAny>,
     location: Bound<'py, PyAny>,
-    retain: &Bound<'py, PyAny>,
+    retain: &mut impl FnMut(Py<Completion>) -> PyResult<()>,
     locations: &mut Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
 ) -> PyResult<()> {
     // Include this location in failure cleanup even when its retirement
     // lookup or the storage owner's retention callback raises an error.
     locations.push((transport.clone(), location.clone()));
     let retirement = transport.call_method1("retirement", (location,))?;
-    retain.call1((retirement,))?;
+    retain(retirement.extract()?)?;
     Ok(())
 }
 

@@ -1743,7 +1743,7 @@ pub(crate) fn tensor_export_from_py(value: &Bound<'_, PyAny>) -> Option<TensorEx
 /// metadata in the same mapping. In the serde form, `Locator.transport` is
 /// instead the adjacently tagged `{"transport": tag, "value": {...}}`
 /// mapping, so the schema-derived converter rejects the worker's locators.
-fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
+pub(crate) fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 

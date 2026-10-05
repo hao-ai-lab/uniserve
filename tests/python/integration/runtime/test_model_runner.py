@@ -878,8 +878,14 @@ def test_output_validation_failure_discards_all_candidate_state():
     assert result.completions[0].kv_visible_len == 3
 
 
-def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact():  # noqa: E501
-    worker = execution_worker(block_size=4)
+@pytest.mark.parametrize("failure", ("prefix", "export"))
+def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact(  # noqa: E501
+    failure: str,
+):
+    worker = execution_worker(
+        block_size=4,
+        transfer_backends=("shm",) if failure == "export" else ("local",),
+    )
     admission = umm_params(
         5, ImageParams(steps=2, height=64, width=64, seed=29)
     )
@@ -921,10 +927,26 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         ),
     )
 
-    failed = finalized_report(worker, worker.submit(batch))
+    if failure == "export":
+        # Force refusal after the final numerical step, when its latent bank
+        # is ready to export. The failed call must retain its accepted source
+        # trajectory and guidance prefixes for the next submission.
+        capacity = worker.transports["shm"].capacity
+        reserved = capacity.capacity - capacity.used
+        capacity.acquire(reserved)
+        try:
+            failed = finalized_report(worker, worker.submit(valid_batch))
+        finally:
+            capacity.release(reserved)
+    else:
+        failed = finalized_report(worker, worker.submit(batch))
 
     assert failed.completions[0].status is CallStatus.ERROR
-    assert failed.completions[0].error_code is ErrorCode.INVALID_CALL
+    assert failed.completions[0].error_code is (
+        ErrorCode.RESOURCE_EXHAUSTED
+        if failure == "export"
+        else ErrorCode.INVALID_CALL
+    )
     assert failed.completions[0].num_completed_steps == 0
 
     replacement, _replacement_latent = diffusion_step_call(
@@ -991,6 +1013,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
     )
     assert recovered_artifact == reference_artifact
     reference.close()
+    worker.close()
 
 
 def test_initial_flow_noise_is_stable_across_call_schedules():

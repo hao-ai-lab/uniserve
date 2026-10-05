@@ -18,11 +18,9 @@ from uniserve_worker.protocol.call import (
 )
 
 if TYPE_CHECKING:
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
@@ -36,7 +34,6 @@ def execute_calls(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     export_transports: Mapping[str, Transport],
@@ -44,7 +41,6 @@ def execute_calls(
     request_tables: BlockTables | None,
     request_pool: RequestPool,
     model_runner: ModelExecutor,
-    config: WorkerConfig,
 ) -> None:
     """Run transfer, encoding and media operations on the batch stream."""
     from uniserve_worker.execution import (
@@ -64,7 +60,6 @@ def execute_calls(
                 transfer.execute(
                     call,
                     tensor_store=tensor_store,
-                    latent_pool=latent_pool,
                     export_transports=export_transports,
                     model_runner=model_runner,
                     state=state,
@@ -79,12 +74,9 @@ def execute_calls(
                 diffusion.prepare_latent(
                     call,
                     kv_cache=kv_cache,
-                    worker_info=worker_info,
                     latent_pool=latent_pool,
-                    export_transports=export_transports,
                     request_tables=request_tables,
                     model_runner=model_runner,
-                    config=config,
                     state=state,
                 )
             elif call.kind is MediaCall.MEDIA_READING:

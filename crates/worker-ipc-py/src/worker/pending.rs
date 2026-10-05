@@ -100,7 +100,6 @@ pub(crate) struct PendingOutput {
     pub(super) latent_params: Option<Py<PyAny>>,
     #[pyo3(get)]
     pub(super) latent_buffer: Option<Py<LatentBuffer>>,
-    #[pyo3(get)]
     pub(super) latent_exports: Py<PyDict>,
     pub(super) host_tasks: Vec<Py<HostTask>>,
     // Video unit positions within this decode round, assigned to this rank.
