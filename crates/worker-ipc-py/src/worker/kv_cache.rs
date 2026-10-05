@@ -46,12 +46,6 @@ impl KVCacheManager {
             .transpose()
     }
 
-    fn validate_install(&self, py: Python<'_>, transfer: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.inner
-            .validate_install(&transfer_from_py(transfer)?)
-            .map_err(|error| native_error(py, error))
-    }
-
     fn validate_exports(
         &self,
         py: Python<'_>,
@@ -254,7 +248,7 @@ impl KVCacheManager {
     }
 }
 
-fn transfer_from_py(value: &Bound<'_, PyAny>) -> PyResult<KvTransfer> {
+pub(super) fn transfer_from_py(value: &Bound<'_, PyAny>) -> PyResult<KvTransfer> {
     convert::kv_transfer_from_py(&value.call_method0("to_mapping")?)
         .ok_or_else(|| invalid(value.py(), "invalid KV transfer"))
 }

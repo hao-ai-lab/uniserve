@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use uniserve_core::UnitId;
-use uniserve_worker_ipc::{BlockTable, RequestKey};
+use uniserve_worker_ipc::{BlockTable, KvTransfer, RequestKey};
 
 use crate::{Error, Result};
 
@@ -156,6 +156,117 @@ impl BlockTables {
         &self.groups
     }
 
+    /// Resolve physical writes before an import starts. Existing prefix pages
+    /// keep their addresses and initialization; only newly assigned units reset.
+    /// This does not install the tables or change their visible lengths.
+    pub fn import_spans(
+        &self,
+        slot: u32,
+        tables: &[Arc<GroupTable>],
+        transfer: &KvTransfer,
+        initialized: &[u32],
+    ) -> Result<Vec<(u32, u32, u32)>> {
+        if slot == 0 || slot > self.request_pool_size || tables.len() != self.groups.len() {
+            return Err(Error::Invalid(
+                "KV import requires a destination table per group".into(),
+            ));
+        }
+        if !transfer.groups.is_empty() && transfer.groups.len() != tables.len() {
+            return Err(Error::Invalid(
+                "KV transfer groups do not match destination groups".into(),
+            ));
+        }
+
+        let reset: HashSet<_> = initialized.iter().copied().collect();
+        let mut held = HashSet::new();
+        let mut spans = Vec::new();
+        for (group, table) in tables.iter().enumerate() {
+            self.validate_table(group, table)?;
+            let page_tokens = u64::from(table.shape.page_tokens);
+            if table.allocated_tokens < transfer.exported_extent
+                || u64::from(table.start_page) * page_tokens > u64::from(transfer.exported_extent)
+            {
+                return Err(Error::Invalid(
+                    "KV import exceeds its scheduler block table".into(),
+                ));
+            }
+            held.extend(table.units.iter().map(|unit| unit.0));
+
+            if transfer.base_extent > 0 {
+                let installed = self.table(slot, group as u32)?;
+                let first = table.start_page.max(installed.start_page) as u64;
+                let last = u64::from(transfer.base_extent)
+                    .div_ceil(page_tokens)
+                    .min(table.end_page())
+                    .min(installed.end_page());
+                let per_page = table.shape.units_per_page as usize;
+                for page in first..last {
+                    let new = (page - u64::from(table.start_page)) as usize * per_page;
+                    let old = (page - u64::from(installed.start_page)) as usize * per_page;
+                    let units = &table.units[new..new + per_page];
+                    if units != &installed.units[old..old + per_page]
+                        || units.iter().any(|unit| reset.contains(&unit.0))
+                    {
+                        return Err(Error::Invalid(
+                            "KV import would replace its installed base units".into(),
+                        ));
+                    }
+                }
+            }
+
+            if let Some(source) = transfer.groups.get(group) {
+                let start = table.shape.window.map_or(transfer.base_extent, |window| {
+                    transfer
+                        .base_extent
+                        .max(transfer.exported_extent.saturating_sub(window))
+                });
+                if source.start != start || start > transfer.exported_extent {
+                    return Err(Error::Invalid(
+                        "KV transfer starts outside its destination history".into(),
+                    ));
+                }
+                spans.extend(table.spans(
+                    u64::from(start),
+                    u64::from(transfer.exported_extent - start),
+                )?);
+            }
+        }
+
+        if reset.len() != initialized.len() || !reset.is_subset(&held) {
+            return Err(Error::Invalid(
+                "KV import resets repeated units or units outside its block tables".into(),
+            ));
+        }
+
+        // A physical unit can serve any group. Reset reserves its full token
+        // range, while the access owner coalesces it with the copied suffix.
+        let unit_tokens = self
+            .groups
+            .iter()
+            .map(|group| group.page_tokens)
+            .fold(0, u32::max);
+        spans.extend(initialized.iter().map(|&unit| (unit, 0, unit_tokens)));
+        Ok(spans)
+    }
+
+    fn validate_table(&self, group: usize, table: &GroupTable) -> Result<()> {
+        let per_page = table.shape.units_per_page as usize;
+        if self.groups.get(group) != Some(&table.shape)
+            || !table.units.len().is_multiple_of(per_page)
+            || table.units.len() / per_page > self.width
+            || table
+                .units
+                .iter()
+                .any(|unit| unit.0 == 0 || unit.0 >= self.num_units)
+            || table.units.iter().collect::<HashSet<_>>().len() != table.units.len()
+            || u64::from(table.allocated_tokens)
+                > table.end_page() * u64::from(table.shape.page_tokens)
+        {
+            return Err(Error::Invalid("scheduler block table is invalid".into()));
+        }
+        Ok(())
+    }
+
     /// Borrow a slot's tables before a batch installs its assignments.
     /// Supplied groups replace resident groups only in this returned view.
     pub fn for_batch(&self, slot: u32, assignments: &[BlockTable]) -> Result<Vec<Arc<GroupTable>>> {
@@ -181,8 +292,8 @@ impl BlockTables {
     }
 
     /// Validate the whole installation before computing any device changes.
-    /// After staging succeeds, commit this update on the same owner thread.
-    /// A failed staging operation discards the update and leaves the host
+    /// After the device copy succeeds, commit on the same owner thread.
+    /// A failed copy discards the update and leaves the host
     /// tables unchanged. No other update may intervene before commit.
     pub fn prepare(&self, tables: &[BlockTable]) -> Result<BlockTableUpdate> {
         let mut accepted = Vec::with_capacity(tables.len());
@@ -206,18 +317,8 @@ impl BlockTables {
                 units: value.unit_ids.clone(),
                 allocated_tokens: value.allocated_tokens,
             };
-            let per_page = table.shape.units_per_page as usize;
-            if !table.units.len().is_multiple_of(per_page)
-                || table.units.len() / per_page > self.width
-                || table
-                    .units
-                    .iter()
-                    .any(|unit| unit.0 == 0 || unit.0 >= self.num_units)
-                || table.units.iter().collect::<HashSet<_>>().len() != table.units.len()
-                || u64::from(table.allocated_tokens)
-                    > table.end_page() * u64::from(table.shape.page_tokens)
-                || !seen.insert((slot, group))
-            {
+            self.validate_table(group as usize, &table)?;
+            if !seen.insert((slot, group)) {
                 return Err(Error::Invalid("scheduler block table is invalid".into()));
             }
 

@@ -23,6 +23,7 @@ from uniserve_worker.protocol.transfer import (
     KvTransfer,
     TensorTransfer,
 )
+from uniserve_worker.storage.block_tables import GroupTable
 from uniserve_worker.transport.fetch import fetch_tensor
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.ticket import TransferTicket
@@ -121,15 +122,31 @@ def _copy(
     workspace: KVWorkspace,
 ) -> None:
     export = write.export
+    tables = write.tables
     for index, group in enumerate(export.groups):
         if not group.tensors:
             continue
 
         if _direct(pool, export, group, index):
-            _copy_direct(pool, importer, write, index, group, transports)
+            _copy_direct(
+                pool,
+                importer,
+                write,
+                index,
+                export,
+                tables[index],
+                transports,
+            )
         else:
             _copy_converted(
-                pool, importer, write, index, group, transports, workspace
+                pool,
+                importer,
+                write,
+                index,
+                export,
+                tables[index],
+                transports,
+                workspace,
             )
 
 
@@ -198,7 +215,8 @@ def _copy_direct(
     importer: KVImporter,
     write: KVImport,
     index: int,
-    group: KvGroupTransfer,
+    export: KvTransfer,
+    table: GroupTable,
     transports: Mapping[str, Transport],
 ) -> None:
     """Fetch one group's source values, and FP8 scales, into its units.
@@ -206,8 +224,7 @@ def _copy_direct(
     The fetch region selects each of this worker's layers and KV heads
     by their offsets on the export's group layer and head axes.
     """
-    export = write.export
-    table = write.tables[index]
+    group = export.groups[index]
     carried = export.exported_extent - group.start
     advertised = pool.info.groups[index]
     axis = pool.axes[index]
@@ -318,7 +335,8 @@ def _copy_converted(
     importer: KVImporter,
     write: KVImport,
     index: int,
-    group: KvGroupTransfer,
+    export: KvTransfer,
+    table: GroupTable,
     transports: Mapping[str, Transport],
     workspace: KVWorkspace,
 ) -> None:
@@ -330,8 +348,7 @@ def _copy_converted(
     sources are copied as fetched. Each layer is then written through
     `mha.State.copy_region`, which applies the destination encoding.
     """
-    export = write.export
-    table = write.tables[index]
+    group = export.groups[index]
     start = group.start
     carried = export.exported_extent - start
     advertised = pool.info.groups[index]

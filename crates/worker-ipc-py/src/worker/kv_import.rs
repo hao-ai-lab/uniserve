@@ -1,6 +1,6 @@
 //! Numerical KV copies on native import lanes and bounded conversion storage.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -11,17 +11,19 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker::cuda::{DeviceGuard, Stream};
 use uniserve_worker::{
-    HostLane as NativeLane, HostTask as NativeTask, ImportBackend, ImportCopy,
-    KVImport as NativeImport, KVImporter as NativeImporter, Outcome,
+    GroupTable as NativeGroupTable, HostLane as NativeLane, HostTask as NativeTask, ImportBackend,
+    ImportCopy, KVImport as NativeImport, KVImporter as NativeImporter, Outcome,
 };
+use uniserve_worker_ipc::KvTransfer;
 
-use super::block_tables::GroupTable;
+use super::block_tables::{BlockTables, GroupTable};
 use super::completion::{Completion, CompletionRef, cancelled};
-use super::error::{invariant, native_error};
+use super::error::{invalid, invariant, native_error};
 use super::host::with_context;
-use super::kv_cache::KVCacheManager;
+use super::kv_cache::{KVCacheManager, transfer_from_py};
 use super::protocol::{buffer_id, request_key};
 use super::transfer::{TransferRef, TransferTicket};
+use crate::convert;
 
 struct Workspace {
     values: Py<PyAny>,
@@ -41,11 +43,9 @@ type CopyTask = NativeTask<ImportCopy<Copy>>;
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct KVImport {
     inner: Arc<NativeImport<TransferRef, Workspace>>,
-    #[pyo3(get)]
-    tables: Py<PyTuple>,
+    tables: Vec<Arc<NativeGroupTable>>,
     pub(super) initialized_units: Vec<u32>,
-    #[pyo3(get)]
-    export: Py<PyAny>,
+    export: KvTransfer,
     task: Option<Arc<CopyTask>>,
     #[pyo3(get)]
     retirement: Py<Completion>,
@@ -53,6 +53,28 @@ pub(crate) struct KVImport {
 
 #[pymethods]
 impl KVImport {
+    #[getter]
+    fn tables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let tables = self
+            .tables
+            .iter()
+            .map(|table| {
+                Py::new(
+                    py,
+                    GroupTable {
+                        table: Arc::clone(table),
+                    },
+                )
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(py, tables)
+    }
+
+    #[getter]
+    fn export<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        convert::kv_transfer_to_py(py, &self.export)
+    }
+
     #[getter]
     pub(super) fn request_pool_idx(&self) -> usize {
         self.inner.request_pool_idx
@@ -129,8 +151,6 @@ impl KVImport {
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.tables)?;
-        visit.call(&self.export)?;
         visit.call(&self.retirement)?;
         if let Some(task) = self
             .task
@@ -173,6 +193,9 @@ pub(crate) struct KVImporter {
     inner: Arc<NativeImporter<ImportRef, Workspace>>,
     pool: Py<PyAny>,
     accesses: Py<KVCacheManager>,
+    tables: Py<BlockTables>,
+    // Global layer, KV-head and head-width axes of each transferred group.
+    transfer_shapes: Vec<[u64; 3]>,
     tasks: NativeLane<ImportCopy<Copy>>,
     wake: Mutex<Option<Py<PyAny>>>,
 }
@@ -230,10 +253,32 @@ impl KVImporter {
             })
             .collect();
         let accesses = pool.bind(py).getattr("_manager")?.extract()?;
+        let tables = pool
+            .bind(py)
+            .getattr("block_tables")?
+            .getattr("_tables")?
+            .extract()?;
+        let axes = pool.bind(py).getattr("axes")?;
+        let groups = pool.bind(py).getattr("info")?.getattr("groups")?;
+        let transfer_shapes = axes
+            .try_iter()?
+            .zip(groups.try_iter()?)
+            .map(|(axis, group)| {
+                let group = group?;
+                Ok([
+                    axis?.getattr("total")?.extract()?,
+                    group.getattr("total_kv_heads")?.extract()?,
+                    group.getattr("head_dim")?.extract()?,
+                ])
+            })
+            .collect::<PyResult<_>>()?;
+
         Ok(Self {
             inner: Arc::new(NativeImporter::new(workspaces)),
             pool,
             accesses,
+            tables,
+            transfer_shapes,
             tasks,
             wake: Mutex::new(None),
         })
@@ -260,48 +305,52 @@ impl KVImporter {
     #[pyo3(signature = (export, *, request_pool_idx, tables, initialized_units, transports))]
     fn reserve(
         slf: &Bound<'_, Self>,
-        export: Py<PyAny>,
-        request_pool_idx: usize,
-        tables: Py<PyTuple>,
+        export: &Bound<'_, PyAny>,
+        request_pool_idx: u32,
+        tables: &Bound<'_, PyTuple>,
         initialized_units: Vec<u32>,
         transports: Py<PyAny>,
     ) -> PyResult<Py<KVImport>> {
         let py = slf.py();
         let this = slf.borrow();
-        let source = buffer_id(&export.bind(py).getattr("source")?)?;
-        let extent: u64 = export.bind(py).getattr("exported_extent")?.extract()?;
-        let groups = export.bind(py).getattr("groups")?;
-        let mut ranges = HashMap::new();
-        for (table, group) in tables.bind(py).iter().zip(groups.try_iter()?) {
-            let start: u64 = group?.getattr("start")?.extract()?;
-            let table = table.extract::<PyRef<'_, GroupTable>>()?;
-            let count = extent.checked_sub(start).ok_or_else(|| {
-                super::error::invalid(py, "KV import starts beyond its exported extent")
-            })?;
-            for (unit, offset, count) in table
-                .table
-                .spans(start, count)
-                .map_err(|error| native_error(py, error))?
+        let export = transfer_from_py(export)?;
+        this.accesses
+            .borrow(py)
+            .inner
+            .validate_install(&export)
+            .map_err(|error| native_error(py, error))?;
+        for (group, shape) in export.groups.iter().zip(&this.transfer_shapes) {
+            let expected = [
+                u64::from(export.exported_extent.saturating_sub(group.start)),
+                shape[0],
+                shape[1],
+                shape[2],
+            ];
+            if group
+                .tensors
+                .first()
+                .is_some_and(|tensor| tensor.shape != expected)
             {
-                ranges.insert(unit, (offset, count));
+                return Err(invalid(
+                    py,
+                    "KV transfer shape does not match destination layers",
+                ));
             }
         }
-        let reset: Vec<(u32, u32, u32)> = this
-            .pool
-            .bind(py)
-            .call_method1("unit_spans", (&initialized_units,))?
-            .extract()?;
-        ranges.extend(
-            reset
-                .into_iter()
-                .map(|(unit, offset, count)| (unit, (offset, count))),
-        );
-        let ranges: Vec<_> = ranges
-            .into_iter()
-            .map(|(unit, (offset, count))| (unit, offset, count))
-            .collect();
-        let copy =
-            !initialized_units.is_empty() || export.bind(py).getattr("tensors")?.is_truthy()?;
+
+        let tables = tables
+            .iter()
+            .map(|table| Ok(Arc::clone(&table.extract::<PyRef<'_, GroupTable>>()?.table)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let ranges = this
+            .tables
+            .borrow(py)
+            .tables
+            .import_spans(request_pool_idx, &tables, &export, &initialized_units)
+            .map_err(|error| native_error(py, error))?;
+        let source = export.source;
+        let copy = !initialized_units.is_empty()
+            || export.groups.iter().any(|group| !group.tensors.is_empty());
 
         let retirement = Py::new(py, Completion::new())?;
         let task = copy
@@ -311,7 +360,7 @@ impl KVImporter {
         let write = Py::new(
             py,
             KVImport {
-                inner: Arc::new(NativeImport::new(source, request_pool_idx, copy)),
+                inner: Arc::new(NativeImport::new(source, request_pool_idx as usize, copy)),
                 tables,
                 initialized_units,
                 export,
@@ -381,7 +430,39 @@ impl KVImporter {
         self.inner.owns(&write.inner)
     }
 
-    fn adopt(&self, py: Python<'_>, write: &KVImport) -> PyResult<()> {
+    fn adopt(
+        &self,
+        py: Python<'_>,
+        write: &KVImport,
+        installed_buffer: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if buffer_id(installed_buffer)?.owner != write.export.source.owner {
+            return Err(invalid(
+                py,
+                "installed KV buffer does not belong to its source",
+            ));
+        }
+
+        // Another completed import may have advanced the accepted base while
+        // this copy was pending. Recheck only mutable state at adoption.
+        self.accesses
+            .borrow(py)
+            .inner
+            .validate_install(&write.export)
+            .map_err(|error| native_error(py, error))?;
+        {
+            let tables = self.tables.borrow(py);
+            for (group, expected) in write.tables.iter().enumerate() {
+                let installed = tables
+                    .tables
+                    .table(write.inner.request_pool_idx as u32, group as u32)
+                    .map_err(|error| native_error(py, error))?;
+                if installed != *expected {
+                    return Err(invalid(py, "KV installation scheduler block table changed"));
+                }
+            }
+        }
+
         if !write.done() {
             return Err(PyRuntimeError::new_err(
                 "KV import was observed before input readiness",
@@ -515,6 +596,7 @@ impl KVImporter {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.pool)?;
         visit.call(&self.accesses)?;
+        visit.call(&self.tables)?;
         if let Some(wake) = self
             .wake
             .lock()
