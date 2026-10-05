@@ -1136,8 +1136,10 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
     assert run(4) == run(1)
 
 
-def test_unequal_denoising_intervals_match_single_step_artifacts() -> None:
-    def run(quantum: int) -> tuple[bytes, ...]:
+def test_rejected_interval_preserves_unequal_denoising_trajectories() -> None:
+    def run(
+        quantum: int, *, reject_interval: bool = False
+    ) -> tuple[bytes, ...]:
         worker = execution_worker()
         admissions = tuple(
             umm_params(
@@ -1179,6 +1181,37 @@ def test_unequal_denoising_intervals_match_single_step_artifacts() -> None:
                 )
                 latents.append(latent)
                 observations.append(observation)
+                batch_id += 1
+
+            if reject_interval:
+                calls = tuple(
+                    diffusion_step_call(
+                        admission.request_key,
+                        call_id=CallId(batch_id, index),
+                        predecessor=observations[index].call_id,
+                        conditioning=conditioning[index],
+                        latent=latents[index],
+                        steps=1,
+                    )[0]
+                    for index, admission in enumerate(admissions)
+                )
+                batch = execution_batch(batch_id=batch_id, calls=calls)
+                batch = replace(
+                    batch,
+                    latent_params=(
+                        batch.latent_params[0],
+                        replace(batch.latent_params[1], start_step=1),
+                    ),
+                )
+                report = finalized_report(
+                    worker, worker.submit(stamp_batch(worker, batch))
+                )
+                assert {row.request_key for row in report.completions} == {
+                    admission.request_key for admission in admissions
+                }
+                for observation in report.completions:
+                    assert observation.status is CallStatus.ERROR
+                    assert observation.num_completed_steps == 0
                 batch_id += 1
 
             progress = [0, 0]
@@ -1229,9 +1262,9 @@ def test_unequal_denoising_intervals_match_single_step_artifacts() -> None:
         finally:
             worker.close()
 
-    # One request leaves the shared forward after two steps; the other
-    # continues to four. Both must retain their own noise and solver state.
-    assert run(4) == run(1)
+    # Rejecting a later row must leave both trajectories intact. On retry,
+    # one request leaves the shared forward at step two and the other at four.
+    assert run(4, reject_interval=True) == run(1)
 
 
 @pytest.mark.parametrize(

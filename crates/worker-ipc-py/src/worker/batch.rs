@@ -8,7 +8,7 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use uniserve_worker_ipc::{Batch, CallStatus, DType, TransferHandle};
+use uniserve_worker_ipc::{Batch, CallKind, CallStatus, DType, MediaCall, TransferHandle};
 
 use super::block_tables::BlockTables;
 use super::completion::CompletionRef;
@@ -266,6 +266,201 @@ impl BatchState {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Bind active trajectory intervals and their numerical latent views.
+    /// Model callbacks describe shapes; the batch owns progress and selection.
+    #[pyo3(signature = (pool, image_builder, media_builder))]
+    fn bind_latents(
+        slf: &Bound<'_, Self>,
+        pool: Option<&Bound<'_, LatentPool>>,
+        image_builder: Option<&Bound<'_, PyAny>>,
+        media_builder: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let (plan, batch, selected, outputs) = {
+            let this = slf.borrow();
+            if this.plan.latent_params.is_empty() {
+                return Ok(());
+            }
+
+            let mut selected = Vec::new();
+            for (parameter, params) in this.plan.latent_params.iter().enumerate() {
+                let index = this.request_indexes[&params.request_key.request_id.0];
+                let output = &this.outputs[index];
+                if output.borrow(py).lock(py)?.output.status != CallStatus::Predicated {
+                    selected.push((parameter, index, output.clone_ref(py)));
+                }
+            }
+
+            (
+                Arc::clone(&this.plan),
+                this.batch.clone_ref(py),
+                selected,
+                this.outputs
+                    .iter()
+                    .map(|output| output.clone_ref(py))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if selected.is_empty() {
+            return Ok(());
+        }
+
+        let pool = pool.ok_or_else(|| invalid(py, "latent inputs require a resident pool"))?;
+
+        let image_shape = image_builder
+            .map(|builder| {
+                Ok::<_, PyErr>((
+                    builder.getattr("denoiser")?.getattr("latent_shape")?,
+                    py.import("uniserve.media.image")?.getattr("Config")?,
+                ))
+            })
+            .transpose()?;
+        let sample_pages = if image_shape.is_none() {
+            let builder =
+                media_builder.ok_or_else(|| invalid(py, "latent inputs require a denoiser"))?;
+            Some((
+                builder.getattr("slot_pages")?,
+                builder
+                    .getattr("sample_pages")?
+                    .getattr("units")?
+                    .extract::<u64>()?,
+            ))
+        } else {
+            None
+        };
+        let imported_steps: HashMap<_, _> = plan
+            .input_products
+            .iter()
+            .filter_map(|export| match &export.value {
+                TransferHandle::Latent { step, .. } => Some((&export.product, u64::from(*step))),
+                _ => None,
+            })
+            .collect();
+
+        // Validate every interval before any writable image view is assigned.
+        for &(parameter, index, ref output) in &selected {
+            let params = &plan.latent_params[parameter];
+            let call = &plan.calls[index];
+            let (request, mut committed_step) = {
+                let output = output.borrow(py);
+                let request = Arc::clone(&output.request.borrow(py).request);
+                let step = output.lock(py)?.progress.flow_step;
+                (request, step)
+            };
+
+            if let Some((pages, units)) = &sample_pages {
+                let pages = pages.call1((request.slot(),))?.extract::<Vec<u32>>()?;
+                if params.page_table != pages || u64::from(params.latent_units) != *units {
+                    return Err(invalid(
+                        py,
+                        "latent inputs do not name the request slot's pages",
+                    ));
+                }
+            }
+
+            let total_steps = if let Some((shape, size)) = &image_shape {
+                let image = request.admission().image.as_ref().ok_or_else(|| {
+                    invalid(py, "latent inputs have no admitted image dimensions")
+                })?;
+                let size = size.call1((params.height, params.width))?;
+                let units = shape
+                    .call1(("image", size))?
+                    .get_item(0)?
+                    .extract::<u64>()?;
+                if params.height != image.height
+                    || params.width != image.width
+                    || u64::from(params.latent_units) != units
+                {
+                    return Err(invalid(
+                        py,
+                        "latent inputs disagree with admitted model dimensions",
+                    ));
+                }
+                if let Some(step) = call
+                    .latent_input
+                    .as_ref()
+                    .and_then(|input| imported_steps.get(input))
+                {
+                    committed_step = *step;
+                }
+
+                Some(u64::from(image.steps))
+            } else {
+                None
+            };
+
+            let start = u64::from(params.start_step);
+            let count = u64::from(params.step_count);
+            let valid = match call.code {
+                CallKind::Media(MediaCall::LatentPreparation) => start == 0 && count == 0,
+                CallKind::Media(MediaCall::Denoising) => {
+                    start == committed_step
+                        && match total_steps {
+                            Some(total) => {
+                                count > 0
+                                    && start + count <= total
+                                    && (call.bounds.max_tokens == 0
+                                        || count <= u64::from(call.bounds.max_tokens))
+                            }
+                            None => count == 1,
+                        }
+                }
+                _ => start == committed_step && count == 0,
+            };
+            if !valid {
+                return Err(invalid(
+                    py,
+                    "latent interval disagrees with request progress or admitted schedule",
+                ));
+            }
+        }
+
+        // Image rows borrow one shared scratch allocation. Standalone media
+        // runners bind their own numerical views over their fixed slot pages.
+        let views = if image_shape.is_some() {
+            let mut occupied = Vec::new();
+            for output in outputs {
+                let view = output.borrow(py).latent.bind(py).getattr("staging")?;
+                if !view.is_none() {
+                    occupied.push(view.unbind());
+                }
+            }
+
+            let tables = selected
+                .iter()
+                .map(|&(parameter, _, _)| {
+                    plan.latent_params[parameter]
+                        .page_table
+                        .iter()
+                        .map(|&page| i64::from(page))
+                        .collect()
+                })
+                .collect();
+            let units = selected
+                .iter()
+                .map(|&(parameter, _, _)| i64::from(plan.latent_params[parameter].latent_units))
+                .collect();
+            Some(pool.borrow().stage(py, tables, units, occupied)?)
+        } else {
+            None
+        };
+
+        let parameters = batch.bind(py).getattr("latent_params")?;
+        for (row, (parameter, _, output)) in selected.iter().enumerate() {
+            let latent = output.borrow(py).latent.clone_ref(py);
+            latent
+                .bind(py)
+                .setattr("input_params", parameters.get_item(*parameter)?)?;
+            if let Some(views) = &views {
+                latent
+                    .bind(py)
+                    .setattr("staging", views.bind(py).get_item(row)?)?;
+            }
+        }
+
         Ok(())
     }
 

@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve.media import image as media_image
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import (
     invalid_descriptor,
@@ -36,12 +35,8 @@ from uniserve_worker.errors import (
 )
 from uniserve_worker.execution import calls as calls
 from uniserve_worker.execution.host_media import encoded_unit_positions
-from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.profiling import record_component
-from uniserve_worker.protocol.batch import (
-    Batch,
-    LatentParams,
-)
+from uniserve_worker.protocol.batch import Batch
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
@@ -50,9 +45,6 @@ from uniserve_worker.protocol.call import (
 )
 from uniserve_worker.protocol.identity import BufferId, CallId, CallIdentity
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
-from uniserve_worker.protocol.transfer import (
-    LatentTransferValue,
-)
 from uniserve_worker.sampling.result import SAMPLING_COMPLETION_FIELDS
 from uniserve_worker.storage.output import OutputBuffer
 from uniserve_worker.storage.tensor_store import TensorRead
@@ -331,11 +323,10 @@ def reserve_outputs(
                     request_tables._copy_tables,
                     kv_cache.cache.recycle_units,
                 )
-            _bind_latent_inputs(
-                active_calls,
-                latent_pool=latent_pool,
-                model_runner=model_runner,
-                state=state,
+            state.bind_latents(
+                latent_pool,
+                model_runner.image_builder,
+                model_runner.media_builder,
             )
         _reserve_outputs(
             scheduled,
@@ -684,183 +675,3 @@ def _publish_predicated_outputs(
             for write in (request.completion_write, request.transition_write):
                 if write is not None:
                     tensor_store.write_scalar(write, False)
-
-
-def _bind_latent_inputs(
-    scheduled: tuple[Call, ...],
-    *,
-    state: BatchState,
-    latent_pool: LatentPool | None,
-    model_runner: ModelExecutor,
-) -> None:
-    """Validate trajectory parameters and bind rank-local latent staging.
-
-    Only the params of the given (active) calls are considered. With an
-    image builder, the params are checked against the admitted image
-    dimensions and the committed solver step, and every row receives a
-    `LatentPool.stage` view in `latent.staging`. Without one, the params are
-    validated by `_validate_sample_params` and only recorded. Raises
-    `invalid_descriptor` errors on any disagreement.
-    """
-    identities = {calls.call_identity(call) for call in scheduled}
-    parameters = tuple(
-        params
-        for params in state.batch.latent_params
-        if (params.request_key, params.call_id) in identities
-    )
-    if not parameters:
-        return
-
-    pool = latent_pool
-    requests = {
-        calls.call_identity(call): (
-            call,
-            state.pending_output(call.request_key.request_id),
-        )
-        for call in scheduled
-    }
-
-    if pool is None:
-        raise invalid_descriptor("latent params require a resident latent pool")
-
-    # Image trajectories bind validated image dimensions and page ownership
-    # and borrow the pool's step staging. A standalone denoiser's runner
-    # stages its own steps, so its calls keep only their parameters.
-    rows: list[tuple[CallIdentity, LatentParams, int]] = []
-    for params in parameters:
-        identity = (params.request_key, params.call_id)
-        selected = requests.get(identity)
-        if selected is None:
-            raise invalid_descriptor(
-                "latent params names a call outside its batch"
-            )
-        call, request = selected
-        slot = int(request.request.request_pool_idx)
-
-        if model_runner.image_builder is None:
-            _validate_sample_params(call, request, params, model_runner)
-            request.latent.input_params = params
-            continue
-
-        image = request.request.image
-        if image is None:
-            raise invalid_descriptor(
-                "latent params has no admitted image dimensions"
-            )
-        flow = model_runner.image_builder
-        expected_units = int(
-            flow.denoiser.latent_shape(
-                "image",
-                media_image.Config(int(params.height), int(params.width)),
-            )[0]
-        )
-        if (
-            int(params.height) != int(image.height)
-            or int(params.width) != int(image.width)
-            or int(params.latent_units) != expected_units
-        ):
-            raise invalid_descriptor(
-                "latent params disagrees with admitted model dimensions"
-            )
-
-        # A transferred trajectory commits at the step it was published at;
-        # a resident trajectory commits at its recorded solver step.
-        transferred = next(
-            (
-                export.value
-                for export in state.batch.input_products
-                if export.product in call.tensor_inputs()
-                and isinstance(export.value, LatentTransferValue)
-            ),
-            None,
-        )
-        committed_step = (
-            int(request.progress.flow_step)
-            if transferred is None
-            else transferred.step
-        )
-
-        if call.kind is MediaCall.LATENT_PREPARATION:
-            if int(params.start_step) != 0 or int(params.step_count) != 0:
-                raise invalid_descriptor(
-                    "media preparation params carries denoise steps"
-                )
-        elif call.kind is MediaCall.DENOISING:
-            if (
-                int(params.start_step) != committed_step
-                or int(params.step_count) < 1
-                or int(params.start_step) + int(params.step_count)
-                > int(image.steps)
-                or (
-                    int(call.bounds.max_tokens) > 0
-                    and int(params.step_count) > int(call.bounds.max_tokens)
-                )
-            ):
-                raise invalid_descriptor(
-                    "media denoise params exceeds its committed schedule"
-                )
-        elif (
-            int(params.start_step) != committed_step
-            or int(params.step_count) != 0
-        ):
-            raise invalid_descriptor(
-                "latent reader params disagrees with committed step state"
-            )
-
-        rows.append((identity, params, slot))
-    if not rows:
-        return
-
-    # Stage every page table together so overlapping physical ownership is
-    # rejected before any call receives a writable tensor view.
-    staged = pool.stage(
-        tuple(params.page_table for _identity, params, _slot in rows),
-        tuple(int(params.latent_units) for _identity, params, _slot in rows),
-        occupied=tuple(
-            output.latent.staging
-            for output in state.pending_outputs()
-            if output.latent.staging is not None
-        ),
-    )
-
-    for (identity, params, slot), value in zip(rows, staged, strict=True):
-        request = state.pending_output(identity[0].request_id)
-        request.latent.input_params = params
-        request.latent.staging = value
-
-
-def _validate_sample_params(
-    call: Call,
-    request: PendingOutput,
-    params: LatentParams,
-    model_runner: ModelExecutor,
-) -> None:
-    """Validate a standalone denoiser's trajectory parameters.
-
-    The request's pages are the run its slot owns, and each call covers the
-    fixed step interval of its kind: preparation opens the trajectory at step
-    zero and each denoising call advances one step from the committed one.
-    """
-    builder = model_runner.media_builder
-    if builder is None:
-        raise invalid_descriptor("latent params has no denoiser to advance")
-    slot = int(request.request.request_pool_idx)
-    if (
-        tuple(params.page_table) != builder.slot_pages(slot)
-        or int(params.latent_units) != builder.sample_pages.units
-    ):
-        raise invalid_descriptor(
-            "latent params does not name the pages of its request slot"
-        )
-
-    step = int(request.progress.flow_step)
-    if call.kind is MediaCall.LATENT_PREPARATION:
-        valid = int(params.start_step) == 0 and int(params.step_count) == 0
-    elif call.kind is MediaCall.DENOISING:
-        valid = int(params.start_step) == step and int(params.step_count) == 1
-    else:
-        valid = int(params.start_step) == step and int(params.step_count) == 0
-    if not valid:
-        raise invalid_descriptor(
-            "latent params disagrees with the request's committed step"
-        )
