@@ -815,7 +815,7 @@ class TokenInPullTokenBackPush:
         expert_sf_pool_block_offset = Int32(0)
 
         # ── Release-flag batching ────────────────────────────────────────
-        # Delay fc1-ready counter publication with the same rotating-lane
+        # Delay fc1-ready counter increments with the same rotating-lane
         # tracker used by the epilogue.  Each token's TMA store to the FC1 pool
         # is drained CTA-locally by ``cp_async_bulk_wait_group(0)`` before its
         # release target is accumulated; the eventual red.release.gpu add

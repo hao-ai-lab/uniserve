@@ -105,7 +105,7 @@ CUmemAllocationHandleType shareable_handle_type(int device) {
 // Bytes of one exported handle of the given type.
 //
 // A descriptor is an int; a fabric handle is an opaque struct. Both travel as
-// bytes so one publication shape carries either.
+// bytes through the same export interface.
 size_t handle_bytes(CUmemAllocationHandleType type) {
   return type == CU_MEM_HANDLE_TYPE_FABRIC ? sizeof(CUmemFabricHandle)
                                            : sizeof(int);
