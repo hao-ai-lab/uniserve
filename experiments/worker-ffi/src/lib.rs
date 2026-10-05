@@ -18,6 +18,7 @@ mod execution;
 mod host;
 mod shared_buffer;
 mod stream;
+mod vmm_pool;
 
 #[repr(C)]
 #[derive(Object)]
@@ -425,6 +426,7 @@ fn method<T: ObjectCore>(name: &str, function: Function, doc: &str) -> Result<()
 fn register() -> Result<()> {
     descriptor_grants::register()?;
     shared_buffer::register()?;
+    vmm_pool::register()?;
     stream::register()?;
     object::<ExecutorObj>();
     object::<SubmissionObj>();

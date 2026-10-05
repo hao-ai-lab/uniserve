@@ -27,6 +27,7 @@ mod shared_buffer;
 mod stream;
 pub mod tensor;
 mod transfer;
+pub mod vmm_pool;
 mod weight_prefetch;
 
 pub use block_tables::{BlockTableUpdate, BlockTables, GroupShape, GroupTable};

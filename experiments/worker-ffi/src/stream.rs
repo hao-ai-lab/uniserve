@@ -49,6 +49,12 @@ pub struct CUDAEvent {
     data: ObjectArc<CUDAEventObj>,
 }
 
+impl CUDAEvent {
+    pub(crate) fn native(&self) -> &Event {
+        &self.data.event
+    }
+}
+
 fn current_stream(device: i32) -> usize {
     unsafe { tvm_ffi::tvm_ffi_sys::TVMFFIEnvGetStream(2, device) as usize }
 }

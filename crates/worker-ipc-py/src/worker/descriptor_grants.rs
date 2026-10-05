@@ -1,14 +1,16 @@
 //! Python entry points for the native descriptor service.
 
 use std::io;
+use std::mem::ManuallyDrop;
 use std::os::fd::{IntoRawFd, RawFd};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use uniserve_worker::DescriptorGrants as NativeGrants;
 
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct DescriptorGrants {
-    inner: NativeGrants,
+    pub(super) inner: ManuallyDrop<Arc<NativeGrants>>,
 }
 
 #[pymethods]
@@ -16,7 +18,7 @@ impl DescriptorGrants {
     #[new]
     fn new(py: Python<'_>, endpoint: &str) -> PyResult<Self> {
         Ok(Self {
-            inner: py.detach(|| NativeGrants::new(endpoint))?,
+            inner: ManuallyDrop::new(Arc::new(py.detach(|| NativeGrants::new(endpoint))?)),
         })
     }
 
@@ -37,11 +39,11 @@ impl DescriptorGrants {
 
 impl Drop for DescriptorGrants {
     fn drop(&mut self) {
-        Python::try_attach(|py| {
-            if let Err(error) = py.detach(|| self.inner.close()) {
-                PyErr::from(error).write_unraisable(py, None);
-            }
-        });
+        // A retired chunk can outlive this wrapper. Release only this owner,
+        // and let the final native owner join the service outside the GIL.
+        // SAFETY: Drop takes this field exactly once; it is not dropped again.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        Python::try_attach(|py| py.detach(|| drop(inner)));
     }
 }
 
