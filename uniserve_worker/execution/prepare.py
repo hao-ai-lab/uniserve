@@ -5,11 +5,10 @@ these stages, in order:
 
 1. The native executor applies request commands, resolves KV input descriptions
    and collects storage completions in `BatchInputs` before this batch writes.
-2. `prepare_inputs` binds transferred tensor and latent inputs once storage
-   dependencies are done, and captures completion-valued predicates. The
-   native executor then reserves KV imports directly from its batch plan.
-   `BatchInputs` retains all accepted inputs through consumption or failure.
-   Later advances call `capture_predicates` until their sources are ready.
+2. The native executor reserves tensor, latent and KV imports once storage
+   dependencies are done. `BatchInputs` retains accepted inputs through
+   consumption or failure. `prepare_predicates` binds completion-valued
+   predicates; later advances call `capture_predicates` as sources become ready.
 3. `reserve_outputs` runs under the native executor once inputs
    are ready. It creates the batch's `PendingOutput` records and completion
    buffer, then reserves host tasks, cache tables, latent buffers, and device
@@ -22,11 +21,9 @@ owners when a stage fails.
 from __future__ import annotations
 
 import logging
-import math
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from functools import partial
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -35,14 +32,10 @@ from uniserve.media import image as media_image
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import (
     invalid_descriptor,
-    resource_error,
     unsupported_setup,
 )
 from uniserve_worker.execution import calls as calls
-from uniserve_worker.execution.host_media import (
-    BORROWED_INPUT_CALLS,
-    encoded_unit_positions,
-)
+from uniserve_worker.execution.host_media import encoded_unit_positions
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.batch import (
@@ -62,17 +55,11 @@ from uniserve_worker.protocol.transfer import (
     DeviceProductTransferValue,
     EncoderTransferValue,
     LatentTransferValue,
-    PosixShmTransfer,
 )
 from uniserve_worker.sampling.result import SAMPLING_COMPLETION_FIELDS
 from uniserve_worker.storage.latent_pool import LatentImport
 from uniserve_worker.storage.output import OutputBuffer
-from uniserve_worker.storage.tensor_store import (
-    FeatureMetadata,
-    ImageMetadata,
-    TensorRead,
-)
-from uniserve_worker.transport.pool import ReadBackpressureError
+from uniserve_worker.storage.tensor_store import TensorRead
 
 if TYPE_CHECKING:
     from uniserve_worker.config.execution.execution import WorkerConfig
@@ -85,395 +72,12 @@ if TYPE_CHECKING:
     from uniserve_worker.storage.latent_pool import LatentPool
     from uniserve_worker.storage.output import OutputPool
     from uniserve_worker.storage.tensor_store import TensorStore
-    from uniserve_worker.transport.interface import Transport
 
 
 logger = logging.getLogger(__name__)
 
 
-def prepare_inputs(
-    state: BatchState,
-    *,
-    tensor_store: TensorStore,
-    latent_pool: LatentPool | None,
-    output_pool: OutputPool,
-    request_pool: RequestPool,
-    model_runner: ModelExecutor,
-    transfer_backends: Mapping[str, Transport],
-    config: WorkerConfig,
-) -> None:
-    """Reserve transfer destinations, start their fetches, and stage predicates.
-
-    The executor calls this after preparing storage dependencies. For
-    transferred inputs, it first waits for those dependencies. Each
-    cross-call input descriptor is validated against its
-    declared product before a destination is reserved; on failure, every
-    input reserved so far is released before the error propagates.
-
-    A product import starts all of its reads or none, and too few free read
-    tickets refuse it (`ReadBackpressureError`): the imports already started
-    keep their destinations and reads, `state.inputs.started` counts the
-    handled entries, and the error propagates. Read tickets return as reads
-    retire whatever the batch does, so the executor calls again once one
-    returns and preparation resumes at the refused import.
-
-    Inputs read in place are registered as borrowed in `BatchInputs`: a video
-    encode's input held in a shared-memory segment on this
-    node, and every transferred input of a mux call. Device and encoder
-    products are imported through `TensorStore.import_tensor` into
-    batch-owned tensor reads, latent products into reserved `LatentPool`
-    pages. KV imports are reserved directly by the native executor.
-    `BatchInputs` retains each reservation until its consumer closes.
-    """
-    from uniserve_worker.execution import transfer
-
-    batch = state.batch
-    entries = batch.input_products
-    transports = transfer_backends
-    if entries and not transports:
-        raise unsupported_setup(
-            "cross-call input requires a configured transport"
-        )
-
-    # A video encode borrows a local decoder's shared-storage segment in place.
-    # A decoder on another host publishes through the rank channel instead;
-    # that value must follow the ordinary import path so execution can stage a
-    # local codec input. The choice is made from the export's physical
-    # locations (a shared-memory location on this node), so the same path
-    # applies to every placement.
-    borrowed_candidates = {
-        product.buffer_id
-        for call in batch.calls
-        if call.kind in BORROWED_INPUT_CALLS
-        for product in call.inputs
-    }
-    shm = transports.get("shm")
-    borrowed = {
-        entry.product.buffer_id
-        for entry in entries
-        if entry.product.buffer_id in borrowed_candidates
-        and isinstance(
-            entry.value, (DeviceProductTransferValue, EncoderTransferValue)
-        )
-        and any(
-            isinstance(location.transport, PosixShmTransfer)
-            and shm is not None
-            and location.source.node == shm.source.node
-            for location in entry.value.tensor.locations
-        )
-    }
-    for buffer in borrowed:
-        state.inputs.add(buffer)
-    # Only a refused product import leaves the batch resumable.
-    resumable = True
-    try:
-        for index in range(state.inputs.started, len(entries)):
-            entry = entries[index]
-            # Every entry before this one has started its reads.
-            state.inputs.started = index
-            assert transports
-            if entry.product.buffer_id in borrowed:
-                continue
-
-            # One transferred product must land on exactly one consumer device:
-            # the compute device (`call_devices(...)[0]`) of its consumers.
-            devices = {
-                model_runner.call_devices(call)[0]
-                for call in batch.calls
-                if entry.product in call.tensor_inputs()
-                or entry.product == call.predicate
-            }
-            if len(devices) != 1:
-                raise invalid_descriptor(
-                    "transferred product requires one consumer device per batch"
-                )
-            device = next(iter(devices))
-
-            value = entry.value
-            if isinstance(value, EncoderTransferValue):
-                main = value.tensor
-                if (
-                    not isinstance(value.payload_kind, str)
-                    or value.payload_kind
-                    not in {"vision_feature", "latent_feature"}
-                    or min(value.height, value.width) < 1
-                    or not transfer.tensor_matches_product(main, entry.product)
-                ):
-                    raise invalid_descriptor(
-                        "encoder transfer metadata exceeds its product bounds"
-                    )
-                if not any(
-                    entry.product
-                    in (
-                        tuple(block.feature for block in call.vision_inputs)
-                        if value.payload_kind == "vision_feature"
-                        else (call.latent_feature_input,)
-                    )
-                    for call in batch.calls
-                ):
-                    raise invalid_descriptor(
-                        "encoder transfer entry disagrees with its product "
-                        "identity"
-                    )
-
-            elif isinstance(value, DeviceProductTransferValue):
-                main = value.tensor
-                if min(value.height, value.width) < 0:
-                    raise invalid_descriptor(
-                        "device-product image dimensions must be non-negative"
-                    )
-                if (value.height == 0) != (value.width == 0):
-                    raise invalid_descriptor(
-                        "device-product image dimensions are incomplete"
-                    )
-                if value.value_range not in {"", "signed_unit", "unit"}:
-                    raise invalid_descriptor(
-                        "device-product value range is invalid"
-                    )
-                if value.height == 0 and value.value_range:
-                    raise invalid_descriptor(
-                        "non-image device product carries an image range"
-                    )
-                if not any(
-                    entry.product
-                    in (
-                        *call.inputs,
-                        call.token_input,
-                        call.image_input,
-                        call.predicate,
-                    )
-                    for call in batch.calls
-                ) or not transfer.tensor_matches_product(main, entry.product):
-                    raise invalid_descriptor(
-                        "device-product transfer metadata exceeds its product "
-                        "bounds"
-                    )
-
-            elif isinstance(value, LatentTransferValue):
-                main = value.tensor
-                pool = latent_pool
-
-                # A latent payload must exactly match the pool's element
-                # layout: [latent_units, latent_width] at the pool dtype.
-                expected_dtype = (
-                    ""
-                    if pool is None
-                    else str(pool.dtype).removeprefix("torch.")
-                )
-                expected_nbytes = (
-                    0
-                    if pool is None
-                    else value.latent_units
-                    * int(pool.latent_width)
-                    * int(pool.storage.element_size())
-                )
-                if (
-                    not any(
-                        entry.product == call.latent_input
-                        for call in batch.calls
-                    )
-                    or pool is None
-                    or min(value.height, value.width, value.latent_units) < 1
-                    or tuple(main.shape)
-                    != (value.latent_units, int(pool.latent_width))
-                    or main.dtype != expected_dtype
-                    or main.nbytes != expected_nbytes
-                    or main.nbytes > entry.product.max_bytes
-                    or math.prod(main.shape)
-                    > entry.product.shape_bound.max_elements
-                ):
-                    raise invalid_descriptor(
-                        "latent transfer metadata exceeds its product bounds"
-                    )
-
-            else:
-                raise invalid_descriptor(
-                    "cross-call transfer entry has an unknown kind"
-                )
-
-            # Encoded rows publish initialized prefixes within their reserved
-            # capacity. The mux reads those host locations directly; importing
-            # the full logical tensor would require uninitialized padding.
-            if any(
-                call.kind is MediaCall.MUXING and entry.product in call.inputs
-                for call in batch.calls
-            ):
-                state.inputs.add(entry.product.buffer_id)
-                continue
-
-            parameters = {
-                params.buffer: params for params in batch.buffer_allocations
-            }
-            if isinstance(
-                value, (EncoderTransferValue, DeviceProductTransferValue)
-            ):
-                request_slots = {
-                    admission.request_key: int(admission.request_pool_idx)
-                    for admission in batch.admissions
-                }
-                resident = request_pool.peek(
-                    entry.product.request_key.request_id
-                )
-                if (
-                    resident is not None
-                    and resident.request_key == entry.product.request_key
-                ):
-                    request_slots[resident.request_key] = int(
-                        resident.request_pool_idx
-                    )
-                imported = tensor_store.import_tensor(
-                    entry.product,
-                    value.tensor,
-                    device=device,
-                    request_slots=request_slots,
-                    buffer_allocations=parameters,
-                    bindings={
-                        (location.source, location.backend): transports[
-                            location.backend
-                        ]
-                        for location in value.tensor.locations
-                        if location.backend in transports
-                        and (
-                            location.backend != "shm"
-                            or location.source.node
-                            == transports[location.backend].source.node
-                        )
-                    },
-                    metadata=(
-                        FeatureMetadata(height=value.height, width=value.width)
-                        if isinstance(value, EncoderTransferValue)
-                        else None
-                        if value.height == 0
-                        else ImageMetadata(
-                            height=value.height,
-                            width=value.width,
-                            value_range=None
-                            if not value.value_range
-                            else (
-                                (-1.0, 1.0)
-                                if value.value_range == "signed_unit"
-                                else (0.0, 1.0)
-                            ),
-                        )
-                    ),
-                )
-                assert imported.imported is not None
-                state.inputs.add(entry.product.buffer_id, imported)
-                continue
-
-            elif isinstance(value, LatentTransferValue):
-                consumers = tuple(
-                    call
-                    for call in batch.calls
-                    if entry.product in call.tensor_inputs()
-                )
-                if len(consumers) != 1:
-                    raise invalid_descriptor(
-                        "latent transfer must have one consumer"
-                    )
-                consumer = consumers[0]
-
-                params = next(
-                    (
-                        params
-                        for params in batch.latent_params
-                        if (params.request_key, params.call_id)
-                        == (consumer.request_key, consumer.call_id)
-                    ),
-                    None,
-                )
-                if params is None or (
-                    value.latent_units,
-                    value.height,
-                    value.width,
-                    value.step,
-                ) != (
-                    params.latent_units,
-                    params.height,
-                    params.width,
-                    params.start_step,
-                ):
-                    raise invalid_descriptor(
-                        "latent transfer disagrees with its scheduler params"
-                    )
-
-                resident = request_pool.peek(
-                    entry.product.request_key.request_id
-                )
-                admission = next(
-                    (
-                        row
-                        for row in batch.admissions
-                        if row.request_key == entry.product.request_key
-                    ),
-                    None,
-                )
-                if (
-                    resident is not None
-                    and resident.request_key == entry.product.request_key
-                ):
-                    slot = int(resident.request_pool_idx)
-                elif admission is not None:
-                    slot = int(admission.request_pool_idx)
-                else:
-                    raise invalid_descriptor(
-                        "latent transfer has no request slot"
-                    )
-
-                # Transfer metadata validation above established the physical
-                # pool.
-                assert latent_pool is not None
-                pool = latent_pool
-                binding = pool.reserve_import(
-                    entry.product,
-                    request_pool_idx=slot,
-                    page_table=params.page_table,
-                    latent_units=value.latent_units,
-                )
-
-                # Record the reservation before fetching so input cleanup
-                # abandons it if `fetch_tensor` raises; each started copy is
-                # retained on the import through `retain_transfer`.
-                state.inputs.add(entry.product.buffer_id, binding)
-                from uniserve_worker.transport.fetch import fetch_tensor
-
-                try:
-                    fetch_tensor(
-                        value.tensor,
-                        binding.spans,
-                        bindings={
-                            (location.source, location.backend): transports[
-                                location.backend
-                            ]
-                            for location in value.tensor.locations
-                            if location.backend in transports
-                        },
-                        retain=partial(pool.retain_transfer, binding),
-                    )
-                except ReadBackpressureError:
-                    # No read started; the resumed import reserves its pages
-                    # again.
-                    state.inputs.remove(entry.product.buffer_id)
-                    pool.abandon_import(binding)
-                    raise
-
-        state.inputs.started = len(entries)
-        resumable = False
-        _prepare_predicates(
-            state,
-            tensor_store=tensor_store,
-            output_pool=output_pool,
-            model_runner=model_runner,
-        )
-    except ReadBackpressureError as error:
-        if resumable:
-            # A refused product import started no read. The executor resumes
-            # it after transport capacity returns, retaining earlier inputs.
-            raise
-        raise resource_error(error.message) from error
-
-
-def _prepare_predicates(
+def prepare_predicates(
     state: BatchState,
     *,
     tensor_store: TensorStore,

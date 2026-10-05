@@ -1458,6 +1458,54 @@ fn product_validation_enforces_generation_and_shape_bounds() {
 }
 
 #[test]
+fn batch_inputs_require_a_consumer_for_their_payload_kind() {
+    let mut feature = output_product(CallId::new(3, 0));
+    feature.dtype = DType::F32;
+    feature.shape_bound.dims = vec![DimBound::Static(2)];
+    let mut call = ar_decode_call();
+    call.vision_inputs = vec![VisionInput {
+        offset: 0,
+        feature: feature.clone(),
+    }];
+    let mut batch = batch_with_calls(11, Vec::new(), vec![call]);
+    batch.input_products.push(TensorExport {
+        product: feature,
+        value: TransferHandle::Encoder {
+            height: 1,
+            width: 1,
+            payload_kind: FeatureKind::Vision,
+            tensor: TensorTransfer {
+                shape: vec![2],
+                locations: vec![Locator {
+                    source: WorkerInfo::default().endpoint,
+                    transport: TransferTransport::Local {
+                        endpoint: "encoder".into(),
+                        key: 1,
+                    },
+                    nbytes: 8,
+                    dtype: "float32".into(),
+                    shape: vec![2],
+                    offset: vec![0],
+                    device: "cpu".into(),
+                }],
+            },
+        },
+    });
+    batch.validate().unwrap();
+
+    // The same numerical shape cannot turn a vision input into a latent input.
+    let TransferHandle::Encoder { payload_kind, .. } = &mut batch.input_products[0].value else {
+        unreachable!()
+    };
+    *payload_kind = FeatureKind::Latent;
+    assert!(batch.validate().is_err());
+
+    let feature = batch.calls[0].vision_inputs.pop().unwrap().feature;
+    batch.calls[0].latent_feature_input = Some(feature);
+    batch.validate().unwrap();
+}
+
+#[test]
 fn batch_rejects_two_calls_for_one_request() {
     let batch = Batch {
         batch_id: 1,

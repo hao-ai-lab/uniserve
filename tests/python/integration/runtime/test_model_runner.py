@@ -1951,6 +1951,8 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
 def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     height: int, export: str
 ) -> None:
+    from uniserve_worker.transport.pool import ReadReservation
+
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
     admission = umm_params(
@@ -2100,8 +2102,14 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             for allocation in batch.latent_params
         ),
     )
-    prepared = consumer.submit(batch)
-    assert prepared is not None
+    # Latent admission must relinquish refused destinations and resume when
+    # read capacity returns, including noncontiguous destination pages.
+    capacity = consumer.transports["shm"].capacity
+    with ReadReservation(capacity, capacity.ticket_capacity):
+        prepared = consumer.submit(batch)
+        consumer.advance()
+        assert consumer.poll(prepared) is None
+
     received = prepared
     received = finalized_report(consumer, received)
     assert received.completions[0].status is CallStatus.OK

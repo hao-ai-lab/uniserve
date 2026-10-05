@@ -591,7 +591,7 @@ impl TensorStore {
     /// reservation. A failed submission retains any in-flight destinations.
     #[pyo3(signature = (reference, tensor, *, device, bindings, request_slots, buffer_allocations, metadata=None))]
     #[allow(clippy::too_many_arguments)]
-    fn import_tensor<'py>(
+    pub(super) fn import_tensor<'py>(
         &self,
         py: Python<'py>,
         reference: Bound<'py, PyAny>,

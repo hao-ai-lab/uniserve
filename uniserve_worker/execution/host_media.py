@@ -52,14 +52,12 @@ if TYPE_CHECKING:
     from uniserve_worker.transport.interface import Transport
     from uniserve_worker.transport.shm import ShmTransport
 
-__all__ = ["BORROWED_INPUT_CALLS", "HOST_MEDIA_CALLS", "execute"]
+__all__ = ["HOST_MEDIA_CALLS", "execute"]
 
 #: The calls host ranks serve.
 HOST_MEDIA_CALLS = frozenset(
     {MediaCall.VIDEO_ENCODING, MediaCall.AUDIO_ENCODING, MediaCall.MUXING}
 )
-#: The calls whose media inputs are read in place rather than imported.
-BORROWED_INPUT_CALLS = frozenset({MediaCall.VIDEO_ENCODING})
 
 
 def encoded_unit_positions(

@@ -12,7 +12,7 @@ use uniserve_worker::{
     LatentExport as NativeLatentExport, LatentImport as NativeLatentImport,
     LatentPool as NativeLatentPool, LatentUpdate as NativeLatentUpdate,
 };
-use uniserve_worker_ipc::{BufferId, LatentParams, RequestKey};
+use uniserve_worker_ipc::{BufferId, LatentParams, RequestKey, TensorTransfer};
 
 use super::completion::{Completion, CompletionRef};
 use super::error::{invalid, native_error};
@@ -70,7 +70,7 @@ pub(crate) struct LatentImport {
     #[pyo3(get)]
     product: Py<PyAny>,
     #[pyo3(get)]
-    spans: Py<PyTuple>,
+    pub(super) spans: Py<PyTuple>,
 }
 
 #[pymethods]
@@ -659,7 +659,7 @@ impl LatentPool {
     /// Assign destination pages in bank zero before any read starts. Padding is
     /// initialized here; transfers write only the logical spans.
     #[pyo3(signature = (product, *, request_pool_idx, page_table, latent_units))]
-    fn reserve_import(
+    pub(super) fn reserve_import(
         &mut self,
         py: Python<'_>,
         product: Py<PyAny>,
@@ -706,7 +706,7 @@ impl LatentPool {
         Ok(write)
     }
 
-    fn retain_transfer(
+    pub(super) fn retain_transfer(
         &self,
         py: Python<'_>,
         write: &Bound<'_, LatentImport>,
@@ -854,6 +854,26 @@ impl LatentPool {
 }
 
 impl LatentPool {
+    /// IPC validates the source bounds; the receiving pool fixes its layout.
+    pub(super) fn validate_transfer(
+        &self,
+        py: Python<'_>,
+        tensor: &TensorTransfer,
+        units: u32,
+    ) -> PyResult<()> {
+        let dtype = self.dtype.bind(py).str()?;
+        let dtype = dtype.to_str()?.trim_start_matches("torch.");
+        if tensor.shape != [u64::from(units), self.latent_width as u64]
+            || tensor.locations[0].dtype != dtype
+        {
+            return Err(invalid(
+                py,
+                "latent transfer does not match the destination pool layout",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn validate(
         &mut self,
         py: Python<'_>,

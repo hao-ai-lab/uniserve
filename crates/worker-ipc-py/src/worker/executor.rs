@@ -2,6 +2,7 @@
 
 mod commit;
 mod execute;
+mod inputs;
 mod output;
 mod prepare;
 mod retirement;
@@ -32,7 +33,6 @@ use super::latent::LatentPool;
 use super::pending::PendingOutput;
 use super::request::RequestPool;
 use super::storage::TensorStore;
-use super::transfer::TransferCapacity;
 use crate::{PyServer, convert};
 use retirement::Retirement;
 
@@ -148,90 +148,6 @@ impl PythonBackend {
             stats: None,
             retirement,
         })
-    }
-
-    fn advance_inputs(
-        &self,
-        py: Python<'_>,
-        batch: &BatchState,
-        submission: &Arc<NativeSubmission>,
-    ) -> PyResult<()> {
-        let inputs = &batch.inputs;
-        if inputs.borrow(py).closed() {
-            return Ok(());
-        }
-
-        if !inputs.borrow(py).submitted() {
-            // Reusing an import destination must wait for its previous
-            // reader. Batches without imports can prepare numerical inputs
-            // while those same dependencies still gate model execution.
-            if batch.imports {
-                if !inputs.borrow(py).storage_ready()? {
-                    return Ok(());
-                }
-                inputs.borrow(py).require_storage(py)?;
-            }
-
-            inputs.borrow_mut(py).set_awaiting_reads(false);
-            let prepared = self
-                .runner
-                .bind(py)
-                .call_method1("prepare_inputs", (&batch.numerical,))
-                .and_then(|_| self.prepare_kv(py, batch));
-            if let Err(error) = prepared {
-                if !error.is_instance(py, self.read_backpressure.bind(py)) {
-                    // Both numerical preparation and native imports use this
-                    // cleanup path. Abandon every accepted destination before
-                    // propagating the error; physical accesses retire later.
-                    if let Err(cleanup) = BatchInputs::close(
-                        inputs.bind(py),
-                        self.tensors.get(),
-                        self.latents.as_ref().map(|pool| pool.bind(py)),
-                        self.cache_imports.as_ref().map(|imports| imports.bind(py)),
-                    ) {
-                        let _ = error.value(py).call_method1(
-                            "add_note",
-                            (format!("batch input cleanup failed: {cleanup}"),),
-                        );
-                    }
-                    return Err(error);
-                }
-
-                let error = error.value(py);
-                let capacity: Py<TransferCapacity> = error.getattr("capacity")?.extract()?;
-                let returns = error.getattr("returns")?.extract()?;
-                inputs.borrow_mut(py).set_awaiting_reads(true);
-
-                // The return counter closes the gap between refusal and
-                // subscription, including a return on another host thread.
-                capacity.get().notify_reads_returned(
-                    py,
-                    Self::input_wake(py, submission)?,
-                    returns,
-                )?;
-                return Ok(());
-            }
-            inputs.borrow_mut(py).set_submitted(true);
-        }
-
-        // Numerical callbacks may acquire or close inputs. Never retain an
-        // input-set borrow across a callback or notification registration.
-        self.runner
-            .bind(py)
-            .call_method1("capture_predicates", (&batch.numerical,))?;
-        Ok(())
-    }
-
-    fn input_wake(py: Python<'_>, submission: &Arc<NativeSubmission>) -> PyResult<Py<PyAny>> {
-        Py::new(
-            py,
-            Submission {
-                submission: Arc::clone(submission),
-            },
-        )?
-        .bind(py)
-        .getattr("notify_ready")
-        .map(Bound::unbind)
     }
 }
 
