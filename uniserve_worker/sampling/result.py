@@ -4,8 +4,8 @@
 ``uniserve_worker.sampling.sampler`` or by graph-replayed greedy decode in
 ``uniserve_worker.model_executor.graph_inputs``. ``SamplerRow`` addresses one
 call within it. Output capture (``uniserve_worker.execution.output``) copies
-a batch's shared ``completion`` and ``logprobs`` columns once; commit
-(``uniserve_worker.execution.commit``) and ``uniserve_worker.execution.token``
+a batch's shared ``completion`` and ``logprobs`` columns once; the native
+executor and ``uniserve_worker.execution.token``
 gather per-call columns through ``sample_columns`` without splitting them per
 row.
 """
@@ -20,8 +20,8 @@ import torch
 
 # The completion column packs four field sections, each one row per call:
 # [valid | active | token | accepted] (``sampling_columns`` in
-# ``uniserve_worker.sampling.sampler``). ``_SAMPLING_FIELDS_PER_CALL`` in
-# ``uniserve_worker.execution.output`` must equal this value.
+# ``uniserve_worker.sampling.sampler``). The native PendingOutput decoder
+# uses the same field count.
 SAMPLING_COMPLETION_FIELDS = 4
 
 # Tagged token relays set bit 31 to flag continuation; the low 31 bits carry

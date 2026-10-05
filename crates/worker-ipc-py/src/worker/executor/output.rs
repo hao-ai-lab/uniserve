@@ -1,14 +1,10 @@
 //! Assemble successful and failed native batch results for delivery.
 
-use std::collections::HashSet;
-
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use uniserve_worker::{BatchResult, request_output};
 use uniserve_worker_ipc::{BatchOutput, CallStatus, ErrorCode, RequestOutput};
 
 use super::{BatchState, PythonBackend};
-use crate::convert;
 use crate::worker::error::native_error;
 use crate::worker::pending::PendingOutput;
 
@@ -55,21 +51,10 @@ impl PythonBackend {
         batch: &BatchState,
         completions: Vec<RequestOutput>,
     ) -> PyResult<BatchOutput> {
-        let products_view = batch.numerical.borrow(py).products.clone_ref(py);
-        let successful = completions
-            .iter()
-            .filter(|value| value.status == CallStatus::Ok)
-            .map(|value| (value.request_key, value.call_id))
-            .collect::<HashSet<_>>();
         let mut products = Vec::new();
-        for product in products_view.bind(py) {
-            let product = convert::tensor_export_from_py(&product.call_method0("to_mapping")?)
-                .ok_or_else(|| PyRuntimeError::new_err("invalid tensor output"))?;
-            if successful.contains(&(
-                product.product.request_key,
-                product.product.producer_call_id,
-            )) {
-                products.push(product);
+        for (pending, completion) in batch.pending_outputs(py).iter().zip(&completions) {
+            if completion.status == CallStatus::Ok {
+                products.extend_from_slice(pending.borrow().lock(py)?.products());
             }
         }
         Ok(BatchOutput {

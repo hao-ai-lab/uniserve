@@ -14,11 +14,73 @@ use uniserve_worker_ipc::{BufferId, Call, CallStatus, ErrorCode, KvTransfer, Req
 use crate::convert;
 
 use super::block_tables::BlockTables;
-use super::error::{native_error, unsupported};
+use super::error::{invalid, native_error, unsupported};
 use super::host::HostTask;
 use super::latent::LatentUpdate;
 use super::output::OutputBuffer;
 use super::request::{Request, RequestPool, RequestProgress};
+
+/// Borrowed sampling views and device coordinates awaiting batch commit.
+#[pyclass(module = "uniserve_worker._uniserve_ipc")]
+pub(crate) struct TokenUpdate {
+    #[pyo3(get, set)]
+    pub(super) sampled: Option<Py<PyAny>>,
+    #[pyo3(get, set)]
+    pub(super) logical_position: Py<PyAny>,
+    #[pyo3(get, set)]
+    pub(super) sampling_position: Py<PyAny>,
+    #[pyo3(get, set)]
+    pub(super) penalty_base: Option<Py<PyAny>>,
+    #[pyo3(get, set)]
+    pub(super) decode_increment: bool,
+    #[pyo3(get, set)]
+    pub(super) cache_length: Option<Py<PyAny>>,
+    #[pyo3(get, set)]
+    pub(super) prompt_logits: Option<Py<PyAny>>,
+}
+
+impl TokenUpdate {
+    fn new(py: Python<'_>) -> Self {
+        Self {
+            sampled: None,
+            logical_position: 0_u64.into_pyobject(py).unwrap().into_any().unbind(),
+            sampling_position: 0_u64.into_pyobject(py).unwrap().into_any().unbind(),
+            penalty_base: None,
+            decode_increment: false,
+            cache_length: None,
+            prompt_logits: None,
+        }
+    }
+
+    /// Release the object's borrow before numerical callbacks can run.
+    pub(super) fn clone_ref(&self, py: Python<'_>) -> Self {
+        Self {
+            sampled: self.sampled.as_ref().map(|value| value.clone_ref(py)),
+            logical_position: self.logical_position.clone_ref(py),
+            sampling_position: self.sampling_position.clone_ref(py),
+            penalty_base: self.penalty_base.as_ref().map(|value| value.clone_ref(py)),
+            decode_increment: self.decode_increment,
+            cache_length: self.cache_length.as_ref().map(|value| value.clone_ref(py)),
+            prompt_logits: self.prompt_logits.as_ref().map(|value| value.clone_ref(py)),
+        }
+    }
+}
+
+#[pymethods]
+impl TokenUpdate {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.sampled)?;
+        visit.call(&self.logical_position)?;
+        visit.call(&self.sampling_position)?;
+        visit.call(&self.penalty_base)?;
+        visit.call(&self.cache_length)?;
+        visit.call(&self.prompt_logits)
+    }
+
+    fn __clear__(&mut self, py: Python<'_>) {
+        *self = Self::new(py);
+    }
+}
 
 /// One call's result, with borrowed numerical views until execution commits.
 ///
@@ -33,7 +95,7 @@ pub(crate) struct PendingOutput {
     #[pyo3(get)]
     pub(super) request: Py<Request>,
     #[pyo3(get)]
-    token_update: Py<PyAny>,
+    pub(super) token_update: Py<TokenUpdate>,
     #[pyo3(get)]
     pub(super) latent: Py<PyAny>,
     pub(super) host_tasks: Vec<Py<HostTask>>,
@@ -64,8 +126,6 @@ pub(crate) struct PendingOutput {
     pub(super) completion_write: Option<Py<PyAny>>,
     #[pyo3(get, set)]
     pub(super) producer_write: Option<Py<PyAny>>,
-    #[pyo3(get, set)]
-    pub(super) products: Py<PyTuple>,
 }
 
 impl PendingOutput {
@@ -104,7 +164,7 @@ impl PendingOutput {
             buffer: Some(buffer),
             call,
             request,
-            token_update: numerical.getattr("TokenUpdate")?.call0()?.unbind(),
+            token_update: Py::new(py, TokenUpdate::new(py))?,
             latent: numerical
                 .getattr("LatentResult")?
                 .call1((update,))?
@@ -125,7 +185,6 @@ impl PendingOutput {
             transition_write: None,
             completion_write: None,
             producer_write: None,
-            products: PyTuple::empty(py).unbind(),
         })
     }
 }
@@ -198,11 +257,23 @@ impl PendingOutput {
     }
 
     fn set_prompt_logits(&self, py: Python<'_>, logits: Py<PyAny>) -> PyResult<()> {
-        self.token_update
-            .bind(py)
-            .setattr("runtime_prompt_logits", logits)?;
+        self.token_update.borrow_mut(py).prompt_logits = Some(logits);
         self.lock(py)?.progress.prompt_logits_ready = true;
         Ok(())
+    }
+
+    /// Convert each export once, including results produced by host callbacks.
+    fn set_products(&self, py: Python<'_>, products: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
+        let products = products
+            .into_iter()
+            .map(|product| {
+                convert::tensor_export_from_py(&product.call_method0("to_mapping")?)
+                    .ok_or_else(|| invalid(py, "invalid tensor output"))
+            })
+            .collect::<PyResult<_>>()?;
+        self.lock(py)?
+            .set_products(products)
+            .map_err(|error| native_error(py, error))
     }
 
     fn cache_coordinates(&self, tables: &Bound<'_, PyAny>) -> PyResult<(u32, u64, u32)> {
@@ -388,12 +459,11 @@ impl PendingOutput {
         visit.call(&self.token_write)?;
         visit.call(&self.transition_write)?;
         visit.call(&self.completion_write)?;
-        visit.call(&self.producer_write)?;
-        visit.call(&self.products)
+        visit.call(&self.producer_write)
     }
 
     fn __clear__(&mut self, py: Python<'_>) {
-        self.token_update = py.None();
+        self.token_update.borrow_mut(py).__clear__(py);
         self.latent = py.None();
         self.host_tasks.clear();
         self.host_finish = None;
@@ -419,17 +489,7 @@ impl PendingOutput {
         self.transition_write = None;
         self.completion_write = None;
         self.producer_write = None;
-        let token = self.token_update.bind(py);
-        for field in [
-            "sampled",
-            "runtime_penalty_base",
-            "runtime_prompt_logits",
-            "runtime_cache_length",
-        ] {
-            token.setattr(field, py.None())?;
-        }
-        token.setattr("runtime_logical_position", 0)?;
-        token.setattr("runtime_sampling_position", 0)?;
+        self.token_update.borrow_mut(py).__clear__(py);
         Ok(())
     }
 

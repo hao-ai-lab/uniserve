@@ -11,10 +11,9 @@ outputs. ``prepare_sampling`` turns the model's logits into
 samples nothing. ``publish_sample`` stages the sampled result and the
 request progress it implies on the call's ``PendingOutput``.
 
-Device state is only bound here: the ``runtime_*`` fields of
-``PendingOutput.token`` are applied to ``DecodeState`` by
-``commit._commit_runtime_states`` when the batch commits. A verify call
-leaves its accepted span on device; ``PendingOutput`` materialization
+Device state is only bound here: the views in ``PendingOutput.token_update``
+are applied to ``DecodeState`` by the native executor at batch commit. A verify
+call leaves its accepted span on device; ``PendingOutput`` materialization
 resolves it on the host against the base coordinates recorded here.
 """
 
@@ -444,9 +443,7 @@ def publish_sample(
                 )
             device_selected = accepted_device.to(dtype=torch.int32) + 1
 
-        request.token_update.runtime_cache_length = device_selected + int(
-            task.seq_len
-        )
+        request.token_update.cache_length = device_selected + int(task.seq_len)
         publish_runtime_sample(
             request,
             sampled,
@@ -1020,7 +1017,7 @@ def prompt_logprob_details(
             raise invalid_descriptor(
                 "continued prompt scoring has no preceding logits"
             )
-        pending = request.token_update.runtime_prompt_logits
+        pending = request.token_update.prompt_logits
         if pending is None:
             pending = states.prompt_logits[slot]
         previous = pending.reshape(1, -1).to(
@@ -1076,7 +1073,7 @@ def token_outcome(
         request = state.pending_output(call.request_key.request_id)
 
     cache = request.cache_coordinates(request_tables)
-    published_length = request.token_update.runtime_cache_length
+    published_length = request.token_update.cache_length
     if published_length is None:
         published_length = (
             int(task.seq_len) + int(tokens) if task is not None else cache[1]
@@ -1193,7 +1190,7 @@ def commit_kv(
     The count must lie within the row's query span and the resulting extent
     within the request's allocated page table. With ``publish_runtime`` and a
     ``DecodeState``, the extent is staged as
-    ``request.token_update.runtime_cache_length`` for the commit. A zero count
+    ``request.token_update.cache_length`` for the commit. A zero count
     leaves the update unchanged and skips the page-table check.
 
     Raises:
@@ -1217,7 +1214,7 @@ def commit_kv(
     if publish_runtime and decode_state is not None:
         if int(task.request_pool_idx) != int(request.request.request_pool_idx):
             raise RuntimeError("token KV update crossed request slots")
-        request.token_update.runtime_cache_length = resulting
+        request.token_update.cache_length = resulting
 
 
 def resolve_decode_token(
@@ -1271,16 +1268,16 @@ def publish_runtime_sample(
 ) -> None:
     """Bind one call's selection for the batch's device state update.
 
-    Does nothing without a ``DecodeState``. ``commit._commit_runtime_states``
-    applies the bound values when the batch commits.
+    Does nothing without a ``DecodeState``. The native executor applies
+    the bound values when the batch commits.
     """
     if decode_state is None:
         return
     request.token_update.sampled = sample
-    request.token_update.runtime_logical_position = logical_position
-    request.token_update.runtime_sampling_position = sampling_position
-    request.token_update.runtime_penalty_base = penalty_base
-    request.token_update.runtime_decode_increment = decode_increment
+    request.token_update.logical_position = logical_position
+    request.token_update.sampling_position = sampling_position
+    request.token_update.penalty_base = penalty_base
+    request.token_update.decode_increment = decode_increment
 
 
 def publish_token_products(

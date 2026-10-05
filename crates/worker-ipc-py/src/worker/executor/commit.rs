@@ -2,8 +2,8 @@
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
-use uniserve_worker_ipc::{CallKind, MediaCall};
+use pyo3::types::{PyDict, PyTuple};
+use uniserve_worker_ipc::{CallKind, CallStatus, MediaCall};
 
 use super::{BatchState, PythonBackend};
 use crate::worker::error::native_error;
@@ -25,9 +25,7 @@ impl PythonBackend {
                 .extract()?;
             let outputs = batch.pending_outputs(py);
             self.finish_reads(py, &outputs)?;
-            self.runner
-                .bind(py)
-                .call_method1("prepare_outputs", (&numerical,))?;
+            self.write_completion_predicates(py, &outputs)?;
 
             for (output, call) in outputs.iter().zip(&batch.plan.calls) {
                 output.borrow().validate_output(py, call)?;
@@ -57,7 +55,6 @@ impl PythonBackend {
             let buffer = numerical.borrow(py).output_buffer(py)?;
             OutputBuffer::seal(buffer.bind(py))?;
 
-            let products = PyList::empty(py);
             let mut exports = Vec::new();
             let mut installations = Vec::new();
             let tensor_exports = PyDict::new(py);
@@ -69,9 +66,6 @@ impl PythonBackend {
             for output in &outputs {
                 let pending = output.borrow();
                 pending.lock(py)?.reports_output = reports_output;
-                for product in pending.products.bind(py) {
-                    products.append(product)?;
-                }
                 if let Some(transfer) = &pending.cache_export {
                     exports.push((transfer.source, (**transfer).clone()));
                 }
@@ -161,9 +155,7 @@ impl PythonBackend {
             for (resident, exports) in directories {
                 resident.update(exports.as_mapping())?;
             }
-            self.runner
-                .bind(py)
-                .call_method1("apply_outputs", (&numerical,))?;
+            self.apply_decode_state(py, &outputs)?;
             for output in outputs {
                 output.borrow_mut().release_execution_references(py)?;
             }
@@ -172,9 +164,170 @@ impl PythonBackend {
                 .pool
                 .add_pending(&calls)
                 .map_err(|error| native_error(py, error))?;
-            numerical.borrow_mut(py).products = PyTuple::new(py, products.iter())?.unbind();
             batch.record_execution(py, &stats)
         })
+    }
+
+    fn write_completion_predicates(
+        &self,
+        py: Python<'_>,
+        outputs: &[Bound<'_, PendingOutput>],
+    ) -> PyResult<()> {
+        let mut writes = Vec::new();
+        for output in outputs {
+            let output = output.borrow();
+            if output.lock(py)?.output.status == CallStatus::Predicated {
+                continue;
+            }
+            if let Some(write) = &output.completion_write {
+                let write = write.bind(py).cast::<Buffer>()?;
+                if !write.get().producer_recorded(py) {
+                    writes.push(write.clone());
+                }
+            }
+        }
+        let Some(first) = writes.first() else {
+            return Ok(());
+        };
+
+        // Models may already have written a device decision. Only unresolved
+        // completion scalars receive true, through the store's shared copy.
+        let tensor = first.get().tensor(py);
+        let options = PyDict::new(py);
+        options.set_item("device", tensor.bind(py).getattr("device")?)?;
+        options.set_item("dtype", tensor.bind(py).getattr("dtype")?)?;
+        let values = py
+            .import("torch")?
+            .call_method("ones", ((writes.len(),),), Some(&options))?;
+        self.tensors.get().write_scalars(py, writes, values, None)?;
+        Ok(())
+    }
+
+    fn apply_decode_state(
+        &self,
+        py: Python<'_>,
+        outputs: &[Bound<'_, PendingOutput>],
+    ) -> PyResult<()> {
+        let updates: Vec<_> = outputs
+            .iter()
+            .map(|output| {
+                let output = output.borrow();
+                (
+                    output.request.borrow(py).request.slot(),
+                    output.token_update.borrow(py).clone_ref(py),
+                )
+            })
+            .collect();
+        let Some(state) = &self.decode_state else {
+            if updates.iter().any(|(_, update)| {
+                update.sampled.is_some()
+                    || update.prompt_logits.is_some()
+                    || update.cache_length.is_some()
+            }) {
+                return Err(PyRuntimeError::new_err(
+                    "runtime state export has no backing storage",
+                ));
+            }
+            return Ok(());
+        };
+        let state = state.bind(py);
+
+        // Install verified extents before advancing tokens. Tensor lengths and
+        // coordinates remain on device, including speculative acceptance.
+        for (slot, update) in &updates {
+            if let Some(length) = &update.cache_length {
+                state.call_method1("set_cache_length", (slot, length))?;
+            }
+        }
+
+        let decode: Vec<_> = updates
+            .iter()
+            .filter_map(|(slot, update)| {
+                update
+                    .sampled
+                    .as_ref()
+                    .filter(|_| update.decode_increment)
+                    .map(|sample| (slot, update, sample.bind(py)))
+            })
+            .collect();
+        if !decode.is_empty() {
+            let samples = PyTuple::new(py, decode.iter().map(|(_, _, sample)| sample))?;
+            let indices = decode
+                .iter()
+                .map(|(_, _, sample)| {
+                    let index = sample.getattr("request_pool_index")?;
+                    if index.is_none() {
+                        return Err(PyRuntimeError::new_err(
+                            "decode samples have no device request slots",
+                        ));
+                    }
+                    Ok(index)
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let indices = PyTuple::new(py, indices)?;
+            let columns: [Bound<'_, PyAny>; 4] = py
+                .import("uniserve_worker.sampling.result")?
+                .call_method1(
+                    "sample_columns",
+                    (samples, ("tokens", "continuation", "valid", "active")),
+                )?
+                .extract()?;
+            let options = PyDict::new(py);
+            for (name, column) in ["tokens", "predicates", "valid", "active"]
+                .into_iter()
+                .zip(columns)
+            {
+                options.set_item(name, column)?;
+            }
+            options.set_item(
+                "device_slots",
+                py.import("uniserve.tensors")?
+                    .call_method1("concatenate_views", (indices,))?,
+            )?;
+            options.set_item(
+                "penalty_bases",
+                PyTuple::new(
+                    py,
+                    decode.iter().map(|(_, update, _)| {
+                        update.penalty_base.as_ref().map(|value| value.bind(py))
+                    }),
+                )?,
+            )?;
+            let slots = PyTuple::new(py, decode.iter().map(|(slot, _, _)| slot))?;
+            state.call_method("apply_tokens", (slots,), Some(&options))?;
+        }
+
+        // Prefill and verification have explicit per-call coordinates; decode
+        // above advances all of its rows together using their device slots.
+        for (slot, update) in &updates {
+            if let Some(sample) = &update.sampled
+                && !update.decode_increment
+            {
+                let sample = sample.bind(py);
+                let options = PyDict::new(py);
+                for (name, field) in [
+                    ("tokens", "tokens"),
+                    ("predicates", "continuation"),
+                    ("valid", "valid"),
+                    ("active", "active"),
+                ] {
+                    options.set_item(name, sample.getattr(field)?)?;
+                }
+                options.set_item("logical_position", &update.logical_position)?;
+                options.set_item("sampling_position", &update.sampling_position)?;
+                options.set_item(
+                    "penalty_bases",
+                    (update.penalty_base.as_ref().map(|value| value.bind(py)),),
+                )?;
+                state.call_method("apply_tokens", ((slot,),), Some(&options))?;
+            }
+        }
+        for (slot, update) in &updates {
+            if let Some(logits) = &update.prompt_logits {
+                state.call_method1("set_prompt_logits", (slot, logits))?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn discard_batch(&self, py: Python<'_>, batch: &BatchState) -> PyResult<()> {

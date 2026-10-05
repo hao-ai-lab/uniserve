@@ -1,11 +1,15 @@
-//! Generated media stays owned until its result is handed to the receiver.
+//! Tensor and media results stay owned until delivery or abandonment.
 
 use uniserve_core::{CallId, MediaSource, RequestId, SharedMedia};
 use uniserve_worker::{BatchResult, PendingOutput, RequestProgress};
-use uniserve_worker_ipc::{BatchOutput, Call, CallKind, MediaCall, RequestKey};
+use uniserve_worker_ipc::{
+    BatchOutput, Call, CallKind, DType, Locator, MAX_TRANSFER_HANDLE_BYTES, MediaCall, RequestKey,
+    ShapeBound, TensorExport, TensorRef, TensorTransfer, TransferHandle, TransferTransport,
+    WorkerInfo,
+};
 
-fn pending() -> uniserve_worker::Result<PendingOutput> {
-    let call = Call {
+fn call() -> Call {
+    Call {
         request_key: RequestKey::new(1, RequestId(7), 1),
         call_id: CallId::new(1, 0),
         coordinates: Default::default(),
@@ -35,8 +39,72 @@ fn pending() -> uniserve_worker::Result<PendingOutput> {
         input_image: None,
         kv_input: None,
         kv_output: None,
+    }
+}
+
+fn pending() -> uniserve_worker::Result<PendingOutput> {
+    PendingOutput::new(&call(), RequestProgress::default(), 0)
+}
+
+#[test]
+fn rejected_tensor_results_preserve_the_accepted_exports() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut call = call();
+    let reference = TensorRef {
+        request_key: call.request_key,
+        producer_call_id: call.call_id,
+        output_index: 0,
+        generation: 1,
+        dtype: DType::U8,
+        shape_bound: ShapeBound::default(),
     };
-    PendingOutput::new(&call, RequestProgress::default(), 0)
+    call.outputs.push(reference.clone());
+    let mut output = PendingOutput::new(&call, RequestProgress::default(), 0)?;
+    let export = TensorExport {
+        product: reference,
+        value: TransferHandle::DeviceProduct {
+            height: 0,
+            width: 0,
+            value_range: String::new(),
+            tensor: TensorTransfer {
+                shape: vec![1],
+                locations: vec![Locator {
+                    source: WorkerInfo::default().endpoint,
+                    transport: TransferTransport::Channel {
+                        endpoint: "reader".into(),
+                        payload: vec![7],
+                    },
+                    nbytes: 1,
+                    dtype: "uint8".into(),
+                    shape: vec![1],
+                    offset: vec![0],
+                    device: "cpu".into(),
+                }],
+            },
+        },
+    };
+    output.set_products(vec![export.clone()])?;
+
+    let mut undeclared = export.clone();
+    undeclared.product.output_index = 1;
+    assert!(
+        output
+            .set_products(vec![export.clone(), undeclared])
+            .is_err()
+    );
+    assert_eq!(output.products(), std::slice::from_ref(&export));
+
+    // Locator metadata has a separate budget from the transported bytes.
+    let mut oversized = export.clone();
+    let tensor = &mut oversized.value.tensors_mut()[0];
+    let location = &mut tensor.locations[0];
+    location.transport = TransferTransport::Channel {
+        endpoint: "r".repeat(MAX_TRANSFER_HANDLE_BYTES + 1),
+        payload: vec![7],
+    };
+    assert!(output.set_products(vec![oversized]).is_err());
+    assert_eq!(output.products(), &[export]);
+    Ok(())
 }
 
 #[test]

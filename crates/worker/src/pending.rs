@@ -3,7 +3,7 @@
 use uniserve_core::{CallId, MediaSource};
 use uniserve_worker_ipc::{
     ArtifactHandle, BatchOutput, Call, CallKind, CallStatus, ErrorCode, MAX_TRANSFER_HANDLE_BYTES,
-    MediaOutput, RequestKey, RequestOutput, TimingCounters,
+    MediaOutput, RequestKey, RequestOutput, TensorExport, TensorRef, TimingCounters,
 };
 
 use crate::{Error, LatentUpdate, OutputBuffer, RequestPool, RequestProgress, Result};
@@ -44,6 +44,8 @@ pub struct PendingOutput {
     pub candidate_range: Option<(usize, usize)>,
     /// Element offset and length of [step outcome | canvas token ids].
     pub canvas_range: Option<(usize, usize)>,
+    tensor_outputs: Vec<TensorRef>,
+    products: Vec<TensorExport>,
     speculation: Option<Speculation>,
     media: Option<MediaSource>,
     resolved: bool,
@@ -60,8 +62,9 @@ impl PendingOutput {
             ..previous
         };
         let mut output = request_output(call.request_key, call.call_id, call.code, progress)?;
-        output.product_generations = call
-            .tensor_outputs()
+        let tensor_outputs: Vec<_> = call.tensor_outputs().cloned().collect();
+        output.product_generations = tensor_outputs
+            .iter()
             .map(|output| output.generation)
             .collect();
 
@@ -75,6 +78,8 @@ impl PendingOutput {
             prompt_logprob_ranges: Vec::new(),
             candidate_range: None,
             canvas_range: None,
+            tensor_outputs,
+            products: Vec::new(),
             speculation: None,
             media: None,
             resolved: false,
@@ -83,6 +88,30 @@ impl PendingOutput {
 
     pub fn resolved(&self) -> bool {
         self.resolved
+    }
+
+    /// Accept exported tensors from numerical work or a completed host task.
+    /// Failed replacement leaves the preceding results intact.
+    pub fn set_products(&mut self, products: Vec<TensorExport>) -> Result<()> {
+        for product in &products {
+            if !self.tensor_outputs.contains(&product.product) {
+                return Err(Error::Invalid(
+                    "completion carries a product not declared by its call".into(),
+                ));
+            }
+            if product.value.encoded_size_bound() > MAX_TRANSFER_HANDLE_BYTES {
+                return Err(Error::Invalid(
+                    "transfer metadata exceeds its byte bound".into(),
+                ));
+            }
+        }
+        self.products = products;
+        Ok(())
+    }
+
+    /// Export metadata stays with its call until batch result assembly.
+    pub fn products(&self) -> &[TensorExport] {
+        &self.products
     }
 
     pub fn result(&self) -> Result<&RequestOutput> {

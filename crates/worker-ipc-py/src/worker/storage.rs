@@ -114,7 +114,7 @@ impl Buffer {
     }
 
     #[getter]
-    fn tensor(&self, py: Python<'_>) -> Py<PyAny> {
+    pub(super) fn tensor(&self, py: Python<'_>) -> Py<PyAny> {
         lock(py, &self.views).tensor.clone_ref(py)
     }
 
@@ -145,7 +145,7 @@ impl Buffer {
     }
 
     #[getter]
-    fn producer_recorded(&self, py: Python<'_>) -> bool {
+    pub(super) fn producer_recorded(&self, py: Python<'_>) -> bool {
         lock(py, &self.inner).state.produced()
     }
 
@@ -922,7 +922,7 @@ impl TensorStore {
     }
 
     #[pyo3(signature = (writes, values, *, producer_event=None))]
-    fn write_scalars<'py>(
+    pub(super) fn write_scalars<'py>(
         &self,
         py: Python<'py>,
         writes: Vec<Bound<'py, Buffer>>,

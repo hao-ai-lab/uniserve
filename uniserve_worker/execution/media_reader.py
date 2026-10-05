@@ -214,10 +214,6 @@ def execute(
     )
 
     def publish(results: tuple[object, ...]) -> None:
-        from uniserve_worker.execution.commit import (
-            _validate_completion_products,
-        )
-
         published = tuple(
             transfer.export_deferred_product(
                 output,
@@ -229,12 +225,7 @@ def execute(
             )
             for output, write in products.values()
         )
-        _validate_completion_products(call, published)
-        # The batch recorded its products when the call committed, before
-        # the media was read; these join the batch's result now.
-        request.products = published
-        state.products = (*state.products, *published)
+        request.set_products(published)
 
     request.set_host_tasks((task,), finish=publish)
-    request.products = ()
     return request

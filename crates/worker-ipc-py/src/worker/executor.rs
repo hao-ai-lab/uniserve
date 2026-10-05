@@ -68,6 +68,7 @@ struct PythonBackend {
     tensors: Py<TensorStore>,
     output_pool: Py<OutputPool>,
     host_tasks: Py<HostLane>,
+    decode_state: Option<Py<PyAny>>,
     sampling_columns: usize,
     latents: Option<Py<LatentPool>>,
     cache: Option<Py<KVCacheManager>>,
@@ -515,6 +516,7 @@ impl Executor {
             tensors: worker.getattr("tensor_store")?.extract()?,
             output_pool: worker.getattr("output_pool")?.extract()?,
             host_tasks: worker.getattr("host_tasks")?.extract()?,
+            decode_state: worker.getattr("decode_state")?.extract()?,
             sampling_columns: py
                 .import("uniserve_worker.sampling.result")?
                 .getattr("SAMPLING_COMPLETION_FIELDS")?
@@ -652,6 +654,7 @@ impl Executor {
             visit.call(&executor.backend().tensors)?;
             visit.call(&executor.backend().output_pool)?;
             visit.call(&executor.backend().host_tasks)?;
+            visit.call(&executor.backend().decode_state)?;
             visit.call(&executor.backend().latents)?;
             visit.call(&executor.backend().cache)?;
             visit.call(&executor.backend().cache_imports)?;

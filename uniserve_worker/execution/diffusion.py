@@ -257,7 +257,7 @@ def prepare_latent(
         state=state,
     )
     request.set_cache_length(cache[1])
-    request.products = products
+    request.set_products(products)
     return request
 
 
@@ -576,7 +576,7 @@ def finish(
     )
     kv = kv_conditioning(trajectory)
     request.set_cache_length(kv.cache[1])
-    request.products = products
+    request.set_products(products)
 
     # Branch prefixes live in pool slots separate from the request's own KV;
     # they are retired once the trajectory has written its final step.
