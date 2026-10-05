@@ -504,15 +504,20 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> KVCacheManager<C> {
 }
 
 fn ranges(spans: &[(u32, u32, u32)]) -> Ranges {
-    spans
-        .iter()
-        .map(|&(unit, offset, count)| {
-            (
-                unit,
-                u64::from(offset)..u64::from(offset) + u64::from(count),
-            )
-        })
-        .collect()
+    let mut ranges = Ranges::new();
+    for &(unit, offset, count) in spans {
+        let start = u64::from(offset);
+        let end = start + u64::from(count);
+        ranges
+            .entry(unit)
+            .and_modify(|range| {
+                range.start = range.start.min(start);
+                range.end = range.end.max(end);
+            })
+            .or_insert(start..end);
+    }
+
+    ranges
 }
 
 fn overlaps(ranges: &Ranges, spans: &[(u32, u32, u32)]) -> bool {
@@ -729,7 +734,7 @@ mod tests {
         let mut cache = KVCacheManager::default();
         let first = buffer(1);
         let fence = Fence::default();
-        cache.reserve_import(first, &[(2, 1, 4)], Arc::clone(&fence))?;
+        cache.reserve_import(first, &[(2, 1, 2), (2, 3, 2)], Arc::clone(&fence))?;
         assert!(
             cache
                 .reserve_import(first, &[(3, 0, 8)], Fence::default())
@@ -741,7 +746,7 @@ mod tests {
                 .is_err()
         );
         cache.require_writable(&[(2, 0, 1), (2, 5, 3)])?;
-        assert!(cache.require_writable(&[(2, 1, 4)]).is_err());
+        assert!(cache.require_writable(&[(2, 1, 1)]).is_err());
 
         cache.release_exports(&[first]);
         assert!(!cache.retirement_ready(&HashSet::from([first]), &HashSet::new(), &HashSet::new()));

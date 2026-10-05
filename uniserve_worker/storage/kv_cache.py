@@ -1,4 +1,4 @@
-"""KV backing tensors, numerical views, transfers, and block-table staging.
+"""KV backing tensors, numerical views, transfers, and block-table binding.
 
 The engine scheduler assigns physical units. Native KVCacheManager retains
 their token intervals through model execution, exports and imports, and
@@ -740,46 +740,6 @@ class KVCacheManager:
             self.block_tables.table(request_pool_idx, group)
         return export
 
-    def _validate_install(self, export: KvTransfer) -> None:
-        """Check lineage and every group's transfer shape before access.
-
-        A first installation into ``(request, destination)`` has no base and
-        a zero base extent; a later one must name the currently installed
-        base and extent. An export carrying tensors must carry one entry
-        per group, each ``[tokens, group layers, KV heads, head dim]`` over
-        this worker's transfer axes and starting where this worker's group
-        needs it.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when either check fails.
-        """
-        self._manager.validate_install(export)
-        if not export.groups:
-            return
-        if len(export.groups) != len(self.shapes):
-            raise invalid_descriptor(
-                "KV transfer groups do not match destination groups"
-            )
-        for group, value in enumerate(export.groups):
-            advertised = self.info.groups[group]
-            expected_start = self._export_start(
-                group, export.base_extent, export.exported_extent
-            )
-            carried = export.exported_extent - value.start
-            if value.start != expected_start or (
-                value.tensors
-                and value.tensors[0].shape
-                != (
-                    carried,
-                    self.axes[group].total,
-                    advertised.total_kv_heads,
-                    advertised.head_dim,
-                )
-            ):
-                raise invalid_descriptor(
-                    "KV transfer shape does not match destination layers"
-                )
-
     def prepare_install(
         self,
         export: KvTransfer,
@@ -798,70 +758,17 @@ class KVCacheManager:
         once complete.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when lineage, shape, units or
+            WorkerError: ``invalid_descriptor`` when the base, shape, units or
                 capacity are invalid, imports are closed, or the export
                 source already has a registered import; a resource error
                 when a destination interval is still retained or the import
                 lane is closed or has no capacity.
         """
-        self._validate_install(export)
-        if len(tables) != len(self.shapes):
-            raise invalid_descriptor(
-                "KV import requires a destination table per group"
-            )
-        initialized = self.validate_units(initialized_units)
-        held = set()
-        for table in tables:
-            held.update(self.validate_units(table.units))
-            if (
-                table.allocated_tokens < export.exported_extent
-                or table.start_page * table.shape.page_tokens
-                > export.exported_extent
-            ):
-                raise invalid_descriptor(
-                    "KV import exceeds its scheduler block table"
-                )
-        if not set(initialized).issubset(held):
-            raise invalid_descriptor(
-                "KV import resets units outside its block tables"
-            )
-
-        if export.base_extent:
-            # Units of the pages that hold the installed base must stay
-            # identical and must not be reset by this import.
-            for group, table in enumerate(tables):
-                installed = self.block_tables.table(request_pool_idx, group)
-                page_tokens = table.shape.page_tokens
-                first = max(table.start_page, installed.start_page)
-                last = min(
-                    -(-export.base_extent // page_tokens),
-                    table.end_page,
-                    installed.end_page,
-                )
-                per_page = table.shape.units_per_page
-                for page in range(first, last):
-                    new = table.units[
-                        (page - table.start_page) * per_page : (
-                            page - table.start_page + 1
-                        )
-                        * per_page
-                    ]
-                    old = installed.units[
-                        (page - installed.start_page) * per_page : (
-                            page - installed.start_page + 1
-                        )
-                        * per_page
-                    ]
-                    if new != old or set(new).intersection(initialized):
-                        raise invalid_descriptor(
-                            "KV import would replace its installed base units"
-                        )
-
         return self.imports.reserve(
             export,
             request_pool_idx=request_pool_idx,
             tables=tuple(tables),
-            initialized_units=initialized,
+            initialized_units=initialized_units,
             transports=transports,
         )
 
@@ -874,36 +781,19 @@ class KVCacheManager:
         """Adopt a completed physical import under its source and base.
 
         The request's block tables must be unchanged since
-        ``prepare_install``. The slot's verified length becomes the published
+        ``prepare_install``. The slot's verified length becomes the imported
         extent; the returned ``KvTransfer`` becomes resident when the batch
         commits (``apply_exports``).
 
         Raises:
             RuntimeError: When the import has not completed.
-            WorkerError: ``invalid_descriptor`` when identities, lineage or
+            WorkerError: ``invalid_descriptor`` when the source, base or
                 the block tables disagree, or the import was abandoned.
             Exception: The import's own failure, re-raised.
         """
+        self.imports.adopt(write, installed_buffer)
         export = write.export
-        if installed_buffer.owner != export.source.owner:
-            raise invalid_descriptor("installed KV buffer identity is invalid")
-
-        self._validate_install(export)
         request_pool_idx = write.request_pool_idx
-        if (
-            tuple(
-                self.block_tables.table(request_pool_idx, group)
-                for group in range(len(self.shapes))
-            )
-            != write.tables
-            or self.block_tables.allocated_length(request_pool_idx)
-            < export.exported_extent
-        ):
-            raise invalid_descriptor(
-                "KV installation scheduler block table changed"
-            )
-
-        self.imports.adopt(write)
         self.block_tables.set_verified(
             torch.tensor(
                 (request_pool_idx,), device=self.block_tables.unit_tables.device
