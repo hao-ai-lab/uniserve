@@ -247,7 +247,7 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
         are layouts (see ``layout_size``) and ``inputs.latents`` carry the
         samples. ``state`` names the device fields ``prepare_state`` fills for
         the request being advanced, which a captured step reads through fixed
-        staging rather than at the request's own addresses; storage a request
+        buffers rather than at the request's own addresses; storage a request
         draws on the host, as ``prepare_latents`` receives, is the
         preparation's and is absent here.
         """

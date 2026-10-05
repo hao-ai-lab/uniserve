@@ -1,4 +1,4 @@
-"""Device staging of attention columns for multi-token request rows.
+"""Gather attention columns for multi-token request rows on device.
 
 One Triton launch fills, for every numerical block table, the staged units,
 first staged pages and per-token cache write addresses of a call's rows from
@@ -259,7 +259,7 @@ def gather_request_rows(
     )
     device = columns.device
     if any(value.device != device for value in tensors):
-        raise ValueError("request row staging requires one device")
+        raise ValueError("request row preparation requires one device")
 
     count, token_count = int(rows), int(tokens)
     tables = int(request_unit_tables.shape[0])
@@ -276,7 +276,7 @@ def gather_request_rows(
             int(block_tables.shape[1]), tables, int(write_indices.shape[1])
         )
     ):
-        raise ValueError("request row staging exceeds its column capacity")
+        raise ValueError("request rows exceed their buffer capacity")
 
     if triton is None or device.type != "cuda" or not launchable(device):
         _gather_rows(

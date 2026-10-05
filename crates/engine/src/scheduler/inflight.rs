@@ -52,7 +52,7 @@ pub(super) struct PendingCompletion {
     pub(super) record: uniserve_worker_ipc::RequestOutput,
     /// Claimed media storage stays alive while its result waits or is discarded.
     pub(super) media: Option<Arc<SharedMedia>>,
-    /// Engine-wide staging order (`Inflight::next_arrival`), used to order
+    /// Engine-wide arrival order (`Inflight::next_arrival`), used to order
     /// ready completions of equal priority.
     pub(super) arrival_seq: u64,
 }
@@ -102,7 +102,7 @@ pub(super) struct Inflight {
     /// Last issued batch id; ids start at 1, so a call id with batch zero has
     /// not been assigned to a batch.
     pub(super) batch_id: u64,
-    /// Next staging sequence number, issued by `next_arrival`.
+    /// Next arrival sequence number, issued by `next_arrival`.
     pub(super) next_arrival_seq: u64,
     /// Submitted calls per request, in submission order.
     pub(super) pending_calls: HashMap<RequestId, VecDeque<InflightCall>>,

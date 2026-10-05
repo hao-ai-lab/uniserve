@@ -427,7 +427,7 @@ def _latents(factory, *, device):
         latent_width=1,
         dtype=pages.dtype,
         device=device,
-        staging=False,
+        with_workspace=False,
     )
 
 

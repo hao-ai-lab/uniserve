@@ -1,4 +1,4 @@
-"""A hybrid model's K/V export, installation and attention staging.
+"""A hybrid model's K/V export, installation and attention inputs.
 
 The fixture model has a windowed group (window 8, 16-token pages of five
 units) and a full-attention group (32-token pages of one unit) in one unit
@@ -184,7 +184,7 @@ def _buffers(device, planes, *, rows, tokens):
     )
 
 
-def test_staging_builds_one_entry_per_table_from_each_row_start():
+def test_attention_inputs_build_one_entry_per_table_from_each_row_start():
     model = hybrid_model(window=WINDOW)
     pool = hybrid_pool(model, _config("cpu"), num_units=32)
     buffers = _buffers(
@@ -236,7 +236,7 @@ def test_staging_builds_one_entry_per_table_from_each_row_start():
 
 
 @pytest.mark.gpu
-def test_indexed_decode_gathers_every_table_in_one_staging():
+def test_indexed_decode_gathers_every_table_in_one_batch():
     device = "cuda:0"
     model = hybrid_model(window=WINDOW)
     config = _config(device)

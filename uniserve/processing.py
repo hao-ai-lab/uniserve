@@ -351,18 +351,18 @@ class TowerTransform:
 
 @dataclass(frozen=True, slots=True)
 class ImageProcessor:
-    """Defines ViT and VAE transforms, staging dtype, and language-sequence feature injection.
+    """Defines ViT and VAE transforms, output dtype, and language-sequence feature injection.
 
     ``alpha`` sets how a decoded image with transparency becomes RGB before
     either transform: ``"white"`` composites it over an opaque white
     background, and ``"drop"`` discards the alpha channel and keeps every
     pixel's stored color, as PIL's ``convert("RGB")`` does. A
-    ``staging_dtype`` of None stages the FP32 transform output.
+    ``output_dtype`` of None preserves the FP32 transform output.
     """  # noqa: E501
 
     vit: PatchTransform | TowerTransform | None = None
     vae: TowerTransform | None = None
-    staging_dtype: torch.dtype | None = None
+    output_dtype: torch.dtype | None = None
     feature_injection: FeatureInjection | None = None
     alpha: Literal["white", "drop"] = "white"
 

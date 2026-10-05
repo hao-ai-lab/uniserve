@@ -1,7 +1,7 @@
 """Size the fixed physical storage of one worker process.
 
 Worker startup bounds each fixed storage owner of a worker process: text
-input staging (``input_buffer_config``), the request pool
+input buffers (``input_buffer_config``), the request pool
 (``resolve_request_capacity``), the paged KV pool
 (``derive_runtime_kv_capacity``), the latent pool (``latent_pool_plan``), and
 the product, relay, transfer and host-lane bounds ``ArenaCapacity`` collects.
@@ -101,7 +101,7 @@ def input_buffer_config(
     *,
     processor: ImageProcessor | None = None,
 ) -> TokenBufferConfig:
-    """Size text input staging for one call on this worker.
+    """Size text input buffers for one call on this worker.
 
     Rows are bounded by the request pool and by the worker's and every lane's
     call bound; with an image denoiser, the row bound is multiplied by the
@@ -117,7 +117,7 @@ def input_buffer_config(
     """
     text = capability(model, CausalLM)
     if text is None:
-        raise ValueError("text input staging requires a causal language model")
+        raise ValueError("text input buffers require a causal language model")
 
     max_rows = min(
         config.max_request_pool_size,
@@ -419,7 +419,7 @@ def latent_pool_capacity_bytes(
     page_units: int,
     latent_width: int,
     dtype_bytes: int,
-    staging: bool = True,
+    with_workspace: bool = True,
 ) -> int:
     """Calculate double-buffered latent pool storage.
 
@@ -447,7 +447,9 @@ def latent_pool_capacity_bytes(
     # usable page; one float32 timestep per one-based slot plus an unused
     # row zero.
     storage = 2 * pages * units * width * element_bytes
-    step_buffer = usable_pages * units * width * element_bytes if staging else 0
+    step_buffer = (
+        usable_pages * units * width * element_bytes if with_workspace else 0
+    )
     page_table = usable_pages * 8
     timesteps = (slots + 1) * 4
     return storage + step_buffer + page_table + timesteps
@@ -470,7 +472,7 @@ class LatentPoolPlan:
     page_units: int
     latent_width: int
     dtype: torch.dtype
-    staging: bool
+    with_workspace: bool
 
     @property
     def capacity_bytes(self) -> int:
@@ -481,7 +483,7 @@ class LatentPoolPlan:
             page_units=self.page_units,
             latent_width=self.latent_width,
             dtype_bytes=self.dtype.itemsize,
-            staging=self.staging,
+            with_workspace=self.with_workspace,
         )
 
 
@@ -531,7 +533,7 @@ def latent_pool_plan(
             latent_width=flow.denoiser.latent_channels
             * flow.denoiser.patch_size**2,
             dtype=dtype,
-            staging=True,
+            with_workspace=True,
         )
 
     builder = media_builder(model, worker_config)
@@ -544,7 +546,7 @@ def latent_pool_plan(
         page_units=pages.page_units,
         latent_width=1,
         dtype=pages.dtype,
-        staging=False,
+        with_workspace=False,
     )
 
 

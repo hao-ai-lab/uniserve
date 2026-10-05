@@ -697,7 +697,7 @@ mod tests {
 
     /// SenseNova input images share one pixel budget per request, so an
     /// image's KV tokens depend on how many input images the request
-    /// carries. The cases are shared with the worker's image staging test.
+    /// carries. The cases are shared with the worker's image preparation test.
     #[tokio::test]
     async fn sensenova_image_tokens_share_the_request_pixel_budget() {
         #[derive(serde::Deserialize)]
@@ -740,7 +740,7 @@ mod tests {
 
     /// Bagel KV-token predictions equal the worker's resize for images whose
     /// resize scale is not one. The cases are shared with the worker's image
-    /// staging test, so both sides are checked against the same numbers.
+    /// preparation test, so both sides are checked against the same numbers.
     #[tokio::test]
     async fn bagel_image_tokens_follow_the_worker_resize() {
         #[derive(serde::Deserialize)]

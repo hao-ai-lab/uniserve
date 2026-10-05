@@ -234,7 +234,7 @@ def prepare_sampling(
 
     A prefill commits every query token and, with a ``DecodeState``, stages
     the resulting runtime cache length; a decode commits one token without
-    staging it; a verify commits nothing here.
+    preparing it; a verify commits nothing here.
     Returns a finished ``PendingOutput`` when a prefill declares no token
     output or a visual call samples nothing. Otherwise returns
     ``SamplingMetadata`` positioned after the tokens the call computed; a
@@ -1195,8 +1195,8 @@ def commit_kv(
 
     Raises:
         RuntimeError: When the count or extent is out of range, there are no
-            page tables, or, when staging, the row belongs to another request
-            slot.
+            page tables, or, when preparing inputs, the row belongs to another
+            request slot.
     """
     count = int(tokens)
     if count < 0 or count > task.query_tokens:

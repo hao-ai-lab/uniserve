@@ -37,7 +37,7 @@ def image_processor(config: Config) -> ImageProcessor:
                 max_total_pixels=4096 * 4096,
             ),
         ),
-        staging_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
         feature_injection=FeatureInjection(
             layout=FeatureLayout.DIRECT,
             positions=PositionLayout.TEMPORAL_SPATIAL,

@@ -150,7 +150,7 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
       return cudaErrorInvalidValue;
   }
   // Mirrors the carve-up at the top of fmha_context_bf16_gen_kernel: two Q
-  // tiles, the K/V ring, two BF16 O staging tiles, the K/V ring mbarriers plus
+  // tiles, the K/V ring, two BF16 O buffer tiles, the K/V ring mbarriers plus
   // 22 pipeline mbarriers, the CLC barriers and responses with 16 bytes of
   // response alignment, the TMEM address slot, the softmax statistics and 256
   // spare bytes. Adding a barrier or buffer to the kernel without updating

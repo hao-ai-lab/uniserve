@@ -124,7 +124,7 @@ class MediaBuilder:
 
     The samples a solver step rewrites live in the worker's latent pool (see
     ``sample_pages``); the request's slot holds only state written once: the
-    denoiser's tables, the retained conditioning and the host staging.
+    denoiser's tables, the retained conditioning and the host buffers.
     """
 
     def __init__(
@@ -603,7 +603,7 @@ class MediaBuilder:
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """Fill sample sources from the drawn noise.
 
-        Returns destination/source pairs for staging: each modality's source
+        Returns destination/source pairs for copying: each modality's source
         into its device view in ``samples``, and every table's source into
         the slot. ``layout`` is the layout the request evaluates in,
         ``layout(size)`` by default.

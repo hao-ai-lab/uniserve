@@ -16,7 +16,7 @@ def gather_chunks(
 ) -> Iterator[tuple[slice, torch.Tensor]]:
     """Expose complete local rows, then ready remote intervals in logical order.
 
-    All source staging precedes asynchronous gathers. Consumers may enqueue
+    All source copies precede asynchronous gathers. Consumers may enqueue
     numerical work between yields while subsequent transfers make progress.
     Workspace is caller-owned and remains live until iterator exhaustion.
     """

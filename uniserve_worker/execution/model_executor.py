@@ -2,7 +2,7 @@
 
 ``ModelExecutor`` binds a loaded model's components to this rank, discovers
 their capabilities, and owns everything that executes them: CUDA streams
-(execution lanes and their forks), input staging, and prepared execution
+(execution lanes and their forks), input buffers, and prepared execution
 contexts and captured graphs, whose allocations its ``GraphStorage``
 accounts against per-device budgets. It keeps three kinds of runner:
 
@@ -1278,7 +1278,7 @@ class ModelExecutor:
         """
         from uniserve_worker.model_executor.canvas_runner import (
             CanvasRunner,
-            canvas_staging_rows,
+            canvas_buffer_rows,
         )
         from uniserve_worker.model_executor.text_runner import TextRunner
 
@@ -1302,7 +1302,7 @@ class ModelExecutor:
         # A decode or prefill row, and the request of every canvas a call
         # reads, holds at least one page of every cache group, so the pool's
         # allocatable units bound the rows of each call. A prefill call holds
-        # at most the text tokens its staging accepts, the batch token budget
+        # at most the text tokens its input buffers hold, the batch token budget
         # plus one image's feature span, and at most the tokens the pool's
         # units cover.
         max_rows = min(max_calls, request_slots)
@@ -1442,8 +1442,8 @@ class ModelExecutor:
                 )
                 # A prefill bucket includes a padding sequence beyond admitted
                 # requests, and a canvas readout bucket padding sequences
-                # (``canvas_runner.canvas_staging_rows``). They consume
-                # staging, but no scheduler request slot.
+                # (``canvas_runner.canvas_buffer_rows``). They consume
+                # input buffers, but no scheduler request slot.
                 fields = (
                     replace(
                         input_config,
@@ -1455,7 +1455,7 @@ class ModelExecutor:
                     if prefill
                     else replace(
                         input_config,
-                        max_rows=canvas_staging_rows(input_config.max_rows),
+                        max_rows=canvas_buffer_rows(input_config.max_rows),
                     )
                     if ForwardMode.TOKEN_DENOISING in kinds
                     and target.type == "cuda"
@@ -1491,8 +1491,8 @@ class ModelExecutor:
                             call.module,
                             (CausalLM, ImageDenoiser, TokenDenoiser),
                         )
-                        # Staging supplies every host sequence length and
-                        # start page, so attention planning never copies
+                        # Input preparation supplies every host sequence length
+                        # and start page, so attention planning never copies
                         # them from the device while serving.
                         context = ExecutionContext(
                             call.module,
@@ -1506,9 +1506,9 @@ class ModelExecutor:
                             else None,
                             weights=self.expert_weights,
                         )
-                        # Text staging counts canonical tokens. Spatial codecs
-                        # and vision towers expand those into different query
-                        # domains, so their layer plans use the actual numerical
+                        # Text input capacity counts canonical tokens. Spatial
+                        # codecs and vision towers expand those into different
+                        # query domains, so layer plans use the actual numerical
                         # shapes encountered during preparation/eager execution.
                         size = (
                             TextSize(fields.max_tokens, fields.max_rows)
@@ -1697,7 +1697,7 @@ class ModelExecutor:
                 "an expert-parallel worker runs its forwards on one lane"
             )
         if self.attention_ranks:
-            # The source's numerical staging includes graph padding and
+            # The source's numerical buffers include graph padding and
             # multimodal rows, which expert-only ranks do not allocate.
             # Borrow that bound before allocating collective workspaces.
             capacity = torch.tensor(max_tokens, dtype=torch.int64)
@@ -2385,7 +2385,7 @@ class ModelExecutor:
                         stats=replace(result.stats, component_us=components),
                     )
 
-                # A later call may replay the same graph or reuse its staging.
+                # A later call may replay the same graph or reuse its buffer.
                 # Preserve these numerical values until their consumer runs.
                 if any(
                     bindings[later[0]] is bindings[indexes[0]]
@@ -2414,8 +2414,8 @@ class ModelExecutor:
         output with its request slot indices, its lane output fence, and
         statistics for this one call. Raises ``RuntimeError`` once closed,
         ``ValueError`` for an empty or mixed-kind group, ``InputError`` when
-        the group has no staged entry or staging fails, and the error
-        ``_execution_failure`` classifies when execution or validation fails.
+        the group has no prepared entry or input preparation fails, and the
+        error ``_execution_failure`` classifies for execution or validation.
         """
         if self._closed:
             raise RuntimeError("model runner is closed")
@@ -2452,7 +2452,7 @@ class ModelExecutor:
             raise InputError(
                 f"model runner has no {calls[0].kind.value!r} binding "
                 f"for {calls[0].component!r}",
-                phase="input_staging",
+                phase="input_preparation",
                 route=forward_mode.value,
                 calls=call_keys,
             )
@@ -2462,8 +2462,8 @@ class ModelExecutor:
         buffers = entry.input_buffers
         assert buffers is not None
 
-        # Staging copies and the forward itself belong to one stage on the
-        # timeline, so the range opens before input staging.
+        # Input copies and the forward itself belong to one stage on the
+        # timeline, so the range opens before input preparation.
         with profile_range(
             f"uniserve.model.forward rank={self.worker_config.rank} "
             f"work={calls[0].component}.{forward_mode.value}"
@@ -2510,7 +2510,7 @@ class ModelExecutor:
                         )
                     )
             except Exception as error:
-                # Join staging copies already submitted to the lane before
+                # Join input copies already submitted to the lane before
                 # reporting, as for execution failures below.
                 output_event = (
                     None if lane_runtime is None else lane_runtime.record()
@@ -2651,7 +2651,7 @@ def _input_failure(
         return error
     return InputError(
         str(error) or type(error).__name__,
-        phase="input_staging",
+        phase="input_preparation",
         route=forward_mode.value,
         calls=calls,
     )

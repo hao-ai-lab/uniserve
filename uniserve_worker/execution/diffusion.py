@@ -11,7 +11,7 @@ the call's declared interval. The solver update between steps runs in
 
 The solver sample lives in the worker's ``LatentPool``. Preparation writes
 the seeded noise to bank one of the request's pages; each denoising call
-gathers the committed bank into its staging and ``finish`` scatters the
+gathers the committed bank into its buffer and ``finish`` scatters the
 successor to the inactive bank. Neither becomes visible until the batch
 commit applies the ``LatentUpdate`` left on the call's ``PendingOutput``.
 Each guidance branch attends to a KV prefix tracked in the request's
@@ -137,7 +137,7 @@ def prepare_latent(
 
     Validates the call's conditioning export, flow-noise RNG coordinates
     and output generation, opens the request's ``DiffusionState``, draws the
-    seeded noise into the call's staging and writes it to bank one of the
+    seeded noise into the call's buffer and writes it to bank one of the
     request's ``LatentPool`` pages. The ``LatentUpdate`` that publishes it as
     ``output.generation`` at step zero is applied by the batch commit.
 
@@ -203,19 +203,19 @@ def prepare_latent(
             "media preparation latent has no logical generation"
         )
 
-    # Noise is generated directly into request-owned staging, then installed in
-    # the pool before its generation becomes visible to downstream calls.
+    # Noise is generated directly into the request-owned buffer, then installed
+    # in the pool before its generation becomes visible to downstream calls.
     row = state.pending_output(call.request_key.request_id)
     params = row.latent.input_params
-    staging = row.latent.staging
-    if params is None or staging is None:
+    buffer = row.latent.buffer
+    if params is None or buffer is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
     pool = latent_pool
-    # ``LatentPool.initialize`` writes the whole staging, so the page padding
+    # ``LatentPool.initialize`` writes the whole buffer, so the page padding
     # past ``latent_units`` is zeroed rather than left stale.
-    staging.value.zero_()
-    initial = staging.value[: int(params.latent_units)]
+    buffer.value.zero_()
+    initial = buffer.value[: int(params.latent_units)]
     trajectory = image_state(
         require_inputs(model_runner),
         media_image.Config(int(params.height), int(params.width)),
@@ -233,7 +233,7 @@ def prepare_latent(
     )
     pool.initialize(
         row.request.request_pool_idx,
-        staging,
+        buffer,
         latent_units=int(params.latent_units),
     )
 
@@ -274,7 +274,7 @@ def initialize(
 
     Validates the call's conditioning export and latent generations,
     gathers the committed bank at ``params.start_step`` into the call's
-    staging, and returns the request's ``DiffusionState``, reopening it when
+    buffer, and returns the request's ``DiffusionState``, reopening it when
     it is absent or has a different size. ``KVConditioning.cache`` is set
     from this call's descriptors and ``entries`` is cleared for
     ``prepare_step`` to fill again.
@@ -319,15 +319,15 @@ def initialize(
 
     row = state.pending_output(call.request_key.request_id)
     params = row.latent.input_params
-    staging = row.latent.staging
-    if params is None or staging is None:
+    buffer = row.latent.buffer
+    if params is None or buffer is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
     pool = latent_pool
     start_step = int(params.start_step)
     pool.gather_current(
         row.request.request_pool_idx,
-        staging,
+        buffer,
         step=start_step,
         generation=int(latent_input.generation),
         latent_units=int(params.latent_units),
@@ -391,8 +391,8 @@ def prepare_step(
     builder = require_inputs(model_runner)
     row = state.pending_output(call.request_key.request_id)
     params = row.latent.input_params
-    staging = row.latent.staging
-    if params is None or staging is None:
+    buffer = row.latent.buffer
+    if params is None or buffer is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
     schedule = trajectory.schedules["image"]
@@ -531,8 +531,8 @@ def finish(
     request = state.pending_output(call.request_key.request_id)
     row = state.pending_output(call.request_key.request_id)
     params = row.latent.input_params
-    staging = row.latent.staging
-    if params is None or staging is None:
+    buffer = row.latent.buffer
+    if params is None or buffer is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
     latent_input, latent_output = (
@@ -550,7 +550,7 @@ def finish(
     final_step = start_step + int(params.step_count)
     latent_pool.write_inactive(
         row.request.request_pool_idx,
-        staging,
+        buffer,
         expected_step=start_step,
         expected_generation=int(latent_input.generation),
         latent_units=int(params.latent_units),

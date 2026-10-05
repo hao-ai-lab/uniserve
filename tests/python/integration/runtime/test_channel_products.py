@@ -75,7 +75,7 @@ def test_a_channel_export_leaves_its_producer_nothing_to_retire(
         locator = transport.export(torch.ones(256, dtype=torch.float32))
 
         assert transport.retirement(locator).done()
-        # Capacity is the staging buffer, not the product, so publishing again
+        # Capacity is the buffer, not the product, so publishing again
         # does not need the first export to be released.
         assert transport.export(torch.ones(256, dtype=torch.float32))
     finally:

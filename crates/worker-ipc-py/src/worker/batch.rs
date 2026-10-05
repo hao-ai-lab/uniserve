@@ -396,7 +396,7 @@ impl BatchState {
         let views = if image_shape.is_some() {
             let mut occupied = Vec::new();
             for output in outputs {
-                let view = output.borrow(py).latent.bind(py).getattr("staging")?;
+                let view = output.borrow(py).latent.bind(py).getattr("buffer")?;
                 if !view.is_none() {
                     occupied.push(view.unbind());
                 }
@@ -416,7 +416,7 @@ impl BatchState {
                 .iter()
                 .map(|&(parameter, _, _)| i64::from(plan.latent_params[parameter].latent_units))
                 .collect();
-            Some(pool.borrow().stage(py, tables, units, occupied)?)
+            Some(pool.borrow().bind(py, tables, units, occupied)?)
         } else {
             None
         };
@@ -430,7 +430,7 @@ impl BatchState {
             if let Some(views) = &views {
                 latent
                     .bind(py)
-                    .setattr("staging", views.bind(py).get_item(row)?)?;
+                    .setattr("buffer", views.bind(py).get_item(row)?)?;
             }
         }
 

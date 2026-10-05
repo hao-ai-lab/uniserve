@@ -19,7 +19,7 @@ def host_lengths(batch, *, prepared=None, derive=True):
     Without ``prepared``, a missing mirror is read from its column. A CUDA
     column is read only with ``derive``, a synchronizing device-to-host copy
     that direct library callers may rely on; serving contexts pass False,
-    because their input staging supplies every mirror, and a missing CUDA
+    because their input buffers supply every mirror, and a missing CUDA
     mirror then raises ``ValueError`` instead of copying. Columns on the CPU
     are mirrored either way, since reading them transfers nothing.
     """

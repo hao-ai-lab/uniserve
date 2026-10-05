@@ -341,7 +341,7 @@ def materialization_latent(
     """Gather a completed latent trajectory for the image decoder.
 
     Returns the request's current latent, gathered from its ``LatentPool``
-    pages into the call's staging. The trajectory must be at the admitted
+    pages into the call's buffer. The trajectory must be at the admitted
     image's final step.
     """
     request = state.pending_output(call.request_key.request_id)
@@ -362,8 +362,8 @@ def materialization_latent(
 
     row = state.pending_output(call.request_key.request_id)
     params = row.latent.input_params
-    staging = row.latent.staging
-    if params is None or staging is None:
+    buffer = row.latent.buffer
+    if params is None or buffer is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
     if int(params.start_step) != int(image_params.steps):
         raise invalid_descriptor(
@@ -372,7 +372,7 @@ def materialization_latent(
 
     current = latent_pool.gather_current(
         row.request.request_pool_idx,
-        staging,
+        buffer,
         step=int(params.start_step),
         generation=int(latent_input.generation),
         latent_units=int(params.latent_units),
@@ -399,8 +399,8 @@ def export_image(
     request = state.pending_output(call.request_key.request_id)
     row = state.pending_output(call.request_key.request_id)
     params = row.latent.input_params
-    staging = row.latent.staging
-    if params is None or staging is None:
+    buffer = row.latent.buffer
+    if params is None or buffer is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
     latent_input = call.latent_input
     if latent_input is None:
@@ -873,7 +873,7 @@ def defer_image_encoding(
     )
     if int(quantized.numel()) > max_bytes:
         raise invalid_descriptor(
-            "image staging exceeds its registered completion byte bound"
+            "image preparation exceeds its registered completion byte bound"
         )
 
     capture = state.output_buffer.capture_bytes(quantized)

@@ -134,7 +134,7 @@ def test_host_observer_can_read_results_and_submit_more_work():
         lane.close()
 
 
-def test_host_close_drains_staging_and_releases_the_gil():
+def test_host_close_drains_host_writes_and_releases_the_gil():
     lane = HostLane(1, 1)
     entered, release = Event(), Event()
     destination = torch.zeros(4)

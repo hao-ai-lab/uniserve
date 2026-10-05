@@ -1,4 +1,4 @@
-"""Device identity, storage accounting and host integer staging."""
+"""Device identity, storage accounting and host integer writes."""
 
 from __future__ import annotations
 
@@ -158,7 +158,7 @@ def fill_cpu_ints(cpu: torch.Tensor, values: Sequence[int]) -> None:
 def fill_cpu_bools(cpu: torch.Tensor, values: Sequence[bool]) -> None:
     """Bulk-fill a CPU boolean tensor from a Python boolean sequence."""
     if cpu.dtype is not torch.bool:
-        raise TypeError("boolean staging requires a torch.bool destination")
+        raise TypeError("boolean writes require a torch.bool destination")
 
     if len(values) == 0:
         return

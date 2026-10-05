@@ -309,7 +309,7 @@ class CausalBlockAttentionSm100(PrefixBlockAttentionSm100):
         p_layout = sm100_utils.make_smem_layout_a(
             pv_mma, self.pv_mma_tiler, dtype, self.s_stage
         )
-        # Output staging buffer: this CTA's rows of one 128-column chunk,
+        # Output buffer: this CTA's rows of one 128-column chunk,
         # row-major in 128-byte swizzle atoms.
         out_layout = sm100_utils.make_smem_layout_epi(
             self.o_dtype, utils.LayoutEnum.ROW_MAJOR, self.pv_block_tiler, 1

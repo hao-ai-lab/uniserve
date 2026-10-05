@@ -208,7 +208,7 @@ pub(crate) struct LatentPool {
 impl LatentPool {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, request_pool_size, num_pages, page_units, latent_width, dtype, device, staging=true))]
+    #[pyo3(signature = (*, request_pool_size, num_pages, page_units, latent_width, dtype, device, with_workspace=true))]
     fn new(
         py: Python<'_>,
         request_pool_size: usize,
@@ -217,7 +217,7 @@ impl LatentPool {
         latent_width: usize,
         dtype: Py<PyAny>,
         device: &Bound<'_, PyAny>,
-        staging: bool,
+        with_workspace: bool,
     ) -> PyResult<Self> {
         if latent_width < 1 {
             return Err(PyValueError::new_err(
@@ -239,7 +239,7 @@ impl LatentPool {
             latent_width,
             &dtype,
             &device,
-            staging,
+            with_workspace,
         ))?;
 
         Ok(Self {
@@ -299,7 +299,7 @@ impl LatentPool {
             .unbind())
     }
 
-    fn _startup_staging(&self, py: Python<'_>, rows: usize, units: i64) -> PyResult<Py<PyTuple>> {
+    fn _startup_buffers(&self, py: Python<'_>, rows: usize, units: i64) -> PyResult<Py<PyTuple>> {
         if !self.inner.idle() {
             return Err(PyRuntimeError::new_err(
                 "startup scratch requires an idle latent pool",
@@ -316,7 +316,7 @@ impl LatentPool {
                     .collect()
             })
             .collect();
-        let staged = self.stage(py, tables, vec![units; rows], Vec::new())?;
+        let staged = self.bind(py, tables, vec![units; rows], Vec::new())?;
         let views = staged
             .bind(py)
             .iter()
@@ -328,11 +328,11 @@ impl LatentPool {
         Ok(PyTuple::new(py, views)?.unbind())
     }
 
-    /// Borrow contiguous staging alongside every still-running call in
+    /// Borrow contiguous latent buffers alongside every still-running call in
     /// `occupied`. The caller retains those views through numerical completion;
     /// omitting a live view permits its scratch range to be overwritten.
     #[pyo3(signature = (page_tables, latent_units, *, occupied=Vec::new()))]
-    pub(super) fn stage(
+    pub(super) fn bind(
         &self,
         py: Python<'_>,
         page_tables: Vec<Vec<i64>>,
@@ -353,11 +353,11 @@ impl LatentPool {
             .collect::<PyResult<Vec<_>>>()?;
         let (tables, offset) = self
             .inner
-            .stage(&page_tables, &latent_units, &occupied)
+            .bind(&page_tables, &latent_units, &occupied)
             .map_err(|error| native_error(py, error))?;
 
         Ok(backend(py)?
-            .getattr("_stage")?
+            .getattr("_bind")?
             .call1((
                 tables,
                 offset,
@@ -372,22 +372,22 @@ impl LatentPool {
 
     /// Scatter the initial values into bank one. The prepared values become
     /// visible when the batch applies its trajectory update.
-    #[pyo3(signature = (request_pool_idx, staging, *, latent_units))]
+    #[pyo3(signature = (request_pool_idx, buffer, *, latent_units))]
     fn initialize(
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
-        staging: &Bound<'_, PyAny>,
+        buffer: &Bound<'_, PyAny>,
         latent_units: i64,
     ) -> PyResult<()> {
         self.inner.reap();
         let slot = self.slot(py, request_pool_idx)?;
-        let pages = self.staging_pages(py, staging, latent_units)?;
+        let pages = self.buffer_pages(py, buffer, latent_units)?;
         self.require_initial(py, slot, &pages)?;
 
         backend(py)?
             .getattr("_scatter")?
-            .call1((&self.storage, 1, staging))?;
+            .call1((&self.storage, 1, buffer))?;
         Ok(())
     }
 
@@ -478,12 +478,12 @@ impl LatentPool {
 
     /// Gather the requested committed trajectory, preserving page-table order.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (request_pool_idx, staging, *, step, generation, latent_units, height, width))]
+    #[pyo3(signature = (request_pool_idx, buffer, *, step, generation, latent_units, height, width))]
     fn gather_current(
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
-        staging: &Bound<'_, PyAny>,
+        buffer: &Bound<'_, PyAny>,
         step: i64,
         generation: i64,
         latent_units: i64,
@@ -492,7 +492,7 @@ impl LatentPool {
     ) -> PyResult<Py<PyAny>> {
         self.inner.reap();
         let slot = self.slot(py, request_pool_idx)?;
-        let pages = self.staging_pages(py, staging, latent_units)?;
+        let pages = self.buffer_pages(py, buffer, latent_units)?;
         let bank = self.current_bank(
             py,
             slot,
@@ -505,18 +505,18 @@ impl LatentPool {
         )?;
         Ok(backend(py)?
             .getattr("_gather")?
-            .call1((&self.storage, bank, staging, latent_units))?
+            .call1((&self.storage, bank, buffer, latent_units))?
             .unbind())
     }
 
     /// Write the hidden successor without changing the committed trajectory.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (request_pool_idx, staging, *, expected_step, expected_generation, latent_units, height, width))]
+    #[pyo3(signature = (request_pool_idx, buffer, *, expected_step, expected_generation, latent_units, height, width))]
     fn write_inactive(
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
-        staging: &Bound<'_, PyAny>,
+        buffer: &Bound<'_, PyAny>,
         expected_step: i64,
         expected_generation: i64,
         latent_units: i64,
@@ -525,7 +525,7 @@ impl LatentPool {
     ) -> PyResult<()> {
         self.inner.reap();
         let slot = self.slot(py, request_pool_idx)?;
-        let pages = self.staging_pages(py, staging, latent_units)?;
+        let pages = self.buffer_pages(py, buffer, latent_units)?;
         let bank = 1 - self.current_bank(
             py,
             slot,
@@ -539,7 +539,7 @@ impl LatentPool {
         self.require_writable(py, bank, &pages)?;
         backend(py)?
             .getattr("_scatter")?
-            .call1((&self.storage, bank, staging))?;
+            .call1((&self.storage, bank, buffer))?;
         Ok(())
     }
 
@@ -924,17 +924,17 @@ impl LatentPool {
             .map_err(|error| native_error(py, error))
     }
 
-    fn staging_pages(
+    fn buffer_pages(
         &self,
         py: Python<'_>,
-        staging: &Bound<'_, PyAny>,
+        buffer: &Bound<'_, PyAny>,
         units: i64,
     ) -> PyResult<Vec<usize>> {
-        let pages = staging.getattr("page_table")?.extract::<Vec<i64>>()?;
+        let pages = buffer.getattr("page_table")?.extract::<Vec<i64>>()?;
         let pages = self.validate_pages(py, &pages, units)?;
         backend(py)?
-            .getattr("_check_staging")?
-            .call1((staging, units, &self.storage))?;
+            .getattr("_check_buffer")?
+            .call1((buffer, units, &self.storage))?;
         Ok(pages)
     }
 

@@ -34,7 +34,7 @@ def image_processor() -> ImageProcessor:
                 max_size=512, min_size=16, stride=16, max_pixels=512 * 512
             )
         ),
-        staging_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
         # The direct layout has no start marker; a row that closes the image
         # appends the end marker. ``model._Head`` maps 1007 to EOS, so logits
         # read at that marker select EOS.

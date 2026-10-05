@@ -1,4 +1,4 @@
-"""Request-pool staging for fixed-capacity decode execution buffers.
+"""Gather resident request state into fixed-capacity decode input buffers.
 
 The Triton kernel gathers live request rows, expands the unit tables of every
 numerical block table, derives each token's cache write location per table,
@@ -305,11 +305,9 @@ def gather_request_decode_inputs(
     if device.type != "cuda" or any(
         value.device != device for value in tensors
     ):
-        raise ValueError(
-            "request-indexed decode staging requires one CUDA device"
-        )
+        raise ValueError("request-indexed decode requires one CUDA device")
     if triton is None or not launchable(device):
-        raise RuntimeError("request-indexed decode staging requires Triton")
+        raise RuntimeError("request-indexed decode requires Triton")
 
     # ``request_pool_indices`` defines scalar output capacity; ``rows`` selects
     # the live prefix populated from request-owned state.
@@ -317,7 +315,7 @@ def gather_request_decode_inputs(
     max_rows = int(request_pool_indices.numel())
     if row_count < 1 or row_count > max_rows:
         raise ValueError(
-            "request-indexed decode row count exceeds staging capacity"
+            "request-indexed decode row count exceeds buffer capacity"
         )
     if (
         request_unit_tables.ndim != 3

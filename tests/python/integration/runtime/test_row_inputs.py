@@ -1,10 +1,10 @@
-"""Token rows stage the attention columns their host page layout describes.
+"""Token rows prepare the attention columns their host page layout describes.
 
 ``AttentionBuffers.stage_rows`` gathers every numerical table's units, first
 staged pages and write addresses from the request slots' resident tables.
 Over random calls of a model whose windowed and full-attention groups share
-one unit pool (six numerical tables, as DiffusionGemma has), its staging,
-padded to a graph bucket, equals the staging of the same call's host layout
+one unit pool (six numerical tables, as DiffusionGemma has), its attention
+inputs, padded to a graph bucket, equal those of the same call's host layout
 (``attention.from_tables`` of ``attention.table_pages``): appending rows,
 mixed appending and read-only rows, read-only non-causal rows, rows whose
 windowed tables retired their first pages, and padding past the live rows.
@@ -228,7 +228,7 @@ def test_rows_stage_the_columns_their_host_layout_describes(
             tokens = actual.inputs.input_ids.numel()
             bucket = (len(rows) + 1, tokens + 1, (WIDTH,) * 6, False)
             padded, padded_expected = (
-                pad_text(batch, *bucket, staging=buffers)
+                pad_text(batch, *bucket, buffers=buffers)
                 for batch, buffers in (
                     (actual, staged),
                     (expected, reference),

@@ -132,8 +132,8 @@ class CanvasRunner(ModelRunner):
         """The most canvases one call stages.
 
         With graph pools a readout bucket stages up to twice its canvases
-        as sequences, so staging holds twice the canvases (see
-        ``canvas_staging_rows``). The scheduler reuses cached prompt pages
+        as sequences, so the input buffers hold twice the canvases (see
+        ``canvas_buffer_rows``). The scheduler reuses cached prompt pages
         only up to a whole page before a prompt's last token, which the
         request computes into a page of every cache group of its own, so no
         call reads more canvases than the KV unit pool has ``pool_rows``.
@@ -218,7 +218,7 @@ class CanvasRunner(ModelRunner):
 
     @staticmethod
     def sampler_bytes(denoiser, *, max_rows, history_depth, device_type):
-        """Per-execution canvas staging and sampler workspace reservation."""
+        """Per-execution canvas input and sampler workspace bytes."""
         fields = denoiser_fields(denoiser)
         length = fields.pop("tokens").length
         vocab = fields.pop("vocab_size")
@@ -722,7 +722,7 @@ def _pad_attention(
     padding: tuple[int, ...],
     width: int,
     widths: tuple[int, ...],
-    staging,
+    buffers,
 ):
     """Append padding sequences to staged canvas attention in place.
 
@@ -734,7 +734,7 @@ def _pad_attention(
     sizes the captured attention launch. Table ``t`` is viewed at its graph
     width ``widths[t]``; live rows read only the pages their prefixes
     cover. Offsets derive from the host lengths, and every table's padding
-    rows clear with one launch per column of ``staging``, whose views the
+    rows clear with one launch per column of ``buffers``, whose views the
     attention is.
     """
     queries = attention.queries
@@ -767,7 +767,7 @@ def _pad_attention(
     prefixes = SequenceLengths(
         host=host_prefixes, values=prefix_values, offsets=prefix_offsets
     )
-    staging.clear_padding(live_rows=live, rows=rows, live_tokens=0, tokens=0)
+    buffers.clear_padding(live_rows=live, rows=rows, live_tokens=0, tokens=0)
 
     # Every canvas token sees its whole canvas.
     visible = values[:, None].expand(-1, width)
@@ -806,12 +806,12 @@ def _pad_rows(tensor: torch.Tensor, rows: int, live: int) -> torch.Tensor:
     return padded
 
 
-def canvas_staging_rows(max_rows: int) -> int:
-    """Rows the canvas staging of a call bound of ``max_rows`` holds.
+def canvas_buffer_rows(max_rows: int) -> int:
+    """Input buffer rows required for at most ``max_rows`` canvases.
 
     A readout graph of ``rows`` canvases stages up to ``2 * rows``
     sequences (``CanvasRunner.select_graph_shape``); the extra rows consume
-    staging, but no scheduler request slot.
+    buffers, but no scheduler request slot.
     """
     return 2 * max_rows
 
@@ -821,7 +821,7 @@ def _pad_readout(
     rows: int,
     length: int,
     widths: tuple[int, ...],
-    staging,
+    buffers,
 ) -> InputBatch:
     """The canvas pass of a readout call as the ``rows`` bucket stages it.
 
@@ -853,7 +853,7 @@ def _pad_readout(
             ids,
             positions,
             _pad_attention(
-                canvas.attention, tuple(padding), length, widths, staging
+                canvas.attention, tuple(padding), length, widths, buffers
             ),
         ),
         _pad_rows(batch.request_pool_indices, 2 * rows, live),
@@ -865,7 +865,7 @@ def _pad_steps(
     rows: int,
     length: int,
     widths: tuple[int, ...],
-    staging,
+    buffers,
 ) -> InputBatch:
     """A canvas step call widened to ``rows`` canvases.
 
@@ -903,7 +903,7 @@ def _pad_steps(
                     (length,) * (rows - live),
                     length,
                     widths,
-                    staging,
+                    buffers,
                 ),
                 self_conditioning=self_conditioning,
             ),

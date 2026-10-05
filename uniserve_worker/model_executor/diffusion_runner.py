@@ -104,13 +104,13 @@ class LayoutEntry:
 
 @dataclass
 class LadderBucket(GraphBucket):
-    """Slot staging and the captured step of one layout.
+    """Slot state buffers and the captured step of one layout.
 
     ``graphs[None]`` is the layout's captured step, which evaluates every
     solver step: the step index, timesteps and schedules are graph inputs
     that a replay copies from the ladder's step. ``signature`` is the
     structure every ladder replaying it must share.
-    ``state`` holds one staging view per banked field, and each ``gathers``
+    ``state`` holds one buffer view per banked field, and each ``gathers``
     entry pairs a bank's [slots, span] column view with its stage viewed as
     [1, numel], so a graph copies the selected slot's span into the stage.
     """
@@ -133,8 +133,8 @@ class DiffusionRunner(ModelRunner):
       the solver.
     - A standalone denoiser has one runner, built by ``for_layouts``, that
       serves every layout its worker admits. The runner's context is
-      prepared for the largest layout, whose workspace, samples, staging and
-      shared scratch every smaller layout borrows as compact leading views:
+      prepared for the largest layout. Smaller layouts borrow its workspace,
+      samples, state buffers and shared scratch as compact leading views:
       the layouts' steps run one at a time on the runner's stream, and no
       step reads what another left behind. Each layout keeps only its own
       constants, sample page count and captured steps. A step gathers one
@@ -183,14 +183,14 @@ class DiffusionRunner(ModelRunner):
         # A standalone denoiser's prepared layouts and the storage they
         # share: the samples, [pages * page_units, latent_width] in the
         # pool's dtype for the largest layout's pages, the workspace and the
-        # captured steps' staging of banked state. ``for_layouts`` allocates
+        # captured steps' copies of banked state. ``for_layouts`` allocates
         # them with the context.
         self.pool = pool
         self._maximum: Hashable = None
         self.layouts: dict[Hashable, LayoutEntry] = {}
         self.samples: torch.Tensor | None = None
         self._workspace: TensorBuffers | None = None
-        self._staging: TensorBuffers | None = None
+        self._state_buffers: TensorBuffers | None = None
         self._row_values: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
 
     @classmethod
@@ -273,7 +273,7 @@ class DiffusionRunner(ModelRunner):
                 if runner.captures:
                     # One stage per banked field at the bank's slot row
                     # shape, the capacity every layout's field fits.
-                    runner._staging = TensorBuffers.allocate(
+                    runner._state_buffers = TensorBuffers.allocate(
                         {
                             name: BufferConfig(
                                 tuple(value.shape[1:]), value.dtype
@@ -633,15 +633,15 @@ class DiffusionRunner(ModelRunner):
         return ladder.samples is self.samples and ladder.layout in self.layouts
 
     def _bucket(self, ladder: Ladder) -> LadderBucket:
-        """Return the ladder's layout bucket, creating its staging once.
+        """Return the ladder's layout bucket, binding its state buffers once.
 
-        Staging views the runner's shared staging: a replay gathers the
-        slot's banked state into it before any read.
+        The bucket borrows the runner's shared state buffers. A replay gathers
+        the slot's banked state into those buffers before any read.
         """
         bucket = self.buckets.get(ladder.layout)
         if bucket is None:
-            staging = cast(TensorBuffers, self._staging)
-            stages = staging.view(
+            state_buffers = cast(TensorBuffers, self._state_buffers)
+            stages = state_buffers.view(
                 {
                     name: BufferConfig(shape, self.bank[name].dtype)
                     for name, (_, shape) in ladder.spans.items()
@@ -770,7 +770,7 @@ class DiffusionRunner(ModelRunner):
                 id(value): staged
                 for value, staged in zip(sources, temporal[1], strict=True)
             }
-            # Banked fields read the bucket's staging and the samples stay
+            # Banked fields read the bucket's state buffers and the samples stay
             # the runner's own.
             samples = {
                 id(value.tensor)
@@ -883,7 +883,7 @@ class DiffusionRunner(ModelRunner):
         finally:
             for entry in self.layouts.values():
                 entry.backing.close()
-            for backing in (self._workspace, self._staging):
+            for backing in (self._workspace, self._state_buffers):
                 if backing is not None:
                     backing.close()
             self.layouts.clear()
@@ -891,5 +891,5 @@ class DiffusionRunner(ModelRunner):
             self._row_values.clear()
             self._slot_index = None
             self.samples = self.pool = None
-            self._workspace = self._staging = None
+            self._workspace = self._state_buffers = None
             self.bank = {}

@@ -88,7 +88,7 @@ class KVWorkspace:
     With ``elements`` the element count of the largest group page (``page
     tokens * layers * kv_heads * head_dim``) and ``scales`` its scale
     entries (``page tokens * layers * kv_heads``), ``raw`` is uint8
-    ``[2, elements * 8]``: one staging page per K/V field, sized for float64
+    ``[2, elements * 8]``: one buffer page per K/V field, sized for float64
     source elements. ``values`` is a flat FP32 ``[elements]`` conversion
     page and ``scales`` a flat FP32 ``[2 * scales]`` buffer for the source
     scale rows of one span; each group views them in its own shape.
@@ -371,7 +371,7 @@ def _copy_converted(
         page, offset = divmod(position, page_tokens)
         count = min(carried - logical, page_tokens - offset)
         elements = count * num_layers * num_heads * head_dim
-        # Raw staging views per K/V field: [tokens, layers, kv heads, dim].
+        # Raw buffer views per K/V field: [tokens, layers, kv heads, dim].
         raw = tuple(
             workspace.raw[field, : elements * itemsize]
             .view(dtype)

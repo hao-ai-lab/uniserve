@@ -108,7 +108,7 @@ class MoEBinding:
             provider = None
         elif self.exchange is not None and self.exchange.transport == "megamoe":
             # The fused kernel exchanges, computes and combines in one launch
-            # over the exchange's symmetric staging.
+            # over the exchange's symmetric buffers.
             from ..backends.moe import megamoe
 
             provider = megamoe.Backend()
@@ -207,7 +207,7 @@ class MoEBinding:
         operator = self.prepare(TextSize(hidden.shape[0], 1))
         if exchange.transport == "megamoe":
             # The fused kernel exchanges, runs the experts and combines in
-            # one launch over the exchange's symmetric staging.
+            # one launch over the exchange's symmetric buffers.
             exchange.enter(id(self.module))
             output = operator(hidden, topk_ids, topk_weights)
         else:

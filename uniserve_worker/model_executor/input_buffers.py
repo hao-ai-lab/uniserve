@@ -1,20 +1,20 @@
-"""Fixed-address staging for homogeneous numerical capability calls.
+"""Fixed-address input buffers for homogeneous numerical calls.
 
 Each staged execution entry of ``ModelExecutor`` owns one ``InputBuffers``
 instance, whose subclass ``input_buffer_config`` selects from the entry's call
 kinds. The buffers allocate every device column once at its configured
 capacity, and ``prepare_inputs`` copies one call's rows into leading slices of
 those columns. Because the addresses never change, text graph buckets capture
-the staging columns themselves, and ``graph_inputs.pad_text`` can widen the
+the buffer columns themselves, and ``graph_inputs.pad_text`` can widen the
 staged slices in place to a bucket's capacity.
 
-Token staging copies its inputs into owned columns, as canvas staging does for
-token canvases and their answer slots; diffusion staging does the same for
-attention metadata, positions and timesteps but borrows the rows' latents.
+Token buffers hold copied input columns, and canvas buffers hold token canvases
+and their answer slots. Diffusion buffers hold attention metadata, positions
+and timesteps, while borrowing the rows' latents.
 The attention metadata of rows that name their request slots is gathered on
 the device from the slots' resident block tables (``stage_rows``); a caller
 may instead pass a prepared host attention batch (``stage_attention``).
-Vision and latent-encoding staging and image-decode staging own only the
+Vision, latent-encoding and image-decode buffers own only the
 request-slot column and borrow the rows' tensors. Borrowed tensors must
 already reside on the entry's device.
 """
@@ -99,10 +99,10 @@ class RowBufferConfig:
 class AttentionBufferConfig(RowBufferConfig):
     """Sequence and page-table capacities shared by attention computations.
 
-    ``positions`` has three axes so multimodal positions fit; staging
+    ``positions`` has three axes so multimodal positions fit; input preparation
     fills only the leading axis for one-axis positions. ``max_tokens`` bounds
     the positions and write-index columns; ``input_buffer_config`` gives
-    text and diffusion staging built from one ``TokenBufferConfig`` the
+    text and diffusion input buffers built from one ``TokenBufferConfig`` the
     same bound. ``table_widths`` holds the most pages one call stages per
     row of each numerical block table, in table order.
     """
@@ -141,7 +141,7 @@ class AttentionBufferConfig(RowBufferConfig):
             "cumulative_prefix_lengths": BufferConfig((rows + 1,), torch.int32),
             # [table, token]: each table addresses its own units.
             "write_indices": BufferConfig((tables, tokens), torch.int64),
-            # Host columns of a call's rows for their device staging
+            # Host columns of a call's rows for their device buffers
             # (``AttentionBuffers.stage_rows``).
             "row_columns": BufferConfig(
                 (row_columns_size(rows, tables, tokens),), torch.int64
@@ -237,7 +237,7 @@ class DiffusionBufferConfig(AttentionBufferConfig):
 
 
 class InputBuffers:
-    """Own request-slot staging and borrow already placed numerical views.
+    """Own request-slot buffers and borrow already placed numerical views.
 
     ``max_inflight`` sets the depth of the host rings (pinned on CUDA) that
     source asynchronous host-to-device copies; with a depth above one, the
@@ -247,7 +247,7 @@ class InputBuffers:
     stream that stages them.
     """
 
-    # The row types this staging accepts.
+    # The row types accepted by this input buffer class.
     row_type: type[InputRow] | tuple[type[InputRow], ...]
 
     # Each field ``config.buffers()`` names becomes a fixed-address column
@@ -272,7 +272,7 @@ class InputBuffers:
         self._backing.close()
 
     def validate_rows(self, rows):
-        """Check types and capacity before staging or partitioning rows."""
+        """Check types and capacity before preparing or partitioning rows."""
         if not 0 < len(rows) <= self.max_rows:
             raise ValueError("row count exceeds input-buffer capacity")
         if any(not isinstance(row, self.row_type) for row in rows):
@@ -282,7 +282,7 @@ class InputBuffers:
                 else (self.row_type,)
             )
             names = " or ".join(kind.__name__ for kind in types)
-            raise TypeError(f"this staging requires {names} inputs")
+            raise TypeError(f"these buffers require {names} inputs")
 
     def prepare_inputs(self, rows, *, forward_mode, **numerical):
         """Stage one numerical call and retain its output request slots.
@@ -298,14 +298,14 @@ class InputBuffers:
 
         Raises:
             ValueError: The row count is zero or exceeds capacity, the rows
-                mix computations, or subclass staging rejects the rows.
-            TypeError: A row is not this staging's ``row_type``, or token or
-                diffusion staging receives unsupported attention.
+                mix computations, or the input buffer subclass rejects the rows.
+            TypeError: A row is not the declared ``row_type``, or token or
+                diffusion input buffers receive unsupported attention.
             WorkerError: ``row_tables`` rejects the rows while attention
                 is built from ``cache`` and ``tables``.
         """
         self.validate_rows(rows)
-        # Token rows of any ForwardMode share one staging layout; a media row
+        # Token rows of any ForwardMode share one buffer layout; a media row
         # must match the call kind exactly.
         if any(
             row.forward_mode != forward_mode
@@ -331,11 +331,11 @@ class InputBuffers:
     ):
         """Stage validated rows into this capability's numerical input.
 
-        ``attention`` supplies prepared attention columns; otherwise staging
+        ``attention`` supplies prepared attention columns; otherwise this method
         builds them from ``cache`` and ``tables``. ``states`` holds resident
         decode continuations. Returns the input, the rows' output selections
-        and the optional decode force-finish column. Stagings that need none
-        of these keywords ignore them.
+        and the optional decode force-finish column. Input buffers that do not
+        use these keywords ignore them.
         """
         raise NotImplementedError
 
@@ -564,8 +564,7 @@ class AttentionBuffers(InputBuffers):
             for entry in entries.values()
         ):
             raise TypeError(
-                "worker token staging requires paged or prefix/current "
-                "attention"
+                "worker token buffers require paged or prefix/current attention"
             )
         if any(table >= len(self.table_widths) for table in entries):
             raise ValueError("attention tables exceed input-buffer capacity")
@@ -645,12 +644,12 @@ class AttentionBuffers(InputBuffers):
 
         if not entry.fully_visible_current:
             raise ValueError(
-                "image staging requires fully visible current sequences"
+                "image preparation requires fully visible current sequences"
             )
         maximum = queries.maximum
         if maximum is None:
             raise ValueError(
-                "image staging requires host query lengths for visibility"
+                "image preparation requires host query lengths for visibility"
             )
 
         return SegmentedInput(
@@ -965,7 +964,7 @@ class TokenBuffers(AttentionBuffers):
         )
 
     def _indexed(self, rows, pages, tables, states):
-        """Gather resident decode rows on device directly into paged staging.
+        """Gather resident decode rows into paged input buffers on device.
 
         One kernel reads the rows' request slots from
         ``request_pool_indices`` (already copied by ``prepare_inputs`` on the
@@ -1295,9 +1294,9 @@ class CanvasBuffers(AttentionBuffers):
         """Return candidate storage of at least ``size`` int64 elements.
 
         Replacing the backing is ordered after earlier readers by the
-        caching allocator, since every reader runs on this staging stream.
+        caching allocator, since every reader runs on the same execution stream.
         Serving stages outside inference mode, so the backing is allocated
-        as an ordinary tensor even when startup staging, which runs in
+        as an ordinary tensor even when startup input preparation, which runs in
         inference mode, grows it first.
         """
         if self._candidates.numel() < size:
@@ -1419,15 +1418,15 @@ class DecodeBuffers(InputBuffers):
 def input_buffer_config(kind, limits: TokenBufferConfig):
     """Select only the backing consumed by this numerical capability.
 
-    ``limits`` is the entry's text staging configuration, derived from
+    ``limits`` is the entry's text input buffer configuration, derived from
     ``bootstrap.capacity.input_buffer_config``; non-text kinds keep only the
-    fields their staging reads.
+    fields their input buffers need.
 
     Returns:
         The ``InputBuffers`` subclass and the configuration to build it.
 
     Raises:
-        ValueError: ``kind`` has no fixed row staging.
+        ValueError: ``kind`` has no fixed input buffers.
     """
     if kind is ForwardMode.TOKEN_DENOISING:
         return CanvasBuffers, CanvasBufferConfig(
@@ -1447,7 +1446,7 @@ def input_buffer_config(kind, limits: TokenBufferConfig):
 
 
 def buffered_kinds(*, diffusion: bool):
-    """Numerical capabilities served by fixed row staging.
+    """Numerical capabilities served by fixed input buffers.
 
     Denoising is included only when ``diffusion`` is set, which callers
     derive from whether the model provides an image builder.

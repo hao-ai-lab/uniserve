@@ -714,7 +714,7 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
 
     PhaseTracker<1> full_o_ph;
 
-    // Both staging buffers start free.
+    // Both buffers start free.
     if (elect_one_sync()) {
       #pragma unroll
       for (int m = 0; m < M_TILES_PER_CTA; ++m)

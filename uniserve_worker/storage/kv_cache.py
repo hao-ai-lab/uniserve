@@ -77,7 +77,7 @@ class KVCacheManager:
         import_capacity: int = 1,
         request_pool_size: int = 1,
         table_width: int | None = None,
-        staging_depth: int = 1,
+        host_buffer_depth: int = 1,
     ) -> None:
         """Validate the unit pool against ``info`` and create its owners.
 
@@ -92,12 +92,12 @@ class KVCacheManager:
             request_pool_size: Request slots of the block tables.
             table_width: Most pages one slot's group table may hold; defaults
                 to every non-sentinel unit.
-            staging_depth: Depth of the block tables' host staging rings.
+            host_buffer_depth: Depth of the block tables' host buffer rings.
 
         Raises:
             ValueError: When the pool does not match ``info``, a group's
                 layers are not one consecutive run of its transfer layers, or
-                ``staging_depth`` is below 1.
+                ``host_buffer_depth`` is below 1.
             WorkerError: ``invalid_descriptor`` when a block-table dimension
                 is below 1.
         """
@@ -170,7 +170,7 @@ class KVCacheManager:
             if table_width is None
             else table_width,
             device=cache.device,
-            staging_depth=staging_depth,
+            host_buffer_depth=host_buffer_depth,
         )
 
         self._manager = NativeKVCacheManager(

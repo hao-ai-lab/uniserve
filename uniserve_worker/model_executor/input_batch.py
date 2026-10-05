@@ -124,8 +124,8 @@ class AttentionRow(InputRow):
 class TokenRow(AttentionRow):
     """Token views or a resident request-slot continuation.
 
-    Indexed decode borrows tokens and positions from DecodeState at staging
-    time and carries no duplicate per-row tensor views.
+    Indexed decode borrows tokens and positions from DecodeState during input
+    preparation and carries no duplicate per-row tensor views.
     """
 
     token_ids: torch.Tensor | None = None

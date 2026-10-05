@@ -165,7 +165,7 @@ class ChannelTransport(Transport):
                 device=str(first.device),
             )
         finally:
-            # The staging buffer is the only thing this rank held: the bytes
+            # The buffer is the only thing this rank held: the bytes
             # are in the locator by now, and the source is its own again.
             self.capacity.release(nbytes)
 

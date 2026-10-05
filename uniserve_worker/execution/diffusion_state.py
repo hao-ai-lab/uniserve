@@ -20,7 +20,7 @@ from uniserve_worker.model_executor.diffusion_runner import Ladder
 class KVConditioning:
     """Where a KV-conditioned request's guidance branches read their prefix.
 
-    Solver samples borrow the pending call's latent staging and are not
+    Solver samples borrow the pending call's latent buffer and are not
     retained here. Physical prefix coordinates follow each submission's
     descriptors, so ``cache`` and ``entries`` refresh per call; prefix tokens
     and rotary positions are retained for the request's lifetime.
@@ -47,7 +47,7 @@ class SlotLadder:
 
     The views borrow request storage whose execution owners retain the
     backing. The ladder views the samples of its layout's runner and is bound
-    again when that runner is replaced. ``staging`` is the host staging
+    again when that runner is replaced. ``preparation`` is the host task
     started at admission (the seeded draw and the request's own state
     tables); latent preparation reads what it filled, and retirement waits
     for it.
@@ -55,7 +55,7 @@ class SlotLadder:
 
     tensors: dict[str, Mapping[str, torch.Tensor]] = field(default_factory=dict)
     ladder: Ladder | None = None
-    staging: HostTask[None] | None = None
+    preparation: HostTask[None] | None = None
 
 
 @dataclass(slots=True)
@@ -79,14 +79,14 @@ class DiffusionState:
 
     def close(self) -> None:
         """Drain host writes before the request's tensor slot can be reused."""
-        if self.slot is not None and self.slot.staging is not None:
+        if self.slot is not None and self.slot.preparation is not None:
             # A failed task may have written part of the destination; wait for
             # its actual exit without rethrowing its already reported error.
             try:
-                self.slot.staging.exception()
+                self.slot.preparation.exception()
             except CancelledError:
                 pass
-            self.slot.staging = None
+            self.slot.preparation = None
 
     @classmethod
     def open(

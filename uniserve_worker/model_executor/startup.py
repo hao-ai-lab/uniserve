@@ -99,14 +99,14 @@ def stage_text(
     slots: tuple[int, ...] | None = None,
     embeddings: bool = False,
 ) -> InputBatch:
-    """Stage synthetic token rows through serving's staging path.
+    """Stage synthetic token rows through serving's input preparation.
 
     ``tokens`` holds each row's token IDs and ``tables`` its scratch tables
     of every cache group. Rows default to empty prefixes and to request
     slots ``1..rows``; slot 0 is the inactive sentinel. Every row writes KV.
     With ``embeddings``, every token replaces its embedding with zeros, as an
     image feature row replaces its placeholders. A decode batch also carries
-    the staging's cleared force-finish column. ``causal=None`` stages device
+    the buffer's cleared force-finish column. ``causal=None`` stages device
     flags for a mixed-context graph family, even for a one-row warmup.
     """
     rows = len(tokens)
@@ -132,8 +132,8 @@ def stage_text(
 
     slots = slots or tuple(range(1, rows + 1))
     mode = ForwardMode.DECODE if decode else ForwardMode.PREFILL
-    # Replaced embeddings take the staging column's dtype; staging rejects
-    # them on a lane without one.
+    # Replaced embeddings take the buffer column's dtype; input preparation
+    # rejects them on a lane without one.
     replaced = buffers.input_embeddings if embeddings else None
     if embeddings and replaced is None:
         raise ValueError("embedding replacement requires an embedding column")
@@ -280,11 +280,10 @@ def prepare_prefill(
     stages the ``capture_lengths`` rows of its bucket on zeroed scratch KV
     units, which the pool's allocatable units hold, with the bucket's
     causality, embedding replacement and outputs (rows of a cache-only
-    bucket select ``TokenSelection.CACHE``), through serving's staging with
-    its real paged
-    attention input: per-table block tables, device start pages for windowed
-    tables and their host mirrors; the runner's ``select_graph_shape`` pads
-    them to the bucket.
+    bucket select ``TokenSelection.CACHE``), through serving's input buffers
+    and paged attention inputs: per-table block tables, device start pages
+    for windowed tables and their host mirrors. The runner's
+    ``select_graph_shape`` pads them to the bucket.
 
     Raises:
         ValueError: A bucket is prepared on a worker without a KV cache.
@@ -382,7 +381,7 @@ def stage_canvas(
     sampling: CanvasSampling | None = None,
     step: int = 0,
 ) -> InputBatch:
-    """Stage synthetic canvas rows through serving's staging path.
+    """Stage synthetic canvas rows through serving's input preparation.
 
     Row ``i`` is a canvas of ``length`` tokens in request slot ``i + 1``
     over a one-token prefix on its scratch ``tables``, read-only and
@@ -445,8 +444,8 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
     sampling over request slots one
     upward, one whose rows all start their canvas and one whose rows
     continue it; their resident state stays scratch until a request starts
-    its canvas there. The rows are staged through serving's staging with the
-    real read-only attention input over one-token prefixes on scratch KV
+    its canvas there. The rows use serving's input buffers and real read-only
+    attention over one-token prefixes on scratch KV
     units, and the runner pads them to their bucket. The largest readout
     bucket, captured first, sizes the runner's shared readout output. A
     step's warm call runs the sampler's chunk shapes before their capture.

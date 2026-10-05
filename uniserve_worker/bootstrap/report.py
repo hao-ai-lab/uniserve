@@ -8,7 +8,7 @@ geometry, latent pages, buffer pool size, component products) together with
 the allocation sizes the worker then reserves.
 
 Two sizing paths exist. A token worker (no ``VideoPostprocessor`` and no
-media request state) sizes paged KV, latent pages and text input staging;
+media request state) sizes paged KV, latent pages and text input buffers;
 given a storage grant, its KV pool is sized from, or with a configured
 ``kv_token_capacity`` checked against, the grant left after its fixed
 allocations. A request-tensor worker (media) holds fixed per-request state
@@ -76,7 +76,7 @@ from uniserve_worker.config.execution import (
     graph_storage_budget_bytes,
 )
 from uniserve_worker.errors import unsupported_setup
-from uniserve_worker.model_executor.canvas_runner import canvas_staging_rows
+from uniserve_worker.model_executor.canvas_runner import canvas_buffer_rows
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.model_executor.input_buffers import (
     TokenBufferConfig,
@@ -115,7 +115,7 @@ class WorkerLayout:
         info: The capacity report sent to the engine.
         arena: Latent pool, tensor store, device-product, transfer and
             host-lane budgets.
-        input_config: Token input staging bounds; ``None`` without a
+        input_config: Token input buffer bounds; ``None`` without a
             ``CausalLM`` and on a request-tensor worker.
         fixed_device_bytes: ``(device, bytes)`` reserved outside the KV pool
             on each device of a token worker; empty on a request-tensor
@@ -221,7 +221,7 @@ def build_worker_layout(
         )
 
     # Media workers hold fixed request tensors; token workers size paged KV,
-    # latent pools, and text staging instead.
+    # latent pools, and text input buffers instead.
     if capability(model, VideoPostprocessor) is not None or state_buffers:
         layout = _request_tensor_worker_layout(
             model,
@@ -336,7 +336,7 @@ def _token_worker_layout(
     Without a configured ``kv_token_capacity``, the KV pool takes the whole
     pages of its storage grant (``pool_storage_bytes``) left after every
     fixed allocation on the primary device: the buffer pool and its share of
-    the device products, the latent pool and input staging placed there,
+    the device products, the latent pool and input buffers placed there,
     block tables, decode state, KV import workspaces, graph padding pages and
     the graph storage budget. A CUDA device requires that grant; another
     device without one takes ``derive_runtime_kv_capacity``'s default page
@@ -474,7 +474,7 @@ def _token_worker_layout(
         )
         from uniserve_worker.protocol.call import ForwardMode, MediaCall
 
-        # Reserve the input staging ``ModelExecutor`` allocates for each call
+        # Reserve the input buffers ``ModelExecutor`` allocates for each call
         # this rank owns and each lane serving it, including the prefill row
         # widening for captured graphs. The worker-wide row and token bounds
         # are used here, so the reservation covers lanes with narrower bounds.
@@ -551,7 +551,7 @@ def _token_worker_layout(
                         # beyond their canvases.
                         fields = replace(
                             fields,
-                            max_rows=canvas_staging_rows(fields.max_rows),
+                            max_rows=canvas_buffer_rows(fields.max_rows),
                         )
                     _, allocation = call_buffer_config(
                         next(iter(selected)), fields
@@ -573,7 +573,7 @@ def _token_worker_layout(
                     )
 
                 # A token denoiser that generates the deployment's canvases
-                # keeps every request slot's canvas resident. Staging and
+                # keeps every request slot's canvas resident. Input buffers and
                 # sampler scratch are private to each concurrent execution.
                 denoiser = (
                     generating_denoiser(call.module)
@@ -672,8 +672,8 @@ def _token_worker_layout(
 
         # Prefill and decode calls on a CUDA device replay graphs whose rows'
         # pages fit the granted pool. The rows the widest graphs hold bound
-        # every prefill and decode call the engine forms. The staging above
-        # was sized before the pool, for the rows of every configured bucket.
+        # every prefill and decode call the engine forms. The input buffers
+        # were sized before the pool, for the rows of every configured bucket.
         row_units = sum(group.units_per_page for group in planes.groups)
         pool_rows = (capacity.num_units - 1) // row_units
         if prefills_on_cuda:

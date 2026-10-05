@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 
 @pytest.mark.parametrize("capacity", (17, 257))
 @pytest.mark.parametrize("axes", (1, 3))
-def test_decode_export_and_staging_follow_live_request_coordinates(
+def test_decode_export_and_inputs_follow_live_request_coordinates(
     capacity, axes
 ):
     device = torch.device("cuda:0")
@@ -47,7 +47,7 @@ def test_decode_export_and_staging_follow_live_request_coordinates(
     shapes = torch.tensor(
         [[0, 2, -1], [1, 2, 2]], dtype=torch.int32, device=device
     )
-    staging_slots = torch.zeros(capacity, dtype=torch.int64, device=device)
+    slot_indices = torch.zeros(capacity, dtype=torch.int64, device=device)
     tables = torch.full((2, capacity, 5), -1, dtype=torch.int32, device=device)
     start_pages = torch.full(
         (2, capacity), -1, dtype=torch.int32, device=device
@@ -109,9 +109,9 @@ def test_decode_export_and_staging_follow_live_request_coordinates(
         first = [max(length - 2, 0) // 2 for length in expected_lengths]
         starts[1].copy_(torch.tensor(first, dtype=torch.int32))
 
-        staging_slots[:count].copy_(indices)
+        slot_indices[:count].copy_(indices)
         gather_request_decode_inputs(
-            request_pool_indices=staging_slots,
+            request_pool_indices=slot_indices,
             request_unit_tables=units,
             request_start_pages=starts,
             table_shapes=shapes,
@@ -125,7 +125,7 @@ def test_decode_export_and_staging_follow_live_request_coordinates(
             **outputs,
         )
         padding = capacity - count
-        assert staging_slots.tolist() == live + [0] * padding
+        assert slot_indices.tolist() == live + [0] * padding
         assert outputs["input_ids"].tolist() == live + [1] * padding
         assert outputs["positions"].tolist() == [
             [expected_positions[s] for s in live] + [0] * padding

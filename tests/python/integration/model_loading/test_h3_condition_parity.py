@@ -222,7 +222,7 @@ class _Worker:
             latent_width=1,
             dtype=pages.dtype,
             device=DEVICE,
-            staging=False,
+            with_workspace=False,
         )
         self.runner.bind_diffusion_storage(self.slots.bank, self.pool)
         try:
