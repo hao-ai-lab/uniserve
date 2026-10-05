@@ -822,7 +822,11 @@ impl TensorStore {
         self.wait_imported(py, &state, read)
     }
 
-    fn complete_import(&self, py: Python<'_>, read: &Bound<'_, TensorRead>) -> PyResult<()> {
+    pub(super) fn complete_import(
+        &self,
+        py: Python<'_>,
+        read: &Bound<'_, TensorRead>,
+    ) -> PyResult<()> {
         self.event_pool.borrow(py).reap(py)?;
 
         let mut state = self.lock(py)?;

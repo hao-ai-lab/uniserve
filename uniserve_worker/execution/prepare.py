@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -41,7 +41,6 @@ from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.batch import (
     Batch,
     LatentParams,
-    TensorExport,
 )
 from uniserve_worker.protocol.call import (
     Call,
@@ -52,12 +51,9 @@ from uniserve_worker.protocol.call import (
 from uniserve_worker.protocol.identity import BufferId, CallId, CallIdentity
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 from uniserve_worker.protocol.transfer import (
-    DeviceProductTransferValue,
-    EncoderTransferValue,
     LatentTransferValue,
 )
 from uniserve_worker.sampling.result import SAMPLING_COMPLETION_FIELDS
-from uniserve_worker.storage.latent_pool import LatentImport
 from uniserve_worker.storage.output import OutputBuffer
 from uniserve_worker.storage.tensor_store import TensorRead
 
@@ -279,26 +275,6 @@ def reserve_outputs(
     with state.scope():
         started = time.perf_counter_ns()
 
-        # Restrict input payloads to identities declared by this batch.
-        declared_inputs = {
-            reference.buffer_id
-            for call in scheduled
-            for reference in call.tensor_inputs()
-        }
-        declared_inputs.update(
-            call.kv_input for call in scheduled if call.kv_input is not None
-        )
-        declared_inputs.update(
-            call.predicate.buffer_id
-            for call in scheduled
-            if call.predicate is not None
-        )
-        input_products = tuple(
-            payload
-            for payload in batch.input_products
-            if payload.product.buffer_id in declared_inputs
-        )
-
         completion: OutputBuffer | None = None
         try:
             # The completion buffer and the records bound to it are owned
@@ -368,30 +344,10 @@ def reserve_outputs(
             state=state,
         )
 
-        # Only live calls consume inputs; predicated calls instead publish
-        # false into their completion and transition outputs
-        # (`_publish_predicated_outputs`).
-        active_inputs = {
-            reference
-            for call in active_calls
-            for reference in call.tensor_inputs()
-        }
-        active_inputs.update(
-            call.predicate
-            for call in active_calls
-            if call.predicate is not None
-        )
-        _stage_input_products(
-            tuple(
-                payload
-                for payload in input_products
-                if payload.product in active_inputs
-            ),
-            kv_cache=kv_cache,
-            tensor_store=tensor_store,
-            latent_pool=latent_pool,
-            model_runner=model_runner,
-            state=state,
+        state.complete_inputs(
+            tensor_store,
+            latent_pool,
+            None if kv_cache is None else kv_cache._manager,
         )
         _consume_predicates(
             active_calls,
@@ -908,140 +864,3 @@ def _validate_sample_params(
         raise invalid_descriptor(
             "latent params disagrees with the request's committed step"
         )
-
-
-def _stage_input_products(
-    input_products: Sequence[TensorExport],
-    *,
-    state: BatchState,
-    kv_cache: KVCacheManager | None,
-    tensor_store: TensorStore,
-    latent_pool: LatentPool | None,
-    model_runner: ModelExecutor,
-) -> None:
-    """Publish query-ready transferred values into their owning stores.
-
-    Every KV import the batch consumes must be complete and agree with any
-    resident export of its buffer, and every other non-borrowed input
-    must be query-ready; violations raise `invalid_descriptor`. A latent
-    import is adopted by the `LatentPool` as a live trajectory at its
-    transferred step, and the destination's projected `flow_step` moves to
-    that step. A device or encoder import is completed in the `TensorStore`.
-    Borrowed inputs are skipped.
-    """
-    # KV imports consumed by this batch must be complete and conflict-free
-    # before any transferred product is published.
-    cache_inputs = {call.kv_input for call in state.batch.calls}
-    for write in state.inputs.cache_imports():
-        buffer = write.export.source
-        if buffer not in cache_inputs:
-            continue
-        if not write.done():
-            raise invalid_descriptor(
-                "KV input has no query-ready physical import"
-            )
-        if kv_cache is None:
-            raise invalid_descriptor("KV input requires cache export storage")
-        existing = kv_cache.resident(buffer)
-        if existing is not None and existing != write.export:
-            raise invalid_descriptor(
-                "staged KV export conflicts with its buffer identity"
-            )
-
-    for entry in input_products:
-        product = entry.product
-        if state.inputs.is_borrowed(product.buffer_id):
-            continue
-        if not state.inputs.input_ready(product.buffer_id):
-            raise invalid_descriptor(
-                "cross-call input has no query-ready prepared transfer"
-            )
-
-        # Transfer metadata determines which runtime owns the imported value;
-        # each branch validates identity and shape before export.
-        value = entry.value
-        if isinstance(value, LatentTransferValue):
-            consumers = tuple(
-                call
-                for call in state.batch.calls
-                if product in call.tensor_inputs()
-            )
-            if len(consumers) != 1:
-                raise invalid_descriptor(
-                    "latent transfer must have one batch consumer"
-                )
-
-            row = state.pending_output(consumers[0].request_key.request_id)
-            params = row.latent.input_params
-            staging = row.latent.staging
-            if params is None or staging is None:
-                raise invalid_descriptor(
-                    "trajectory call has no staged latent inputs"
-                )
-            if (
-                value.latent_units != int(params.latent_units)
-                or value.height != int(params.height)
-                or value.width != int(params.width)
-                or value.step != int(params.start_step)
-            ):
-                raise invalid_descriptor(
-                    "latent transfer disagrees with its scheduler params"
-                )
-
-            request = state.pending_output(product.request_key.request_id)
-            if int(request.progress.flow_step) != 0:
-                raise invalid_descriptor(
-                    "latent transfer destination already owns a trajectory"
-                )
-
-            binding = state.inputs.latent(product.buffer_id)
-            if not isinstance(binding, LatentImport):
-                raise RuntimeError(
-                    "latent transfer lost its reserved destination"
-                )
-            if (binding.request_pool_idx, binding.page_table) != (
-                row.request.request_pool_idx,
-                tuple(params.page_table),
-            ):
-                raise invalid_descriptor(
-                    "latent import reservation changed before execution"
-                )
-
-            # The reserved import becomes a live trajectory at the transferred
-            # solver step, replacing the destination's empty progress.
-            assert latent_pool is not None
-            latent_pool.adopt_import(
-                binding,
-                generation=product.generation,
-                step=value.step,
-                height=value.height,
-                width=value.width,
-            )
-            row.latent.imported = True
-            request.set_flow_step(value.step)
-            continue
-
-        consumers = tuple(
-            call
-            for call in state.batch.calls
-            if product in call.tensor_inputs() or call.predicate == product
-        )
-        if not consumers:
-            raise invalid_descriptor(
-                "transferred product has no batch consumer"
-            )
-
-        devices = {model_runner.call_devices(call)[0] for call in consumers}
-        if len(devices) != 1:
-            raise invalid_descriptor(
-                "transferred product spans multiple consumer devices"
-            )
-        if not isinstance(
-            value, (DeviceProductTransferValue, EncoderTransferValue)
-        ):
-            raise RuntimeError("prepared transfer has an unknown descriptor")
-
-        imported = state.inputs.tensor(product.buffer_id)
-        if imported is None:
-            raise RuntimeError("tensor transfer lost its reserved destination")
-        tensor_store.complete_import(imported)

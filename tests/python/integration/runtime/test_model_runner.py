@@ -2044,10 +2044,20 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
         consumer.close()
 
 
-@pytest.mark.parametrize("height", (16, 80))
-@pytest.mark.parametrize("export", ("pages", "shards", "transfer"))
+@pytest.mark.parametrize(
+    ("height", "export", "reject_output"),
+    (
+        (16, "pages", False),
+        (80, "pages", False),
+        (16, "shards", False),
+        (80, "shards", False),
+        (16, "transfer", False),
+        (80, "transfer", False),
+        (80, "pages", True),
+    ),
+)
 def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
-    height: int, export: str
+    height: int, export: str, reject_output: bool
 ) -> None:
     from uniserve_worker.transport.pool import ReadReservation
 
@@ -2181,25 +2191,39 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         call_id=CallId(5, 0),
         predecessor=root_parent(admission),
         latent=exported_latent,
+        feedback_source=reject_output,
     )
-    batch = execution_batch(
-        batch_id=5,
-        admissions=(admission,),
-        calls=(diffusion_finalize,),
-        input_products=transferred,
-    )
-    # The consumer's physical page order is independent of the publisher's.
-    batch = replace(
-        batch,
-        latent_params=tuple(
-            replace(
-                allocation,
-                page_table=tuple(reversed(allocation.page_table)),
-                start_step=1,
-            )
-            for allocation in batch.latent_params
-        ),
-    )
+    if reject_output:
+        assert diffusion_finalize.image_output is not None
+        diffusion_finalize = replace(
+            diffusion_finalize,
+            image_output=replace(
+                diffusion_finalize.image_output,
+                shape_bound=ShapeBound((StaticDim(1),)),
+            ),
+        )
+
+    def decode_batch(call: Call, admissions=()):
+        batch = execution_batch(
+            batch_id=call.call_id.batch_id,
+            admissions=admissions,
+            calls=(call,),
+            input_products=transferred,
+        )
+        # Destination page order is independent of the source's page order.
+        return replace(
+            batch,
+            latent_params=tuple(
+                replace(
+                    allocation,
+                    page_table=tuple(reversed(allocation.page_table)),
+                    start_step=1,
+                )
+                for allocation in batch.latent_params
+            ),
+        )
+
+    batch = decode_batch(diffusion_finalize, admissions=(admission,))
     # Latent admission must relinquish refused destinations and resume when
     # read capacity returns, including noncontiguous destination pages.
     capacity = consumer.transports["shm"].capacity
@@ -2210,6 +2234,22 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
 
     received = prepared
     received = finalized_report(consumer, received)
+    if reject_output:
+        # Decoding imports the trajectory before discovering that the output
+        # cannot hold the image. Failure must release those adopted pages so
+        # the same request can import and decode the source again.
+        assert received.completions[0].status is CallStatus.ERROR
+        assert received.completions[0].num_completed_steps == 0
+        retry = diffusion_finalize_call(
+            admission.request_key,
+            call_id=CallId(6, 0),
+            predecessor=root_parent(admission),
+            latent=exported_latent,
+        )
+        received = finalized_report(
+            consumer, consumer.submit(decode_batch(retry))
+        )
+
     assert received.completions[0].status is CallStatus.OK
     assert received.completions[0].num_completed_steps == 0
     assert _media_bytes(received.completions[0]) == source_artifact

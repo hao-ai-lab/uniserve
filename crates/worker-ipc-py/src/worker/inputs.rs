@@ -25,6 +25,15 @@ pub(super) enum Input {
 }
 
 impl Input {
+    fn clone_ref(&self, py: Python<'_>) -> Self {
+        match self {
+            Self::Tensor(read) => Self::Tensor(read.clone_ref(py)),
+            Self::Latent(write) => Self::Latent(write.clone_ref(py)),
+            Self::Cache(write) => Self::Cache(write.clone_ref(py)),
+            Self::Borrowed => Self::Borrowed,
+        }
+    }
+
     fn dependencies(&self, py: Python<'_>) -> Vec<Dependency> {
         match self {
             Self::Tensor(read) => read
@@ -168,11 +177,44 @@ pub(crate) struct BatchInputs {
 }
 
 impl BatchInputs {
+    pub(super) fn get(&self, py: Python<'_>, buffer: BufferId) -> Option<Input> {
+        self.inner
+            .inputs
+            .get(&buffer)
+            .map(|input| input.clone_ref(py))
+    }
+
     pub(super) fn cache_import(&self, py: Python<'_>, buffer: BufferId) -> Option<Py<KVImport>> {
         match self.inner.inputs.get(&buffer) {
             Some(Input::Cache(write)) => Some(write.clone_ref(py)),
             _ => None,
         }
+    }
+
+    pub(super) fn cache_imports(&self, py: Python<'_>) -> Vec<Py<KVImport>> {
+        self.inner
+            .inputs
+            .values()
+            .filter_map(|input| match input {
+                Input::Cache(write) => Some(write.clone_ref(py)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Slots made resident by this batch's latent imports. Failed execution
+    /// releases them using the import owner's adoption state.
+    pub(super) fn imported_slots(&self) -> Vec<i64> {
+        self.inner
+            .inputs
+            .values()
+            .filter_map(|input| match input {
+                Input::Latent(write) if write.get().inner.adopted() => {
+                    Some(write.get().inner.request_pool_idx as i64)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     pub(super) fn insert(&mut self, buffer: BufferId, input: Input) {
@@ -297,30 +339,8 @@ impl BatchInputs {
         })
     }
 
-    fn latent(
-        &self,
-        py: Python<'_>,
-        buffer: &Bound<'_, PyAny>,
-    ) -> PyResult<Option<Py<LatentImport>>> {
-        Ok(match self.inner.inputs.get(&buffer_id(buffer)?) {
-            Some(Input::Latent(write)) => Some(write.clone_ref(py)),
-            _ => None,
-        })
-    }
-
     fn cache(&self, py: Python<'_>, buffer: &Bound<'_, PyAny>) -> PyResult<Option<Py<KVImport>>> {
         Ok(self.cache_import(py, buffer_id(buffer)?))
-    }
-
-    pub(super) fn cache_imports(&self, py: Python<'_>) -> Vec<Py<KVImport>> {
-        self.inner
-            .inputs
-            .values()
-            .filter_map(|input| match input {
-                Input::Cache(write) => Some(write.clone_ref(py)),
-                _ => None,
-            })
-            .collect()
     }
 
     fn add_image(&mut self, call: &Bound<'_, PyAny>, task: Py<HostTask>) -> PyResult<()> {

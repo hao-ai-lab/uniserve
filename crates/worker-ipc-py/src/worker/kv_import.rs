@@ -45,7 +45,7 @@ pub(crate) struct KVImport {
     inner: Arc<NativeImport<TransferRef, Workspace>>,
     tables: Vec<Arc<NativeGroupTable>>,
     pub(super) initialized_units: Vec<u32>,
-    export: Arc<KvTransfer>,
+    pub(super) export: Arc<KvTransfer>,
     task: Option<Arc<CopyTask>>,
     #[pyo3(get)]
     retirement: Py<Completion>,

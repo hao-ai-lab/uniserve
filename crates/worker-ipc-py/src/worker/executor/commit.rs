@@ -245,18 +245,7 @@ impl PythonBackend {
                 .collect();
             self.release_buffers(py, &buffers)?;
             if let Some(latents) = &self.latents {
-                let mut slots = Vec::new();
-                for output in &outputs {
-                    let pending = output.borrow();
-                    if pending
-                        .latent
-                        .bind(py)
-                        .getattr("imported")?
-                        .extract::<bool>()?
-                    {
-                        slots.push(pending.request.borrow(py).request.slot() as i64);
-                    }
-                }
+                let slots = batch.inputs.borrow(py).imported_slots();
                 if !slots.is_empty() {
                     latents.borrow_mut(py).release_slots(py, slots)?;
                 }

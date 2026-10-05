@@ -108,5 +108,4 @@ class LatentResult:
     update: LatentUpdate
     input_params: LatentParams | None = None
     staging: LatentStaging | None = None
-    imported: bool = False
     exports: dict[BufferId, ExportLocations] = field(default_factory=dict)
