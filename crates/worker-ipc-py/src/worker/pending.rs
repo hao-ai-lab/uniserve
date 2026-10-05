@@ -36,7 +36,9 @@ pub(crate) struct PendingOutput {
     token_update: Py<PyAny>,
     #[pyo3(get)]
     pub(super) latent: Py<PyAny>,
-    host_tasks: Vec<Py<HostTask>>,
+    pub(super) host_tasks: Vec<Py<HostTask>>,
+    // Video unit positions within this decode round, assigned to this rank.
+    pub(super) media_units: Vec<usize>,
     host_finish: Option<Py<PyAny>>,
     #[pyo3(get)]
     pub(super) tensor_exports: Py<PyDict>,
@@ -53,13 +55,13 @@ pub(crate) struct PendingOutput {
     #[pyo3(get)]
     pub(super) writes: Py<PyList>,
     #[pyo3(get, set)]
-    predicate: Option<Py<PyAny>>,
+    pub(super) predicate: Option<Py<PyAny>>,
     #[pyo3(get, set)]
-    token_write: Option<Py<PyAny>>,
+    pub(super) token_write: Option<Py<PyAny>>,
     #[pyo3(get, set)]
-    transition_write: Option<Py<PyAny>>,
+    pub(super) transition_write: Option<Py<PyAny>>,
     #[pyo3(get, set)]
-    completion_write: Option<Py<PyAny>>,
+    pub(super) completion_write: Option<Py<PyAny>>,
     #[pyo3(get, set)]
     pub(super) producer_write: Option<Py<PyAny>>,
     #[pyo3(get, set)]
@@ -108,6 +110,7 @@ impl PendingOutput {
                 .call1((update,))?
                 .unbind(),
             host_tasks: Vec::new(),
+            media_units: Vec::new(),
             host_finish: None,
             tensor_exports: PyDict::new(py).unbind(),
             cache_exports: PyDict::new(py).unbind(),
@@ -274,6 +277,11 @@ impl PendingOutput {
         self.lock(py)?
             .set_speculation(draft_tokens, terminal_prefix, visible, initialized);
         Ok(())
+    }
+
+    #[getter]
+    fn media_units<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.media_units)
     }
 
     #[getter]

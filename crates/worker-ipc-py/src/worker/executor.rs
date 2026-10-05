@@ -6,6 +6,7 @@ mod inputs;
 mod output;
 mod predicates;
 mod prepare;
+mod reserve;
 mod retirement;
 
 use std::collections::HashSet;
@@ -28,7 +29,7 @@ use uniserve_worker_ipc::{
 
 use super::block_tables::BlockTables;
 use super::events::EventPool;
-use super::host::with_context;
+use super::host::{HostLane, with_context};
 use super::inputs::BatchInputs;
 use super::kv_cache::KVCacheManager;
 use super::kv_import::KVImporter;
@@ -66,6 +67,8 @@ struct PythonBackend {
     requests: Py<RequestPool>,
     tensors: Py<TensorStore>,
     output_pool: Py<OutputPool>,
+    host_tasks: Py<HostLane>,
+    sampling_columns: usize,
     latents: Option<Py<LatentPool>>,
     cache: Option<Py<KVCacheManager>>,
     cache_imports: Option<Py<KVImporter>>,
@@ -511,6 +514,11 @@ impl Executor {
             requests: worker.getattr("requests")?.extract()?,
             tensors: worker.getattr("tensor_store")?.extract()?,
             output_pool: worker.getattr("output_pool")?.extract()?,
+            host_tasks: worker.getattr("host_tasks")?.extract()?,
+            sampling_columns: py
+                .import("uniserve_worker.sampling.result")?
+                .getattr("SAMPLING_COMPLETION_FIELDS")?
+                .extract()?,
             latents: worker.getattr("latent_pool")?.extract()?,
             cache: cache_manager,
             cache_imports,
@@ -643,6 +651,7 @@ impl Executor {
             visit.call(&executor.backend().requests)?;
             visit.call(&executor.backend().tensors)?;
             visit.call(&executor.backend().output_pool)?;
+            visit.call(&executor.backend().host_tasks)?;
             visit.call(&executor.backend().latents)?;
             visit.call(&executor.backend().cache)?;
             visit.call(&executor.backend().cache_imports)?;
