@@ -19,7 +19,7 @@ use uniserve_worker::{
     Submission as NativeSubmission,
 };
 use uniserve_worker_ipc::{
-    Batch as BatchPlan, ForwardStats, RequestKind, WorkerInfo, WorkerResponseError,
+    Batch as BatchPlan, ForwardStats, KvTransfer, RequestKind, WorkerInfo, WorkerResponseError,
 };
 
 use super::block_tables::BlockTables;
@@ -79,6 +79,7 @@ struct BatchState {
     predecessors: Vec<Option<CallId>>,
     numerical: Py<super::batch::BatchState>,
     inputs: Py<BatchInputs>,
+    resident_kv: Vec<Arc<KvTransfer>>,
     imports: bool,
     committed: bool,
     propagate_errors: bool,
@@ -137,6 +138,7 @@ impl PythonBackend {
             plan,
             predecessors: Vec::new(),
             inputs,
+            resident_kv: Vec::new(),
             numerical,
             imports: false,
             committed: false,
@@ -174,9 +176,24 @@ impl PythonBackend {
             let prepared = self
                 .runner
                 .bind(py)
-                .call_method1("prepare_inputs", (&batch.numerical,));
+                .call_method1("prepare_inputs", (&batch.numerical,))
+                .and_then(|_| self.prepare_kv(py, batch));
             if let Err(error) = prepared {
                 if !error.is_instance(py, self.read_backpressure.bind(py)) {
+                    // Both numerical preparation and native imports use this
+                    // cleanup path. Abandon every accepted destination before
+                    // propagating the error; physical accesses retire later.
+                    if let Err(cleanup) = BatchInputs::close(
+                        inputs.bind(py),
+                        self.tensors.get(),
+                        self.latents.as_ref().map(|pool| pool.bind(py)),
+                        self.cache_imports.as_ref().map(|imports| imports.bind(py)),
+                    ) {
+                        let _ = error.value(py).call_method1(
+                            "add_note",
+                            (format!("batch input cleanup failed: {cleanup}"),),
+                        );
+                    }
                     return Err(error);
                 }
 

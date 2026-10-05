@@ -91,7 +91,7 @@ def _input_export(
     if len(call.inputs) <= index:
         raise invalid_descriptor("host media call lacks its input product")
     product = call.inputs[index]
-    for payload in state.input_products:
+    for payload in state.batch.input_products:
         if payload.product == product:
             return payload
     raise invalid_descriptor("host media input has no published locations")

@@ -48,7 +48,6 @@ from uniserve_worker.protocol.call import (
     ImageParams,
 )
 from uniserve_worker.protocol.tensor import TensorRef
-from uniserve_worker.protocol.transfer import KvTransfer
 from uniserve_worker.sampling.metadata import TokenSelection
 
 if TYPE_CHECKING:
@@ -169,16 +168,11 @@ def prepare_latent(
     exports = kv_cache
     if exports is None:
         raise invalid_descriptor("media preparation requires KV export storage")
-    export = next(
-        (value for value in state.kv_inputs if value.source == conditioning),
-        None,
-    )
     exports.validate_conditioning(
         call.request_key,
         conditioning,
         request_pool_idx=request.request.request_pool_idx,
         visible_length=cache[1],
-        export=export if isinstance(export, KvTransfer) else None,
     )
 
     image = request.request.image
@@ -302,16 +296,11 @@ def initialize(
         raise invalid_descriptor(
             "flow conditioning requires cache export storage"
         )
-    export = next(
-        (value for value in state.kv_inputs if value.source == conditioning),
-        None,
-    )
     exports.validate_conditioning(
         call.request_key,
         conditioning,
         request_pool_idx=request.request.request_pool_idx,
         visible_length=cache[1],
-        export=export if isinstance(export, KvTransfer) else None,
     )
 
     image = request.request.image

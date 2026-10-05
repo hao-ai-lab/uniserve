@@ -5,15 +5,14 @@ these stages, in order:
 
 1. The native executor applies request commands, resolves KV input descriptions
    and collects storage completions in `BatchInputs` before this batch writes.
-2. `prepare_inputs` runs once those dependencies are done when the batch has
-   transferred inputs, and immediately otherwise. It validates each
-   cross-call transfer against its declared product, reserves its
-   destination, starts the physical fetch, and captures completion-valued
-   predicates. Each later advance of the batch calls `capture_predicates`
-   until the transferred predicate sources are ready.
+2. `prepare_inputs` binds transferred tensor and latent inputs once storage
+   dependencies are done, and captures completion-valued predicates. The
+   native executor then reserves KV imports directly from its batch plan.
+   `BatchInputs` retains all accepted inputs through consumption or failure.
+   Later advances call `capture_predicates` until their sources are ready.
 3. `reserve_outputs` runs under the native executor once inputs
    are ready. It creates the batch's `PendingOutput` records and completion
-   buffer, then reserves host tasks, cache tables, latent staging, and device
+   buffer, then reserves host tasks, cache tables, latent buffers, and device
    output writes, and publishes the transferred inputs into their stores.
 
 The native executor retires partially prepared resources through their
@@ -95,11 +94,9 @@ logger = logging.getLogger(__name__)
 def prepare_inputs(
     state: BatchState,
     *,
-    kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     output_pool: OutputPool,
-    request_tables: BlockTables | None,
     request_pool: RequestPool,
     model_runner: ModelExecutor,
     transfer_backends: Mapping[str, Transport],
@@ -118,23 +115,22 @@ def prepare_inputs(
     keep their destinations and reads, `state.inputs.started` counts the
     handled entries, and the error propagates. Read tickets return as reads
     retire whatever the batch does, so the executor calls again once one
-    returns and preparation resumes at the refused import. A KV installation
-    is not resumed part way, so a refused one fails the batch.
+    returns and preparation resumes at the refused import.
 
     Inputs read in place are registered as borrowed in `BatchInputs`: a video
     encode's input held in a shared-memory segment on this
     node, and every transferred input of a mux call. Device and encoder
     products are imported through `TensorStore.import_tensor` into
     batch-owned tensor reads, latent products into reserved `LatentPool`
-    pages, and KV inputs through `KVCacheManager.prepare_install`.
+    pages. KV imports are reserved directly by the native executor.
     `BatchInputs` retains each reservation until its consumer closes.
     """
     from uniserve_worker.execution import transfer
 
     batch = state.batch
-    entries, kv_entries = state.input_products, state.kv_inputs
+    entries = batch.input_products
     transports = transfer_backends
-    if (entries or kv_entries) and not transports:
+    if entries and not transports:
         raise unsupported_setup(
             "cross-call input requires a configured transport"
         )
@@ -463,90 +459,18 @@ def prepare_inputs(
 
         state.inputs.started = len(entries)
         resumable = False
-        for kv_transfer in kv_entries:
-            consumers = tuple(
-                call
-                for call in batch.calls
-                if call.kv_input == kv_transfer.source
-            )
-            if (
-                len(consumers) != 1
-                or consumers[0].kind is not TransferMode.KV_INSTALL
-            ):
-                raise invalid_descriptor(
-                    "KV input requires one installation consumer"
-                )
-
-            exports = kv_cache
-            cache = kv_cache
-            tables = request_tables
-            if exports is None or cache is None or tables is None:
-                raise invalid_descriptor(
-                    "KV input requires physical cache storage"
-                )
-
-            resident = request_pool.peek(kv_transfer.source.owner.request_id)
-            admission = next(
-                (
-                    row
-                    for row in batch.admissions
-                    if row.request_key == kv_transfer.source.owner
-                ),
-                None,
-            )
-            if (
-                resident is not None
-                and resident.request_key == kv_transfer.source.owner
-            ):
-                slot = int(resident.request_pool_idx)
-            elif admission is not None:
-                slot = int(admission.request_pool_idx)
-            else:
-                raise invalid_descriptor(
-                    "KV transfer has no admitted request slot"
-                )
-
-            # New units of the destination tables are zeroed by the import
-            # itself before its copy; batch cache binding skips them.
-            initialized = tuple(
-                unit
-                for allocation in batch.new_cache_units
-                if allocation.request_pool_idx == slot
-                for unit in allocation.unit_ids
-            )
-            write = exports.prepare_install(
-                kv_transfer,
-                request_pool_idx=slot,
-                tables=state.slot_tables(tables._tables, slot),
-                initialized_units=initialized,
-                transports=transports,
-            )
-            state.inputs.add(kv_transfer.source, write)
-
         _prepare_predicates(
             state,
             tensor_store=tensor_store,
             output_pool=output_pool,
             model_runner=model_runner,
         )
-    except BaseException as error:
-        if resumable and isinstance(error, ReadBackpressureError):
-            # The refused import started nothing; the earlier ones keep their
-            # reads for the call that resumes here.
+    except ReadBackpressureError as error:
+        if resumable:
+            # A refused product import started no read. The executor resumes
+            # it after transport capacity returns, retaining earlier inputs.
             raise
-        # Release every input reserved above; a cleanup failure annotates the
-        # original error rather than masking it.
-        try:
-            state.inputs.close(
-                tensor_store,
-                latent_pool,
-                None if kv_cache is None else kv_cache.imports,
-            )
-        except BaseException as cleanup_error:
-            error.add_note(f"batch input cleanup failed: {cleanup_error!r}")
-        if isinstance(error, ReadBackpressureError):
-            raise resource_error(error.message) from error
-        raise
+        raise resource_error(error.message) from error
 
 
 def _prepare_predicates(
@@ -1284,7 +1208,7 @@ def _bind_latent_inputs(
         transferred = next(
             (
                 export.value
-                for export in state.input_products
+                for export in state.batch.input_products
                 if export.product in call.tensor_inputs()
                 and isinstance(export.value, LatentTransferValue)
             ),
