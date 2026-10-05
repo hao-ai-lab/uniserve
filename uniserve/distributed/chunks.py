@@ -1,4 +1,4 @@
-"""Chunked publication and exchange over borrowed numerical communicators."""
+"""Chunked tensor exchange over borrowed numerical communicators."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def gather_chunks(
                     begin = logical_rank * rows + start
                     yield slice(begin, begin + count), sources[backend_rank]
     finally:
-        # Cancellation retires published transfers before the caller can lend
+        # Cancellation drains pending transfers before the caller can lend
         # this scratch to another projection on its computation stream.
         for work in pending[consumed:]:
             work.wait()
@@ -90,7 +90,7 @@ def produce_exchange(
     destination: torch.Tensor,
     producer: Callable[[tuple[torch.Tensor, ...]], None],
 ) -> Callable[[], tuple[torch.Tensor, ...]]:
-    """Publish equal peer payloads and return their deferred completion.
+    """Exchange equal peer payloads and return their deferred completion.
 
     Physical buffers have a leading member axis. Producer and consumer
     views use logical member order. Contiguous registered buffers permit
@@ -137,7 +137,7 @@ def _produce_chunks(
     chunk_rows: int,
     producer: ChunkProducer,
 ) -> Iterator[tuple[slice, tuple[torch.Tensor, ...]]]:
-    """Exchange row intervals as a stream-ordered producer publishes them.
+    """Exchange row intervals as a stream-ordered producer writes them.
 
     Shape axes are logical destination, row, and payload. The producer
     writes each supplied logical destination view on the current stream.

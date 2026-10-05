@@ -353,7 +353,7 @@ class RowParallelLinear(Linear):
                 yield interval, self(values, output_dtype=output_dtype)
             return
 
-        # Tensor scales span every supplied row, even when publication order
+        # Tensor scales span every supplied row, even when arrival order
         # differs from logical token order. Wait for that numerical dependency.
         rows = list(chunks)
         if all(isinstance(values, QuantizedTensor) for _, values in rows):

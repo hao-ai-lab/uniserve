@@ -271,8 +271,7 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
     with _storage(module, byte_count, device) as backing:
         storage = backing[:byte_count].view(dtype)
         # Use the same payload bound as complete-input row gathers. Producer
-        # intervals need not force smaller GEMMs or additional peer
-        # publications.
+        # intervals need not force smaller GEMMs or additional peer transfers.
         chunk_rows = _projection_chunk_rows(width, dtype)
         backend_rank = group.backend_order.index(group.rank)
         pending = []

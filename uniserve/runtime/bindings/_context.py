@@ -19,7 +19,7 @@ class _ContextPlan:
     """Map physical collective slots to global sequence coordinates.
 
     Token ownership follows topology order. A head exchange can join several
-    disjoint token intervals; context publication can order them differently
+    disjoint token intervals; context gathering can order them differently
     again. These maps preserve the logical sequences and exclude all transport
     padding, including entirely empty rank shards.
     """
@@ -158,7 +158,7 @@ class _ContextPlan:
             physical.sort(key=lambda item: item[1])
             if [index for _, index in physical] != list(range(key_tokens)):
                 raise ValueError(
-                    "context publication must cover each logical key token once"
+                    "context gathering must cover each logical key token once"
                 )
 
             self.key_indices = torch.tensor(

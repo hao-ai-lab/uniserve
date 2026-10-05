@@ -70,8 +70,8 @@ class _CollectiveWork:
 class NcclCommunicator:
     """Own ordered NCCL transport for a borrowed computation stream.
 
-    Synchronous numerical calls execute on the computation stream. Streamed
-    publications use an owned stream in the same CUDA/Green Context and join
+    Synchronous numerical calls execute on the computation stream. Asynchronous
+    collectives use an owned stream in the same CUDA/Green Context and join
     when their remote outputs are consumed. Rank ordering matches the process
     group; the model Communicator handles logical membership ordering.
     """
@@ -86,7 +86,7 @@ class NcclCommunicator:
         self._nccl = nccl
         self._stream = stream
         self._stream_owner = owner
-        # The owned publication stream exists from construction until close.
+        # The owned transfer stream exists from construction until close.
         self._transfer: torch.cuda.ExternalStream | None = None
         self._transfer_owner = None
         self._pending: _CollectiveWork | None = None
@@ -149,7 +149,7 @@ class NcclCommunicator:
 
     @property
     def transfer_stream(self) -> torch.cuda.Stream | None:
-        """Return the owned stream that carries streamed publications."""
+        """Return the owned stream for asynchronous collectives."""
         return self._transfer
 
     def _arguments(

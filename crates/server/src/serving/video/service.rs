@@ -226,14 +226,14 @@ impl VideoService {
     /// capacity (`--max-model-len`), the condition rows the condition
     /// capacity (`--max-condition-rows`), and the packed sequence (text,
     /// conditions, generated audio and video) the denoiser's sequence
-    /// capacity. Each condition's fetched media is then published to shared
+    /// capacity. Each condition's fetched media is then copied to shared
     /// memory, which the request holds until the engine retires it.
     ///
     /// # Errors
     ///
     /// Returns `invalid_request` naming the field at fault, or the rows the
     /// request needs and the capacity it exceeds, and a server error when
-    /// ingestion's own resources or the media publication fail.
+    /// ingestion's own resources or the shared-memory allocation fail.
     pub async fn prepare(
         &self,
         request_id: &ServeRequestId,

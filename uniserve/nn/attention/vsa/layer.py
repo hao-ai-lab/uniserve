@@ -471,8 +471,8 @@ class Attention(nn.Module):
             prepared.append(local, q, k, v, g, norm_rope, interval)
             intervals.append((interval.start, interval.stop))
 
-        # A gather may publish its local interval before remote intervals.
-        # Pooling and packing address logical positions, so publication order
+        # A gather may yield its local interval before remote intervals.
+        # Pooling and packing address logical positions, so arrival order
         # is independent of coverage and every tile still has exactly one
         # writer.
         cursor = query_start
