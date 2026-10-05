@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
@@ -13,7 +13,12 @@ from uniserve_worker.execution.commit import (
     publish_predicates,
     validate_outputs,
 )
+from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.dispatch import execute_calls
+from uniserve_worker.execution.forward import (
+    forward_step,
+    initialize_trajectories,
+)
 from uniserve_worker.execution.image import reserve_images
 from uniserve_worker.execution.prepare import (
     capture_predicates,
@@ -106,12 +111,71 @@ class BatchRunner:
             request_tables=self.worker.block_tables,
             request_pool=self.worker.requests,
             model_runner=self.worker.runner,
+            config=self.worker.worker_config,
+            state=state,
+        )
+
+    def prepare_diffusion(
+        self, state: BatchState, indices: Sequence[int]
+    ) -> dict[int, DiffusionState]:
+        """Borrow numerical trajectories for native-selected denoising calls."""
+        assert self.worker.latent_pool is not None
+        return initialize_trajectories(
+            state.batch.calls,
+            indices,
+            state=state,
+            kv_cache=self.worker.kv_cache,
+            latent_pool=self.worker.latent_pool,
+            request_tables=self.worker.block_tables,
+            model_runner=self.worker.runner,
+        )
+
+    def forward(
+        self,
+        state: BatchState,
+        steps: Sequence[tuple[int, int]],
+        trajectories: Mapping[int, DiffusionState],
+    ) -> tuple[int, ...]:
+        """Run one numerical step and return integrated trajectory indexes."""
+        return forward_step(
+            state.batch.calls,
+            steps,
+            trajectories,
+            state=state,
+            kv_cache=self.worker.kv_cache,
+            tensor_store=self.worker.tensor_store,
+            worker_info=self.worker.info,
+            latent_pool=self.worker.latent_pool,
+            export_transports=self.worker.export_transports,
+            request_tables=self.worker.block_tables,
+            model_runner=self.worker.runner,
             decode_state=self.worker.decode_state,
             sampling_group=self.worker.sampling_group,
             tokenizer=self.worker.tokenizer,
             config=self.worker.worker_config,
-            state=state,
         )
+
+    def finish_diffusion(
+        self,
+        state: BatchState,
+        indices: Sequence[int],
+        trajectories: Mapping[int, DiffusionState],
+    ) -> None:
+        """Capture latent results for the intervals finished by Rust."""
+        from uniserve_worker.execution import diffusion
+
+        assert self.worker.latent_pool is not None
+        for index in indices:
+            diffusion.finish(
+                state.batch.calls[index],
+                trajectories[index],
+                worker_info=self.worker.info,
+                latent_pool=self.worker.latent_pool,
+                export_transports=self.worker.export_transports,
+                request_tables=self.worker.block_tables,
+                config=self.worker.worker_config,
+                state=state,
+            )
 
     def prepare_outputs(self, state: BatchState) -> None:
         """Write completion predicates and check numerical output bounds."""

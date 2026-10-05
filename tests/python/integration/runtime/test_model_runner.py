@@ -1136,6 +1136,104 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
     assert run(4) == run(1)
 
 
+def test_unequal_denoising_intervals_match_single_step_artifacts() -> None:
+    def run(quantum: int) -> tuple[bytes, ...]:
+        worker = execution_worker()
+        admissions = tuple(
+            umm_params(
+                index + 1,
+                ImageParams(
+                    steps=steps,
+                    height=16,
+                    width=16,
+                    seed=31 + index,
+                    cfg_text_scale=4.0,
+                ),
+            )
+            for index, steps in enumerate((2, 4))
+        )
+        conditioning = []
+        latents = []
+        observations = []
+        batch_id = 1
+
+        try:
+            for index, admission in enumerate(admissions):
+                conditioning.append(
+                    _publish_conditioning(
+                        worker,
+                        admission,
+                        call_id=CallId(batch_id, 0),
+                        batch_id=batch_id,
+                    )
+                )
+                batch_id += 1
+                latent, observation = _prepare_media(
+                    worker,
+                    admission,
+                    conditioning[index],
+                    call_id=CallId(batch_id, 0),
+                    predecessor=root_parent(admission),
+                    batch_id=batch_id,
+                    seed=31 + index,
+                )
+                latents.append(latent)
+                observations.append(observation)
+                batch_id += 1
+
+            progress = [0, 0]
+            while progress != [2, 4]:
+                calls = []
+                selected = []
+                for index, total in enumerate((2, 4)):
+                    if progress[index] == total:
+                        continue
+
+                    count = min(quantum, total - progress[index])
+                    call, successor = diffusion_step_call(
+                        admissions[index].request_key,
+                        call_id=CallId(batch_id, len(calls)),
+                        predecessor=observations[index].call_id,
+                        conditioning=conditioning[index],
+                        latent=latents[index],
+                        steps=count,
+                    )
+                    calls.append(call)
+                    selected.append(index)
+                    latents[index] = successor
+                    progress[index] += count
+
+                report = finalized_report(
+                    worker,
+                    worker.submit(
+                        execution_batch(batch_id=batch_id, calls=calls)
+                    ),
+                )
+                for index, call in zip(selected, calls, strict=True):
+                    observation = record_completion(call, report)
+                    assert observation.num_completed_steps == progress[index]
+                    observations[index] = observation
+                batch_id += 1
+
+            return tuple(
+                _finalized_artifact(
+                    worker,
+                    admission,
+                    latents[index],
+                    observations[index],
+                    call_id=CallId(batch_id + index, 0),
+                    batch_id=batch_id + index,
+                )
+                for index, admission in enumerate(admissions)
+            )
+        finally:
+            worker.close()
+
+    # One request leaves the shared forward after two steps; the other
+    # continues to four. Both must retain their own noise and solver state.
+    assert run(4) == run(1)
+
+
 @pytest.mark.parametrize(
     "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
 )

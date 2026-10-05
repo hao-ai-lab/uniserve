@@ -520,9 +520,9 @@ def finish(
 ) -> PendingOutput:
     """Write a denoising call's integrated latent and stage its export.
 
-    ``forward.integrate_predictions`` calls this after applying the last
-    solver step of the call's declared interval to its staging. Scatters the
-    staging to the inactive bank and records the ``LatentUpdate`` that
+    The native executor selects completed intervals after their final
+    prediction has been integrated. This scatters the numerical values to
+    the inactive bank and records the ``LatentUpdate`` that
     advances the request from ``params.start_step`` by ``params.step_count``
     steps at the batch commit. When that final step reaches the admitted
     ``image.steps``, the alternative-prefix slots of the guidance branches

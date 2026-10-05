@@ -7,6 +7,7 @@ mod output;
 mod prepare;
 mod retirement;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
@@ -20,7 +21,8 @@ use uniserve_worker::{
     Submission as NativeSubmission,
 };
 use uniserve_worker_ipc::{
-    Batch as BatchPlan, ForwardStats, KvTransfer, RequestKind, WorkerInfo, WorkerResponseError,
+    Batch as BatchPlan, CallKind, ForwardStats, KvTransfer, MediaCall, RequestKind, WorkerInfo,
+    WorkerResponseError,
 };
 
 use super::block_tables::BlockTables;
@@ -69,6 +71,7 @@ struct PythonBackend {
     exports: Vec<Py<PyDict>>,
     retirement_devices: Vec<Py<PyAny>>,
     model_runner: Py<PyAny>,
+    forward_calls: HashSet<CallKind>,
     transports: Vec<Py<PyAny>>,
     info: WorkerInfo,
 }
@@ -478,6 +481,22 @@ impl Executor {
             }
         }
 
+        let info: WorkerInfo = depythonize(&worker.getattr("info")?.call_method0("to_mapping")?)?;
+        let model_runner = worker.getattr("runner")?;
+        let images = !model_runner.getattr("image_builder")?.is_none();
+        let videos = !model_runner.getattr("video_postprocessor")?.is_none();
+        let forward_calls = info
+            .supported_calls
+            .iter()
+            .copied()
+            .filter(|kind| match kind {
+                CallKind::Forward(_) => true,
+                CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => !videos,
+                CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding) => images,
+                _ => false,
+            })
+            .collect();
+
         let backend = PythonBackend {
             worker: worker.clone().unbind(),
             runner: runner.unbind(),
@@ -495,14 +514,15 @@ impl Executor {
             events: worker.getattr("device_events")?.extract()?,
             exports,
             retirement_devices,
-            model_runner: worker.getattr("runner")?.unbind(),
+            model_runner: model_runner.unbind(),
+            forward_calls,
             transports: worker
                 .getattr("transports")?
                 .call_method0("values")?
                 .try_iter()?
                 .map(|value| value.map(Bound::unbind))
                 .collect::<PyResult<_>>()?,
-            info: depythonize(&worker.getattr("info")?.call_method0("to_mapping")?)?,
+            info,
         };
         let executor = NativeExecutor::new(backend, capacity, distributed, collective)
             .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))?;

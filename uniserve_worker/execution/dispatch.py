@@ -11,25 +11,19 @@ from typing import TYPE_CHECKING
 
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution.forward import execute_forward
 from uniserve_worker.protocol.call import (
     Call,
-    ForwardMode,
     MediaCall,
     TransferMode,
 )
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
-
-    from uniserve.distributed.mesh import Communicator
     from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
     from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
-    from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
     from uniserve_worker.storage.tensor_store import TensorStore
@@ -37,70 +31,6 @@ if TYPE_CHECKING:
 
 
 def execute_calls(
-    scheduled: tuple[Call, ...],
-    *,
-    state: BatchState,
-    kv_cache: KVCacheManager | None,
-    tensor_store: TensorStore,
-    worker_info: WorkerInfo,
-    latent_pool: LatentPool | None,
-    media_mux: MediaMux | None,
-    export_transports: Mapping[str, Transport],
-    transports: Mapping[str, Transport],
-    request_tables: BlockTables | None,
-    request_pool: RequestPool,
-    model_runner: ModelExecutor,
-    decode_state: DecodeState | None,
-    sampling_group: Communicator | None,
-    tokenizer: PreTrainedTokenizerBase | None,
-    config: WorkerConfig,
-) -> None:
-    """Dispatch the homogeneous calls selected by the native executor."""
-    kind = scheduled[0].kind
-    images = model_runner.image_builder is not None
-    videos = model_runner.video_postprocessor is not None
-    if (
-        isinstance(kind, ForwardMode)
-        or (
-            not videos
-            and kind in {MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING}
-        )
-        or (images and kind in {MediaCall.DENOISING, MediaCall.IMAGE_DECODING})
-    ):
-        execute_forward(
-            scheduled,
-            state=state,
-            kv_cache=kv_cache,
-            tensor_store=tensor_store,
-            worker_info=worker_info,
-            latent_pool=latent_pool,
-            export_transports=export_transports,
-            request_tables=request_tables,
-            model_runner=model_runner,
-            decode_state=decode_state,
-            sampling_group=sampling_group,
-            tokenizer=tokenizer,
-            config=config,
-        )
-    else:
-        _execute_actions(
-            scheduled,
-            state=state,
-            kv_cache=kv_cache,
-            tensor_store=tensor_store,
-            worker_info=worker_info,
-            latent_pool=latent_pool,
-            media_mux=media_mux,
-            export_transports=export_transports,
-            transports=transports,
-            request_tables=request_tables,
-            request_pool=request_pool,
-            model_runner=model_runner,
-            config=config,
-        )
-
-
-def _execute_actions(
     scheduled: tuple[Call, ...],
     *,
     state: BatchState,

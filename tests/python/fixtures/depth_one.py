@@ -82,6 +82,7 @@ _CALL_PROJECTIONS: dict[tuple[RequestKey, CallId], tuple[str, int]] = {}
 # its run so the identity stays valid until the run is submitted.
 _FIXTURE_BATCHES: dict[int, Batch] = {}
 _LATENT_STEPS: dict[TensorRef, int] = {}
+_LATENT_PAGES: dict[RequestKey, tuple[int, ...]] = {}
 _MAX_CFG_BRANCHES = 1
 _REQUEST_POOL_SIZE = 1
 _CACHE_PAGES = 1
@@ -122,9 +123,11 @@ def configure_physical_pool(
     _MAX_CFG_BRANCHES = max(1, int(max_cfg_branches))
     _LATENT_PAGE_UNITS = max(1, int(latent_page_units))
     _LATENT_DOWNSAMPLE = max(1, int(latent_downsample))
+    _LATENT_PAGES.clear()
 
 
 def _reset_request(rk: RequestKey) -> None:
+    _LATENT_PAGES.pop(rk, None)
     _BLOCK_TABLES[rk] = []
     _REQUEST_POOL_INDICES.pop(rk, None)
     _UNBOUND_PAGES[rk] = []
@@ -185,6 +188,17 @@ def _latent_params(call: Call) -> LatentParams:
         * (int(image.width) // _LATENT_DOWNSAMPLE),
     )
     page_count = (latent_units + _LATENT_PAGE_UNITS - 1) // _LATENT_PAGE_UNITS
+    if call.request_key not in _LATENT_PAGES:
+        # Concurrent trajectories keep disjoint pages across their calls,
+        # as the engine's latent allocator does for admitted requests.
+        first = 1 + max(
+            (page for pages in _LATENT_PAGES.values() for page in pages),
+            default=0,
+        )
+        _LATENT_PAGES[call.request_key] = tuple(
+            range(first, first + page_count)
+        )
+
     latent_input = call.latent_input
     start_step = (
         0 if latent_input is None else _LATENT_STEPS.get(latent_input, 0)
@@ -192,7 +206,7 @@ def _latent_params(call: Call) -> LatentParams:
     return LatentParams(
         request_key=call.request_key,
         call_id=call.call_id,
-        page_table=tuple(range(1, page_count + 1)),
+        page_table=_LATENT_PAGES[call.request_key],
         latent_units=latent_units,
         height=int(image.height),
         width=int(image.width),
