@@ -344,7 +344,7 @@ fn device_index<'py>(
     Ok((target, index))
 }
 
-fn current_stream(py: Python<'_>, device: &Bound<'_, PyAny>) -> PyResult<usize> {
+pub(super) fn current_stream(py: Python<'_>, device: &Bound<'_, PyAny>) -> PyResult<usize> {
     py.import("torch.cuda")?
         .call_method1("current_stream", (device,))?
         .getattr("cuda_stream")?

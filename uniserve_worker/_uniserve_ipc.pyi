@@ -311,6 +311,31 @@ class OutputPool:
     ) -> OutputBuffer: ...
     def close(self) -> None: ...
 
+@final
+class HostBuffers:
+    """Round-robin host inputs retained until asynchronous copies finish.
+
+    Pair each acquire with record_copy after enqueueing the copy on the
+    current stream. Close drains copies and releases the host allocations.
+    """
+
+    def __new__(
+        cls,
+        shape: tuple[int, ...] | int,
+        *,
+        dtype: torch.dtype,
+        depth: int,
+        device: torch.device | str,
+    ) -> Self: ...
+    @property
+    def device(self) -> torch.device: ...
+    def acquire(self) -> tuple[int, torch.Tensor]:
+        """Wait for the next slot's previous copy and return its host tensor."""
+    def record_copy(self, slot: int) -> None:
+        """Fence this slot's copy on the current CUDA stream."""
+    def close(self) -> None:
+        """Wait for copies and release storage; subsequent acquire fails."""
+
 class EventPoolError(RuntimeError):
     """Invalid event lease ownership or stream ordering."""
 
