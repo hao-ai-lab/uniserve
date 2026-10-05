@@ -670,7 +670,7 @@ const HOST_ALLOCATOR_THP_VARIABLE: &str = "MIMALLOC_ALLOW_THP";
 /// Every rank serves varying shapes from expandable caching-allocator
 /// segments, unless the head's environment already configures the caching
 /// allocator under either name, in which case each rank receives exactly
-/// the head's variables. Publication never depends on the caching
+/// the head's variables. Tensor export never depends on the caching
 /// allocator: a device product is exported from the rank's own VMM arena or
 /// copied into its bounded VMM pool, both reserved outside the allocator.
 ///

@@ -15,7 +15,7 @@ mod error;
 /// Generation request lowering and submission support.
 pub mod generation;
 mod in_process;
-/// Engine-statistics publication to serving metrics.
+/// Export engine statistics as serving metrics.
 pub mod metrics;
 pub(crate) mod requests;
 

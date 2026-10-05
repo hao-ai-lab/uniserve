@@ -11,7 +11,7 @@ from uniserve.nn.attention import AttentionBatch
 
 @dataclass(frozen=True)
 class DenoiserInput(NumericalDenoiserInput[image.Config]):
-    """Latents and image sizes plus the attention input for cache publication."""  # noqa: E501
+    """Latents, image sizes and attention inputs for KV writes."""
 
     # ``Denoiser.forward`` rejects a dense batch or one without host query
     # lengths, and writes zero K/V at the cache layer's table entry's

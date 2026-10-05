@@ -109,8 +109,8 @@ class AttentionRowExchange:
         The runtime registers that storage as an NCCL window only for a
         layer with a context partition; under plain Ulysses it is an
         ordinary allocation. Consumers exhaust this iterator before the
-        execution owner reuses its backing. Projection callbacks retire after
-        their final row publication.
+        execution owner reuses its backing. Projection callbacks enqueue all
+        row writes before consumers receive a chunk.
         """
         group = self.parallel.ulysses_group
         rows = self.tensor.shape[0] // group.size

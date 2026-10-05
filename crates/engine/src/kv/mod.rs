@@ -876,7 +876,7 @@ impl KvCacheCoordinator {
         &self.groups
     }
 
-    /// Enables or disables prefix-cache lookup and publication.
+    /// Enables or disables prefix-cache lookup and insertion.
     pub(crate) fn set_prefix_enabled(&mut self, enabled: bool) {
         self.prefix_enabled = enabled;
     }
@@ -1258,7 +1258,7 @@ impl KvCacheCoordinator {
             return None;
         }
 
-        // Empty hashes also keep image requests out of later publication; see
+        // Empty hashes also prevent prefix-cache insertion for image requests; see
         // `probe_prefix` for why images are excluded.
         if !self.prefix_enabled || has_images {
             return Some(PrefixLookup::default());
@@ -1357,8 +1357,7 @@ impl KvCacheCoordinator {
             let page_tokens = table.shape.page_tokens;
             let complete = (computed / page_tokens).min(group_hashes.len());
             for page in published[group]..complete {
-                // A page retired before publication (never, for a caller that
-                // publishes before releasing) cannot be published anymore.
+                // Retired pages cannot be inserted into the prefix cache.
                 let Some(reference) = table.page(page) else {
                     continue;
                 };

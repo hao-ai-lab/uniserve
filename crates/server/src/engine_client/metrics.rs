@@ -1,4 +1,4 @@
-//! Prometheus publication of engine-reported scheduler statistics and of
+//! Prometheus metrics for engine-reported scheduler statistics and
 //! completed request lifecycles.
 //!
 //! `EngineClient` (in `in_process`) runs a once-per-second task that asks the
