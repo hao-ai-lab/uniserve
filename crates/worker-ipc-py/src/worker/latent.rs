@@ -332,7 +332,7 @@ impl LatentPool {
     /// `occupied`. The caller retains those views through numerical completion;
     /// omitting a live view permits its scratch range to be overwritten.
     #[pyo3(signature = (page_tables, latent_units, *, occupied=Vec::new()))]
-    fn stage(
+    pub(super) fn stage(
         &self,
         py: Python<'_>,
         page_tables: Vec<Vec<i64>>,

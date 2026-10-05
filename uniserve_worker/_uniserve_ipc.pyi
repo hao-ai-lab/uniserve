@@ -30,6 +30,8 @@ from uniserve_worker.execution.output import (
     TokenUpdate,
 )
 from uniserve_worker.execution.request import RequestResult
+from uniserve_worker.model_executor.diffusion_inputs import ImageBuilder
+from uniserve_worker.model_executor.media_inputs import MediaBuilder
 from uniserve_worker.protocol.batch import (
     Batch,
     BufferAllocation,
@@ -317,6 +319,13 @@ class BatchState:
         cache: KVCacheManager | None,
     ) -> None:
         """Adopt active prepared inputs after ordering their producer fences."""
+    def bind_latents(
+        self,
+        pool: LatentPool | None,
+        image_builder: ImageBuilder | None,
+        media_builder: MediaBuilder | None,
+    ) -> None:
+        """Bind active intervals and latent views from model dimensions."""
     def pending_outputs(self) -> tuple[PendingOutput, ...]: ...
     def pending_output(self, request_id: int) -> PendingOutput: ...
     def predicate_values(self) -> dict[CallIdentity, bool]:
