@@ -3,9 +3,8 @@
 The native executor and its `BatchRunner` drive a batch through
 these stages, in order:
 
-1. `prepare_batch` runs after Rust checks batch bounds and applies request
-   commands. It binds KV input descriptions and collects storage completions
-   in `BatchInputs` that must resolve before this batch writes.
+1. The native executor applies request commands, resolves KV input descriptions
+   and collects storage completions in `BatchInputs` before this batch writes.
 2. `prepare_inputs` runs once those dependencies are done when the batch has
    transferred inputs, and immediately otherwise. It validates each
    cross-call transfer against its declared product, reserves its
@@ -34,7 +33,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from uniserve.media import image as media_image
-from uniserve_worker._uniserve_ipc import BatchState, Completion
+from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import (
     invalid_descriptor,
     resource_error,
@@ -67,7 +66,6 @@ from uniserve_worker.protocol.transfer import (
     PosixShmTransfer,
 )
 from uniserve_worker.sampling.result import SAMPLING_COMPLETION_FIELDS
-from uniserve_worker.storage.block_tables import GroupTable
 from uniserve_worker.storage.latent_pool import LatentImport
 from uniserve_worker.storage.output import OutputBuffer
 from uniserve_worker.storage.tensor_store import (
@@ -94,195 +92,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def prepare_batch(
-    prepared: BatchState,
-    *,
-    kv_cache: KVCacheManager | None,
-    latent_pool: LatentPool | None,
-    request_tables: BlockTables | None,
-    request_pool: RequestPool,
-) -> None:
-    """Materialize KV exports and record the batch's write dependencies.
-
-    Runs after admission and release controls have been applied. KV install
-    calls receive a cache export for their source, and every latent,
-    cache-page, and KV write records the future that must complete before its
-    target storage is written.
-
-    Binds storage dependencies and records `input_products` and `kv_inputs` on
-    `prepared`; reserves nothing. Malformed batches raise
-    `invalid_descriptor` errors, for example a latent write without a
-    request slot, a KV installation whose source is neither supplied by the
-    batch nor resident in the cache, or, when the cache has pending
-    accesses, a KV installation without a request slot.
-    """
-    batch = prepared.batch
-    storage_dependencies: list[Completion] = []
-
-    pool = latent_pool
-    if pool is not None:
-        admissions = {
-            admission.request_key: admission.request_pool_idx
-            for admission in batch.admissions
-        }
-        scheduled = {
-            (call.request_key, call.call_id): call for call in batch.calls
-        }
-        for latent_params in batch.latent_params:
-            # Only preparation and denoising write trajectory pages.
-            # `LatentPool.write_dependencies` returns the retirements of the
-            # exports that hold those pages in the bank the write
-            # targets.
-            call = scheduled[(latent_params.request_key, latent_params.call_id)]
-            if call.kind not in {
-                MediaCall.LATENT_PREPARATION,
-                MediaCall.DENOISING,
-            }:
-                continue
-
-            request = request_pool.peek(latent_params.request_key.request_id)
-            request_slot = (
-                admissions.get(latent_params.request_key)
-                if request is None
-                else request.request_pool_idx
-            )
-            if request_slot is None:
-                raise invalid_descriptor(
-                    "latent write has no admitted request slot"
-                )
-            storage_dependencies.extend(
-                pool.write_dependencies(request_slot, latent_params.page_table)
-            )
-
-    # Install calls may reference sources without a scheduler-supplied
-    # export; `KVCacheManager.get_export` then supplies the source's
-    # resident export and rejects a source that is not resident.
-    entries = list(batch.input_products)
-    kv_entries = list(batch.kv_inputs)
-    supplied = {export.source for export in kv_entries}
-    for call in batch.calls:
-        if call.kind is not TransferMode.KV_INSTALL:
-            continue
-        source = call.kv_input
-        if source is None:
-            raise invalid_descriptor("KV installation requires a source export")
-        if source not in supplied:
-            if kv_cache is None:
-                raise invalid_descriptor(
-                    "KV installation requires cache export storage"
-                )
-            kv_entries.append(kv_cache.get_export(source))
-            supplied.add(source)
-
-    # Without pending cache accesses there is nothing a write could wait for,
-    # so the unit scan is skipped.
-    cache = kv_cache
-    tables = request_tables
-    if cache is not None and tables is not None and cache.has_pending_accesses:
-        request_slots = {
-            admission.request_key: admission.request_pool_idx
-            for admission in batch.admissions
-        }
-        kv_inputs = {export.source: export for export in kv_entries}
-
-        # New units are covered in full, since a unit leaving one group may
-        # hold any tokens of another. A forward row that writes KV covers its
-        # `query_lens` tokens after the `seq_lens - query_lens` tokens
-        # already in its sequence, in every group.
-        for allocation in batch.new_cache_units:
-            storage_dependencies.extend(
-                cache.write_dependencies(
-                    cache.unit_spans(cache.validate_units(allocation.unit_ids))
-                )
-            )
-
-        for row, write_kv in enumerate(batch.write_kv):
-            if not write_kv:
-                continue
-            start = batch.seq_lens[row] - batch.query_lens[row]
-            for table in _slot_tables(
-                batch, tables, batch.request_pool_indices[row]
-            ):
-                storage_dependencies.extend(
-                    cache.write_dependencies(
-                        table.spans(start, batch.query_lens[row])
-                    )
-                )
-
-        # An installation overwrites the published extent of its source into
-        # the destination request's unit tables.
-        for call in batch.calls:
-            if call.kind is not TransferMode.KV_INSTALL:
-                continue
-            request = request_pool.peek(call.request_key.request_id)
-            slot = (
-                request_slots.get(call.request_key)
-                if request is None
-                else request.request_pool_idx
-            )
-            if slot is None:
-                raise invalid_descriptor(
-                    "KV installation has no admitted request slot"
-                )
-            source = call.kv_input
-            if source is None:
-                raise invalid_descriptor(
-                    "KV installation requires a source export"
-                )
-            kv_export = kv_inputs.get(source)
-            if kv_export is not None:
-                # Each group's import writes at most the suffix after the
-                # base that its destination table still holds.
-                end = kv_export.exported_extent
-                for table in _slot_tables(batch, tables, slot):
-                    start = max(
-                        kv_export.base_extent,
-                        table.start_page * table.shape.page_tokens,
-                    )
-                    if start < end:
-                        storage_dependencies.extend(
-                            cache.write_dependencies(
-                                table.spans(start, end - start)
-                            )
-                        )
-
-    prepared.inputs.set_dependencies(storage_dependencies)
-    prepared.input_products = tuple(entries)
-    prepared.kv_inputs = tuple(kv_entries)
-
-
-def _slot_tables(
-    batch: Batch, tables: BlockTables, slot: int
-) -> tuple[GroupTable, ...]:
-    """Return a slot's table of every cache group for this batch.
-
-    A block table supplied by the batch takes precedence over the table an
-    earlier batch installed.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when a group has neither.
-    """
-    supplied = {
-        table.group_id: table
-        for table in batch.block_tables
-        if table.request_pool_idx == slot
-    }
-    result = []
-    for group, shape in enumerate(tables.groups):
-        table = supplied.get(group)
-        result.append(
-            tables.table(slot, group)
-            if table is None
-            else GroupTable(
-                shape,
-                int(table.start_page),
-                tuple(int(unit) for unit in table.unit_ids),
-                int(table.allocated_tokens),
-            )
-        )
-    return tuple(result)
-
-
 def prepare_inputs(
     state: BatchState,
     *,
@@ -298,9 +107,9 @@ def prepare_inputs(
 ) -> None:
     """Reserve transfer destinations, start their fetches, and stage predicates.
 
-    The executor calls this after `prepare_batch`; when the batch has
-    transferred inputs, the executor first waits for the batch's storage
-    dependencies. Each cross-call input descriptor is validated against its
+    The executor calls this after preparing storage dependencies. For
+    transferred inputs, it first waits for those dependencies. Each
+    cross-call input descriptor is validated against its
     declared product before a destination is reserved; on failure, every
     input reserved so far is released before the error propagates.
 
@@ -708,7 +517,7 @@ def prepare_inputs(
             write = exports.prepare_install(
                 kv_transfer,
                 request_pool_idx=slot,
-                tables=_slot_tables(batch, tables, slot),
+                tables=state.slot_tables(tables._tables, slot),
                 initialized_units=initialized,
                 transports=transports,
             )

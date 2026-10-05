@@ -155,7 +155,7 @@ impl LatentExport {
 
 // Keep the public wrappers alive for Python GC while the core uses their
 // stable native objects. There is one owner of each import/export lifecycle.
-struct ImportRef {
+pub(super) struct ImportRef {
     owner: Py<LatentImport>,
     inner: Arc<NativeLatentImport<TransferRef>>,
 }
@@ -168,7 +168,7 @@ impl Deref for ImportRef {
     }
 }
 
-struct ExportRef {
+pub(super) struct ExportRef {
     owner: Py<LatentExport>,
     inner: Arc<NativeLatentExport<CompletionRef>>,
 }
@@ -199,7 +199,7 @@ pub(crate) struct LatentPool {
     #[pyo3(get)]
     timesteps: Py<PyAny>,
     page_host: Py<HostBuffers>,
-    inner: NativeLatentPool<ImportRef, ExportRef>,
+    pub(super) inner: NativeLatentPool<ImportRef, ExportRef>,
     #[pyo3(get)]
     exports: Py<PyDict>,
 }

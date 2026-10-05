@@ -17,7 +17,6 @@ from uniserve_worker.execution.dispatch import execute_calls
 from uniserve_worker.execution.image import reserve_images
 from uniserve_worker.execution.prepare import (
     capture_predicates,
-    prepare_batch,
     prepare_inputs,
     reserve_outputs,
 )
@@ -42,15 +41,8 @@ class BatchRunner:
             worker.sampling_group is not None and worker.sampling_group.size > 1
         )
 
-    def prepare(self, state: BatchState) -> bool:
-        """Reserve numerical inputs and report whether any require imports."""
-        prepare_batch(
-            state,
-            kv_cache=self.worker.kv_cache,
-            latent_pool=self.worker.latent_pool,
-            request_tables=self.worker.block_tables,
-            request_pool=self.worker.requests,
-        )
+    def prepare(self, state: BatchState) -> None:
+        """Prepare inline image inputs while other batches can advance."""
         # Inline images prepare on the host lane while the executor advances
         # other batches. Their tasks join the native batch input dependencies.
         reserve_images(
@@ -59,7 +51,6 @@ class BatchRunner:
             request_pool=self.worker.requests,
             model_runner=self.worker.runner,
         )
-        return bool(state.input_products or state.kv_inputs)
 
     def prepare_inputs(self, state: BatchState) -> None:
         """Bind tensor views and submit copies into reserved destinations."""

@@ -1,15 +1,18 @@
 //! Request commands and input ownership around numerical batch execution.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
 use uniserve_core::CallId;
-use uniserve_worker_ipc::{BatchCommand, CallKind, MediaCall};
+use uniserve_worker_ipc::{BatchCommand, CallKind, MediaCall, TransferMode};
 
 use super::super::error::{invalid, native_error};
 use super::super::inputs::BatchInputs;
 use super::{BatchState, PythonBackend};
+use crate::convert;
 
 impl PythonBackend {
     pub(super) fn prepare_batch(&self, py: Python<'_>, batch: &mut BatchState) -> PyResult<()> {
@@ -91,16 +94,216 @@ impl PythonBackend {
 
         self.release_predecessors(py, batch, false)?;
         batch.retirement.revoke(py, self)?;
-        batch.imports = self
-            .runner
+        self.prepare_storage(py, batch)?;
+        self.runner
             .bind(py)
-            .call_method1("prepare", (&batch.numerical,))?
+            .call_method1("prepare", (&batch.numerical,))?;
+        Ok(())
+    }
+
+    /// Resolve imported KV and storage hazards before any numerical write.
+    /// All Starts are already installed; these queries reserve no storage.
+    fn prepare_storage(&self, py: Python<'_>, batch: &mut BatchState) -> PyResult<()> {
+        let plan = &batch.plan;
+        let requests = self.requests.borrow(py);
+        let mut dependencies = Vec::new();
+
+        if let Some(pool) = &self.latents {
+            let mut pool = pool.borrow_mut(py);
+            pool.inner.reap();
+            let writes: HashSet<_> = plan
+                .calls
+                .iter()
+                .filter(|call| {
+                    matches!(
+                        call.code,
+                        CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
+                    )
+                })
+                .map(|call| (call.request_key, call.call_id))
+                .collect();
+
+            for params in &plan.latent_params {
+                if !writes.contains(&(params.request_key, params.call_id)) {
+                    continue;
+                }
+                let slot = requests
+                    .pool
+                    .get(params.request_key.request_id.0)
+                    .map_err(|error| native_error(py, error))?
+                    .slot();
+                let slot = pool
+                    .inner
+                    .slot(slot as i64)
+                    .map_err(|error| native_error(py, error))?;
+                let pages = params
+                    .page_table
+                    .iter()
+                    .map(|&page| page as usize)
+                    .collect::<Vec<_>>();
+                dependencies.extend(
+                    pool.inner
+                        .write_dependencies(slot, &pages)
+                        .iter()
+                        .map(|completion| completion.owner.clone_ref(py)),
+                );
+            }
+        }
+
+        // Supplied transfers take precedence. Retain resident descriptors by
+        // shared reference so channel payloads are not copied during lookup.
+        let mut resident = Vec::new();
+        let mut supplied: HashSet<_> = plan.kv_inputs.iter().map(|export| export.source).collect();
+        for call in &plan.calls {
+            if call.code != CallKind::Transfer(TransferMode::KvInstall) {
+                continue;
+            }
+            let source = call
+                .kv_input
+                .ok_or_else(|| invalid(py, "KV installation requires a source export"))?;
+            if supplied.insert(source) {
+                let cache = self
+                    .cache
+                    .as_ref()
+                    .ok_or_else(|| invalid(py, "KV installation requires cache export storage"))?;
+                let cache = cache.borrow(py);
+                let export = cache
+                    .inner
+                    .resident(source)
+                    .ok_or_else(|| invalid(py, "KV export buffer is not resident"))?;
+                resident.push(Arc::clone(export));
+            }
+        }
+
+        if let (Some(cache), Some(tables)) = (&self.cache, &self.tables) {
+            let mut cache = cache.borrow_mut(py);
+            if cache.inner.has_pending_accesses() {
+                let tables = tables.borrow(py);
+                let tables = &tables.tables;
+                let unit_tokens = tables
+                    .groups()
+                    .iter()
+                    .map(|group| group.page_tokens)
+                    .max()
+                    .unwrap_or(0);
+                let mut spans = Vec::new();
+
+                // A recycled unit can have belonged to another cache group.
+                // Cover its full token capacity before its new owner writes.
+                for allocation in &plan.new_cache_units {
+                    spans.extend(
+                        allocation
+                            .unit_ids
+                            .iter()
+                            .map(|unit| (unit.0, 0, unit_tokens)),
+                    );
+                }
+                for (row, &write_kv) in plan.forward.write_kv.iter().enumerate() {
+                    if !write_kv {
+                        continue;
+                    }
+                    let length = u64::from(plan.forward.query_lens[row]);
+                    let start = u64::from(plan.forward.seq_lens[row]) - length;
+                    for table in tables
+                        .for_batch(plan.forward.request_pool_indices[row], &plan.block_tables)
+                        .map_err(|error| native_error(py, error))?
+                    {
+                        spans.extend(
+                            table
+                                .spans(start, length)
+                                .map_err(|error| native_error(py, error))?,
+                        );
+                    }
+                }
+
+                let imports: HashMap<_, _> = plan
+                    .kv_inputs
+                    .iter()
+                    .chain(resident.iter().map(AsRef::as_ref))
+                    .map(|export| (export.source, export))
+                    .collect();
+                for call in &plan.calls {
+                    if call.code != CallKind::Transfer(TransferMode::KvInstall) {
+                        continue;
+                    }
+                    let Some(export) = call.kv_input.and_then(|source| imports.get(&source)) else {
+                        continue;
+                    };
+                    let slot = requests
+                        .pool
+                        .get(call.request_key.request_id.0)
+                        .map_err(|error| native_error(py, error))?
+                        .slot() as u32;
+                    for table in tables
+                        .for_batch(slot, &plan.block_tables)
+                        .map_err(|error| native_error(py, error))?
+                    {
+                        let start = u64::from(export.base_extent)
+                            .max(u64::from(table.start_page) * u64::from(table.shape.page_tokens));
+                        let end = u64::from(export.exported_extent);
+                        if start < end {
+                            spans.extend(
+                                table
+                                    .spans(start, end - start)
+                                    .map_err(|error| native_error(py, error))?,
+                            );
+                        }
+                    }
+                }
+
+                // Query the combined footprint once. One execution completion
+                // can cover many rows and groups in the same batch.
+                dependencies.extend(
+                    cache
+                        .inner
+                        .write_dependencies(&spans)
+                        .into_iter()
+                        .map(|completion| completion.owner.clone_ref(py)),
+                );
+            }
+        }
+        drop(requests);
+
+        batch.imports =
+            !plan.input_products.is_empty() || !plan.kv_inputs.is_empty() || !resident.is_empty();
+        batch.inputs.borrow_mut(py).set_dependencies(dependencies);
+        let numerical_batch = batch.numerical.borrow(py).batch.clone_ref(py);
+        let inputs = numerical_batch
+            .bind(py)
+            .getattr("input_products")?
             .extract()?;
+        let supplied: Py<PyTuple> = numerical_batch.bind(py).getattr("kv_inputs")?.extract()?;
+        let kv_inputs = if resident.is_empty() {
+            supplied
+        } else {
+            let additional = resident
+                .iter()
+                .map(|export| convert::kv_transfer_to_py(py, export))
+                .collect::<PyResult<Vec<_>>>()?;
+            let values = supplied
+                .bind(py)
+                .iter()
+                .chain(additional)
+                .collect::<Vec<_>>();
+            PyTuple::new(py, values)?.unbind()
+        };
+        let mut numerical = batch.numerical.borrow_mut(py);
+        numerical.input_products = inputs;
+        numerical.kv_inputs = kv_inputs;
         Ok(())
     }
 
     fn validate_batch(&self, py: Python<'_>, batch: &BatchState) -> PyResult<()> {
         let plan = &batch.plan;
+        if let Some(cache) = &self.info.kv_cache
+            && plan
+                .new_cache_units
+                .iter()
+                .flat_map(|allocation| &allocation.unit_ids)
+                .any(|unit| unit.0 >= cache.num_units)
+        {
+            return Err(invalid(py, "KV allocation exceeds the fixed physical pool"));
+        }
         if let Some(allocation) = plan
             .buffer_allocations
             .iter()

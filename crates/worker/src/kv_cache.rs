@@ -61,8 +61,8 @@ impl<C> Default for KVCacheManager<C> {
 }
 
 impl<C> KVCacheManager<C> {
-    pub fn resident(&self, buffer: BufferId) -> Option<&KvTransfer> {
-        self.resident.get(&buffer).map(AsRef::as_ref)
+    pub fn resident(&self, buffer: BufferId) -> Option<&Arc<KvTransfer>> {
+        self.resident.get(&buffer)
     }
 
     /// The latest extent sent to this destination, retained even after its
@@ -108,7 +108,7 @@ impl<C> KVCacheManager<C> {
             let existing = resident
                 .get(buffer)
                 .copied()
-                .or_else(|| self.resident(*buffer));
+                .or_else(|| self.resident(*buffer).map(AsRef::as_ref));
             if existing.is_some_and(|existing| existing != transfer) {
                 return Err(Error::Invalid(
                     "KV export conflicts with its resident buffer".into(),
@@ -593,7 +593,10 @@ mod tests {
             cache.destination_base(first.source.owner, "decoder"),
             Some((first.source, 0))
         );
-        assert_eq!(cache.resident(first.source), Some(&first));
+        assert_eq!(
+            cache.resident(first.source).map(AsRef::as_ref),
+            Some(&first)
+        );
         assert_eq!(cache.resident(second.source), None);
 
         third.base = Some(second.source);
@@ -609,7 +612,10 @@ mod tests {
         ]);
         assert_eq!(cache.resident(first.source), None);
         assert_eq!(cache.resident(second.source), None);
-        assert_eq!(cache.resident(third.source), Some(&third));
+        assert_eq!(
+            cache.resident(third.source).map(AsRef::as_ref),
+            Some(&third)
+        );
         assert_eq!(
             cache.destination_base(first.source.owner, "decoder"),
             Some((third.source, 0))
@@ -635,7 +641,7 @@ mod tests {
         cache.apply_exports(vec![], installs);
         cache.release_calls(&[(first.source.owner, first.source.producer_call_id)]);
         assert_eq!(cache.resident(first.source), None);
-        assert_eq!(cache.resident(local), Some(&first));
+        assert_eq!(cache.resident(local).map(AsRef::as_ref), Some(&first));
 
         let next = empty_transfer(
             BufferId {
@@ -650,7 +656,10 @@ mod tests {
         cache.validate_install(&first)?;
         assert!(cache.validate_install(&next).is_err());
         assert_eq!(cache.resident(local), None);
-        assert_eq!(cache.resident(other.source), Some(&other));
+        assert_eq!(
+            cache.resident(other.source).map(AsRef::as_ref),
+            Some(&other)
+        );
         assert!(cache.validate_install(&other).is_err());
         Ok(())
     }

@@ -145,6 +145,34 @@ impl BlockTables {
         &self.first_table
     }
 
+    pub fn groups(&self) -> &[GroupShape] {
+        &self.groups
+    }
+
+    /// Borrow a slot's tables before a batch installs its assignments.
+    /// Supplied groups replace resident groups only in this returned view.
+    pub fn for_batch(&self, slot: u32, assignments: &[BlockTable]) -> Result<Vec<Arc<GroupTable>>> {
+        let supplied: HashMap<_, _> = assignments
+            .iter()
+            .filter(|table| table.request_pool_idx == slot)
+            .map(|table| (table.group_id, table))
+            .collect();
+
+        self.groups
+            .iter()
+            .enumerate()
+            .map(|(group, &shape)| match supplied.get(&(group as u32)) {
+                Some(table) => Ok(Arc::new(GroupTable {
+                    shape,
+                    start_page: table.start_page,
+                    units: table.unit_ids.clone(),
+                    allocated_tokens: table.allocated_tokens,
+                })),
+                None => self.table(slot, group as u32),
+            })
+            .collect()
+    }
+
     /// Validate the whole installation before computing any device changes.
     /// After staging succeeds, commit this update on the same owner thread.
     /// A failed staging operation discards the update and leaves the host
@@ -376,6 +404,52 @@ mod tests {
 
         tables.release(&[1]);
         assert!(tables.coordinates(1, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_assignments_replace_only_supplied_groups_until_commit() -> Result<()> {
+        let groups = vec![
+            GroupShape::new(4, 1, None)?,
+            GroupShape::new(8, 2, Some(8))?,
+        ];
+        let mut tables = BlockTables::new(groups, 1, 2)?;
+        let first = BlockTable {
+            request_pool_idx: 1,
+            group_id: 0,
+            start_page: 0,
+            unit_ids: vec![UnitId(1), UnitId(2)],
+            allocated_tokens: 8,
+        };
+        assert!(tables.for_batch(1, std::slice::from_ref(&first)).is_err());
+
+        let update = tables.prepare(&[
+            first,
+            BlockTable {
+                request_pool_idx: 1,
+                group_id: 1,
+                start_page: 0,
+                unit_ids: vec![UnitId(3), UnitId(4)],
+                allocated_tokens: 8,
+            },
+        ])?;
+        tables.commit(update);
+
+        let assignments = [BlockTable {
+            request_pool_idx: 1,
+            group_id: 1,
+            start_page: 1,
+            unit_ids: vec![UnitId(5), UnitId(6)],
+            allocated_tokens: 16,
+        }];
+        let batch = tables.for_batch(1, &assignments)?;
+        assert_eq!(batch[0].spans(2, 4)?, vec![(1, 2, 2), (2, 0, 2)]);
+        assert_eq!(batch[1].spans(10, 4)?, vec![(5, 2, 4), (6, 2, 4)]);
+        assert_eq!(tables.table(1, 1)?.spans(2, 4)?, vec![(3, 2, 4), (4, 2, 4)]);
+
+        let update = tables.prepare(&assignments)?;
+        tables.commit(update);
+        assert_eq!(tables.table(1, 1)?.spans(10, 4)?, batch[1].spans(10, 4)?);
         Ok(())
     }
 
