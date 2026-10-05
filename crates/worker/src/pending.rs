@@ -44,6 +44,8 @@ pub struct PendingOutput {
     pub candidate_range: Option<(usize, usize)>,
     /// Element offset and length of [step outcome | canvas token ids].
     pub canvas_range: Option<(usize, usize)>,
+    /// Present only after this call's numerical latent consumer completes.
+    pub latent_update: Option<LatentUpdate>,
     tensor_outputs: Vec<TensorRef>,
     products: Vec<TensorExport>,
     speculation: Option<Speculation>,
@@ -78,6 +80,7 @@ impl PendingOutput {
             prompt_logprob_ranges: Vec::new(),
             candidate_range: None,
             canvas_range: None,
+            latent_update: None,
             tensor_outputs,
             products: Vec::new(),
             speculation: None,
@@ -185,13 +188,11 @@ impl PendingOutput {
     /// Mirror a validated physical trajectory commit in the call's progress.
     /// Releasing the trajectory ends its solver sequence.
     pub fn apply_latent_update(&mut self, update: &LatentUpdate) {
-        if update.params.is_some() {
-            self.progress.flow_step = if update.release {
-                0
-            } else {
-                update.step as u64
-            };
-        }
+        self.progress.flow_step = if update.release {
+            0
+        } else {
+            update.step as u64
+        };
     }
 
     /// Verification initializes KV for the full draft. Acceptance later makes

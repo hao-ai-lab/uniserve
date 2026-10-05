@@ -477,11 +477,11 @@ def prepare_forward_rows(
         if index in trajectories:
             guide, timestep, _step = step_inputs[index]
             row = state.pending_output(call.request_key.request_id)
-            params = row.latent.input_params
-            buffer = row.latent.buffer
+            params = row.latent_params
+            buffer = row.latent_buffer
             if params is None or buffer is None:
                 raise invalid_descriptor(
-                    "trajectory call has no staged latent inputs"
+                    "trajectory call has no bound latent inputs"
                 )
 
             # The model sees only the first ``latent_units`` rows of the
@@ -581,11 +581,11 @@ def prepare_forward_rows(
                 state=state,
             )
             row = state.pending_output(call.request_key.request_id)
-            params = row.latent.input_params
-            buffer = row.latent.buffer
+            params = row.latent_params
+            buffer = row.latent_buffer
             if params is None or buffer is None:
                 raise invalid_descriptor(
-                    "trajectory call has no staged latent inputs"
+                    "trajectory call has no bound latent inputs"
                 )
 
             forward.append(
@@ -782,11 +782,11 @@ def integrate_predictions(
         call = scheduled[index]
         _, timestep, step = step_inputs[index]
         row = state.pending_output(call.request_key.request_id)
-        params = row.latent.input_params
-        buffer = row.latent.buffer
+        params = row.latent_params
+        buffer = row.latent_buffer
         if params is None or buffer is None:
             raise invalid_descriptor(
-                "trajectory call has no staged latent inputs"
+                "trajectory call has no bound latent inputs"
             )
 
         # The solver updates only the model-visible portion of this

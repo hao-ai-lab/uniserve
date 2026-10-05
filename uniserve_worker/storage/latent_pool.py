@@ -9,30 +9,18 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 
 import torch
 
 from uniserve.runtime.device import fill_cpu_ints
 from uniserve_worker._uniserve_ipc import (
+    LatentBuffer,
     LatentExport,
     LatentImport,
     LatentPool,
     LatentUpdate,
 )
-from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.storage.host_buffers import HostBuffers
-
-
-@dataclass(frozen=True, slots=True)
-class LatentBuffer:
-    """A fixed page-index view and its contiguous, padded latent values."""
-
-    page_table: tuple[int, ...]
-    # [len(page_table)] int64, in the pool's device page-index buffer.
-    pages: torch.Tensor
-    # [len(page_table) * page_units, latent_width], with final-page padding.
-    value: torch.Tensor
 
 
 def _allocate(
@@ -77,15 +65,12 @@ def _startup_values(pool: LatentPool, rows: int, units: int):
             torch.cuda.current_stream(pool.device).synchronize()
 
 
-def _bind(
-    page_tables: Sequence[Sequence[int]],
+def _copy_pages(
+    pages: Sequence[int],
     page_offset: int,
-    page_units: int,
     page_table_buffer: torch.Tensor,
-    step_buffer: torch.Tensor,
     page_host: HostBuffers,
-) -> tuple[LatentBuffer, ...]:
-    pages = tuple(page for table in page_tables for page in table)
+) -> None:
     slot, host = page_host.acquire()
     fill_cpu_ints(host, pages)
     page_table_buffer[page_offset : page_offset + len(pages)].copy_(
@@ -93,66 +78,24 @@ def _bind(
     )
     page_host.record_copy(slot)
 
-    result = []
-    for table in page_tables:
-        end = page_offset + len(table)
-        result.append(
-            LatentBuffer(
-                tuple(table),
-                page_table_buffer[page_offset:end],
-                step_buffer[page_offset * page_units : end * page_units],
-            )
-        )
-        page_offset = end
-    return tuple(result)
-
-
-def _check_buffer(
-    buffer: LatentBuffer, units: int, storage: torch.Tensor
-) -> None:
-    page_units, width = storage.shape[-2:]
-    pages = (units + page_units - 1) // page_units
-    if (
-        buffer.pages.device != storage.device
-        or buffer.pages.dtype != torch.int64
-    ):
-        raise invalid_descriptor(
-            "latent page table is not in fixed device buffers"
-        )
-    if (
-        buffer.value.device != storage.device
-        or buffer.value.dtype != storage.dtype
-        or buffer.value.ndim != 2
-        or buffer.value.shape[1] != width
-    ):
-        raise invalid_descriptor("latent value is not in fixed device buffers")
-    if (
-        buffer.pages.numel() != pages
-        or buffer.value.shape[0] != pages * page_units
-    ):
-        raise invalid_descriptor(
-            "latent buffer does not establish its logical extent"
-        )
-
 
 def _gather(
-    storage: torch.Tensor, bank: int, buffer: LatentBuffer, units: int
+    storage: torch.Tensor,
+    bank: int,
+    pages: torch.Tensor,
+    value: torch.Tensor,
+    units: int,
 ) -> torch.Tensor:
     torch.index_select(
-        storage[bank],
-        0,
-        buffer.pages,
-        out=buffer.value.view(len(buffer.page_table), *storage.shape[-2:]),
+        storage[bank], 0, pages, out=value.view(-1, *storage.shape[-2:])
     )
-    return buffer.value[:units]
+    return value[:units]
 
 
-def _scatter(storage: torch.Tensor, bank: int, buffer: LatentBuffer) -> None:
-    storage[bank].index_copy_(
-        0,
-        buffer.pages,
-        buffer.value.view(len(buffer.page_table), *storage.shape[-2:]),
-    )
+def _scatter(
+    storage: torch.Tensor, bank: int, pages: torch.Tensor, value: torch.Tensor
+) -> None:
+    storage[bank].index_copy_(0, pages, value.view(-1, *storage.shape[-2:]))
 
 
 def _spans(

@@ -76,6 +76,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<buffer::BufferBinding>()?;
     module.add_class::<buffer::BufferPool>()?;
     module.add_class::<latent::LatentPool>()?;
+    module.add_class::<latent::LatentBuffer>()?;
     module.add_class::<latent::LatentImport>()?;
     module.add_class::<latent::LatentExport>()?;
     module.add_class::<latent::LatentUpdate>()?;

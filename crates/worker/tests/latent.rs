@@ -22,7 +22,7 @@ fn buffer(slot: u64) -> BufferId {
 fn initial(slot: i64, pages: &[u32], units: u32) -> LatentUpdate {
     LatentUpdate {
         request_pool_idx: slot,
-        params: Some(LatentParams {
+        params: LatentParams {
             request_key: buffer(slot as u64).owner,
             call_id: CallId::new(1, 0),
             page_table: pages.to_vec(),
@@ -31,7 +31,7 @@ fn initial(slot: i64, pages: &[u32], units: u32) -> LatentUpdate {
             width: units * 16,
             start_step: 0,
             step_count: 1,
-        }),
+        },
         expected_generation: 0,
         expected_step: 0,
         generation: 1,

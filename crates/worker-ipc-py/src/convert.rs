@@ -799,7 +799,7 @@ pub(crate) fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'
                 .into_pyobject(py)?
                 .into_any(),
             record_tuple(py, &run.latent_params, |params| {
-                latent_params_to_py(py, params, &mut native)
+                latent_params_with_context(py, params, &mut native)
             })?
             .into_any(),
             record_tuple(py, &run.decode_ranges, |params| {
@@ -823,7 +823,7 @@ pub(crate) fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'
 
 /// Converts one trajectory's solver-step range and latent page table into a
 /// Python `LatentParams` record.
-fn latent_params_to_py<'py>(
+fn latent_params_with_context<'py>(
     py: Python<'py>,
     params: &LatentParams,
     context: &mut RequestConversion<'py>,
@@ -847,6 +847,13 @@ fn latent_params_to_py<'py>(
     dict.set_item(intern!(py, "start_step"), params.start_step)?;
     dict.set_item(intern!(py, "step_count"), params.step_count)?;
     construct(py, "LatentParams", &dict)
+}
+
+pub(crate) fn latent_params_to_py<'py>(
+    py: Python<'py>,
+    params: &LatentParams,
+) -> PyResult<Bound<'py, PyAny>> {
+    latent_params_with_context(py, params, &mut RequestConversion::new(py)?)
 }
 
 /// Converts the cursor and unit bound of one diffusion decode call into a

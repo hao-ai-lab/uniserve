@@ -7,15 +7,10 @@ Rust owns readiness, result decoding, request acceptance and output retirement.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 
 from uniserve_worker._uniserve_ipc import PendingOutput
-from uniserve_worker.protocol.batch import LatentParams
-from uniserve_worker.protocol.identity import BufferId
 from uniserve_worker.sampling.result import LogprobValues, SamplerRow
-from uniserve_worker.storage.latent_pool import LatentBuffer, LatentUpdate
 from uniserve_worker.storage.output import OutputBuffer
-from uniserve_worker.transport.exports import ExportLocations
 
 __all__ = [
     "PendingOutput",
@@ -84,13 +79,3 @@ def capture_samples(
                 details[key] = capture_logprobs(sample.batch.logprobs, output)
             scores = details[key].get(sample.index)
         request.set_sampling((*span, sample.index), scores)
-
-
-@dataclass(slots=True)
-class LatentResult:
-    """Borrowed trajectory inputs, prepared storage, and visibility updates."""
-
-    update: LatentUpdate
-    input_params: LatentParams | None = None
-    buffer: LatentBuffer | None = None
-    exports: dict[BufferId, ExportLocations] = field(default_factory=dict)

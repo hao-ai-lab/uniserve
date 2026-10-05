@@ -122,7 +122,7 @@ def _publish_current_latent(
 ) -> TensorExport:
     """Publish the committed trajectory's current latent pages as a product.
 
-    ``LatentPool.reserve_current_export`` requires the staged start
+    ``LatentPool.reserve_current_export`` requires the bound start
     step, the input's generation, units, raster and pages to match the
     slot's committed trajectory. The product must be the call's declared
     latent output, and export leaves the request's generation and step
@@ -134,10 +134,10 @@ def _publish_current_latent(
         )
 
     row = state.pending_output(call.request_key.request_id)
-    params = row.latent.input_params
-    buffer = row.latent.buffer
+    params = row.latent_params
+    buffer = row.latent_buffer
     if params is None or buffer is None:
-        raise invalid_descriptor("trajectory call has no staged latent inputs")
+        raise invalid_descriptor("trajectory call has no bound latent inputs")
 
     source = latent_pool.reserve_current_export(
         product,
@@ -179,9 +179,9 @@ def export_latent_source(
     bank until its readers retire. The locators are recorded on the
     product's pending output.
     """
-    params = row.latent.input_params
+    params = row.latent_params
     if params is None:
-        raise invalid_descriptor("latent export has no staged parameters")
+        raise invalid_descriptor("latent export has no bound parameters")
 
     request = state.pending_output(product.request_key.request_id)
     transports = export_transports
@@ -208,7 +208,7 @@ def export_latent_source(
         consumers=row.call.consumer_slots,
     )
     request.exported_locators.extend(locations)
-    request.latent.exports[product.buffer_id] = tuple(
+    request.latent_exports[product.buffer_id] = tuple(
         (transports[location.backend], location) for location in locations
     )
 

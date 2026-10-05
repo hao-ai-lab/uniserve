@@ -205,11 +205,10 @@ def prepare_latent(
 
     # Noise is generated directly into the request-owned buffer, then installed
     # in the pool before its generation becomes visible to downstream calls.
-    row = state.pending_output(call.request_key.request_id)
-    params = row.latent.input_params
-    buffer = row.latent.buffer
+    params = request.latent_params
+    buffer = request.latent_buffer
     if params is None or buffer is None:
-        raise invalid_descriptor("trajectory call has no staged latent inputs")
+        raise invalid_descriptor("trajectory call has no bound latent inputs")
 
     pool = latent_pool
     # ``LatentPool.initialize`` writes the whole buffer, so the page padding
@@ -221,7 +220,7 @@ def prepare_latent(
         media_image.Config(int(params.height), int(params.width)),
         image,
     )
-    row.request.diffusion = trajectory
+    request.request.diffusion = trajectory
 
     initial_latent(
         call,
@@ -232,23 +231,19 @@ def prepare_latent(
         model_runner=model_runner,
     )
     pool.initialize(
-        row.request.request_pool_idx,
+        request.request.request_pool_idx,
         buffer,
         latent_units=int(params.latent_units),
     )
 
     # Export is deferred with the batch commit so a failed
     # batch cannot expose a partially initialized trajectory.
-    request.latent.update.params = params
-    request.latent.update.expected_generation = 0
-    request.latent.update.expected_step = 0
-    request.latent.update.generation = int(output.generation)
-    request.latent.update.step = 0
+    state.complete_latent(call.request_key.request_id)
 
     products = export_latent_transfer(
         call,
         output,
-        row,
+        request,
         step=0,
         worker_info=worker_info,
         latent_pool=latent_pool,
@@ -318,10 +313,10 @@ def initialize(
         raise invalid_descriptor("flow latent generations are invalid")
 
     row = state.pending_output(call.request_key.request_id)
-    params = row.latent.input_params
-    buffer = row.latent.buffer
+    params = row.latent_params
+    buffer = row.latent_buffer
     if params is None or buffer is None:
-        raise invalid_descriptor("trajectory call has no staged latent inputs")
+        raise invalid_descriptor("trajectory call has no bound latent inputs")
 
     pool = latent_pool
     start_step = int(params.start_step)
@@ -390,10 +385,10 @@ def prepare_step(
 
     builder = require_inputs(model_runner)
     row = state.pending_output(call.request_key.request_id)
-    params = row.latent.input_params
-    buffer = row.latent.buffer
+    params = row.latent_params
+    buffer = row.latent_buffer
     if params is None or buffer is None:
-        raise invalid_descriptor("trajectory call has no staged latent inputs")
+        raise invalid_descriptor("trajectory call has no bound latent inputs")
 
     schedule = trajectory.schedules["image"]
     if not 0 <= step_index < schedule.num_steps:
@@ -529,11 +524,10 @@ def finish(
     are released here, before the batch commit.
     """
     request = state.pending_output(call.request_key.request_id)
-    row = state.pending_output(call.request_key.request_id)
-    params = row.latent.input_params
-    buffer = row.latent.buffer
+    params = request.latent_params
+    buffer = request.latent_buffer
     if params is None or buffer is None:
-        raise invalid_descriptor("trajectory call has no staged latent inputs")
+        raise invalid_descriptor("trajectory call has no bound latent inputs")
 
     latent_input, latent_output = (
         call.latent_input,
@@ -549,7 +543,7 @@ def finish(
     start_step = int(params.start_step)
     final_step = start_step + int(params.step_count)
     latent_pool.write_inactive(
-        row.request.request_pool_idx,
+        request.request.request_pool_idx,
         buffer,
         expected_step=start_step,
         expected_generation=int(latent_input.generation),
@@ -557,16 +551,12 @@ def finish(
         height=int(params.height),
         width=int(params.width),
     )
-    request.latent.update.params = params
-    request.latent.update.expected_generation = int(latent_input.generation)
-    request.latent.update.expected_step = start_step
-    request.latent.update.generation = int(latent_output.generation)
-    request.latent.update.step = final_step
+    state.complete_latent(call.request_key.request_id)
 
     products = export_latent_transfer(
         call,
         latent_output,
-        row,
+        request,
         step=final_step,
         worker_info=worker_info,
         latent_pool=latent_pool,
@@ -615,9 +605,9 @@ def export_latent_transfer(
     is reserved through ``LatentPool.reserve_export`` and published by
     ``transfer.export_latent_source``.
     """
-    params = row.latent.input_params
+    params = row.latent_params
     if params is None:
-        raise invalid_descriptor("latent export has no staged parameters")
+        raise invalid_descriptor("latent export has no bound parameters")
 
     transports = export_transports
     if not any(name != "local" for name in transports) or (

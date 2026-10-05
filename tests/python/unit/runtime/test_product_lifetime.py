@@ -1035,10 +1035,9 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             height=16,
             width=176,
         )
-        second = latent_output(1, pages, 11, 16, 176)
-        second.expected_generation = 1
-        second.generation = 2
-        second.step = 1
+        second = LatentUpdate(
+            1, commit.params, expected_generation=1, generation=2, step=1
+        )
         pool.validate_updates((second,))
         pool.apply_updates((second,))
         for value in borrowed:
@@ -1093,11 +1092,14 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             height=16,
             width=176,
         )
-        third = latent_output(1, pages, 11, 16, 176)
-        third.expected_generation = 2
-        third.expected_step = 1
-        third.generation = 3
-        third.step = 2
+        third = LatentUpdate(
+            1,
+            commit.params,
+            expected_generation=2,
+            expected_step=1,
+            generation=3,
+            step=2,
+        )
         pool.validate_updates((third,))
         pool.apply_updates((third,))
         torch.testing.assert_close(
@@ -1299,14 +1301,19 @@ def test_unknown_latent_reader_completion_retains_only_its_pages(
     assert closing.value.code is WorkerErrorCode.RESOURCE_ERROR
 
 
-def test_latent_buffer_preserves_live_trajectories(latent_output) -> None:
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
+)
+def test_latent_buffer_preserves_live_trajectories(
+    latent_output, device
+) -> None:
     pool = LatentPool(
         request_pool_size=2,
         num_pages=5,
         page_units=4,
         latent_width=4,
         dtype=torch.float32,
-        device="cpu",
+        device=device,
     )
     try:
         first = pool.bind(((3, 1),), (7,))[0]
@@ -1316,7 +1323,7 @@ def test_latent_buffer_preserves_live_trajectories(latent_output) -> None:
         with pytest.raises(WorkerError, match="overlap"):
             pool.bind(((1,),), (4,), occupied=(first, second))
 
-        # Both consumers run after both inputs were staged. Their original
+        # Both consumers run after both inputs were bound. Their original
         # values and page order must survive binding an independent call.
         pool.initialize(1, first, latent_units=7)
         pool.initialize(2, second, latent_units=7)
@@ -1338,7 +1345,7 @@ def test_latent_buffer_preserves_live_trajectories(latent_output) -> None:
             )
             torch.testing.assert_close(
                 actual,
-                torch.full((7, 4), expected),
+                torch.full((7, 4), expected, device=device),
                 rtol=0,
                 atol=0,
                 check_dtype=False,
