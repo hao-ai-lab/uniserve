@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use uniserve_worker_ipc::Wake;
 
 use crate::Error;
+use crate::profiling::range;
 
 /// Execution resources and numerical operations borrowed by one executor.
 ///
@@ -135,13 +136,17 @@ impl<B: Backend> Batch<B> {
     ) {
         let result = (|| {
             if !self.prepared {
+                let _range = range(c"uniserve.worker.prepare", Some(self.id));
                 backend.prepare(&mut self.data)?;
                 self.prepared = true;
             }
 
             let submission = self.submission.as_ref().expect("submitted batch");
-            if !backend.prepare_inputs(&mut self.data, submission)? {
-                return backend.await_inputs(&mut self.data, submission);
+            {
+                let _range = range(c"uniserve.worker.inputs", Some(self.id));
+                if !backend.prepare_inputs(&mut self.data, submission)? {
+                    return backend.await_inputs(&mut self.data, submission);
+                }
             }
 
             if distributed && let Some(sequence) = self.collective_seq {
@@ -158,8 +163,13 @@ impl<B: Backend> Batch<B> {
                 *last_sequence = Some(sequence);
             }
 
-            backend.execute(&mut self.data)?;
+            {
+                let _range = range(c"uniserve.worker.execute", Some(self.id));
+                backend.execute(&mut self.data)?;
+            }
+
             self.launched = true;
+            let _range = range(c"uniserve.worker.retire", Some(self.id));
             backend.begin_retirement(&mut self.data)
         })();
 
@@ -173,7 +183,12 @@ impl<B: Backend> Batch<B> {
             return false;
         }
 
-        match backend.poll(&mut self.data) {
+        let result = {
+            let _range = range(c"uniserve.worker.poll", Some(self.id));
+            backend.poll(&mut self.data)
+        };
+
+        match result {
             Ok((advanced, complete)) => {
                 self.complete = complete;
                 advanced || complete
@@ -186,6 +201,7 @@ impl<B: Backend> Batch<B> {
     }
 
     fn fail(&mut self, backend: &mut B, error: B::Error, context: &str) {
+        let _range = range(c"uniserve.worker.close", Some(self.id));
         let mut error = backend.classify(error, &self.data, context);
         if let Err(cleanup) = backend.close(&mut self.data) {
             backend.note_cleanup(&mut error, cleanup);
@@ -323,7 +339,11 @@ impl<B: Backend> Executor<B> {
             ready: self.ready_sender.clone(),
             completion_wake: self.completion_wake.clone(),
         });
-        self.backend.admit(&mut batch.data)?;
+        {
+            let _range = range(c"uniserve.worker.admit", Some(batch.id));
+            self.backend.admit(&mut batch.data)?;
+        }
+
         batch.submission = Some(Arc::clone(&submission));
         self.batches.insert(batch.id, batch);
         self.start(submission.batch_id);
@@ -343,7 +363,11 @@ impl<B: Backend> Executor<B> {
     /// Progress ready inputs and physical completions on the owning thread.
     pub fn advance(&mut self) -> Result<bool, B::Error> {
         self.require_open()?;
-        self.backend.reap()?;
+        {
+            let _range = range(c"uniserve.worker.reap", None);
+            self.backend.reap()?;
+        }
+
         let mut advanced = false;
 
         // Resume one notified preparation, then inspect every running batch.
@@ -398,9 +422,13 @@ impl<B: Backend> Executor<B> {
             .expect("owned submission");
         let result = match batch.error.take() {
             Some(error) => Err(error),
-            None => self.backend.result(&mut batch.data).map(Some),
+            None => {
+                let _range = range(c"uniserve.worker.result", Some(batch.id));
+                self.backend.result(&mut batch.data).map(Some)
+            }
         };
 
+        let _range = range(c"uniserve.worker.close", Some(batch.id));
         match (result, self.backend.close(&mut batch.data)) {
             (Err(mut error), Err(cleanup)) => {
                 self.backend.note_cleanup(&mut error, cleanup);
@@ -431,6 +459,7 @@ impl<B: Backend> Executor<B> {
         self.closed = true;
         let mut failure = None;
         for (_, mut batch) in self.batches.drain(..) {
+            let _range = range(c"uniserve.worker.close", Some(batch.id));
             if let Err(error) = self.backend.close(&mut batch.data) {
                 match &mut failure {
                     Some(first) => self.backend.note_cleanup(first, error),

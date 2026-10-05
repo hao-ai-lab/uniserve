@@ -72,6 +72,8 @@ Canvas generation captures the numerical pass, vocabulary projection, sampler an
 
 The worker logs `uniserve-kernel-table` JSON after startup and when serving resolves additional call sites. Each record names the computation, layer paths, representation and selected provider. These records describe the executed configuration; they are not performance measurements.
 
+The [execution profiler and sanitizer](profiling.md) correlate native batch stages with numerical ranges, CUDA calls and transfers. Their offline hints identify possible host waits and device roundtrips for investigation without changing serving behavior.
+
 The scheduler's allocator does not advise its heap for transparent huge pages. Worker launches default `MIMALLOC_ALLOW_THP` to `0` and propagate an explicit operator value to local and remote ranks. This keeps automatic heap collapse outside the default serving allocation policy while preserving operator control of worker allocation.
 
 ## Replicas and experts
