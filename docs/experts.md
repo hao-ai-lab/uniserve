@@ -14,7 +14,9 @@ Calibrated NVFP4 checkpoints own their packed values, per-block and per-expert s
 
 ## Token exchange
 
-`ExpertExchange` owns the resources for one expert group. Each invocation agrees its capability and token capacity, opens a step, evaluates expert layers in the same order on every rank, and closes the step. FlashInfer NVLink all-to-all dispatches tokens to resident experts and combines the weighted results. The NVFP4 MegaMoE provider fuses dispatch, expert computation and combination under the same step protocol.
+`ExpertExchange` owns the resources for one expert group. Each invocation selects a ready call kind and token capacity, opens a step, evaluates expert layers in the same order on every rank, and closes the step. FlashInfer NVLink all-to-all dispatches tokens to resident experts and combines the weighted results. The NVFP4 MegaMoE provider fuses dispatch, expert computation and combination under the same step sequence.
+
+Rust owns source readiness, cyclic call selection, step capacity and layer participation. Gloo exchanges token counts and call kinds through fixed CPU buffers; this control data requires no device readback. A source retains its pending input until selected. During shutdown, ranks continue participating until every rank reports that it is leaving with no pending tokens.
 
 A rank with no input tokens still participates. `ExecutionContext.join_expert_layers()` completes the forward's skipped tail with empty source rows; `JoinGraphs` captures this participation for configured capacities. Graph padding contributes no route weight. Drain all participating invocations before closing graphs, contexts and the exchange, in that order.
 
@@ -32,9 +34,9 @@ Install the locked GPU extra to use native expert providers and NVSHMEM. Distrib
 
 ## Asymmetric expert exchange
 
-An `ExpertExchange` can separate source-only attention ranks from expert-only ranks in one ordered communicator. `attention_ranks=N` assigns the first N members to sources; the remaining M members own equal contiguous expert partitions. Source parameters may remain on meta, while expert ranks materialize the same `FusedMoE` modules used by colocated execution. `source_group` identifies the global ranks that execute one source forward together, such as a tensor-parallel group. Every member must declare consistent, disjoint source groups, and a source group starts only after all its members submit the same capability.
+An `ExpertExchange` can separate source-only attention ranks from expert-only ranks in one ordered communicator. `attention_ranks=N` assigns the first N members to sources; the remaining M members own equal contiguous expert partitions. Source parameters may remain on meta, while expert ranks materialize the same `FusedMoE` modules used by colocated execution. `source_group` identifies the global ranks that execute one source forward together, such as a tensor-parallel group. Every member must declare consistent, disjoint source groups, and a source group starts only after all its members submit the same call kind.
 
-The runtime retains the model's logical expert ids, hidden widths and numerical representation. A transport provider owns wire ids, padding, communication streams and staging buffers. Every rank agrees the capability and capacity and visits the same layer sequence, including empty sources. Dispatch and combine alternate before reusing a buffer; unused capacity has invalid expert ids and zero route weights. The expert equation applies each route weight exactly once, after its output projection, before returning the completed logical rows to the source.
+The runtime retains the model's logical expert ids, hidden widths and numerical representation. A transport provider owns wire ids, padding, communication streams and buffers. Every rank selects the same call kind and capacity and visits the same layer sequence, including empty sources. Dispatch and combine alternate before reusing a buffer; unused capacity has invalid expert ids and zero route weights. The expert equation applies each route weight exactly once, after its output projection, before returning the completed logical rows to the source.
 
 | Transport | Source/expert placement | Numerical representation |
 | --- | --- | --- |

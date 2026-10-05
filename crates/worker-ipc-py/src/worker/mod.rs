@@ -9,6 +9,7 @@ mod completion;
 mod error;
 mod events;
 mod executor;
+mod expert_exchange;
 mod exports;
 mod graph_storage;
 mod host;
@@ -38,6 +39,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(microbatches::yield_microbatch, module)?)?;
     module.add_class::<microbatches::Microbatches>()?;
     module.add_class::<weight_prefetch::WeightPrefetch>()?;
+    module.add_class::<expert_exchange::ExpertExchange>()?;
     module.add_class::<batch::BatchState>()?;
     module.add_class::<block_tables::BlockTables>()?;
     module.add_class::<block_tables::GroupShape>()?;

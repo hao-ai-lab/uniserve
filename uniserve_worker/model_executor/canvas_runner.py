@@ -567,7 +567,7 @@ class CanvasRunner(ModelRunner):
         def attend(batch):
             exchange = self.context.experts
             if exchange is not None:
-                exchange.invoked.clear()
+                exchange.reset_layers()
             return self._attend_state(batch)
 
         graph = capture_hidden(

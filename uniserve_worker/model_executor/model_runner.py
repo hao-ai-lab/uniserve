@@ -67,7 +67,7 @@ def joining_experts(forward, context):
     def call(*args):
         experts = context.experts
         if experts is not None and experts.capacity:
-            experts.invoked.clear()
+            experts.reset_layers()
         result = forward(*args)
         context.join_expert_layers()
         return result
@@ -424,8 +424,8 @@ class ModelRunner(Execution, ABC):
                         if padded
                         else forward,
                     )
-                    bucket.expert_layers = frozenset(
-                        () if exchange is None else exchange.invoked
+                    bucket.expert_layers = (
+                        frozenset() if exchange is None else exchange.invoked
                     )
                 finally:
                     if exchange is not None:
@@ -667,7 +667,7 @@ class ModelRunner(Execution, ABC):
         exchange = self.context.experts
         if exchange is not None and self.expert_step:
             # Replayed exchanges run no host code; the bucket names them.
-            exchange.invoked.update(self.buckets[key].expert_layers)
+            exchange.record_layers(self.buckets[key].expert_layers)
         result = self.replay_graph(key, execution, batch, borrow=borrow_output)
         return replace(
             result,
