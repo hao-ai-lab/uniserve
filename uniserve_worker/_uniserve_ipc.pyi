@@ -19,6 +19,7 @@ from typing import Any, Generic, ParamSpec, Self, TypeVar, final
 import torch
 
 import uniserve_worker.storage.kv_cache as kv_cache
+from uniserve.runtime.execution import ExecutionContext
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
@@ -93,6 +94,7 @@ __all__ = [
     "LatentImport",
     "LatentPool",
     "LatentUpdate",
+    "Microbatches",
     "OutputBuffer",
     "OutputPool",
     "PendingOutput",
@@ -113,10 +115,26 @@ __all__ = [
     "service_name",
     "release_exports",
     "graph_storage_budget_bytes",
+    "yield_microbatch",
 ]
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")
+
+def yield_microbatch() -> None: ...
+
+@final
+class Microbatches:
+    """Cooperative numerical calls on persistent native host threads."""
+
+    contexts: tuple[ExecutionContext, ...]
+    device: torch.device
+
+    def __init__(self, contexts: Sequence[ExecutionContext]) -> None: ...
+    def __call__(
+        self, calls: Sequence[Callable[[], Source]]
+    ) -> list[Source]: ...
+    def close(self) -> None: ...
 
 def graph_storage_budget_bytes(total_device_bytes: int) -> int: ...
 

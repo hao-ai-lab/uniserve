@@ -23,13 +23,27 @@ enum Dependency {
     Completion(CompletionRef),
 }
 
-struct PythonAction {
+pub(super) struct PythonAction {
     action: Py<PyAny>,
     dependencies: Vec<Dependency>,
     input_ready: Option<Py<PyAny>>,
     input_completion: Option<CompletionRef>,
     release: Option<Py<PyAny>>,
     profile_name: String,
+}
+
+impl PythonAction {
+    /// A numerical call whose input lifetime belongs to its enclosing owner.
+    pub(super) fn numerical(action: Py<PyAny>, profile_name: &str) -> Self {
+        Self {
+            action,
+            dependencies: Vec::new(),
+            input_ready: None,
+            input_completion: None,
+            release: None,
+            profile_name: profile_name.to_owned(),
+        }
+    }
 }
 
 impl HostAction for PythonAction {
