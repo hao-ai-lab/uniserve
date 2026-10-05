@@ -1,6 +1,6 @@
 # MiniMax-H3 computation library
 
-The model package loads base MiniMax-H3, FastH3 DMD and FastH3 OmniRef checkpoints through the public model catalog. Each checkpoint determines its denoising components, attention layout, schedule, output heads and elementwise rounding. Component exports resolve their missing text encoder, processor and VAE components at the base revision recorded in the export.
+The model package loads base MiniMax-H3, FastH3 DMD and FastH3 OmniRef checkpoints through the public model catalog. Each checkpoint determines its denoising components, attention layout, schedule, output heads and elementwise rounding. Component exports resolve their missing text encoder, processor and VAE components from the caller's local base directory, or from the Hub revision declared by the export when no local base is supplied.
 
 Models are ordinary PyTorch modules. Text and latent encoders, denoisers, video and audio decoders compose the shared numerical capabilities. Execution contexts own kernel workspaces and communication backing; callers own request state and advance the solver. Serving workers use these same modules and numerical calls.
 

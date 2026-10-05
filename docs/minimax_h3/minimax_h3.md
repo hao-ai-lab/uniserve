@@ -21,7 +21,7 @@ Install as the [FastH3 cheat sheet](../fast_h3/fast_h3.md#install) describes: `u
 | `MiniMaxAI/MiniMax-H3` (diffusers root) | `reference_denoiser` (`transformer_ref/`) | `ref2va` | Every canvas of the canvas rule | 50 points, flow shift 12, audio shift 3 |
 | FastH3 OmniRef component export | `reference_denoiser` (`transformer_ref/`) | `ref2va` | Every canvas of the canvas rule | The export's parallel-decoding schedule |
 
-A deployment places exactly one denoising component, so one server serves one task family. A diffusers root holds both base DiTs; the deployment file chooses which one a server runs. A component export holds only its denoiser, schedulers and inference contract; its `fastvideo_inference.json` pins the base revision (`base_model_revision`) whose text encoder, tokenizer, processor and VAEs it uses. The server reads those components from the Hugging Face cache at that revision, or from the local copy `--base-model` names; a local copy must hold every file at the pinned revision, as the `.cache/huggingface/download` records of `hf download --revision <revision> --local-dir` show, and the server refuses a file recorded at another revision by name.
+A deployment places exactly one denoising component, so one server serves one task family. A diffusers root holds both base DiTs; the deployment file chooses which one a server runs. A component export holds its denoiser, schedulers and inference configuration; `base_model_revision` in `fastvideo_inference.json` selects the Hub revision supplying its text encoder, tokenizer, processor and VAEs. `--base-model` supplies these components from a local directory instead. Local bases need the component configuration and weight files.
 
 ```bash
 export H3_ROOT=/workspace/models/MiniMax-H3
@@ -30,7 +30,7 @@ hf download MiniMaxAI/MiniMax-H3 --local-dir "$H3_ROOT"
 
 ## Start the server
 
-`$OMNIREF_EXPORT` and `$OMNIREF_BASE` below name an OmniRef export and a local copy of the base revision it pins, downloaded with `hf download MiniMaxAI/MiniMax-H3 --revision <revision> --local-dir "$OMNIREF_BASE"` for each of `text_encoder`, `tokenizer`, `processor`, `vae` and `audio_vae`.
+`$OMNIREF_EXPORT` and `$OMNIREF_BASE` below name an OmniRef export and a local directory supplying `text_encoder`, `tokenizer`, `processor`, `vae` and `audio_vae`. To obtain the declared base from the Hub, use `hf download MiniMaxAI/MiniMax-H3 --revision <revision> --local-dir "$OMNIREF_BASE"` for these components.
 
 Text-to-video and keyframe requests:
 
@@ -177,4 +177,3 @@ The [evaluation guide](evaluation.md) documents fixed workloads, serial executio
 | A refused `file://` condition | `--media-directory` is unset or the path resolves outside it. |
 | `server_error` naming `cannot run ffprobe` | The server probes video and audio conditions with `ffprobe` and cannot run it. Put FFmpeg's `ffprobe` on `PATH` or name it with `--ffprobe`. |
 | `ModuleNotFoundError: torchaudio` in the worker log | The environment predates the `torchaudio` dependency. Run `uv sync --locked` again. |
-| An OmniRef start refusing a base file by name | The `--base-model` copy holds that file at another revision. Download the base at the revision the export pins. |

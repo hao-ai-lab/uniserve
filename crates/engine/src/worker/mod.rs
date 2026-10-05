@@ -8,12 +8,10 @@
 //! targeted work to the groups of a deployment. `process` owns one rank's
 //! process and IPC channel, `registration` the addresses ranks rendezvous and
 //! report their endpoints at, `launcher` the per-host launchers that start
-//! ranks placed on other hosts, `checkpoint` the checkpoint identity every
-//! rank is checked against, and `death_watch` the Linux watcher that fires a
+//! ranks placed on other hosts, and `death_watch` the Linux watcher that fires a
 //! rank channel's death wake when a rank process this engine spawned exits.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-mod checkpoint;
 mod death_watch;
 mod executor;
 mod instance;
@@ -49,15 +47,8 @@ pub struct WorkerProcessArgs {
     pub python: std::path::PathBuf,
     /// Model identifier or local model path.
     pub model: String,
-    /// Identity of the checkpoint at `model`, derived by the head when the
-    /// model is a local directory of a non-stub launch and left unset
-    /// otherwise. Every rank verifies the checkpoint it loads against it and
-    /// reports what it loaded; a launch fills it once before any rank starts.
-    pub checkpoint_identity: Option<String>,
-    /// Local copy of the base checkpoint a component export at `model` pins,
-    /// passed to every rank, which verifies its revision from its Hugging
-    /// Face download records. Unset, ranks read the base from the Hugging
-    /// Face cache; a checkpoint that pins no base refuses one.
+    /// Local base directory supplying a component export's missing modules.
+    /// Unset, ranks fetch the base revision the export declares from the Hub.
     pub base_model: Option<std::path::PathBuf>,
     /// Ordered physical members of this WorkerGroup instance.
     pub ranks: Vec<crate::WorkerRank>,

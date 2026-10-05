@@ -4,9 +4,6 @@ A worker launched with ``no_model`` (which also requires ``allow_stub``)
 builds ``Model`` and ``image_processor`` instead of loading a checkpoint, so
 the serving path runs end to end without weights and yields predictable
 tokens, cache writes and images. No checkpoint catalog registers ``Model``.
-The Rust ``WorkerInfo`` validation accepts an empty checkpoint identity only
-for model names under this package's module path, so the path is part of
-that contract.
 """
 
 from .config import Config

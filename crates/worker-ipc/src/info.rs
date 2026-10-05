@@ -275,10 +275,6 @@ impl WorkerEndpoint {
     }
 }
 
-/// Python package of the weightless stub model, the one model that reports
-/// no checkpoint identity because it loads no checkpoint.
-const STUB_MODEL_PREFIX: &str = "uniserve_models.stub";
-
 /// Whole-tile condition packing of a multi-region video denoiser.
 ///
 /// Each condition occupies whole tiles of `rows` rows: its audio rows fill
@@ -430,11 +426,6 @@ pub struct WorkerInfo {
     /// Resolved activation quantization formats on this physical rank.
     #[serde(default)]
     pub activation_formats: Vec<String>,
-    /// Identity of the loaded checkpoint files: the lowercase hex SHA-256 the
-    /// checkpoint identity rule defines over the checkpoint directory. The
-    /// weightless stub model reports none; every other worker must.
-    #[serde(default)]
-    pub checkpoint_identity: String,
     /// Finalized component membership and logical degrees.
     #[serde(default)]
     pub components: Vec<ComponentInfo>,
@@ -658,22 +649,8 @@ impl WorkerInfo {
             );
         }
 
-        // Model identity remains mandatory independently of enabled resources.
+        // The model name is used in serving responses and runtime reports.
         ensure_valid!(!self.model_name.is_empty(), "worker model name is empty");
-        // Only the stub model has no checkpoint behind it; a served checkpoint
-        // must be identified so ranks can be held to the same one.
-        ensure_valid!(
-            if self.checkpoint_identity.is_empty() {
-                self.model_name.starts_with(STUB_MODEL_PREFIX)
-            } else {
-                self.checkpoint_identity.len() == 64
-                    && self
-                        .checkpoint_identity
-                        .bytes()
-                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-            },
-            "worker checkpoint identity is missing or malformed"
-        );
         Ok(())
     }
 }
@@ -701,7 +678,6 @@ impl Default for WorkerInfo {
             attention_backend: String::new(),
             weight_formats: Vec::new(),
             activation_formats: Vec::new(),
-            checkpoint_identity: "0".repeat(64),
             components: Vec::new(),
             supported_calls: vec![
                 CallKind::Forward(ForwardMode::Prefill),

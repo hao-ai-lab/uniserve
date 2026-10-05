@@ -205,8 +205,8 @@ def _omniref() -> tuple[str, str]:
     if not export or not base_copy:
         pytest.fail(
             "UNISERVE_MINIMAX_H3_OMNIREF must name a FastH3 OmniRef export "
-            "and UNISERVE_MINIMAX_H3_OMNIREF_BASE a local copy of the base "
-            "revision it pins"
+            "and UNISERVE_MINIMAX_H3_OMNIREF_BASE a local directory "
+            "supplying the text encoder, tokenizer, processor and VAEs"
         )
     return export, base_copy
 

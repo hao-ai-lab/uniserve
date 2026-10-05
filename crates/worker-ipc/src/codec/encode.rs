@@ -1495,7 +1495,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             .collect::<Vec<_>>();
         Some(b.create_vector(&values))
     };
-    let checkpoint_identity = Some(b.create_string(&v.checkpoint_identity));
     let video_denoiser = v.video_denoiser.as_ref().map(|value| {
         let tasks = value
             .tasks
@@ -1555,7 +1554,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             media_components,
             num_inference_steps: v.num_inference_steps,
             host_lane_capacity: v.host_lane_capacity,
-            checkpoint_identity,
             video_denoiser,
             max_prefill_calls: v.max_prefill_calls,
             max_decode_calls: v.max_decode_calls,

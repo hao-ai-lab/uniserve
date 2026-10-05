@@ -14,7 +14,6 @@ partitioning, and resolves the load-time ``WorkerConfig``. The launch's
 from __future__ import annotations
 
 import logging
-import socket
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -80,8 +79,6 @@ class WorkerModel:
             host worker, or for a checkpoint without one.
         image_processor: The model's image preprocessing, if any.
         flow_prompt: The checkpoint's flow prompt template, if any.
-        checkpoint_identity: Identity of the loaded checkpoint; empty for a
-            model without one.
         entry_points: The checkpoint's IPC entry declarations; ``None`` for
             the stub model, whose declarations ``describe_components`` reads
             from the model's module.
@@ -92,28 +89,8 @@ class WorkerModel:
     tokenizer: Any | None = None
     image_processor: ImageProcessor | None = None
     flow_prompt: FlowPrompt | None = None
-    checkpoint_identity: str = ""
     entry_points: Mapping[str, ComponentEntry] | None = None
     model_name: str | None = None
-
-
-def verify_checkpoint_identity(
-    expected: str | None, actual: str, *, rank: int, host: str
-) -> None:
-    """Refuse a rank whose loaded checkpoint is not the one the head derived.
-
-    ``expected`` is absent when the launching side could not read the
-    checkpoint locally; the engine then still requires every rank to report
-    the same identity. The refusal names the rank and host so an operator can
-    find the divergent copy.
-    """
-    if expected is None or expected == actual:
-        return
-
-    raise unsupported_setup(
-        f"rank {rank} on host {host} loaded checkpoint {actual}, but the "
-        f"head derived checkpoint {expected}"
-    )
 
 
 def prepare_worker_model(
@@ -121,11 +98,9 @@ def prepare_worker_model(
 ) -> tuple[models.Config | None, nn.Module, dict[str, tuple[Call, ...]]]:
     """Resolve the checkpoint configuration and this rank's resident modules.
 
-    This runs before process groups exist. The checkpoint identity is
-    verified against the launch expectation before ``load_worker_model``
-    materializes any weight. A placement that does not fit the model's
-    declarations, or a checkpoint identity that differs from the launch
-    expectation, raises ``WorkerError`` with ``UNSUPPORTED_SETUP``. Errors
+    This runs before process groups exist. A placement that does not fit
+    the model's declarations raises ``WorkerError`` with
+    ``UNSUPPORTED_SETUP`` before weights are materialized. Errors
     from reading the checkpoint configuration and from ``_weight_config``
     propagate.
 
@@ -205,15 +180,6 @@ def prepare_worker_model(
         exclude_modules=expert_paths
         if split and not dedicated
         else frozenset(),
-    )
-
-    # The host name is the ``node`` the rank's ``WorkerEndpoint`` reports, so
-    # the refusal and the engine's own report name one host.
-    verify_checkpoint_identity(
-        launch.checkpoint_identity,
-        source.checkpoint_identity,
-        rank=config.execution.rank,
-        host=socket.gethostname(),
     )
 
     return (
@@ -427,7 +393,6 @@ def load_worker_model(
             None,
             source.image_processor,
             source.flow_prompt,
-            source.checkpoint_identity,
             source.entry_points,
         )
 
@@ -516,7 +481,6 @@ def load_worker_model(
         else load_tokenizer(source.tokenizer),
         source.image_processor,
         source.flow_prompt,
-        source.checkpoint_identity,
         {} if dedicated else source.entry_points,
         model_name,
     )

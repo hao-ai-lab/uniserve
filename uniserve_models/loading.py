@@ -14,18 +14,15 @@ A model package provides ``config_sources``, ``read_config``, ``Model``,
 ``image_processor``, ``flow_prompt``, ``precisions`` and
 ``checkpoint_precision``. A package whose checkpoints may be component
 exports, which hold some components and pin a base checkpoint for the rest,
-also provides ``base_checkpoint`` (see ``Base``). This module also implements
-the Python side of the checkpoint identity that ranks compare against the
-head, and recognizes calibrated ModelOpt NVFP4 exports.
+also provides ``base_checkpoint`` (see ``Base``). This module also recognizes
+calibrated ModelOpt NVFP4 exports.
 """
 
 from __future__ import annotations
 
 import fnmatch
-import hashlib
 import json
 import math
-import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -139,10 +136,6 @@ class Config(Generic[ConfigT, ModelT]):
             or ``None``.
         modules: Selected module paths; ``None`` selects the whole model.
         exclude_modules: Subtrees excluded from that selection by identity.
-        checkpoint_identity: Identity of the checkpoint, as defined by
-            ``checkpoint_identity``. Every rank of one instance must load the
-            same checkpoint, and the launching side derives the same value
-            for a local checkpoint directory.
     """  # noqa: D205
 
     model: ConfigT
@@ -158,7 +151,6 @@ class Config(Generic[ConfigT, ModelT]):
     image_processor: ImageProcessor | None
     flow_prompt: FlowPrompt | None
     modules: frozenset[str] | None
-    checkpoint_identity: str
     exclude_modules: frozenset[str] = frozenset()
 
     def __post_init__(self):
@@ -183,137 +175,6 @@ def _json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"checkpoint metadata {path} must contain an object")
     return value
-
-
-# Sidecars whose contents enter the checkpoint identity. Every other file,
-# which in practice is a weight shard, contributes only its path and size, so
-# the identity stays cheap for a checkpoint of hundreds of gigabytes.
-_IDENTITY_CONTENT_SUFFIXES = frozenset({".json", ".jinja", ".model", ".txt"})
-
-# Top-level directories that hold training state rather than the served
-# checkpoint; the same exclusion read_config applies when collecting sidecars.
-_IDENTITY_EXCLUDED_DIRECTORIES = frozenset({"optimizer", "original"})
-
-
-def _identity_includes(name: str) -> bool:
-    """Apply the identity's file exclusions to one relative POSIX path.
-
-    A path is excluded when any component is hidden (starts with ``.``) or
-    when it lies under an excluded top-level directory.
-    """
-    parts = PurePosixPath(name).parts
-    if any(part.startswith(".") for part in parts):
-        return False
-    return not (len(parts) > 1 and parts[0] in _IDENTITY_EXCLUDED_DIRECTORIES)
-
-
-def _identity_digest(
-    files: Iterable[tuple[str, int]], content: Callable[[str], bytes]
-) -> str:
-    """Digest checkpoint files as the identity rule defines it.
-
-    ``files`` yields relative POSIX paths with their sizes in bytes; ``content``
-    reads the bytes of a sidecar whose contents the identity covers. The
-    digest feeds one SHA-256 with, per file in lexicographic byte order of its
-    path: the path bytes, NUL, the decimal size, NUL, and for a covered
-    sidecar the lowercase hex SHA-256 of its contents followed by NUL.
-    """
-    digest = hashlib.sha256()
-    for name, size in sorted(
-        ((name, size) for name, size in files if _identity_includes(name)),
-        key=lambda entry: os.fsencode(entry[0]),
-    ):
-        digest.update(os.fsencode(name))
-        digest.update(b"\0")
-        digest.update(str(size).encode("ascii"))
-        digest.update(b"\0")
-        if PurePosixPath(name).suffix in _IDENTITY_CONTENT_SUFFIXES:
-            digest.update(
-                hashlib.sha256(content(name)).hexdigest().encode("ascii")
-            )
-            digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _walk_checkpoint(root: Path) -> Iterable[tuple[str, int]]:
-    """Yield every checkpoint file under ``root`` with its size in bytes.
-
-    Hidden entries and the excluded top-level directories are not entered. A
-    symbolic link to a regular file counts as that file, which is how a
-    Hub cache snapshot references its blobs; a link to a directory is not
-    followed, so a checkpoint cannot alias itself into its own identity.
-    """
-    pending = [root]
-    while pending:
-        directory = pending.pop()
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                name = Path(entry.path).relative_to(root).as_posix()
-                if not _identity_includes(name):
-                    continue
-                if entry.is_dir(follow_symlinks=False):
-                    # An excluded top-level directory is pruned here; its
-                    # contents would fail the same predicate one level down.
-                    if (
-                        directory != root
-                        or entry.name not in _IDENTITY_EXCLUDED_DIRECTORIES
-                    ):
-                        pending.append(Path(entry.path))
-                elif entry.is_file():
-                    yield name, entry.stat().st_size
-
-
-def checkpoint_identity(root: Path) -> str:
-    """Identify the checkpoint stored in a local directory.
-
-    The identity is the lowercase hex SHA-256 defined by ``_identity_digest``
-    over every regular file under ``root``. The launching side derives the
-    same value for the directory it names, so a rank that resolves a
-    different checkpoint at the same path is refused by name.
-
-    When the head can read the directory, the engine computes the expected
-    value in Rust (``checkpoint_identity`` in the engine's
-    ``worker::checkpoint`` module), and
-    ``uniserve_worker.bootstrap.model_loader.verify_checkpoint_identity``
-    compares the two, so both implementations must agree byte for byte.
-    Their unit tests share one fixture and golden digest.
-    """
-    root = Path(root)
-    return _identity_digest(
-        _walk_checkpoint(root), lambda name: (root / name).read_bytes()
-    )
-
-
-def _hub_checkpoint_identity(repository: str, revision: str, io) -> str:
-    """Identify a pinned Hub revision without downloading its weights.
-
-    A snapshot directory holds only the shards this rank has fetched, so the
-    identity takes every file's path and size from the revision's tree and
-    reads sidecar contents through the cache. The result equals
-    ``checkpoint_identity`` of a complete local copy of the revision.
-    """
-    from huggingface_hub import HfApi, RepoFolder, hf_hub_download
-
-    # The recursive tree lists folders beside files; only files have sizes.
-    files = [
-        (entry.path, int(entry.size))
-        for entry in HfApi().list_repo_tree(
-            repo_id=repository, revision=revision, recursive=True
-        )
-        if not isinstance(entry, RepoFolder)
-    ]
-
-    def content(name: str) -> bytes:
-        return Path(
-            hf_hub_download(
-                repo_id=repository,
-                filename=name,
-                revision=revision,
-                cache_dir=io.download_dir,
-            )
-        ).read_bytes()
-
-    return _identity_digest(files, content)
 
 
 def _root(path: str | Path, io: loading.Config):
@@ -968,74 +829,15 @@ def _calibrated_quantization(
     }
 
 
-def _verify_revision(root: Path, base: Base) -> None:
-    """Refuse a local base whose files are not those of the pinned revision.
-
-    ``huggingface_hub`` records, for every file it downloads into a local
-    directory, ``.cache/huggingface/download/<path>.metadata``, whose first
-    line is the commit the file was downloaded at. Every file under the
-    directories the base supplies must carry a record of ``base.revision``.
-
-    Raises:
-        FileNotFoundError: A supplied directory is missing.
-        ValueError: A file has no download record, so its revision cannot be
-            verified, or its record names another commit.
-    """
-    records = root / ".cache" / "huggingface" / "download"
-    unrecorded, mismatched = [], []
-    for directory in sorted(base.directories):
-        folder = root / directory
-        if not folder.is_dir():
-            raise FileNotFoundError(
-                f"base checkpoint {root} has no {directory} directory"
-            )
-        for path in sorted(folder.rglob("*")):
-            name = path.relative_to(root).as_posix()
-            if not path.is_file() or not _identity_includes(name):
-                continue
-            record = records / f"{name}.metadata"
-            if not record.is_file():
-                unrecorded.append(name)
-                continue
-            lines = record.read_text(encoding="utf-8").splitlines()
-            commit = lines[0].strip() if lines else ""
-            if commit != base.revision:
-                mismatched.append(f"{name} at {commit or 'no commit'}")
-    pinned = f"{base.repository}@{base.revision}"
-    if mismatched:
-        raise ValueError(
-            f"base checkpoint {root} is not {pinned}: its download records "
-            f"place {', '.join(mismatched[:4])}"
-            + (
-                f" and {len(mismatched) - 4} more"
-                if len(mismatched) > 4
-                else ""
-            )
-        )
-    if unrecorded:
-        raise ValueError(
-            f"base checkpoint {root} has no Hugging Face download record for "
-            f"{', '.join(unrecorded[:4])}"
-            + (
-                f" and {len(unrecorded) - 4} more"
-                if len(unrecorded) > 4
-                else ""
-            )
-            + f", so it cannot be verified as {pinned}"
-        )
-
-
 def _base_snapshot(base: Base, path: str | Path | None, io) -> _Snapshot:
     """Resolve a component export's base checkpoint.
 
-    ``path`` names a local copy, verified against the pinned revision by its
-    download records (``_verify_revision``); without one the base is the
-    Hub snapshot of ``base.revision``, read from the Hub cache and fetched
-    into it when absent. Only files under ``base.directories`` are listed.
+    ``path`` names the local directory supplying the missing components.
+    Without it, fetch the Hub revision declared by the export. Only files
+    under ``base.directories`` are listed.
 
     Raises:
-        FileNotFoundError: The local copy or a supplied directory is missing.
-        ValueError: The local copy is not the pinned revision.
+        FileNotFoundError: The supplied local directory does not exist.
     """
     if path is not None:
         root = Path(path).expanduser()
@@ -1043,17 +845,11 @@ def _base_snapshot(base: Base, path: str | Path | None, io) -> _Snapshot:
             raise FileNotFoundError(
                 f"base checkpoint {root} is not a directory"
             )
-        _verify_revision(root, base)
         repository = revision = None
     else:
         root, repository, revision = _root(
             base.repository, replace(io, revision=base.revision)
         )
-        if revision != base.revision:
-            raise ValueError(
-                f"the Hub resolved {base.repository}@{base.revision} to "
-                f"commit {revision}"
-            )
     inventory = frozenset(
         name
         for name in _inventory(root, repository, revision, io)
@@ -1121,10 +917,9 @@ def read_config(
             whole model, and an empty set resolves no payload source.
         exclude_modules: Subtrees to leave unmaterialized, including their
             aliases. Their architecture metadata remains available.
-        base: A local copy of the base checkpoint a component export pins
-            (``Base``), verified against the pinned revision; without it the
-            base comes from the Hub cache at that revision. The checkpoint
-            identity remains the export's own.
+        base: Local directory supplying a component export's missing modules
+            (``Base``). Without it, fetch the revision declared by the export
+            from the Hub cache.
 
     Raises:
         FileNotFoundError: The checkpoint, its metadata, its base, or a
@@ -1134,8 +929,7 @@ def read_config(
             selected path that is not a module, and malformed architecture,
             model configuration, index, tokenizer or quantization metadata
             (a required field that is missing or a field of the wrong type);
-            a ``base`` for a checkpoint that pins none; or a base that is not
-            the pinned revision.
+            or a ``base`` for a checkpoint that declares none.
     """  # noqa: D205
     root, repository, revision = _root(path, io)
     metadata = _root_metadata(root)
@@ -1158,11 +952,6 @@ def read_config(
         and not name.startswith(("optimizer/", "original/"))
     }
     _fetch(root, sidecars, repository, revision, io)
-    identity = (
-        checkpoint_identity(root)
-        if repository is None
-        else _hub_checkpoint_identity(repository, revision, io)
-    )
 
     # A component export reads the directories its base supplies from the
     # base checkpoint, whose sidecars are fetched like the export's own.
@@ -1395,7 +1184,6 @@ def read_config(
         processor,
         package.flow_prompt,
         modules,
-        identity,
         exclude_modules,
     )
 

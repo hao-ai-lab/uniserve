@@ -167,15 +167,13 @@ def build_worker_layout(
     attention_backend: str = "",
     bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
-    checkpoint_identity: str = "",
 ) -> WorkerLayout:
     """Resolve resource dimensions and the capacity report used by the worker.
 
     Model dimensions determine storage reservations. Admission additionally
     obeys the configured call set and every lane's bounds; these
     restrictions do not shrink the storage needed by warmup and graph
-    capture. ``checkpoint_identity`` is reported as loaded; a model built
-    without a checkpoint reports none.
+    capture.
 
     ``state_buffers`` defaults to the media request state derived from
     ``bindings``; a non-empty value, or a ``VideoPostprocessor`` in the model,
@@ -234,7 +232,6 @@ def build_worker_layout(
             queue_depth=queue_depth,
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
-            checkpoint_identity=checkpoint_identity,
         )
     else:
         layout = _token_worker_layout(
@@ -247,7 +244,6 @@ def build_worker_layout(
             endpoint=endpoint,
             capacity_group=capacity_group,
             bindings=bindings,
-            checkpoint_identity=checkpoint_identity,
         )
 
     # A shared admission limit must be safe on every eligible lane. Keep it
@@ -334,7 +330,6 @@ def _token_worker_layout(
     endpoint: WorkerEndpoint,
     capacity_group: Communicator | None,
     bindings: Mapping[str, ComponentBinding] | None,
-    checkpoint_identity: str,
 ) -> WorkerLayout:
     """Size token inputs, paged KV, and latent storage before admission.
 
@@ -718,7 +713,6 @@ def _token_worker_layout(
     )
     info = WorkerInfo(
         model_name=model_name,
-        checkpoint_identity=checkpoint_identity,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
@@ -811,7 +805,6 @@ def _request_tensor_worker_layout(
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
     bindings: Mapping[str, ComponentBinding] | None,
-    checkpoint_identity: str,
 ) -> WorkerLayout:
     """Describe request tensors, products, and persistent capacity.
 
@@ -831,7 +824,6 @@ def _request_tensor_worker_layout(
 
     info = WorkerInfo(
         model_name=model_name,
-        checkpoint_identity=checkpoint_identity,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
