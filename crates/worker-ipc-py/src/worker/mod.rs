@@ -11,6 +11,7 @@ mod events;
 mod executor;
 mod expert_exchange;
 mod exports;
+mod fetch;
 mod graph_storage;
 mod host;
 mod host_buffers;
@@ -31,6 +32,7 @@ mod weight_prefetch;
 
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(fetch::fetch_tensor, module)?)?;
     module.add_function(wrap_pyfunction!(exports::release_exports, module)?)?;
     module.add_function(wrap_pyfunction!(
         graph_storage::graph_storage_budget_bytes,

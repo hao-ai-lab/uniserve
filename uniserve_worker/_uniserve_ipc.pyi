@@ -113,6 +113,7 @@ __all__ = [
     "TransferCapacity",
     "TransferPool",
     "TransferTicket",
+    "fetch_tensor",
     "WeightPrefetch",
     "atomic_load_u32",
     "atomic_store_u32",
@@ -848,6 +849,16 @@ class ReadReservation:
     def close(self) -> None: ...
     def __enter__(self) -> Self: ...
     def __exit__(self, *args: object) -> None: ...
+
+def fetch_tensor(
+    tensor: TensorTransfer,
+    destination: torch.Tensor | tuple[torch.Tensor, ...],
+    *,
+    bindings: Mapping[tuple[WorkerEndpoint, str], Transport],
+    region: tuple[slice, ...] | None = None,
+    retain: Callable[[TransferTicket], None] | None = None,
+) -> tuple[TransferTicket, ...]:
+    """Reserve and submit reads covering the requested logical tensor region."""
 
 @final
 class TransferTicket:

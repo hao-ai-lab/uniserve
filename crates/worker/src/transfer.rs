@@ -1,12 +1,70 @@
 //! Transfer admission, readable results, and physical retirement.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 
 use crate::cuda::{DeviceGuard, Event, Stream};
 use crate::{Completion, Error, EventPool, Outcome, Result};
+
+/// One source's contribution to a logical tensor fetch, in source-local and
+/// destination-local coordinates. The numerical backend borrows those views.
+pub struct ReadRegion {
+    pub location: usize,
+    pub source: Vec<Range<u64>>,
+    pub destination: Vec<Range<u64>>,
+}
+
+/// Cover a requested region from bound locations in preference order.
+///
+/// Location bounds are already validated by their transfer descriptor. All
+/// bounds use the logical tensor's axes. Missing coverage rejects the complete
+/// plan, before any destination can be written. Return `None` for missing
+/// coverage, and stop asking for locations as soon as coverage is complete.
+/// An empty region needs no reads. Source lookup errors propagate unchanged.
+pub fn plan_reads<E>(
+    region: &[Range<u64>],
+    locations: impl IntoIterator<Item = std::result::Result<(usize, Vec<Range<u64>>), E>>,
+) -> std::result::Result<Option<Vec<ReadRegion>>, E> {
+    if region.iter().any(Range::is_empty) {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut missing = vec![region.to_vec()];
+    let mut reads = Vec::new();
+    for location in locations {
+        let (location, covered) = location?;
+        let mut remaining = Vec::new();
+        for required in missing {
+            if let Some(overlap) =
+                uniserve_worker_ipc::subtract_region(&required, &covered, &mut remaining)
+            {
+                reads.push(ReadRegion {
+                    location,
+                    source: relative_region(&overlap, &covered),
+                    destination: relative_region(&overlap, region),
+                });
+            }
+        }
+
+        if remaining.is_empty() {
+            return Ok(Some(reads));
+        }
+        missing = remaining;
+    }
+
+    Ok(None)
+}
+
+fn relative_region(region: &[Range<u64>], origin: &[Range<u64>]) -> Vec<Range<u64>> {
+    region
+        .iter()
+        .zip(origin)
+        .map(|(axis, base)| axis.start - base.start..axis.end - base.start)
+        .collect()
+}
 
 struct CapacityState<C> {
     used: u64,

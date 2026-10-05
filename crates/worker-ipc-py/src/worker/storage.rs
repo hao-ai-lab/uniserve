@@ -8,7 +8,7 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyDict, PyTuple};
 use uniserve_core::CallId;
 use uniserve_worker_ipc::{BufferId, RequestKey};
 
@@ -642,7 +642,7 @@ impl TensorStore {
             .get(&key)
             .filter(|buffer| lock(py, buffer).state == WriteState::Committed)
             .map(|buffer| buffer.clone_ref(py));
-        let full = full_region(py, &shape)?;
+        let full: Vec<_> = shape.iter().map(|&extent| 0..extent as u64).collect();
         let (buffer, destination, missing) = if existing.is_some() {
             let buffer = require_reference(py, &state, &reference)?;
             let value = buffer_view(py, &buffer);
@@ -691,11 +691,14 @@ impl TensorStore {
                             return Err(resource(py, "product storage has pending physical reads"));
                         }
                     }
-                    let missing: Vec<Bound<'py, PyAny>> = py
-                        .import("uniserve._slices")?
-                        .getattr("subtract")?
-                        .call1((&full, region))?
-                        .extract()?;
+                    let bounds: Vec<_> = shape.iter().map(|&extent| extent as u64).collect();
+                    let covered = super::fetch::requested_region(
+                        py,
+                        Some(region.bind(py).cast::<PyTuple>()?),
+                        &bounds,
+                    )?;
+                    let mut missing = Vec::new();
+                    uniserve_worker_ipc::subtract_region(&full, &covered, &mut missing);
                     (destination, missing)
                 }
             };
@@ -745,7 +748,7 @@ impl TensorStore {
                 &shape,
                 extent,
             )?;
-            (buffer, destination, vec![full.into_any()])
+            (buffer, destination, vec![full])
         };
         if destination
             .getattr("dtype")?
@@ -761,30 +764,23 @@ impl TensorStore {
             return Err(invalid(py, "product import changes resident tensor dtype"));
         }
         lock(py, &buffer).readers += 1;
-        let tickets = PyList::empty(py);
+        let mut tickets = Vec::new();
         let submitted = (|| -> PyResult<()> {
-            let fetch = py.import("uniserve_worker.transport.fetch")?;
-            let mut reads = Vec::<Bound<'py, PyAny>>::new();
+            let mut reads = Vec::new();
             for region in missing {
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("bindings", &bindings)?;
-                kwargs.set_item("region", &region)?;
-                reads.extend(
-                    fetch
-                        .getattr("plan_reads")?
-                        .call((&tensor, destination.get_item(&region)?), Some(&kwargs))?
-                        .extract::<Vec<Bound<'py, PyAny>>>()?,
-                );
+                let target = destination.get_item(super::fetch::slices(py, &region)?)?;
+                reads.extend(super::fetch::plan_reads(
+                    py, &tensor, &target, &bindings, &region,
+                )?);
             }
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("retain", tickets.getattr("append")?)?;
-            fetch
-                .getattr("submit_reads")?
-                .call((PyTuple::new(py, reads)?,), Some(&kwargs))?;
+
+            super::fetch::submit_reads(py, &reads, |ticket| {
+                tickets.push(ticket.clone_ref(py));
+                Ok(())
+            })?;
             Ok(())
         })();
         let tickets: Vec<TransferRef> = tickets
-            .extract::<Vec<Py<TransferTicket>>>()?
             .into_iter()
             .map(|ticket| TransferRef::new(py, ticket))
             .collect::<PyResult<_>>()?;
@@ -799,7 +795,6 @@ impl TensorStore {
             drop(state);
 
             for ticket in tickets {
-                ticket.owner.get().cancel(py)?;
                 TransferTicket::close(ticket.owner.into_bound(py))?;
             }
             let mut state = self.lock(py)?;
