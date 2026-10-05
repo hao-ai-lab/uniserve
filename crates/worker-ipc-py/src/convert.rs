@@ -2027,7 +2027,7 @@ fn tensor_transfer_to_py<'py>(
 
 /// Decodes a tensor transfer and rejects it unless `TensorTransfer::validate`
 /// accepts the assembled descriptor.
-fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
+pub(crate) fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
     let raw = get(dict, intern!(py, "locations"))?;

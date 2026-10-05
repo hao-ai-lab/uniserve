@@ -9,7 +9,7 @@ use pyo3::sync::MutexExt;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use uniserve_core::MediaSource;
 use uniserve_worker::PendingOutput as NativeOutput;
-use uniserve_worker_ipc::{Call, CallStatus, ErrorCode, RequestOutput};
+use uniserve_worker_ipc::{BufferId, Call, CallStatus, ErrorCode, KvTransfer, RequestOutput};
 
 use crate::convert;
 
@@ -44,10 +44,8 @@ pub(crate) struct PendingOutput {
     pub(super) cache_exports: Py<PyDict>,
     #[pyo3(get)]
     pub(super) exported_locators: Py<PyList>,
-    #[pyo3(get, set)]
-    pub(super) cache_export: Option<Py<PyAny>>,
-    #[pyo3(get, set)]
-    pub(super) cache_installation: Option<Py<PyAny>>,
+    pub(super) cache_export: Option<Arc<KvTransfer>>,
+    pub(super) cache_installation: Option<(BufferId, Arc<KvTransfer>)>,
     #[pyo3(get)]
     pub(super) device_reads: Py<PyList>,
     #[pyo3(get)]
@@ -300,13 +298,6 @@ impl PendingOutput {
         drop(retired);
     }
 
-    fn set_kv_output(&self, output: &Bound<'_, PyAny>) -> PyResult<()> {
-        let value = convert::kv_transfer_from_py(&output.call_method0("to_mapping")?)
-            .ok_or_else(|| PyRuntimeError::new_err("invalid KV output"))?;
-        self.lock(output.py())?.output.kv_output = Some(value);
-        Ok(())
-    }
-
     pub(super) fn ready(slf: &Bound<'_, Self>) -> PyResult<bool> {
         let py = slf.py();
         let (buffer, tasks) = {
@@ -387,8 +378,6 @@ impl PendingOutput {
         visit.call(&self.tensor_exports)?;
         visit.call(&self.cache_exports)?;
         visit.call(&self.exported_locators)?;
-        visit.call(&self.cache_export)?;
-        visit.call(&self.cache_installation)?;
         visit.call(&self.device_reads)?;
         visit.call(&self.feature_reads)?;
         visit.call(&self.writes)?;

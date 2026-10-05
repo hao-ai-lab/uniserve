@@ -28,7 +28,6 @@ from uniserve_worker._uniserve_ipc import KVCacheManager as NativeKVCacheManager
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
-    KvGroupTransfer,
     KvTransfer,
     Locator,
     TensorTransfer,
@@ -162,7 +161,6 @@ class KVCacheManager:
         # Transport locations of committed exports, updated by the batch
         # commit; export intervals retained under their buffers.
         self.exports: dict[BufferId, ExportLocations] = {}
-        self._manager = NativeKVCacheManager()
 
         self.block_tables = BlockTables(
             groups=self.shapes,
@@ -175,6 +173,11 @@ class KVCacheManager:
             staging_depth=staging_depth,
         )
 
+        self._manager = NativeKVCacheManager(
+            self.block_tables._tables,
+            str(self.compute_dtypes[0]).removeprefix("torch."),
+            self._export_group,
+        )
         self.imports = KVImporter(self, capacity=import_capacity)
 
     @property
@@ -427,15 +430,6 @@ class KVCacheManager:
         self.require_reusable(self.unit_spans(units))
         self.cache.recycle_units(units)
 
-    def _export_start(self, group: int, base: int, visible: int) -> int:
-        """Return the first token a group carries in an export.
-
-        A full-attention group carries the whole suffix after ``base``; a
-        sliding-window group only the history a reader of ``visible`` needs.
-        """
-        window = self.shapes[group].window
-        return base if window is None else max(base, visible - window)
-
     def export(
         self,
         *,
@@ -466,80 +460,14 @@ class KVCacheManager:
                 failure propagates after every exported locator and the
                 reservation are released.
         """
-        installed = self._manager.destination_base(buffer.owner, destination)
-        base, base_extent = (None, 0) if installed is None else installed
-
-        visible = int(visible_length)
-        tables = tuple(
-            self.block_tables.table(request_pool_idx, group)
-            for group in range(len(self.shapes))
-        )
-        if visible > self.block_tables.allocated_length(request_pool_idx):
-            raise invalid_descriptor(
-                "KV export exceeds its scheduler block table"
-            )
-        if visible < base_extent:
-            raise invalid_descriptor(
-                "KV export destination is ahead of its source"
-            )
-
-        starts = tuple(
-            self._export_start(group, base_extent, visible)
-            for group in range(len(tables))
-        )
-        spans = tuple(
-            table.spans(start, visible - start)
-            for table, start in zip(tables, starts, strict=True)
-        )
-        source = (
-            self.reserve_export(
-                buffer, tuple(span for group in spans for span in group)
-            )
-            if visible > base_extent
-            else None
-        )
-
-        locators: list[Locator] = []
-        groups: list[KvGroupTransfer] = []
-        try:
-            if source is not None:
-                for group, (table, start) in enumerate(
-                    zip(tables, starts, strict=True)
-                ):
-                    tensors = self._export_group(
-                        group,
-                        table,
-                        start,
-                        visible,
-                        source=source,
-                        transports=transports,
-                        consumers=consumers,
-                        locators=locators,
-                    )
-                    groups.append(
-                        KvGroupTransfer(
-                            start=start,
-                            page_tokens=table.shape.page_tokens,
-                            tensors=tensors,
-                        )
-                    )
-        except BaseException:
-            for locator in locators:
-                transports[locator.backend].release(locator)
-            self.release_buffers((buffer,))
-            raise
-
-        # Every group of one pool shares a compute dtype; the first names it.
-        export = KvTransfer(
-            groups=tuple(groups),
-            source=buffer,
+        return self._manager.export(
+            request_pool_idx=request_pool_idx,
+            visible_length=visible_length,
             destination=destination,
-            base=base,
-            base_extent=base_extent,
-            exported_extent=visible,
-            compute_dtype=str(self.compute_dtypes[0]).removeprefix("torch."),
+            buffer=buffer,
+            transports=transports,
+            consumers=consumers,
         )
-        return export
 
     def _export_group(
         self,
@@ -788,19 +716,15 @@ class KVCacheManager:
                 the block tables disagree, or the import was abandoned.
             Exception: The import's own failure, re-raised.
         """
-        self.imports.adopt(write, installed_buffer)
-        export = write.export
-        request_pool_idx = write.request_pool_idx
+        return self.imports.adopt(write, installed_buffer)
+
+    def _set_imported_length(self, slot: int, extent: int) -> None:
+        """Copy the adopted extent into the numerical block tables."""
+        device = self.block_tables.unit_tables.device
         self.block_tables.set_verified(
-            torch.tensor(
-                (request_pool_idx,), device=self.block_tables.unit_tables.device
-            ),
-            torch.tensor(
-                (export.exported_extent,),
-                device=self.block_tables.unit_tables.device,
-            ),
+            torch.tensor((slot,), device=device),
+            torch.tensor((extent,), device=device),
         )
-        return export
 
     def validate_exports(
         self,

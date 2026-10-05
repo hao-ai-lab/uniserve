@@ -94,14 +94,6 @@ class BatchRunner:
         """Launch the selected homogeneous calls into reserved output views."""
         scheduled = tuple(state.batch.calls[index] for index in indices)
 
-        with state.scope():
-            for device in dict.fromkeys(
-                device
-                for call in scheduled
-                for device in self.worker.runner.call_devices(call)
-            ):
-                state.output_buffer.begin_device(device)
-
         execute_calls(
             scheduled,
             kv_cache=self.worker.kv_cache,

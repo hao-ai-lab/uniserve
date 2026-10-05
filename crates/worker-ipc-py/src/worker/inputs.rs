@@ -168,6 +168,13 @@ pub(crate) struct BatchInputs {
 }
 
 impl BatchInputs {
+    pub(super) fn cache_import(&self, py: Python<'_>, buffer: BufferId) -> Option<Py<KVImport>> {
+        match self.inner.inputs.get(&buffer) {
+            Some(Input::Cache(write)) => Some(write.clone_ref(py)),
+            _ => None,
+        }
+    }
+
     pub(super) fn insert(&mut self, buffer: BufferId, input: Input) {
         self.inner.inputs.insert(buffer, input);
     }
@@ -302,10 +309,7 @@ impl BatchInputs {
     }
 
     fn cache(&self, py: Python<'_>, buffer: &Bound<'_, PyAny>) -> PyResult<Option<Py<KVImport>>> {
-        Ok(match self.inner.inputs.get(&buffer_id(buffer)?) {
-            Some(Input::Cache(write)) => Some(write.clone_ref(py)),
-            _ => None,
-        })
+        Ok(self.cache_import(py, buffer_id(buffer)?))
     }
 
     pub(super) fn cache_imports(&self, py: Python<'_>) -> Vec<Py<KVImport>> {

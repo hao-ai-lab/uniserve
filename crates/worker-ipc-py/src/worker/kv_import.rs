@@ -14,7 +14,7 @@ use uniserve_worker::{
     GroupTable as NativeGroupTable, HostLane as NativeLane, HostTask as NativeTask, ImportBackend,
     ImportCopy, KVImport as NativeImport, KVImporter as NativeImporter, Outcome,
 };
-use uniserve_worker_ipc::KvTransfer;
+use uniserve_worker_ipc::{BufferId, KvTransfer};
 
 use super::block_tables::{BlockTables, GroupTable};
 use super::completion::{Completion, CompletionRef, cancelled};
@@ -201,6 +201,56 @@ pub(crate) struct KVImporter {
 }
 
 impl KVImporter {
+    pub(super) fn adopt(
+        &self,
+        py: Python<'_>,
+        write: &KVImport,
+        installed_buffer: BufferId,
+    ) -> PyResult<Arc<KvTransfer>> {
+        if installed_buffer.owner != write.export.source.owner {
+            return Err(invalid(
+                py,
+                "installed KV buffer does not belong to its source",
+            ));
+        }
+
+        // Another completed import may have advanced the accepted base while
+        // this copy was pending. Recheck only mutable state at adoption.
+        self.accesses
+            .borrow(py)
+            .inner
+            .validate_install(&write.export)
+            .map_err(|error| native_error(py, error))?;
+        {
+            let tables = self.tables.borrow(py);
+            for (group, expected) in write.tables.iter().enumerate() {
+                let installed = tables
+                    .tables
+                    .table(write.inner.request_pool_idx as u32, group as u32)
+                    .map_err(|error| native_error(py, error))?;
+                if installed != *expected {
+                    return Err(invalid(py, "KV installation scheduler block table changed"));
+                }
+            }
+        }
+
+        if !write.done() {
+            return Err(PyRuntimeError::new_err(
+                "KV import was observed before input readiness",
+            ));
+        }
+        write.result(py, None)?;
+        self.inner
+            .adopt(&write.inner)
+            .map_err(|error| native_error(py, error))?;
+        self.pool.bind(py).call_method1(
+            "_set_imported_length",
+            (write.inner.request_pool_idx, write.export.exported_extent),
+        )?;
+        self._reap(py)?;
+        Ok(Arc::clone(&write.export))
+    }
+
     /// Share reservation and copy ownership between native batches and direct
     /// Python callers. Only the numerical copy materializes Python views.
     pub(super) fn reserve(
@@ -452,49 +502,15 @@ impl KVImporter {
         self.inner.owns(&write.inner)
     }
 
-    fn adopt(
+    #[pyo3(name = "adopt")]
+    fn adopt_py(
         &self,
         py: Python<'_>,
         write: &KVImport,
         installed_buffer: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        if buffer_id(installed_buffer)?.owner != write.export.source.owner {
-            return Err(invalid(
-                py,
-                "installed KV buffer does not belong to its source",
-            ));
-        }
-
-        // Another completed import may have advanced the accepted base while
-        // this copy was pending. Recheck only mutable state at adoption.
-        self.accesses
-            .borrow(py)
-            .inner
-            .validate_install(&write.export)
-            .map_err(|error| native_error(py, error))?;
-        {
-            let tables = self.tables.borrow(py);
-            for (group, expected) in write.tables.iter().enumerate() {
-                let installed = tables
-                    .tables
-                    .table(write.inner.request_pool_idx as u32, group as u32)
-                    .map_err(|error| native_error(py, error))?;
-                if installed != *expected {
-                    return Err(invalid(py, "KV installation scheduler block table changed"));
-                }
-            }
-        }
-
-        if !write.done() {
-            return Err(PyRuntimeError::new_err(
-                "KV import was observed before input readiness",
-            ));
-        }
-        write.result(py, None)?;
-        self.inner
-            .adopt(&write.inner)
-            .map_err(|error| native_error(py, error))?;
-        self._reap(py)
+    ) -> PyResult<Py<PyAny>> {
+        let transfer = self.adopt(py, write, buffer_id(installed_buffer)?)?;
+        convert::kv_transfer_to_py(py, &transfer).map(Bound::unbind)
     }
 
     pub(crate) fn abandon(&self, py: Python<'_>, write: &KVImport) -> PyResult<()> {
