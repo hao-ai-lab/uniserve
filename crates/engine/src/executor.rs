@@ -30,7 +30,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use uniserve_worker_ipc::{
-    BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorPublication, WorkerInfo,
+    BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, WorkerInfo,
 };
 
 mod batch;
@@ -444,8 +444,8 @@ pub struct WorkerResult {
     /// Every participating rank has retired this batch, including command-only ranks.
     pub done: bool,
     pub results: Vec<CallResult>,
-    /// Tensor publications remain owned by the executor's transfer consumers.
-    pub products: Vec<TensorPublication>,
+    /// Tensor exports remain owned by the executor's transfer consumers.
+    pub products: Vec<TensorExport>,
     /// Worker-reported execution duration in microseconds, when reported.
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported.
@@ -468,7 +468,7 @@ impl WorkerResult {
                     .take()
                     .map(|media| {
                         let uniserve_worker_ipc::ArtifactHandle::PosixShm { name } = media.handle;
-                        // SAFETY: publication transfers immutable storage after the writer closes.
+                        // SAFETY: export transfers immutable storage after the writer closes.
                         // The mapping owns the bytes even if this result is rejected downstream.
                         unsafe { uniserve_core::SharedMedia::open(&name, media.bytes) }
                             .map(Arc::new)
@@ -537,7 +537,7 @@ pub struct BatchResult {
 /// numbered with `Start` admissions skipped, so `commands` may be given with
 /// or without them; callers that track other outcomes overwrite the receipts.
 /// A partial result carries no receipts. `report.products` is not carried
-/// into the result: publications stay with the executor, and
+/// into the result: exports stay with the executor, and
 /// `WorkerExecutor` records them before converting.
 pub(crate) fn logical_result(
     report: WorkerResult,
@@ -724,7 +724,7 @@ pub struct TransferConfig {
     pub worker_ranks: std::collections::BTreeMap<String, u32>,
     /// Host of each rank of each worker an edge may name.
     ///
-    /// A publication's readiness mechanism depends on where it is read: an
+    /// An export's readiness mechanism depends on where it is read: an
     /// interprocess event reaches another process on this host and no further.
     /// Only the placement knows where a consumer runs.
     #[serde(default)]
@@ -822,7 +822,7 @@ impl TransferConfig {
     /// the rank produces or consumes on, plus `Local`; `publish` is the
     /// mechanisms on edges the rank produces on, or only `Local` when it
     /// produces on none. The launch descriptor carries them as
-    /// `transfer_backends` and `publish_backends`.
+    /// `transfer_backends` and `export_backends`.
     pub fn rank_backends(
         &self,
         worker: &str,
@@ -832,13 +832,13 @@ impl TransferConfig {
         std::collections::BTreeSet<TransferBackend>,
     ) {
         let mut backends = std::collections::BTreeSet::from([TransferBackend::Local]);
-        let mut publications = std::collections::BTreeSet::new();
+        let mut exports = std::collections::BTreeSet::new();
         for edge in &self.edges {
             if edge.source_worker.0 == worker
                 && edge.source_rank.is_none_or(|source| source == rank)
             {
                 backends.extend(edge.mechanisms());
-                publications.extend(edge.mechanisms());
+                exports.extend(edge.mechanisms());
             }
             if edge.destination_worker.0 == worker
                 && edge
@@ -848,10 +848,10 @@ impl TransferConfig {
                 backends.extend(edge.mechanisms());
             }
         }
-        if publications.is_empty() {
-            publications.insert(TransferBackend::Local);
+        if exports.is_empty() {
+            exports.insert(TransferBackend::Local);
         }
-        (backends, publications)
+        (backends, exports)
     }
 
     /// Returns the instance-wide acknowledgment slot of one rank.
@@ -1015,7 +1015,7 @@ impl TransferConfig {
     /// tensor keeps its filtered locations.
     pub(crate) fn bind_inputs(
         &self,
-        products: &mut [uniserve_worker_ipc::TensorPublication],
+        products: &mut [uniserve_worker_ipc::TensorExport],
         kv_inputs: &mut [uniserve_worker_ipc::KvTransfer],
         destination: &uniserve_worker_ipc::WorkerEndpoint,
     ) -> Result<(), UnroutableInputs> {
@@ -1030,13 +1030,13 @@ impl TransferConfig {
                 unroutable.push(buffer);
             }
         }
-        for publication in kv_inputs.iter_mut() {
+        for export in kv_inputs.iter_mut() {
             let mut bound = true;
-            for tensor in publication.tensors_mut() {
+            for tensor in export.tensors_mut() {
                 bound &= self.bind_locations(tensor, destination);
             }
             if !bound {
-                unroutable.push(publication.source);
+                unroutable.push(export.source);
             }
         }
         if unroutable.is_empty() {
@@ -1606,7 +1606,7 @@ mod tests {
     #[test]
     fn a_device_only_edge_refuses_a_product_published_as_host_bytes() {
         use uniserve_worker_ipc::{
-            CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorPublication, TensorRef,
+            CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
             TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
         };
 
@@ -1641,7 +1641,7 @@ mod tests {
                 dims: vec![DimBound::Static(1)],
             },
         };
-        let mut products = vec![TensorPublication {
+        let mut products = vec![TensorExport {
             product: product.clone(),
             value: TransferHandle::DeviceProduct {
                 height: 0,

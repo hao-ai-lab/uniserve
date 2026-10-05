@@ -21,8 +21,8 @@ pub struct DescriptorGrants {
     data: ObjectArc<DescriptorGrantsObj>,
 }
 
-pub fn fetch_descriptor(endpoint: String, publication: String) -> Result<i32> {
-    uniserve_worker::fetch_descriptor(endpoint.as_str(), publication.as_str())
+pub fn fetch_descriptor(endpoint: String, export: String) -> Result<i32> {
+    uniserve_worker::fetch_descriptor(endpoint.as_str(), export.as_str())
         .map(IntoRawFd::into_raw_fd)
         .map_err(|error| failure(error.to_string()))
 }
@@ -45,23 +45,21 @@ pub fn register() -> Result<()> {
     )?;
     method::<DescriptorGrantsObj>(
         "register",
-        Function::from_typed(|owner: DescriptorGrants, publication: String, fd: i32| {
+        Function::from_typed(|owner: DescriptorGrants, export: String, fd: i32| {
             owner
                 .data
                 .grants
-                .register(publication.as_str(), fd)
+                .register(export.as_str(), fd)
                 .map_err(|error| failure(error.to_string()))
         }),
         "Retain an allocation descriptor until revocation.",
     )?;
     method::<DescriptorGrantsObj>(
         "release",
-        Function::from_typed(
-            |owner: DescriptorGrants, publication: String| -> Result<()> {
-                owner.data.grants.release(publication.as_str());
-                Ok(())
-            },
-        ),
+        Function::from_typed(|owner: DescriptorGrants, export: String| -> Result<()> {
+            owner.data.grants.release(export.as_str());
+            Ok(())
+        }),
         "Refuse later requests while received descriptors remain usable.",
     )?;
     method::<DescriptorGrantsObj>(

@@ -40,7 +40,7 @@ REQUIRED_FIELDS = (
     "deployment_components",
     "supported_calls",
     "transfer_backends",
-    "publish_backends",
+    "export_backends",
     "rendezvous_address",
     "rendezvous_listen_fd",
     "attention_backend",

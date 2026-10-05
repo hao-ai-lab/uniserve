@@ -1,4 +1,4 @@
-"""Public component execution, publication and component participation."""
+"""Public component execution, export and component participation."""
 
 import threading
 from types import SimpleNamespace
@@ -37,7 +37,7 @@ from uniserve_worker.protocol.batch import (
     DiffusionParams,
     NewRequest,
     Start,
-    TensorPublication,
+    TensorExport,
 )
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -377,7 +377,7 @@ def test_a_batch_reading_more_regions_than_read_tickets_completes():
             )
             # The producer wrote rows [0, 3) and [3, 6) as separate regions.
             locations = tuple(
-                producer.publish(value[start : start + 3], offset=(start, 0))
+                producer.export(value[start : start + 3], offset=(start, 0))
                 for start in (0, 3)
             )
             published.extend(locations)
@@ -409,7 +409,7 @@ def test_a_batch_reading_more_regions_than_read_tickets_completes():
                 )
             )
             inputs.append(
-                TensorPublication(
+                TensorExport(
                     reference,
                     DeviceProductTransferValue(
                         0, 0, "", TensorTransfer((6, 4), locations)
@@ -420,7 +420,7 @@ def test_a_batch_reading_more_regions_than_read_tickets_completes():
 
         # Reads elsewhere on the rank hold three of its four tickets: a
         # borrowed view does until its consumers finish.
-        source = producer.publish(torch.zeros(4))
+        source = producer.export(torch.zeros(4))
         published.append(source)
         held = [
             local.fetch(source, device=torch.device("cpu")) for _ in range(3)
@@ -608,7 +608,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
                 batch_id=2,
                 collective_seq=3,
                 calls=(consumer,),
-                input_products=(TensorPublication(reference, product.value),),
+                input_products=(TensorExport(reference, product.value),),
                 buffer_allocations=(
                     BufferAllocation(
                         reference.buffer_id, 0, reference.max_bytes

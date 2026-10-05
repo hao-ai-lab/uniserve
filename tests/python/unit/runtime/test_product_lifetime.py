@@ -382,11 +382,9 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
             pages, start=0, length=3
         ):
             assert tensor is not None
-            location = transport.publish(tensor)
+            location = transport.export(tensor)
             locations.append(location)
-            pool.retain_export(
-                source, transport.publication_retirement(location)
-            )
+            pool.retain_export(source, transport.retirement(location))
             readers.append(
                 transport.fetch(location, device=torch.device("cpu"))
             )
@@ -492,7 +490,7 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
                 product.buffer_id: BufferAllocation(product.buffer_id, 0, 16)
             },
         )[0]
-        store.publish_write(
+        store.write(
             write,
             value,
             metadata=FeatureMetadata(height=1, width=4)
@@ -556,7 +554,7 @@ def test_shared_tensor_reads_survive_collection_and_release_cycles() -> None:
                 )
             },
         )
-        store.publish_write(writes[0], value)
+        store.write(writes[0], value)
         store.commit_writes(writes)
         reads = tuple(
             store.consume(reference, consumer_call_id=CallId(batch, 0))
@@ -585,7 +583,7 @@ def test_shared_tensor_reads_survive_collection_and_release_cycles() -> None:
 
 
 def test_a_retired_segment_no_consumer_began_reading_returns_at_once() -> None:
-    """A publication released before its consumer read retires unread.
+    """A export released before its consumer read retires unread.
 
     The engine releases a buffer only once every consuming call has resolved
     or will never be submitted, as for a request cancelled before its
@@ -598,8 +596,8 @@ def test_a_retired_segment_no_consumer_began_reading_returns_at_once() -> None:
     )
     try:
         value = torch.arange(8, dtype=torch.float32)
-        locator = transport.publish(value, consumers=(1, 2))
-        retirement = transport.publication_retirement(locator)
+        locator = transport.export(value, consumers=(1, 2))
+        retirement = transport.retirement(locator)
         transport.release(locator)
         transport.reap()
         retirement.result(timeout=5)
@@ -640,7 +638,7 @@ def test_a_deferred_write_commits_when_its_host_work_publishes_it() -> None:
         )
         deferred, immediate = writes
         store.defer_write(deferred)
-        store.publish_write(immediate, torch.tensor([7.0]))
+        store.write(immediate, torch.tensor([7.0]))
         # The call's completion packs and commits with the immediate write
         # only; the deferred one is neither published nor exposed yet.
         store.validate_writes(writes)
@@ -654,7 +652,7 @@ def test_a_deferred_write_commits_when_its_host_work_publishes_it() -> None:
             store.consume(rows, consumer_call_id=consumer)
         # Host work publishes and commits it later; then it reads like any
         # other product.
-        store.publish_write(deferred, torch.tensor([3.0]))
+        store.write(deferred, torch.tensor([3.0]))
         store.commit_writes((deferred,))
         read = store.consume(rows, consumer_call_id=consumer)
         torch.testing.assert_close(
@@ -723,7 +721,7 @@ def test_resident_bytes_cover_only_storage_the_store_allocates() -> None:
 
 
 @pytest.mark.parametrize("relay", (False, True))
-def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
+def test_tensor_export_is_atomic_and_preserves_generation_ownership(
     relay: bool,
 ) -> None:
     buffers = BufferPool(byte_capacity=16, devices=("cpu",))
@@ -763,7 +761,7 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
         with pytest.raises(WorkerError):
             reserve((first, first))
         writes = reserve((first, second))
-        store.publish_write(writes[0], torch.tensor([3.0]))
+        store.write(writes[0], torch.tensor([3.0]))
         with pytest.raises(WorkerError):
             reserve((first,))
         with pytest.raises(WorkerError):
@@ -772,7 +770,7 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
         for reference in (first, second):
             with pytest.raises(WorkerError):
                 store.consume(reference, consumer_call_id=consumer)
-        store.publish_write(writes[1], torch.tensor([7.0]))
+        store.write(writes[1], torch.tensor([7.0]))
         store.commit_writes(writes)
         with pytest.raises(WorkerError):
             store.consume_batch(
@@ -797,7 +795,7 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
         (write,) = reserve((replacement,))
         with pytest.raises(WorkerError):
             store.producer_write_views((writes[0],))
-        store.publish_write(write, torch.tensor([11.0]))
+        store.write(write, torch.tensor([11.0]))
         store.commit_writes((write,))
         with pytest.raises(WorkerError):
             store.consume(first, consumer_call_id=consumer)
@@ -812,7 +810,7 @@ def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
         store.event_pool.close()
 
 
-def test_tensor_publication_enforces_its_logical_region_and_representation() -> (  # noqa: E501
+def test_tensor_export_enforces_its_logical_region_and_representation() -> (  # noqa: E501
     None
 ):
     buffers = BufferPool(byte_capacity=24, devices=("cpu",))
@@ -846,10 +844,10 @@ def test_tensor_publication_enforces_its_logical_region_and_representation() -> 
             regions={reference: region},
         )[0]
         with pytest.raises(WorkerError, match="dtype"):
-            store.publish_write(write, expected.to(torch.float16))
+            store.write(write, expected.to(torch.float16))
         with pytest.raises(WorkerError, match="shape"):
-            store.publish_write(write, expected.reshape(3, 2))
-        store.publish_write(write, expected)
+            store.write(write, expected.reshape(3, 2))
+        store.write(write, expected)
         store.commit_writes((write,))
         read = store.consume(reference, consumer_call_id=CallId(2, 0))
         assert read.region == region
@@ -883,7 +881,7 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
         shape_bound=ShapeBound((StaticDim(11), StaticDim(4))),
     )
     expected = torch.arange(44, dtype=torch.float32).reshape(11, 4)
-    locator = transport.publish(expected)
+    locator = transport.export(expected)
     try:
         write = pool.reserve_import(
             product, request_pool_idx=1, page_table=(3, 1, 4), latent_units=11
@@ -1014,11 +1012,9 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             )
         offset = 0
         for span in source.spans:
-            location = transport.publish(span, offset=(offset, 0))
+            location = transport.export(span, offset=(offset, 0))
             locations.append(location)
-            pool.retain_export(
-                source, transport.publication_retirement(location)
-            )
+            pool.retain_export(source, transport.retirement(location))
             readers.append(
                 transport.fetch(location, device=torch.device("cpu"))
             )
@@ -1128,12 +1124,12 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         events.close()
 
 
-def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_other_requests(  # noqa: E501
+def test_unacknowledged_latent_export_retains_its_pages_without_poisoning_other_requests(  # noqa: E501
     latent_output,
 ) -> None:
-    """A retired publication holds its pages while its consumer reads.
+    """A retired export holds its pages while its consumer reads.
 
-    The consumer named on the publication has claimed its word and not yet
+    The consumer named on the export has claimed its word and not yet
     acknowledged, so the pages stay owned and the request is not
     retirement-ready, while an independent request proceeds. Once the word
     lands, the next sweep returns the pages.
@@ -1169,13 +1165,13 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
     source = pool.reserve_export(
         product, request_pool_idx=1, page_table=(1,), latent_units=4
     )
-    locator = transport.publish(source.spans[0], consumers=(1,))
-    retirement = transport.publication_retirement(locator)
+    locator = transport.export(source.spans[0], consumers=(1,))
+    retirement = transport.retirement(locator)
     pool.retain_export(source, retirement)
     commit = latent_output(1, (1,), 4, 16, 64)
     pool.validate_updates((commit,))
     pool.apply_updates((commit,))
-    # The consumer begins reading before the engine retires the publication.
+    # The consumer begins reading before the engine retires the export.
     storage = open_shared_storage(
         locator.transport.name, segment.HEADER_BYTES + locator.nbytes
     )
@@ -1190,7 +1186,7 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
         pool.release_buffers((product.buffer_id,))
         transport.reap()
         assert not retirement.done(), (
-            "publication retired before its consumer acknowledged"
+            "export retired before its consumer acknowledged"
         )
         assert not pool.retirement_ready((product.request_key,))
         pool.release_slots((1,))
@@ -1351,7 +1347,7 @@ def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
         pool.close()
 
 
-def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
+def test_fp8_export_preserves_values_before_a_later_block_scale_growth():
     pool = mha_pool(
         num_layers=1,
         num_kv_heads=1,
@@ -1380,7 +1376,7 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
     try:
         pool.block_tables.install(((1, 0, 0, (1,), 4),))
         state.write((1,), start=0, key=prefix, value=-prefix)
-        publication = pool.publish(
+        export = pool.export(
             request_pool_idx=1,
             visible_length=1,
             destination="consumer",
@@ -1388,24 +1384,22 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
             transports={"local": transport},
         )
         locations.extend(
-            location
-            for field in publication.tensors
-            for location in field.locations
+            location for field in export.tensors for location in field.locations
         )
-        pool.validate_publications(((source, publication),), ())
-        pool.apply_publications(((source, publication),), ())
+        pool.validate_exports(((source, export),), ())
+        pool.apply_exports(((source, export),), ())
         # The import can begin after another invocation appends to the same
         # physical block. Its BufferId still denotes the earlier exact value.
         suffix = torch.full_like(prefix, 896)
         pool.require_writable(_table(pool, (1,)), start=1, length=1)
         state.write((1,), start=1, key=suffix, value=-suffix)
-        for index, field in enumerate(publication.tensors[:2]):
+        for index, field in enumerate(export.tensors[:2]):
             reader = transport.fetch(
                 field.locations[0], device=torch.device("cpu")
             )
             readers.append(reader)
             scale_reader = transport.fetch(
-                publication.tensors[2].locations[index],
+                export.tensors[2].locations[index],
                 device=torch.device("cpu"),
             )
             readers.append(scale_reader)
@@ -1429,7 +1423,7 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
 def test_a_host_product_is_published_where_its_consumers_are() -> None:
     """Each host mechanism carries a product only to consumers it reaches."""
     from uniserve_worker.transport import make_transports, segment
-    from uniserve_worker.transport.publication import publish_tensor
+    from uniserve_worker.transport.exports import export_tensor
     from uniserve_worker.transport.shared_storage import open_shared_storage
 
     events = EventPool()
@@ -1451,7 +1445,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
             (): {"local", "shm", "channel"},
         }
         for consumers, expected in cases.items():
-            locations = publish_tensor(
+            locations = export_tensor(
                 transports,
                 value,
                 retain=lambda future: None,

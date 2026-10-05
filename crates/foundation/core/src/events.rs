@@ -328,7 +328,7 @@ pub struct DiffusionRequest {
     pub text_tags: Vec<u8>,
     /// The conditions in request order; empty for `t2va`.
     pub conditions: Vec<VideoCondition>,
-    /// The shared-memory publication of each condition's media, in request
+    /// The shared-memory export of each condition's media, in request
     /// order; `conditions[i].source` names `media[i]`. The request holds
     /// them, and so keeps their bytes readable, until the engine retires it.
     #[serde(skip)]

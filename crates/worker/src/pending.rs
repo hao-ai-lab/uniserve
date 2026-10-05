@@ -196,7 +196,7 @@ impl PendingOutput {
         if let Some(output) = &self.output.kv_output {
             if Some(output.source) != call.kv_output {
                 return Err(Error::Invalid(
-                    "KV publication differs from its declared output".into(),
+                    "KV export differs from its declared output".into(),
                 ));
             }
 
@@ -208,7 +208,7 @@ impl PendingOutput {
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             if bytes > call.bounds.max_transfer_bytes {
                 return Err(Error::Invalid(
-                    "KV publication exceeds its transfer-byte bound".into(),
+                    "KV export exceeds its transfer-byte bound".into(),
                 ));
             }
             if output.encoded_size_bound() > MAX_TRANSFER_HANDLE_BYTES {

@@ -830,7 +830,7 @@ const CONDITION_CANVAS: Canvas = Canvas {
 
 /// A `ref2va` request with an image reference, a three-unit video reference
 /// with its soundtrack and an audio reference. `media` keeps the published
-/// bytes alive as the server's publications would.
+/// bytes alive as the server's exports would.
 fn reference_request(id: u64, media: &Arc<MediaSource>) -> Request {
     let fit = ImageFit {
         resized: CONDITION_CANVAS,

@@ -135,7 +135,7 @@ def prepare_rows(
     return tuple(rows)
 
 
-def publish(
+def capture_readout(
     call: Call,
     values: list[torch.Tensor],
     *,
@@ -273,7 +273,7 @@ def publish_steps(
 
     Each call's completion output receives, on the device, whether its block
     continues after the step: the predicate of a step queued behind it. One
-    publication covers every row, so each row's completion becomes visible
+    export covers every row, so each row's completion becomes visible
     together with its values, after the same producer point on the stream.
     The outcomes report the requests' coordinates unchanged, since a step
     writes no KV.
@@ -316,7 +316,7 @@ def publish_steps(
         if len(written_rows) != len(steps):
             outcome_column = outcome_column[written_rows]
         (view, *_views) = tensor_store.producer_write_views(tuple(writes))
-        tensor_store.publish_writes(
+        tensor_store.write_scalars(
             tuple(writes),
             (outcome_column == STEP_CONTINUED).to(view.dtype),
         )

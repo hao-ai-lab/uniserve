@@ -11,7 +11,7 @@ use super::WorkerId;
 use std::collections::BTreeMap;
 use uniserve_worker_ipc::{
     Batch, BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
-    ForwardBatch, LatentParams, NewRequest, RequestKey, TensorPublication,
+    ForwardBatch, LatentParams, NewRequest, RequestKey, TensorExport,
 };
 
 /// Physical placement selected by the scheduler for a computation.
@@ -62,8 +62,8 @@ pub struct ExecutionBatch {
     /// Ordered lifecycle and resource commands.
     pub commands: Vec<BatchCommand>,
     /// Published transfer descriptors supplied by an external storage owner.
-    pub input_transfers: Vec<TensorPublication>,
-    /// External cache publications consumed by explicit KV installation.
+    pub input_transfers: Vec<TensorExport>,
+    /// External cache exports consumed by explicit KV installation.
     ///
     /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
     /// the worker-local batches it builds.
@@ -76,7 +76,7 @@ impl ExecutionBatch {
         id: u64,
         requests: Vec<(Call, RequestPlacement)>,
         commands: Vec<BatchCommand>,
-        input_transfers: Vec<TensorPublication>,
+        input_transfers: Vec<TensorExport>,
     ) -> Self {
         Self {
             id,
@@ -126,10 +126,10 @@ impl ExecutionBatch {
             .collect::<std::collections::HashSet<_>>();
         self.input_transfers
             .retain(|payload| inputs.contains(&payload.product));
-        self.kv_inputs.retain(|publication| {
+        self.kv_inputs.retain(|export| {
             self.requests
                 .iter()
-                .any(|(call, _)| call.kv_input == Some(publication.source))
+                .any(|(call, _)| call.kv_input == Some(export.source))
         });
         retired
     }
@@ -221,8 +221,8 @@ impl ExecutionBatch {
         for transfer in &self.input_transfers {
             transfer.validate()?;
         }
-        for publication in &self.kv_inputs {
-            publication.validate()?;
+        for export in &self.kv_inputs {
+            export.validate()?;
         }
         Ok(())
     }

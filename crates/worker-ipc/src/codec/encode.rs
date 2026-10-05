@@ -695,7 +695,7 @@ fn locator<'a>(b: &mut FlatBufferBuilder<'a>, v: &Locator) -> WIPOffset<fbs::Loc
         }
         TransferTransport::CudaVmm {
             endpoint,
-            publication_id,
+            export_id,
             storage_size_bytes,
             storage_offsets_bytes,
             span_lengths,
@@ -707,7 +707,7 @@ fn locator<'a>(b: &mut FlatBufferBuilder<'a>, v: &Locator) -> WIPOffset<fbs::Loc
         } => {
             args.transport = fbs::TransferTransportKind::CudaVmm;
             args.endpoint = Some(b.create_string(endpoint));
-            args.publication_id = Some(b.create_string(publication_id));
+            args.export_id = Some(b.create_string(export_id));
             args.storage_size_bytes = *storage_size_bytes;
             args.storage_offsets_bytes = Some(b.create_vector(storage_offsets_bytes));
             args.span_lengths = Some(b.create_vector(span_lengths));
@@ -762,7 +762,7 @@ fn kv_transfer<'a>(
             destination,
             base,
             base_extent: v.base_extent,
-            published_extent: v.published_extent,
+            exported_extent: v.exported_extent,
             compute_dtype,
         },
     )
@@ -877,13 +877,10 @@ fn transfer_handle<'a>(
     )
 }
 
-fn publication<'a>(
-    b: &mut FlatBufferBuilder<'a>,
-    v: &TensorPublication,
-) -> WIPOffset<fbs::TensorPublication<'a>> {
+fn export<'a>(b: &mut FlatBufferBuilder<'a>, v: &TensorExport) -> WIPOffset<fbs::TensorExport<'a>> {
     let product = Some(tensor_ref(b, &v.product));
     let value = Some(transfer_handle(b, &v.value));
-    fbs::TensorPublication::create(b, &fbs::TensorPublicationArgs { product, value })
+    fbs::TensorExport::create(b, &fbs::TensorExportArgs { product, value })
 }
 
 fn command<'a>(
@@ -1002,7 +999,7 @@ fn batch<'a>(b: &mut FlatBufferBuilder<'a>, v: &Batch) -> WIPOffset<fbs::Batch<'
         let items = v
             .input_products
             .iter()
-            .map(|item| publication(b, item))
+            .map(|item| export(b, item))
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };
@@ -1230,7 +1227,7 @@ fn batch_output<'a>(
         let items = v
             .products
             .iter()
-            .map(|item| publication(b, item))
+            .map(|item| export(b, item))
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };

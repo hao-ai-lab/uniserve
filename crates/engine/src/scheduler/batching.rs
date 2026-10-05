@@ -616,7 +616,7 @@ impl Scheduler {
     /// Context ingestion (encoders and prefill) comes first; then token decode,
     /// verification and canvas denoising, image decoding, and KV installation;
     /// then denoising and the video and audio media calls; and last latent
-    /// preparation, tensor transfers, KV publication, and requests with no
+    /// preparation, tensor transfers, KV export, and requests with no
     /// next call.
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_call_variant(id) {
@@ -645,7 +645,7 @@ impl Scheduler {
             Some(
                 CallKind::Media(MediaCall::LatentPreparation)
                 | CallKind::Transfer(TransferMode::Tensor)
-                | CallKind::Transfer(TransferMode::KvPublish),
+                | CallKind::Transfer(TransferMode::KvExport),
             )
             | None => 3,
         }
@@ -681,7 +681,7 @@ impl Scheduler {
             Phase::Prefill => CallKind::Forward(ForwardMode::Prefill),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::CloseKv => CallKind::Forward(ForwardMode::Prefill),
-            Phase::PublishKv => CallKind::Transfer(TransferMode::KvPublish),
+            Phase::PublishKv => CallKind::Transfer(TransferMode::KvExport),
             Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
             Phase::DenoiseGen if st.denoising.is_complete() => {
                 CallKind::Media(MediaCall::ImageDecoding)
@@ -810,7 +810,7 @@ impl Scheduler {
         // Freeze physical inputs before registering this computation as pending.
         // Accepted progress may stop on cancellation while these inputs still drain.
         // `visible` is the KV length after the in-flight predecessors; `input`
-        // counts the tokens this call appends. Publication, latent preparation,
+        // counts the tokens this call appends. Export, latent preparation,
         // and denoising only read the request's KV.
         let (_, visible) = self.scheduled_token_lengths(request_id)?;
         let kv_lengths = match call.code {
@@ -828,7 +828,7 @@ impl Scheduler {
                 Some(KvLengths { visible, input: 1 })
             }
             CallKind::Forward(ForwardMode::TokenDenoising)
-            | CallKind::Transfer(TransferMode::KvPublish)
+            | CallKind::Transfer(TransferMode::KvExport)
             | CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising) => Some(KvLengths { visible, input: 0 }),
             _ => None,
@@ -1530,12 +1530,12 @@ impl Scheduler {
                 })
             }
             Phase::PublishKv => self.plan_computation(id, |scheduler, request| {
-                generation::plan_kv_publish(
+                generation::plan_kv_export(
                     scheduler
                         .info
                         .kv_cache
                         .as_ref()
-                        .map_or(0, |cache| cache.publication_bytes(kv_visible_len)),
+                        .map_or(0, |cache| cache.transfer_bytes(kv_visible_len)),
                     request,
                 )
             }),

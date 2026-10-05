@@ -214,7 +214,7 @@ uniserve/                                 Numerical layers, loading, and resourc
 uniserve_models/                          Concrete models, typed configs, and checkpoint catalog
 uniserve_worker/                          Worker lifecycle and rank-local execution
   protocol/                              Validated batches, calls, WorkerInfo, and IPC envelopes
-  execution/                             Submission, request progress, publication, and retirement
+  execution/                             Submission, request progress, tensor export, and retirement
   model_executor/                        Capability runners, numerical inputs, and CUDA graphs
   sampling/                              Sampling metadata, execution, and numerical results
   storage/                               KV, latent, tensor, request-slot, and output backing

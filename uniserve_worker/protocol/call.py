@@ -81,7 +81,7 @@ class TransferMode(StrEnum):
     """The storage action between a concrete producer and consumer."""
 
     TENSOR = "tensor"
-    KV_PUBLISH = "kv_publish"
+    KV_EXPORT = "kv_export"
     KV_INSTALL = "kv_install"
 
 
@@ -938,13 +938,12 @@ class Call:
         # index space with the tensor outputs checked below.
         output_indices: set[int] = set()
         publishes_kv = self.kind in {
-            TransferMode.KV_PUBLISH,
+            TransferMode.KV_EXPORT,
             TransferMode.KV_INSTALL,
         }
         if (self.kv_output is not None) != publishes_kv:
             raise invalid_descriptor(
-                "KV publication or installation requires one cache output "
-                "identity"
+                "KV export or installation requires one cache output identity"
             )
         if self.kv_output is not None:
             if (
@@ -968,9 +967,7 @@ class Call:
                 "KV input is incompatible with its computation or request"
             )
         if self.kind is TransferMode.KV_INSTALL and self.kv_input is None:
-            raise invalid_descriptor(
-                "KV installation requires a source publication"
-            )
+            raise invalid_descriptor("KV installation requires a source export")
 
         # Output ownership, generation, and capacity.
         for product in self.tensor_outputs():

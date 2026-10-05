@@ -15,7 +15,7 @@ from typing import Any, cast
 
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity, transfer
-from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.batch import TensorExport
 from uniserve_worker.protocol.call import (
     CallKind,
     CallStatus,
@@ -221,7 +221,7 @@ class RequestOutput:
     committed_tokens: tuple[int, ...]
     finish_flags: FinishFlags
     media_output: MediaOutput | None = None
-    # KV publication; only a successful KV_PUBLISH call carries one.
+    # KV export; only a successful KV_EXPORT call carries one.
     kv_output: transfer.KvTransfer | None = None
     # Natural-log probability of the final accepted token, when requested.
     sampled_logprob: float | None = None
@@ -241,8 +241,8 @@ class RequestOutput:
         parsed one.
 
         Raises:
-            WorkerError: The call id is not positive; a KV publication is
-                attached to anything but a successful KV_PUBLISH of this
+            WorkerError: The call id is not positive; a KV export is
+                attached to anything but a successful KV_EXPORT of this
                 call; the visible KV extent exceeds the computed one; a
                 coordinate is negative; the error code does not match the
                 status; a completion other than a successful token
@@ -264,12 +264,12 @@ class RequestOutput:
 
         if self.kv_output is not None and (
             self.status is not CallStatus.OK
-            or self.kind is not TransferMode.KV_PUBLISH
+            or self.kind is not TransferMode.KV_EXPORT
             or self.kv_output.source.owner != self.request_key
             or self.kv_output.source.producer_call_id != self.call_id
         ):
             raise invalid_descriptor(
-                "KV publication does not belong to its successful completion"
+                "KV export does not belong to its successful completion"
             )
 
         if self.kv_visible_len > self.kv_computed_len:
@@ -672,13 +672,13 @@ class BatchOutput:
     """One batch's complete result, carrying only materialized host values.
 
     `BatchState.result` in `uniserve_worker.execution.batch` builds it
-    with only the product publications of calls that completed with status
+    with only the product exports of calls that completed with status
     OK; the record itself does not check this.
     """
 
     batch_id: int
     completions: tuple[RequestOutput, ...] = ()
-    products: tuple[TensorPublication, ...] = ()
+    products: tuple[TensorExport, ...] = ()
     worker_exec_us: int | None = None
     forward_stats: ForwardStats | None = None
 
@@ -699,9 +699,7 @@ class BatchOutput:
                 )
             ),
             products=tuple(
-                TensorPublication.from_mapping(
-                    item, f"{where}.products[{index}]"
-                )
+                TensorExport.from_mapping(item, f"{where}.products[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("products", ()), f"{where}.products")
                 )

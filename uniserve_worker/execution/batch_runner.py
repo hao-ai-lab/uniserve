@@ -124,7 +124,7 @@ class BatchRunner:
             worker_info=self.worker.info,
             latent_pool=self.worker.latent_pool,
             media_mux=self.worker.media_mux,
-            publication_transports=self.worker.publication_transports,
+            export_transports=self.worker.export_transports,
             transports=self.worker.transports,
             request_tables=self.worker.block_tables,
             request_pool=self.worker.requests,

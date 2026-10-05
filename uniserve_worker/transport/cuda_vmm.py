@@ -1,16 +1,16 @@
-"""CUDA virtual storage publication and bounded peer transfers.
+"""CUDA virtual storage export and bounded peer transfers.
 
-A device product is published in one of two forms. Storage that already has
+A device product is exported in one of two forms. Storage that already has
 exportable physical backing is exported where it lies, which copies nothing.
 Anything else is copied into a chunk of the device's `VmmPool`, whose single
-handle covers every chunk published from that device. Either way the locator
+handle covers every chunk exported from that device. Either way the locator
 carries a shareable allocation handle, the byte offsets of the spans inside
 that allocation, and a readiness fence when one can reach the consumer.
 
 Readiness: a rank whose products cross hosts drains its stream on every
-publication and publishes no fence; otherwise the locator carries an
+export and exports no fence; otherwise the locator carries an
 interprocess event handle. Retirement: once the engine has retired a
-publication, the producer's source is released when its fence drains, and a
+export, the producer's source is released when its fence drains, and a
 pool chunk returns once no named consumer is still reading it, as the
 acknowledgment words in the chunk header show when `CudaVmmTransport.reap`
 sweeps them.
@@ -51,7 +51,7 @@ from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     copy_pairs,
     dtype_name,
-    publication_views,
+    export_views,
     read_destination,
     region_view,
     tensor_nbytes,
@@ -87,9 +87,9 @@ def _can_access_peer(device: str, peer: str) -> bool:
 
 @dataclass(slots=True)
 class _CudaSource:
-    """Retain publication bytes through the producer's final device access.
+    """Retain export bytes through the producer's final device access.
 
-    `tensor` is what readers in this address space borrow: the published
+    `tensor` is what readers in this address space borrow: the exported
     source itself, or its pool chunk view. `event` is the producer fence, and
     `handle` the allocation handle bytes the locator carries. When the product
     was copied into a chunk, `copied_source` keeps the original views alive
@@ -103,25 +103,21 @@ class _CudaSource:
     handle: bytes
     copied_source: torch.Tensor | tuple[torch.Tensor, ...] | None = None
     retirement: Completion | None = None
-    #: Pool and chunk this publication occupies, when it came from a pool.
+    #: Pool and chunk this export occupies, when it came from a pool.
     pool: VmmPool | None = None
     chunk: PoolChunk | None = None
-    #: Acknowledgment slots of the ranks that read this publication.
+    #: Acknowledgment slots of the ranks that read this export.
     consumers: tuple[int, ...] = ()
-    #: Grant table this publication's descriptor is lent from, on a device
+    #: Grant table this export's descriptor is lent from, on a device
     #: that exports descriptors rather than fabric handles.
     grants: DescriptorGrants | None = None
-    publication_id: str = ""
+    export_id: str = ""
 
     def events_released(self) -> None:
         # Direct exports own their descriptor and end its grant here. A pool
         # chunk keeps its grant until remote readers finish with the chunk.
-        if (
-            self.grants is not None
-            and self.publication_id
-            and self.pool is None
-        ):
-            self.grants.release(self.publication_id)
+        if self.grants is not None and self.export_id and self.pool is None:
+            self.grants.release(self.export_id)
             os.close(int.from_bytes(self.handle, sys.byteorder))
 
         # The copy fence ends access to the original views. Remote readers
@@ -133,7 +129,7 @@ class _CudaSource:
 
 
 class CudaVmmTransport(Transport):
-    """Device publications a consumer imports by their shareable handle.
+    """Device exports a consumer imports by their shareable handle.
 
     A consumer maps the producer's allocation from the handle the locator
     carries and, for a pool chunk, writes its acknowledgment word in the
@@ -141,7 +137,7 @@ class CudaVmmTransport(Transport):
     handles nothing connects back to the producing rank, which is what lets a
     device product cross hosts.
 
-    Where it exports POSIX descriptors instead, the published handle names an
+    Where it exports POSIX descriptors instead, the exported handle names an
     open file of the producing process and carries no meaning elsewhere, so a
     consumer asks this rank for it over the grant socket in
     `descriptor_grants`. Such a device cannot place an edge across hosts in
@@ -164,11 +160,11 @@ class CudaVmmTransport(Transport):
         peer_storage.load()
         self.source = source or WorkerEndpoint.local()
         self._events = event_pool
-        # A failed publication whose device work could not be drained. The
-        # drain's error is re-raised by later `publish` calls and by `close`,
+        # A failed export whose device work could not be drained. The
+        # drain's error is re-raised by later `export` calls and by `close`,
         # and the tuple keeps the source, fence and copied views referenced so
         # storage a device may still be accessing is never reused.
-        self._failed_publication: (
+        self._failed_export: (
             tuple[
                 BaseException,
                 torch.Tensor | tuple[torch.Tensor, ...] | None,
@@ -179,24 +175,24 @@ class CudaVmmTransport(Transport):
         ) = None
         self.capacity = capacity
         # Grants exist only where the device exports descriptors, so the
-        # socket is bound when the first such publication needs it.
+        # socket is bound when the first such export needs it.
         self._grants: DescriptorGrants | None = None
         # One bounded pool per device, reserved when that device first
-        # publishes, so a rank reserves nothing on a device it never
-        # publishes from. The pool is bounded by this rank's transfer byte
+        # exports, so a rank reserves nothing on a device it never
+        # exports from. The pool is bounded by this rank's transfer byte
         # budget, which is what that budget already governs.
         self._pools: dict[str, VmmPool] = {}
         # This rank's own word in every chunk header it reads.
         self._acknowledgment_slot = int(acknowledgment_slot)
-        # Whether a publication has to state readiness without an interprocess
+        # Whether an export has to state readiness without an interprocess
         # event, which only a consumer on another host requires.
         self._cross_host_consumers = bool(cross_host_consumers)
-        # What publishing costs this rank. A crossing publication drains the
+        # What exporting costs this rank. A crossing export drains the
         # producer's stream, because a consumer on another host can wait on no
         # fence this rank records, and that wait is on the batch's critical
         # path. The payloads are counted with it, since the cost of a crossing
         # is only interpretable against what it carries.
-        self._published = 0
+        self._exported = 0
         self._payload_bytes = 0
         self._largest_payload = 0
         self._synchronize_seconds = 0.0
@@ -204,16 +200,16 @@ class CudaVmmTransport(Transport):
         # Retain chunks still read by remote consumers until reap() observes
         # their acknowledgments, independently of the original source fence.
         self._unacknowledged: dict[str, _CudaSource] = {}
-        # A source is released when its own fence drains: a pool publication
+        # A source is released when its own fence drains: a pool export
         # was copied into its chunk, and the chunk is what waits for the
         # consumers, swept separately in reap().
         self._buffers = BufferRegistry(
             capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
-            # A device publication's chunk is held by the pool until its
+            # A device export's chunk is held by the pool until its
             # readers finish, which the transport's own sweep decides; the
-            # publication itself owes nothing once the producer's work is
+            # export itself owes nothing once the producer's work is
             # complete.
             settled=lambda source: True,
         )
@@ -236,7 +232,7 @@ class CudaVmmTransport(Transport):
             self._grants = DescriptorGrants(self.endpoint())
         return self._grants
 
-    def publication_retirement(self, locator: Locator) -> Completion:
+    def retirement(self, locator: Locator) -> Completion:
         return self._buffers.retirement(locator)
 
     def set_completion_wake(self, wake: Any) -> None:
@@ -250,8 +246,8 @@ class CudaVmmTransport(Transport):
         chunk can be handed out again.
         """
         assert source.pool is not None and source.chunk is not None
-        if source.grants is not None and source.publication_id:
-            source.grants.release(source.publication_id)
+        if source.grants is not None and source.export_id:
+            source.grants.release(source.export_id)
         source.pool.release(source.chunk)
 
     def _reclaim(
@@ -266,7 +262,7 @@ class CudaVmmTransport(Transport):
                 # so by writing its word rather than by closing a connection.
                 # Holding the chunk until then does not hold the source: that
                 # was copied into the chunk and is released below.
-                self._unacknowledged[source.publication_id] = source
+                self._unacknowledged[source.export_id] = source
             else:
                 # No other rank reads this product, so nothing can be waiting.
                 self._release_chunk(source)
@@ -289,7 +285,7 @@ class CudaVmmTransport(Transport):
             return
         # Every held chunk's words are read in one transfer. Asking each chunk
         # separately would put one device-to-host synchronize per held
-        # publication into every retirement pass.
+        # export into every retirement pass.
         watched = [
             source.chunk.acknowledgments[list(source.consumers)]
             for source in held
@@ -307,7 +303,7 @@ class CudaVmmTransport(Transport):
                 self._release_chunk(source)
                 # Read completions may add other chunks while the GPU query
                 # runs. Remove only the chunks this sweep observed as settled.
-                self._unacknowledged.pop(source.publication_id)
+                self._unacknowledged.pop(source.export_id)
 
     def awaiting_acknowledgment(self) -> bool:
         return bool(self._unacknowledged)
@@ -322,7 +318,7 @@ class CudaVmmTransport(Transport):
         self._events.reap()
 
     def _pool(self, device: torch.device) -> VmmPool:
-        """Return this device's pool, reserving it on first publication."""
+        """Return this device's pool, reserving it on first export."""
         key = str(device)
         pool = self._pools.get(key)
         if pool is None:
@@ -330,7 +326,7 @@ class CudaVmmTransport(Transport):
             self._pools[key] = pool
         return pool
 
-    def publish(
+    def export(
         self,
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
@@ -341,13 +337,13 @@ class CudaVmmTransport(Transport):
 
         Capacity is retained until its producer fence retires. A product that
         can neither be exported where it lies nor fit its device's pool raises
-        `PoolExhaustedError`, and the caller publishes it as bytes over the
+        `PoolExhaustedError`, and the caller exports it as bytes over the
         host mechanism instead.
         """
         import torch
         from uniserve_kernels.peer_storage import export_handle
 
-        source, shape, offset = publication_views(tensor, offset)
+        source, shape, offset = export_views(tensor, offset)
         spans = source if isinstance(source, tuple) else (source,)
         first = spans[0]
         if not first.is_cuda:
@@ -363,27 +359,27 @@ class CudaVmmTransport(Transport):
             for span in spans
         ):
             raise invalid_descriptor(
-                "CUDA VMM publication spans require one allocation and stride"
+                "CUDA VMM export spans require one allocation and stride"
             )
-        if self._failed_publication is not None:
-            raise self._failed_publication[0]
+        if self._failed_export is not None:
+            raise self._failed_export[0]
 
         self._events.reap()
         nbytes = tensor_nbytes(tensor)
         self.capacity.acquire(nbytes)
 
         event = None
-        publication = None
+        export = None
         descriptor = None
         copied_source = None
         pool = chunk = grants = None
-        publication_id = ""
+        export_id = ""
         submitted = False
         try:
-            # Storage that can be exported where it lies is published where
+            # Storage that can be exported where it lies is exported where
             # it lies, wherever it is read. That copies nothing, and it is
-            # what lets a publication name a row whose bytes arrive later: an
-            # encoded media unit is published with the batch that reserves its
+            # what lets an export name a row whose bytes arrive later: an
+            # encoded media unit is exported with the batch that reserves its
             # row and filled when the encode completes, so a snapshot taken
             # now would carry whatever the row held before the encoder wrote
             # it. Where the device exports a fabric handle, the handle this
@@ -392,10 +388,10 @@ class CudaVmmTransport(Transport):
             exported = export_handle(first)
             if exported is None:
                 # Otherwise the product is materialized in this device's pool,
-                # whose one handle covers every product published from that
-                # device. Only the publication's logical spans are
+                # whose one handle covers every product exported from that
+                # device. Only the export's logical spans are
                 # materialized, never an enclosing allocator segment. A
-                # product the pool cannot hold is the caller's to publish over
+                # product the pool cannot hold is the caller's to export over
                 # the host mechanism; the pool reports the exhaustion once.
                 pool = self._pool(first.device)
                 chunk = pool.reserve(tensor_nbytes(tensor))
@@ -410,7 +406,7 @@ class CudaVmmTransport(Transport):
                 for target, value in copy_pairs(source, shared):
                     target.copy_(value, non_blocking=True)
                 # The asynchronous copies still read the original views, which
-                # the publication retains until its fence drains.
+                # the export retains until its fence drains.
                 copied_source = source
                 source = shared
                 spans = (shared,)
@@ -420,25 +416,25 @@ class CudaVmmTransport(Transport):
                 # A consumer reads the payload, which follows the chunk's
                 # acknowledgment words, so the offset names the payload.
                 storage_offset = chunk.payload_offset
-            # A publication hands its consumers an event when one can reach
+            # An export hands its consumers an event when one can reach
             # all of them, which is when this rank has no consumer on another
             # host. A consumer elsewhere can wait on nothing this rank records:
             # an event handle is host-local, and imported VMM storage admits
             # no device-side wait on current drivers. So a rank whose products
-            # cross hosts drains its stream on every publication, and the
-            # publication carries no fence at all. The event recorded below
+            # cross hosts drains its stream on every export, and the
+            # export carries no fence at all. The event recorded below
             # still gates the source's release on this rank.
             interprocess = not self._cross_host_consumers
             if not interprocess:
                 started = time.perf_counter()
-                with profile_range("vmm_publish_synchronize"):
+                with profile_range("vmm_export_synchronize"):
                     torch.cuda.current_stream(first.device).synchronize()
                 waited = time.perf_counter() - started
                 self._synchronize_seconds += waited
                 self._longest_synchronize = max(
                     self._longest_synchronize, waited
                 )
-            self._published += 1
+            self._exported += 1
             self._payload_bytes += nbytes
             self._largest_payload = max(self._largest_payload, nbytes)
             event = self._events.acquire(
@@ -450,7 +446,7 @@ class CudaVmmTransport(Transport):
             # a reader of this call's products has written its acknowledgment,
             # which a consumer on another host can do as well as one here.
             readers = tuple(int(slot) for slot in consumers)
-            publication_id = uuid.uuid4().hex
+            export_id = uuid.uuid4().hex
             grants = None
             if len(descriptor) == DESCRIPTOR_HANDLE_BYTES:
                 # The handle is an open file of this process. A consumer can
@@ -458,9 +454,9 @@ class CudaVmmTransport(Transport):
                 # before the locator naming it leaves this rank.
                 grants = self._descriptor_grants()
                 grants.register(
-                    publication_id, int.from_bytes(descriptor, sys.byteorder)
+                    export_id, int.from_bytes(descriptor, sys.byteorder)
                 )
-            publication = _CudaSource(
+            export = _CudaSource(
                 source,
                 event,
                 nbytes,
@@ -471,7 +467,7 @@ class CudaVmmTransport(Transport):
                 chunk=chunk,
                 consumers=readers if chunk is not None else (),
                 grants=grants,
-                publication_id=publication_id,
+                export_id=export_id,
             )
 
             # Run-length encode first-axis span lengths so the importer can
@@ -486,7 +482,7 @@ class CudaVmmTransport(Transport):
                 source=self.source,
                 transport=CudaVmmTransfer(
                     endpoint=self.endpoint(),
-                    publication_id=publication_id,
+                    export_id=export_id,
                     storage_size_bytes=storage_size,
                     storage_offsets_bytes=tuple(
                         storage_offset + span.data_ptr() - first.data_ptr()
@@ -498,13 +494,13 @@ class CudaVmmTransport(Transport):
                     ready_event_handle=(
                         bytes(event.ipc_handle()) if interprocess else b""
                     ),
-                    # A fabric handle travels with the publication and a
+                    # A fabric handle travels with the export and a
                     # consumer imports it directly, anywhere in the fabric
                     # domain. A descriptor travels only so a consumer can tell
                     # which kind it is; the usable one comes from the grant.
                     allocation_handle=descriptor,
                     # A consumer writes its own slot's word here once its reads
-                    # retire. A publication outside the pool carries no header.
+                    # retire. An export outside the pool carries no header.
                     acknowledgment_offset=(
                         chunk.offset if chunk is not None else -1
                     ),
@@ -515,11 +511,11 @@ class CudaVmmTransport(Transport):
                 offset=offset,
                 device=str(first.device),
             )
-            self._buffers.register(locator, publication)
+            self._buffers.register(locator, export)
             return locator
         except BaseException:
-            if publication is not None:
-                self._reclaim(publication)
+            if export is not None:
+                self._reclaim(export)
             else:
                 try:
                     # No usable producer fence exists on this failure path.
@@ -529,7 +525,7 @@ class CudaVmmTransport(Transport):
                     if event is not None:
                         self._events.defer_release((event,), source)
                 except BaseException as error:
-                    self._failed_publication = (
+                    self._failed_export = (
                         error,
                         source,
                         event,
@@ -537,7 +533,7 @@ class CudaVmmTransport(Transport):
                     )
                     raise
                 if grants is not None:
-                    grants.release(publication_id)
+                    grants.release(export_id)
                 if chunk is not None:
                     assert pool is not None
                     pool.release(chunk)
@@ -607,7 +603,7 @@ class CudaVmmTransport(Transport):
         handle = locator.transport
         assert isinstance(handle, CudaVmmTransfer)
         # A consumer in another process cannot fully check that a locator
-        # still names a publication the producer holds: a descriptor grant is
+        # still names an export the producer holds: a descriptor grant is
         # refused once withdrawn, but a fabric handle is imported unchecked.
         # The locator is the engine's word. The engine binds only locators the
         # producing rank reported to it, and frees a product's buffer only
@@ -616,7 +612,7 @@ class CudaVmmTransport(Transport):
         event = None
         import_device = device
         # A read in the producer's own address space needs no acknowledgment:
-        # the publication's own owner reclaims it.
+        # the export's own owner reclaims it.
         acknowledgment = None
         try:
             ticket._require_active()
@@ -631,14 +627,14 @@ class CudaVmmTransport(Transport):
                         owner = _endpoints.get(handle.endpoint)
                     if not isinstance(owner, CudaVmmTransport):
                         raise invalid_descriptor(
-                            "CUDA publication has no live local owner"
+                            "CUDA export has no live local owner"
                         )
-                    publication = owner._buffers.acquire(locator)
+                    export = owner._buffers.acquire(locator)
                     ticket.add_retirement_callback(
                         lambda: owner._buffers.release_reader(locator)
                     )
-                    mapped = publication.tensor
-                    event = publication.event
+                    mapped = export.tensor
+                    event = export.event
                 else:
                     destination_prototype = (
                         destination[0]
@@ -680,7 +676,7 @@ class CudaVmmTransport(Transport):
                             device=import_device,
                         )
                     )
-                    # A fabric handle is importable as published. A descriptor
+                    # A fabric handle is importable as exported. A descriptor
                     # names an open file of the producing process, so the
                     # usable one is received from that rank over its grant
                     # socket and closed once the allocation, which holds its
@@ -688,7 +684,7 @@ class CudaVmmTransport(Transport):
                     granted = None
                     if len(handle.allocation_handle) == DESCRIPTOR_HANDLE_BYTES:
                         granted = descriptor_grants.fetch(
-                            handle.endpoint, handle.publication_id
+                            handle.endpoint, handle.export_id
                         )
                         exported = granted.to_bytes(
                             DESCRIPTOR_HANDLE_BYTES, sys.byteorder
@@ -734,7 +730,7 @@ class CudaVmmTransport(Transport):
                         ][:ACK_WORD_BYTES].view(torch.int32)
                     del allocation
                     # A producer whose products cross hosts drained its stream
-                    # before publishing, and its locator carries no fence;
+                    # before exporting, and its locator carries no fence;
                     # otherwise the fence is an interprocess event of the
                     # producer's host.
                     if handle.ready_event_handle:
@@ -753,7 +749,7 @@ class CudaVmmTransport(Transport):
                     event = None
                 if acknowledgment is not None and import_device != device:
                     # The acknowledgment word belongs to the source-device
-                    # mapping. Claim it before the staged copy, then publish
+                    # mapping. Claim it before the staged copy, then export
                     # completion only after the destination copy has drained.
                     with torch.cuda.device(import_device):
                         acknowledgment.copy_(chunk_word(vmm_pool.CLAIMED))
@@ -793,20 +789,20 @@ class CudaVmmTransport(Transport):
         return retirement
 
     def close(self) -> None:
-        if self._published:
+        if self._exported:
             _LOG.info(
-                "cuda_vmm transport retired: published=%d crossing=%s "
+                "cuda_vmm transport retired: exported=%d crossing=%s "
                 "payload_total=%d payload_mean=%d payload_max=%d "
                 "synchronize_ms_total=%.3f synchronize_ms_max=%.3f "
                 "synchronize_ms_mean=%.3f",
-                self._published,
+                self._exported,
                 self._cross_host_consumers,
                 self._payload_bytes,
-                self._payload_bytes // self._published,
+                self._payload_bytes // self._exported,
                 self._largest_payload,
                 self._synchronize_seconds * 1e3,
                 self._longest_synchronize * 1e3,
-                self._synchronize_seconds * 1e3 / self._published,
+                self._synchronize_seconds * 1e3 / self._exported,
             )
         try:
             self._reads.close()
@@ -822,5 +818,5 @@ class CudaVmmTransport(Transport):
                 self._grants = None
             with _endpoint_lock:
                 _endpoints.pop(self.endpoint(), None)
-        if self._failed_publication is not None:
-            raise self._failed_publication[0]
+        if self._failed_export is not None:
+            raise self._failed_export[0]

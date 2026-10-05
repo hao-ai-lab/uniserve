@@ -47,7 +47,7 @@ from uniserve_worker.model_executor.image_inputs import (
     stage_image,
 )
 from uniserve_worker.model_executor.input_batch import TokenRow
-from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.batch import TensorExport
 from uniserve_worker.protocol.call import (
     Call,
     ForwardMode,
@@ -64,7 +64,7 @@ from uniserve_worker.storage.tensor_store import (
     FeatureMetadata,
     ImageMetadata,
 )
-from uniserve_worker.transport.publication import publish_tensor
+from uniserve_worker.transport.exports import export_tensor
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -85,7 +85,7 @@ def text(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     model_runner: ModelExecutor,
 ) -> PendingOutput:
     """Encode admitted conditioning tokens and publish their declared tensors.
@@ -122,11 +122,11 @@ def text(
             "text encoder output declarations disagree with the loaded entry"
         )
 
-    products = transfer.publish_tensors(
+    products = transfer.export_tensors(
         call,
         result.values,
         tensor_store=tensor_store,
-        publication_transports=publication_transports,
+        export_transports=export_transports,
         state=state,
     )
     if result.stats is None:
@@ -273,7 +273,7 @@ def _input_images(count: int) -> int:
     return int(count)
 
 
-def publish_features(
+def export_features(
     call: Call,
     prepared: PreparedImage,
     output: torch.Tensor,
@@ -281,13 +281,13 @@ def publish_features(
     state: BatchState,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> PendingOutput:
     """Commit encoded features to the tensor store and export them if needed.
 
     The features always land in the call's encoder-cache write. They are
-    also exported as a product when any non-local publication transport is
+    also exported as a product when any non-local export transport is
     bound and this rank is the component's output rank.
     """
     request = state.pending_output(call.request_key.request_id)
@@ -296,25 +296,25 @@ def publish_features(
         raise invalid_descriptor("encoder output has no feature reference")
     features = output.detach()
     write = bound_encoder_write(feature_output, state=state)
-    resident = tensor_store.publish_write(
+    resident = tensor_store.write(
         write,
         features,
         metadata=FeatureMetadata(height=prepared.height, width=prepared.width),
     )
 
-    products: tuple[TensorPublication, ...] = ()
+    products: tuple[TensorExport, ...] = ()
     if any(
-        name != "local" for name in publication_transports
+        name != "local" for name in export_transports
     ) and config.rank == worker_info.output_rank(call.component):
-        locations = publish_tensor(
-            publication_transports,
+        locations = export_tensor(
+            export_transports,
             resident,
             retain=partial(tensor_store.retain_export, write),
             consumers=call.consumer_slots,
         )
         request.exported_locators.extend(locations)
         request.tensor_exports[feature_output.buffer_id] = tuple(
-            (publication_transports[location.backend], location)
+            (export_transports[location.backend], location)
             for location in locations
         )
         descriptor = EncoderTransferValue(
@@ -327,9 +327,7 @@ def publish_features(
             height=prepared.height,
             width=prepared.width,
         )
-        products = (
-            TensorPublication(product=feature_output, value=descriptor),
-        )
+        products = (TensorExport(product=feature_output, value=descriptor),)
     return non_state_outcome(call, products=products, state=state)
 
 
@@ -384,7 +382,7 @@ def materialization_latent(
     return current
 
 
-def publish_image(
+def export_image(
     call: Call,
     image_tensor: torch.Tensor,
     image_range: tuple[float, float],
@@ -406,7 +404,7 @@ def publish_image(
         raise invalid_descriptor("trajectory call has no staged latent inputs")
     latent_input = call.latent_input
     if latent_input is None:
-        raise invalid_descriptor("image publication lost its latent input")
+        raise invalid_descriptor("image export lost its latent input")
 
     resident_output = call.image_output
     if resident_output is not None:
@@ -418,7 +416,7 @@ def publish_image(
         # The reserved product storage has the product's declared dtype;
         # convert the decoder output to it before committing.
         storage = tensor_store.producer_write_views((write,))[0]
-        tensor_store.publish_write(
+        tensor_store.write(
             write,
             image_tensor.to(dtype=storage.dtype),
             metadata=ImageMetadata(
@@ -449,7 +447,7 @@ def state_outcome(
     call: Call,
     *,
     state: BatchState,
-    products: tuple[TensorPublication, ...] = (),
+    products: tuple[TensorExport, ...] = (),
     request_tables: BlockTables | None,
 ) -> PendingOutput:
     """Stage the successful outcome of a visual-state call, which wrote KV.
@@ -479,7 +477,7 @@ def non_state_outcome(
     call: Call,
     *,
     state: BatchState,
-    products: tuple[TensorPublication, ...] = (),
+    products: tuple[TensorExport, ...] = (),
     completion_tasks: tuple[HostTask, ...] = (),
 ) -> PendingOutput:
     """Record a stateless completion and its already materialized products.
@@ -764,7 +762,7 @@ def latent_state_row(
     builder = model_runner.image_builder
     if builder is None or builder.framing != 2:
         raise invalid_descriptor(
-            "latent feature publication requires framed image conditioning"
+            "latent feature export requires framed image conditioning"
         )
 
     size = image.Config(height, width)
@@ -954,7 +952,7 @@ def bound_encoder_write(reference: TensorRef, *, state: BatchState) -> Buffer:
 __all__ = [
     "text",
     "prepare_features",
-    "publish_features",
+    "export_features",
     "materialization_latent",
-    "publish_image",
+    "export_image",
 ]

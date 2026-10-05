@@ -59,7 +59,7 @@ class WorkerEndpoint:
     `worker_id` and `rank` name the logical position and survive a restart;
     `incarnation` is fresh for every loaded rank. `address_space` identifies
     the process, independently of how many Worker instances it hosts, and
-    `node` is the host name. Publication addresses belong to each
+    `node` is the host name. Export addresses belong to each
     `Locator`'s transport handle, not to the endpoint.
     """
 
@@ -185,13 +185,13 @@ class CudaVmmTransfer:
     changing logical coverage. `Locator.__post_init__` checks that the
     expanded lengths sum to the view's first extent.
 
-    `endpoint` names the producer's publication table and, for a descriptor
-    handle, its grant socket. `publication_id` is 32 characters (the producer
+    `endpoint` names the producer's export table and, for a descriptor
+    handle, its grant socket. `export_id` is 32 characters (the producer
     uses ``uuid.uuid4().hex``) and keys that grant.
     """
 
     endpoint: str
-    publication_id: str
+    export_id: str
     storage_size_bytes: int
     storage_offsets_bytes: tuple[int, ...]
     span_lengths: tuple[int, ...]
@@ -200,14 +200,14 @@ class CudaVmmTransfer:
     ready_event_handle: bytes
     # The producing rank's shareable allocation handle, of the type its device
     # was probed for. A fabric handle is importable from another host, so it
-    # travels with the publication rather than through a descriptor grant that
+    # travels with the export rather than through a descriptor grant that
     # only reaches this one. A descriptor travels only so a consumer can tell
     # which kind it is; the usable one comes from the grant.
     allocation_handle: bytes = b""
-    # Byte offset of this publication's acknowledgment header inside the
+    # Byte offset of this export's acknowledgment header inside the
     # exported allocation. A consumer writes its own slot's word there once its
     # reads retire, which retires the chunk without a host-local connection.
-    # Negative when the publication carries no header, which is the case for
+    # Negative when the export carries no header, which is the case for
     # storage exported where it lies rather than copied into the device pool.
     acknowledgment_offset: int = -1
 
@@ -215,7 +215,7 @@ class CudaVmmTransfer:
         """Validate native CUDA handles and the declared allocation bounds."""
         if (
             not self.endpoint
-            or len(self.publication_id) != 32
+            or len(self.export_id) != 32
             or self.storage_size_bytes < 1
             or not self.storage_offsets_bytes
             or len(self.span_counts) != len(self.span_lengths)
@@ -227,7 +227,7 @@ class CudaVmmTransfer:
             )
             or any(length < 1 for length in self.span_lengths)
             or any(stride < 0 for stride in self.tensor_stride)
-            # A 64-byte CUDA IPC event handle fences the publication for
+            # A 64-byte CUDA IPC event handle fences the export for
             # consumers on the producer's host. A producing rank with any
             # consumer on another host publishes no fence, because an event
             # handle does not reach there; it synchronizes its stream before
@@ -275,7 +275,7 @@ class Locator:
     `nbytes` is the view's size and `dtype` its element type name.
     `transport` is the handle a consumer opens and `source` the publishing
     rank. Except for a `ChannelTransfer`, whose payload is the bytes, the
-    publishing rank's transport keeps the storage until the publication
+    publishing rank's transport keeps the storage until the export
     retires after the engine releases it.
     """
 
@@ -289,7 +289,7 @@ class Locator:
 
     @property
     def backend(self) -> str:
-        """Return the name of the transport that owns this publication.
+        """Return the name of the transport that owns this export.
 
         The names are the `WorkerInfo.transfer_backends` vocabulary and key a
         rank's transport table. A `PosixShmTransfer` is ``"shm"`` here but
@@ -370,9 +370,7 @@ class Locator:
         elif kind == "cuda_vmm":
             transport = CudaVmmTransfer(
                 endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                publication_id=_str(
-                    data.get("publication_id"), f"{where}.publication_id"
-                ),
+                export_id=_str(data.get("export_id"), f"{where}.export_id"),
                 storage_size_bytes=_uint(
                     data.get("storage_size_bytes"),
                     f"{where}.storage_size_bytes",
@@ -454,7 +452,7 @@ class Locator:
             output.update(
                 transport="cuda_vmm",
                 endpoint=transport.endpoint,
-                publication_id=transport.publication_id,
+                export_id=transport.export_id,
                 storage_size_bytes=transport.storage_size_bytes,
                 storage_offsets_bytes=list(transport.storage_offsets_bytes),
                 span_lengths=list(transport.span_lengths),
@@ -586,11 +584,11 @@ class DeviceProductTransferValue:
 
 @dataclass(frozen=True, slots=True)
 class KvGroupTransfer:
-    """One cache group's share of a KV publication.
+    """One cache group's share of a KV export.
 
-    The tensors carry the group's tokens ``[start, published_extent)`` of the
+    The tensors carry the group's tokens ``[start, exported_extent)`` of the
     enclosing `KvTransfer`: a full-attention group starts at the
-    publication's base extent, and a sliding-window group no earlier than
+    export's base extent, and a sliding-window group no earlier than
     the first token its readers need. With ``T`` those tokens:
 
     - keys and values are ``[T, layers, kv heads, head dim]`` over the
@@ -608,21 +606,21 @@ class KvGroupTransfer:
     page_tokens: int
     tensors: tuple[TensorTransfer, ...]
 
-    def validate(self, base_extent: int, published_extent: int) -> None:
+    def validate(self, base_extent: int, exported_extent: int) -> None:
         """Validate the carried interval and tensor layout.
 
         Raises:
             WorkerError: `invalid_descriptor` when the interval lies outside
-                ``[base_extent, published_extent]``, the tensors disagree
+                ``[base_extent, exported_extent]``, the tensors disagree
                 with it, or the K/V/scale geometry is invalid.
         """
         if (
             self.page_tokens < 1
-            or not base_extent <= self.start <= published_extent
+            or not base_extent <= self.start <= exported_extent
         ):
             raise invalid_descriptor("KV group transfer interval is invalid")
 
-        carried = published_extent - self.start
+        carried = exported_extent - self.start
         if not carried:
             if self.tensors:
                 raise invalid_descriptor(
@@ -632,7 +630,7 @@ class KvGroupTransfer:
 
         if len(self.tensors) not in {2, 3}:
             raise invalid_descriptor(
-                "KV publication requires raw keys, values and optional scales"
+                "KV export requires raw keys, values and optional scales"
             )
 
         # Key and value tensors are [carried tokens, layers, heads, head dim].
@@ -652,13 +650,13 @@ class KvGroupTransfer:
             }
         ):
             raise invalid_descriptor(
-                "KV publication has invalid token, layer, or head bounds"
+                "KV export has invalid token, layer, or head bounds"
             )
 
         quantized = key.dtype == "float8_e4m3fn"
         if (len(self.tensors) == 3) != quantized:
             raise invalid_descriptor(
-                "KV publication scale presence disagrees with its storage"
+                "KV export scale presence disagrees with its storage"
             )
 
         if quantized:
@@ -677,7 +675,7 @@ class KvGroupTransfer:
                 or key.shape[2] % scales.shape[3]
             ):
                 raise invalid_descriptor(
-                    "KV publication scales disagree with its source pages"
+                    "KV export scales disagree with its source pages"
                 )
 
     @property
@@ -724,7 +722,7 @@ class KvGroupTransfer:
 class KvTransfer:
     """A published KV extent and the physical tensors that install its suffix.
 
-    The publication is incremental: the destination already holds `base`,
+    The export is incremental: the destination already holds `base`,
     when set, up to `base_extent` tokens, and each of `groups` carries only
     its tokens from its `KvGroupTransfer.start` on. An unchanged extent
     carries no groups; otherwise there is one entry per cache group, in
@@ -741,7 +739,7 @@ class KvTransfer:
     destination: str
     base: identity.BufferId | None
     base_extent: int
-    published_extent: int
+    exported_extent: int
     compute_dtype: str
 
     def __post_init__(self) -> None:
@@ -749,14 +747,14 @@ class KvTransfer:
         if (
             not self.destination
             or self.base_extent < 0
-            or self.published_extent < self.base_extent
+            or self.exported_extent < self.base_extent
         ):
             raise invalid_descriptor(
-                "KV publication extent or destination is invalid"
+                "KV export extent or destination is invalid"
             )
         if self.base is None and self.base_extent != 0:
             raise invalid_descriptor(
-                "KV publication base identity disagrees with its extent"
+                "KV export base identity disagrees with its extent"
             )
         if self.compute_dtype not in {
             "float16",
@@ -764,15 +762,13 @@ class KvTransfer:
             "float32",
             "float64",
         }:
-            raise invalid_descriptor(
-                "KV publication storage identity is invalid"
-            )
-        if bool(self.groups) != (self.published_extent > self.base_extent):
+            raise invalid_descriptor("KV export storage identity is invalid")
+        if bool(self.groups) != (self.exported_extent > self.base_extent):
             raise invalid_descriptor(
                 "KV group presence disagrees with its incremental extent"
             )
         for group in self.groups:
-            group.validate(self.base_extent, self.published_extent)
+            group.validate(self.base_extent, self.exported_extent)
 
     @property
     def tensors(self) -> tuple[TensorTransfer, ...]:
@@ -787,7 +783,7 @@ class KvTransfer:
     ) -> KvTransfer:
         """Decode source identity and every group's physical representation.
 
-        Absent ``base_extent`` and ``published_extent`` decode as zero.
+        Absent ``base_extent`` and ``exported_extent`` decode as zero.
         """
         data = _map(value, where)
         raw_base = data.get("base")
@@ -810,9 +806,9 @@ class KvTransfer:
             base_extent=_uint(
                 data.get("base_extent", 0), f"{where}.base_extent"
             ),
-            published_extent=_uint(
-                data.get("published_extent", 0),
-                f"{where}.published_extent",
+            exported_extent=_uint(
+                data.get("exported_extent", 0),
+                f"{where}.exported_extent",
             ),
             compute_dtype=_str(
                 data.get("compute_dtype"), f"{where}.compute_dtype"
@@ -820,14 +816,14 @@ class KvTransfer:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode the cache publication without a generic product envelope."""
+        """Encode the cache export without a generic product envelope."""
         return {
             "groups": [group.to_mapping() for group in self.groups],
             "source": self.source.to_mapping(),
             "destination": self.destination,
             "base": None if self.base is None else self.base.to_mapping(),
             "base_extent": self.base_extent,
-            "published_extent": self.published_extent,
+            "exported_extent": self.exported_extent,
             "compute_dtype": self.compute_dtype,
         }
 
@@ -835,7 +831,7 @@ class KvTransfer:
         """Return the estimated descriptor size, enforcing the handle bound.
 
         The estimate covers every page and scale locator of every group plus
-        the publication metadata, and parallels the worker-ipc crate's
+        the export metadata, and parallels the worker-ipc crate's
         `KvTransfer::encoded_size_bound`.
 
         Raises:
@@ -922,7 +918,7 @@ def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
         elif isinstance(transport, CudaVmmTransfer):
             size += (
                 len(transport.endpoint.encode())
-                + len(transport.publication_id.encode())
+                + len(transport.export_id.encode())
                 + len(transport.ready_event_handle)
                 + 8 * len(transport.tensor_stride)
                 + 8 * len(transport.storage_offsets_bytes)

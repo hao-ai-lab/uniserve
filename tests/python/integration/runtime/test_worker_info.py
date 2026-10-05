@@ -57,7 +57,7 @@ def test_worker_info_reports_schedulable_work_and_bounds(
         "denoising",
         "image_decoding",
         "tensor",
-        "kv_publish",
+        "kv_export",
         "kv_install",
     }
     assert info["kv_cache"]["num_units"] > 1

@@ -264,7 +264,7 @@ def test_worker_worker_config_rejects_invalid_runtime_geometry(worker_config):
     "dtype,axes,message",
     [(torch.float64, (), "dtype"), (torch.float32, (0, 1), "dynamic axes")],
 )
-def test_result_publication_rejects_unrepresentable_numerical_outputs(
+def test_result_export_rejects_unrepresentable_numerical_outputs(
     dtype, axes, message
 ):
     from tests.python.fixtures.encoding import Model as EncodedModel

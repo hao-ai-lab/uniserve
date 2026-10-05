@@ -20,7 +20,7 @@ from tests.python.fixtures.depth_one import (
     encode_call,
     execution_batch,
     finalized_report,
-    kv_publication_call,
+    kv_export_call,
     record_completion,
     root_parent,
     stamp_batch,
@@ -40,7 +40,7 @@ from uniserve_worker.protocol.batch import (
     Free,
     GenerationParams,
     NewRequest,
-    TensorPublication,
+    TensorExport,
 )
 from uniserve_worker.protocol.call import (
     CALL_KINDS,
@@ -101,7 +101,7 @@ def _publish_conditioning(
     call_id: CallId,
     batch_id: int,
 ):
-    publication, product = kv_publication_call(
+    export, product = kv_export_call(
         admission.request_key,
         call_id=call_id,
         predecessor=root_parent(admission),
@@ -112,7 +112,7 @@ def _publish_conditioning(
             execution_batch(
                 batch_id=batch_id,
                 admissions=(admission,),
-                calls=(publication,),
+                calls=(export,),
             )
         ),
     )
@@ -1775,8 +1775,8 @@ def test_tensor_import_preserves_values_through_output_release(
         expected[0] = torch.tensor(
             [-(1 << 63), -1, 1 << 40, (1 << 63) - 1], dtype=storage_dtype
         )
-    location = producer.publish(expected)
-    payload = TensorPublication(
+    location = producer.export(expected)
+    payload = TensorExport(
         product=source,
         value=DeviceProductTransferValue(
             height=0,
@@ -1947,9 +1947,9 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
 
 
 @pytest.mark.parametrize("height", (16, 80))
-@pytest.mark.parametrize("publication", ("pages", "shards", "transfer"))
+@pytest.mark.parametrize("export", ("pages", "shards", "transfer"))
 def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
-    height: int, publication: str
+    height: int, export: str
 ) -> None:
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
@@ -1985,7 +1985,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     produced = finalized_report(producer, produced)
     flow_observation = record_completion(flow, produced)
     exported_latent = final_latent
-    if publication == "transfer":
+    if export == "transfer":
         exported_latent = replace(
             final_latent, producer_call_id=CallId(4, 0), generation=904
         )
@@ -2021,7 +2021,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         )
     assert len(transferred) == 1
 
-    if publication == "shards":
+    if export == "shards":
         from uniserve_worker.transport.fetch import fetch_tensor
 
         descriptor = transferred[0].value
@@ -2053,8 +2053,8 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             first.shape[axis] if index == axis else 0 for index in range(2)
         )
         locations = (
-            producer.transports["shm"].publish(first),
-            producer.transports["shm"].publish(second, offset=offset),
+            producer.transports["shm"].export(first),
+            producer.transports["shm"].export(second, offset=offset),
         )
         transferred = (
             replace(
@@ -2313,7 +2313,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     )
     extended = finalized_report(worker, extended)
     first_observation = record_completion(extend, extended)
-    publication, conditioning = kv_publication_call(
+    export, conditioning = kv_export_call(
         admission.request_key,
         call_id=CallId(2, 0),
         predecessor=first_observation.call_id,
@@ -2324,7 +2324,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
             execution_batch(
                 batch_id=2,
                 admissions=(),
-                calls=(publication,),
+                calls=(export,),
                 commands=(),
             )
         ),
@@ -2439,7 +2439,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     assert completion.kv_visible_len == 4
 
     feedback_observation = record_completion(state, report)
-    publication, next_conditioning = kv_publication_call(
+    export, next_conditioning = kv_export_call(
         admission.request_key,
         call_id=CallId(8, 0),
         predecessor=feedback_observation.call_id,
@@ -2449,7 +2449,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         worker.submit(
             execution_batch(
                 batch_id=8,
-                calls=(publication,),
+                calls=(export,),
                 commands=(),
             )
         ),

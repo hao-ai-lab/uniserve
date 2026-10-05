@@ -1,12 +1,12 @@
-"""Layout of a shared storage publication's segment.
+"""Layout of a shared storage export's segment.
 
-A host product published over shared storage carries everything a consumer
+A host product exported over shared storage carries everything a consumer
 needs inside the segment itself, so that no connection to the producer is
 required: its readiness and one acknowledgment
 word per instance rank. A consumer claims its word when it begins reading
 and acknowledges it once its reads are done, so a producer whose
-publication the engine has retired can tell a consumer still reading from
-one that never began: the engine retires a publication only after every
+export the engine has retired can tell a consumer still reading from
+one that never began: the engine retires an export only after every
 consumer's call has resolved or will never be submitted, so no consumer
 begins reading after that. The words are written and read with release and
 acquire ordering, because the readiness word announces the payload written
@@ -46,7 +46,7 @@ ACKNOWLEDGED = 2
 #: Bytes of the header, after which the payload begins; a multiple of the
 #: alignment every payload dtype needs.
 HEADER_BYTES = 512
-#: How long a consumer waits for a pending publication before failing.
+#: How long a consumer waits for a pending export before failing.
 READINESS_TIMEOUT_S = 120.0
 
 assert ACK_OFFSET + ACK_WORD_BYTES * MAX_ACKNOWLEDGMENT_SLOTS <= HEADER_BYTES
@@ -63,7 +63,7 @@ def initialize(buffer: memoryview) -> None:
     """Initialize pending readiness and unclaimed reader slots.
 
     The producer calls this before the locator naming the segment leaves
-    `ShmTransport.publish`, so no consumer can observe a partial header.
+    `ShmTransport.export`, so no consumer can observe a partial header.
     """
     for slot in range(MAX_ACKNOWLEDGMENT_SLOTS):
         atomic_store_u32(buffer, ack_offset(slot), 0)
@@ -111,11 +111,9 @@ def await_ready(
         if current == READY:
             return
         if current == FAILED:
-            raise resource_error("publication producer failed before readiness")
+            raise resource_error("export producer failed before readiness")
         if time.monotonic() >= deadline:
-            raise resource_error(
-                "publication endpoint was lost before readiness"
-            )
+            raise resource_error("export endpoint was lost before readiness")
         if pause:
             time.sleep(pause)
         pause = min(1e-3, pause + 5e-5)
@@ -134,7 +132,7 @@ def acknowledge(buffer: memoryview, slot: int) -> None:
 def settled(buffer: memoryview, slots: Sequence[int]) -> bool:
     """Report whether no named consumer is still reading the segment.
 
-    Consulted once the engine has retired the publication, after which a
+    Consulted once the engine has retired the export, after which a
     consumer that has not claimed its word never will: every named word is
     then either acknowledged or untouched.
     """

@@ -40,9 +40,12 @@ from uniserve_worker.storage.block_tables import (
     GroupTable,
 )
 from uniserve_worker.storage.cache_imports import KVImport, KVImporter
-from uniserve_worker.transport.exports import ExportLocations, release_exports
+from uniserve_worker.transport.exports import (
+    ExportLocations,
+    export_tensor,
+    release_exports,
+)
 from uniserve_worker.transport.interface import Transport
-from uniserve_worker.transport.publication import publish_tensor
 
 __all__ = ["KVCacheManager"]
 
@@ -157,7 +160,7 @@ class KVCacheManager:
         ] = {}
 
         # Transport locations of committed exports, updated by the batch
-        # commit; publication intervals retained under their buffers.
+        # commit; export intervals retained under their buffers.
         self.exports: dict[BufferId, ExportLocations] = {}
         self._manager = NativeKVCacheManager()
 
@@ -212,7 +215,7 @@ class KVCacheManager:
         again on exit, after the current stream drains on CUDA. The startup
         caller serializes this lease with other preparation. Serving
         allocation authority remains with the scheduler; no request or
-        publication is introduced.
+        export is introduced.
 
         Raises:
             RuntimeError: When any cache interval is still retained.
@@ -275,7 +278,7 @@ class KVCacheManager:
 
         The buffer identifies the reservation. Attach each transport's
         retirement through retain_export and revoke it through
-        release_buffers even if publication fails.
+        release_buffers even if export fails.
         """
         self._manager.reserve_export(buffer, ranges)
         return buffer
@@ -423,8 +426,8 @@ class KVCacheManager:
         self.require_reusable(self.unit_spans(units))
         self.cache.recycle_units(units)
 
-    def _published_start(self, group: int, base: int, visible: int) -> int:
-        """Return the first token a group carries in a publication.
+    def _export_start(self, group: int, base: int, visible: int) -> int:
+        """Return the first token a group carries in an export.
 
         A full-attention group carries the whole suffix after ``base``; a
         sliding-window group only the history a reader of ``visible`` needs.
@@ -432,7 +435,7 @@ class KVCacheManager:
         window = self.shapes[group].window
         return base if window is None else max(base, visible - window)
 
-    def publish(
+    def export(
         self,
         *,
         request_pool_idx: int,
@@ -444,13 +447,13 @@ class KVCacheManager:
     ) -> KvTransfer:
         """Export a visible KV extent of every group under its buffer identity.
 
-        Publications to one ``(request, destination)`` form a chain: this one
+        Exports to one ``(request, destination)`` form a chain: this one
         exports only tokens after ``base_extent``, the latest committed
-        publication to that destination, and a sliding-window group only its
+        export to that destination, and a sliding-window group only its
         window before ``visible_length``. An empty suffix exports no tensors.
         The exported spans are reserved before any view is exported. The
         returned ``KvTransfer`` becomes resident only when the batch commits
-        it (``validate_publications`` then ``apply_publications``).
+        it (``validate_exports`` then ``apply_exports``).
 
         `consumers` are the acknowledgment slots of the ranks that install it.
 
@@ -472,15 +475,15 @@ class KVCacheManager:
         )
         if visible > self.block_tables.allocated_length(request_pool_idx):
             raise invalid_descriptor(
-                "KV publication exceeds its scheduler block table"
+                "KV export exceeds its scheduler block table"
             )
         if visible < base_extent:
             raise invalid_descriptor(
-                "KV publication destination is ahead of its source"
+                "KV export destination is ahead of its source"
             )
 
         starts = tuple(
-            self._published_start(group, base_extent, visible)
+            self._export_start(group, base_extent, visible)
             for group in range(len(tables))
         )
         spans = tuple(
@@ -502,7 +505,7 @@ class KVCacheManager:
                 for group, (table, start) in enumerate(
                     zip(tables, starts, strict=True)
                 ):
-                    tensors = self._publish_group(
+                    tensors = self._export_group(
                         group,
                         table,
                         start,
@@ -526,18 +529,18 @@ class KVCacheManager:
             raise
 
         # Every group of one pool shares a compute dtype; the first names it.
-        publication = KvTransfer(
+        export = KvTransfer(
             groups=tuple(groups),
             source=buffer,
             destination=destination,
             base=base,
             base_extent=base_extent,
-            published_extent=visible,
+            exported_extent=visible,
             compute_dtype=str(self.compute_dtypes[0]).removeprefix("torch."),
         )
-        return publication
+        return export
 
-    def _publish_group(
+    def _export_group(
         self,
         group: int,
         table: GroupTable,
@@ -598,12 +601,12 @@ class KVCacheManager:
                 if encoded:
                     # Appending can enlarge a unit's scale and re-encode its
                     # prefix. Freeze exported bytes so an immutable
-                    # publication survives later numerical updates.
+                    # export survives later numerical updates.
                     views = (torch.cat(views, dim=0),)
                 # The offset places this run inside the group's
                 # [tokens, layers, KV heads, head dim] transfer at the run's
                 # first layer and this rank's first KV head.
-                exported = publish_tensor(
+                exported = export_tensor(
                     transports,
                     views,
                     retain=partial(self.retain_export, source),
@@ -652,7 +655,7 @@ class KVCacheManager:
                             dim=0,
                         ),
                     )
-                    exported = publish_tensor(
+                    exported = export_tensor(
                         transports,
                         views,
                         retain=partial(self.retain_export, source),
@@ -680,19 +683,19 @@ class KVCacheManager:
             )
         return tuple(tensors)
 
-    def publication(self, buffer: BufferId) -> KvTransfer:
-        """Return the resident KV publication registered for ``buffer``.
+    def get_export(self, buffer: BufferId) -> KvTransfer:
+        """Return the resident KV export registered for ``buffer``.
 
         Raises:
             WorkerError: ``invalid_descriptor`` when none is resident.
         """
         resident = self.resident(buffer)
         if resident is None:
-            raise invalid_descriptor("KV publication buffer is not resident")
+            raise invalid_descriptor("KV export buffer is not resident")
         return resident
 
     def resident(self, buffer: BufferId) -> KvTransfer | None:
-        """Look up a resident KV publication; absence is not an error."""
+        """Look up a resident KV export; absence is not an error."""
         return self._manager.resident(buffer)
 
     def validate_conditioning(
@@ -702,48 +705,46 @@ class KVCacheManager:
         *,
         request_pool_idx: int,
         visible_length: int,
-        publication: KvTransfer | None = None,
+        export: KvTransfer | None = None,
     ) -> KvTransfer:
-        """Verify that a request's allocation still covers a publication.
+        """Verify that a request's allocation still covers an export.
 
         ``buffer`` must belong to ``request_key``, the published extent must
         lie within both ``visible_length`` and the slot's allocated length,
         and the slot must have an installed table for every group.
-        ``publication`` skips the directory lookup when the caller already
+        ``export`` skips the directory lookup when the caller already
         holds it.
 
         Returns:
-            The publication.
+            The export.
 
         Raises:
             WorkerError: ``invalid_descriptor`` when any check fails or the
-                publication is not resident.
+                export is not resident.
         """
-        publication = (
-            self.publication(buffer) if publication is None else publication
-        )
+        export = self.get_export(buffer) if export is None else export
         if buffer.owner != request_key:
             raise invalid_descriptor(
                 "KV conditioning buffer belongs to another request"
             )
         if (
-            int(visible_length) < publication.published_extent
+            int(visible_length) < export.exported_extent
             or self.block_tables.allocated_length(request_pool_idx)
-            < publication.published_extent
+            < export.exported_extent
         ):
             raise invalid_descriptor(
-                "KV conditioning allocation disagrees with its publication"
+                "KV conditioning allocation disagrees with its export"
             )
         for group in range(len(self.shapes)):
             self.block_tables.table(request_pool_idx, group)
-        return publication
+        return export
 
-    def _validate_install(self, publication: KvTransfer) -> None:
+    def _validate_install(self, export: KvTransfer) -> None:
         """Check lineage and every group's transfer shape before access.
 
         A first installation into ``(request, destination)`` has no base and
         a zero base extent; a later one must name the currently installed
-        base and extent. A publication carrying tensors must carry one entry
+        base and extent. An export carrying tensors must carry one entry
         per group, each ``[tokens, group layers, KV heads, head dim]`` over
         this worker's transfer axes and starting where this worker's group
         needs it.
@@ -751,19 +752,19 @@ class KVCacheManager:
         Raises:
             WorkerError: ``invalid_descriptor`` when either check fails.
         """
-        self._manager.validate_install(publication)
-        if not publication.groups:
+        self._manager.validate_install(export)
+        if not export.groups:
             return
-        if len(publication.groups) != len(self.shapes):
+        if len(export.groups) != len(self.shapes):
             raise invalid_descriptor(
                 "KV transfer groups do not match destination groups"
             )
-        for group, value in enumerate(publication.groups):
+        for group, value in enumerate(export.groups):
             advertised = self.info.groups[group]
-            expected_start = self._published_start(
-                group, publication.base_extent, publication.published_extent
+            expected_start = self._export_start(
+                group, export.base_extent, export.exported_extent
             )
-            carried = publication.published_extent - value.start
+            carried = export.exported_extent - value.start
             if value.start != expected_start or (
                 value.tensors
                 and value.tensors[0].shape
@@ -780,7 +781,7 @@ class KVCacheManager:
 
     def prepare_install(
         self,
-        publication: KvTransfer,
+        export: KvTransfer,
         *,
         request_pool_idx: int,
         tables: Sequence[GroupTable],
@@ -797,12 +798,12 @@ class KVCacheManager:
 
         Raises:
             WorkerError: ``invalid_descriptor`` when lineage, shape, units or
-                capacity are invalid, imports are closed, or the publication
+                capacity are invalid, imports are closed, or the export
                 source already has a registered import; a resource error
                 when a destination interval is still retained or the import
                 lane is closed or has no capacity.
         """
-        self._validate_install(publication)
+        self._validate_install(export)
         if len(tables) != len(self.shapes):
             raise invalid_descriptor(
                 "KV import requires a destination table per group"
@@ -812,9 +813,9 @@ class KVCacheManager:
         for table in tables:
             held.update(self.validate_units(table.units))
             if (
-                table.allocated_tokens < publication.published_extent
+                table.allocated_tokens < export.exported_extent
                 or table.start_page * table.shape.page_tokens
-                > publication.published_extent
+                > export.exported_extent
             ):
                 raise invalid_descriptor(
                     "KV import exceeds its scheduler block table"
@@ -824,7 +825,7 @@ class KVCacheManager:
                 "KV import resets units outside its block tables"
             )
 
-        if publication.base_extent:
+        if export.base_extent:
             # Units of the pages that hold the installed base must stay
             # identical and must not be reset by this import.
             for group, table in enumerate(tables):
@@ -832,7 +833,7 @@ class KVCacheManager:
                 page_tokens = table.shape.page_tokens
                 first = max(table.start_page, installed.start_page)
                 last = min(
-                    -(-publication.base_extent // page_tokens),
+                    -(-export.base_extent // page_tokens),
                     table.end_page,
                     installed.end_page,
                 )
@@ -856,7 +857,7 @@ class KVCacheManager:
                         )
 
         return self.imports.reserve(
-            publication,
+            export,
             request_pool_idx=request_pool_idx,
             tables=tuple(tables),
             initialized_units=initialized,
@@ -874,7 +875,7 @@ class KVCacheManager:
         The request's block tables must be unchanged since
         ``prepare_install``. The slot's verified length becomes the published
         extent; the returned ``KvTransfer`` becomes resident when the batch
-        commits (``apply_publications``).
+        commits (``apply_exports``).
 
         Raises:
             RuntimeError: When the import has not completed.
@@ -882,11 +883,11 @@ class KVCacheManager:
                 the block tables disagree, or the import was abandoned.
             Exception: The import's own failure, re-raised.
         """
-        publication = write.publication
-        if installed_buffer.owner != publication.source.owner:
+        export = write.export
+        if installed_buffer.owner != export.source.owner:
             raise invalid_descriptor("installed KV buffer identity is invalid")
 
-        self._validate_install(publication)
+        self._validate_install(export)
         request_pool_idx = write.request_pool_idx
         if (
             tuple(
@@ -895,7 +896,7 @@ class KVCacheManager:
             )
             != write.tables
             or self.block_tables.allocated_length(request_pool_idx)
-            < publication.published_extent
+            < export.exported_extent
         ):
             raise invalid_descriptor(
                 "KV installation scheduler block table changed"
@@ -907,20 +908,20 @@ class KVCacheManager:
                 (request_pool_idx,), device=self.block_tables.unit_tables.device
             ),
             torch.tensor(
-                (publication.published_extent,),
+                (export.exported_extent,),
                 device=self.block_tables.unit_tables.device,
             ),
         )
-        return publication
+        return export
 
-    def validate_publications(
+    def validate_exports(
         self,
-        publications: Sequence[tuple[BufferId, KvTransfer]],
+        exports: Sequence[tuple[BufferId, KvTransfer]],
         installations: Sequence[tuple[BufferId, BufferId, KvTransfer]],
     ) -> None:
         """Validate touched KV versions before any group resource is visible.
 
-        Checks the batch's publications and installations without changing
+        Checks the batch's exports and installations without changing
         the directory. Several entries for one ``(request, destination)``
         must chain in order.
 
@@ -929,25 +930,25 @@ class KVCacheManager:
                 not match its transfer, a resident buffer names another
                 transfer, or a base is not the current one.
         """
-        self._manager.validate_publications(publications, installations)
+        self._manager.validate_exports(exports, installations)
 
-    def apply_publications(
+    def apply_exports(
         self,
-        publications: Sequence[tuple[BufferId, KvTransfer]],
+        exports: Sequence[tuple[BufferId, KvTransfer]],
         installations: Sequence[tuple[BufferId, BufferId, KvTransfer]],
     ) -> None:
         """Apply a preflighted update without repeating fallible validation.
 
-        The caller must call ``validate_publications`` before committing any
+        The caller must call ``validate_exports`` before committing any
         owner and must not mutate this directory between preflight and
         application.
         """
-        self._manager.apply_publications(publications, installations)
+        self._manager.apply_exports(exports, installations)
 
     def release_calls(
         self, releases: Sequence[tuple[RequestKey, CallId]]
     ) -> tuple[BufferId, ...]:
-        """Forget resident publications produced by the given calls.
+        """Forget resident exports produced by the given calls.
 
         Returns the removed buffer identities for the caller to release
         (``release_buffers``). Locator registration and physical retirement
@@ -958,7 +959,7 @@ class KVCacheManager:
         return self._manager.release_calls(releases)
 
     def drop(self, request_id: int) -> None:
-        """Forget every resident publication and lineage base of a request.
+        """Forget every resident export and lineage base of a request.
 
         Physical registrations are retired separately by their owners.
         """

@@ -63,7 +63,7 @@ impl PythonBackend {
             .collect::<HashSet<_>>();
         let mut products = Vec::new();
         for product in products_view.bind(py) {
-            let product = convert::tensor_publication_from_py(&product.call_method0("to_mapping")?)
+            let product = convert::tensor_export_from_py(&product.call_method0("to_mapping")?)
                 .ok_or_else(|| PyRuntimeError::new_err("invalid tensor output"))?;
             if successful.contains(&(
                 product.product.request_key,

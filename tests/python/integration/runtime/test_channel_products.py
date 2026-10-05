@@ -41,7 +41,7 @@ def test_a_channel_product_carries_its_own_bytes(events: EventPool) -> None:
     )
     try:
         source = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
-        locator = transport.publish(source)
+        locator = transport.export(source)
 
         # A round trip through the wire mapping is the journey the product
         # actually makes: rank, head, rank.
@@ -60,7 +60,7 @@ def test_a_channel_product_carries_its_own_bytes(events: EventPool) -> None:
         transport.close()
 
 
-def test_a_channel_publication_leaves_its_producer_nothing_to_retire(
+def test_a_channel_export_leaves_its_producer_nothing_to_retire(
     events: EventPool,
 ) -> None:
     """The source is the rank's own again as soon as the locator exists.
@@ -72,12 +72,12 @@ def test_a_channel_publication_leaves_its_producer_nothing_to_retire(
         "channel", byte_capacity=1 << 20, ticket_capacity=2, event_pool=events
     )
     try:
-        locator = transport.publish(torch.ones(256, dtype=torch.float32))
+        locator = transport.export(torch.ones(256, dtype=torch.float32))
 
-        assert transport.publication_retirement(locator).done()
+        assert transport.retirement(locator).done()
         # Capacity is the staging buffer, not the product, so publishing again
-        # does not need the first publication to be released.
-        assert transport.publish(torch.ones(256, dtype=torch.float32))
+        # does not need the first export to be released.
+        assert transport.export(torch.ones(256, dtype=torch.float32))
     finally:
         transport.close()
 
@@ -88,7 +88,7 @@ def test_a_channel_locator_from_another_endpoint_is_refused(
     """A rank retires only what it published.
 
     The bytes are indistinguishable once they travel, so the endpoint is what
-    identifies whose publication a locator is.
+    identifies whose export a locator is.
     """
     from uniserve_worker.errors import WorkerError
 
@@ -99,7 +99,7 @@ def test_a_channel_locator_from_another_endpoint_is_refused(
         "channel", byte_capacity=1 << 20, ticket_capacity=2, event_pool=events
     )
     try:
-        locator = producer.publish(torch.ones(16, dtype=torch.float32))
+        locator = producer.export(torch.ones(16, dtype=torch.float32))
         with pytest.raises(WorkerError, match="another endpoint"):
             other.release(locator)
     finally:
@@ -107,16 +107,16 @@ def test_a_channel_locator_from_another_endpoint_is_refused(
         other.close()
 
 
-def test_a_channel_product_of_media_size_fits_its_publication_bound(
+def test_a_channel_product_of_media_size_fits_its_export_bound(
     events: EventPool,
 ) -> None:
     """The bytes are the product, not the handle.
 
     A media unit's PCM or encoded bytes are far larger than a transfer handle
     may be, and they travel on the rank channel whose message caps bound them;
-    the publication's handle bound counts the locator, not the payload.
+    the export's handle bound counts the locator, not the payload.
     """
-    from uniserve_worker.protocol.batch import TensorPublication
+    from uniserve_worker.protocol.batch import TensorExport
     from uniserve_worker.protocol.identity import CallId, RequestKey
     from uniserve_worker.protocol.tensor import (
         DType,
@@ -135,8 +135,8 @@ def test_a_channel_product_of_media_size_fits_its_publication_bound(
     try:
         samples = 5 * 32000
         pcm = torch.zeros(samples, 2, dtype=torch.int16)
-        locator = transport.publish(pcm)
-        publication = TensorPublication(
+        locator = transport.export(pcm)
+        export = TensorExport(
             product=TensorRef(
                 request_key=RequestKey(1, 1, 1),
                 producer_call_id=CallId(1, 0),
@@ -152,7 +152,7 @@ def test_a_channel_product_of_media_size_fits_its_publication_bound(
                 tensor=TensorTransfer(shape=(samples, 2), locations=(locator,)),
             ),
         )
-        assert publication.encoded_size_bound() < pcm.numel() * 2
+        assert export.encoded_size_bound() < pcm.numel() * 2
     finally:
         transport.close()
 
@@ -167,7 +167,7 @@ def test_a_channel_product_reaches_a_device_destination(
     )
     try:
         source = torch.arange(96, dtype=torch.int16).reshape(48, 2)
-        delivered = Locator.from_mapping(transport.publish(source).to_mapping())
+        delivered = Locator.from_mapping(transport.export(source).to_mapping())
         destination = torch.empty(48, 2, dtype=torch.int16, device="cuda:0")
         _await_ticket(
             transport.fetch(

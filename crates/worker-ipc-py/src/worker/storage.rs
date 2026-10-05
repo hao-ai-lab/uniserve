@@ -419,7 +419,7 @@ impl TensorStore {
         self.wait_producer(py, &lock(py, &imported.buffer), &mut HashSet::new())
     }
 
-    fn publish<'py>(
+    fn write_value<'py>(
         &self,
         py: Python<'py>,
         buffer: &BufferHandle,
@@ -840,7 +840,7 @@ impl TensorStore {
         let buffer = &value.buffer;
         let tensor = value.views.tensor.bind(py);
         if !lock(py, buffer).state.produced() {
-            self.publish(
+            self.write_value(
                 py,
                 buffer,
                 tensor,
@@ -886,7 +886,7 @@ impl TensorStore {
     /// Copy a numerical value, then attach its producer fence. A supplied
     /// event is recorded by the caller after all writes in that invocation.
     #[pyo3(signature = (write, value, *, producer_event=None, metadata=None))]
-    fn publish_write<'py>(
+    fn write<'py>(
         &self,
         py: Python<'py>,
         write: Bound<'py, Buffer>,
@@ -902,7 +902,7 @@ impl TensorStore {
         state
             .require_buffer(&write)
             .map_err(|error| native_error(py, error))?;
-        self.publish(
+        self.write_value(
             py,
             &write,
             &value,
@@ -912,7 +912,7 @@ impl TensorStore {
     }
 
     #[pyo3(signature = (writes, values, *, producer_event=None))]
-    fn publish_writes<'py>(
+    fn write_scalars<'py>(
         &self,
         py: Python<'py>,
         writes: Vec<Bound<'py, Buffer>>,
@@ -955,7 +955,7 @@ impl TensorStore {
     }
 
     #[pyo3(signature = (write, value, *, producer_event=None))]
-    fn publish_scalar_write<'py>(
+    fn write_scalar<'py>(
         &self,
         py: Python<'py>,
         write: Bound<'py, Buffer>,

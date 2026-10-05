@@ -1,4 +1,4 @@
-"""A hybrid model's K/V publication, installation and attention staging.
+"""A hybrid model's K/V export, installation and attention staging.
 
 The fixture model has a windowed group (window 8, 16-token pages of five
 units) and a full-attention group (32-token pages of one unit) in one unit
@@ -87,9 +87,7 @@ def _buffer(call: int) -> BufferId:
         pytest.param("cuda_vmm", "cuda:0", marks=pytest.mark.gpu),
     ),
 )
-def test_publication_carries_each_group_from_its_first_needed_token(
-    backend, device
-):
+def test_export_carries_each_group_from_its_first_needed_token(backend, device):
     model = hybrid_model(window=WINDOW)
     producer = hybrid_pool(model, _config(device), num_units=32)
     consumer = hybrid_pool(model, _config(device), num_units=32)
@@ -100,7 +98,7 @@ def test_publication_carries_each_group_from_its_first_needed_token(
         )
         for event in events
     ]
-    source, write, publication = _buffer(1), None, None
+    source, write, export = _buffer(1), None, None
     try:
         _install(producer, PRODUCER)
         _install(consumer, CONSUMER)
@@ -108,7 +106,7 @@ def test_publication_carries_each_group_from_its_first_needed_token(
         if device.startswith("cuda"):
             torch.cuda.synchronize(device)
 
-        publication = producer.publish(
+        export = producer.export(
             request_pool_idx=1,
             visible_length=40,
             destination="consumer",
@@ -117,16 +115,16 @@ def test_publication_carries_each_group_from_its_first_needed_token(
         )
         # A reader at token 40 needs the windowed group's last eight tokens
         # and the full group's whole history, each over its group's layers.
-        windowed, full = publication.groups
+        windowed, full = export.groups
         assert (windowed.start, windowed.page_tokens) == (32, 16)
         assert windowed.tensors[0].shape == (8, 10, 4, 4)
         assert (full.start, full.page_tokens) == (0, 32)
         assert full.tensors[0].shape == (40, 2, 1, 8)
-        producer.validate_publications(((source, publication),), ())
-        producer.apply_publications(((source, publication),), ())
+        producer.validate_exports(((source, export),), ())
+        producer.apply_exports(((source, export),), ())
 
         write = consumer.prepare_install(
-            publication,
+            export,
             request_pool_idx=1,
             tables=tuple(
                 consumer.block_tables.table(1, group) for group in range(2)
@@ -139,8 +137,8 @@ def test_publication_carries_each_group_from_its_first_needed_token(
             torch.cuda.synchronize(device)
         installed = _buffer(101)
         result = consumer.install(installed_buffer=installed, write=write)
-        consumer.validate_publications((), ((source, installed, result),))
-        consumer.apply_publications((), ((source, installed, result),))
+        consumer.validate_exports((), ((source, installed, result),))
+        consumer.apply_exports((), ((source, installed, result),))
 
         # Each layer holds exactly the carried tokens at its own units.
         for name, table, row in _layers(consumer):
@@ -156,8 +154,8 @@ def test_publication_carries_each_group_from_its_first_needed_token(
     finally:
         if write is not None:
             consumer.imports.abandon(write)
-        if publication is not None:
-            for tensor in publication.tensors:
+        if export is not None:
+            for tensor in export.tensors:
                 for location in tensor.locations:
                     transports[0].release(location)
             producer.release_buffers((source,))

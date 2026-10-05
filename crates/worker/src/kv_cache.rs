@@ -90,19 +90,19 @@ impl<C> KVCacheManager<C> {
     /// Check all touched versions before any resource owner commits. Updates
     /// to one destination must form a chain in batch order; rejection leaves
     /// both resident descriptors and accepted bases unchanged.
-    pub fn validate_publications(
+    pub fn validate_exports(
         &self,
-        publications: &[(BufferId, KvTransfer)],
+        exports: &[(BufferId, KvTransfer)],
         installations: &[(BufferId, BufferId, KvTransfer)],
     ) -> Result<()> {
         let mut resident = HashMap::new();
         let mut destination_bases = Destinations::new();
         let mut installed_bases = Destinations::new();
 
-        for (buffer, transfer) in publications {
+        for (buffer, transfer) in exports {
             if *buffer != transfer.source {
                 return Err(Error::Invalid(
-                    "KV publication buffer differs from its source".into(),
+                    "KV export buffer differs from its source".into(),
                 ));
             }
             let existing = resident
@@ -111,7 +111,7 @@ impl<C> KVCacheManager<C> {
                 .or_else(|| self.resident(*buffer));
             if existing.is_some_and(|existing| existing != transfer) {
                 return Err(Error::Invalid(
-                    "KV publication conflicts with its resident buffer".into(),
+                    "KV export conflicts with its resident buffer".into(),
                 ));
             }
 
@@ -133,15 +133,15 @@ impl<C> KVCacheManager<C> {
 
     /// Commit an already checked batch. The executor must leave this
     /// directory unchanged between validation and the shared resource commit.
-    pub fn apply_publications(
+    pub fn apply_exports(
         &mut self,
-        publications: Vec<(BufferId, KvTransfer)>,
+        exports: Vec<(BufferId, KvTransfer)>,
         installations: Vec<(BufferId, BufferId, KvTransfer)>,
     ) {
-        for (buffer, transfer) in publications {
+        for (buffer, transfer) in exports {
             self.destination_bases.insert(
                 (buffer.owner, transfer.destination.clone()),
-                (transfer.source, transfer.published_extent),
+                (transfer.source, transfer.exported_extent),
             );
             self.resident.insert(buffer, Arc::new(transfer));
         }
@@ -149,7 +149,7 @@ impl<C> KVCacheManager<C> {
         for (source, installed, transfer) in installations {
             self.installed_bases.insert(
                 (installed.owner, transfer.destination.clone()),
-                (transfer.source, transfer.published_extent),
+                (transfer.source, transfer.exported_extent),
             );
             let transfer = Arc::new(transfer);
             self.resident.insert(source, Arc::clone(&transfer));
@@ -212,7 +212,7 @@ fn stage_base(
         transfer,
         staged.get(&key).or_else(|| resident.get(&key)).copied(),
     )?;
-    staged.insert(key, (transfer.source, transfer.published_extent));
+    staged.insert(key, (transfer.source, transfer.exported_extent));
     Ok(())
 }
 
@@ -442,7 +442,7 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> KVCacheManager<C> {
         }
         if !self.exports.is_empty() {
             return Err(Error::Resource(
-                "KV cache still has unretired physical publications",
+                "KV cache still has unretired physical exports",
             ));
         }
         if !self.imports.is_empty() {
@@ -549,7 +549,7 @@ mod tests {
             destination: "decoder".into(),
             base,
             base_extent: 0,
-            published_extent: 0,
+            exported_extent: 0,
             compute_dtype: "bfloat16".into(),
         }
     }
@@ -573,14 +573,14 @@ mod tests {
             },
             Some(first.source),
         );
-        cache.validate_publications(&[(first.source, first.clone())], &[])?;
-        cache.apply_publications(vec![(first.source, first.clone())], vec![]);
+        cache.validate_exports(&[(first.source, first.clone())], &[])?;
+        cache.apply_exports(vec![(first.source, first.clone())], vec![]);
 
         // Even an empty suffix advances the accepted transfer base. The
         // third update cannot skip the second update in the same batch.
         assert!(
             cache
-                .validate_publications(
+                .validate_exports(
                     &[
                         (second.source, second.clone()),
                         (third.source, third.clone())
@@ -601,8 +601,8 @@ mod tests {
             (second.source, second.clone()),
             (third.source, third.clone()),
         ];
-        cache.validate_publications(&batch, &[])?;
-        cache.apply_publications(batch, vec![]);
+        cache.validate_exports(&batch, &[])?;
+        cache.apply_exports(batch, vec![]);
         cache.release_calls(&[
             (first.source.owner, first.source.producer_call_id),
             (second.source.owner, second.source.producer_call_id),
@@ -631,8 +631,8 @@ mod tests {
             (other.source, other.source, other.clone()),
         ];
         cache.validate_install(&first)?;
-        cache.validate_publications(&[], &installs)?;
-        cache.apply_publications(vec![], installs);
+        cache.validate_exports(&[], &installs)?;
+        cache.apply_exports(vec![], installs);
         cache.release_calls(&[(first.source.owner, first.source.producer_call_id)]);
         assert_eq!(cache.resident(first.source), None);
         assert_eq!(cache.resident(local), Some(&first));

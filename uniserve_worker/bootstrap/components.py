@@ -296,7 +296,7 @@ def supported_calls(
         if name in components:
             kinds.update(host_kinds)
     if any(isinstance(call.module, CausalLM) for call in calls):
-        kinds.update((TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL))
+        kinds.update((TransferMode.KV_EXPORT, TransferMode.KV_INSTALL))
     return frozenset(kinds)
 
 

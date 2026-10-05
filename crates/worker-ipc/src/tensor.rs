@@ -3,7 +3,7 @@
 //! The engine's scheduler declares a cross-call tensor product as a
 //! [`TensorRef`]: a request-scoped identity plus a [`DType`] and a
 //! [`ShapeBound`] that fix the product's maximum size before its producing call
-//! runs. A producing worker reports the product as a [`TensorPublication`],
+//! runs. A producing worker reports the product as a [`TensorExport`],
 //! whose [`TransferHandle`] carries the actual logical shape
 //! ([`TensorTransfer`]) and one [`Locator`] per shard or replica, each naming
 //! the [`TransferTransport`] a consumer opens. A published KV extent travels as
@@ -170,7 +170,7 @@ pub struct TensorRef {
 /// Stable identity for one cross-call buffer, independent of its physical representation.
 ///
 /// A [`TensorRef`] projects to one through [`TensorRef::buffer_id`]; a KV
-/// publication carries one directly. The engine routes buffers and frees them
+/// export carries one directly. The engine routes buffers and frees them
 /// (`BatchCommand::Free`) by this identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferId {
@@ -226,29 +226,29 @@ impl TensorRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "transport", content = "value")]
 pub enum TransferTransport {
-    /// Process-local publication resolved through a worker endpoint.
+    /// Process-local export resolved through a worker endpoint.
     Local {
         /// Publishing endpoint identity.
         endpoint: String,
-        /// Endpoint-local publication key.
+        /// Endpoint-local export key.
         key: u64,
     },
-    /// POSIX shared-storage publication with endpoint-driven readiness and ownership.
+    /// POSIX shared-storage export with endpoint-driven readiness and ownership.
     PosixShm {
         /// Publishing address-space incarnation and reader-lease endpoint.
         endpoint: String,
         /// Shared-storage object name.
         name: String,
     },
-    /// CUDA VMM publication of device storage, which a consumer maps by
+    /// CUDA VMM export of device storage, which a consumer maps by
     /// importing the producer's allocation handle and viewing its spans.
     CudaVmm {
         /// Publishing worker endpoint.
         endpoint: String,
-        /// Stable publication identity: exactly 32 bytes long (the producer
+        /// Stable export identity: exactly 32 bytes long (the producer
         /// uses a hex UUID). It also keys the producer's descriptor grant
         /// when `allocation_handle` is a process descriptor.
-        publication_id: String,
+        export_id: String,
         /// Exported allocation size in bytes.
         storage_size_bytes: u64,
         /// Byte offsets of ordered first-axis spans within one allocation, one
@@ -263,7 +263,7 @@ pub enum TransferTransport {
         /// Non-negative element strides shared by every span view, one per
         /// locator axis.
         tensor_stride: Vec<i64>,
-        /// Opaque 64-byte CUDA IPC event handle signaling publication
+        /// Opaque 64-byte CUDA IPC event handle signaling export
         /// readiness, or empty. It is empty when any of the producing rank's
         /// consumers is on another host, where an event handle does not
         /// reach; the producer then synchronizes its stream before publishing.
@@ -275,13 +275,13 @@ pub enum TransferTransport {
         /// travels here rather than through a descriptor grant that only
         /// reaches the producer's own host. A descriptor names an open file
         /// of the producing process, so a consumer receives the usable one
-        /// over the producer's grant socket, keyed by `publication_id`.
+        /// over the producer's grant socket, keyed by `export_id`.
         #[serde(with = "serde_bytes")]
         allocation_handle: Vec<u8>,
-        /// Byte offset of this publication's acknowledgment header inside the
+        /// Byte offset of this export's acknowledgment header inside the
         /// exported allocation. A consumer writes its own slot's word there
         /// once its reads retire, which is how a product retires across hosts.
-        /// Negative when the publication carries no header, which is the case
+        /// Negative when the export carries no header, which is the case
         /// for storage exported where it lies rather than copied into the
         /// producer's device pool.
         acknowledgment_offset: i64,
@@ -306,9 +306,9 @@ pub enum TransferTransport {
 /// semantic transfer metadata remains typed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Locator {
-    /// Loaded producer rank that owns this publication.
+    /// Loaded producer rank that owns this export.
     pub source: WorkerEndpoint,
-    /// Transport-specific publication descriptor.
+    /// Transport-specific export descriptor.
     pub transport: TransferTransport,
     /// Payload size in bytes of this shard or replica.
     pub nbytes: u64,
@@ -444,13 +444,13 @@ fn tensor_elements(shape: &[u64]) -> ValidationResult<u64> {
     })
 }
 
-/// One cache group's share of a KV publication.
+/// One cache group's share of a KV export.
 ///
-/// The tensors carry the group's tokens `[start, published_extent)` of the
+/// The tensors carry the group's tokens `[start, exported_extent)` of the
 /// enclosing [`KvTransfer`]. A full-attention group starts at the
-/// publication's `base_extent`; a sliding-window group starts no earlier than
+/// export's `base_extent`; a sliding-window group starts no earlier than
 /// the first token its readers need, so it never carries retired history.
-/// With `T = published_extent - start`, the tensors use this layout, whose
+/// With `T = exported_extent - start`, the tensors use this layout, whose
 /// shape relations [`KvTransfer::validate`] checks:
 ///
 /// - keys and values: `[T, layers, kv heads, head dim]` over the group's
@@ -461,7 +461,7 @@ fn tensor_elements(shape: &[u64]) -> ValidationResult<u64> {
 ///   the carried tokens touch (the first one holds `start`), the second axis
 ///   selects K or V, and the kv-head count is a multiple of `head groups`.
 ///
-/// A group that carries no token (`start == published_extent`) has no
+/// A group that carries no token (`start == exported_extent`) has no
 /// tensors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvGroupTransfer {
@@ -477,18 +477,18 @@ pub struct KvGroupTransfer {
 
 impl KvGroupTransfer {
     /// Validates the carried interval and the raw K/V/scale geometry.
-    fn validate(&self, base_extent: u32, published_extent: u32) -> ValidationResult<()> {
+    fn validate(&self, base_extent: u32, exported_extent: u32) -> ValidationResult<()> {
         let Self {
             start,
             page_tokens,
             tensors,
         } = self;
         ensure_valid!(
-            *page_tokens > 0 && base_extent <= *start && *start <= published_extent,
+            *page_tokens > 0 && base_extent <= *start && *start <= exported_extent,
             "KV group transfer interval is invalid"
         );
         ensure_valid!(
-            tensors.is_empty() == (*start == published_extent),
+            tensors.is_empty() == (*start == exported_extent),
             "KV group tensor presence disagrees with its carried interval"
         );
         if tensors.is_empty() {
@@ -507,7 +507,7 @@ impl KvGroupTransfer {
             .map(|location| location.dtype.as_str());
         ensure_valid!(
             key.shape.len() == 4
-                && key.shape[0] == u64::from(published_extent - start)
+                && key.shape[0] == u64::from(exported_extent - start)
                 && value.shape == key.shape
                 && value
                     .locations
@@ -530,7 +530,7 @@ impl KvGroupTransfer {
             // holds `start`, so a partially filled boundary page contributes
             // its already installed tokens to the count.
             let scales = &tensors[2];
-            let tokens = u64::from(start % page_tokens) + u64::from(published_extent - start);
+            let tokens = u64::from(start % page_tokens) + u64::from(exported_extent - start);
             let pages = tokens.div_ceil(u64::from(*page_tokens));
             ensure_valid!(
                 scales.shape.len() == 4
@@ -554,16 +554,16 @@ impl KvGroupTransfer {
 
 /// A published KV extent and the physical tensors needed to install its suffix.
 ///
-/// The publication is incremental: the destination already holds `base`, when
+/// The export is incremental: the destination already holds `base`, when
 /// set, up to `base_extent` tokens, and each group carries only its tokens
 /// from its [`KvGroupTransfer::start`] on. An unchanged extent
-/// (`published_extent == base_extent`) carries no groups; otherwise there is
+/// (`exported_extent == base_extent`) carries no groups; otherwise there is
 /// one entry per cache group, in table order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvTransfer {
     /// Published tensors of every cache group, in group order.
     pub groups: Vec<KvGroupTransfer>,
-    /// Published buffer identity represented by the publication.
+    /// Published buffer identity represented by the export.
     pub source: BufferId,
     /// Destination worker or pool identity.
     pub destination: String,
@@ -571,8 +571,8 @@ pub struct KvTransfer {
     pub base: Option<BufferId>,
     /// KV token extent represented by `base`.
     pub base_extent: u32,
-    /// Total KV token extent represented by this publication.
-    pub published_extent: u32,
+    /// Total KV token extent represented by this export.
+    pub exported_extent: u32,
     /// Compute precision used when reading quantized source pages.
     pub compute_dtype: String,
 }
@@ -590,7 +590,7 @@ impl KvTransfer {
             destination,
             base,
             base_extent,
-            published_extent,
+            exported_extent,
             compute_dtype,
         } = self;
         source.validate()?;
@@ -603,16 +603,16 @@ impl KvTransfer {
                     compute_dtype.as_str(),
                     "float16" | "bfloat16" | "float32" | "float64"
                 )
-                && *base_extent <= *published_extent
+                && *base_extent <= *exported_extent
                 && (base.is_some() || *base_extent == 0),
-            "KV transfer publication metadata is invalid"
+            "KV transfer export metadata is invalid"
         );
         ensure_valid!(
-            groups.is_empty() == (published_extent == base_extent),
+            groups.is_empty() == (exported_extent == base_extent),
             "KV group presence disagrees with its incremental extent"
         );
         for group in groups {
-            group.validate(*base_extent, *published_extent)?;
+            group.validate(*base_extent, *exported_extent)?;
         }
         ensure_valid!(
             self.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
@@ -643,10 +643,10 @@ impl KvTransfer {
             .saturating_add(self.compute_dtype.len())
     }
 
-    /// Merge reports for one immutable publication without exposing a partial update.
+    /// Merge reports for one immutable export without exposing a partial update.
     ///
     /// The engine merges reports that carry locators for the same `source`,
-    /// such as per-rank reports of one call, this way. Every publication field
+    /// such as per-rank reports of one call, this way. Every export field
     /// except the locators must agree, and the merged result must pass
     /// [`KvTransfer::validate`]; on any error `self` is left unchanged.
     pub fn merge_locations(&mut self, other: &Self) -> ValidationResult<()> {
@@ -655,13 +655,13 @@ impl KvTransfer {
                 && self.destination == other.destination
                 && self.base == other.base
                 && self.base_extent == other.base_extent
-                && self.published_extent == other.published_extent
+                && self.exported_extent == other.exported_extent
                 && self.compute_dtype == other.compute_dtype
                 && self.groups.len() == other.groups.len()
                 && self.groups.iter().zip(&other.groups).all(|(left, right)| {
                     left.start == right.start && left.page_tokens == right.page_tokens
                 }),
-            "KV locations disagree on publication metadata"
+            "KV locations disagree on export metadata"
         );
         let mut candidate = self.clone();
         for (destination, source) in candidate.groups.iter_mut().zip(&other.groups) {
@@ -673,7 +673,7 @@ impl KvTransfer {
     }
 }
 
-/// Encoding represented by a reusable image-feature publication.
+/// Encoding represented by a reusable image-feature export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FeatureKind {
     /// Vision-encoder features, consumed through a call's `vision_inputs`.
@@ -796,7 +796,7 @@ fn transfer_encoded_size<'a>(tensors: impl IntoIterator<Item = &'a TensorTransfe
                 }
                 TransferTransport::CudaVmm {
                     endpoint,
-                    publication_id,
+                    export_id,
                     ready_event_handle,
                     allocation_handle,
                     tensor_stride,
@@ -805,7 +805,7 @@ fn transfer_encoded_size<'a>(tensors: impl IntoIterator<Item = &'a TensorTransfe
                     ..
                 } => endpoint
                     .len()
-                    .saturating_add(publication_id.len())
+                    .saturating_add(export_id.len())
                     .saturating_add(ready_event_handle.len())
                     .saturating_add(allocation_handle.len())
                     .saturating_add(8usize.saturating_mul(tensor_stride.len()))
@@ -855,22 +855,22 @@ fn merge_tensor_locations(
     Ok(())
 }
 
-/// Published tensor storage matched to one exact product identity.
+/// A tensor result and the locations from which consumers can read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TensorPublication {
-    /// Exact product identity and bounds.
+pub struct TensorExport {
+    /// Logical output and expected tensor bounds.
     pub product: TensorRef,
     /// Transport descriptor for the published tensor.
     pub value: TransferHandle,
 }
 
-impl TensorPublication {
+impl TensorExport {
     /// Adds locations of the same immutable logical value without changing its metadata.
     ///
     /// The engine merges reports of one product, such as per-rank reports,
     /// this way. The product identities and the variant's semantic metadata
-    /// must match, and the merged publication must stay within
-    /// [`MAX_TRANSFER_HANDLE_BYTES`] and pass [`TensorPublication::validate`];
+    /// must match, and the merged export must stay within
+    /// [`MAX_TRANSFER_HANDLE_BYTES`] and pass [`TensorExport::validate`];
     /// on any error `self` is left unchanged.
     pub fn merge_locations(&mut self, other: &Self) -> ValidationResult<()> {
         ensure_valid!(
@@ -961,7 +961,7 @@ impl Locator {
     fn validate(&self) -> ValidationResult<()> {
         self.source.validate()?;
         // Tensor metadata is transport-independent and establishes the minimum
-        // shape needed to validate every publication mechanism.
+        // shape needed to validate every export mechanism.
         ensure_valid!(
             self.nbytes > 0
                 && !self.dtype.is_empty()
@@ -973,7 +973,7 @@ impl Locator {
         );
 
         // Each transport validates only the handles and readiness metadata its
-        // consumer must use to open the publication.
+        // consumer must use to open the export.
         match &self.transport {
             TransferTransport::Local { endpoint, .. } => {
                 ensure_valid!(!endpoint.is_empty(), "local transfer endpoint is empty");
@@ -987,7 +987,7 @@ impl Locator {
             }
             TransferTransport::CudaVmm {
                 endpoint,
-                publication_id,
+                export_id,
                 storage_size_bytes,
                 storage_offsets_bytes,
                 span_lengths,
@@ -999,7 +999,7 @@ impl Locator {
             } => {
                 ensure_valid!(
                     !endpoint.is_empty()
-                        && publication_id.len() == 32
+                        && export_id.len() == 32
                         && *storage_size_bytes > 0
                         && !storage_offsets_bytes.is_empty()
                         && span_counts.len() == span_lengths.len()
@@ -1020,7 +1020,7 @@ impl Locator {
                             }
                         ) == self.shape.first().copied()
                         && tensor_stride.len() == self.shape.len()
-                        // A publication read only from this host carries the
+                        // An export read only from this host carries the
                         // event its consumers wait on; one read from another
                         // host carries no fence, because none would reach
                         // there, and its producer drained its stream before

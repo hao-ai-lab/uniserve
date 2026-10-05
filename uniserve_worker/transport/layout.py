@@ -1,6 +1,6 @@
 """Tensor representation, source regions, and destination span validation.
 
-A published product or a read destination is either one tensor or a tuple of
+A exported product or a read destination is either one tensor or a tuple of
 first-axis spans: views that concatenate along axis 0 into one logical
 tensor, such as pages of a paged allocation. The helpers here select regions
 of either form and walk two partitions together without packing them into a
@@ -36,7 +36,7 @@ def validate_destination(
 
     Raises:
         WorkerError: `invalid_descriptor` when the dtype, device or shape
-            disagree with the published representation, or when any two
+            disagree with the exported representation, or when any two
             destination elements may share storage.
     """
     spans = destination if isinstance(destination, tuple) else (destination,)
@@ -45,7 +45,7 @@ def validate_destination(
         for span in spans
     ):
         raise invalid_descriptor(
-            "transfer destination disagrees with the published representation"
+            "transfer destination disagrees with the exported representation"
         )
 
     # A tuple destination is a logical tensor partitioned along the first axis;
@@ -59,14 +59,14 @@ def validate_destination(
         ):
             raise invalid_descriptor(
                 "transfer destination disagrees with the "
-                "published representation"
+                "exported representation"
             )
         actual_shape = (sum(int(span.shape[0]) for span in spans), *shape[1:])
     else:
         actual_shape = tuple(destination.shape)
     if actual_shape != shape:
         raise invalid_descriptor(
-            "transfer destination disagrees with the published representation"
+            "transfer destination disagrees with the exported representation"
         )
 
     # First pass: a coarse per-span envelope [data_ptr, data_ptr + extent),
@@ -209,16 +209,16 @@ def read_destination(
     destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
     region: tuple[slice, ...] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """Return the destination for reading `region` of a published view.
+    """Return the destination for reading `region` of a exported view.
 
-    `region` is in the published view's coordinates and defaults to the whole
+    `region` is in the exported view's coordinates and defaults to the whole
     view. Without a destination, a new tensor of the region's shape is
     allocated on `device`; a given destination is checked by
     `validate_destination`.
 
     Raises:
         WorkerError: `invalid_descriptor` when the region exceeds the
-            published view or the destination does not match it.
+            exported view or the destination does not match it.
     """
     import torch
 
@@ -229,7 +229,7 @@ def read_destination(
         )
     )
     if not _slices.within(region, locator.shape):
-        raise invalid_descriptor("read region exceeds the published view")
+        raise invalid_descriptor("read region exceeds the exported view")
     dtype = resolve_dtype(locator.dtype)
     if destination is None:
         return torch.empty(_slices.shape(region), dtype=dtype, device=device)
@@ -242,7 +242,7 @@ def read_destination(
     return destination
 
 
-def publication_views(
+def export_views(
     tensor: torch.Tensor | tuple[torch.Tensor, ...],
     offset: tuple[int, ...] | None,
 ) -> tuple[
@@ -263,7 +263,7 @@ def publication_views(
     """
     spans = tensor if isinstance(tensor, tuple) else (tensor,)
     if not spans:
-        raise invalid_descriptor("publication has no source spans")
+        raise invalid_descriptor("export has no source spans")
     first = spans[0]
     if first.ndim < 1 or any(
         span.ndim != first.ndim
@@ -274,7 +274,7 @@ def publication_views(
         for span in spans
     ):
         raise invalid_descriptor(
-            "publication spans disagree on their representation"
+            "export spans disagree on their representation"
         )
 
     shape = (sum(int(span.shape[0]) for span in spans), *first.shape[1:])
@@ -283,10 +283,10 @@ def publication_views(
         not isinstance(start, int) or start < 0 for start in value
     ):
         raise invalid_descriptor(
-            "publication offset does not match its tensor shape"
+            "export offset does not match its tensor shape"
         )
 
-    # Detach so autograd metadata never reaches readers of the published view.
+    # Detach so autograd metadata never reaches readers of the exported view.
     source = tuple(span.detach() for span in spans)
     return (source if isinstance(tensor, tuple) else source[0]), shape, value
 

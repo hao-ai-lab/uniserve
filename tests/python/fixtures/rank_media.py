@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from tests.python.fixtures.depth_one import finalized_report
-from uniserve_worker._uniserve_ipc import publish_media_bytes
+from uniserve_worker._uniserve_ipc import store_media_bytes
 from uniserve_worker.bootstrap.cli import parse_worker_args
 from uniserve_worker.bootstrap.launch import (
     WorkerIpcEndpoint,
@@ -55,7 +55,7 @@ def main():
                     ):
                         completion = report["completions"][0]
                         payload = b"generated media content"
-                        name = publish_media_bytes(payload)
+                        name = store_media_bytes(payload)
                         Path(os.environ["UNISERVE_TEST_MEDIA_NAME"]).write_text(
                             name
                         )

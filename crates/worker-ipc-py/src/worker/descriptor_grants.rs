@@ -20,13 +20,13 @@ impl DescriptorGrants {
         })
     }
 
-    fn register(&self, py: Python<'_>, publication: &str, descriptor: RawFd) -> PyResult<()> {
-        py.detach(|| self.inner.register(publication, descriptor))?;
+    fn register(&self, py: Python<'_>, export: &str, descriptor: RawFd) -> PyResult<()> {
+        py.detach(|| self.inner.register(export, descriptor))?;
         Ok(())
     }
 
-    fn release(&self, py: Python<'_>, publication: &str) {
-        py.detach(|| self.inner.release(publication));
+    fn release(&self, py: Python<'_>, export: &str) {
+        py.detach(|| self.inner.release(export));
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -46,12 +46,8 @@ impl Drop for DescriptorGrants {
 }
 
 #[pyfunction]
-pub(crate) fn fetch_descriptor(
-    py: Python<'_>,
-    endpoint: &str,
-    publication: &str,
-) -> PyResult<RawFd> {
-    py.detach(|| uniserve_worker::fetch_descriptor(endpoint, publication))
+pub(crate) fn fetch_descriptor(py: Python<'_>, endpoint: &str, export: &str) -> PyResult<RawFd> {
+    py.detach(|| uniserve_worker::fetch_descriptor(endpoint, export))
         .map(IntoRawFd::into_raw_fd)
         .map_err(|error| match error.kind() {
             io::ErrorKind::NotFound

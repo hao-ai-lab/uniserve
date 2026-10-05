@@ -92,7 +92,7 @@ def row_tables(
             exceeds its allocated capacity, or a windowed row would read a
             retired page. Errors from ``cache.require_writable`` for a
             writing row propagate: a resource error when the interval
-            overlaps a publication or an import destination, or
+            overlaps an export or an import destination, or
             ``invalid_descriptor`` for an interval outside its table.
     """
     if not tasks:

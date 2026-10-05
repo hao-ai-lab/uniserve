@@ -18,7 +18,7 @@ from multiprocessing import shared_memory
 def allocate_shared_storage(size: int) -> shared_memory.SharedMemory:
     """Allocate physically backed POSIX storage or raise before a mapped write.
 
-    The caller owns close/unlink and any ownership transfer after publication.
+    The caller owns close/unlink and any ownership transfer after export.
     Reserving tmpfs pages avoids an uncatchable SIGBUS from a later copy when
     the shared storage filesystem is full.
 
@@ -70,7 +70,7 @@ def open_shared_storage(name: str, size: int) -> mmap.mmap:
     Raises:
         OSError: When `shm_open` or the mapping fails; a missing segment raises
             `FileNotFoundError`, which `ShmTransport` reports as a retired
-            publication.
+            export.
         ValueError: When `size` exceeds the segment's size.
     """
     descriptor = _open_descriptor(name)

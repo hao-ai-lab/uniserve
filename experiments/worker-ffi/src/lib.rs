@@ -587,10 +587,10 @@ tvm_ffi::tvm_ffi_dll_export_typed_func!(register, register);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(partition_streams, stream::partition_streams);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(fetch_descriptor, descriptor_grants::fetch_descriptor);
 
-fn publish_media_bytes(payload: Bytes) -> Result<tvm_ffi::String> {
+fn store_media_bytes(payload: Bytes) -> Result<tvm_ffi::String> {
     let source = uniserve_core::MediaSource::publish(payload.as_ref())
         .map_err(|error| failure(error.to_string()))?;
     Ok(source.into_locator().name.into())
 }
 
-tvm_ffi::tvm_ffi_dll_export_typed_func!(publish_media_bytes, publish_media_bytes);
+tvm_ffi::tvm_ffi_dll_export_typed_func!(store_media_bytes, store_media_bytes);

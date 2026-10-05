@@ -50,7 +50,7 @@ pub(crate) struct LatentPages {
     pub(crate) units: u64,
 }
 
-/// A byte span whose publication may outlive its producing request.
+/// A byte span whose export may outlive its producing request.
 #[derive(Debug)]
 pub(crate) struct BufferSpan {
     pub(crate) owner: RequestKey,
@@ -348,7 +348,7 @@ impl BufferPool {
         })
     }
 
-    /// Return the complete span after its publication and transport readers retire.
+    /// Return the complete span after its export and transport readers retire.
     pub(crate) fn free(&mut self, allocation: BufferSpan) {
         let BufferSpan { offset, bytes, .. } = allocation;
         self.release(offset, bytes);

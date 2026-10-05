@@ -616,7 +616,7 @@ impl WorkerGroup {
         // every layer must have its KV heads covered from head 0 to
         // `total_kv_heads` by the ranks storing it. Overlapping regions are
         // allowed; a gap is not. The group reports the union of its ranks'
-        // layers, which bounds publications, and the largest unit, because
+        // layers, which bounds exports, and the largest unit, because
         // the scheduler reserves units shared by every stage.
         if let Some(cache) = &mut info.kv_cache {
             let regions: Vec<_> = workers
@@ -1434,11 +1434,11 @@ fn rank_projection(
         projection
             .input_products
             .retain(|payload| inputs.contains(&payload.product));
-        projection.kv_inputs.retain(|publication| {
+        projection.kv_inputs.retain(|export| {
             projection
                 .calls
                 .iter()
-                .any(|call| call.kv_input == Some(publication.source))
+                .any(|call| call.kv_input == Some(export.source))
         });
         let buffers = inputs
             .iter()
@@ -1657,33 +1657,33 @@ fn validate_and_order_rank_report(
         let completion = report.results.swap_remove(index);
         anyhow::ensure!(
             completion.output.status != uniserve_worker_ipc::CallStatus::Predicated
-                || report.products.iter().all(|publication| {
-                    publication.product.request_key != completion.output.request_key
-                        || publication.product.producer_call_id != completion.output.call_id
+                || report.products.iter().all(|export| {
+                    export.product.request_key != completion.output.request_key
+                        || export.product.producer_call_id != completion.output.call_id
                 }),
             "predicated call published a tensor"
         );
         if planned.code
-            == uniserve_worker_ipc::CallKind::Transfer(uniserve_worker_ipc::TransferMode::KvPublish)
+            == uniserve_worker_ipc::CallKind::Transfer(uniserve_worker_ipc::TransferMode::KvExport)
             && completion.output.status == uniserve_worker_ipc::CallStatus::Ok
         {
-            let publication = completion
+            let export = completion
                 .output
                 .kv_output
                 .as_ref()
-                .context("successful KV publication has no transfer descriptor")?;
+                .context("successful KV export has no transfer descriptor")?;
             anyhow::ensure!(
-                Some(publication.source) == planned.kv_output,
-                "KV publication differs from its declared output"
+                Some(export.source) == planned.kv_output,
+                "KV export differs from its declared output"
             );
-            let bytes = publication.tensors().try_fold(0_u64, |sum, tensor| {
+            let bytes = export.tensors().try_fold(0_u64, |sum, tensor| {
                 Ok::<_, uniserve_worker_ipc::ValidationError>(
                     sum.saturating_add(tensor.validate()?),
                 )
             })?;
             anyhow::ensure!(
                 bytes <= planned.bounds.max_transfer_bytes,
-                "KV publication exceeds its transfer-byte bound"
+                "KV export exceeds its transfer-byte bound"
             );
         }
         ordered.push(completion);
@@ -1698,7 +1698,7 @@ fn validate_and_order_rank_report(
 }
 
 /// Merge one participant into the output owner's result. Accepted progress and
-/// allocation generations agree; KV publications contribute immutable rank locations.
+/// allocation generations agree; KV exports contribute immutable rank locations.
 fn merge_completion_record(
     canonical: &mut CallResult,
     rank_completion: &CallResult,
@@ -1735,9 +1735,9 @@ fn merge_completion_record(
         &mut canonical.output.kv_output,
         &rank_completion.output.kv_output,
     ) {
-        (Some(stored), Some(publication)) => stored.merge_locations(publication)?,
+        (Some(stored), Some(export)) => stored.merge_locations(export)?,
         (None, None) => {}
-        _ => anyhow::bail!("rank KV publication presence diverged"),
+        _ => anyhow::bail!("rank KV export presence diverged"),
     }
     Ok(())
 }

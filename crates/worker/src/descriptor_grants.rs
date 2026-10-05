@@ -50,8 +50,8 @@ impl DescriptorGrants {
     }
 
     /// Retain an allocation until revocation. The caller keeps ownership of fd.
-    pub fn register(&self, publication: &str, fd: RawFd) -> io::Result<()> {
-        request(publication)?;
+    pub fn register(&self, export: &str, fd: RawFd) -> io::Result<()> {
+        request(export)?;
 
         // SAFETY: fcntl validates the caller's descriptor and returns a new
         // descriptor owned by this registration, with close-on-exec set.
@@ -66,15 +66,15 @@ impl DescriptorGrants {
         let table = registered.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "descriptor grants closed")
         })?;
-        table.insert(publication.to_owned(), Arc::new(descriptor));
+        table.insert(export.to_owned(), Arc::new(descriptor));
         Ok(())
     }
 
     /// Refuse later requests; already received descriptors remain usable.
-    pub fn release(&self, publication: &str) {
+    pub fn release(&self, export: &str) {
         let mut registered = self.descriptors.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(table) = registered.as_mut() {
-            table.remove(publication);
+            table.remove(export);
         }
     }
 
@@ -104,8 +104,8 @@ impl Drop for DescriptorGrants {
 
 /// Receive an owned descriptor. The caller closes it after importing the
 /// allocation; CUDA's import retains its own allocation reference.
-pub fn fetch_descriptor(endpoint: &str, publication: &str) -> io::Result<OwnedFd> {
-    let request = request(publication)?;
+pub fn fetch_descriptor(endpoint: &str, export: &str) -> io::Result<OwnedFd> {
+    let request = request(export)?;
     let socket = UnixDatagram::unbound()?;
     socket.set_read_timeout(Some(TIMEOUT))?;
     socket.set_write_timeout(Some(TIMEOUT))?;
@@ -122,14 +122,14 @@ fn address(endpoint: &str) -> io::Result<SocketAddr> {
     SocketAddr::from_abstract_name(format!("uniserve-grants-{endpoint}"))
 }
 
-fn request(publication: &str) -> io::Result<&[u8]> {
-    if publication.len() != REQUEST_BYTES {
+fn request(export: &str) -> io::Result<&[u8]> {
+    if export.len() != REQUEST_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "descriptor requests require a 32-byte publication name",
+            "descriptor requests require a 32-byte export name",
         ));
     }
-    Ok(publication.as_bytes())
+    Ok(export.as_bytes())
 }
 
 fn serve(socket: UnixDatagram, stop: UnixStream, descriptors: Descriptors) -> io::Result<()> {

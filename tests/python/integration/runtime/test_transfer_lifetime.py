@@ -9,7 +9,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from tests.python.fixtures.shm_publication import serve_pending_publication
+from tests.python.fixtures.shm_export import serve_pending_export
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
 from uniserve_worker.errors import WorkerError, WorkerErrorCode
@@ -41,7 +41,7 @@ def test_exhausted_vmm_pool_delivers_host_fallback_and_restores_quota():
     from uniserve_kernels.peer_storage import allocation_granularity
 
     from uniserve_worker.transport import make_transports
-    from uniserve_worker.transport.publication import publish_tensor
+    from uniserve_worker.transport.exports import export_tensor
 
     device = torch.device("cuda:0")
     page = allocation_granularity(device)
@@ -66,7 +66,7 @@ def test_exhausted_vmm_pool_delivers_host_fallback_and_restores_quota():
     try:
         for _ in range(2):
             retirements = []
-            locations = publish_tensor(
+            locations = export_tensor(
                 transports,
                 source,
                 retain=retirements.append,
@@ -96,12 +96,12 @@ def test_exhausted_vmm_pool_without_another_mechanism_refuses_the_product():
 
     from uniserve_worker.errors import ResourceError
     from uniserve_worker.transport import make_transports
-    from uniserve_worker.transport.publication import publish_tensor
+    from uniserve_worker.transport.exports import export_tensor
 
     device = torch.device("cuda:0")
     page = allocation_granularity(device)
     events = EventPool()
-    # A rank whose only publication mechanism is CUDA VMM, as an edge that
+    # A rank whose only export mechanism is CUDA VMM, as an edge that
     # names only a device mechanism binds it.
     transports = make_transports(
         ("cuda_vmm",), byte_capacity=page, ticket_capacity=2, event_pool=events
@@ -114,7 +114,7 @@ def test_exhausted_vmm_pool_without_another_mechanism_refuses_the_product():
         # way rather than for an exhausted budget.
         for _ in range(2):
             with pytest.raises(ResourceError, match="does not fit its VMM"):
-                publish_tensor(
+                export_tensor(
                     transports,
                     source,
                     retain=lambda future: None,
@@ -136,7 +136,7 @@ def test_transfer_writes_only_the_reserved_destination(backend: str) -> None:
     source = torch.arange(1024, dtype=torch.float32, device=device)
     storage = torch.full((1026,), -1.0, device=device)
     destination = storage[1:-1]
-    locator = transport.publish(source)
+    locator = transport.export(source)
     try:
         with pytest.raises(WorkerError, match="destination disagrees"):
             transport.fetch(
@@ -171,7 +171,7 @@ def test_transfer_scatters_exactly_into_disjoint_page_spans(
     source = torch.arange(44, dtype=torch.float32, device=device).reshape(11, 4)
     storage = torch.full((5, 4, 4), -1.0, device=device)
     destination = (storage[3], storage[1], storage[4, :3])
-    locator = transport.publish(source)
+    locator = transport.export(source)
     try:
         with pytest.raises(WorkerError, match="destination disagrees"):
             transport.fetch(
@@ -204,7 +204,7 @@ def test_transfer_scatters_exactly_into_disjoint_page_spans(
         events.close()
 
 
-def _read_cuda_publications(channel) -> None:
+def _read_cuda_exports(channel) -> None:
     torch.cuda.set_device(0)
     event_pool = EventPool()
     transport = make_transport(
@@ -264,14 +264,14 @@ def test_cuda_vmm_read_does_not_wait_for_consumer_stream() -> None:
         ticket_capacity=2,
         event_pool=event_pool,
     )
-    process = context.Process(target=_read_cuda_publications, args=(child,))
-    publications = []
+    process = context.Process(target=_read_cuda_exports, args=(child,))
+    exports = []
     try:
-        warmup = transport.publish(torch.ones(1024, device="cuda:0"))
-        locator = transport.publish(
+        warmup = transport.export(torch.ones(1024, device="cuda:0"))
+        locator = transport.export(
             torch.arange(1024, dtype=torch.float32, device="cuda:0")
         )
-        publications.extend((warmup, locator))
+        exports.extend((warmup, locator))
         process.start()
         child.close()
         parent.send(warmup.to_mapping())
@@ -289,7 +289,7 @@ def test_cuda_vmm_read_does_not_wait_for_consumer_stream() -> None:
             process.terminate()
             process.join(30)
         parent.close()
-        for locator in publications:
+        for locator in exports:
             transport.release(locator)
         transport.close()
         event_pool.close()
@@ -322,7 +322,7 @@ def _consume_fanout(channel, device_index: int) -> None:
         channel.close()
 
 
-def test_cuda_vmm_publication_fits_the_existing_device_allocation() -> None:
+def test_cuda_vmm_export_fits_the_existing_device_allocation() -> None:
     device = torch.device("cuda:0")
     events = EventPool()
     source = (
@@ -337,14 +337,14 @@ def test_cuda_vmm_publication_fits_the_existing_device_allocation() -> None:
     )
     locator = None
     try:
-        warmup = transport.publish(source)
+        warmup = transport.export(source)
         transport.release(warmup)
         torch.cuda.synchronize(device)
         events.reap()
         resident_bytes = torch.cuda.memory_allocated(device)
         torch.cuda.reset_peak_memory_stats(device)
-        locator = transport.publish(source)
-        # Publication's GPU payload budget is already occupied by its source.
+        locator = transport.export(source)
+        # Export's GPU payload budget is already occupied by its source.
         # An additional tensor-sized copy exceeds that public resource contract.
         assert torch.cuda.max_memory_allocated(device) == resident_bytes
         _await_ticket(
@@ -358,8 +358,8 @@ def test_cuda_vmm_publication_fits_the_existing_device_allocation() -> None:
         events.close()
 
 
-def test_cuda_vmm_serves_a_fanout_and_refuses_a_retired_publication() -> None:
-    """One publication is read by consumers on two devices, then retires.
+def test_cuda_vmm_serves_a_fanout_and_refuses_a_retired_export() -> None:
+    """One export is read by consumers on two devices, then retires.
 
     A chunk is addressed by offset in the producing device's pool, so each
     consumer imports the same allocation handle and reads the same bytes.
@@ -374,7 +374,7 @@ def test_cuda_vmm_serves_a_fanout_and_refuses_a_retired_publication() -> None:
     replacement = None
     try:
         # Warm native export before measuring the ordering of a pending fence.
-        warmup = transport.publish(torch.ones(1024, device="cuda:0"))
+        warmup = transport.export(torch.ones(1024, device="cuda:0"))
         torch.cuda.synchronize(0)
         transport.release(warmup)
         for device in (0, 1):
@@ -390,7 +390,7 @@ def test_cuda_vmm_serves_a_fanout_and_refuses_a_retired_publication() -> None:
             assert channel.recv() == "ready"
 
         source = torch.arange(1024, dtype=torch.float32, device="cuda:0")
-        locator = transport.publish(source)
+        locator = transport.export(source)
         for channel, _process, _device in readers:
             channel.send(locator.to_mapping())
         for channel, _process, _device in readers:
@@ -415,7 +415,7 @@ def test_cuda_vmm_serves_a_fanout_and_refuses_a_retired_publication() -> None:
                 transport.fetch(locator, device=torch.device("cuda:0"))
             )
         assert failure.value.code == WorkerErrorCode.INVALID_DESCRIPTOR
-        replacement = transport.publish(torch.ones(2048, device="cuda:0"))
+        replacement = transport.export(torch.ones(2048, device="cuda:0"))
     finally:
         for channel, process, _device in readers:
             if process.is_alive():
@@ -438,7 +438,7 @@ def test_cuda_vmm_rejects_a_changed_registered_view() -> None:
         ticket_capacity=2,
         event_pool=event_pool,
     )
-    locator = transport.publish(torch.arange(1024, device="cuda:0"))
+    locator = transport.export(torch.arange(1024, device="cuda:0"))
     try:
         changed = replace(
             locator,
@@ -458,7 +458,7 @@ def test_cuda_vmm_rejects_a_changed_registered_view() -> None:
 
 
 @pytest.mark.parametrize("ending", ("close", "drop"))
-def test_local_read_keeps_its_producer_fence_after_publication_retirement(
+def test_local_read_keeps_its_producer_fence_after_retirement(
     ending: str,
 ) -> None:
     device = torch.device("cuda:0")
@@ -477,13 +477,13 @@ def test_local_read_keeps_its_producer_fence_after_publication_retirement(
         with torch.cuda.stream(producer):
             torch.cuda._sleep(1_000_000_000)
             source.fill_(7)
-            locator = transport.publish(source)
+            locator = transport.export(source)
         unused = transport.fetch(locator, device=device)
         retained = transport.fetch(locator, device=device)
         del unused
         retirement = transport.release(locator)
         assert retirement is not None and not retirement.done()
-        replacement = transport.publish(unrelated)
+        replacement = transport.export(unrelated)
         with torch.cuda.stream(consumer):
             value = retained.result(consumer).clone()
         if ending == "close":
@@ -520,12 +520,12 @@ def _serve_unusable_cuda_handle(channel) -> None:
     event.record()
     exported, capacity, offset = export_handle(source)
     # A handle of the right length that names no allocation: the consumer
-    # imports from the publication, so this is what an unusable handle is.
+    # imports from the export, so this is what an unusable handle is.
     locator = Locator(
         source=WorkerEndpoint.local("publisher"),
         transport=CudaVmmTransfer(
             endpoint=f"uniserve-test-read-{uuid.uuid4().hex}",
-            publication_id=uuid.uuid4().hex,
+            export_id=uuid.uuid4().hex,
             storage_size_bytes=capacity,
             storage_offsets_bytes=(offset,),
             span_lengths=(source.shape[0],),
@@ -588,7 +588,7 @@ def test_cuda_vmm_reports_an_unusable_handle_to_its_reader() -> None:
     assert process.exitcode == 0
 
 
-def _read_shm_publication(channel, slot: int) -> None:
+def _read_shm_export(channel, slot: int) -> None:
     """External reader that acknowledges the segment only when told to.
 
     The reader waits on readiness and claims its acknowledgment word before
@@ -628,7 +628,7 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
 ) -> None:
     """A segment returns once every consumer that claimed it has acknowledged.
 
-    A device-sourced publication returns before its bytes have landed; the
+    A device-sourced export returns before its bytes have landed; the
     readers wait on the segment's readiness word instead. Retirement holds the
     segment and its capacity until both readers, each of which claimed its
     word before reading, have acknowledged.
@@ -648,7 +648,7 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
         for slot in (1, 2):
             parent, child = context.Pipe()
             process = context.Process(
-                target=_read_shm_publication, args=(child, slot)
+                target=_read_shm_export, args=(child, slot)
             )
             process.start()
             child.close()
@@ -663,13 +663,13 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
             completed = torch.cuda.Event()
             with torch.cuda.stream(stream):
                 torch.cuda._sleep(1_000_000_000)
-                locator = transport.publish(source, consumers=(1, 2))
+                locator = transport.export(source, consumers=(1, 2))
                 completed.record(stream)
             assert not completed.query(), (
-                "shared-storage publication waited for device completion"
+                "shared-storage export waited for device completion"
             )
         else:
-            locator = transport.publish(source, consumers=(1, 2))
+            locator = transport.export(source, consumers=(1, 2))
         for channel, _process in readers:
             channel.send(locator.to_mapping())
         for channel, _process in readers:
@@ -681,7 +681,7 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
         assert retirement is not None and not retirement.done()
         for channel, process in readers:
             with pytest.raises(WorkerError, match="capacity"):
-                transport.publish(source)
+                transport.export(source)
             channel.send("consume")
             assert channel.poll(30), "shared-storage reader did not complete"
             assert channel.recv() is True
@@ -689,7 +689,7 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
             assert process.exitcode == 0
         transport.reap()
         retirement.result(timeout=5)
-        replacement = transport.publish(source)
+        replacement = transport.export(source)
         with pytest.raises(WorkerError) as retired:
             _await_ticket(consumer.fetch(locator, device=torch.device("cpu")))
         assert retired.value.code is WorkerErrorCode.INVALID_DESCRIPTOR
@@ -708,12 +708,12 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
         events.close()
 
 
-def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
+def test_cuda_vmm_export_read_from_another_host_carries_no_fence() -> None:
     """A chunk whose readers are elsewhere is readable when it is published.
 
     An interprocess event handle does not reach another host, and imported VMM
     storage admits no device-side wait on current drivers, so the producer
-    synchronizes after copying into the chunk instead and the publication
+    synchronizes after copying into the chunk instead and the export
     carries nothing for a consumer to wait on.
     """
     device = torch.device("cuda:0")
@@ -727,7 +727,7 @@ def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
     )
     locator = None
     try:
-        # Exportable storage, so the publication is the source itself: a
+        # Exportable storage, so the export is the source itself: a
         # crossing decides the fence, not where the product is materialized.
         from uniserve_kernels.peer_storage import empty
 
@@ -737,14 +737,12 @@ def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
         submitted = torch.cuda.Event()
         with torch.cuda.stream(stream):
             torch.cuda._sleep(1_000_000_000)
-            locator = transport.publish(source)
+            locator = transport.export(source)
             submitted.record(stream)
 
-        assert submitted.query(), (
-            "publication returned before its copy had landed"
-        )
+        assert submitted.query(), "export returned before its copy had landed"
         assert not locator.transport.ready_event_handle, (
-            "a pool publication carries a fence a consumer cannot import"
+            "a pool export carries a fence a consumer cannot import"
         )
     finally:
         if locator is not None:
@@ -753,15 +751,13 @@ def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
         events.close()
 
 
-def test_cuda_vmm_publication_on_this_host_does_not_stall_its_producer() -> (
-    None
-):
+def test_cuda_vmm_export_on_this_host_does_not_stall_its_producer() -> None:
     """Readiness within a host is an event, which costs the producer nothing.
 
     Every consumer on this host can wait on an interprocess event, so a
-    publication hands them one rather than draining the producing stream. A
+    export hands them one rather than draining the producing stream. A
     synchronize here would be a bubble the placement does not require, and on
-    a single-host instance every publication would pay it.
+    a single-host instance every export would pay it.
     """
     device = torch.device("cuda:0")
     events = EventPool()
@@ -775,12 +771,12 @@ def test_cuda_vmm_publication_on_this_host_does_not_stall_its_producer() -> (
         submitted = torch.cuda.Event()
         with torch.cuda.stream(stream):
             torch.cuda._sleep(1_000_000_000)
-            locator = transport.publish(source)
+            locator = transport.export(source)
             submitted.record(stream)
 
-        assert not submitted.query(), "publication drained the producing stream"
+        assert not submitted.query(), "export drained the producing stream"
         assert len(locator.transport.ready_event_handle) == 64, (
-            "a publication read on this host carries the fence to wait on"
+            "an export read on this host carries the fence to wait on"
         )
     finally:
         if locator is not None:
@@ -790,10 +786,10 @@ def test_cuda_vmm_publication_on_this_host_does_not_stall_its_producer() -> (
 
 
 def test_cuda_vmm_retirement_retains_capacity_until_it_completes() -> None:
-    """Byte capacity is held from publication to retirement.
+    """Byte capacity is held from export to retirement.
 
     Capacity bounds what a rank can have published at once, so it is returned
-    when the publication retires rather than when its copy completes.
+    when the export retires rather than when its copy completes.
     """
     device = torch.device("cuda:0")
     events = EventPool()
@@ -804,15 +800,15 @@ def test_cuda_vmm_retirement_retains_capacity_until_it_completes() -> None:
     locator = None
     replacement = None
     try:
-        locator = transport.publish(source)
+        locator = transport.export(source)
         with pytest.raises(WorkerError, match="capacity"):
-            transport.publish(source)
+            transport.export(source)
 
         retirement = transport.release(locator)
         assert retirement is not None
         events.reap()
         retirement.result(timeout=5)
-        replacement = transport.publish(source)
+        replacement = transport.export(source)
     finally:
         if locator is not None:
             transport.release(locator)
@@ -828,12 +824,12 @@ def test_shm_producer_failure_fails_its_pending_read_and_preserves_independent_r
     """A pending read waits on the segment's readiness word.
 
     A producer that fails marks its segment failed and unlinks it, so the
-    waiting read fails and a later read finds no publication, while reads of
-    a healthy publication are unaffected.
+    waiting read fails and a later read finds no export, while reads of
+    a healthy export are unaffected.
     """
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
-    process = context.Process(target=serve_pending_publication, args=(child,))
+    process = context.Process(target=serve_pending_export, args=(child,))
     events = EventPool()
     consumer = make_transport(
         "shm", byte_capacity=16384, ticket_capacity=4, event_pool=events
@@ -854,7 +850,7 @@ def test_shm_producer_failure_fails_its_pending_read_and_preserves_independent_r
             "reader exposed bytes before producer readiness"
         )
 
-        healthy = producer.publish(torch.tensor([7.0]))
+        healthy = producer.export(torch.tensor([7.0]))
         actual = _await_ticket(
             consumer.fetch(healthy, device=torch.device("cpu"))
         )
@@ -893,9 +889,7 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     shape = (256, 4) if owner == "latent" else (1024,)
-    process = context.Process(
-        target=serve_pending_publication, args=(child, shape)
-    )
+    process = context.Process(target=serve_pending_export, args=(child, shape))
     events = EventPool()
     consumer = make_transport(
         "shm", byte_capacity=4096, ticket_capacity=1, event_pool=events
@@ -985,7 +979,7 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
     try:
         assert parent.poll(60), "shared-storage publisher did not start"
         locator = Locator.from_mapping(parent.recv())
-        completed_source = producer.publish(torch.full(shard_shape, 3.0))
+        completed_source = producer.export(torch.full(shard_shape, 3.0))
         completed = consumer.fetch(
             completed_source,
             device=torch.device("cpu"),
@@ -1030,7 +1024,7 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
             assert store.retirement_ready((product.request_key,))
         reused = reserve(replacement, replacement_allocation)
         abandon(reused)
-        healthy = producer.publish(torch.tensor([7.0]))
+        healthy = producer.export(torch.tensor([7.0]))
         actual = _await_ticket(
             consumer.fetch(healthy, device=torch.device("cpu"))
         )
@@ -1069,7 +1063,7 @@ def test_local_delivery_between_workers_retains_the_publisher_until_consumption(
         source=WorkerEndpoint.local("denoiser"),
     )
     source = torch.arange(32, dtype=torch.float32, device=device)
-    locator = producer.publish(source)
+    locator = producer.export(source)
     try:
         ticket = consumer.fetch(locator, device=device)
         value = _await_ticket(ticket)
@@ -1084,7 +1078,7 @@ def test_local_delivery_between_workers_retains_the_publisher_until_consumption(
         torch.cuda.synchronize(device)
         producer_events.reap()
         retirement.result(timeout=30)
-        successor = producer.publish(source)
+        successor = producer.export(source)
         producer.release(successor)
     finally:
         consumer.close()
@@ -1109,7 +1103,7 @@ def test_cuda_vmm_source_retires_before_its_consumers_acknowledge() -> None:
     source = torch.ones(1024, device=device)
     try:
         # A consumer that never acknowledges: the chunk stays out of the pool.
-        locator = transport.publish(source, consumers=(1,))
+        locator = transport.export(source, consumers=(1,))
         torch.cuda.synchronize(device)
 
         retirement = transport.release(locator)
@@ -1139,7 +1133,7 @@ def test_cuda_vmm_local_copy_retains_its_source_until_device_completion(
     allocate = empty if storage == "direct" else torch.empty
     source = allocate((1024,), dtype=torch.float32, device=device)
     source.fill_(7)
-    locator = producer.publish(source)
+    locator = producer.export(source)
     destination = torch.empty_like(source)
     initializer = torch.cuda.Stream(device=device)
     torch.cuda.synchronize(device)
@@ -1169,7 +1163,7 @@ def test_cuda_vmm_local_copy_retains_its_source_until_device_completion(
         events.close()
 
 
-def _read_late_filled_publication(channel) -> None:
+def _read_late_filled_export(channel) -> None:
     """External consumer reading only once the producer says it is filled."""
     device = torch.device("cuda:1")
     torch.cuda.set_device(device)
@@ -1193,7 +1187,7 @@ def _read_late_filled_publication(channel) -> None:
 
 
 def test_cuda_vmm_publishes_a_row_whose_bytes_arrive_later() -> None:
-    """A publication may name storage its producer has not written yet.
+    """A export may name storage its producer has not written yet.
 
     An encoded media unit is published with the batch that reserves its row and
     filled when the encode completes; the engine schedules its consumer only
@@ -1206,9 +1200,7 @@ def test_cuda_vmm_publishes_a_row_whose_bytes_arrive_later() -> None:
     transport = make_transport(
         "cuda_vmm", byte_capacity=8 << 20, ticket_capacity=2, event_pool=events
     )
-    process = context.Process(
-        target=_read_late_filled_publication, args=(child,)
-    )
+    process = context.Process(target=_read_late_filled_export, args=(child,))
     locator = None
     try:
         process.start()
@@ -1222,7 +1214,7 @@ def test_cuda_vmm_publishes_a_row_whose_bytes_arrive_later() -> None:
 
         row = empty((256,), dtype=torch.float32, device=torch.device("cuda:0"))
         row.zero_()
-        locator = transport.publish(row)
+        locator = transport.export(row)
         parent.send(locator.to_mapping())
 
         # The producer writes the row after it is published, as the encode
@@ -1265,7 +1257,7 @@ def test_cuda_vmm_refuses_a_descriptor_handle_from_another_host() -> None:
     )
     locator = None
     try:
-        locator = transport.publish(torch.ones(256, device=device))
+        locator = transport.export(torch.ones(256, device=device))
         elsewhere = replace(
             locator, source=replace(locator.source, node="another-host")
         )

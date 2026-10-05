@@ -11,19 +11,19 @@ from bindings import DescriptorGrants, fetch_descriptor
 
 def test_container_retains_grants_until_final_release():
     endpoint = f"uniserve-ffi-{uuid.uuid4().hex}"
-    publication = uuid.uuid4().hex
+    export = uuid.uuid4().hex
     retained = tvm_ffi.Array([DescriptorGrants(endpoint)])
     try:
         with tempfile.TemporaryFile() as source:
             source.write(b"allocation")
             source.flush()
-            retained[0].register(publication, source.fileno())
+            retained[0].register(export, source.fileno())
 
-        received = fetch_descriptor(endpoint, publication)
+        received = fetch_descriptor(endpoint, export)
         try:
-            retained[0].release(publication)
+            retained[0].release(export)
             with pytest.raises(RuntimeError, match="no live descriptor"):
-                fetch_descriptor(endpoint, publication)
+                fetch_descriptor(endpoint, export)
             assert os.pread(received, 10, 0) == b"allocation"
             assert not os.get_inheritable(received)
         finally:

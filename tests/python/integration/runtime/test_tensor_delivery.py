@@ -77,7 +77,7 @@ def test_tensor_store_allows_event_callback_reentry() -> None:
             )
         event.synchronize()
 
-        store.publish_write(writes[0], value)
+        store.write(writes[0], value)
         events.reap()
         assert observed == [0]
         torch.testing.assert_close(writes[0].tensor, value, rtol=0, atol=0)
@@ -179,14 +179,12 @@ def test_tensor_resharding_preserves_values_and_destination_bounds(
                 },
                 regions={reference: region},
             )[0]
-            physical = store.publish_write(write, piece)
+            physical = store.write(write, piece)
             store.commit_writes((write,))
-            location = producer.publish(
+            location = producer.export(
                 physical, offset=tuple(axis.start for axis in region)
             )
-            store.retain_export(
-                write, producer.publication_retirement(location)
-            )
+            store.retain_export(write, producer.retirement(location))
             locations.append(location)
             store.release_requests((reference.request_key,))
         tensor = TensorTransfer(shape=(6, 8), locations=tuple(locations))
@@ -234,7 +232,7 @@ def test_missing_coverage_is_rejected_before_destination_writes() -> None:
         "local", byte_capacity=16384, ticket_capacity=2, event_pool=events
     )
     source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-    location = transport.publish(source)
+    location = transport.export(source)
     destination = torch.full((6, 4), -1.0)
     try:
         tensor = TensorTransfer(shape=(6, 4), locations=(location,))
@@ -258,8 +256,8 @@ def test_shard_reads_reject_aliasing_destination_pages_before_writing() -> None:
     )
     source = torch.arange(24, dtype=torch.float32).reshape(6, 4)
     locations = (
-        transport.publish(source[:3]),
-        transport.publish(source[3:], offset=(3, 0)),
+        transport.export(source[:3]),
+        transport.export(source[3:], offset=(3, 0)),
     )
     storage = torch.full((3, 4), -1.0)
     try:
@@ -278,9 +276,7 @@ def test_shard_reads_reject_aliasing_destination_pages_before_writing() -> None:
         events.close()
 
 
-def test_explicit_replica_binding_can_use_an_independent_live_publication() -> (
-    None
-):
+def test_explicit_replica_binding_can_use_an_independent_live_export() -> None:
     events = EventPool()
     first = make_transport(
         "shm",
@@ -297,7 +293,7 @@ def test_explicit_replica_binding_can_use_an_independent_live_publication() -> (
         source=WorkerEndpoint.local("encoder", rank=1),
     )
     expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-    unavailable, available = first.publish(expected), second.publish(expected)
+    unavailable, available = first.export(expected), second.export(expected)
     first.release(unavailable)
     first.close()
     destination = torch.empty_like(expected)
@@ -328,8 +324,8 @@ def test_local_replica_precedes_an_unavailable_remote_copy() -> None:
         event_pool=events,
     )
     expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-    remote = transports["shm"].publish(expected)
-    local = transports["local"].publish(expected)
+    remote = transports["shm"].export(expected)
+    local = transports["local"].export(expected)
     transports["shm"].release(remote)
     destination = torch.empty_like(expected)
     try:
@@ -360,7 +356,7 @@ def test_fetch_backpressure_preserves_the_complete_destination() -> None:
     )
     expected = torch.arange(8, dtype=torch.float32)
     locations = tuple(
-        transport.publish(expected[start : start + 4], offset=(start,))
+        transport.export(expected[start : start + 4], offset=(start,))
         for start in (0, 4)
     )
     tensor = TensorTransfer(shape=(8,), locations=locations)
@@ -393,7 +389,7 @@ def test_failed_fetch_retires_submitted_reads_and_returns_unused_credits(
     )
     expected = torch.arange(8, dtype=torch.float32)
     locations = [
-        transport.publish(expected[start : start + 4], offset=(start,))
+        transport.export(expected[start : start + 4], offset=(start,))
         for start in (0, 4)
     ]
     bindings = {(locations[0].source, "local"): transport}
@@ -423,7 +419,7 @@ def test_failed_fetch_retires_submitted_reads_and_returns_unused_credits(
             assert retired.wait(5), "cancelled read did not retire"
 
         if failure == "source":
-            locations[1] = transport.publish(expected[4:], offset=(4,))
+            locations[1] = transport.export(expected[4:], offset=(4,))
 
         # Both credits must be available again, including the unused one.
         _consume(
@@ -447,7 +443,7 @@ def test_shm_cuda_region_fits_its_reserved_device_allocation() -> None:
         "shm", byte_capacity=16384, ticket_capacity=2, event_pool=events
     )
     source = torch.arange(24, dtype=torch.float32).reshape(4, 6)
-    location = transport.publish(source)
+    location = transport.export(source)
     destination = torch.full((4, 3), -1.0, device="cuda:0")
     try:
         tensor = TensorTransfer(shape=(4, 6), locations=(location,))
@@ -557,7 +553,7 @@ def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
     expected = torch.arange(
         48, dtype=torch.float32, device=f"cuda:{source_device}"
     ).reshape(6, 8)
-    location = producer.publish(expected)
+    location = producer.export(expected)
     process = context.Process(
         target=_receive_non_peer_cuda_product,
         args=(child, f"cuda:{destination_device}"),
@@ -602,12 +598,12 @@ def test_tensor_delivery_gathers_shards_across_processes(
     order = (4, 1, 5, 2, 0, 3) if fragmented else tuple(range(6))
     expected = source[list(order)].cpu().tolist()
     locations = [
-        producers[backends[0]].publish(
+        producers[backends[0]].export(
             tuple(source[index : index + 1, :4] for index in order)
             if fragmented
             else source[:, :4]
         ),
-        producers[backends[-1]].publish(
+        producers[backends[-1]].export(
             tuple(source[index : index + 1, 4:] for index in order)
             if fragmented
             else source[:, 4:],
@@ -700,7 +696,7 @@ def test_sharded_delivery_progresses_during_independent_device_work() -> None:
         for index in range(3)
     )
     locations = tuple(
-        producer.publish(source, offset=(index, 0, 0))
+        producer.export(source, offset=(index, 0, 0))
         for index, source in enumerate(sources)
     )
     process = context.Process(target=_receive_independent_shards, args=(child,))
@@ -731,23 +727,21 @@ def test_sharded_delivery_progresses_during_independent_device_work() -> None:
         child.close()
 
 
-def test_backends_share_the_rank_byte_budget_until_publications_retire() -> (
-    None
-):
+def test_backends_share_the_rank_byte_budget_until_exports_retire() -> None:
     events = EventPool()
     transports = make_transports(
         ("local", "shm"), byte_capacity=64, ticket_capacity=2, event_pool=events
     )
     source = torch.arange(8, dtype=torch.float32)
-    local = transports["local"].publish(source)
-    shared = transports["shm"].publish(source)
+    local = transports["local"].export(source)
+    shared = transports["shm"].export(source)
     try:
         with pytest.raises(WorkerError, match="byte capacity is exhausted"):
-            transports["local"].publish(source)
+            transports["local"].export(source)
         retired = transports["shm"].release(shared)
         assert retired is not None
         retired.result(timeout=10)
-        replacement = transports["local"].publish(source)
+        replacement = transports["local"].export(source)
         transports["local"].release(replacement)
     finally:
         transports["local"].release(local)
@@ -771,8 +765,8 @@ def test_read_ticket_capacity_is_shared_across_backends(ending: str) -> None:
         event_pool=events,
     )
     source = torch.arange(8, dtype=torch.float32)
-    local = transports["local"].publish(source)
-    shared = transports["shm"].publish(source)
+    local = transports["local"].export(source)
+    shared = transports["shm"].export(source)
     borrowed = transports["local"].fetch(local, device=torch.device("cpu"))
     retired = threading.Event()
     borrowed.add_retirement_callback(retired.set)
@@ -856,7 +850,7 @@ def test_fragmented_layer_pages_use_one_read_into_reserved_pages(
         if device.startswith("cuda"):
             resident_bytes = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
-        location = transport.publish(spans)
+        location = transport.export(spans)
         _consume(
             fetch_tensor(
                 TensorTransfer(
@@ -928,7 +922,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
     )
     metadata = FeatureMetadata(6, 8) if feature else None
     reserve = store.reserve_features if feature else store.bind_outputs
-    location = transport.publish(peer)
+    location = transport.export(peer)
     # The descriptor supplies only the missing half: successfully consuming the
     # whole value therefore requires preserving the resident region.
     representation = TensorTransfer(shape=(6, 8), locations=(location,))
@@ -940,7 +934,7 @@ def test_resident_shard_materialization_preserves_readers_and_shared_consumers(
             regions={reference: region},
             shapes={reference: (6, 8)},
         )[0]
-        store.publish_write(write, resident, metadata=metadata)
+        store.write(write, resident, metadata=metadata)
         store.commit_writes((write,))
         earlier = store.consume(
             reference, consumer_call_id=CallId(2, 0), device=device
@@ -1024,7 +1018,7 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
             shapes={reference: (6, 8)},
             regions={reference: (slice(0, 6), slice(0, 8))},
         )
-        store.publish_write(write, expected)
+        store.write(write, expected)
         store.commit_writes((write,))
         read = store.consume(
             reference, consumer_call_id=CallId(2, 0), device="cpu"
@@ -1037,7 +1031,7 @@ def test_full_region_publishes_complete_bounded_tensor() -> None:
         arena.close()
 
 
-def test_shm_allocation_failure_preserves_publication_capacity(
+def test_shm_allocation_failure_preserves_export_capacity(
     monkeypatch,
 ) -> None:
     events = EventPool()
@@ -1057,9 +1051,9 @@ def test_shm_allocation_failure_preserves_publication_capacity(
         with monkeypatch.context() as filesystem:
             filesystem.setattr(os, "posix_fallocate", exhausted_filesystem)
             with pytest.raises(OSError) as failure:
-                transport.publish(source)
+                transport.export(source)
             assert failure.value.errno == errno.ENOSPC
-        locator = transport.publish(source)
+        locator = transport.export(source)
         destination = torch.empty_like(source)
         ticket = consumer.fetch(
             locator, device=torch.device("cpu"), destination=destination
@@ -1085,7 +1079,7 @@ def test_transfer_orders_destination_writes_before_its_copy(
     source = torch.arange(
         12, dtype=torch.float32, device="cpu" if backend == "shm" else "cuda:0"
     )
-    locator = transport.publish(source)
+    locator = transport.export(source)
     destination = torch.empty(12, device="cuda:0")
     initializer = torch.cuda.Stream(device=0)
     tickets = ()

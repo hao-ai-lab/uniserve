@@ -34,7 +34,7 @@ namespace uniserve.ipc;
 // names. Their leading `None` exists only to mark an unset CallKind tag.
 enum ForwardMode : ubyte { None, Prefill, Decode, Verify, TokenDenoising }
 enum MediaCall : ubyte { None, MediaReading, VisionEncoding, LatentEncoding, TextEncoding, LatentPreparation, Denoising, ImageDecoding, VideoDecoding, AudioDecoding, VideoEncoding, AudioEncoding, Muxing }
-enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
+enum TransferMode : ubyte { None, Tensor, KvExport, KvInstall }
 
 /// Inline encoding of the Rust `CallKind` sum: exactly one of the three tags
 /// is not `None`. `computation_from_fb` rejects zero or several set tags.
@@ -237,7 +237,7 @@ table WorkerInfo {
   transfer_backends:[string];
   /// Whether this rank's device exports a fabric handle. A descriptor handle
   /// reaches only this host, so an edge that must cross hosts is refused at
-  /// startup rather than failing on its first publication.
+  /// startup rather than failing on its first export.
   fabric_handles:bool = false;
   world_size:uint = 1;
   model_dtype:string;
@@ -654,12 +654,12 @@ table Batch {
   /// Applied in order.
   commands:[BatchCommandEnvelope];
   /// Values of input products, matched to calls by TensorRef identity.
-  input_products:[TensorPublication];
+  input_products:[TensorExport];
   kv_inputs:[KvTransfer];
 }
 
-// Tensor publication descriptors and worker response payloads. Ranks report
-// publications in their results, and the engine forwards them in the batches
+// Tensor export descriptors and worker response payloads. Ranks report
+// exports in their results, and the engine forwards them in the batches
 // that consume them.
 
 /// Where one shard or replica of a published tensor lives. `transport`
@@ -667,7 +667,7 @@ table Batch {
 ///
 /// - `Local`: `endpoint`, `key`.
 /// - `PosixShm`: `endpoint`, `name`.
-/// - `CudaVmm`: `endpoint` and `publication_id` through
+/// - `CudaVmm`: `endpoint` and `export_id` through
 ///   `acknowledgment_offset`.
 /// - `Channel`: `endpoint`, `payload`.
 ///
@@ -683,7 +683,7 @@ table Locator {
   name:string;
   /// Exactly 32 characters; also keys the producer's descriptor grant when
   /// `allocation_handle` is a process descriptor.
-  publication_id:string;
+  export_id:string;
   storage_size_bytes:ulong;
   storage_offsets_bytes:[ulong];
   span_lengths:[ulong];
@@ -697,9 +697,9 @@ table Locator {
   /// was probed for: a 64-byte fabric handle another host can import, or a
   /// 4-byte process descriptor that reaches only this one.
   allocation_handle:[ubyte];
-  /// Byte offset of the publication's acknowledgment header inside the
+  /// Byte offset of the export's acknowledgment header inside the
   /// exported allocation, where a consumer writes its own slot's word once its
-  /// reads have retired. Negative when the publication carries no header and
+  /// reads have retired. Negative when the export carries no header and
   /// so retires by its producer's own accounting.
   acknowledgment_offset:long = -1;
   /// A host product's bytes, carried on the rank channel's data path. Shared
@@ -737,7 +737,7 @@ table DeviceProductTransfer {
   tensor:TensorTransfer;
 }
 
-/// One cache group's tokens `[start, published_extent)` of a KV publication:
+/// One cache group's tokens `[start, exported_extent)` of a KV export:
 /// keys, values, and, for quantized storage, scales.
 table KvGroupTransfer {
   start:uint;
@@ -745,7 +745,7 @@ table KvGroupTransfer {
   tensors:[TensorTransfer];
 }
 
-/// An incremental KV cache publication: the destination already holds `base`,
+/// An incremental KV cache export: the destination already holds `base`,
 /// when set, up to `base_extent` tokens, and each group carries only its own
 /// tokens from its `start` on.
 table KvTransfer {
@@ -754,7 +754,7 @@ table KvTransfer {
   destination:string;
   base:BufferId;
   base_extent:uint;
-  published_extent:uint;
+  exported_extent:uint;
   compute_dtype:string;
 }
 
@@ -770,7 +770,7 @@ table LatentTransfer {
 /// Rust `TransferHandle` variants.
 union TransferData { EncoderTransfer, DeviceProductTransfer, LatentTransfer }
 table TransferHandle { value:TransferData; }
-table TensorPublication {
+table TensorExport {
   product:TensorRef;
   value:TransferHandle;
 }
@@ -779,7 +779,7 @@ table TensorPublication {
 table BatchOutput {
   batch_id:ulong;
   completions:[RequestOutput];
-  products:[TensorPublication];
+  products:[TensorExport];
   worker_exec_us:ulong = null;
   forward_stats:ForwardStats;
 }

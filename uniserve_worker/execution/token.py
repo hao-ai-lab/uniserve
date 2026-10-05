@@ -1,4 +1,4 @@
-"""Token and visual-state packing and publication.
+"""Token and visual-state packing and export.
 
 This module is the autoregressive half of the numerical path that
 ``forward`` drives. ``prepare_forward`` packs a prefill, decode or verify
@@ -862,7 +862,7 @@ def graph_decode_samples(
     sampling_group: Communicator | None,
     request_pool_indices: torch.Tensor,
 ) -> tuple[SamplerRow, ...] | None:
-    """Accept a graph-replayed greedy selection for common token publication.
+    """Accept a graph-replayed greedy selection for common token export.
 
     Returns one ``SamplerRow`` per call after broadcasting the tokens over
     ``sampling_group`` and applying the same finish policy as eager sampling.
@@ -1294,7 +1294,7 @@ def publish_token_products(
 
     Transition products are published in one pass and token products in a
     second; each pass publishes every call that reserved that write through
-    one ``TensorStore.publish_writes`` call. Token products receive the
+    one ``TensorStore.write_scalars`` call. Token products receive the
     tagged token values. Transition payloads are concatenated unless they
     already form one adjacent view.
     """
@@ -1327,7 +1327,7 @@ def publish_token_products(
                 values = torch.cat(tensors, dim=0)
         else:
             (values,) = sample_columns(selected, ("tagged_tokens",))
-        tensor_store.publish_writes(tuple(writes), values.reshape(-1))
+        tensor_store.write_scalars(tuple(writes), values.reshape(-1))
 
 
 def build_sampling_metadata(

@@ -41,7 +41,7 @@ from uniserve_worker.model_executor.diffusion_inputs import (
     resolve_prefix,
 )
 from uniserve_worker.model_executor.input_batch import TokenRow
-from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.batch import TensorExport
 from uniserve_worker.protocol.call import (
     Call,
     DrawLayout,
@@ -130,14 +130,14 @@ def prepare_latent(
     kv_cache: KVCacheManager | None,
     worker_info: WorkerInfo,
     latent_pool: LatentPool,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
     config: WorkerConfig,
 ) -> PendingOutput:
     """Seed a diffusion request's trajectory and stage its first latent.
 
-    Validates the call's conditioning publication, flow-noise RNG coordinates
+    Validates the call's conditioning export, flow-noise RNG coordinates
     and output generation, opens the request's ``DiffusionState``, draws the
     seeded noise into the call's staging and writes it to bank one of the
     request's ``LatentPool`` pages. The ``LatentUpdate`` that publishes it as
@@ -145,18 +145,18 @@ def prepare_latent(
 
     Returns:
         The call's ``PendingOutput`` with status OK and the latent product
-        when ``publish_latent_transfer`` publishes one.
+        when ``export_latent_transfer`` publishes one.
 
     Raises:
         WorkerError: For example when the worker has no image builder or KV
-            storage, the conditioning publication, image parameters, RNG
+            storage, the conditioning export, image parameters, RNG
             coordinates, output generation or staged latent do not match the
             call, or the request's trajectory has already started.
     """
     require_inputs(model_runner)
     request_id = call.request_key.request_id
 
-    # Media preparation joins one visible conditioning publication to one new
+    # Media preparation joins one visible conditioning export to one new
     # latent product; accepting any other arity would make ownership ambiguous.
     conditioning = call.kv_input
     output = call.latent_output
@@ -167,23 +167,19 @@ def prepare_latent(
         )
     request = state.pending_output(request_id)
     cache = request.cache_coordinates(request_tables)
-    publications = kv_cache
-    if publications is None:
-        raise invalid_descriptor(
-            "media preparation requires KV publication storage"
-        )
-    publication = next(
+    exports = kv_cache
+    if exports is None:
+        raise invalid_descriptor("media preparation requires KV export storage")
+    export = next(
         (value for value in state.kv_inputs if value.source == conditioning),
         None,
     )
-    publications.validate_conditioning(
+    exports.validate_conditioning(
         call.request_key,
         conditioning,
         request_pool_idx=request.request.request_pool_idx,
         visible_length=cache[1],
-        publication=publication
-        if isinstance(publication, KvTransfer)
-        else None,
+        export=export if isinstance(export, KvTransfer) else None,
     )
 
     image = request.request.image
@@ -248,7 +244,7 @@ def prepare_latent(
         latent_units=int(params.latent_units),
     )
 
-    # Publication is deferred with the batch commit so a failed
+    # Export is deferred with the batch commit so a failed
     # batch cannot expose a partially initialized trajectory.
     request.latent.update.params = params
     request.latent.update.expected_generation = 0
@@ -256,14 +252,14 @@ def prepare_latent(
     request.latent.update.generation = int(output.generation)
     request.latent.update.step = 0
 
-    products = publish_latent_transfer(
+    products = export_latent_transfer(
         call,
         output,
         row,
         step=0,
         worker_info=worker_info,
         latent_pool=latent_pool,
-        publication_transports=publication_transports,
+        export_transports=export_transports,
         config=config,
         state=state,
     )
@@ -283,7 +279,7 @@ def initialize(
 ) -> DiffusionState:
     """Open a denoising call's trajectory from its exact input generation.
 
-    Validates the call's conditioning publication and latent generations,
+    Validates the call's conditioning export and latent generations,
     gathers the committed bank at ``params.start_step`` into the call's
     staging, and returns the request's ``DiffusionState``, reopening it when
     it is absent or has a different size. ``KVConditioning.cache`` is set
@@ -302,23 +298,21 @@ def initialize(
         )
     request = state.pending_output(request_id)
     cache = request.cache_coordinates(request_tables)
-    publications = kv_cache
-    if publications is None:
+    exports = kv_cache
+    if exports is None:
         raise invalid_descriptor(
-            "flow conditioning requires cache publication storage"
+            "flow conditioning requires cache export storage"
         )
-    publication = next(
+    export = next(
         (value for value in state.kv_inputs if value.source == conditioning),
         None,
     )
-    publications.validate_conditioning(
+    exports.validate_conditioning(
         call.request_key,
         conditioning,
         request_pool_idx=request.request.request_pool_idx,
         visible_length=cache[1],
-        publication=publication
-        if isinstance(publication, KvTransfer)
-        else None,
+        export=export if isinstance(export, KvTransfer) else None,
     )
 
     image = request.request.image
@@ -532,11 +526,11 @@ def finish(
     state: BatchState,
     worker_info: WorkerInfo,
     latent_pool: LatentPool,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     config: WorkerConfig,
 ) -> PendingOutput:
-    """Write a denoising call's integrated latent and stage its publication.
+    """Write a denoising call's integrated latent and stage its export.
 
     ``forward.integrate_predictions`` calls this after applying the last
     solver step of the call's declared interval to its staging. Scatters the
@@ -581,14 +575,14 @@ def finish(
     request.latent.update.generation = int(latent_output.generation)
     request.latent.update.step = final_step
 
-    products = publish_latent_transfer(
+    products = export_latent_transfer(
         call,
         latent_output,
         row,
         step=final_step,
         worker_info=worker_info,
         latent_pool=latent_pool,
-        publication_transports=publication_transports,
+        export_transports=export_transports,
         config=config,
         state=state,
     )
@@ -614,7 +608,7 @@ def finish(
     return request
 
 
-def publish_latent_transfer(
+def export_latent_transfer(
     call: Call,
     product: TensorRef,
     row: PendingOutput,
@@ -623,21 +617,21 @@ def publish_latent_transfer(
     step: int,
     worker_info: WorkerInfo,
     latent_pool: LatentPool,
-    publication_transports: Mapping[str, Transport],
+    export_transports: Mapping[str, Transport],
     config: WorkerConfig,
-) -> tuple[TensorPublication, ...]:
+) -> tuple[TensorExport, ...]:
     """Publish the latent bank a call wrote as a transport product.
 
     Returns no product unless a transport other than ``local`` is configured
     and this rank is the component's output rank. Otherwise the written bank
     is reserved through ``LatentPool.reserve_export`` and published by
-    ``transfer.publish_latent_source``.
+    ``transfer.export_latent_source``.
     """
     params = row.latent.input_params
     if params is None:
-        raise invalid_descriptor("latent publication has no staged parameters")
+        raise invalid_descriptor("latent export has no staged parameters")
 
-    transports = publication_transports
+    transports = export_transports
     if not any(name != "local" for name in transports) or (
         config.rank != worker_info.output_rank(call.component)
     ):
@@ -650,16 +644,16 @@ def publish_latent_transfer(
         page_table=params.page_table,
         latent_units=params.latent_units,
     )
-    from uniserve_worker.execution.transfer import publish_latent_source
+    from uniserve_worker.execution.transfer import export_latent_source
 
     return (
-        publish_latent_source(
+        export_latent_source(
             product,
             source,
             row,
             step=step,
             latent_pool=latent_pool,
-            publication_transports=publication_transports,
+            export_transports=export_transports,
             state=state,
         ),
     )

@@ -22,7 +22,7 @@ from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     copy_pairs,
     dtype_name,
-    publication_views,
+    export_views,
     read_destination,
     region_view,
     resolve_dtype,
@@ -50,8 +50,8 @@ class ChannelTransport(Transport):
     head's custody, and out in the consuming rank's batch, reaching wherever
     the rank channel does.
 
-    The producing rank owns nothing after publication. The bytes are copied out
-    of its storage while it publishes, so the source is its own again as soon
+    The producing rank owns nothing after export. The bytes are copied out
+    of its storage while it exports, so the source is its own again as soon
     as the locator exists, and the head releases its copy when the buffer is
     freed. That is what the acknowledgment discipline reduces to when the head
     is the intermediary: it already holds the product exactly as long as some
@@ -81,11 +81,11 @@ class ChannelTransport(Transport):
             name="uniserve-channel-read",
             event_pool=event_pool,
         )
-        # What carrying a product on the channel costs this rank. A publication
+        # What carrying a product on the channel costs this rank. An export
         # blocks on its own stream and then copies the bytes out, and both are
         # on the batch's critical path, so each is counted separately from the
         # payload they move.
-        self._published = 0
+        self._exported = 0
         self._payload_bytes = 0
         self._largest_payload = 0
         self._synchronize_seconds = 0.0
@@ -105,7 +105,7 @@ class ChannelTransport(Transport):
     def set_completion_wake(self, wake: Any) -> None:
         self._reads.set_completion_wake(wake)
 
-    def publish(
+    def export(
         self,
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
@@ -117,7 +117,7 @@ class ChannelTransport(Transport):
         """Copy the product into a locator that carries it."""
         import torch
 
-        source, shape, offset = publication_views(tensor, offset)
+        source, shape, offset = export_views(tensor, offset)
         spans = source if isinstance(source, tuple) else (source,)
         first = spans[0]
         nbytes = tensor_nbytes(source)
@@ -132,9 +132,9 @@ class ChannelTransport(Transport):
             if first.is_cuda:
                 # The producer waits here for its own writes: the bytes leave
                 # with the result, so nothing downstream can fence them. This
-                # is the publication's synchronize cost.
+                # is the export's synchronize cost.
                 started = time.perf_counter()
-                with profile_range("channel_publish_synchronize"):
+                with profile_range("channel_export_synchronize"):
                     torch.cuda.current_stream(first.device).synchronize()
                 waited = time.perf_counter() - started
                 self._synchronize_seconds += waited
@@ -143,10 +143,10 @@ class ChannelTransport(Transport):
                 )
 
             started = time.perf_counter()
-            with profile_range("channel_publish_payload"):
+            with profile_range("channel_export_payload"):
                 payload = bytes(packed.flatten().view(torch.uint8).numpy())
             self._copy_seconds += time.perf_counter() - started
-            self._published += 1
+            self._exported += 1
             self._payload_bytes += nbytes
             self._largest_payload = max(self._largest_payload, nbytes)
 
@@ -202,7 +202,7 @@ class ChannelTransport(Transport):
         if region is not None:
             if not _slices.within(region, locator.shape):
                 raise invalid_descriptor(
-                    "read region exceeds the published view"
+                    "read region exceeds the exported view"
                 )
             carried = region_view(carried, region)
         return self._reads.submit(
@@ -216,14 +216,14 @@ class ChannelTransport(Transport):
         )
 
     def release(self, locator: Locator) -> Completion | None:
-        """Revoke a publication the rank no longer owns anything of."""
+        """Revoke an export the rank no longer owns anything of."""
         self._require_own(locator)
         return None
 
-    def publication_retirement(self, locator: Locator) -> Completion:
-        """Expose completion, which publication itself established.
+    def retirement(self, locator: Locator) -> Completion:
+        """Expose completion, which export itself established.
 
-        The product was copied out of the rank's storage while it published,
+        The product was copied out of the rank's storage while it exported,
         so there is nothing left to wait for and the source is reusable at
         once. The head holds the bytes from here, until the buffer is freed.
         """
@@ -240,22 +240,22 @@ class ChannelTransport(Transport):
             or handle.endpoint != self._endpoint
         ):
             raise invalid_descriptor(
-                "channel publication belongs to another endpoint"
+                "channel export belongs to another endpoint"
             )
         return handle
 
     def close(self) -> None:
         """Report what the channel cost this rank, then release its reads."""
-        if self._published or self._fetched:
+        if self._exported or self._fetched:
             mean = (
-                self._payload_bytes // self._published if self._published else 0
+                self._payload_bytes // self._exported if self._exported else 0
             )
             _LOG.info(
-                "channel transport retired: published=%d payload_total=%d "
+                "channel transport retired: exported=%d payload_total=%d "
                 "payload_mean=%d payload_max=%d synchronize_ms_total=%.3f "
                 "synchronize_ms_max=%.3f copy_ms_total=%.3f fetched=%d "
                 "fetch_ms_total=%.3f",
-                self._published,
+                self._exported,
                 self._payload_bytes,
                 mean,
                 self._largest_payload,

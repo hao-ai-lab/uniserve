@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 
 @pytest.mark.parametrize("capacity", (17, 257))
 @pytest.mark.parametrize("axes", (1, 3))
-def test_decode_publication_and_staging_follow_live_request_coordinates(
+def test_decode_export_and_staging_follow_live_request_coordinates(
     capacity, axes
 ):
     device = torch.device("cuda:0")

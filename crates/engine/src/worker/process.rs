@@ -325,7 +325,7 @@ impl WorkerProcessArgs {
         let depth = self.queue_depth.max(1);
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
         // Resolve mechanism ownership from the physical rank's incident edges.
-        let (transfer_backends, publish_backends) =
+        let (transfer_backends, export_backends) =
             self.transfer.rank_backends(&self.worker_id, rank);
         let names = |backends: &std::collections::BTreeSet<crate::executor::TransferBackend>| {
             backends
@@ -401,7 +401,7 @@ impl WorkerProcessArgs {
             },
         );
         fields.insert("transfer_backends".into(), json!(names(&transfer_backends)));
-        fields.insert("publish_backends".into(), json!(names(&publish_backends)));
+        fields.insert("export_backends".into(), json!(names(&export_backends)));
         // Every rank of a group connects to the collective store at this
         // address. The group's first rank serves it on the socket it inherits
         // at the named descriptor rather than binding the port itself; a

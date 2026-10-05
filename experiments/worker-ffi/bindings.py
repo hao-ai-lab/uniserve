@@ -45,12 +45,12 @@ class DescriptorGrants(tvm_ffi.Object):
     """Allocation descriptors served by the shared native transport owner."""
 
 
-def fetch_descriptor(endpoint, publication):
-    return _module.fetch_descriptor(endpoint, publication)
+def fetch_descriptor(endpoint, export):
+    return _module.fetch_descriptor(endpoint, export)
 
 
-def publish_media_bytes(payload):
-    return _module.publish_media_bytes(payload)
+def store_media_bytes(payload):
+    return _module.store_media_bytes(payload)
 
 
 def partition_streams(device, counts, event_slots=2):

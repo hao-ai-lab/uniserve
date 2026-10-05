@@ -644,7 +644,7 @@ impl SimEngine {
     /// records the boolean values of the call's products in
     /// `predicate_values`. Errors when a chained call states coordinates other
     /// than the request's own, when sampling rejects the call's RNG, or when
-    /// synthetic media encoding or publication fails. A sampling pipeline with
+    /// synthetic media encoding or export fails. A sampling pipeline with
     /// no valid distribution yields an `Error` record with `InvalidCall`
     /// instead.
     fn execute_call(
@@ -908,7 +908,7 @@ impl SimEngine {
             | CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {}
             CallKind::Transfer(TransferMode::Tensor)
-            | CallKind::Transfer(TransferMode::KvPublish)
+            | CallKind::Transfer(TransferMode::KvExport)
             | CallKind::Transfer(TransferMode::KvInstall) => {
                 set_kv_lengths(&mut record, request.kv_visible_len);
             }

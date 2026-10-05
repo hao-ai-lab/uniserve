@@ -88,7 +88,7 @@ def execution_worker(
         tokenizer=tokenizer,
         allowed_calls=None,
         transfer_backends=transfer_backends,
-        publication_backends=transfer_backends,
+        export_backends=transfer_backends,
         # The fixture's deployment is one host: the worker's own slot and the
         # external consumer slot a test names both read over shared storage.
         host_slots=host_slots,

@@ -50,7 +50,7 @@ from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.batch import (
     Batch,
     LatentParams,
-    TensorPublication,
+    TensorExport,
 )
 from uniserve_worker.protocol.call import (
     Call,
@@ -102,10 +102,10 @@ def prepare_batch(
     request_tables: BlockTables | None,
     request_pool: RequestPool,
 ) -> None:
-    """Materialize KV publications and record the batch's write dependencies.
+    """Materialize KV exports and record the batch's write dependencies.
 
     Runs after admission and release controls have been applied. KV install
-    calls receive a cache publication for their source, and every latent,
+    calls receive a cache export for their source, and every latent,
     cache-page, and KV write records the future that must complete before its
     target storage is written.
 
@@ -131,7 +131,7 @@ def prepare_batch(
         for latent_params in batch.latent_params:
             # Only preparation and denoising write trajectory pages.
             # `LatentPool.write_dependencies` returns the retirements of the
-            # publications that hold those pages in the bank the write
+            # exports that hold those pages in the bank the write
             # targets.
             call = scheduled[(latent_params.request_key, latent_params.call_id)]
             if call.kind not in {
@@ -155,25 +155,23 @@ def prepare_batch(
             )
 
     # Install calls may reference sources without a scheduler-supplied
-    # publication; `KVCacheManager.publication` then supplies the source's
-    # resident publication and rejects a source that is not resident.
+    # export; `KVCacheManager.get_export` then supplies the source's
+    # resident export and rejects a source that is not resident.
     entries = list(batch.input_products)
     kv_entries = list(batch.kv_inputs)
-    supplied = {publication.source for publication in kv_entries}
+    supplied = {export.source for export in kv_entries}
     for call in batch.calls:
         if call.kind is not TransferMode.KV_INSTALL:
             continue
         source = call.kv_input
         if source is None:
-            raise invalid_descriptor(
-                "KV installation requires a source publication"
-            )
+            raise invalid_descriptor("KV installation requires a source export")
         if source not in supplied:
             if kv_cache is None:
                 raise invalid_descriptor(
-                    "KV installation requires cache publication storage"
+                    "KV installation requires cache export storage"
                 )
-            kv_entries.append(kv_cache.publication(source))
+            kv_entries.append(kv_cache.get_export(source))
             supplied.add(source)
 
     # Without pending cache accesses there is nothing a write could wait for,
@@ -185,9 +183,7 @@ def prepare_batch(
             admission.request_key: admission.request_pool_idx
             for admission in batch.admissions
         }
-        kv_inputs = {
-            publication.source: publication for publication in kv_entries
-        }
+        kv_inputs = {export.source: export for export in kv_entries}
 
         # New units are covered in full, since a unit leaving one group may
         # hold any tokens of another. A forward row that writes KV covers its
@@ -231,16 +227,16 @@ def prepare_batch(
             source = call.kv_input
             if source is None:
                 raise invalid_descriptor(
-                    "KV installation requires a source publication"
+                    "KV installation requires a source export"
                 )
-            kv_publication = kv_inputs.get(source)
-            if kv_publication is not None:
+            kv_export = kv_inputs.get(source)
+            if kv_export is not None:
                 # Each group's import writes at most the suffix after the
                 # base that its destination table still holds.
-                end = kv_publication.published_extent
+                end = kv_export.exported_extent
                 for table in _slot_tables(batch, tables, slot):
                     start = max(
-                        kv_publication.base_extent,
+                        kv_export.base_extent,
                         table.start_page * table.shape.page_tokens,
                     )
                     if start < end:
@@ -337,7 +333,7 @@ def prepare_inputs(
     # A video encode borrows a local decoder's shared-storage segment in place.
     # A decoder on another host publishes through the rank channel instead;
     # that value must follow the ordinary import path so execution can stage a
-    # local codec input. The choice is made from the publication's physical
+    # local codec input. The choice is made from the export's physical
     # locations (a shared-memory location on this node), so the same path
     # applies to every placement.
     borrowed_candidates = {
@@ -672,10 +668,10 @@ def prepare_inputs(
                     "KV input requires one installation consumer"
                 )
 
-            publications = kv_cache
+            exports = kv_cache
             cache = kv_cache
             tables = request_tables
-            if publications is None or cache is None or tables is None:
+            if exports is None or cache is None or tables is None:
                 raise invalid_descriptor(
                     "KV input requires physical cache storage"
                 )
@@ -709,7 +705,7 @@ def prepare_inputs(
                 if allocation.request_pool_idx == slot
                 for unit in allocation.unit_ids
             )
-            write = publications.prepare_install(
+            write = exports.prepare_install(
                 kv_transfer,
                 request_pool_idx=slot,
                 tables=_slot_tables(batch, tables, slot),
@@ -1103,7 +1099,7 @@ def _reserve_host_tasks(
     A media unit encode reserves one slot per unit this rank takes from the
     round; audio encoding, muxing and image decoding reserve one each. A
     non-distributed component's encode and mux work belongs to its
-    publication owner (`WorkerInfo.output_rank`), so other ranks reserve
+    export owner (`WorkerInfo.output_rank`), so other ranks reserve
     nothing for it; image decoding reserves on every rank that runs it.
 
     The slots are stored in the call's `PendingOutput.host_tasks`. A failure
@@ -1394,7 +1390,7 @@ def _publish_predicated_outputs(
         if request.status is CallStatus.PREDICATED:
             for write in (request.completion_write, request.transition_write):
                 if write is not None:
-                    tensor_store.publish_scalar_write(write, False)
+                    tensor_store.write_scalar(write, False)
 
 
 def _bind_latent_inputs(
@@ -1478,10 +1474,10 @@ def _bind_latent_inputs(
         # a resident trajectory commits at its recorded solver step.
         transferred = next(
             (
-                publication.value
-                for publication in state.input_products
-                if publication.product in call.tensor_inputs()
-                and isinstance(publication.value, LatentTransferValue)
+                export.value
+                for export in state.input_products
+                if export.product in call.tensor_inputs()
+                and isinstance(export.value, LatentTransferValue)
             ),
             None,
         )
@@ -1738,7 +1734,7 @@ def _bind_cache_tables(
 
 
 def _stage_input_products(
-    input_products: Sequence[TensorPublication],
+    input_products: Sequence[TensorExport],
     *,
     state: BatchState,
     kv_cache: KVCacheManager | None,
@@ -1749,7 +1745,7 @@ def _stage_input_products(
     """Publish query-ready transferred values into their owning stores.
 
     Every KV import the batch consumes must be complete and agree with any
-    resident publication of its buffer, and every other non-borrowed input
+    resident export of its buffer, and every other non-borrowed input
     must be query-ready; violations raise `invalid_descriptor`. A latent
     import is adopted by the `LatentPool` as a live trajectory at its
     transferred step, and the destination's projected `flow_step` moves to
@@ -1760,7 +1756,7 @@ def _stage_input_products(
     # before any transferred product is published.
     cache_inputs = {call.kv_input for call in state.batch.calls}
     for write in state.inputs.cache_imports():
-        buffer = write.publication.source
+        buffer = write.export.source
         if buffer not in cache_inputs:
             continue
         if not write.completion.done():
@@ -1768,13 +1764,11 @@ def _stage_input_products(
                 "KV input has no query-ready physical import"
             )
         if kv_cache is None:
-            raise invalid_descriptor(
-                "KV input requires cache publication storage"
-            )
+            raise invalid_descriptor("KV input requires cache export storage")
         existing = kv_cache.resident(buffer)
-        if existing is not None and existing != write.publication:
+        if existing is not None and existing != write.export:
             raise invalid_descriptor(
-                "staged KV publication conflicts with its buffer identity"
+                "staged KV export conflicts with its buffer identity"
             )
 
     for entry in input_products:
@@ -1787,7 +1781,7 @@ def _stage_input_products(
             )
 
         # Transfer metadata determines which runtime owns the imported value;
-        # each branch validates identity and shape before publication.
+        # each branch validates identity and shape before export.
         value = entry.value
         if isinstance(value, LatentTransferValue):
             consumers = tuple(

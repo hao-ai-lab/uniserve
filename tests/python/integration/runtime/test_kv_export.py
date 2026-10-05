@@ -17,7 +17,7 @@ from tests.python.fixtures.depth_one import (
     token_call,
 )
 from tests.python.fixtures.depth_one import (
-    kv_publication_call as _publication_call,
+    kv_export_call as _export_call,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.protocol.batch import (
@@ -48,10 +48,10 @@ from uniserve_worker.transport.shared_storage import open_shared_storage
 pytestmark = pytest.mark.integration
 
 
-def _map_locations(publication: KvTransfer, locate) -> KvTransfer:
+def _map_locations(export: KvTransfer, locate) -> KvTransfer:
     """Replace every published tensor's locations, group by group."""
     return replace(
-        publication,
+        export,
         groups=tuple(
             replace(
                 group,
@@ -60,13 +60,13 @@ def _map_locations(publication: KvTransfer, locate) -> KvTransfer:
                     for tensor in group.tensors
                 ),
             )
-            for group in publication.groups
+            for group in export.groups
         ),
     )
 
 
 def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
-    """Copy a ready publication into a segment whose readiness the test holds.
+    """Copy a ready export into a segment whose readiness the test holds.
 
     The reader stays pending until the test announces readiness in the header.
     """
@@ -98,8 +98,8 @@ def test_kv_install_waits_without_blocking_independent_work(
 ) -> None:
     """A KV installation waits for its storage and its input, and no more.
 
-    The storage is held by a retired publication a consumer has not yet
-    acknowledged; the input is a publication whose producer has not yet
+    The storage is held by a retired export a consumer has not yet
+    acknowledged; the input is an export whose producer has not yet
     announced it. Independent work completes meanwhile, the acknowledgment
     releases the storage, and readiness completes the installation.
     """
@@ -112,7 +112,7 @@ def test_kv_install_waits_without_blocking_independent_work(
         worker.warmup()
         gated_segments: list[shared_memory.SharedMemory] = []
         try:
-            publications = []
+            exports = []
             commits = []
             for owner, request, tokens in (
                 (producer, incoming, (8, 9)),
@@ -136,33 +136,33 @@ def test_kv_install_waits_without_blocking_independent_work(
                     ),
                 )
                 observation = record_completion(extend, extended)
-                publication, _product = _publication_call(
+                export, _product = _export_call(
                     request.request_key,
                     call_id=CallId(2, 0),
                     predecessor=observation.call_id,
                 )
                 if owner is worker:
-                    # This publication is read by an external consumer whose
+                    # This export is read by an external consumer whose
                     # acknowledgment the test controls.
-                    publication = replace(publication, consumer_slots=(1,))
+                    export = replace(export, consumer_slots=(1,))
                 published = finalized_report(
                     owner,
                     owner.submit(
                         execution_batch(
-                            batch_id=2, calls=(publication,), commands=()
+                            batch_id=2, calls=(export,), commands=()
                         )
                     ),
                 )
-                publications.append(published.completions[0].kv_output)
+                exports.append(published.completions[0].kv_output)
                 commits.append(observation)
 
-            source, resident = publications
+            source, resident = exports
             assert isinstance(source, KvTransfer)
             assert isinstance(resident, KvTransfer)
             old_locator = resident.tensors[0].locations[0]
             assert isinstance(old_locator.transport, PosixShmTransfer)
 
-            # The incoming publication's bytes are real, but the test holds
+            # The incoming export's bytes are real, but the test holds
             # their readiness, so storage retirement and input completion
             # remain distinct.
             def gate(tensor):
@@ -176,7 +176,7 @@ def test_kv_install_waits_without_blocking_independent_work(
             incoming_payload = _map_locations(source, gate)
 
             # An external consumer holds every segment of the worker's own
-            # publication unacknowledged across the request's Finish.
+            # export unacknowledged across the request's Finish.
             held: list[tuple[object, memoryview]] = []
             for tensor in resident.tensors:
                 for locator in tensor.locations:
@@ -332,7 +332,7 @@ def _installation_allocation(call: Call, length: int) -> dict[str, object]:
     }
 
 
-def test_tail_closure_precedes_exact_incremental_publication() -> None:
+def test_tail_closure_precedes_exact_incremental_export() -> None:
     worker = execution_worker()
     admission = ar_params(41, block_ids=(0,))
     extend = token_call(
@@ -385,29 +385,29 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     assert closure_record.kv_computed_len == 3
 
     second_observation = record_completion(closure, closure_result)
-    publication, publication_product = _publication_call(
+    export, export_product = _export_call(
         admission.request_key,
         call_id=CallId(3, 0),
         predecessor=second_observation.call_id,
     )
-    publication_result = finalized_report(
+    export_result = finalized_report(
         worker,
         worker.submit(
             execution_batch(
                 batch_id=3,
                 admissions=(),
-                calls=(publication,),
+                calls=(export,),
                 commands=(),
             )
         ),
     )
 
-    assert publication_result.completions[0].kv_visible_len == 3
-    snapshot = publication_result.completions[0].kv_output
+    assert export_result.completions[0].kv_visible_len == 3
+    snapshot = export_result.completions[0].kv_output
     assert isinstance(snapshot, KvTransfer)
-    assert snapshot.source == publication_product
+    assert snapshot.source == export_product
     assert snapshot.base_extent == 0
-    assert snapshot.published_extent == 3
+    assert snapshot.exported_extent == 3
 
     suffix_template = token_call(
         admission.request_key,
@@ -439,7 +439,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     assert suffix_result.completions[0].kv_visible_len == 4
 
     suffix_observation = record_completion(suffix_closure, suffix_result)
-    incremental, incremental_product = _publication_call(
+    incremental, incremental_product = _export_call(
         admission.request_key,
         call_id=CallId(5, 0),
         predecessor=suffix_observation.call_id,
@@ -458,9 +458,9 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     incremental_snapshot = incremental_result.completions[0].kv_output
     assert isinstance(incremental_snapshot, KvTransfer)
     assert incremental_snapshot.source == incremental_product
-    assert incremental_snapshot.base == publication_product
+    assert incremental_snapshot.base == export_product
     assert incremental_snapshot.base_extent == 3
-    assert incremental_snapshot.published_extent == 4
+    assert incremental_snapshot.exported_extent == 4
 
 
 def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
@@ -485,7 +485,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         )
         extended = finalized_report(producer, extended)
         observation = record_completion(extend, extended)
-        publication, source = _publication_call(
+        export, source = _export_call(
             admission.request_key,
             call_id=CallId(2, 0),
             predecessor=observation.call_id,
@@ -495,7 +495,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             producer.submit(
                 execution_batch(
                     batch_id=2,
-                    calls=(publication,),
+                    calls=(export,),
                     commands=(),
                 )
             ),
@@ -522,7 +522,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
 
         # Republishing an unchanged visible extent carries a valid empty suffix.
         # Installation must preserve the cache and acknowledge its new product.
-        repeated_publication, repeated_source = _publication_call(
+        repeated_export, repeated_source = _export_call(
             admission.request_key,
             call_id=CallId(4, 0),
             predecessor=observation.call_id,
@@ -530,7 +530,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         repeated = finalized_report(
             producer,
             producer.submit(
-                execution_batch(batch_id=4, calls=(repeated_publication,))
+                execution_batch(batch_id=4, calls=(repeated_export,))
             ),
         )
         repeated_install, repeated_installed = _installation_call(
@@ -608,7 +608,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         )
         extended = finalized_report(producer, extended)
         observation = record_completion(extend, extended)
-        publication, source = _publication_call(
+        export, source = _export_call(
             admission.request_key,
             call_id=CallId(2, 0),
             predecessor=observation.call_id,
@@ -617,9 +617,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             finalized_report(
                 producer,
                 producer.submit(
-                    execution_batch(
-                        batch_id=2, calls=(publication,), commands=()
-                    )
+                    execution_batch(batch_id=2, calls=(export,), commands=())
                 ),
             )
             .completions[0]

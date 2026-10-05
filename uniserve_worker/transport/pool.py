@@ -56,7 +56,7 @@ def chunk_word(state: int) -> torch.Tensor:
 
     A claim precedes the consumer's first read of the chunk and an
     acknowledgment follows its last, so a producing rank sweeping a retired
-    publication can tell a consumer that is still reading from one that never
+    export can tell a consumer that is still reading from one that never
     began.
 
     One tensor is cached per state value and shared by every thread and read

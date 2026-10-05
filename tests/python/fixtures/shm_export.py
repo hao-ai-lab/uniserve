@@ -12,7 +12,7 @@ from uniserve_worker.protocol.transfer import (
 from uniserve_worker.transport import segment
 
 
-def serve_pending_publication(channel, shape=(1024,)) -> None:
+def serve_pending_export(channel, shape=(1024,)) -> None:
     """Publish a segment that never becomes ready, then fail it on command.
 
     On "exit" the producer marks the segment failed and unlinks it, as a

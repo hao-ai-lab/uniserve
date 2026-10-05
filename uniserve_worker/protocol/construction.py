@@ -20,7 +20,7 @@ from .batch import (
     CacheUnitAllocation,
     DecodeRange,
     LatentParams,
-    TensorPublication,
+    TensorExport,
 )
 from .call import Call
 from .transfer import KvTransfer
@@ -43,7 +43,7 @@ def batch_from_validated(
     decode_ranges: tuple[DecodeRange, ...],
     buffer_allocations: tuple[BufferAllocation, ...],
     commands: tuple[BatchCommand, ...],
-    input_products: tuple[TensorPublication, ...],
+    input_products: tuple[TensorExport, ...],
     kv_inputs: tuple[KvTransfer, ...],
 ) -> Batch:
     """Assemble a validated batch from transport-constructed members.
@@ -71,7 +71,7 @@ def batch_from_validated(
         buffer_allocations: Persistent storage slices for call outputs.
         commands: Ordered lifecycle commands.
         input_products: Published tensor values feeding declared call inputs.
-        kv_inputs: KV publications installed by this batch's calls.
+        kv_inputs: KV exports installed by this batch's calls.
 
     Returns:
         The assembled batch, without `Batch.validate` having run.

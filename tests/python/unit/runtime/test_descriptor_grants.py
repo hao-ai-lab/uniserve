@@ -1,9 +1,9 @@
-"""A publication's descriptor reaches a consumer process that asks for it.
+"""A export's descriptor reaches a consumer process that asks for it.
 
 A file descriptor names an open file of the process that opened it, so the
 bytes of one carry no meaning anywhere else. A device that exports descriptors
 rather than fabric handles therefore has to hand the descriptor itself to its
-readers, which is what these cover: a registered publication is granted, an
+readers, which is what these cover: a registered export is granted, an
 unregistered or withdrawn one is refused, an endpoint that serves nothing is
 refused rather than hung on, and a rank's readers are served when they all ask
 at once, which is what a batch of products actually produces.
@@ -31,9 +31,9 @@ def _identity(descriptor: int) -> tuple[int, int]:
     return status.st_dev, status.st_ino
 
 
-def _fetch_identity(endpoint: str, publication: str, channel) -> None:
+def _fetch_identity(endpoint: str, export: str, channel) -> None:
     try:
-        descriptor = fetch(endpoint, publication)
+        descriptor = fetch(endpoint, export)
     except Exception as error:  # reported to the parent as a value
         channel.send(("error", type(error).__name__))
         return
@@ -43,11 +43,11 @@ def _fetch_identity(endpoint: str, publication: str, channel) -> None:
         os.close(descriptor)
 
 
-def _in_child(endpoint: str, publication: str) -> tuple[str, object]:
+def _in_child(endpoint: str, export: str) -> tuple[str, object]:
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     process = context.Process(
-        target=_fetch_identity, args=(endpoint, publication, child)
+        target=_fetch_identity, args=(endpoint, export, child)
     )
     process.start()
     try:
@@ -61,13 +61,13 @@ def _in_child(endpoint: str, publication: str) -> tuple[str, object]:
 
 
 def test_a_registered_descriptor_opens_the_same_file_in_a_consumer() -> None:
-    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+    endpoint = f"uniserve-exports-{uuid.uuid4().hex}"
     grants = DescriptorGrants(endpoint)
-    publication = uuid.uuid4().hex
+    export = uuid.uuid4().hex
     with tempfile.TemporaryFile() as source:
-        grants.register(publication, source.fileno())
+        grants.register(export, source.fileno())
         try:
-            kind, value = _in_child(endpoint, publication)
+            kind, value = _in_child(endpoint, export)
         finally:
             grants.close()
         assert kind == "granted"
@@ -75,15 +75,15 @@ def test_a_registered_descriptor_opens_the_same_file_in_a_consumer() -> None:
         assert value == _identity(source.fileno())
 
 
-def test_a_withdrawn_publication_is_refused() -> None:
-    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+def test_a_withdrawn_export_is_refused() -> None:
+    endpoint = f"uniserve-exports-{uuid.uuid4().hex}"
     grants = DescriptorGrants(endpoint)
-    publication = uuid.uuid4().hex
+    export = uuid.uuid4().hex
     with tempfile.TemporaryFile() as source:
-        grants.register(publication, source.fileno())
-        grants.release(publication)
+        grants.register(export, source.fileno())
+        grants.release(export)
         try:
-            kind, value = _in_child(endpoint, publication)
+            kind, value = _in_child(endpoint, export)
         finally:
             grants.close()
     assert kind == "error" and value == WorkerError.__name__
@@ -91,29 +91,29 @@ def test_a_withdrawn_publication_is_refused() -> None:
 
 def test_an_endpoint_that_serves_nothing_is_refused() -> None:
     kind, value = _in_child(
-        f"uniserve-publications-{uuid.uuid4().hex}", uuid.uuid4().hex
+        f"uniserve-exports-{uuid.uuid4().hex}", uuid.uuid4().hex
     )
     assert kind == "error" and value == WorkerError.__name__
 
 
 def test_registration_and_receiver_own_their_descriptors() -> None:
-    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+    endpoint = f"uniserve-exports-{uuid.uuid4().hex}"
     grants = DescriptorGrants(endpoint)
-    publication = uuid.uuid4().hex
+    export = uuid.uuid4().hex
     try:
         with tempfile.TemporaryFile() as source:
             source.write(b"allocation")
             source.flush()
-            grants.register(publication, source.fileno())
+            grants.register(export, source.fileno())
 
         # Registration retains the open allocation after its caller closes.
-        received = fetch(endpoint, publication)
+        received = fetch(endpoint, export)
         try:
-            grants.release(publication)
+            grants.release(export)
             assert os.pread(received, 10, 0) == b"allocation"
             assert not os.get_inheritable(received)
             with pytest.raises(WorkerError):
-                fetch(endpoint, publication)
+                fetch(endpoint, export)
         finally:
             os.close(received)
     finally:
@@ -123,7 +123,7 @@ def test_registration_and_receiver_own_their_descriptors() -> None:
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize("release", ("close", "drop"))
 def test_retirement_releases_an_idle_endpoint(release) -> None:
-    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+    endpoint = f"uniserve-exports-{uuid.uuid4().hex}"
     owners = [DescriptorGrants(endpoint)]
 
     def retire():
@@ -138,9 +138,9 @@ def test_retirement_releases_an_idle_endpoint(release) -> None:
     replacement = DescriptorGrants(endpoint)
     try:
         with tempfile.TemporaryFile() as source:
-            publication = uuid.uuid4().hex
-            replacement.register(publication, source.fileno())
-            received = fetch(endpoint, publication)
+            export = uuid.uuid4().hex
+            replacement.register(export, source.fileno())
+            received = fetch(endpoint, export)
             try:
                 assert _identity(received) == _identity(source.fileno())
             finally:
@@ -148,17 +148,17 @@ def test_retirement_releases_an_idle_endpoint(release) -> None:
 
             if release == "close":
                 with pytest.raises(OSError, match="closed"):
-                    owners[0].register(publication, source.fileno())
+                    owners[0].register(export, source.fileno())
     finally:
         replacement.close()
 
 
-def _fetch_many(endpoint: str, publications: list[str], channel) -> None:
-    """Ask for one publication and report what file it names."""
+def _fetch_many(endpoint: str, exports: list[str], channel) -> None:
+    """Ask for one export and report what file it names."""
     results = []
-    for publication in publications:
+    for export in exports:
         try:
-            descriptor = fetch(endpoint, publication)
+            descriptor = fetch(endpoint, export)
         except Exception as error:
             results.append(("error", type(error).__name__))
             continue
@@ -170,25 +170,23 @@ def _fetch_many(endpoint: str, publications: list[str], channel) -> None:
 
 
 def test_concurrent_consumers_are_all_served() -> None:
-    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+    endpoint = f"uniserve-exports-{uuid.uuid4().hex}"
     grants = DescriptorGrants(endpoint)
     context = mp.get_context("spawn")
     readers = 8
     sources = [tempfile.TemporaryFile() for _ in range(4)]
-    publications = [uuid.uuid4().hex for _ in sources]
+    exports = [uuid.uuid4().hex for _ in sources]
     expected = []
     try:
-        for publication, source in zip(publications, sources, strict=True):
-            grants.register(publication, source.fileno())
+        for export, source in zip(exports, sources, strict=True):
+            grants.register(export, source.fileno())
             expected.append(_identity(source.fileno()))
 
-        # Every reader asks for every publication at the same time, which is
+        # Every reader asks for every export at the same time, which is
         # what a rank reading a batch of products from several producers does.
         pipes = [context.Pipe() for _ in range(readers)]
         processes = [
-            context.Process(
-                target=_fetch_many, args=(endpoint, publications, child)
-            )
+            context.Process(target=_fetch_many, args=(endpoint, exports, child))
             for _parent, child in pipes
         ]
         for process in processes:

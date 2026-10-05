@@ -437,9 +437,9 @@ def classify_batch_failure(
     if committed:
         classified = WorkerError(
             code=WorkerErrorCode.INVARIANT_VIOLATION,
-            message=f"batch publication failed after visibility began: {error}",
+            message=f"batch export failed after visibility began: {error}",
             fatal=True,
-            phase="batch publication",
+            phase="batch export",
             route=state.route,
             calls=scheduled,
         )

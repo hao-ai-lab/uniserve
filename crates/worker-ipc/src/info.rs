@@ -47,16 +47,16 @@ impl KvCacheInfo {
             .unwrap_or(0)
     }
 
-    /// Bounds the logical publication of a `tokens`-long visible KV extent,
+    /// Bounds the logical export of a `tokens`-long visible KV extent,
     /// independently of the producing TP size.
     ///
-    /// A publication carries each group's keys and values over the group's
+    /// An export carries each group's keys and values over the group's
     /// layers (`layer_ids`) and `total_kv_heads`; a sliding-window group
     /// carries at most `window` tokens, the history its readers need. With
     /// FP8 the bound also reserves one FP32 scale for each key and value
     /// head, layer and token, because a partial-page suffix may carry a
     /// complete scale for every head group.
-    pub fn publication_bytes(&self, tokens: u32) -> u64 {
+    pub fn transfer_bytes(&self, tokens: u32) -> u64 {
         let width = match self.dtype {
             KvCacheDtype::Float16 | KvCacheDtype::BFloat16 => 2,
             KvCacheDtype::Float32 => 4,
@@ -137,7 +137,7 @@ impl KvCacheInfo {
     /// page shape; their rank-local layer ids and head placement may differ.
     /// The combined pool has the smaller unit count, because the scheduler
     /// assigns one set of unit ids valid in both, the larger unit size, and
-    /// per group the union of both stages' layers, which bounds publications.
+    /// per group the union of both stages' layers, which bounds exports.
     pub fn merge(&self, other: &Self) -> ValidationResult<Self> {
         ensure_valid!(
             self.dtype == other.dtype
@@ -246,7 +246,7 @@ impl OutputInfo {
 }
 
 /// A loaded rank incarnation in an explicitly identified host address space.
-/// Backend addresses and storage generations are carried by each publication.
+/// Backend addresses and storage generations are carried by each export.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerEndpoint {
     /// Logical instance selected by the engine.
@@ -262,7 +262,7 @@ pub struct WorkerEndpoint {
 }
 
 impl WorkerEndpoint {
-    /// Checks identities before accepting startup metadata or a publication.
+    /// Checks identities before accepting startup metadata or an export.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.worker_id.is_empty()

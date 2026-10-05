@@ -169,9 +169,7 @@ def _copy_value(
     elif isinstance(metadata, FeatureMetadata):
         raise invalid_descriptor("feature metadata requires feature admission")
     if value.dtype != target.dtype:
-        raise invalid_descriptor(
-            "tensor publication changes its declared dtype"
-        )
+        raise invalid_descriptor("tensor export changes its declared dtype")
     shape = tuple(value.shape)
     matches = (
         shape == _slices.shape(region)
@@ -179,9 +177,7 @@ def _copy_value(
         else reference.shape_bound.contains_shape(shape)
     )
     if not matches:
-        raise invalid_descriptor(
-            "tensor publication changes its declared shape"
-        )
+        raise invalid_descriptor("tensor export changes its declared shape")
     if value.numel() > target.numel():
         raise WorkerError(
             code=WorkerErrorCode.INVARIANT_VIOLATION,
@@ -211,11 +207,11 @@ def _copy_scalars(
     flat = values.detach().reshape(-1)
     if flat.numel() != len(targets):
         raise invalid_descriptor(
-            "batched device-product publication requires one scalar per output"
+            "batched device-product export requires one scalar per output"
         )
     if any(target.numel() != 1 for target in targets):
         raise invalid_descriptor(
-            "batched device-product publication requires scalar output bounds"
+            "batched device-product export requires scalar output bounds"
         )
     first = targets[0]
     if any(
@@ -223,7 +219,7 @@ def _copy_scalars(
         for target in targets
     ):
         raise invalid_descriptor(
-            "batched device-product publication spans incompatible storage"
+            "batched device-product export spans incompatible storage"
         )
     source = flat.to(dtype=first.dtype)
     torch._foreach_copy_(

@@ -32,7 +32,7 @@ from uniserve_worker.protocol.batch import (
     LatentParams,
     NewRequest,
     Start,
-    TensorPublication,
+    TensorExport,
 )
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -442,7 +442,7 @@ def execution_batch(
     batch_id: int,
     admissions: Sequence[NewRequest] = (),
     calls: Sequence[Call] = (),
-    input_products: Sequence[TensorPublication] = (),
+    input_products: Sequence[TensorExport] = (),
     kv_inputs: Sequence[KvTransfer] = (),
     commands: Sequence[BatchCommand] = (),
     block_tables: Sequence[BlockTable] = (),
@@ -914,7 +914,7 @@ def diffusion_step_call(
     return call, output
 
 
-def kv_publication_call(
+def kv_export_call(
     rk: RequestKey,
     *,
     call_id: CallId,
@@ -931,7 +931,7 @@ def kv_publication_call(
         request_key=rk,
         call_id=call_id,
         coordinates=CallCoordinates(),
-        kind=TransferMode.KV_PUBLISH,
+        kind=TransferMode.KV_EXPORT,
         bounds=Bounds(max_transfer_bytes=1 << 20),
         kv_output=product,
     )
@@ -1022,7 +1022,7 @@ __all__ = [
     "diffusion_prepare_call",
     "umm_params",
     "diffusion_finalize_call",
-    "kv_publication_call",
+    "kv_export_call",
     "observe_completions",
     "stamp_batch",
     "submitted_batch",

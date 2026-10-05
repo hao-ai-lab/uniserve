@@ -34,7 +34,7 @@ from uniserve_worker.protocol.batch import (
     BufferAllocation,
     LatentParams,
     NewRequest,
-    TensorPublication,
+    TensorExport,
 )
 from uniserve_worker.protocol.call import (
     Call,
@@ -72,15 +72,15 @@ class DescriptorGrants:
     """Own local allocation grants and their native socket service."""
 
     def __init__(self, endpoint: str) -> None: ...
-    def register(self, publication: str, descriptor: int) -> None: ...
-    def release(self, publication: str) -> None: ...
+    def register(self, export: str, descriptor: int) -> None: ...
+    def release(self, export: str) -> None: ...
     def close(self) -> None: ...
 
-def fetch_descriptor(endpoint: str, publication: str) -> int:
+def fetch_descriptor(endpoint: str, export: str) -> int:
     """Return an owned descriptor; the caller closes it after CUDA import."""
     ...
 
-def publish_media_bytes(payload: bytes) -> str:
+def store_media_bytes(payload: bytes) -> str:
     """Publish bytes and hand their segment name to the receiving process."""
     ...
 
@@ -131,7 +131,7 @@ __all__ = [
     "TransferTicket",
     "fetch_tensor",
     "fetch_descriptor",
-    "publish_media_bytes",
+    "store_media_bytes",
     "WeightPrefetch",
     "atomic_load_u32",
     "atomic_store_u32",
@@ -266,14 +266,14 @@ class BatchState:
     inputs: BatchInputs
     predicate_entries: list[tuple[CallIdentity, tuple[int, int], int]]
     predicate_transfers: tuple[tuple[CallIdentity, BufferId, int], ...]
-    input_products: tuple[TensorPublication, ...]
+    input_products: tuple[TensorExport, ...]
     kv_inputs: tuple[KvTransfer, ...]
     stream: torch.cuda.Stream | None
     started_ns: int
     forward_stats: list[ForwardStats]
     component_us: dict[str, int]
     forward_indices: dict[CallIdentity, tuple[int, ...]]
-    products: tuple[TensorPublication, ...]
+    products: tuple[TensorExport, ...]
 
     @property
     def batch_id(self) -> int: ...
@@ -349,7 +349,7 @@ class PendingOutput:
     tensor_exports: dict[BufferId, ExportLocations]
     cache_exports: dict[BufferId, ExportLocations]
     exported_locators: list[Locator]
-    cache_publication: tuple[BufferId, KvTransfer] | None
+    cache_export: tuple[BufferId, KvTransfer] | None
     cache_installation: tuple[BufferId, BufferId, KvTransfer] | None
     device_reads: list[TensorRead]
     feature_reads: list[TensorRead]
@@ -359,7 +359,7 @@ class PendingOutput:
     transition_write: Buffer | None
     completion_write: Buffer | None
     producer_write: Buffer | None
-    products: tuple[TensorPublication, ...]
+    products: tuple[TensorExport, ...]
 
     def set_sampling(
         self,
@@ -658,7 +658,7 @@ class KVImport:
     @property
     def initialized_units(self) -> tuple[int, ...]: ...
     @property
-    def publication(self) -> KvTransfer: ...
+    def export(self) -> KvTransfer: ...
     @property
     def completion(self) -> HostTask[None] | Completion: ...
     @property
@@ -678,7 +678,7 @@ class KVImporter:
     def set_completion_wake(self, wake: Callable[[], None] | None) -> None: ...
     def reserve(
         self,
-        publication: KvTransfer,
+        export: KvTransfer,
         *,
         request_pool_idx: int,
         tables: tuple[GroupTable, ...],
@@ -714,14 +714,14 @@ class KVCacheManager:
         self, request: RequestKey, destination: str
     ) -> tuple[BufferId, int] | None: ...
     def validate_install(self, transfer: KvTransfer) -> None: ...
-    def validate_publications(
+    def validate_exports(
         self,
-        publications: Sequence[tuple[BufferId, KvTransfer]],
+        exports: Sequence[tuple[BufferId, KvTransfer]],
         installations: Sequence[tuple[BufferId, BufferId, KvTransfer]],
     ) -> None: ...
-    def apply_publications(
+    def apply_exports(
         self,
-        publications: Sequence[tuple[BufferId, KvTransfer]],
+        exports: Sequence[tuple[BufferId, KvTransfer]],
         installations: Sequence[tuple[BufferId, BufferId, KvTransfer]],
     ) -> None: ...
     def release_calls(
@@ -1257,7 +1257,7 @@ class TensorStore:
     def producer_write_views(
         self, writes: tuple[Buffer, ...]
     ) -> tuple[torch.Tensor, ...]: ...
-    def publish_write(
+    def write(
         self,
         write: Buffer,
         value: torch.Tensor,
@@ -1265,14 +1265,14 @@ class TensorStore:
         producer_event: CUDAEvent | None = None,
         metadata: ImageMetadata | FeatureMetadata | None = None,
     ) -> torch.Tensor: ...
-    def publish_writes(
+    def write_scalars(
         self,
         writes: tuple[Buffer, ...],
         values: torch.Tensor,
         *,
         producer_event: CUDAEvent | None = None,
     ) -> tuple[torch.Tensor, ...]: ...
-    def publish_scalar_write(
+    def write_scalar(
         self,
         write: Buffer,
         value: bool | int,
@@ -1716,7 +1716,7 @@ class Server:
         Raises:
             TypeError, ValueError: ``response`` does not decode.
             RuntimeError: The endpoint is closed or in use, or encoding or
-                publication fails.
+                export fails.
         """
         ...
 

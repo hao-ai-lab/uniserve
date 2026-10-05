@@ -1,24 +1,24 @@
-"""One bounded VMM pool per device on a publishing rank.
+"""One bounded VMM pool per device on a exporting rank.
 
 `CudaVmmTransport` reserves one pool per device the first time that device
-publishes a product it cannot export where it lies, sized by the rank's
+exports a product it cannot export where it lies, sized by the rank's
 transfer byte budget, and exports one shareable handle for the pool's whole
-allocation. Such a publication is a chunk of that pool addressed by byte
+allocation. Such an export is a chunk of that pool addressed by byte
 offset and size, so a consumer imports one handle per producing device rather
 than one per product.
 
 Because the pool is reserved outside the PyTorch caching allocator,
-publication never needs exportable allocator segments, and the engine enables
+export never needs exportable allocator segments, and the engine enables
 expandable segments on every rank unless the head's environment already
 configures the allocator, in which case every rank receives the head's
 setting.
 
 A chunk carries its own acknowledgment header but does not track who owes an
-acknowledgment: that belongs to the publication the chunk backs, which
+acknowledgment: that belongs to the export the chunk backs, which
 `CudaVmmTransport` owns, retires and sweeps.
 
 A product that does not fit the pool raises `PoolExhaustedError`, and
-`publication.publish_tensor` publishes that product as host bytes instead,
+`exports.export_tensor` exports that product as host bytes instead,
 over whichever host mechanisms the rank binds for its consumers. The pool
 logs its exhaustion once rather than once per product.
 """
@@ -65,7 +65,7 @@ CHUNK_ALIGNMENT = 512
 
 @dataclass(frozen=True, slots=True)
 class PoolChunk:
-    """One publication's span of its device's pool.
+    """One export's span of its device's pool.
 
     The chunk begins with one acknowledgment word per instance rank. A
     consumer claims the word of its own slot before its first read and
@@ -89,13 +89,13 @@ class PoolChunk:
     def settled(self, slots: Sequence[int]) -> bool:
         """Report whether no named consumer is still reading this chunk.
 
-        Consulted once the producing publication has been retired, after
-        which no consumer begins reading: the engine retires a publication
+        Consulted once the producing export has been retired, after
+        which no consumer begins reading: the engine retires an export
         only when every consuming call has resolved or will never be
         submitted. A named slot that never claimed its word therefore holds
         nothing, and one that claimed must acknowledge before its span is
         handed out again. A product with no remote consumer is settled on
-        publication: no other rank reads it.
+        export: no other rank reads it.
 
         The words live in device memory, so the check runs on the current
         stream and blocks the host until that stream reaches it.
@@ -114,7 +114,7 @@ class VmmPool:
     """A device's bounded pool of exportable pages.
 
     Chunks are handed out from a rising watermark and returned when their
-    publication retires. The pool does not compact: a publication's chunk is
+    export retires. The pool does not compact: an export's chunk is
     live while a consumer may still read it, and moving it would invalidate the
     offset that consumer was given.
 
@@ -164,7 +164,7 @@ class VmmPool:
         """Return this rank's flat byte view of the whole pool.
 
         A consumer maps the same allocation from the pool's handle, so offsets
-        into this view are the offsets a publication carries.
+        into this view are the offsets an export carries.
         """
         return self._storage
 
@@ -195,13 +195,13 @@ class VmmPool:
         with self._lock:
             offset = self._free_offset(span)
             if offset is None:
-                # One report names the pool that filled; per-publication
+                # One report names the pool that filled; per-export
                 # reporting would say the same thing once per product.
                 if not self._reported_exhaustion:
                     self._reported_exhaustion = True
                     _LOG.warning(
                         "device %s VMM pool of %d bytes cannot fit a %d byte "
-                        "product; such products are published as host bytes "
+                        "product; such products are exported as host bytes "
                         "where the rank binds a host mechanism for them",
                         self._device,
                         self._capacity,
@@ -232,7 +232,7 @@ class VmmPool:
                 return
             if not self._live:
                 # An empty pool restarts at the beginning, which is what keeps
-                # a steady publish-and-retire cycle from walking the watermark
+                # a steady export-and-retire cycle from walking the watermark
                 # to the end of a pool it never actually fills.
                 self._watermark = 0
 

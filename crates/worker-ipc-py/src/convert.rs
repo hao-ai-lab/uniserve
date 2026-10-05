@@ -29,9 +29,9 @@ use uniserve_worker_ipc::{
     BufferAllocation, BufferId, CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType,
     DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, FeatureKind,
     FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaOutput,
-    NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, ShapeBound,
-    TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
-    TransferTransport, VideoAdmission, WorkerEndpoint, WorkerRequest, WorkerResponse,
+    NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, ShapeBound, TensorExport,
+    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    WorkerEndpoint, WorkerRequest, WorkerResponse,
 };
 
 #[cfg(test)]
@@ -52,7 +52,7 @@ pub(crate) fn batch_from_py(value: &Bound<'_, PyAny>) -> PyResult<Batch> {
     let mut batch: Batch = depythonize(fields.as_any())?;
     for product in products.try_iter()? {
         batch.input_products.push(
-            tensor_publication_from_py(&product?)
+            tensor_export_from_py(&product?)
                 .ok_or_else(|| PyValueError::new_err("invalid batch tensor product"))?,
         );
     }
@@ -87,9 +87,7 @@ fn batch_output_mapping<'py>(py: Python<'py>, result: &BatchOutput) -> PyResult<
     let products = result
         .products
         .iter()
-        .map(|product| {
-            tensor_publication_to_py(py, product, &mut records)?.call_method0("to_mapping")
-        })
+        .map(|product| tensor_export_to_py(py, product, &mut records)?.call_method0("to_mapping"))
         .collect::<PyResult<Vec<_>>>()?;
     output.set_item("products", PyList::new(py, products)?)?;
     let completions = output.get_item("completions")?;
@@ -231,7 +229,7 @@ impl RequestTypes {
         records.insert("GenerationParams", class(&module, "GenerationParams")?);
         records.insert("CanvasSampling", class(&module, "CanvasSampling")?);
         records.insert("DiffusionParams", class(&module, "DiffusionParams")?);
-        records.insert("TensorPublication", class(&module, "TensorPublication")?);
+        records.insert("TensorExport", class(&module, "TensorExport")?);
         let module = py.import("uniserve_worker.protocol.video")?;
         for name in [
             "VideoAdmission",
@@ -775,7 +773,7 @@ pub(crate) fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'
         .collect::<PyResult<Vec<_>>>()?;
 
     let input_products = record_tuple(py, &run.input_products, |payload| {
-        tensor_publication_to_py(py, payload, &mut native)
+        tensor_export_to_py(py, payload, &mut native)
     })?;
 
     // `batch_from_validated` sets these fields on a bare `Batch` without
@@ -1230,10 +1228,10 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
     construct(py, "ImageParams", &dict)
 }
 
-/// Converts a tensor publication into its Python record.
-fn tensor_publication_to_py<'py>(
+/// Converts a tensor export into its Python record.
+fn tensor_export_to_py<'py>(
     py: Python<'py>,
-    payload: &TensorPublication,
+    payload: &TensorExport,
     context: &mut RequestConversion<'py>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
@@ -1245,7 +1243,7 @@ fn tensor_publication_to_py<'py>(
         intern!(py, "value"),
         transfer_handle_to_py(py, &payload.value)?,
     )?;
-    construct(py, "TensorPublication", &dict)
+    construct(py, "TensorExport", &dict)
 }
 
 /// Converts tensor metadata and transport coordinates into a Python record.
@@ -1286,7 +1284,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
         }
         TransferTransport::CudaVmm {
             endpoint,
-            publication_id,
+            export_id,
             storage_size_bytes,
             storage_offsets_bytes,
             span_lengths,
@@ -1297,7 +1295,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
             acknowledgment_offset,
         } => {
             handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
-            handle.set_item(intern!(py, "publication_id"), publication_id.as_str())?;
+            handle.set_item(intern!(py, "export_id"), export_id.as_str())?;
             handle.set_item(intern!(py, "storage_size_bytes"), storage_size_bytes)?;
             handle.set_item(
                 intern!(py, "storage_offsets_bytes"),
@@ -1331,7 +1329,7 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
     construct(py, "Locator", &dict)
 }
 
-/// Encodes the persistent buffer that identifies a KV publication.
+/// Encodes the persistent buffer that identifies a KV export.
 ///
 /// Uses a fresh `RequestConversion`, so the owner request key and producer
 /// call id are equal to, but not the same objects as, the batch's cached
@@ -1452,7 +1450,7 @@ pub(crate) fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput
     let products = products.cast::<PyList>().ok()?;
     let mut payloads = Vec::with_capacity(products.len());
     for item in products.iter() {
-        payloads.push(tensor_publication_from_py(&item)?);
+        payloads.push(tensor_export_from_py(&item)?);
     }
     let forward_stats = match dict.get_item(intern!(py, "forward_stats")).ok()? {
         None => None,
@@ -1690,9 +1688,9 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
     })
 }
 
-/// Decodes a tensor publication: the product reference and its transfer
+/// Decodes a tensor export: the product reference and its transfer
 /// handle, given as `{"kind": ..., "value": {...}}`.
-pub(crate) fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<TensorPublication> {
+pub(crate) fn tensor_export_from_py(value: &Bound<'_, PyAny>) -> Option<TensorExport> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
@@ -1725,7 +1723,7 @@ pub(crate) fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<Ten
         _ => return None,
     };
 
-    Some(TensorPublication {
+    Some(TensorExport {
         product: tensor_ref_from_py(&get(dict, intern!(py, "product"))?)?,
         value,
     })
@@ -1754,7 +1752,7 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
         },
         "cuda_vmm" => TransferTransport::CudaVmm {
             endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
-            publication_id: string_of(&get(dict, intern!(py, "publication_id"))?)?,
+            export_id: string_of(&get(dict, intern!(py, "export_id"))?)?,
             storage_size_bytes: u64_of(&get(dict, intern!(py, "storage_size_bytes"))?)?,
             storage_offsets_bytes: u64_vec(&get(dict, intern!(py, "storage_offsets_bytes"))?)?,
             span_lengths: u64_vec(&get(dict, intern!(py, "span_lengths"))?)?,
@@ -1790,7 +1788,7 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
     })
 }
 
-/// Decodes the persistent buffer that identifies a KV publication.
+/// Decodes the persistent buffer that identifies a KV export.
 fn buffer_id_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<BufferId> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
@@ -2047,7 +2045,7 @@ fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
     Some(tensor)
 }
 
-/// Converts a KV publication imported by a batch into a Python `KvTransfer`
+/// Converts a KV export imported by a batch into a Python `KvTransfer`
 /// record.
 pub(crate) fn kv_transfer_to_py<'py>(
     py: Python<'py>,
@@ -2059,7 +2057,7 @@ pub(crate) fn kv_transfer_to_py<'py>(
         destination,
         base,
         base_extent,
-        published_extent,
+        exported_extent,
         compute_dtype,
     } = transfer;
     let value = PyDict::new(py);
@@ -2077,12 +2075,12 @@ pub(crate) fn kv_transfer_to_py<'py>(
             .transpose()?,
     )?;
     value.set_item(intern!(py, "base_extent"), base_extent)?;
-    value.set_item(intern!(py, "published_extent"), published_extent)?;
+    value.set_item(intern!(py, "exported_extent"), exported_extent)?;
     value.set_item(intern!(py, "compute_dtype"), compute_dtype.as_str())?;
     construct(py, "KvTransfer", &value)
 }
 
-/// Converts one cache group's share of a KV publication into a Python
+/// Converts one cache group's share of a KV export into a Python
 /// `KvGroupTransfer` record.
 fn kv_group_transfer_to_py<'py>(
     py: Python<'py>,
@@ -2102,7 +2100,7 @@ fn kv_group_transfer_to_py<'py>(
     construct(py, "KvGroupTransfer", &value)
 }
 
-/// Decodes the KV publication a completion reports in `kv_output`.
+/// Decodes the KV export a completion reports in `kv_output`.
 ///
 /// Each tensor is checked by `tensor_transfer_from_py`. `KvTransfer::validate`
 /// runs later, through `RequestOutput::validate`, when the result is
@@ -2129,12 +2127,12 @@ pub(crate) fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer
             )?)?)
         },
         base_extent: u32_of(&get(payload, intern!(py, "base_extent"))?)?,
-        published_extent: u32_of(&get(payload, intern!(py, "published_extent"))?)?,
+        exported_extent: u32_of(&get(payload, intern!(py, "exported_extent"))?)?,
         compute_dtype: string_of(&get(payload, intern!(py, "compute_dtype"))?)?,
     })
 }
 
-/// Decodes one cache group's share of a KV publication, preserving its key,
+/// Decodes one cache group's share of a KV export, preserving its key,
 /// value, scale tensor order.
 fn kv_group_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvGroupTransfer> {
     let py = value.py();
@@ -2162,10 +2160,10 @@ mod tests {
 
     use super::*;
 
-    /// An unquantized two-token KV publication of `source`: `bfloat16` keys
+    /// An unquantized two-token KV export of `source`: `bfloat16` keys
     /// and values tensors of shape `[2, 1, 1, 4]`, each on a single
     /// `posix_shm` locator.
-    fn kv_publication(source: BufferId) -> KvTransfer {
+    fn kv_export(source: BufferId) -> KvTransfer {
         let tensors = ["keys", "values"]
             .into_iter()
             .map(|name| TensorTransfer {
@@ -2194,7 +2192,7 @@ mod tests {
             destination: "decoder".into(),
             base: None,
             base_extent: 0,
-            published_extent: 2,
+            exported_extent: 2,
             compute_dtype: "bfloat16".into(),
         }
     }
@@ -2441,7 +2439,7 @@ mod tests {
         media_batch.latent_params = latent_params;
 
         let mut kv_batch = Batch::new(13, Vec::new(), vec![kv_call]);
-        kv_batch.kv_inputs = vec![kv_publication(kv_source)];
+        kv_batch.kv_inputs = vec![kv_export(kv_source)];
 
         let mut readout_batch = Batch::new(14, Vec::new(), vec![readout_call]);
         readout_batch.forward = uniserve_worker_ipc::ForwardBatch {
@@ -2466,7 +2464,7 @@ mod tests {
     /// The expected reply to the KV batch (message id 11).
     ///
     /// It holds a decode completion with sampled, top, and prompt logprobs,
-    /// and a KV-publish completion whose publication is owned by that
+    /// and a KV-publish completion whose export is owned by that
     /// completion's own request and call, as `RequestOutput::validate`
     /// requires.
     fn result_response() -> WorkerResponse {
@@ -2510,18 +2508,18 @@ mod tests {
             unreachable!();
         };
 
-        let mut publication = result.completions[0].clone();
-        publication.request_key = RequestKey::new(1, RequestId(4), 1);
-        publication.call_id = CallId::new(13, 1);
-        publication.code = CallKind::Transfer(TransferMode::KvPublish);
-        publication.committed_tokens.clear();
-        publication.sampled_logprob = None;
-        publication.top_logprobs.clear();
-        publication.prompt_logprobs.clear();
-        publication.product_generations.clear();
-        publication.kv_output = Some(kv_publication(BufferId {
-            owner: publication.request_key,
-            producer_call_id: publication.call_id,
+        let mut export = result.completions[0].clone();
+        export.request_key = RequestKey::new(1, RequestId(4), 1);
+        export.call_id = CallId::new(13, 1);
+        export.code = CallKind::Transfer(TransferMode::KvExport);
+        export.committed_tokens.clear();
+        export.sampled_logprob = None;
+        export.top_logprobs.clear();
+        export.prompt_logprobs.clear();
+        export.product_generations.clear();
+        export.kv_output = Some(kv_export(BufferId {
+            owner: export.request_key,
+            producer_call_id: export.call_id,
             output_index: 0,
             generation: 4,
         }));
@@ -2536,7 +2534,7 @@ mod tests {
         readout.prompt_logprobs.clear();
         readout.product_generations.clear();
         readout.candidate_logprobs = vec![-0.5, -2.25, -9.0];
-        result.completions.push(publication);
+        result.completions.push(export);
         result.completions.push(readout);
         response.set_call_id(Some(11));
         response
@@ -2757,7 +2755,7 @@ mod tests {
                             .unwrap();
                     }
                     // The KV install call reads the batch's imported
-                    // publication; the reply relays its tensors back in a
+                    // export; the reply relays its tensors back in a
                     // KV-publish completion.
                     _ => {
                         let imported_kv = native_batch
@@ -2783,29 +2781,29 @@ mod tests {
                                 .unwrap()
                         );
 
-                        // `pythonize` renders the expected publication in the
+                        // `pythonize` renders the expected export in the
                         // serde form, whose nested locator transports the
                         // native decoder rejects. Substitute the imported
-                        // publication's `to_mapping` form, re-owned by the
+                        // export's `to_mapping` form, re-owned by the
                         // publishing completion. Its tensors equal the
                         // expected ones, so the final Rust equality checks
                         // every locator and extent after both native
                         // directions.
                         let response = pythonize(py, &expected).unwrap();
-                        let publication = response
+                        let export = response
                             .get_item("result")
                             .unwrap()
                             .get_item("completions")
                             .unwrap()
                             .get_item(1)
                             .unwrap();
-                        let output_source = publication
+                        let output_source = export
                             .get_item("kv_output")
                             .unwrap()
                             .get_item("source")
                             .unwrap();
                         imported_mapping.set_item("source", output_source).unwrap();
-                        publication.set_item("kv_output", imported_mapping).unwrap();
+                        export.set_item("kv_output", imported_mapping).unwrap();
                         server.respond(py, &response).unwrap();
                     }
                 }

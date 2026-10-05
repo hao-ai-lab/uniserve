@@ -1,9 +1,9 @@
 """Construct bounded transport backends for one worker endpoint.
 
-The transport package moves a rank's published products (tensors) to the
+The transport package moves a rank's exported products (tensors) to the
 ranks that read them. Each backend is one physical mechanism:
 
-- `local`: a publication read within the producer's own address space.
+- `local`: an export read within the producer's own address space.
 - `shm`: host bytes in a POSIX shared-memory segment, for readers on the
   producer's host.
 - `cuda_vmm`: device storage exported as a CUDA VMM shareable handle, either
@@ -11,10 +11,10 @@ ranks that read them. Each backend is one physical mechanism:
 - `channel`: host bytes carried inside the locator itself, through the head,
   for readers on another host.
 
-`publication.publish_tensor` chooses the mechanisms for one product,
-`fetch.fetch_tensor` assembles a consumer's region from the published
+`exports.export_tensor` chooses the mechanisms for one product,
+`fetch.fetch_tensor` assembles a consumer's region from the exported
 locations, and `exports` operates on each storage owner's record of what it
-has published.
+has exported.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ def make_transports(
     the ranks on this host, which decide whether a host product's consumers
     are reached over shared storage or over the rank channel.
     `cross_host_consumers` says whether a rank on another host reads this
-    rank's products, which decides how a device publication states
+    rank's products, which decides how a device export states
     readiness. Which ranks read a given product is stated on the call that
     produces it.
 
