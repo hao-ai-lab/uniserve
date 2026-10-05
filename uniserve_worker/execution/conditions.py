@@ -37,9 +37,8 @@ from uniserve.model import (
 )
 from uniserve.tensors import OutputLayout
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import calls, transfer
-from uniserve_worker.protocol.call import CallStatus, MediaCall
-from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.execution import transfer
+from uniserve_worker.protocol.call import MediaCall
 from uniserve_worker.protocol.video import VideoAdmission
 from uniserve_worker.storage.tensor_store import device_product_storage
 
@@ -292,10 +291,6 @@ def _outcome(
     if result.stats is None:
         raise RuntimeError("module output has no execution statistics")
     state.forward_stats.append(result.stats)
-    request.status = CallStatus.OK
-    request.progress = calls.execution_runtime(request, None)
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
     return request
 

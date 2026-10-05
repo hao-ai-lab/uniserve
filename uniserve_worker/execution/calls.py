@@ -18,17 +18,6 @@ from uniserve_worker.protocol.identity import CallIdentity
 from uniserve_worker.storage.block_tables import BlockTables
 
 
-def output_generations(call: Call) -> tuple[int, ...]:
-    """Return the generation of each tensor output the call declares.
-
-    Values follow `Call.tensor_outputs` order. Handlers store them as the
-    completion's ``product_generations``.
-    """
-    return tuple(
-        int(reference.generation) for reference in call.tensor_outputs()
-    )
-
-
 def execution_runtime(
     request: PendingOutput,
     cache: tuple[int, int, int] | None,

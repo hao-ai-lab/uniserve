@@ -293,6 +293,21 @@ pub struct TensorTransfer {
 }
 
 impl TensorTransfer {
+    /// Bytes in the whole logical tensor, independent of shard replication.
+    pub fn nbytes(&self) -> ValidationResult<u64> {
+        let first = self
+            .locations
+            .first()
+            .ok_or_else(|| invalid_message!("tensor transfer has no locations"))?;
+        let element_bytes = first
+            .nbytes
+            .checked_div(tensor_elements(&first.shape)?)
+            .ok_or_else(|| invalid_message!("tensor transfer has an empty location"))?;
+        tensor_elements(&self.shape)?
+            .checked_mul(element_bytes)
+            .ok_or_else(|| invalid_message!("logical tensor byte size overflows"))
+    }
+
     /// Returns whether the available shard/replica boxes cover the complete logical tensor.
     /// Partial rank reports are valid descriptors, so completeness is a separate question.
     ///
@@ -396,9 +411,7 @@ impl TensorTransfer {
                 "tensor location disagrees with its logical representation"
             );
         }
-        tensor_elements(&self.shape)?
-            .checked_mul(element_bytes)
-            .ok_or_else(|| invalid_message!("logical tensor byte size overflows"))
+        self.nbytes()
     }
 }
 

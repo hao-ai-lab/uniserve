@@ -1,0 +1,347 @@
+//! Resolve numerical completion into accepted request progress and wire output.
+
+use uniserve_core::CallId;
+use uniserve_worker_ipc::{
+    Call, CallKind, CallStatus, ErrorCode, MAX_TRANSFER_HANDLE_BYTES, RequestKey, RequestOutput,
+    TimingCounters,
+};
+
+use crate::{Error, OutputBuffer, RequestPool, RequestProgress, Result};
+
+// sampling_columns packs [valid | active | token | accepted draft count],
+// with one word per row in each field. Canvas completion starts with its outcome.
+const SAMPLING_FIELDS: usize = 4;
+const STEP_STOPPED: i64 = 1;
+const STEP_SKIPPED: i64 = 2;
+
+struct Speculation {
+    draft_tokens: Vec<u32>,
+    terminal_prefix: Option<usize>,
+    base: RequestProgress,
+}
+
+/// A call's completion captures and projected state. The executor resolves all
+/// ready rows before accepting them into RequestPool. Tensor and callback
+/// owners remain with the numerical backend; decoding needs only host values.
+pub struct PendingOutput {
+    pub output: RequestOutput,
+    pub progress: RequestProgress,
+    pub row: usize,
+    pub reports_output: bool,
+    /// Element offset, packed-column length, and row within that column.
+    pub sampling_range: Option<(usize, usize, usize)>,
+    pub logprob_range: Option<(usize, usize, usize)>,
+    /// Each row names one scored token in its prompt chunk.
+    pub prompt_logprob_ranges: Vec<(usize, usize, usize)>,
+    /// Element offset and length of sign-extended FP32 score bits.
+    pub candidate_range: Option<(usize, usize)>,
+    /// Element offset and length of [step outcome | canvas token ids].
+    pub canvas_range: Option<(usize, usize)>,
+    speculation: Option<Speculation>,
+    resolved: bool,
+}
+
+impl PendingOutput {
+    pub fn new(call: &Call, previous: RequestProgress, row: usize) -> Result<Self> {
+        let coordinates = &call.coordinates;
+        let progress = RequestProgress {
+            logical_position: u64::from(coordinates.logical_position),
+            flow_step: u64::from(coordinates.flow_step),
+            kv_visible_len: u64::from(coordinates.kv_visible_len),
+            kv_computed_len: u64::from(coordinates.kv_computed_len),
+            ..previous
+        };
+        let mut output = request_output(call.request_key, call.call_id, call.code, progress)?;
+        output.product_generations = call
+            .tensor_outputs()
+            .map(|output| output.generation)
+            .collect();
+
+        Ok(Self {
+            output,
+            progress,
+            row,
+            reports_output: true,
+            sampling_range: None,
+            logprob_range: None,
+            prompt_logprob_ranges: Vec::new(),
+            candidate_range: None,
+            canvas_range: None,
+            speculation: None,
+            resolved: false,
+        })
+    }
+
+    pub fn resolved(&self) -> bool {
+        self.resolved
+    }
+
+    pub fn result(&self) -> Result<&RequestOutput> {
+        if !self.resolved {
+            return Err(Error::State("call output is not resolved"));
+        }
+        Ok(&self.output)
+    }
+
+    /// Verification initializes KV for the full draft. Acceptance later makes
+    /// only its selected prefix visible, starting from these base coordinates.
+    pub fn set_speculation(
+        &mut self,
+        draft_tokens: Vec<u32>,
+        terminal_prefix: Option<usize>,
+        visible: u64,
+        initialized: u64,
+    ) {
+        self.progress.kv_visible_len = visible;
+        self.progress.kv_computed_len = initialized;
+        self.speculation = Some(Speculation {
+            draft_tokens,
+            terminal_prefix,
+            base: self.progress,
+        });
+    }
+
+    pub fn validate_output<A>(&self, buffer: &OutputBuffer<A>, call: &Call) -> Result<()> {
+        let sampled = self.logprob_range.as_slice();
+        let bytes =
+            buffer.logprob_bytes(sampled)? + buffer.logprob_bytes(&self.prompt_logprob_ranges)?;
+        if bytes > call.bounds.max_completion_bytes as usize {
+            return Err(Error::Invalid(
+                "logprob result exceeds its registered completion capacity".into(),
+            ));
+        }
+
+        if let Some(output) = &self.output.kv_output {
+            if Some(output.source) != call.kv_output {
+                return Err(Error::Invalid(
+                    "KV publication differs from its declared output".into(),
+                ));
+            }
+
+            let bytes = output
+                .tensors()
+                .try_fold(0_u64, |sum, tensor| {
+                    tensor.nbytes().map(|bytes| sum.saturating_add(bytes))
+                })
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            if bytes > call.bounds.max_transfer_bytes {
+                return Err(Error::Invalid(
+                    "KV publication exceeds its transfer-byte bound".into(),
+                ));
+            }
+            if output.encoded_size_bound() > MAX_TRANSFER_HANDLE_BYTES {
+                return Err(Error::Invalid(
+                    "KV transfer exceeds its descriptor byte bound".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The caller has completed host actions and made the buffer readable.
+    /// Invalid sampling distributions become error results; malformed captures
+    /// return an error so the executor can report the failed computation.
+    pub fn resolve<A>(
+        &mut self,
+        parent: RequestProgress,
+        buffer: &mut OutputBuffer<A>,
+    ) -> Result<()> {
+        if self.resolved {
+            return Ok(());
+        }
+        if self.output.status == CallStatus::Ok {
+            self.decode(buffer)?;
+        }
+
+        // Failed and skipped work cannot advance either the local request or
+        // the coordinates reported to the engine.
+        if self.output.status != CallStatus::Ok {
+            self.progress = parent;
+            self.output.committed_tokens.clear();
+            self.output.product_generations.clear();
+            self.output.finish_flags = Default::default();
+            self.output.kv_output = None;
+        }
+        if self.output.status == CallStatus::Predicated {
+            self.output.error_code = None;
+        }
+        if self.output.status != CallStatus::Ok || !self.reports_output {
+            self.output.sampled_logprob = None;
+            self.output.top_logprobs.clear();
+            self.output.prompt_logprobs.clear();
+            self.output.candidate_logprobs.clear();
+        }
+
+        set_progress(&mut self.output, self.progress)?;
+        let [queued_us, device_us, copy_us, host_us] = buffer.observe(self.row)?;
+        self.output.timing_counters = TimingCounters {
+            queued_us,
+            device_us,
+            copy_us,
+            host_us,
+        };
+        self.resolved = true;
+        Ok(())
+    }
+
+    pub fn accept(&self, requests: &mut RequestPool) -> Result<()> {
+        let output = self.result()?;
+        requests.apply_result(
+            output.request_key,
+            output.call_id,
+            output.status,
+            Some(self.progress),
+        )
+    }
+
+    pub fn cancel(&self, requests: &mut RequestPool) -> Result<()> {
+        if !self.resolved {
+            requests.cancel_calls(&[(self.output.request_key, self.output.call_id)])?;
+        }
+        Ok(())
+    }
+
+    fn decode<A>(&mut self, buffer: &mut OutputBuffer<A>) -> Result<()> {
+        if let Some((offset, count)) = self.canvas_range {
+            let Some((&outcome, tokens)) = buffer.read_tokens(offset, count)?.split_first() else {
+                return Err(Error::State("canvas completion has no step outcome"));
+            };
+            if outcome == STEP_SKIPPED {
+                self.output.status = CallStatus::Predicated;
+                return Ok(());
+            }
+            self.output.committed_tokens = if outcome == STEP_STOPPED {
+                tokens
+                    .iter()
+                    .copied()
+                    .map(token_id)
+                    .collect::<Result<_>>()?
+            } else {
+                Vec::new()
+            };
+        }
+
+        if let Some((offset, extent, row)) = self.sampling_range {
+            let values = buffer.read_tokens(offset, extent)?;
+            let count = extent / SAMPLING_FIELDS;
+            if extent % SAMPLING_FIELDS != 0 || row >= count {
+                return Err(Error::State("sampling completion vectors do not align"));
+            }
+
+            // Inactive graph rows never sampled, even if their unused
+            // distribution is invalid. Their predicate takes precedence.
+            if values[count + row] == 0 {
+                self.output.status = CallStatus::Predicated;
+                return Ok(());
+            }
+            if values[row] == 0 {
+                self.output.status = CallStatus::Error;
+                self.output.error_code = Some(ErrorCode::InvalidCall);
+                return Ok(());
+            }
+            self.accept_tokens(values[count * 2 + row], values[count * 3 + row])?;
+        }
+
+        if !self.reports_output {
+            return Ok(());
+        }
+        if let Some(span) = self.logprob_range {
+            let values = buffer.logprob_values(span)?;
+            self.output.sampled_logprob = values.first().map(|entry| entry.logprob);
+            self.output.top_logprobs = values.to_vec();
+        }
+        self.output.prompt_logprobs = self
+            .prompt_logprob_ranges
+            .iter()
+            .map(|&span| buffer.logprob_values(span).map(<[_]>::to_vec))
+            .collect::<Result<_>>()?;
+        if let Some((offset, count)) = self.candidate_range {
+            self.output.candidate_logprobs = buffer
+                .read_tokens(offset, count)?
+                .iter()
+                .map(|&word| f32::from_bits(word as u32))
+                .collect();
+        }
+        Ok(())
+    }
+
+    fn accept_tokens(&mut self, sampled: i64, accepted: i64) -> Result<()> {
+        let Some(speculation) = &self.speculation else {
+            self.output.committed_tokens = vec![token_id(sampled)?];
+            return Ok(());
+        };
+        let accepted = usize::try_from(accepted)
+            .ok()
+            .filter(|&count| count <= speculation.draft_tokens.len())
+            .ok_or(Error::State(
+                "speculative acceptance count is outside the draft span",
+            ))?;
+        let mut tokens = speculation.draft_tokens[..accepted].to_vec();
+        if speculation
+            .terminal_prefix
+            .is_none_or(|terminal| accepted < terminal)
+        {
+            tokens.push(token_id(sampled)?);
+        }
+
+        let base = speculation.base;
+        let visible = base.kv_visible_len + tokens.len() as u64;
+        if self.progress.kv_computed_len != base.kv_computed_len || visible > base.kv_computed_len {
+            return Err(Error::State(
+                "speculative acceptance exceeds initialized KV state",
+            ));
+        }
+        self.progress.logical_position = base.logical_position + tokens.len() as u64;
+        self.progress.rng_counter = base.rng_counter + tokens.len() as u64;
+        self.progress.kv_visible_len = visible;
+        self.output.committed_tokens = tokens;
+        Ok(())
+    }
+}
+
+/// Successful completion and batch failure start from the same wire result.
+pub fn request_output(
+    key: RequestKey,
+    id: CallId,
+    code: CallKind,
+    progress: RequestProgress,
+) -> Result<RequestOutput> {
+    let mut output = RequestOutput {
+        request_key: key,
+        call_id: id,
+        code,
+        status: CallStatus::Ok,
+        product_generations: Vec::new(),
+        error_code: None,
+        timing_counters: Default::default(),
+        position: 0,
+        kv_visible_len: 0,
+        kv_computed_len: 0,
+        num_completed_steps: 0,
+        committed_tokens: Vec::new(),
+        sampled_logprob: None,
+        top_logprobs: Vec::new(),
+        prompt_logprobs: Vec::new(),
+        candidate_logprobs: Vec::new(),
+        finish_flags: Default::default(),
+        media_output: None,
+        kv_output: None,
+    };
+    set_progress(&mut output, progress)?;
+    Ok(output)
+}
+
+fn set_progress(output: &mut RequestOutput, progress: RequestProgress) -> Result<()> {
+    let narrow = |value| {
+        u32::try_from(value).map_err(|_| Error::State("request coordinate exceeds its wire range"))
+    };
+    output.position = narrow(progress.logical_position)?;
+    output.kv_visible_len = narrow(progress.kv_visible_len)?;
+    output.kv_computed_len = narrow(progress.kv_computed_len)?;
+    output.num_completed_steps = narrow(progress.flow_step)?;
+    Ok(())
+}
+
+fn token_id(value: i64) -> Result<u32> {
+    u32::try_from(value).map_err(|_| Error::State("sampled token is outside the token id range"))
+}

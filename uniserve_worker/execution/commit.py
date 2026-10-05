@@ -19,43 +19,11 @@ if TYPE_CHECKING:
 
 
 def validate_outputs(state: BatchState) -> None:
-    """Check numerical result descriptors and captured score capacity."""
+    """Check numerical publications against their requested tensor views."""
     for call, outcome in zip(
         state.batch.calls, state.pending_outputs(), strict=True
     ):
         _validate_completion_products(call, outcome.products)
-
-        if outcome.kv_output is not None:
-            if outcome.kv_output.source != call.kv_output:
-                raise invalid_descriptor(
-                    "KV publication differs from its declared output"
-                )
-            if (
-                sum(tensor.nbytes for tensor in outcome.kv_output.tensors)
-                > call.bounds.max_transfer_bytes
-            ):
-                raise invalid_descriptor(
-                    "KV publication exceeds its transfer-byte bound"
-                )
-            # Called only for its check, which raises when the descriptor
-            # exceeds ``MAX_TRANSFER_HANDLE_BYTES`` or names an unknown
-            # transport.
-            outcome.kv_output.encoded_size_bound()
-
-        score_spans = outcome.token.prompt_logprob_ranges
-        if outcome.token.logprob_range is not None:
-            score_spans = (outcome.token.logprob_range, *score_spans)
-        if score_spans:
-            buffer = outcome._buffer
-            if buffer is None:
-                raise RuntimeError("logprob output lost its pinned range")
-            if (
-                buffer.logprob_bytes(score_spans)
-                > call.bounds.max_completion_bytes
-            ):
-                raise invalid_descriptor(
-                    "logprob result exceeds its registered completion capacity"
-                )
 
 
 def apply_decode_state(
@@ -73,9 +41,9 @@ def apply_decode_state(
     states = decode_state
     if states is None:
         if any(
-            request.token.sampled is not None
-            or request.token.runtime_prompt_logits is not None
-            or request.token.runtime_cache_length is not None
+            request.token_update.sampled is not None
+            or request.token_update.runtime_prompt_logits is not None
+            or request.token_update.runtime_cache_length is not None
             for request in requests
         ):
             raise RuntimeError(
@@ -86,23 +54,23 @@ def apply_decode_state(
     # Install lengths before advancing tokens. Decode rows share one update;
     # prefill/verification retain their explicit logical and RNG coordinates.
     for request in requests:
-        if request.token.runtime_cache_length is not None:
+        if request.token_update.runtime_cache_length is not None:
             states.set_cache_length(
                 int(request.request.request_pool_idx),
-                request.token.runtime_cache_length,
+                request.token_update.runtime_cache_length,
             )
 
     decode = tuple(
         request
         for request in requests
-        if request.token.sampled is not None
-        and request.token.runtime_decode_increment
+        if request.token_update.sampled is not None
+        and request.token_update.runtime_decode_increment
     )
     if decode:
         samples = tuple(
-            request.token.sampled
+            request.token_update.sampled
             for request in decode
-            if request.token.sampled is not None
+            if request.token_update.sampled is not None
         )
         if any(sample.request_pool_index is None for sample in samples):
             raise RuntimeError("decode samples have no device request slots")
@@ -120,31 +88,34 @@ def apply_decode_state(
             tokens=tokens,
             predicates=continuation,
             penalty_bases=tuple(
-                request.token.runtime_penalty_base for request in decode
+                request.token_update.runtime_penalty_base for request in decode
             ),
             valid=valid,
             active=active,
         )
 
     for request in requests:
-        sampled = request.token.sampled
-        if sampled is not None and not request.token.runtime_decode_increment:
+        sampled = request.token_update.sampled
+        if (
+            sampled is not None
+            and not request.token_update.runtime_decode_increment
+        ):
             states.apply_tokens(
                 (int(request.request.request_pool_idx),),
                 tokens=sampled.tokens,
                 predicates=sampled.continuation,
-                logical_position=request.token.runtime_logical_position,
-                sampling_position=request.token.runtime_sampling_position,
-                penalty_bases=(request.token.runtime_penalty_base,),
+                logical_position=request.token_update.runtime_logical_position,
+                sampling_position=request.token_update.runtime_sampling_position,
+                penalty_bases=(request.token_update.runtime_penalty_base,),
                 valid=sampled.valid,
                 active=sampled.active,
             )
 
     for request in requests:
-        if request.token.runtime_prompt_logits is not None:
+        if request.token_update.runtime_prompt_logits is not None:
             states.set_prompt_logits(
                 int(request.request.request_pool_idx),
-                request.token.runtime_prompt_logits,
+                request.token_update.runtime_prompt_logits,
             )
 
 

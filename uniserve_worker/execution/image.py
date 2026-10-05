@@ -51,11 +51,9 @@ from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.batch import TensorPublication
 from uniserve_worker.protocol.call import (
     Call,
-    CallStatus,
     ForwardMode,
     MediaCall,
 )
-from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import (
     EncoderTransferValue,
@@ -136,12 +134,6 @@ def text(
         raise RuntimeError("module output has no execution statistics")
     state.forward_stats.append(result.stats)
 
-    request.status = CallStatus.OK
-    request.progress = calls.execution_runtime(request, None)
-    request.finish_flags = FinishFlags()
-    request.product_generations = tuple(
-        output.generation for output in call.tensor_outputs()
-    )
     request.products = products
     return request
 
@@ -475,18 +467,14 @@ def state_outcome(
     """
     request = state.pending_output(call.request_key.request_id)
     cache = calls.cache_coordinates(request, tables=request_tables)
-    selected = request.token.runtime_cache_length
+    selected = request.token_update.runtime_cache_length
     if selected is None:
         selected = cache[1]
     if not isinstance(selected, int):
         raise RuntimeError("visual state completion has a dynamic KV length")
     cache = (cache[0], selected, cache[2])
 
-    request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, cache)
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
-    request.token.committed_tokens = ()
     request.products = products
     return request
 
@@ -500,16 +488,12 @@ def non_state_outcome(
 ) -> PendingOutput:
     """Record a stateless completion and its already materialized products.
 
-    ``completion_tasks`` become the call's ``host.tasks``, which must finish
+    ``completion_tasks`` become the call's ``host_tasks``, which must finish
     before its output is ready.
     """
     request = state.pending_output(call.request_key.request_id)
-    request.status = CallStatus.OK
-    request.progress = calls.execution_runtime(request, None)
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
-    request.host.tasks = completion_tasks
+    request.set_host_tasks(completion_tasks)
     return request
 
 
@@ -901,9 +885,9 @@ def defer_image_encoding(
 
     capture = state.output_buffer.capture_bytes(quantized)
     pending = state.pending_output(call.request_key.request_id)
-    if len(pending.host.tasks) != 1:
+    if len(pending.host_tasks) != 1:
         raise RuntimeError("materialization has no registered CPU task slot")
-    reservation = pending.host.tasks[0]
+    reservation = pending.host_tasks[0]
 
     def encode() -> bytes:
         payload = uint8_image_to_png_base64_bytes(capture)

@@ -24,9 +24,8 @@ from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.output import (
-    HostResult,
     LatentResult,
-    TokenResult,
+    TokenUpdate,
 )
 from uniserve_worker.execution.request import RequestProgress, RequestResult
 from uniserve_worker.protocol.batch import (
@@ -51,8 +50,8 @@ from uniserve_worker.protocol.identity import (
 )
 from uniserve_worker.protocol.output import (
     BatchOutput,
-    FinishFlags,
     ForwardStats,
+    MediaOutput,
     RequestOutput,
 )
 from uniserve_worker.protocol.tensor import TensorRef
@@ -324,14 +323,9 @@ class PendingOutput:
 
     call: Call
     request: Request
-    token: TokenResult
+    token_update: TokenUpdate
     latent: LatentResult
-    host: HostResult
     progress: RequestProgress
-    status: CallStatus
-    error_code: ErrorCode | None
-    finish_flags: FinishFlags
-    product_generations: tuple[int, ...]
     tensor_exports: dict[BufferId, ExportLocations]
     cache_exports: dict[BufferId, ExportLocations]
     exported_locators: list[Locator]
@@ -345,9 +339,35 @@ class PendingOutput:
     transition_write: Buffer | None
     completion_write: Buffer | None
     producer_write: Buffer | None
-    kv_output: KvTransfer | None
     products: tuple[TensorPublication, ...]
 
+    def set_sampling(
+        self,
+        sampling: tuple[int, int, int],
+        logprobs: tuple[int, int, int] | None = None,
+    ) -> None: ...
+    def add_prompt_logprobs(
+        self, spans: Sequence[tuple[int, int, int]]
+    ) -> None: ...
+    def set_candidates(self, span: tuple[int, int]) -> None: ...
+    def set_canvas(self, span: tuple[int, int]) -> None: ...
+    def set_tokens(self, tokens: Sequence[int]) -> None: ...
+    def set_speculation(
+        self,
+        draft_tokens: Sequence[int],
+        terminal_prefix: int | None,
+        visible: int,
+        initialized: int,
+    ) -> None: ...
+    @property
+    def host_tasks(self) -> tuple[HostTask[Any], ...]: ...
+    def set_host_tasks(
+        self,
+        tasks: Sequence[HostTask[Any]],
+        finish: Callable[[tuple[object, ...]], None] | None = None,
+    ) -> None: ...
+    def set_media(self, media: MediaOutput) -> None: ...
+    def set_kv_output(self, output: KvTransfer) -> None: ...
     @property
     def request_key(self) -> RequestKey: ...
     @property
@@ -357,7 +377,9 @@ class PendingOutput:
     @property
     def value(self) -> RequestOutput | None: ...
     @property
-    def _buffer(self) -> OutputBuffer | None: ...
+    def status(self) -> CallStatus: ...
+    @property
+    def error_code(self) -> ErrorCode | None: ...
     def ready(self) -> bool: ...
     def materialize(self) -> RequestOutput:
         """Resolve completed work once; retain accepted progress on failure."""
@@ -393,7 +415,6 @@ class OutputBuffer:
         max_requested: int,
     ) -> None:
         """Describe one captured score column before sealing the buffer."""
-    def logprob_bytes(self, spans: Sequence[tuple[int, int, int]]) -> int: ...
     def observe(self, row: int) -> tuple[int, int]: ...
     def timing(self) -> tuple[int, int, int, int]: ...
     def discard(self, row: int) -> None: ...

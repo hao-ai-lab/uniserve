@@ -1,5 +1,6 @@
 """Host results retain their output row until delivery or abandonment."""
 
+from dataclasses import replace
 from multiprocessing import shared_memory
 
 import pytest
@@ -58,17 +59,19 @@ def test_media_delivery_releases_the_output_row(output, finish_callback):
     pending, buffer, buffers, lane = output
     payload = b"encoded image bytes"
     task = lane.reserve().configure(lambda: payload)
-    pending.host.tasks = (task,)
+    finish = None
     if finish_callback:
 
         def finish(results):
             # The numerical callback may update its own result object.
             data = b"".join(results)
-            pending.host.media = MediaOutput(
-                PosixShmArtifact(publish_media_bytes(data)), len(data)
+            pending.set_media(
+                MediaOutput(
+                    PosixShmArtifact(publish_media_bytes(data)), len(data)
+                )
             )
 
-        pending.host.finish = finish
+    pending.set_host_tasks((task,), finish=finish)
 
     task.submit_if_ready()
     task.result(timeout=5)
@@ -93,12 +96,20 @@ def test_media_delivery_releases_the_output_row(output, finish_callback):
 
 def test_failed_host_work_reports_compute_error_and_releases_the_row(output):
     pending, buffer, buffers, lane = output
+    pending.progress = replace(
+        pending.progress,
+        logical_position=8,
+        flow_step=3,
+        rng_counter=2,
+        kv_visible_len=8,
+        kv_computed_len=10,
+    )
 
     def encode():
         raise ValueError("codec failed")
 
     task = lane.reserve().configure(encode)
-    pending.host.tasks = (task,)
+    pending.set_host_tasks((task,))
     task.submit_if_ready()
     with pytest.raises(ValueError, match="codec failed"):
         task.result(timeout=5)
@@ -111,5 +122,10 @@ def test_failed_host_work_reports_compute_error_and_releases_the_row(output):
     assert pending.error_code is result.error_code
     assert result.committed_tokens == ()
     assert result.media_output is None
+    assert result.num_completed_steps == 0
+    assert (
+        result.position == result.kv_visible_len == result.kv_computed_len == 0
+    )
+    assert pending.progress.rng_counter == 0
     replacement = buffers.acquire(1, token_capacity=1)
     replacement.abandon()

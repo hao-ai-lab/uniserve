@@ -201,7 +201,7 @@ impl BatchState {
         let calls = batch.bind(py).getattr("calls")?;
         let mut outputs = Vec::with_capacity(plan.calls.len());
         for (index, (call, request)) in plan.calls.iter().zip(bindings).enumerate() {
-            let mut output = PendingOutput::for_call(
+            let output = PendingOutput::for_call(
                 py,
                 calls.get_item(index)?.unbind(),
                 call,
@@ -210,7 +210,7 @@ impl BatchState {
                 index,
             )?;
             if predicated.contains(&call.request_key.request_id.0) {
-                output.status = CallStatus::Predicated;
+                output.lock(py)?.output.status = CallStatus::Predicated;
             }
             outputs.push(Py::new(py, output)?);
         }
