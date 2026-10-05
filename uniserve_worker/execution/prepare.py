@@ -1759,7 +1759,7 @@ def _stage_input_products(
         buffer = write.export.source
         if buffer not in cache_inputs:
             continue
-        if not write.completion.done():
+        if not write.done():
             raise invalid_descriptor(
                 "KV input has no query-ready physical import"
             )

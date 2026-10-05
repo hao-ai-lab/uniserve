@@ -43,7 +43,7 @@ pub use host::{HostAction, HostLane, HostTask};
 pub use host_buffers::HostBuffers;
 pub use inputs::{BatchInputs, InputReady, InputWait};
 pub use kv_cache::KVCacheManager;
-pub use kv_import::{KVImport, KVImporter};
+pub use kv_import::{ImportBackend, ImportCopy, KVImport, KVImporter};
 pub use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
 pub use microbatches::{Microbatches, yield_microbatch};
 pub use output::{LogprobLayout, OutputBuffer, OutputPool, OutputStorage};

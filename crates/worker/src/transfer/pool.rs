@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread::ThreadId;
 
-use crate::cuda::{DeviceGuard, Stream};
+use crate::cuda::Stream;
 use crate::{Error, HostAction, HostLane, HostTask, Outcome, Result};
 
 use super::{ReadReservation, TransferCapacity, TransferTicket};
@@ -261,8 +261,7 @@ impl<B: ReadBackend> TransferPool<B> {
             return Ok(Arc::clone(stream));
         }
 
-        let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
-        let stream = Arc::new(Stream::new().map_err(Error::Cuda)?);
+        let stream = Arc::new(Stream::new(device).map_err(Error::Cuda)?);
         state.streams.insert(key, Arc::clone(&stream));
         Ok(stream)
     }

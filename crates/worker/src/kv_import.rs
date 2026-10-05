@@ -8,6 +8,10 @@ use uniserve_worker_ipc::{BufferId, RequestKey};
 
 use crate::{Completion, Error, Result};
 
+mod copy;
+
+pub use copy::{ImportBackend, ImportCopy};
+
 struct ImportState<T, W> {
     reads: Vec<Arc<T>>,
     workspace: Option<Arc<W>>,
@@ -51,12 +55,16 @@ impl<T, W> KVImport<T, W> {
         self.lock().released
     }
 
-    pub fn start(&self) {
+    fn drained(&self) -> bool {
+        self.lock().drained
+    }
+
+    fn start(&self) {
         self.lock().started = true;
     }
 
     /// A copy that could not drain its stream keeps all backing retained.
-    pub fn finish(&self, drained: bool) {
+    fn finish(&self, drained: bool) {
         let mut state = self.lock();
         state.finished = true;
         state.drained = drained;
@@ -64,7 +72,7 @@ impl<T, W> KVImport<T, W> {
 
     /// Cancelling a queued host task never enters its action. Its destination
     /// has no device access to drain, but still needs normal import retirement.
-    pub fn task_done(&self) {
+    fn task_done(&self) {
         let mut state = self.lock();
         if !state.started {
             state.finished = true;

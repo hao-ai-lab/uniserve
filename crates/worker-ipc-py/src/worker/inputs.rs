@@ -9,7 +9,7 @@ use uniserve_worker::{BatchInputs as NativeInputs, InputReady, InputWait as Nati
 
 use super::completion::Completion;
 use super::host::HostTask;
-use super::kv_import::{CopyCompletion, KVImport, KVImporter};
+use super::kv_import::{KVImport, KVImporter};
 use super::latent::{LatentImport, LatentPool};
 use super::output::OutputBuffer;
 use super::protocol::{buffer_id, call_id};
@@ -39,10 +39,7 @@ impl Input {
                 .iter()
                 .map(|ticket| Dependency::Transfer(ticket.owner.clone_ref(py)))
                 .collect(),
-            Self::Cache(write) => vec![match &write.get().completion {
-                CopyCompletion::Task(task) => Dependency::Task(task.clone_ref(py)),
-                CopyCompletion::Immediate(done) => Dependency::Completion(done.clone_ref(py)),
-            }],
+            Self::Cache(write) => vec![Dependency::Cache(write.clone_ref(py))],
             Self::Borrowed => Vec::new(),
         }
     }
@@ -78,13 +75,14 @@ impl InputReady for Input {
                 }
                 Ok(true)
             }
-            Self::Cache(write) => Ok(write.get().completion.done(py)),
+            Self::Cache(write) => Ok(write.get().done()),
             Self::Borrowed => Ok(true),
         })
     }
 }
 
 enum Dependency {
+    Cache(Py<KVImport>),
     Completion(Py<Completion>),
     Task(Py<HostTask>),
     Transfer(Py<TransferTicket>),
@@ -94,6 +92,7 @@ enum Dependency {
 impl Dependency {
     fn clone_ref(&self, py: Python<'_>) -> Self {
         match self {
+            Self::Cache(value) => Self::Cache(value.clone_ref(py)),
             Self::Completion(value) => Self::Completion(value.clone_ref(py)),
             Self::Task(value) => Self::Task(value.clone_ref(py)),
             Self::Transfer(value) => Self::Transfer(value.clone_ref(py)),
@@ -103,6 +102,7 @@ impl Dependency {
 
     fn subscribe(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
         match self {
+            Self::Cache(value) => KVImport::add_done_callback(value.bind(py), callback),
             Self::Completion(value) => Completion::add_done_callback(value.bind(py), callback),
             Self::Task(value) => HostTask::add_done_callback(value.bind(py), callback),
             Self::Transfer(value) => value.get().add_done_callback(py, callback)?,
@@ -115,6 +115,7 @@ impl Dependency {
 
     fn visit(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
         match self {
+            Self::Cache(value) => visit.call(value),
             Self::Completion(value) => visit.call(value),
             Self::Task(value) => visit.call(value),
             Self::Transfer(value) => visit.call(value),
@@ -128,6 +129,7 @@ impl InputReady for Dependency {
 
     fn ready(&self) -> PyResult<bool> {
         Python::attach(|py| match self {
+            Self::Cache(value) => Ok(value.get().done()),
             Self::Completion(value) => Ok(value.borrow(py).done()),
             Self::Task(value) => Ok(value.borrow(py).done()),
             Self::Transfer(value) => value.get().ready(py),

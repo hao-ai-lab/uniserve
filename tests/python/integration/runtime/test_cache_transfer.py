@@ -77,7 +77,7 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
         )
         # A pending producer cannot complete the read. The destination remains
         # reserved while an unrelated page is usable.
-        assert not write.completion.done()
+        assert not write.done()
         assert not pool.retirement_ready(requests=(source.owner,))
         with pytest.raises(WorkerError, match="import destination"):
             pool.zero_units((1,))
@@ -107,7 +107,7 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
 
         pool.imports.cancel_requests(frozenset((source.owner,)))
         with pytest.raises(WorkerError, match="cancelled"):
-            write.completion.result(timeout=5)
+            write.result(timeout=5)
         write.retirement.result(timeout=5)
         assert pool.retirement_ready(requests=(source.owner,))
         parent.send("settled")
@@ -186,13 +186,14 @@ def test_shutdown_retires_running_and_queued_import_destinations() -> None:
         # Five pending copies exceed the import lane's four execution threads.
         # Cancelling copy tasks leaves running readers for import shutdown to
         # drain. Queued copies never enter the numerical action at all.
-        assert all(not write.completion.done() for write in writes)
+        assert all(not write.done() for write in writes)
         for write in writes:
-            write.completion.cancel()
+            if write.cancel():
+                assert write.cancelled
         pool.imports.stop()
         consumer.close()
         for write in writes:
-            assert write.completion.done()
+            assert write.done()
             write.retirement.result(timeout=5)
         pool.imports.require_retired()
         pool.zero_units(tuple(range(1, 6)))
@@ -448,7 +449,7 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
                 transports={transports[1].name: transports[1]},
             )
             writes.append(write)
-            write.completion.result(timeout=30)
+            write.result(timeout=30)
             if device.startswith("cuda"):
                 torch.cuda.synchronize(device)
             result = exports[1].install(
@@ -663,7 +664,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                     transports={backend: transport},
                 )
                 writes.append((pool, write))
-                write.completion.result(timeout=30)
+                write.result(timeout=30)
                 installed = _buffer(100 + call)
                 value = owner.install(
                     installed_buffer=installed,
@@ -826,7 +827,7 @@ def test_deep_kv_export_fits_its_descriptor_and_installs(
             initialized_units=pages,
             transports={peer: transports[2][peer]},
         )
-        write.completion.result(timeout=60)
+        write.result(timeout=60)
         target.install(installed_buffer=_buffer(101), write=write)
         for layer, name in enumerate(target.cache.groups[0].layers):
             key, value = target.cache.state(name).read(
@@ -930,7 +931,7 @@ def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes()
                 transports={"local": transports[2]},
             )
             writes.append(write)
-            write.completion.result(timeout=10)
+            write.result(timeout=10)
             installed = _buffer(100 + call)
             result = owners[2].install(
                 installed_buffer=installed,

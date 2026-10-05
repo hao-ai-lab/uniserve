@@ -41,6 +41,14 @@ class TransferTicket(tvm_ffi.Object):
     """Native read readiness and retirement with a DLPack destination view."""
 
 
+class KVImporter(tvm_ffi.Object):
+    """Native KV copy admission, workspaces and retirement."""
+
+
+class KVImport(tvm_ffi.Object):
+    """A KV destination retained through copying and adoption or abandonment."""
+
+
 class CUDAStream(tvm_ffi.Object):
     """Native stream, SM partition and submission fences."""
 
@@ -99,6 +107,8 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.HostBuffers")(HostBuffers)
     tvm_ffi.register_object("uniserve.ffi.TransferPool")(TransferPool)
     tvm_ffi.register_object("uniserve.ffi.TransferTicket")(TransferTicket)
+    tvm_ffi.register_object("uniserve.ffi.KVImporter")(KVImporter)
+    tvm_ffi.register_object("uniserve.ffi.KVImport")(KVImport)
     tvm_ffi.register_object("uniserve.ffi.CUDAStream")(CUDAStream)
     tvm_ffi.register_object("uniserve.ffi.CUDAEvent")(CUDAEvent)
     tvm_ffi.register_object("uniserve.ffi.DescriptorGrants")(DescriptorGrants)

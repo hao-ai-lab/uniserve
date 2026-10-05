@@ -51,7 +51,6 @@ impl<T> WeightPrefetch<T> {
             ));
         }
 
-        let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
         Ok(Self {
             device,
             layers: layers
@@ -60,7 +59,7 @@ impl<T> WeightPrefetch<T> {
                 .map(|(i, layer)| (layer, i))
                 .collect(),
             copies: copies.into_iter().map(plan).collect(),
-            stream: Stream::new().map_err(Error::Cuda)?,
+            stream: Stream::new(device).map_err(Error::Cuda)?,
             ready: std::array::from_fn(|_| Event::external(device)),
             consumed: std::array::from_fn(|_| Event::external(device)),
             state: Mutex::new(State {

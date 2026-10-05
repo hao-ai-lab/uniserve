@@ -16,6 +16,7 @@ use execution::{failure, lock};
 mod descriptor_grants;
 mod execution;
 mod host;
+mod kv_import;
 mod shared_buffer;
 mod stream;
 mod transfer;
@@ -430,6 +431,7 @@ fn register() -> Result<()> {
     vmm_pool::register()?;
     stream::register()?;
     transfer::register()?;
+    kv_import::register()?;
     object::<ExecutorObj>();
     object::<SubmissionObj>();
     object::<WorkerRequestObj>();

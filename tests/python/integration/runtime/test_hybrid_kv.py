@@ -132,7 +132,7 @@ def test_export_carries_each_group_from_its_first_needed_token(backend, device):
             initialized_units=(21, 22, 23, 24, 25, 3, 4),
             transports={backend: transports[1]},
         )
-        write.completion.result(timeout=30)
+        write.result(timeout=30)
         if device.startswith("cuda"):
             torch.cuda.synchronize(device)
         installed = _buffer(101)

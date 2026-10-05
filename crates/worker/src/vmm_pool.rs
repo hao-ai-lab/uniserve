@@ -68,7 +68,6 @@ impl<B> VmmPool<B> {
     /// `address` must identify that mapping. All producer streams passed to
     /// reserve remain valid through close, which drains header initialization.
     pub unsafe fn new(backing: B, device: i32, address: usize, capacity: usize) -> Result<Self> {
-        let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
         Ok(Self {
             backing: Some(backing),
             device,
@@ -77,7 +76,7 @@ impl<B> VmmPool<B> {
             watermark: 0,
             allocations: BTreeMap::new(),
             initializers: HashSet::new(),
-            stream: Stream::new().map_err(Error::Cuda)?,
+            stream: Stream::new(device).map_err(Error::Cuda)?,
             completion: Event::new(device, false, false),
             observed: Vec::new(),
             readback: Vec::new(),

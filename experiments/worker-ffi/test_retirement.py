@@ -11,8 +11,10 @@ from bindings import (
     CUDAStream,
     Executor,
     HostBuffers,
+    KVImporter,
     TransferPool,
     VmmPool,
+    WorkerRequest,
     load_library,
 )
 from uniserve_kernels.peer_storage import copy_host_device, empty
@@ -20,8 +22,9 @@ from uniserve_kernels.peer_storage import copy_host_device, empty
 from tests.python.fixtures.cuda_stream import blocked_stream
 
 
-def _retire(library, resource, owner):
+def _retire(library, resource, owner, kv_request):
     load_library(library)
+    value = KVImporter(1, 1, 0) if resource == "kv_import" else None
     output = torch.zeros(32, dtype=torch.int64, device="cuda:0")
     host = torch.full((32,), 17, pin_memory=True)
     backing = (
@@ -77,6 +80,24 @@ def _retire(library, resource, owner):
                         output,
                         output.numel() * output.element_size(),
                     )
+                elif resource == "kv_import":
+                    copied = Event()
+
+                    def copy(_workspace, handle):
+                        numerical = torch.cuda.ExternalStream(handle, device=0)
+                        numerical.wait_stream(stream)
+                        with torch.cuda.stream(numerical):
+                            output.fill_(17)
+                        copied.set()
+
+                    value.reserve(
+                        WorkerRequest(kv_request),
+                        0,
+                        1,
+                        tvm_ffi.convert_func(lambda _workspace, _stream: None),
+                        tvm_ffi.convert_func(copy),
+                    )
+                    assert copied.wait(5)
                 else:
                     value = CUDAStream(0, stream.cuda_stream, 2)
                     output.fill_(17)
@@ -101,15 +122,23 @@ def _retire(library, resource, owner):
 
 
 @pytest.mark.parametrize(
-    "resource", ("buffers", "executor", "stream", "vmm_pool", "transfer")
+    "resource",
+    ("buffers", "executor", "stream", "vmm_pool", "transfer", "kv_import"),
 )
 @pytest.mark.parametrize("owner", ("object", "array", "any"))
-def test_final_owner_drains_without_blocking_python(request, resource, owner):
+def test_final_owner_drains_without_blocking_python(
+    request, resource, owner, kv_request
+):
     # A GIL deadlock prevents in-process timeouts from running. The parent
     # process must remain independent so a regression cannot hang pytest.
     process = multiprocessing.get_context("spawn").Process(
         target=_retire,
-        args=(request.config.getoption("--ffi-library"), resource, owner),
+        args=(
+            request.config.getoption("--ffi-library"),
+            resource,
+            owner,
+            kv_request.encode(),
+        ),
     )
     process.start()
     try:
