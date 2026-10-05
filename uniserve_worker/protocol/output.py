@@ -128,7 +128,7 @@ class PosixShmArtifact:
     """Identifies a completed media artifact stored in POSIX shared storage.
 
     The worker writes the bytes and closes its mapping before publishing the
-    name (`uniserve_worker.media.storage.publish_media_bytes`); the engine
+    name through the native media publisher; the engine
     claims the object by name, which unlinks it, when it receives the batch
     result.
     """

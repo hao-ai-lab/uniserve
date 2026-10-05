@@ -1,7 +1,7 @@
 """Physically backed shared allocations used by media and transport owners.
 
 A producer creates a POSIX shared-memory segment with
-`allocate_shared_storage` (used by `ShmTransport` and `media.storage`), and
+`allocate_shared_storage` (used by `ShmTransport`), and
 a reader on the same host maps it by name with `open_shared_storage`, which
 resolves the name with `shm_open`. Both operations use POSIX segment names;
 the mount path of the shared-memory filesystem is not needed.

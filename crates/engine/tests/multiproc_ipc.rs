@@ -33,7 +33,7 @@ use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode}
 use anyhow::Context as _;
 use uniserve_core::{
     DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, Request, RequestId, RuntimeFamily,
-    SamplingParams, UnitId,
+    SamplingParams, SharedMedia, UnitId,
 };
 use uniserve_engine::{
     CallReaders, EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup,
@@ -1416,8 +1416,9 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         let published_name = std::fs::read_to_string(&name_path)?;
         // The receiver claims the POSIX name even when correlation, rank ownership,
         // or extent validation rejects the result. Retained mappings keep the bytes.
+        // SAFETY: the fixture handed off an immutable, completed publication.
         assert!(
-            !Path::new("/dev/shm").join(published_name.trim()).exists(),
+            unsafe { SharedMedia::open(published_name.trim(), 1) }.is_err(),
             "unclaimed media in {case}"
         );
         if rejected {

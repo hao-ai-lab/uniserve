@@ -33,6 +33,7 @@ mod weight_prefetch;
 
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(pending::publish_media_bytes, module)?)?;
     module.add_class::<descriptor_grants::DescriptorGrants>()?;
     module.add_function(wrap_pyfunction!(
         descriptor_grants::fetch_descriptor,

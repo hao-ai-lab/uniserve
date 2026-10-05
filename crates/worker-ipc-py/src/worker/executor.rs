@@ -15,11 +15,11 @@ use pyo3::types::{PyDict, PyType};
 use pythonize::depythonize;
 use uniserve_core::CallId;
 use uniserve_worker::{
-    Backend, Batch, Executor as NativeExecutor, Service, ServiceBackend,
+    Backend, Batch, BatchResult, Executor as NativeExecutor, Service, ServiceBackend,
     Submission as NativeSubmission,
 };
 use uniserve_worker_ipc::{
-    Batch as BatchPlan, BatchOutput, ForwardStats, RequestKind, WorkerInfo, WorkerResponseError,
+    Batch as BatchPlan, ForwardStats, RequestKind, WorkerInfo, WorkerResponseError,
 };
 
 use super::events::EventPool;
@@ -80,7 +80,7 @@ struct BatchState {
     imports: bool,
     committed: bool,
     propagate_errors: bool,
-    output: Option<BatchOutput>,
+    output: Option<BatchResult>,
     execution_us: Option<u64>,
     stats: Option<ForwardStats>,
     retirement: Retirement,
@@ -220,7 +220,7 @@ impl PythonBackend {
 
 impl Backend for PythonBackend {
     type Batch = BatchState;
-    type Output = BatchOutput;
+    type Output = BatchResult;
     type Error = Py<PyBaseException>;
 
     fn error(&self, error: uniserve_worker::Error) -> Self::Error {
@@ -306,10 +306,12 @@ impl Backend for PythonBackend {
                 .execute_batch(py, batch)
                 .map_err(|error| error.into_value(py))?;
             if !failure.is_none() {
-                batch.output = Some(
-                    self.failed_output(py, batch, &failure)
+                batch.output = Some(BatchResult {
+                    output: self
+                        .failed_output(py, batch, &failure)
                         .map_err(|error| error.into_value(py))?,
-                );
+                    media: Vec::new(),
+                });
             }
             Ok(())
         })
@@ -345,10 +347,14 @@ impl Backend for PythonBackend {
     }
 
     fn result(&mut self, batch: &mut Self::Batch) -> Result<Self::Output, Self::Error> {
-        batch.output.clone().ok_or_else(|| {
+        let result = batch.output.as_mut().ok_or_else(|| {
             Python::attach(|py| {
                 PyRuntimeError::new_err("batch output is not resolved").into_value(py)
             })
+        })?;
+        Ok(BatchResult {
+            output: result.output.clone(),
+            media: std::mem::take(&mut result.media),
         })
     }
 
@@ -623,7 +629,13 @@ impl Executor {
         self.executor_mut()?
             .poll(&submission.submission)
             .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))?
-            .map(|output| convert::batch_output_to_py(py, &output))
+            .map(|result| {
+                let output = convert::batch_output_to_py(py, &result.output)?;
+                for source in result.media {
+                    source.into_locator();
+                }
+                Ok(output)
+            })
             .transpose()
     }
 

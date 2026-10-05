@@ -45,7 +45,7 @@ pub use kv_import::{KVImport, KVImporter};
 pub use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
 pub use microbatches::{Microbatches, yield_microbatch};
 pub use output::{LogprobLayout, OutputBuffer, OutputPool, OutputStorage};
-pub use pending::{PendingOutput, request_output};
+pub use pending::{BatchResult, PendingOutput, request_output};
 pub use registry::{BufferRegistry, RegisteredBuffer};
 pub use request::{Request, RequestPool, RequestProgress};
 pub use service::{Service, ServiceBackend};

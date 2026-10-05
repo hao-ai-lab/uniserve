@@ -15,6 +15,4 @@ crate-type = ["cdylib"]
 tvm-ffi = { git = "https://github.com/apache/tvm-ffi", rev = "df463f9bd269867fc7f4d578d62d80cc2a11d004" }
 uniserve-worker-ipc = { path = "../../crates/worker-ipc" }
 uniserve-worker = { path = "../../crates/worker" }
-
-[dev-dependencies]
 uniserve-core = { path = "../../crates/foundation/core" }
