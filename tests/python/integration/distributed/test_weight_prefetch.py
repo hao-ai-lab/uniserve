@@ -13,6 +13,7 @@ from uniserve.model import TextSize
 from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import Quantizer, ScaleLayout
 from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
+from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.process_groups import (
     Rendezvous,
     initialize_process_groups,
@@ -167,6 +168,32 @@ def _run(rank, port, quantized, prepared, finished):
             stream.synchronize()
             for actual, wanted in zip(eager, expected, strict=True):
                 torch.testing.assert_close(actual, wanted, atol=0, rtol=0)
+
+            # A failed numerical call can leave a speculative read for its
+            # next layer. Retire that invocation without poisoning later
+            # calls or releasing storage still used by other graphs.
+            failure = ValueError(
+                "numerical call rejected after its first layer"
+            )
+
+            def rejected():
+                distributed[0](hidden, ids, weights)
+                raise failure
+
+            with context.activate():
+                with pytest.raises(
+                    RuntimeError, match="active weight prefetch"
+                ):
+                    owner.close()
+                with pytest.raises(ValueError) as raised:
+                    rejected()
+            assert raised.value is failure
+
+            with CUDAGraph(context=context, pools={device: pool}) as failed:
+                with pytest.raises(CUDAGraphError) as raised:
+                    failed.capture(rejected)
+                assert raised.value.__cause__ is failure
+
             graph = scope.enter_context(
                 CUDAGraph(context=context, pools={device: pool})
             )

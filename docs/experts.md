@@ -24,7 +24,9 @@ The colocated MegaMoE provider requires directly mapped NVLink peer memory. Its 
 
 `WeightPrefetch` exposes immutable distributed expert weights through contiguous CUDA virtual views. Resident pages alias published storage; remote pages use two local prefetch slots. Setup is collective, while inference dependencies use local copy and compute events, so replicas can advance at different rates or remain idle. Contexts borrow this owner through `weights=` and serialize their calls within its execution domain.
 
-The CUDA graph owner captures computation around copy submissions that cannot be placed inside a graph. External events preserve dependencies between graph segments and copies. Published peer pages, local slots and their mappings must outlive all contexts and graph replays that read them. Release the owner only after those readers have retired.
+Rust owns the fixed copy plans, copy stream, slot events and invocation progress. It interleaves 2 MiB slices from source peers in each CUDA batch submission. Python assembles the numerical weight views at setup; model calls retain ordinary routed-expert computation. Prefetch overlaps the following layer's reads with current computation, and invocation retirement joins any unused speculative tail copy through a device event.
+
+The CUDA graph owner captures computation around copy submissions that cannot be placed inside a graph. External events preserve dependencies between graph segments and copies. Published peer pages, local slots and their mappings must outlive all contexts and graph replays that read them. Release the owner only after those readers have retired; close drains pending copies without holding the Python GIL.
 
 Install the locked GPU extra to use native expert providers and NVSHMEM. Distributed correctness tests cover weighted outputs, empty participation, repeated graph replay, unequal token counts and independent prefetch progress; they do not establish a preferred deployment ratio or throughput.
 

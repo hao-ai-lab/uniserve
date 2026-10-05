@@ -25,6 +25,7 @@ mod registry;
 mod request;
 mod storage;
 mod transfer;
+mod weight_prefetch;
 
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -36,6 +37,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<graph_storage::GraphStorage>()?;
     module.add_function(wrap_pyfunction!(microbatches::yield_microbatch, module)?)?;
     module.add_class::<microbatches::Microbatches>()?;
+    module.add_class::<weight_prefetch::WeightPrefetch>()?;
     module.add_class::<batch::BatchState>()?;
     module.add_class::<block_tables::BlockTables>()?;
     module.add_class::<block_tables::GroupShape>()?;

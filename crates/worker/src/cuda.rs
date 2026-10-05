@@ -27,10 +27,11 @@ struct Driver {
     primary_retain: unsafe extern "C" fn(*mut Handle, i32) -> Status,
     primary_release: unsafe extern "C" fn(i32) -> Status,
     stream_context: unsafe extern "C" fn(Handle, *mut Handle) -> Status,
+    stream_capture: unsafe extern "C" fn(Handle, *mut i32) -> Status,
     push: unsafe extern "C" fn(Handle) -> Status,
     pop: unsafe extern "C" fn(*mut Handle) -> Status,
     create: unsafe extern "C" fn(*mut Handle, u32) -> Status,
-    record: unsafe extern "C" fn(Handle, Handle) -> Status,
+    record: unsafe extern "C" fn(Handle, Handle, u32) -> Status,
     query: unsafe extern "C" fn(Handle) -> Status,
     synchronize: unsafe extern "C" fn(Handle) -> Status,
     wait: unsafe extern "C" fn(Handle, Handle, u32) -> Status,
@@ -60,7 +61,9 @@ fn driver() -> Result<&'static Driver, String> {
                         .get(b"cuCtxPopCurrent_v2\0")
                         .map_err(|e| e.to_string())?,
                     create: *library.get(b"cuEventCreate\0").map_err(|e| e.to_string())?,
-                    record: *library.get(b"cuEventRecord\0").map_err(|e| e.to_string())?,
+                    record: *library
+                        .get(b"cuEventRecordWithFlags\0")
+                        .map_err(|e| e.to_string())?,
                     query: *library.get(b"cuEventQuery\0").map_err(|e| e.to_string())?,
                     synchronize: *library
                         .get(b"cuEventSynchronize\0")
@@ -76,6 +79,9 @@ fn driver() -> Result<&'static Driver, String> {
                         .map_err(|e| e.to_string())?,
                     stream_context: *library
                         .get(b"cuStreamGetCtx\0")
+                        .map_err(|e| e.to_string())?,
+                    stream_capture: *library
+                        .get(b"cuStreamIsCapturing\0")
                         .map_err(|e| e.to_string())?,
                     elapsed: *library
                         .get(b"cuEventElapsedTime\0")
@@ -141,6 +147,7 @@ pub struct Event {
     device: i32,
     timing: bool,
     interprocess: bool,
+    external: bool,
     handle: Mutex<Option<Arc<EventHandle>>>,
 }
 
@@ -162,7 +169,17 @@ impl Event {
             device,
             timing,
             interprocess,
+            external: false,
             handle: Mutex::new(None),
+        }
+    }
+
+    /// An event whose record and wait remain explicit nodes across graph
+    /// segments, including work submitted between those segments.
+    pub fn external(device: i32) -> Self {
+        Self {
+            external: true,
+            ..Self::new(device, false, false)
         }
     }
 
@@ -215,8 +232,8 @@ impl Event {
         };
         unsafe {
             check(
-                (driver.record)(event.raw, stream as Handle),
-                "cuEventRecord",
+                (driver.record)(event.raw, stream as Handle, self.capture_flags(stream)?),
+                "cuEventRecordWithFlags",
             )
         }
     }
@@ -226,6 +243,23 @@ impl Event {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    fn capture_flags(&self, stream: usize) -> Result<u32, String> {
+        if !self.external {
+            return Ok(0);
+        }
+
+        // CUDA rejects EXTERNAL outside capture. As with PyTorch events,
+        // eager record/wait use ordinary flags on these same stable handles.
+        let mut status = 0;
+        unsafe {
+            check(
+                (driver()?.stream_capture)(stream as Handle, &mut status),
+                "cuStreamIsCapturing",
+            )?;
+        }
+        Ok(u32::from(status != 0))
     }
 
     /// Queries completion without waiting; device failures remain errors.
@@ -256,7 +290,7 @@ impl Event {
         };
         unsafe {
             check(
-                (driver()?.wait)(stream as Handle, event.raw, 0),
+                (driver()?.wait)(stream as Handle, event.raw, self.capture_flags(stream)?),
                 "cuStreamWaitEvent",
             )
         }
@@ -312,6 +346,7 @@ impl Event {
             device,
             timing: false,
             interprocess: true,
+            external: false,
             handle: Mutex::new(Some(Arc::new(event))),
         })
     }
@@ -417,6 +452,93 @@ impl Drop for Stream {
     fn drop(&mut self) {
         if let Ok(driver) = driver() {
             unsafe { (driver.destroy_stream)(self.handle) };
+        }
+    }
+}
+
+#[repr(C)]
+struct CopyAttributes {
+    source_order: i32,
+    source_location: [i32; 2],
+    destination_location: [i32; 2],
+    flags: u32,
+}
+
+type CopyBatchFn = unsafe extern "C" fn(
+    *mut u64,
+    *mut u64,
+    *mut usize,
+    usize,
+    *mut CopyAttributes,
+    *mut usize,
+    usize,
+    Handle,
+) -> Status;
+
+/// A fixed batch of disjoint CUDA copies. The caller retains source and
+/// destination allocations until every submission on its stream completes.
+pub struct CopyBatch {
+    destinations: Vec<u64>,
+    sources: Vec<u64>,
+    sizes: Vec<usize>,
+}
+
+impl CopyBatch {
+    pub fn new(copies: impl IntoIterator<Item = (usize, usize, usize)>) -> Self {
+        let mut batch = Self {
+            destinations: Vec::new(),
+            sources: Vec::new(),
+            sizes: Vec::new(),
+        };
+        for (destination, source, size) in copies {
+            batch.destinations.push(destination as u64);
+            batch.sources.push(source as u64);
+            batch.sizes.push(size);
+        }
+        batch
+    }
+
+    /// Submit one DMA batch with source accesses ordered on `stream`.
+    /// CUDA 13's batch API is resolved only for users of batched copies.
+    pub fn copy_on(&self, stream: usize) -> Result<(), String> {
+        if self.sizes.is_empty() {
+            return Ok(());
+        }
+        static COPY: OnceLock<Result<CopyBatchFn, String>> = OnceLock::new();
+        let copy = COPY
+            .get_or_init(|| unsafe {
+                driver()?
+                    ._library
+                    .get::<CopyBatchFn>(b"cuMemcpyBatchAsync_v2\0")
+                    .map(|symbol| *symbol)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let mut attributes = CopyAttributes {
+            source_order: 1, // CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+            source_location: [0; 2],
+            destination_location: [0; 2],
+            flags: 0,
+        };
+        let mut first = 0;
+
+        // CUDA reads these host arrays during submission; it neither writes
+        // them nor retains their addresses for the asynchronous device work.
+        unsafe {
+            check(
+                copy(
+                    self.destinations.as_ptr().cast_mut(),
+                    self.sources.as_ptr().cast_mut(),
+                    self.sizes.as_ptr().cast_mut(),
+                    self.sizes.len(),
+                    &mut attributes,
+                    &mut first,
+                    1,
+                    stream as Handle,
+                ),
+                "cuMemcpyBatchAsync",
+            )
         }
     }
 }
