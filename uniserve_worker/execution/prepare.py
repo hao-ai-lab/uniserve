@@ -507,7 +507,7 @@ def prepare_inputs(
                 )
 
             # New units of the destination tables are zeroed by the import
-            # itself before its copy; `_bind_cache_tables` skips them.
+            # itself before its copy; batch cache binding skips them.
             initialized = tuple(
                 unit
                 for allocation in batch.new_cache_units
@@ -821,11 +821,11 @@ def reserve_outputs(
                         "KV-free execution received cache forward rows"
                     )
             else:
-                _bind_cache_tables(
-                    active_calls,
-                    kv_cache=kv_cache,
-                    request_tables=request_tables,
-                    state=state,
+                state.bind_cache(
+                    kv_cache._manager,
+                    request_tables._tables,
+                    request_tables._copy_tables,
+                    kv_cache.cache.recycle_units,
                 )
             _bind_latent_inputs(
                 active_calls,
@@ -1380,166 +1380,6 @@ def _validate_sample_params(
         raise invalid_descriptor(
             "latent params disagrees with the request's committed step"
         )
-
-
-def _bind_cache_tables(
-    scheduled: tuple[Call, ...],
-    *,
-    state: BatchState,
-    kv_cache: KVCacheManager | None,
-    request_tables: BlockTables | None,
-) -> None:
-    """Install scheduler tables and retain row-aligned forward coordinates.
-
-    For every slot the active calls read or write, including the
-    alternative-prefix slots of their forward rows, the batch's block tables
-    are validated and installed in `BlockTables`, and new cache units that no
-    KV import initializes are zeroed. Each call's forward rows are then
-    recorded in `state.forward_indices`, the main row's prefix is checked
-    against the call's projected visible KV length, and the units each row
-    accesses in every group are retained in the `KVCacheManager` until the
-    batch's output buffer completes.
-    """
-    cache = kv_cache
-    page_tables = request_tables
-    if cache is None or page_tables is None:
-        raise invalid_descriptor("cache tables require physical KV storage")
-
-    started = time.perf_counter_ns()
-    inputs = state.batch
-    identities = {calls.call_identity(call) for call in scheduled}
-
-    # Tables are needed for every slot this batch reads or writes: its own
-    # requests plus any alternative-prefix rows of its forward calls.
-    slots = {
-        state.pending_output(
-            call.request_key.request_id
-        ).request.request_pool_idx
-        for call in scheduled
-    }
-    slots.update(
-        {
-            inputs.request_pool_indices[row]
-            for row, index in enumerate(inputs.forward_call_indices)
-            if calls.call_identity(inputs.calls[index]) in identities
-        }
-    )
-
-    # `BlockTables.install` checks each table's page shape and allocated
-    # extent against its group.
-    tables = []
-    for table in inputs.block_tables:
-        if table.request_pool_idx not in slots:
-            continue
-        tables.append(
-            (
-                int(table.request_pool_idx),
-                cache.validate_group(table.group_id),
-                int(table.start_page),
-                cache.validate_units(table.unit_ids),
-                int(table.allocated_tokens),
-            )
-        )
-    page_tables.install(tuple(tables))
-
-    recycled: list[int] = []
-    for allocation in inputs.new_cache_units:
-        if allocation.request_pool_idx not in slots:
-            continue
-        units = cache.validate_units(allocation.unit_ids)
-        installed = page_tables.table(
-            allocation.request_pool_idx,
-            cache.validate_group(allocation.group_id),
-        )
-        if not set(units).issubset(installed.units):
-            raise invalid_descriptor(
-                "new cache units are outside the installed block table"
-            )
-
-        # A KV import resets the new units it covers before copying into
-        # them (`KVImport.initialized_units`); every other new unit is
-        # recycled for its new owner below.
-        initialized = {
-            unit
-            for write in state.inputs.cache_imports()
-            if write.request_pool_idx == allocation.request_pool_idx
-            for unit in write.initialized_units
-        }
-        recycled.extend(unit for unit in units if unit not in initialized)
-
-    # One recycle covers every allocation of the batch, so any device reset
-    # it needs is one launch per field rather than one per allocation.
-    cache.recycle_units(tuple(recycled))
-
-    # Forward rows index `inputs.calls`, the full batch including predicated
-    # calls, so rows are mapped by call identity rather than by position in
-    # `scheduled`.
-    rows_by_call: dict[CallIdentity, list[int]] = defaultdict(list)
-    for row, index in enumerate(inputs.forward_call_indices):
-        identity = calls.call_identity(inputs.calls[index])
-        rows_by_call[identity].append(row)
-
-    for call in scheduled:
-        request = state.pending_output(call.request_key.request_id)
-        main_slot = int(request.request.request_pool_idx)
-        call_rows = rows_by_call.get(calls.call_identity(call), [])
-        state.forward_indices[calls.call_identity(call)] = tuple(call_rows)
-
-        main_descriptor = next(
-            (
-                row
-                for row in call_rows
-                if inputs.request_pool_indices[row] == main_slot
-            ),
-            None,
-        )
-        if main_descriptor is not None:
-            visible = int(request.progress.kv_visible_len)
-            declared = (
-                inputs.seq_lens[main_descriptor]
-                - inputs.query_lens[main_descriptor]
-            )
-            relayed = (
-                call.predicate is not None and call.predicate.dtype is DType.I64
-            )
-            # A queued relay carries a capacity bound computed before its
-            # predecessor's predicate was known. Actual KV length and validity
-            # come from the device row; an inactive descendant must still drain.
-            if declared < visible or (not relayed and declared != visible):
-                raise invalid_descriptor(
-                    "forward row sequence length disagrees with execution state"
-                )
-
-        for descriptor in call_rows:
-            slot = inputs.request_pool_indices[descriptor]
-            if slot != main_slot and (
-                inputs.seq_lens[descriptor] - inputs.query_lens[descriptor]
-            ) > page_tables.allocated_length(slot):
-                raise invalid_descriptor(
-                    "forward row exceeds alternative-prefix capacity"
-                )
-            if slot != main_slot:
-                page_tables.retain_prefix(call.request_key, slot)
-
-            # Rows that write KV retain their prefix plus the query tokens
-            # they write (`seq_lens`); read-only rows retain only the
-            # `seq_lens - query_lens` prefix. Each group's retention starts
-            # at its table's first held page and lasts until the batch's
-            # completion future resolves.
-            length = inputs.seq_lens[descriptor] - (
-                0
-                if inputs.write_kv[descriptor]
-                else inputs.query_lens[descriptor]
-            )
-            for group in range(len(page_tables.groups)):
-                cache.retain_execution(
-                    call.request_key,
-                    page_tables.table(slot, group),
-                    length=length,
-                    completion=state.output_buffer.completion(),
-                )
-
-    record_component(state.component_us, "bc_tables", started)
 
 
 def _stage_input_products(

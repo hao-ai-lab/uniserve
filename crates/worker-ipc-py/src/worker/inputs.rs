@@ -306,7 +306,7 @@ impl BatchInputs {
         })
     }
 
-    fn cache_imports(&self, py: Python<'_>) -> Vec<Py<KVImport>> {
+    pub(super) fn cache_imports(&self, py: Python<'_>) -> Vec<Py<KVImport>> {
         self.inner
             .inputs
             .values()

@@ -21,6 +21,7 @@ GROUPS = (GroupShape(4, 1), GroupShape(8, 2, window=8))
 def test_table_updates_and_release_preserve_all_queued_snapshots(device, depth):
     tables = BlockTables(
         groups=GROUPS,
+        num_units=16,
         request_pool_size=3,
         width=3,
         device=device,
@@ -119,6 +120,7 @@ def test_table_updates_and_release_preserve_all_queued_snapshots(device, depth):
 def test_release_bursts_do_not_wait_for_queued_device_work():
     tables = BlockTables(
         groups=GROUPS,
+        num_units=16,
         request_pool_size=3,
         width=3,
         device="cuda:0",
@@ -162,11 +164,13 @@ def test_release_bursts_do_not_wait_for_queued_device_work():
         (1, 0, 0, (2, 3, 4, 5), 8),
         # The padding sentinel.
         (1, 0, 0, (0, 3), 8),
+        # A physical unit beyond the backing KV pool.
+        (1, 0, 0, (2, 16), 8),
     ),
 )
 def test_rejected_installation_changes_nothing(entry):
     tables = BlockTables(
-        groups=GROUPS, request_pool_size=2, width=3, device="cpu"
+        groups=GROUPS, num_units=16, request_pool_size=2, width=3, device="cpu"
     )
     try:
         tables.install(((2, 0, 0, (9,), 4),))

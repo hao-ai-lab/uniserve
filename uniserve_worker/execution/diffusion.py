@@ -30,7 +30,6 @@ from uniserve.media import image as media_image
 from uniserve.nn.rng import flow_noise_seed
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import calls
 from uniserve_worker.execution.diffusion_state import (
     DiffusionState,
     KVConditioning,
@@ -423,7 +422,7 @@ def prepare_step(
     prefix_branches = []
     kv = kv_conditioning(trajectory)
     entries = kv.entries
-    descriptors = state.forward_indices.get(calls.call_identity(call), ())
+    descriptors = state.forward_rows(call.request_key.request_id)
     if len(descriptors) < len(branches):
         raise invalid_descriptor(
             "media denoise has incomplete forward-row metadata"

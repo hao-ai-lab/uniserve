@@ -146,13 +146,15 @@ impl BlockTables {
         groups: Vec<PyRef<'_, GroupShape>>,
         request_pool_size: i64,
         width: i64,
+        num_units: i64,
     ) -> PyResult<Self> {
         let invalid_dimensions = |_| invalid(py, "request-to-token pool dimensions are invalid");
         let request_pool_size = u32::try_from(request_pool_size).map_err(invalid_dimensions)?;
         let width = usize::try_from(width).map_err(invalid_dimensions)?;
+        let num_units = u32::try_from(num_units).map_err(invalid_dimensions)?;
         let groups = groups.iter().map(|group| group.shape).collect();
         Ok(Self {
-            tables: NativeBlockTables::new(groups, request_pool_size, width)
+            tables: NativeBlockTables::new(groups, request_pool_size, width, num_units)
                 .map_err(|error| native_error(py, error))?,
         })
     }
@@ -163,7 +165,8 @@ impl BlockTables {
     }
 
     /// The copy callback borrows one update; it is never retained by Rust.
-    fn install(
+    #[pyo3(name = "install")]
+    fn install_py(
         &mut self,
         py: Python<'_>,
         tables: &Bound<'_, PyAny>,
@@ -188,27 +191,7 @@ impl BlockTables {
             });
         }
 
-        let update = self
-            .tables
-            .prepare(&values)
-            .map_err(|error| native_error(py, error))?;
-        if !update.rows.is_empty()
-            || !update.start_values.is_empty()
-            || !update.length_slots.is_empty()
-        {
-            copy.call1((
-                &update.rows,
-                &update.row_tables,
-                &update.row_slots,
-                &update.start_groups,
-                &update.start_slots,
-                &update.start_values,
-                &update.length_slots,
-                &update.length_values,
-            ))?;
-        }
-        self.tables.commit(update);
-        Ok(())
+        self.install(py, &values, copy)
     }
 
     fn table(&self, py: Python<'_>, request_pool_idx: i64, group_id: i64) -> PyResult<GroupTable> {
@@ -275,6 +258,35 @@ impl BlockTables {
 }
 
 impl BlockTables {
+    pub(super) fn install(
+        &mut self,
+        py: Python<'_>,
+        values: &[BlockTable],
+        copy: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let update = self
+            .tables
+            .prepare(values)
+            .map_err(|error| native_error(py, error))?;
+        if !update.rows.is_empty()
+            || !update.start_values.is_empty()
+            || !update.length_slots.is_empty()
+        {
+            copy.call1((
+                &update.rows,
+                &update.row_tables,
+                &update.row_slots,
+                &update.start_groups,
+                &update.start_slots,
+                &update.start_values,
+                &update.length_slots,
+                &update.length_values,
+            ))?;
+        }
+        self.tables.commit(update);
+        Ok(())
+    }
+
     fn slots(&self, py: Python<'_>, slots: Vec<i64>) -> PyResult<Vec<u32>> {
         let slots = slots
             .into_iter()

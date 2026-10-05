@@ -30,7 +30,7 @@ from uniserve.sampling import SamplingParams
 from uniserve.tensors import adjacent_view
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.execution import calls, image
+from uniserve_worker.execution import image
 from uniserve_worker.execution.output import PendingOutput, capture_logprobs
 from uniserve_worker.model_executor.input_batch import InputRow, TokenRow
 from uniserve_worker.protocol.call import (
@@ -747,7 +747,7 @@ def prepare_context(
     # The engine sizes the call's KV and forward rows from the blocks'
     # declared lengths; each row must be the one it declared.
     inputs = state.batch
-    descriptors = state.forward_indices.get(calls.call_identity(call), ())
+    descriptors = state.forward_rows(call.request_key.request_id)
     if (
         sum(row.query_tokens for row in rows) > int(call.bounds.max_tokens)
         or len(descriptors) != len(rows)

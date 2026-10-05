@@ -2,16 +2,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use uniserve_worker_ipc::{Batch, CallStatus};
+use uniserve_worker_ipc::{Batch, CallStatus, DType};
 
 use super::block_tables::{BlockTables, GroupTable};
+use super::completion::CompletionRef;
 use super::error::{invalid, native_error};
 use super::inputs::BatchInputs;
+use super::kv_cache::KVCacheManager;
 use super::kv_import::KVImporter;
 use super::latent::LatentPool;
 use super::output::OutputBuffer;
@@ -56,8 +59,7 @@ pub(crate) struct BatchState {
     pub(super) forward_stats: Py<PyList>,
     #[pyo3(get)]
     pub(super) component_us: Py<PyDict>,
-    #[pyo3(get)]
-    pub(super) forward_indices: Py<PyDict>,
+    forward_indices: Vec<Vec<usize>>,
 
     #[pyo3(get, set)]
     pub(super) products: Py<PyTuple>,
@@ -71,6 +73,11 @@ impl BatchState {
             .enumerate()
             .map(|(index, call)| (call.request_key.request_id.0, index))
             .collect();
+
+        let mut forward_indices = vec![Vec::new(); plan.calls.len()];
+        for (row, &call) in plan.forward.call_indices.iter().enumerate() {
+            forward_indices[call as usize].push(row);
+        }
 
         Ok(Self {
             plan,
@@ -88,7 +95,7 @@ impl BatchState {
             started_ns: 0,
             forward_stats: PyList::empty(py).unbind(),
             component_us: PyDict::new(py).unbind(),
-            forward_indices: PyDict::new(py).unbind(),
+            forward_indices,
             products: PyTuple::empty(py).unbind(),
         })
     }
@@ -151,6 +158,186 @@ impl BatchState {
             .map(|table| Py::new(py, GroupTable { table }))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(PyTuple::new(py, views)?.unbind())
+    }
+
+    /// Return numerical forward rows in their scheduler-supplied order.
+    fn forward_rows<'py>(&self, py: Python<'py>, request_id: u64) -> PyResult<Bound<'py, PyTuple>> {
+        let rows = self
+            .request_indexes
+            .get(&request_id)
+            .map_or(&[][..], |&index| self.forward_indices[index].as_slice());
+        PyTuple::new(py, rows)
+    }
+
+    /// Install active calls' KV assignments and retain their physical access.
+    /// Callbacks only copy numerical tables and reset recycled cache units.
+    fn bind_cache(
+        &self,
+        py: Python<'_>,
+        cache: &Bound<'_, KVCacheManager>,
+        tables: &Bound<'_, BlockTables>,
+        copy: &Bound<'_, PyAny>,
+        recycle: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let started = Instant::now();
+        let forward = &self.plan.forward;
+        let mut active = Vec::new();
+        let mut slots = HashSet::new();
+        for (index, output) in self.outputs.iter().enumerate() {
+            let output = output.borrow(py);
+            let pending = output.lock(py)?;
+            if pending.output.status == CallStatus::Predicated {
+                continue;
+            }
+
+            let slot = output.request.borrow(py).request.slot() as u32;
+            active.push((index, slot, pending.progress.kv_visible_len));
+            slots.insert(slot);
+            slots.extend(
+                self.forward_indices[index]
+                    .iter()
+                    .map(|&row| forward.request_pool_indices[row]),
+            );
+        }
+
+        // Alternative-prefix rows need their own assignments even though they
+        // share a call's progress. Numerical copying precedes host-table commit.
+        let assignments = self
+            .plan
+            .block_tables
+            .iter()
+            .filter(|table| slots.contains(&table.request_pool_idx))
+            .cloned()
+            .collect::<Vec<_>>();
+        tables.borrow_mut().install(py, &assignments, copy)?;
+
+        // Import copies reset their own destinations. All other new units are
+        // recycled together before this batch can submit model writes.
+        let mut initialized = HashSet::new();
+        for write in self.inputs.borrow(py).cache_imports(py) {
+            let write = write.get();
+            initialized.extend(
+                write
+                    .initialized_units
+                    .iter()
+                    .map(|&unit| (write.request_pool_idx() as u32, unit)),
+            );
+        }
+
+        let mut recycled = Vec::new();
+        let mut seen = HashSet::new();
+        for allocation in &self.plan.new_cache_units {
+            if !slots.contains(&allocation.request_pool_idx) {
+                continue;
+            }
+            for unit in &allocation.unit_ids {
+                if initialized.contains(&(allocation.request_pool_idx, unit.0)) {
+                    continue;
+                }
+                if !seen.insert(unit.0) {
+                    return Err(invalid(py, "KV allocation repeats a physical unit"));
+                }
+                recycled.push(unit.0);
+            }
+        }
+
+        if !recycled.is_empty() {
+            let unit_tokens = tables
+                .borrow()
+                .tables
+                .groups()
+                .iter()
+                .map(|group| group.page_tokens)
+                .max()
+                .unwrap_or(0);
+            let spans = recycled
+                .iter()
+                .map(|&unit| (unit, 0, unit_tokens))
+                .collect::<Vec<_>>();
+            cache
+                .borrow_mut()
+                .inner
+                .require_reusable(&spans)
+                .map_err(|error| native_error(py, error))?;
+            recycle.call1((PyTuple::new(py, recycled)?,))?;
+        }
+
+        let completion = self.output_buffer(py)?.borrow(py).completion(py)?;
+        let mut tables = tables.borrow_mut();
+        let tables = &mut tables.tables;
+        let mut cache = cache.borrow_mut();
+        for (index, main_slot, visible) in active {
+            let call = &self.plan.calls[index];
+            let rows = &self.forward_indices[index];
+            if let Some(&row) = rows
+                .iter()
+                .find(|&&row| forward.request_pool_indices[row] == main_slot)
+            {
+                let declared = u64::from(forward.seq_lens[row] - forward.query_lens[row]);
+                let relayed = call
+                    .predicate
+                    .as_ref()
+                    .is_some_and(|value| value.dtype == DType::I64);
+                // A queued token relay carries a capacity bound. Its device
+                // predicate determines the actual visible length at execution.
+                if declared < visible || (!relayed && declared != visible) {
+                    return Err(invalid(
+                        py,
+                        "forward row sequence length disagrees with execution state",
+                    ));
+                }
+            }
+
+            let mut spans = Vec::new();
+            for &row in rows {
+                let slot = forward.request_pool_indices[row];
+                if slot != main_slot {
+                    if forward.seq_lens[row] - forward.query_lens[row]
+                        > tables.allocated_length(slot)
+                    {
+                        return Err(invalid(
+                            py,
+                            "forward row exceeds alternative-prefix capacity",
+                        ));
+                    }
+                    tables.retain_prefix(call.request_key, slot);
+                }
+
+                // Read-only rows retain the prefix; writers also retain query
+                // tokens. A windowed group starts at its first resident page.
+                let length = forward.seq_lens[row]
+                    - if forward.write_kv[row] {
+                        0
+                    } else {
+                        forward.query_lens[row]
+                    };
+                for group in 0..tables.groups().len() as u32 {
+                    let table = tables
+                        .table(slot, group)
+                        .map_err(|error| native_error(py, error))?;
+                    let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
+                    if u64::from(length) > start {
+                        spans.extend(
+                            table
+                                .spans(start, u64::from(length) - start)
+                                .map_err(|error| native_error(py, error))?,
+                        );
+                    }
+                }
+            }
+            cache.inner.retain_execution(
+                call.request_key,
+                &spans,
+                CompletionRef::new(py, completion.clone_ref(py)),
+            );
+        }
+
+        let components = self.component_us.bind(py);
+        let previous = components
+            .get_item("bc_tables")?
+            .map_or(Ok(0), |value| value.extract::<u64>())?;
+        components.set_item("bc_tables", previous + started.elapsed().as_micros() as u64)?;
+        Ok(())
     }
 
     #[getter]
@@ -327,7 +514,6 @@ impl BatchState {
         visit.call(&self.stream)?;
         visit.call(&self.forward_stats)?;
         visit.call(&self.component_us)?;
-        visit.call(&self.forward_indices)?;
         visit.call(&self.products)
     }
 
@@ -343,7 +529,6 @@ impl BatchState {
         self.kv_inputs = PyTuple::empty(py).unbind();
         self.forward_stats = PyList::empty(py).unbind();
         self.component_us = PyDict::new(py).unbind();
-        self.forward_indices = PyDict::new(py).unbind();
         self.products = PyTuple::empty(py).unbind();
     }
 }

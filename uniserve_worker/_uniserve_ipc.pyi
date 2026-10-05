@@ -285,7 +285,6 @@ class BatchState:
     started_ns: int
     forward_stats: list[ForwardStats]
     component_us: dict[str, int]
-    forward_indices: dict[CallIdentity, tuple[int, ...]]
     products: tuple[TensorExport, ...]
 
     @property
@@ -299,6 +298,16 @@ class BatchState:
         self, tables: BlockTables, slot: int
     ) -> tuple[GroupTable, ...]:
         """Borrow supplied page assignments or the resident groups."""
+    def forward_rows(self, request_id: int) -> tuple[int, ...]:
+        """Return numerical forward rows in scheduler order."""
+    def bind_cache(
+        self,
+        cache: KVCacheManager,
+        tables: BlockTables,
+        copy: Callable[..., None],
+        recycle: Callable[[tuple[int, ...]], None],
+    ) -> None:
+        """Install active KV assignments and retain physical accesses."""
     def bind_outputs(
         self,
         requests: RequestPool,
@@ -1552,7 +1561,11 @@ class BlockTables:
     """Own host KV page tables; copy callbacks borrow numerical updates."""
 
     def __new__(
-        cls, groups: Sequence[GroupShape], request_pool_size: int, width: int
+        cls,
+        groups: Sequence[GroupShape],
+        request_pool_size: int,
+        width: int,
+        num_units: int,
     ) -> Self: ...
     @property
     def first_table(self) -> tuple[int, ...]: ...

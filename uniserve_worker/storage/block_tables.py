@@ -1,12 +1,11 @@
-"""Device-resident execution image of scheduler-owned KV unit tables.
+"""Device KV block tables for scheduler-assigned cache pages.
 
 The engine scheduler owns request-slot and KV-unit assignment and sends each
-batch's per-group unit tables in `Batch.block_tables`. `execution.prepare`
-validates the unit ids against `KVCacheManager` and installs the tables here,
-before the batch's forward calls read them. `BlockTables` holds the device
-copy that the decode input kernels (`model_executor._decode_inputs`) index by
-request slot, while Rust owns the host tables and change detection. Host-side
-lookups for attention input construction borrow those native tables.
+batch's per-group unit tables in `Batch.block_tables`. Native `BatchState`
+selects active slots and installs their assignments before forward calls read
+them. The decode input kernels (`model_executor._decode_inputs`) index device
+tables by request slot. Rust owns the host tables and change detection;
+attention input construction borrows those native tables.
 
 A cache group's logical page occupies ``units_per_page`` units, and the units
 at one position of every page form one numerical block table (see
@@ -73,12 +72,14 @@ class BlockTables:
         groups: Sequence[GroupShape],
         request_pool_size: int,
         width: int,
+        num_units: int,
         device: torch.device | str,
         staging_depth: int = 1,
     ) -> None:
         """Allocate device unit tables and bounded host staging.
 
         ``width`` is the most pages one slot's group table may hold.
+        ``num_units`` is the backing KV pool's unit count, including padding.
         ``staging_depth`` is the number of pinned host staging generations
         per staging tensor; an update blocks only when it reuses a generation
         whose previous host-to-device copy has not completed.
@@ -91,7 +92,7 @@ class BlockTables:
         self.request_pool_size = int(request_pool_size)
         self.width = int(width)
         self._tables = NativeBlockTables(
-            self.groups, self.request_pool_size, self.width
+            self.groups, self.request_pool_size, self.width, num_units
         )
         self.first_table = self._tables.first_table
         self.table_count = sum(group.units_per_page for group in self.groups)
@@ -219,13 +220,11 @@ class BlockTables:
         stream; the host blocks only when a pinned staging generation is
         reused before its previous copy has completed.
 
-        This method checks table-local bounds only: slots in
-        ``[1, request_pool_size]``, groups in range, positive unique units
-        forming whole pages that fit the width, ``allocated_tokens`` within
-        the installed pages, and no repeated ``(slot, group)``. The caller
-        validates unit ids against the physical pool
-        (`KVCacheManager.validate_units`). All entries are validated before
-        any staging or device write, so a rejected update changes nothing.
+        Slots and groups must be in range, and unique units in
+        ``[1, num_units)`` must form whole pages that fit the width.
+        ``allocated_tokens`` must fit those pages and each ``(slot, group)``
+        can occur once. All entries are validated before any device write,
+        so a rejected update changes nothing.
 
         Raises:
             WorkerError: ``invalid_descriptor`` when any entry fails

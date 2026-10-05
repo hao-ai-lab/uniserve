@@ -43,8 +43,7 @@ pub(crate) struct KVImport {
     inner: Arc<NativeImport<TransferRef, Workspace>>,
     #[pyo3(get)]
     tables: Py<PyTuple>,
-    #[pyo3(get)]
-    initialized_units: Py<PyTuple>,
+    pub(super) initialized_units: Vec<u32>,
     #[pyo3(get)]
     export: Py<PyAny>,
     task: Option<Arc<CopyTask>>,
@@ -55,8 +54,13 @@ pub(crate) struct KVImport {
 #[pymethods]
 impl KVImport {
     #[getter]
-    fn request_pool_idx(&self) -> usize {
+    pub(super) fn request_pool_idx(&self) -> usize {
         self.inner.request_pool_idx
+    }
+
+    #[getter]
+    fn initialized_units<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.initialized_units)
     }
 
     #[getter]
@@ -126,7 +130,6 @@ impl KVImport {
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.tables)?;
-        visit.call(&self.initialized_units)?;
         visit.call(&self.export)?;
         visit.call(&self.retirement)?;
         if let Some(task) = self
@@ -260,7 +263,7 @@ impl KVImporter {
         export: Py<PyAny>,
         request_pool_idx: usize,
         tables: Py<PyTuple>,
-        initialized_units: Py<PyTuple>,
+        initialized_units: Vec<u32>,
         transports: Py<PyAny>,
     ) -> PyResult<Py<KVImport>> {
         let py = slf.py();
@@ -286,7 +289,7 @@ impl KVImporter {
         let reset: Vec<(u32, u32, u32)> = this
             .pool
             .bind(py)
-            .call_method1("unit_spans", (initialized_units.bind(py),))?
+            .call_method1("unit_spans", (&initialized_units,))?
             .extract()?;
         ranges.extend(
             reset
@@ -297,8 +300,8 @@ impl KVImporter {
             .into_iter()
             .map(|(unit, (offset, count))| (unit, offset, count))
             .collect();
-        let copy = !initialized_units.bind(py).is_empty()
-            || export.bind(py).getattr("tensors")?.is_truthy()?;
+        let copy =
+            !initialized_units.is_empty() || export.bind(py).getattr("tensors")?.is_truthy()?;
 
         let retirement = Py::new(py, Completion::new())?;
         let task = copy
@@ -621,7 +624,7 @@ impl ImportBackend for Copy {
 
     fn reset(&self, workspace: &Workspace) -> Result<(), Self::Error> {
         Python::attach(|py| {
-            let units = self.write.get().initialized_units.bind(py);
+            let units = &self.write.get().initialized_units;
             if units.is_empty() {
                 return Ok(());
             }
@@ -631,7 +634,7 @@ impl ImportBackend for Copy {
                     .pool
                     .bind(py)
                     .getattr("cache")?
-                    .call_method1("zero_units", (units,))?;
+                    .call_method1("zero_units", (PyTuple::new(py, units)?,))?;
                 Ok(())
             })
             .map_err(|error| error.into_value(py).into_any())
