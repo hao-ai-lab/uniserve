@@ -219,6 +219,7 @@ pub(super) fn partition(device: i32, counts: &[u32]) -> Result<Vec<Stream>, Stri
         streams.push(Stream {
             handle,
             owned: true,
+            primary_device: None,
             green: Some(green),
         });
 

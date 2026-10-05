@@ -460,6 +460,7 @@ impl Drop for DeviceGuard {
 pub struct Stream {
     handle: Handle,
     owned: bool,
+    primary_device: Option<i32>,
     green: Option<Arc<green::GreenContext>>,
 }
 
@@ -469,13 +470,22 @@ unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
 
 impl Stream {
-    /// Creates a stream in the backend's current device context.
-    pub fn new() -> Result<Self, String> {
+    /// Creates a stream retaining the device's primary context through destruction.
+    pub fn new(device: i32) -> Result<Self, String> {
+        let context = primary_context(device)?;
         let mut handle = std::ptr::null_mut();
-        unsafe { check((driver()?.create_stream)(&mut handle, 1), "cuStreamCreate")? };
+        let created = in_context(context, |driver| unsafe {
+            check((driver.create_stream)(&mut handle, 1), "cuStreamCreate")
+        });
+        if let Err(error) = created {
+            unsafe { (driver()?.primary_release)(device) };
+            return Err(error);
+        }
+
         Ok(Self {
             handle,
             owned: true,
+            primary_device: Some(device),
             green: None,
         })
     }
@@ -485,6 +495,7 @@ impl Stream {
         Self {
             handle: handle as Handle,
             owned: false,
+            primary_device: None,
             green: None,
         }
     }
@@ -533,13 +544,18 @@ impl Stream {
         Ok(Self {
             handle,
             owned: true,
+            primary_device: None,
             green: None,
         })
     }
 
-    /// Forks this stream while retaining its owned SM partition.
+    /// Forks this stream while retaining its owned CUDA context or SM partition.
     pub fn fork(&self) -> Result<Self, String> {
         let mut stream = Self::sibling(self.handle())?;
+        if let Some(device) = self.primary_device {
+            primary_context(device)?;
+            stream.primary_device = Some(device);
+        }
         stream.green = self.green.clone();
         Ok(stream)
     }
@@ -595,6 +611,9 @@ impl Drop for Stream {
             && let Ok(driver) = driver()
         {
             unsafe { (driver.destroy_stream)(self.handle) };
+            if let Some(device) = self.primary_device {
+                unsafe { (driver.primary_release)(device) };
+            }
         }
     }
 }

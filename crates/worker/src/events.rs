@@ -196,7 +196,7 @@ impl<O> EventPool<O> {
     }
 
     /// Selects an independent notification stream for this producer and orders
-    /// it after the event. The caller selects the device context for creation.
+    /// it after the event.
     pub fn wake_stream(&mut self, event: &Arc<Event>, device: i32) -> Result<Arc<Stream>> {
         self.require_open()?;
         let state = self.require(event, device)?;
@@ -206,7 +206,7 @@ impl<O> EventPool<O> {
         let stream = match self.wake_streams.get(&(device, producer)) {
             Some(stream) => Arc::clone(stream),
             None => {
-                let stream = Arc::new(Stream::new().map_err(Error::Cuda)?);
+                let stream = Arc::new(Stream::new(device).map_err(Error::Cuda)?);
                 self.wake_streams
                     .insert((device, producer), Arc::clone(&stream));
                 stream
