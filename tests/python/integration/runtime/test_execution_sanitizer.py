@@ -27,7 +27,7 @@ def test_cuda_timeline_hints_distinguish_host_and_device_dependencies(tmp_path):
         [
             nsys,
             "profile",
-            "--trace=cuda,nvtx",
+            "--trace=cuda,nvtx,python-gil",
             "--sample=process-tree",
             "--cuda-trace-all-apis=true",
             "--cudabacktrace=sync:0,memory:0",
@@ -74,6 +74,12 @@ def test_cuda_timeline_hints_distinguish_host_and_device_dependencies(tmp_path):
     assert first.copies[0].end_ns <= second.start_ns
     assert first.stack or native[0].evidence[0].stack
     assert report.coverage["driver_calls"] > 0
+
+    held = by_scope["uniserve.capture.gil_held_wait"]
+    assert any(h.rule == "gil-held-wait" for h in held)
+    released = by_scope["uniserve.capture.gil_released_wait"]
+    assert all(h.rule == "host-sync" for h in released)
+    assert report.coverage["gil_holds"] > 0
 
     # Batch phase names and payloads are part of the profiler interface.
     # They must come from the actual native executor, including preparation.
@@ -176,5 +182,29 @@ def _capture_workload():
         assert len(finalized_report(worker, submitted).completions) == 1
 
 
+def _capture_gil_waits():
+    # ctypes is an external native boundary with explicit GIL behavior:
+    # PyDLL holds it during a call, while CDLL releases it. The CUDA work is
+    # identical, so the trace must distinguish ownership from API duration.
+    torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+
+    for loader, name in (
+        (ctypes.PyDLL, "gil_held_wait"),
+        (ctypes.CDLL, "gil_released_wait"),
+    ):
+        synchronize = loader("libcuda.so.1").cuEventSynchronize
+        synchronize.argtypes = [ctypes.c_void_p]
+        synchronize.restype = ctypes.c_int
+        event = torch.cuda.Event()
+
+        torch.cuda._sleep(100_000_000)
+        event.record()
+
+        with torch.cuda.nvtx.range("uniserve.capture." + name):
+            assert synchronize(event.cuda_event) == 0
+
+
 if __name__ == "__main__":
     _capture_workload()
+    _capture_gil_waits()

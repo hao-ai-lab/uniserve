@@ -58,6 +58,12 @@ def main() -> None:
                         f"correlation={event.correlation_id} {event.name}"
                     )
                     print(f"    scope: {event.scope.name}")
+                    for state in event.gil:
+                        print(
+                            f"    {state.name}: "
+                            f"{state.start_ns}..{state.end_ns} ns "
+                            f"tid={state.global_tid}"
+                        )
                     for copy in event.copies:
                         print(
                             f"    GPU {copy.start_ns}..{copy.end_ns} ns: "

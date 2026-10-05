@@ -44,6 +44,7 @@ class Event:
     scope: Scope
     stack: tuple[str, ...] = ()
     copies: tuple[Copy, ...] = ()
+    gil: tuple[Scope, ...] = ()
 
 
 @dataclass(frozen=True)
