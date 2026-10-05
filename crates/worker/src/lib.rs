@@ -22,6 +22,7 @@ mod request;
 mod service;
 pub mod tensor;
 mod transfer;
+mod weight_prefetch;
 
 pub use block_tables::{BlockTableUpdate, BlockTables, GroupShape, GroupTable};
 pub use buffer::{BufferBinding, BufferPool};
@@ -42,3 +43,4 @@ pub use registry::{BufferRegistry, RegisteredBuffer};
 pub use request::{Request, RequestPool, RequestProgress};
 pub use service::{Service, ServiceBackend};
 pub use transfer::{ReadReservation, TransferCapacity, TransferPool, TransferTicket};
+pub use weight_prefetch::WeightPrefetch;

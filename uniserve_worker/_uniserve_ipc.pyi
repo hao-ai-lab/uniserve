@@ -110,6 +110,7 @@ __all__ = [
     "TransferCapacity",
     "TransferPool",
     "TransferTicket",
+    "WeightPrefetch",
     "atomic_load_u32",
     "atomic_store_u32",
     "service_name",
@@ -120,6 +121,28 @@ __all__ = [
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")
+
+@final
+class WeightPrefetch:
+    """Peer-weight copy plans, CUDA dependencies and backing ownership."""
+
+    def __init__(
+        self,
+        device: int,
+        layers: Sequence[int],
+        copies: Sequence[Sequence[tuple[int, torch.Tensor, torch.Tensor]]],
+        backing: Sequence[torch.Tensor],
+    ) -> None: ...
+    def begin(self) -> None: ...
+    def end(self, stream: int) -> None: ...
+    def contains(self, module: torch.nn.Module) -> bool: ...
+    def before(self, module: torch.nn.Module, stream: int) -> None: ...
+    def after(self, module: torch.nn.Module, stream: int) -> None: ...
+    def copy(self, index: int) -> None: ...
+    def set_capture(
+        self, submit: Callable[[Callable[[], None]], None] | None
+    ) -> Callable[[Callable[[], None]], None] | None: ...
+    def close(self) -> None: ...
 
 def yield_microbatch() -> None: ...
 

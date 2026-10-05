@@ -10,9 +10,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
-from functools import partial
-from itertools import zip_longest
 
 import torch
 from torch import nn
@@ -23,13 +20,7 @@ from uniserve.quantization import QuantizedTensor
 from uniserve.runtime._peer_storage import allocate_peer_tensor
 from uniserve.runtime.backends import moe
 from uniserve_kernels import peer_storage
-
-
-@dataclass
-class _Call:
-    started: bool = False
-    queued: int | None = None
-    last: int | None = None
+from uniserve_worker._uniserve_ipc import WeightPrefetch as _WeightPrefetch
 
 
 class WeightPrefetch:
@@ -52,8 +43,6 @@ class WeightPrefetch:
 
     @torch.inference_mode()
     def __init__(self, model: nn.Module, *, backend="auto"):
-        from cuda.bindings import runtime as cudart
-
         layers = [
             layer
             for layer in model.modules()
@@ -69,30 +58,22 @@ class WeightPrefetch:
             raise ValueError("DWDP weights must share one expert group")
         if self.device.type != "cuda":
             raise ValueError("DWDP requires CUDA peer memory")
-        self._layers = {id(layer): index for index, layer in enumerate(layers)}
         self._copies: list[list[tuple[int, torch.Tensor, torch.Tensor]]] = []
-        self._plans: list[tuple[list[int], list[int], list[int]]] = []
-        self._submissions: list[Callable[[], None]] = []
-        self._capture: Callable[[Callable[[], None]], None] | None = None
-        self._runtime = cudart
-        self._attributes = cudart.cudaMemcpyAttributes()
-        self._attributes.srcAccessOrder = (
-            cudart.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
-        )
         self._storage: list[torch.Tensor] = []
         self._slots: dict[tuple, torch.Tensor] = {}
-        self._calls: list[_Call] = []
-        self._stream = torch.cuda.Stream(device=self.device)
-        self._ready = [torch.cuda.Event(external=True) for _ in range(2)]
-        self._consumed = [torch.cuda.Event(external=True) for _ in range(2)]
-        self._closed = False
         self.resident_bytes = self.buffer_bytes = self.transfer_bytes = 0
 
         try:
             self._prepare(layers, backend)
-            for index, copies in enumerate(self._copies):
-                self._plans.append(self._plan(copies))
-                self._submissions.append(partial(self._copy, index))
+            self._prefetch = _WeightPrefetch(
+                self.device.index,
+                tuple(id(layer) for layer in layers),
+                self._copies,
+                [*self._storage, *self._slots.values()],
+            )
+            # Native ownership retains the mappings through copy retirement.
+            # These collections only assemble the numerical storage at setup.
+            del self._copies, self._storage, self._slots
         except BaseException:
             # A peer can still read already-published pages when this rank
             # fails during setup. Do not unmap them or wait collectively in
@@ -239,120 +220,38 @@ class WeightPrefetch:
     @contextmanager
     def activate(self):
         """Bracket one eager or captured invocation, lazily for graph replay."""
-        if self._closed:
-            raise RuntimeError("DWDP weight owner is closed")
-        call = _Call()
-        self._calls.append(call)
+        self._prefetch.begin()
         try:
             yield
         finally:
-            if call.last is not None:
-                # Also join a speculative prefetch when this invocation
-                # omits its final expert layer. No fork spans graph segments.
-                torch.cuda.current_stream(self.device).wait_event(
-                    self._ready[call.last % 2]
-                )
-            self._calls.pop()
+            self._prefetch.end(
+                torch.cuda.current_stream(self.device).cuda_stream
+            )
 
     @contextmanager
     def capture(self, submit: Callable[[Callable[[], None]], None]):
         """Bind the graph owner's recorder for eager DMA submissions."""
-        previous, self._capture = self._capture, submit
+        previous = self._prefetch.set_capture(submit)
         try:
             yield
         finally:
-            self._capture = previous
-
-    @staticmethod
-    def _plan(copies):
-        # Match the upstream batch plan: 2 MiB slices round-robin across
-        # source peers. All destinations are disjoint, so the batch API may
-        # pipeline independent DMA operations without changing their values.
-        peers: dict[int, list[tuple[int, int, int]]] = {}
-        chunk = 2 << 20
-        for peer, destination, source in copies:
-            size = destination.numel() * destination.element_size()
-            slices = peers.setdefault(peer, [])
-            for offset in range(0, size, chunk):
-                slices.append(
-                    (
-                        destination.data_ptr() + offset,
-                        source.data_ptr() + offset,
-                        min(chunk, size - offset),
-                    )
-                )
-        destinations, sources, sizes = [], [], []
-        for row in zip_longest(*peers.values()):
-            for item in row:
-                if item is not None:
-                    destination, source, size = item
-                    destinations.append(destination)
-                    sources.append(source)
-                    sizes.append(size)
-        return destinations, sources, sizes
-
-    def _copy(self, index: int) -> None:
-        slot = index % 2
-        with torch.cuda.stream(self._stream):
-            self._stream.wait_event(self._consumed[slot])
-            destinations, sources, sizes = self._plans[index]
-            if destinations:
-                (status,) = self._runtime.cudaMemcpyBatchAsync(
-                    destinations,
-                    sources,
-                    sizes,
-                    len(destinations),
-                    [self._attributes],
-                    [0],
-                    1,
-                    self._stream.cuda_stream,
-                )
-                if status != self._runtime.cudaError_t.cudaSuccess:
-                    raise RuntimeError(f"DWDP weight prefetch failed: {status}")
-            self._ready[slot].record(self._stream)
-
-    def _prefetch(self, index: int) -> None:
-        self._calls[-1].last = index
-        submit = self._submissions[index]
-        if self._capture is None:
-            submit()
-        else:
-            self._capture(submit)
+            self._prefetch.set_capture(previous)
 
     def before(self, module: nn.Module) -> None:
         """Wait for this layer and overlap the next layer's peer reads."""
-        index = self._layers[id(module)]
-        if not self._calls:
-            raise RuntimeError("DWDP expert call requires an active context")
-        call = self._calls[-1]
-        compute = torch.cuda.current_stream(self.device)
-        if not call.started:
-            for event in self._consumed:
-                event.record(compute)
-            call.started = True
-        if call.queued != index:
-            self._prefetch(index)
-        compute.wait_event(self._ready[index % 2])
-        following = index + 1
-        call.queued = following if following < len(self._copies) else None
-        if call.queued is not None:
-            self._prefetch(call.queued)
+        self._prefetch.before(
+            module, torch.cuda.current_stream(self.device).cuda_stream
+        )
 
     def after(self, module: nn.Module) -> None:
         """Release the layer's slot only after its last weight reader."""
-        slot = self._layers[id(module)] % 2
-        self._consumed[slot].record(torch.cuda.current_stream(self.device))
+        self._prefetch.after(
+            module, torch.cuda.current_stream(self.device).cuda_stream
+        )
 
     def contains(self, module: nn.Module) -> bool:
-        return id(module) in self._layers
+        return self._prefetch.contains(module)
 
     def close(self) -> None:
         """Release owned references after all contexts and graphs retire."""
-        if not self._closed:
-            self._stream.synchronize()
-            self._copies.clear()
-            self._plans.clear()
-            self._submissions.clear()
-            self._storage.clear()
-            self._slots.clear()
-            self._closed = True
+        self._prefetch.close()
