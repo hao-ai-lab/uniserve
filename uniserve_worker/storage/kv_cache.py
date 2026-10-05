@@ -166,6 +166,7 @@ class KVCacheManager:
 
         self.block_tables = BlockTables(
             groups=self.shapes,
+            num_units=self.info.num_units,
             request_pool_size=request_pool_size,
             width=max(1, self.info.num_units - 1)
             if table_width is None

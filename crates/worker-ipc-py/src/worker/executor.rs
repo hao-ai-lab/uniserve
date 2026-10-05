@@ -103,17 +103,15 @@ impl BatchState {
         self.stats = Some(depythonize(
             &stats.get_item(1)?.call_method0("to_mapping")?,
         )?);
-        let (buffer, indices, forwards, components) = {
+        let (buffer, forwards, components) = {
             let mut numerical = self.numerical.borrow_mut(py);
             (
                 numerical.buffer.take(),
-                numerical.forward_indices.clone_ref(py),
                 numerical.forward_stats.clone_ref(py),
                 numerical.component_us.clone_ref(py),
             )
         };
         drop(buffer);
-        indices.bind(py).clear();
         forwards.bind(py).call_method0("clear")?;
         components.bind(py).clear();
         Ok(())

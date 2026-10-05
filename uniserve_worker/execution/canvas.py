@@ -27,7 +27,6 @@ import torch
 from uniserve.tensors import adjacent_view
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import calls
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.model_executor.input_batch import (
     CanvasRow,
@@ -70,7 +69,7 @@ def prepare_rows(
 
     # Each forward row of the call is one canvas over the visible prefix.
     inputs = state.batch
-    descriptors = state.forward_indices.get(calls.call_identity(call), ())
+    descriptors = state.forward_rows(call.request_key.request_id)
     lengths = tuple(inputs.query_lens[index] for index in descriptors)
     if (
         not descriptors
@@ -214,7 +213,7 @@ def prepare_step(
     slot, visible, _capacity = request.cache_coordinates(request_tables)
 
     inputs = state.batch
-    descriptors = state.forward_indices.get(calls.call_identity(call), ())
+    descriptors = state.forward_rows(call.request_key.request_id)
     length = sampling.canvas_length
     if (
         len(descriptors) != 1

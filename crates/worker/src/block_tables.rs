@@ -110,14 +110,20 @@ pub struct BlockTables {
     first_table: Vec<usize>,
     request_pool_size: u32,
     width: usize,
+    num_units: u32,
     tables: HashMap<(u32, u32), Arc<GroupTable>>,
     lengths: HashMap<u32, u32>,
     prefixes: HashMap<RequestKey, BTreeSet<u32>>,
 }
 
 impl BlockTables {
-    pub fn new(groups: Vec<GroupShape>, request_pool_size: u32, width: usize) -> Result<Self> {
-        if groups.is_empty() || request_pool_size == 0 || width == 0 {
+    pub fn new(
+        groups: Vec<GroupShape>,
+        request_pool_size: u32,
+        width: usize,
+        num_units: u32,
+    ) -> Result<Self> {
+        if groups.is_empty() || request_pool_size == 0 || width == 0 || num_units == 0 {
             return Err(Error::Invalid(
                 "request-to-token pool dimensions are invalid".into(),
             ));
@@ -135,6 +141,7 @@ impl BlockTables {
             first_table,
             request_pool_size,
             width,
+            num_units,
             tables: HashMap::new(),
             lengths: HashMap::new(),
             prefixes: HashMap::new(),
@@ -202,7 +209,10 @@ impl BlockTables {
             let per_page = table.shape.units_per_page as usize;
             if !table.units.len().is_multiple_of(per_page)
                 || table.units.len() / per_page > self.width
-                || table.units.iter().any(|unit| unit.0 == 0)
+                || table
+                    .units
+                    .iter()
+                    .any(|unit| unit.0 == 0 || unit.0 >= self.num_units)
                 || table.units.iter().collect::<HashSet<_>>().len() != table.units.len()
                 || u64::from(table.allocated_tokens)
                     > table.end_page() * u64::from(table.shape.page_tokens)
@@ -380,7 +390,7 @@ mod tests {
             GroupShape::new(4, 1, None)?,
             GroupShape::new(8, 2, Some(8))?,
         ];
-        let mut tables = BlockTables::new(groups, 1, 3)?;
+        let mut tables = BlockTables::new(groups, 1, 3, 6)?;
         let update = tables.prepare(&[BlockTable {
             request_pool_idx: 1,
             group_id: 0,
@@ -413,7 +423,7 @@ mod tests {
             GroupShape::new(4, 1, None)?,
             GroupShape::new(8, 2, Some(8))?,
         ];
-        let mut tables = BlockTables::new(groups, 1, 2)?;
+        let mut tables = BlockTables::new(groups, 1, 2, 7)?;
         let first = BlockTable {
             request_pool_idx: 1,
             group_id: 0,
@@ -476,7 +486,7 @@ mod tests {
     #[test]
     fn retained_prefixes_follow_the_request_epoch_and_preserve_borrowed_tables() -> Result<()> {
         let shape = GroupShape::new(4, 1, None)?;
-        let mut tables = BlockTables::new(vec![shape], 3, 2)?;
+        let mut tables = BlockTables::new(vec![shape], 3, 2, 9)?;
         let update = tables.prepare(&[BlockTable {
             request_pool_idx: 2,
             group_id: 0,

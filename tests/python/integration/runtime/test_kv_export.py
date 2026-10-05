@@ -22,6 +22,7 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.shared_storage import open_shared_storage
+from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.batch import (
     BlockTable,
     CacheUnitAllocation,
@@ -463,8 +464,16 @@ def test_tail_closure_precedes_exact_incremental_export() -> None:
     assert incremental_snapshot.exported_extent == 4
 
 
-def test_local_kv_install_resolves_resident_export() -> None:
-    with execution_worker() as worker:
+@pytest.mark.parametrize("cache_dtype", ("float32", "float8_e4m3fn"))
+def test_local_kv_install_preserves_resident_values_on_append(
+    cache_dtype,
+) -> None:
+    execution = WorkerConfig(
+        graph_policy="off",
+        prefill_cuda_graph=False,
+        kv_cache_dtype=cache_dtype,
+    )
+    with execution_worker(execution=execution) as worker:
         source = ar_params(47, block_ids=(0,))
         extend = token_call(
             source.request_key,
@@ -482,6 +491,18 @@ def test_local_kv_install_resolves_resident_export() -> None:
             ),
         )
         observation = record_completion(extend, extended)
+
+        # Fill through the public numerical cache interface. The prefix and
+        # the later append require different FP8 scales when written alone.
+        for layer in worker.kv_cache.cache.config.layers:
+            state = worker.kv_cache.cache.state(layer)
+            key, value = state.read((1,), start=0, length=2)
+            state.write(
+                (1,),
+                start=0,
+                key=torch.full_like(key, 448),
+                value=torch.full_like(value, -448),
+            )
         export, buffer = _export_call(
             source.request_key,
             call_id=CallId(2, 0),
@@ -508,7 +529,7 @@ def test_local_kv_install_resolves_resident_export() -> None:
                     batch_id=3,
                     calls=(install,),
                     block_tables=(
-                        BlockTable(source.request_pool_idx, 0, 0, (2,), 2),
+                        BlockTable(source.request_pool_idx, 0, 0, (2,), 3),
                     ),
                     new_cache_units=(
                         CacheUnitAllocation(source.request_pool_idx, 0, (2,)),
@@ -524,6 +545,20 @@ def test_local_kv_install_resolves_resident_export() -> None:
             actual = state.read((2,), start=0, length=2)
             for left, right in zip(actual, expected, strict=True):
                 torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+            # Installing the batch's tables must preserve the imported page's
+            # initialization state. Otherwise an append can reset its scale
+            # and reinterpret the already installed prefix.
+            key = torch.ones_like(expected[0][:1])
+            value = -torch.ones_like(expected[1][:1])
+            state.write((2,), start=2, key=key, value=value)
+            actual = state.read((2,), start=0, length=3)
+            for left, prefix, suffix in zip(
+                actual, expected, (key, value), strict=True
+            ):
+                torch.testing.assert_close(
+                    left, torch.cat((prefix, suffix)), rtol=0, atol=0
+                )
 
 
 def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
