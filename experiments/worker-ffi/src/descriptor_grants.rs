@@ -1,6 +1,7 @@
 //! Native descriptor ownership and local grants through TVM-FFI.
 
 use std::os::fd::IntoRawFd;
+use std::sync::Arc;
 
 use tvm_ffi::derive::{Object, ObjectRef};
 use tvm_ffi::{Function, Object, ObjectArc, Result, String};
@@ -13,12 +14,18 @@ use crate::{method, object};
 #[type_key = "uniserve.ffi.DescriptorGrants"]
 pub struct DescriptorGrantsObj {
     object: Object,
-    grants: uniserve_worker::DescriptorGrants,
+    grants: Arc<uniserve_worker::DescriptorGrants>,
 }
 
 #[derive(Clone, ObjectRef)]
 pub struct DescriptorGrants {
     data: ObjectArc<DescriptorGrantsObj>,
+}
+
+impl DescriptorGrants {
+    pub(crate) fn native(&self) -> Arc<uniserve_worker::DescriptorGrants> {
+        Arc::clone(&self.data.grants)
+    }
 }
 
 pub fn fetch_descriptor(endpoint: String, export: String) -> Result<i32> {
@@ -37,7 +44,7 @@ pub fn register() -> Result<()> {
             Ok(DescriptorGrants {
                 data: ObjectArc::new(DescriptorGrantsObj {
                     object: Object::new(),
-                    grants,
+                    grants: Arc::new(grants),
                 }),
             })
         }),

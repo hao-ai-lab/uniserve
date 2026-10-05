@@ -7,7 +7,8 @@ from threading import Event
 import pytest
 import torch
 import tvm_ffi
-from bindings import CUDAStream, Executor, HostBuffers, load_library
+from bindings import CUDAStream, Executor, HostBuffers, VmmPool, load_library
+from uniserve_kernels.peer_storage import empty
 
 from tests.python.fixtures.cuda_stream import blocked_stream
 
@@ -16,6 +17,11 @@ def _retire(library, resource, owner):
     load_library(library)
     output = torch.zeros(32, dtype=torch.int64, device="cuda:0")
     host = torch.full((32,), 17, pin_memory=True)
+    backing = (
+        empty((1 << 20,), dtype=torch.uint8, device=torch.device("cuda:0"))
+        if resource == "vmm_pool"
+        else None
+    )
 
     # Load the numerical kernels before holding the device behind a gate.
     output.fill_(0)
@@ -43,6 +49,10 @@ def _retire(library, resource, owner):
                         1,
                     )
                     value.submit(1, output)
+                elif resource == "vmm_pool":
+                    value = VmmPool(backing)
+                    value.reserve(64)
+                    output.fill_(17)
                 else:
                     value = CUDAStream(0, stream.cuda_stream, 2)
                     output.fill_(17)
@@ -66,7 +76,9 @@ def _retire(library, resource, owner):
     assert output.cpu().tolist() == [17] * 32
 
 
-@pytest.mark.parametrize("resource", ("buffers", "executor", "stream"))
+@pytest.mark.parametrize(
+    "resource", ("buffers", "executor", "stream", "vmm_pool")
+)
 @pytest.mark.parametrize("owner", ("object", "array", "any"))
 def test_final_owner_drains_without_blocking_python(request, resource, owner):
     # A GIL deadlock prevents in-process timeouts from running. The parent

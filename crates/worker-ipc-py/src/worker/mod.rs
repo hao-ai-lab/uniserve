@@ -30,6 +30,7 @@ mod shared_buffer;
 mod storage;
 mod stream;
 mod transfer;
+mod vmm_pool;
 mod weight_prefetch;
 
 /// Register the worker objects in the common native extension.
@@ -83,6 +84,12 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<pending::PendingOutput>()?;
     module.add_class::<registry::BufferRegistry>()?;
     module.add_class::<shared_buffer::SharedBuffer>()?;
+    module.add_class::<vmm_pool::VmmPool>()?;
+    module.add_class::<vmm_pool::PoolChunk>()?;
+    module.add(
+        "PoolExhaustedError",
+        module.py().get_type::<vmm_pool::PoolExhaustedError>(),
+    )?;
     module.add_class::<shared_buffer::SharedRead>()?;
     module.add("SHM_HEADER_BYTES", uniserve_worker::SHM_HEADER_BYTES)?;
     module.add_function(wrap_pyfunction!(shared_buffer::open_shared_memory, module)?)?;

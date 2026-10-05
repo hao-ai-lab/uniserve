@@ -197,20 +197,14 @@ class CudaVmmTransport(Transport):
         self._largest_payload = 0
         self._synchronize_seconds = 0.0
         self._longest_synchronize = 0.0
-        # Retain chunks still read by remote consumers until reap() observes
-        # their acknowledgments, independently of the original source fence.
-        self._unacknowledged: dict[str, _CudaSource] = {}
-        # A source is released when its own fence drains: a pool export
-        # was copied into its chunk, and the chunk is what waits for the
-        # consumers, swept separately in reap().
+        # The source retires after its copy. The native pool separately holds
+        # the exported chunk until remote readers acknowledge completion.
         self._buffers = BufferRegistry(
             capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
-            # A device export's chunk is held by the pool until its
-            # readers finish, which the transport's own sweep decides; the
-            # export itself owes nothing once the producer's work is
-            # complete.
+            # Remote readers retain the native pool's chunk independently
+            # of this registry's original source.
             settled=lambda source: True,
         )
         self._reads = TransferPool(
@@ -238,18 +232,6 @@ class CudaVmmTransport(Transport):
     def set_completion_wake(self, wake: Any) -> None:
         self._reads.set_completion_wake(wake)
 
-    def _release_chunk(self, source: _CudaSource) -> None:
-        """Return one chunk to its pool and withdraw the grant that named it.
-
-        The grant lends the pool's descriptor, which the pool keeps; what ends
-        here is a consumer's right to ask for this chunk, which ends when the
-        chunk can be handed out again.
-        """
-        assert source.pool is not None and source.chunk is not None
-        if source.grants is not None and source.export_id:
-            source.grants.release(source.export_id)
-        source.pool.release(source.chunk)
-
     def _reclaim(
         self,
         source: _CudaSource,
@@ -257,15 +239,13 @@ class CudaVmmTransport(Transport):
     ) -> None:
         source.retirement = retirement
         if source.chunk is not None and source.pool is not None:
-            if source.consumers:
-                # A consumer may still be reading this chunk, and it will say
-                # so by writing its word rather than by closing a connection.
-                # Holding the chunk until then does not hold the source: that
-                # was copied into the chunk and is released below.
-                self._unacknowledged[source.export_id] = source
-            else:
-                # No other rank reads this product, so nothing can be waiting.
-                self._release_chunk(source)
+            source.pool.retire(
+                source.chunk,
+                source.consumers,
+                source.event,
+                source.grants,
+                source.export_id,
+            )
         self._events.defer_release(
             (source.event,), source, completed=source.events_released
         )
@@ -278,35 +258,13 @@ class CudaVmmTransport(Transport):
         way one on this host does: by writing its slot's word in the chunk it
         mapped.
         """
-        import torch
-
-        held = list(self._unacknowledged.values())
-        if not held:
-            return
-        # Every held chunk's words are read in one transfer. Asking each chunk
-        # separately would put one device-to-host synchronize per held
-        # export into every retirement pass.
-        watched = [
-            source.chunk.acknowledgments[list(source.consumers)]
-            for source in held
-            if source.chunk is not None
-        ]
-        observed = (
-            torch.cat(watched).cpu().split([len(words) for words in watched])
-        )
-
-        for source, words in zip(held, observed, strict=True):
-            # A chunk returns once no named consumer is still reading it: one
-            # that never claimed its word holds nothing, which is how a
-            # product whose consuming call was never submitted retires.
-            if bool((words != vmm_pool.CLAIMED).all()):
-                self._release_chunk(source)
-                # Read completions may add other chunks while the GPU query
-                # runs. Remove only the chunks this sweep observed as settled.
-                self._unacknowledged.pop(source.export_id)
+        for pool in tuple(self._pools.values()):
+            pool.reap()
 
     def awaiting_acknowledgment(self) -> bool:
-        return bool(self._unacknowledged)
+        return any(
+            pool.awaiting_acknowledgment() for pool in self._pools.values()
+        )
 
     def _drain(self, source: _CudaSource) -> None:
         """Block until the producer fence completes, then release the source.
@@ -811,7 +769,8 @@ class CudaVmmTransport(Transport):
             # Consumers of this rank's remaining chunks are gone with it, so
             # their acknowledgments will never arrive. The pools are released
             # whole, which is what closing the transport means for them.
-            self._unacknowledged.clear()
+            for pool in self._pools.values():
+                pool.close()
             self._pools.clear()
             if self._grants is not None:
                 self._grants.close()

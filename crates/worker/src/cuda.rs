@@ -51,6 +51,9 @@ struct Driver {
     launch: unsafe extern "C" fn(Handle, unsafe extern "C" fn(Handle), Handle) -> Status,
     register_host: unsafe extern "C" fn(Handle, usize, u32) -> Status,
     unregister_host: unsafe extern "C" fn(Handle) -> Status,
+    allocate_host: unsafe extern "C" fn(*mut Handle, usize, u32) -> Status,
+    free_host: unsafe extern "C" fn(Handle) -> Status,
+    memset: unsafe extern "C" fn(u64, u32, usize, Handle) -> Status,
 }
 
 fn driver() -> Result<&'static Driver, String> {
@@ -62,6 +65,13 @@ fn driver() -> Result<&'static Driver, String> {
             unsafe {
                 let library = Library::new("libcuda.so.1").map_err(|e| e.to_string())?;
                 let driver = Driver {
+                    allocate_host: *library
+                        .get(b"cuMemHostAlloc\0")
+                        .map_err(|e| e.to_string())?,
+                    free_host: *library.get(b"cuMemFreeHost\0").map_err(|e| e.to_string())?,
+                    memset: *library
+                        .get(b"cuMemsetD32Async\0")
+                        .map_err(|e| e.to_string())?,
                     register_host: *library
                         .get(b"cuMemHostRegister_v2\0")
                         .map_err(|e| e.to_string())?,
@@ -673,6 +683,67 @@ impl CopyBatch {
                 "cuMemcpyBatchAsync",
             )
         }
+    }
+}
+
+/// Pinned bytes used by native DMA consumers. The owner drains every copy
+/// before reading, resizing or dropping this allocation.
+pub struct PinnedBuffer {
+    address: usize,
+    bytes: usize,
+}
+
+impl PinnedBuffer {
+    pub fn new(bytes: usize) -> Result<Self, String> {
+        let mut address = std::ptr::null_mut();
+        // Portable host storage can be used by copies in any device context.
+        unsafe {
+            check(
+                (driver()?.allocate_host)(&mut address, bytes, 1),
+                "cuMemHostAlloc",
+            )?;
+        }
+        Ok(Self {
+            address: address as usize,
+            bytes,
+        })
+    }
+
+    pub fn address(&self) -> usize {
+        self.address
+    }
+
+    pub fn size(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for PinnedBuffer {
+    fn drop(&mut self) {
+        if let Ok(driver) = driver() {
+            // SAFETY: this allocation is owned here and its DMA has ended.
+            unsafe { (driver.free_host)(self.address as Handle) };
+        }
+    }
+}
+
+/// Fill aligned device words after preceding work on the borrowed stream.
+/// The caller retains the writable span through stream completion.
+///
+/// # Safety
+/// `address` must identify `words` writable, aligned u32 values in the current
+/// device context, and `stream` must belong to that context.
+pub unsafe fn fill_words(
+    address: usize,
+    value: u32,
+    words: usize,
+    stream: usize,
+) -> Result<(), String> {
+    unsafe {
+        check(
+            (driver()?.memset)(address as u64, value, words, stream as Handle),
+            "cuMemsetD32Async",
+        )
     }
 }
 

@@ -53,6 +53,14 @@ class SharedRead(tvm_ffi.Object):
     """Native reader claim, readiness wait and DLPack payload view."""
 
 
+class VmmPool(tvm_ffi.Object):
+    """Export ranges and asynchronous retirement over a DLPack allocation."""
+
+
+class PoolChunk(tvm_ffi.Object):
+    """A pool reservation with borrowed payload and acknowledgment tensors."""
+
+
 def fetch_descriptor(endpoint, export):
     return _module.fetch_descriptor(endpoint, export)
 
@@ -86,3 +94,5 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.DescriptorGrants")(DescriptorGrants)
     tvm_ffi.register_object("uniserve.ffi.SharedBuffer")(SharedBuffer)
     tvm_ffi.register_object("uniserve.ffi.SharedRead")(SharedRead)
+    tvm_ffi.register_object("uniserve.ffi.VmmPool")(VmmPool)
+    tvm_ffi.register_object("uniserve.ffi.PoolChunk")(PoolChunk)
