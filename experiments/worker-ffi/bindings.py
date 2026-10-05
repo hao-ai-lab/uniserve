@@ -33,6 +33,18 @@ class HostBuffers(tvm_ffi.Object):
     """Host input tensors and native copy fences shared with production."""
 
 
+class CUDAStream(tvm_ffi.Object):
+    """Native stream, SM partition and submission fences."""
+
+
+class CUDAEvent(tvm_ffi.Object):
+    """A native device dependency that retains its producer's SM partition."""
+
+
+def partition_streams(device, counts, event_slots=2):
+    return _module.partition_streams(device, counts, event_slots)
+
+
 def load_library(filename: str) -> None:
     """Load the explicitly selected library and bind its reflected methods."""
     global _module
@@ -45,3 +57,5 @@ def load_library(filename: str) -> None:
     tvm_ffi.register_object("uniserve.ffi.HostLane")(HostLane)
     tvm_ffi.register_object("uniserve.ffi.HostTask")(HostTask)
     tvm_ffi.register_object("uniserve.ffi.HostBuffers")(HostBuffers)
+    tvm_ffi.register_object("uniserve.ffi.CUDAStream")(CUDAStream)
+    tvm_ffi.register_object("uniserve.ffi.CUDAEvent")(CUDAEvent)

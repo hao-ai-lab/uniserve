@@ -1,4 +1,6 @@
-//! CUDA completion events and host notifications shared by worker backends.
+//! CUDA streams, completion events and host notifications shared by worker backends.
+
+mod green;
 
 use std::ffi::c_void;
 use std::io;
@@ -42,6 +44,10 @@ struct Driver {
     create_stream: unsafe extern "C" fn(*mut Handle, u32) -> Status,
     synchronize_stream: unsafe extern "C" fn(Handle) -> Status,
     destroy_stream: unsafe extern "C" fn(Handle) -> Status,
+    stream_priority: unsafe extern "C" fn(Handle, *mut i32) -> Status,
+    create_priority_stream: unsafe extern "C" fn(*mut Handle, u32, i32) -> Status,
+    stream_green: unsafe extern "C" fn(Handle, *mut Handle) -> Status,
+    create_green_stream: unsafe extern "C" fn(*mut Handle, Handle, u32, i32) -> Status,
     launch: unsafe extern "C" fn(Handle, unsafe extern "C" fn(Handle), Handle) -> Status,
 }
 
@@ -101,6 +107,18 @@ fn driver() -> Result<&'static Driver, String> {
                     destroy_stream: *library
                         .get(b"cuStreamDestroy_v2\0")
                         .map_err(|e| e.to_string())?,
+                    stream_priority: *library
+                        .get(b"cuStreamGetPriority\0")
+                        .map_err(|e| e.to_string())?,
+                    create_priority_stream: *library
+                        .get(b"cuStreamCreateWithPriority\0")
+                        .map_err(|e| e.to_string())?,
+                    stream_green: *library
+                        .get(b"cuStreamGetGreenCtx\0")
+                        .map_err(|e| e.to_string())?,
+                    create_green_stream: *library
+                        .get(b"cuGreenCtxStreamCreate\0")
+                        .map_err(|e| e.to_string())?,
                     init: *library.get(b"cuInit\0").map_err(|e| e.to_string())?,
                     primary_retain: *library
                         .get(b"cuDevicePrimaryCtxRetain\0")
@@ -149,6 +167,8 @@ pub struct Event {
     interprocess: bool,
     external: bool,
     handle: Mutex<Option<Arc<EventHandle>>>,
+    // Output fences may outlive the stream that produced them.
+    _green: Option<Arc<green::GreenContext>>,
 }
 
 struct EventHandle {
@@ -171,6 +191,7 @@ impl Event {
             interprocess,
             external: false,
             handle: Mutex::new(None),
+            _green: None,
         }
     }
 
@@ -348,6 +369,7 @@ impl Event {
             interprocess: true,
             external: false,
             handle: Mutex::new(Some(Arc::new(event))),
+            _green: None,
         })
     }
 }
@@ -419,6 +441,8 @@ impl Drop for DeviceGuard {
 /// A nonblocking stream owned by worker execution or transport infrastructure.
 pub struct Stream {
     handle: Handle,
+    owned: bool,
+    green: Option<Arc<green::GreenContext>>,
 }
 
 // SAFETY: the CUDA driver supports stream operations from multiple host threads.
@@ -431,7 +455,106 @@ impl Stream {
     pub fn new() -> Result<Self, String> {
         let mut handle = std::ptr::null_mut();
         unsafe { check((driver()?.create_stream)(&mut handle, 1), "cuStreamCreate")? };
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            owned: true,
+            green: None,
+        })
+    }
+
+    /// Borrows a stream whose creator retains its CUDA context and handle.
+    pub fn borrowed(handle: usize) -> Self {
+        Self {
+            handle: handle as Handle,
+            owned: false,
+            green: None,
+        }
+    }
+
+    /// Creates an independent stream with the origin's context and priority.
+    /// A borrowed origin's context must outlive the returned stream.
+    pub fn sibling(origin: usize) -> Result<Self, String> {
+        let driver = driver()?;
+        let mut green = std::ptr::null_mut();
+        let mut priority = 0;
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(
+                (driver.stream_green)(origin as Handle, &mut green),
+                "cuStreamGetGreenCtx",
+            )?;
+            check(
+                (driver.stream_priority)(origin as Handle, &mut priority),
+                "cuStreamGetPriority",
+            )?;
+        }
+
+        if green.is_null() {
+            let mut context = std::ptr::null_mut();
+            unsafe {
+                check(
+                    (driver.stream_context)(origin as Handle, &mut context),
+                    "cuStreamGetCtx",
+                )?;
+            }
+            in_context(context, |driver| unsafe {
+                check(
+                    (driver.create_priority_stream)(&mut handle, 1, priority),
+                    "cuStreamCreateWithPriority",
+                )
+            })?;
+        } else {
+            unsafe {
+                check(
+                    (driver.create_green_stream)(&mut handle, green, 1, priority),
+                    "cuGreenCtxStreamCreate",
+                )?;
+            }
+        }
+
+        Ok(Self {
+            handle,
+            owned: true,
+            green: None,
+        })
+    }
+
+    /// Forks this stream while retaining its owned SM partition.
+    pub fn fork(&self) -> Result<Self, String> {
+        let mut stream = Self::sibling(self.handle())?;
+        stream.green = self.green.clone();
+        Ok(stream)
+    }
+
+    /// Allocates disjoint SM partitions and one stream per partition.
+    pub fn partition(device: i32, counts: &[u32]) -> Result<Vec<Self>, String> {
+        green::partition(device, counts)
+    }
+
+    pub fn sm_count(&self) -> Result<u32, String> {
+        match &self.green {
+            Some(green) => Ok(green.sm_count),
+            None => green::stream_sms(self.handle),
+        }
+    }
+
+    pub fn partitioned(&self) -> Result<bool, String> {
+        let mut green = std::ptr::null_mut();
+        unsafe {
+            check(
+                (driver()?.stream_green)(self.handle, &mut green),
+                "cuStreamGetGreenCtx",
+            )?;
+        }
+        Ok(!green.is_null())
+    }
+
+    /// Creates a fence retaining the stream's owned CUDA context.
+    pub fn event(&self, device: i32) -> Event {
+        Event {
+            _green: self.green.clone(),
+            ..Event::new(device, false, false)
+        }
     }
 
     pub fn handle(&self) -> usize {
@@ -450,7 +573,9 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        if let Ok(driver) = driver() {
+        if self.owned
+            && let Ok(driver) = driver()
+        {
             unsafe { (driver.destroy_stream)(self.handle) };
         }
     }

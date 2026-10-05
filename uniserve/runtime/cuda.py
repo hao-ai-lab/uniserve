@@ -1,10 +1,12 @@
-"""CUDA driver results and captured-kernel context ownership."""
+"""CUDA driver results and numerical views of native streams."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import torch
+
+from uniserve_worker._uniserve_ipc import CUDAStream as NativeStream
 
 
 class CUDAError(RuntimeError):
@@ -17,11 +19,7 @@ class CUDAError(RuntimeError):
 
 
 def driver() -> Any:
-    """Import the CUDA driver bindings.
-
-    Import and return the CUDA driver bindings required for explicit CUDA
-    resources.
-    """
+    """Import the CUDA driver bindings used by numerical backends."""
     try:
         from cuda.bindings import (
             driver,  # pyright: ignore[reportAttributeAccessIssue]
@@ -34,11 +32,7 @@ def driver() -> Any:
 
 
 def cuda_status(result: tuple[Any, ...], call: str) -> None:
-    """Validate a CUDA driver result.
-
-    Validate a CUDA driver result, raising CUDAError with the decoded
-    failure.
-    """
+    """Raise CUDAError with the decoded driver failure, if any."""
     cu = driver()
     if result[0] == cu.CUresult.CUDA_SUCCESS:
         return
@@ -65,107 +59,19 @@ def cuda_value(result: tuple[Any, ...], call: str) -> Any:
 
 
 def create_sibling_stream(
-    stream: torch.cuda.Stream, purpose: str
-) -> tuple[Any, torch.cuda.ExternalStream]:
-    """Create a driver stream in ``stream``'s CUDA context.
+    stream: torch.cuda.Stream,
+    owner: NativeStream | None = None,
+) -> tuple[NativeStream, torch.cuda.ExternalStream]:
+    """Own a stream in the origin's context and return its PyTorch view.
 
-    The new stream shares the context of ``stream``, including its SM
-    partition when that is a green context, at the same priority and without
-    implicit synchronization against the legacy default stream. A driver
-    stream is never one of PyTorch's pooled streams, so it is distinct from
-    every stream the pool hands out. Returns the raw handle, which the caller
-    destroys with ``destroy_stream``, and the wrapped stream PyTorch
-    dispatches onto. ``purpose`` names the stream in failures.
+    Forking an owned stream retains its SM partition. A caller supplying only
+    a PyTorch view retains the origin's context until the new stream closes.
     """
-    with torch.cuda.device(stream.device):
-        cu = driver()
-        origin = cu.CUstream(stream.cuda_stream)
-        flags = int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING)
-        green = cuda_value(
-            cu.cuStreamGetGreenCtx(origin), f"query {purpose} stream context"
-        )
-        if int(green):
-            raw = cuda_value(
-                cu.cuGreenCtxStreamCreate(green, flags, stream.priority),
-                f"create partitioned {purpose} stream",
-            )
-        else:
-            context = cuda_value(
-                cu.cuStreamGetCtx(origin), f"query {purpose} stream context"
-            )
-            cuda_status(
-                cu.cuCtxPushCurrent(context), f"enter {purpose} context"
-            )
-            try:
-                raw = cuda_value(
-                    cu.cuStreamCreateWithPriority(flags, stream.priority),
-                    f"create {purpose} stream",
-                )
-            finally:
-                cuda_status(cu.cuCtxPopCurrent(), f"leave {purpose} context")
-
-    return raw, torch.cuda.ExternalStream(int(raw), device=stream.device)
-
-
-def destroy_stream(raw: Any, purpose: str) -> None:
-    """Destroy a driver stream created by ``create_sibling_stream``."""
-    cuda_status(driver().cuStreamDestroy(raw), f"destroy {purpose} stream")
-
-
-def verify_graph_context(
-    graph: torch.cuda.CUDAGraph, contexts: frozenset[int]
-) -> int:
-    """Verify kernels belong to the execution context's actual device bindings.
-
-    Returns the number of captured kernel nodes; raises CUDAError when any
-    kernel was captured against a CUDA context outside ``contexts``.
-    """
-    if not contexts:
-        raise ValueError("CUDA graph verification requires its bound contexts")
-
-    cu = driver()
-    raw_graph = graph.raw_cuda_graph()
-    # The binding materializes every requested entry, including unused NULL
-    # handles. Query the size before enumeration so small graph segments do
-    # not each allocate a million Python handles during startup.
-    size_result = cu.cuGraphGetNodes(cu.CUgraph(raw_graph), 0)
-    cuda_status(size_result, "count CUDA graph nodes")
-    count = int(size_result[2])
-    if count == 0:
-        return 0
-    nodes_result = cu.cuGraphGetNodes(cu.CUgraph(raw_graph), count)
-    cuda_status(nodes_result, "enumerate CUDA graph nodes")
-    nodes = nodes_result[1]
-
-    kernels = 0
-    for node in nodes:
-        node_type = cuda_value(
-            cu.cuGraphNodeGetType(node), "query CUDA graph node type"
-        )
-        if node_type != cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
-            continue
-
-        params = cuda_value(
-            cu.cuGraphKernelNodeGetParams(node), "query kernel node context"
-        )
-        if int(params.ctx) not in contexts:
-            name_result = (
-                cu.cuFuncGetName(params.func)
-                if int(params.func)
-                else cu.cuKernelGetName(params.kern)
-            )
-            name = (
-                name_result[1]
-                if name_result[0] == cu.CUresult.CUDA_SUCCESS
-                else "unknown"
-            )
-            raise CUDAError(
-                f"captured compute node {name!r} escaped its owning context: "
-                f"actual={int(params.ctx):#x}, "
-                f"expected={sorted(hex(value) for value in contexts)}"
-            )
-        kernels += 1
-
-    # Empty token partitions and copy-only call kinds are valid graphs.
-    # Their lack of kernels does not violate device-context containment.
-    return kernels
+    native = (
+        owner.fork()
+        if owner is not None
+        else NativeStream.sibling(stream.device.index, stream.cuda_stream)
+    )
+    return native, torch.cuda.ExternalStream(
+        native.handle, device=stream.device
+    )
