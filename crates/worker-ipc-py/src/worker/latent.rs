@@ -720,7 +720,7 @@ impl LatentPool {
     /// Expose imported pages after ordering their producer fences on the
     /// consuming stream. A pending or failed transfer cannot be adopted.
     #[pyo3(signature = (write, *, generation, step, height, width))]
-    fn adopt_import(
+    pub(super) fn adopt_import(
         &mut self,
         py: Python<'_>,
         write: &Bound<'_, LatentImport>,

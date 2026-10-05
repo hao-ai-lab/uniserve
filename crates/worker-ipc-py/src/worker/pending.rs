@@ -194,11 +194,6 @@ impl PendingOutput {
         Ok(())
     }
 
-    fn set_flow_step(&self, py: Python<'_>, step: u64) -> PyResult<()> {
-        self.lock(py)?.progress.flow_step = step;
-        Ok(())
-    }
-
     fn set_prompt_logits(&self, py: Python<'_>, logits: Py<PyAny>) -> PyResult<()> {
         self.token_update
             .bind(py)
@@ -410,7 +405,6 @@ impl PendingOutput {
         latent.getattr("exports")?.call_method0("clear")?;
         latent.setattr("input_params", py.None())?;
         latent.setattr("staging", py.None())?;
-        latent.setattr("imported", false)?;
 
         self.predicate = None;
         self.token_write = None;

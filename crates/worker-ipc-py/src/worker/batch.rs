@@ -8,12 +8,12 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use uniserve_worker_ipc::{Batch, CallStatus, DType};
+use uniserve_worker_ipc::{Batch, CallStatus, DType, TransferHandle};
 
 use super::block_tables::BlockTables;
 use super::completion::CompletionRef;
 use super::error::{invalid, native_error};
-use super::inputs::BatchInputs;
+use super::inputs::{BatchInputs, Input};
 use super::kv_cache::KVCacheManager;
 use super::kv_import::KVImporter;
 use super::latent::LatentPool;
@@ -143,6 +143,130 @@ impl BatchState {
             .get(&request_id)
             .map_or(&[][..], |&index| self.forward_indices[index].as_slice());
         PyTuple::new(py, rows)
+    }
+
+    /// Complete ready inputs for active numerical consumers. The executor
+    /// establishes readiness; owners order device fences and propagate failures.
+    #[pyo3(signature = (tensors, latents, cache))]
+    fn complete_inputs(
+        slf: &Bound<'_, Self>,
+        tensors: &TensorStore,
+        latents: Option<&Bound<'_, LatentPool>>,
+        cache: Option<&Bound<'_, KVCacheManager>>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let (plan, inputs) = {
+            let this = slf.borrow();
+            (Arc::clone(&this.plan), this.inputs.clone_ref(py))
+        };
+
+        // KV descriptors can have become resident since read admission. Check
+        // those mutable owners before exposing any imported tensor or latent.
+        let cache_inputs: HashSet<_> = plan.calls.iter().filter_map(|call| call.kv_input).collect();
+        for write in inputs.borrow(py).cache_imports(py) {
+            let write = write.get();
+            if !cache_inputs.contains(&write.export.source) {
+                continue;
+            }
+            let cache =
+                cache.ok_or_else(|| invalid(py, "KV input requires cache export storage"))?;
+            if let Some(existing) = cache.borrow().inner.resident(write.export.source)
+                && existing.as_ref() != write.export.as_ref()
+            {
+                return Err(invalid(
+                    py,
+                    "prepared KV import conflicts with its resident export",
+                ));
+            }
+        }
+
+        if plan.input_products.is_empty() {
+            return Ok(());
+        }
+
+        // Admission already resolved input roles, placement and immutable
+        // transfer dimensions. Only calls whose predicates passed consume.
+        let outputs = slf
+            .borrow()
+            .outputs
+            .iter()
+            .map(|output| output.clone_ref(py))
+            .collect::<Vec<_>>();
+        let mut consumers = HashMap::new();
+        for (index, call) in plan.calls.iter().enumerate() {
+            if outputs[index].borrow(py).lock(py)?.output.status == CallStatus::Predicated {
+                continue;
+            }
+            for product in call.tensor_inputs().chain(call.predicate.as_ref()) {
+                consumers.entry(product).or_insert(index);
+            }
+        }
+
+        for export in &plan.input_products {
+            let Some(&index) = consumers.get(&export.product) else {
+                continue;
+            };
+            let input = inputs
+                .borrow(py)
+                .get(py, export.product.buffer_id())
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("transferred input lost its prepared destination")
+                })?;
+
+            // No batch/input borrow spans completion callbacks. The cloned
+            // input retains its views while its owner makes them visible.
+            match (input, &export.value) {
+                (Input::Borrowed, _) => {}
+                (Input::Tensor(read), _) => tensors.complete_import(py, read.bind(py))?,
+                (
+                    Input::Latent(write),
+                    TransferHandle::Latent {
+                        height,
+                        width,
+                        step,
+                        ..
+                    },
+                ) => {
+                    let output = &outputs[index];
+                    let (slot, current_step) = {
+                        let output = output.borrow(py);
+                        let slot = output.request.borrow(py).request.slot();
+                        let step = output.lock(py)?.progress.flow_step;
+                        (slot, step)
+                    };
+                    if current_step != 0 {
+                        return Err(invalid(
+                            py,
+                            "latent transfer destination already owns a trajectory",
+                        ));
+                    }
+                    if write.get().inner.request_pool_idx != slot {
+                        return Err(invalid(
+                            py,
+                            "latent import has a different destination slot",
+                        ));
+                    }
+
+                    let pool = latents
+                        .ok_or_else(|| invalid(py, "latent import requires physical storage"))?;
+                    pool.borrow_mut().adopt_import(
+                        py,
+                        write.bind(py),
+                        i64::from(export.product.generation),
+                        i64::from(*step),
+                        i64::from(*height),
+                        i64::from(*width),
+                    )?;
+                    output.borrow(py).lock(py)?.progress.flow_step = u64::from(*step);
+                }
+                _ => {
+                    return Err(PyRuntimeError::new_err(
+                        "tensor product has no prepared tensor or latent import",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Install active calls' KV assignments and retain their physical access.
