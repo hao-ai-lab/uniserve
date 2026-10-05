@@ -396,9 +396,8 @@ impl BatchState {
         let views = if image_shape.is_some() {
             let mut occupied = Vec::new();
             for output in outputs {
-                let view = output.borrow(py).latent.bind(py).getattr("buffer")?;
-                if !view.is_none() {
-                    occupied.push(view.unbind());
+                if let Some(view) = &output.borrow(py).latent_buffer {
+                    occupied.push(view.clone_ref(py));
                 }
             }
 
@@ -423,14 +422,10 @@ impl BatchState {
 
         let parameters = batch.bind(py).getattr("latent_params")?;
         for (row, (parameter, _, output)) in selected.iter().enumerate() {
-            let latent = output.borrow(py).latent.clone_ref(py);
-            latent
-                .bind(py)
-                .setattr("input_params", parameters.get_item(*parameter)?)?;
+            let mut output = output.borrow_mut(py);
+            output.latent_params = Some(parameters.get_item(*parameter)?.unbind());
             if let Some(views) = &views {
-                latent
-                    .bind(py)
-                    .setattr("buffer", views.bind(py).get_item(row)?)?;
+                output.latent_buffer = Some(views[row].clone_ref(py));
             }
         }
 
@@ -721,6 +716,28 @@ impl BatchState {
 
 #[pymethods]
 impl BatchState {
+    /// Record completion only after the numerical consumer has written or read
+    /// its latent bank. Ranks without that consumer leave their update empty.
+    fn complete_latent(&self, py: Python<'_>, request_id: u64) -> PyResult<()> {
+        let index = self
+            .request_indexes
+            .get(&request_id)
+            .ok_or_else(|| invalid(py, "request has no output in this batch"))?;
+        let call = &self.plan.calls[*index];
+        let params = self
+            .plan
+            .latent_params
+            .iter()
+            .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
+            .ok_or_else(|| invalid(py, "call has no bound latent parameters"))?;
+        let output = self.outputs[*index].borrow(py);
+        let slot = output.request.borrow(py).request.slot();
+        let update = uniserve_worker::LatentUpdate::for_call(slot, call, params)
+            .map_err(|error| native_error(py, error))?;
+        output.lock(py)?.latent_update = Some(update);
+        Ok(())
+    }
+
     #[getter]
     fn batch_id(&self) -> u64 {
         self.plan.batch_id

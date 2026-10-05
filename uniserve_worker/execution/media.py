@@ -49,7 +49,6 @@ from uniserve_worker.protocol.batch import (
     TensorExport,
 )
 from uniserve_worker.protocol.call import Call, MediaCall
-from uniserve_worker.storage.latent_pool import LatentUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -653,51 +652,6 @@ def mux_config(runner: ModelExecutor, media) -> AvMuxConfig:
     )
 
 
-def sample_generation(step: int) -> int:
-    """Return the pool generation of a trajectory at an accepted step.
-
-    A standalone denoiser's samples are never published from the pool, and
-    one request slot holds one trajectory, so its accepted step count
-    versions it; zero stays the empty slot's generation.
-    """
-    return int(step) + 1
-
-
-def sample_update(
-    slot: int, params, *, step: int, previous: int | None
-) -> LatentUpdate:
-    """Describe the pool export of a trajectory's successor.
-
-    ``previous`` is the committed step the successor advances, or ``None``
-    for the prepared trajectory at step zero.
-    """
-    return LatentUpdate(
-        int(slot),
-        params=params,
-        expected_generation=0
-        if previous is None
-        else sample_generation(previous),
-        expected_step=0 if previous is None else int(previous),
-        generation=sample_generation(step),
-        step=int(step),
-    )
-
-
-def trajectory_params(call: Call, *, state: BatchState):
-    """Return the unique latent trajectory params assigned to a call."""
-    selected = tuple(
-        params
-        for params in state.batch.latent_params
-        if params.request_key == call.request_key
-        and params.call_id == call.call_id
-    )
-    if len(selected) != 1:
-        raise invalid_descriptor(
-            "video trajectory call has no exact latent params"
-        )
-    return selected[0]
-
-
 def decode_range(call: Call, *, state: BatchState) -> DecodeRange:
     """Return the unique reconstruction params assigned to a call."""
     selected = tuple(
@@ -821,7 +775,11 @@ def execute(
     products: tuple[TensorExport, ...] = ()
     if call.kind is MediaCall.LATENT_PREPARATION:
         # Batch preparation validated the call's pages and interval.
-        params = trajectory_params(call, state=state)
+        params = request.latent_params
+        if params is None:
+            raise invalid_descriptor(
+                "video call has no bound latent parameters"
+            )
         assert pool is not None
         # The text features, then a conditioned request's condition latents:
         # every visual round's rows, then every audio track's
@@ -909,31 +867,21 @@ def execute(
                         video_inputs, tuple(read.tensor for read in reads[1:])
                     ),
                 )
-        request.latent.update = sample_update(
-            slot_index, params, step=0, previous=None
-        )
+        state.complete_latent(call.request_key.request_id)
 
     elif call.kind is MediaCall.DENOISING:
-        params = trajectory_params(call, state=state)
+        params = request.latent_params
+        if params is None:
+            raise invalid_descriptor(
+                "video call has no bound latent parameters"
+            )
         start_step, step_count = int(params.start_step), int(params.step_count)
-        if start_step != request.progress.flow_step:
-            raise invalid_descriptor(
-                "denoising does not begin at the selected request step"
-            )
-        if step_count != 1:
-            raise invalid_descriptor(
-                "video denoising requires one selected numerical step"
-            )
-
-        # ``step_banks`` checks the slot's committed trajectory against
-        # ``start_step``, its generation and the call's parameters, and names
-        # the bank holding it; the runner writes the successor to the other.
         assert pool is not None
         source, _ = pool.step_banks(
             slot_index,
             params.page_table,
             step=start_step,
-            generation=sample_generation(start_step),
+            generation=start_step + 1,
             latent_units=params.latent_units,
             height=params.height,
             width=params.width,
@@ -970,12 +918,7 @@ def execute(
         if result.stats is None:
             raise RuntimeError("module output has no execution statistics")
         state.forward_stats.append(result.stats)
-        request.latent.update = sample_update(
-            slot_index,
-            params,
-            step=start_step + step_count,
-            previous=start_step,
-        )
+        state.complete_latent(call.request_key.request_id)
 
         # Only the call that completes denoising may declare products, and
         # it publishes the step's result, the final samples.
@@ -1111,5 +1054,4 @@ def _request_label(call: Call) -> str:
 __all__ = [
     "decode_range",
     "execute",
-    "trajectory_params",
 ]

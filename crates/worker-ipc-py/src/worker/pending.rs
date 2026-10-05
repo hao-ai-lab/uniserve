@@ -16,7 +16,7 @@ use crate::convert;
 use super::block_tables::BlockTables;
 use super::error::{invalid, native_error, unsupported};
 use super::host::HostTask;
-use super::latent::LatentUpdate;
+use super::latent::LatentBuffer;
 use super::output::OutputBuffer;
 use super::request::{Request, RequestPool, RequestProgress};
 
@@ -97,7 +97,11 @@ pub(crate) struct PendingOutput {
     #[pyo3(get)]
     pub(super) token_update: Py<TokenUpdate>,
     #[pyo3(get)]
-    pub(super) latent: Py<PyAny>,
+    pub(super) latent_params: Option<Py<PyAny>>,
+    #[pyo3(get)]
+    pub(super) latent_buffer: Option<Py<LatentBuffer>>,
+    #[pyo3(get)]
+    pub(super) latent_exports: Py<PyDict>,
     pub(super) host_tasks: Vec<Py<HostTask>>,
     // Video unit positions within this decode round, assigned to this rank.
     pub(super) media_units: Vec<usize>,
@@ -137,24 +141,11 @@ impl PendingOutput {
         buffer: Py<OutputBuffer>,
         row: usize,
     ) -> PyResult<Self> {
-        let numerical = py.import("uniserve_worker.execution.output")?;
         let native_request = request.borrow(py);
         let previous = native_request
             .request
             .progress()
             .map_err(|error| native_error(py, error))?;
-        let update = Py::new(
-            py,
-            LatentUpdate::new(
-                native_request.request.slot() as i64,
-                None,
-                0,
-                0,
-                0,
-                0,
-                false,
-            ),
-        )?;
         drop(native_request);
 
         Ok(Self {
@@ -165,10 +156,9 @@ impl PendingOutput {
             call,
             request,
             token_update: Py::new(py, TokenUpdate::new(py))?,
-            latent: numerical
-                .getattr("LatentResult")?
-                .call1((update,))?
-                .unbind(),
+            latent_params: None,
+            latent_buffer: None,
+            latent_exports: PyDict::new(py).unbind(),
             host_tasks: Vec::new(),
             media_units: Vec::new(),
             host_finish: None,
@@ -444,7 +434,9 @@ impl PendingOutput {
         visit.call(&self.call)?;
         visit.call(&self.request)?;
         visit.call(&self.token_update)?;
-        visit.call(&self.latent)?;
+        visit.call(&self.latent_params)?;
+        visit.call(&self.latent_buffer)?;
+        visit.call(&self.latent_exports)?;
         for task in &self.host_tasks {
             visit.call(task)?;
         }
@@ -464,7 +456,9 @@ impl PendingOutput {
 
     fn __clear__(&mut self, py: Python<'_>) {
         self.token_update.borrow_mut(py).__clear__(py);
-        self.latent = py.None();
+        self.latent_params = None;
+        self.latent_buffer = None;
+        self.latent_exports.bind(py).clear();
         self.host_tasks.clear();
         self.host_finish = None;
     }
@@ -479,10 +473,9 @@ impl PendingOutput {
         self.cache_export = None;
         self.cache_installation = None;
 
-        let latent = self.latent.bind(py);
-        latent.getattr("exports")?.call_method0("clear")?;
-        latent.setattr("input_params", py.None())?;
-        latent.setattr("buffer", py.None())?;
+        self.latent_exports.bind(py).clear();
+        self.latent_params = None;
+        self.latent_buffer = None;
 
         self.predicate = None;
         self.token_write = None;

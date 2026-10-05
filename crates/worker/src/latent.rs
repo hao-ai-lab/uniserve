@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use uniserve_worker_ipc::{BufferId, LatentParams, RequestKey};
+use uniserve_worker_ipc::{BufferId, Call, CallKind, LatentParams, MediaCall, RequestKey};
 
 use crate::{Completion, Error, Result};
 
@@ -21,14 +21,68 @@ struct LatentSlot {
 
 /// A batch's prepared trajectory commit or release. The executor validates
 /// all updates before making any result visible, then applies the same values.
+#[derive(Clone)]
 pub struct LatentUpdate {
     pub request_pool_idx: i64,
-    pub params: Option<LatentParams>,
+    pub params: LatentParams,
     pub expected_generation: i64,
     pub expected_step: i64,
     pub generation: i64,
     pub step: i64,
     pub release: bool,
+}
+
+impl LatentUpdate {
+    /// Derive a completed numerical call's trajectory change from its plan.
+    /// Standalone media keeps one slot-local trajectory, versioned by step;
+    /// transferred image trajectories use the call's explicit generations.
+    pub fn for_call(slot: usize, call: &Call, params: &LatentParams) -> Result<Self> {
+        let start = i64::from(params.start_step);
+        let end = start + i64::from(params.step_count);
+        let (expected_generation, expected_step, generation, step, release) = match call.code {
+            CallKind::Media(MediaCall::LatentPreparation) => (
+                0,
+                0,
+                call.latent_output
+                    .as_ref()
+                    .map_or(1, |output| i64::from(output.generation)),
+                0,
+                false,
+            ),
+            CallKind::Media(MediaCall::Denoising) => (
+                call.latent_input
+                    .as_ref()
+                    .map_or(start + 1, |input| i64::from(input.generation)),
+                start,
+                call.latent_output
+                    .as_ref()
+                    .map_or(end + 1, |output| i64::from(output.generation)),
+                end,
+                false,
+            ),
+            CallKind::Media(MediaCall::ImageDecoding) => {
+                let input = call.latent_input.as_ref().ok_or_else(|| {
+                    Error::Invalid("image decoding has no latent trajectory".into())
+                })?;
+                (0, 0, i64::from(input.generation), start, true)
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "call does not update a latent trajectory".into(),
+                ));
+            }
+        };
+
+        Ok(Self {
+            request_pool_idx: slot as i64,
+            params: params.clone(),
+            expected_generation,
+            expected_step,
+            generation,
+            step,
+            release,
+        })
+    }
 }
 
 struct ImportState<T> {
@@ -503,9 +557,7 @@ where
         let mut slots = HashSet::new();
         let mut claimed = HashSet::new();
         for update in updates {
-            let Some(params) = &update.params else {
-                continue;
-            };
+            let params = &update.params;
             let slot = self.slot(update.request_pool_idx)?;
             if !slots.insert(slot) {
                 return Err(Error::Invalid(
@@ -587,9 +639,7 @@ where
     pub fn apply_updates(&mut self, updates: &[LatentUpdate]) -> Vec<Arc<T>> {
         let mut transfers = Vec::new();
         for update in updates {
-            let Some(params) = &update.params else {
-                continue;
-            };
+            let params = &update.params;
             let slot = update.request_pool_idx as usize;
             if update.release {
                 transfers.extend(self.clear_slot(slot));

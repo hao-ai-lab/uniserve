@@ -9,7 +9,6 @@ use super::{BatchState, PythonBackend};
 use crate::worker::error::native_error;
 use crate::worker::exports;
 use crate::worker::host::with_context;
-use crate::worker::latent::{LatentUpdate, lower_updates};
 use crate::worker::output::OutputBuffer;
 use crate::worker::pending::PendingOutput;
 use crate::worker::storage::{Buffer, TensorRead};
@@ -33,21 +32,15 @@ impl PythonBackend {
 
             let writes = output_writes(py, &outputs)?;
             self.tensors.get().validate_writes(py, writes.clone())?;
-            let updates = outputs
-                .iter()
-                .map(|output| {
-                    Ok(output
-                        .borrow()
-                        .latent
-                        .bind(py)
-                        .getattr("update")?
-                        .extract()?)
-                })
-                .collect::<PyResult<Vec<Py<LatentUpdate>>>>()?;
-            let updates = lower_updates(py, &updates)?;
+            let mut updates = Vec::new();
+            for output in &outputs {
+                if let Some(update) = &output.borrow().lock(py)?.latent_update {
+                    updates.push(update.clone());
+                }
+            }
             if let Some(latents) = &self.latents {
                 latents.borrow_mut(py).validate(py, &updates)?;
-            } else if updates.iter().any(|update| update.params.is_some()) {
+            } else if !updates.is_empty() {
                 return Err(PyRuntimeError::new_err(
                     "latent export has no physical pool",
                 ));
@@ -74,14 +67,7 @@ impl PythonBackend {
                 }
                 tensor_exports.update(pending.tensor_exports.bind(py).as_mapping())?;
                 cache_exports.update(pending.cache_exports.bind(py).as_mapping())?;
-                latent_exports.update(
-                    pending
-                        .latent
-                        .bind(py)
-                        .getattr("exports")?
-                        .cast::<PyDict>()?
-                        .as_mapping(),
-                )?;
+                latent_exports.update(pending.latent_exports.bind(py).as_mapping())?;
             }
 
             // Keep execution/commit timings at their established sampling
@@ -142,8 +128,12 @@ impl PythonBackend {
                 latents.borrow_mut(py).apply(py, &updates)?;
             }
 
-            for (output, update) in outputs.iter().zip(&updates) {
-                output.borrow().lock(py)?.apply_latent_update(update);
+            for output in &outputs {
+                let output = output.borrow();
+                let mut state = output.lock(py)?;
+                if let Some(update) = state.latent_update.take() {
+                    state.apply_latent_update(&update);
+                }
             }
 
             if let Some(cache) = &self.cache {

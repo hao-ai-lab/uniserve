@@ -26,7 +26,6 @@ from uniserve.runtime.execution import ExecutionContext
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
-from uniserve_worker.execution.output import LatentResult
 from uniserve_worker.execution.request import RequestResult
 from uniserve_worker.protocol.batch import (
     Batch,
@@ -59,7 +58,6 @@ from uniserve_worker.protocol.transfer import (
     TensorTransfer,
     WorkerEndpoint,
 )
-from uniserve_worker.storage.latent_pool import LatentBuffer
 from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
@@ -289,6 +287,7 @@ class BatchState:
     def forward_rows(self, request_id: int) -> tuple[int, ...]:
         """Return numerical forward rows in scheduler order."""
     def pending_outputs(self) -> tuple[PendingOutput, ...]: ...
+    def complete_latent(self, request_id: int) -> None: ...
     def pending_output(self, request_id: int) -> PendingOutput: ...
 
 @final
@@ -349,7 +348,11 @@ class PendingOutput:
     call: Call
     request: Request
     token_update: TokenUpdate
-    latent: LatentResult
+    @property
+    def latent_params(self) -> LatentParams | None: ...
+    @property
+    def latent_buffer(self) -> LatentBuffer | None: ...
+    latent_exports: dict[BufferId, ExportLocations]
     tensor_exports: dict[BufferId, ExportLocations]
     cache_exports: dict[BufferId, ExportLocations]
     exported_locators: list[Locator]
@@ -1062,21 +1065,38 @@ class TransferPool:
     def close(self) -> None: ...
 
 @final
+class LatentBuffer:
+    """Borrowed page indices and padded latent values, created by LatentPool."""
+
+    @property
+    def page_table(self) -> tuple[int, ...]: ...
+    @property
+    def pages(self) -> torch.Tensor: ...
+    @property
+    def value(self) -> torch.Tensor: ...
+
+@final
 class LatentUpdate:
     """A batch's prepared trajectory commit or release."""
 
-    request_pool_idx: int
-    params: LatentParams | None
-    expected_generation: int
-    expected_step: int
-    generation: int
-    step: int
-    release: bool
-
+    @property
+    def request_pool_idx(self) -> int: ...
+    @property
+    def params(self) -> LatentParams: ...
+    @property
+    def expected_generation(self) -> int: ...
+    @property
+    def expected_step(self) -> int: ...
+    @property
+    def generation(self) -> int: ...
+    @property
+    def step(self) -> int: ...
+    @property
+    def release(self) -> bool: ...
     def __new__(
         cls,
         request_pool_idx: int,
-        params: LatentParams | None = None,
+        params: LatentParams,
         expected_generation: int = 0,
         expected_step: int = 0,
         generation: int = 0,
@@ -1173,7 +1193,7 @@ class LatentPool:
         latent_units: Sequence[int],
         *,
         occupied: Sequence[LatentBuffer] = (),
-    ) -> tuple[LatentBuffer, ...]: ...
+    ) -> list[LatentBuffer]: ...
     def initialize(
         self,
         request_pool_idx: int,

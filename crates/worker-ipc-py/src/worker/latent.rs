@@ -14,6 +14,8 @@ use uniserve_worker::{
 };
 use uniserve_worker_ipc::{BufferId, LatentParams, RequestKey, TensorTransfer};
 
+use crate::convert;
+
 use super::completion::{Completion, CompletionRef};
 use super::error::{invalid, native_error};
 use super::host_buffers::HostBuffers;
@@ -21,14 +23,20 @@ use super::protocol::{buffer_id, call_id, request_key};
 use super::transfer::{TransferRef, TransferTicket};
 
 /// A prepared trajectory commit or release, applied with its batch's outputs.
-#[pyclass(get_all, set_all, module = "uniserve_worker._uniserve_ipc")]
+#[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct LatentUpdate {
+    #[pyo3(get)]
     request_pool_idx: i64,
-    params: Option<Py<PyAny>>,
+    params: LatentParams,
+    #[pyo3(get)]
     expected_generation: i64,
+    #[pyo3(get)]
     expected_step: i64,
+    #[pyo3(get)]
     generation: i64,
+    #[pyo3(get)]
     step: i64,
+    #[pyo3(get)]
     release: bool,
 }
 
@@ -36,29 +44,70 @@ pub(crate) struct LatentUpdate {
 impl LatentUpdate {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (request_pool_idx, params=None, expected_generation=0, expected_step=0, generation=0, step=0, release=false))]
+    #[pyo3(signature = (request_pool_idx, params, expected_generation=0, expected_step=0, generation=0, step=0, release=false))]
     pub(super) fn new(
         request_pool_idx: i64,
-        params: Option<Py<PyAny>>,
+        params: &Bound<'_, PyAny>,
         expected_generation: i64,
         expected_step: i64,
         generation: i64,
         step: i64,
         release: bool,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        Ok(Self {
             request_pool_idx,
-            params,
+            params: latent_params(params)?,
             expected_generation,
             expected_step,
             generation,
             step,
             release,
+        })
+    }
+
+    #[getter]
+    fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        convert::latent_params_to_py(py, &self.params)
+    }
+}
+
+impl LatentUpdate {
+    pub(super) fn native(&self) -> NativeLatentUpdate {
+        NativeLatentUpdate {
+            request_pool_idx: self.request_pool_idx,
+            params: self.params.clone(),
+            expected_generation: self.expected_generation,
+            expected_step: self.expected_step,
+            generation: self.generation,
+            step: self.step,
+            release: self.release,
         }
+    }
+}
+
+/// Borrowed page indices and padded values over a pool's fixed workspace.
+/// Only LatentPool creates these views; tensors retain their backing storage.
+#[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
+pub(crate) struct LatentBuffer {
+    page_table: Vec<usize>,
+    // Offset into the shared page-index buffer, also measured in latent pages.
+    offset: usize,
+    #[pyo3(get)]
+    pages: Py<PyAny>,
+    #[pyo3(get)]
+    value: Py<PyAny>,
+}
+
+#[pymethods]
+impl LatentBuffer {
+    #[getter]
+    fn page_table<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.page_table)
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.params)
+        visit.call(&self.pages)?;
+        visit.call(&self.value)
     }
 }
 
@@ -199,6 +248,7 @@ pub(crate) struct LatentPool {
     #[pyo3(get)]
     timesteps: Py<PyAny>,
     page_host: Py<HostBuffers>,
+    with_workspace: bool,
     pub(super) inner: NativeLatentPool<ImportRef, ExportRef>,
     #[pyo3(get)]
     exports: Py<PyDict>,
@@ -251,6 +301,7 @@ impl LatentPool {
             page_table_buffer: allocated.get_item(2)?.unbind(),
             timesteps: allocated.get_item(3)?.unbind(),
             page_host: allocated.get_item(4)?.extract()?,
+            with_workspace,
             inner,
             exports: PyDict::new(py).unbind(),
         })
@@ -316,12 +367,13 @@ impl LatentPool {
                     .collect()
             })
             .collect();
-        let staged = self.bind(py, tables, vec![units; rows], Vec::new())?;
-        let views = staged
-            .bind(py)
+        let buffers = self.bind(py, tables, vec![units; rows], Vec::new())?;
+        let views = buffers
             .iter()
             .map(|item| {
-                item.getattr("value")?
+                item.get()
+                    .value
+                    .bind(py)
                     .get_item(PySlice::new(py, 0, units as isize, 1))
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -337,37 +389,60 @@ impl LatentPool {
         py: Python<'_>,
         page_tables: Vec<Vec<i64>>,
         latent_units: Vec<i64>,
-        occupied: Vec<Py<PyAny>>,
-    ) -> PyResult<Py<PyTuple>> {
+        occupied: Vec<Py<LatentBuffer>>,
+    ) -> PyResult<Vec<Py<LatentBuffer>>> {
+        if !self.with_workspace {
+            return Err(invalid(py, "latent pool has no step workspace"));
+        }
+
         let occupied = occupied
             .iter()
             .map(|item| {
-                let item = item.bind(py);
-                Ok::<_, PyErr>((
-                    item.getattr("page_table")?.extract::<Vec<usize>>()?,
-                    item.getattr("pages")?
-                        .call_method0("storage_offset")?
-                        .extract::<usize>()?,
-                ))
+                let item = item.get();
+                (item.page_table.clone(), item.offset)
             })
-            .collect::<PyResult<Vec<_>>>()?;
-        let (tables, offset) = self
+            .collect::<Vec<_>>();
+        let (tables, mut offset) = self
             .inner
             .bind(&page_tables, &latent_units, &occupied)
             .map_err(|error| native_error(py, error))?;
 
-        Ok(backend(py)?
-            .getattr("_bind")?
-            .call1((
-                tables,
-                offset,
-                self.inner.page_units(),
-                &self.page_table_buffer,
-                &self.step_buffer,
-                &self.page_host,
-            ))?
-            .cast_into::<PyTuple>()?
-            .unbind())
+        let pages: Vec<_> = tables.iter().flatten().copied().collect();
+        backend(py)?.getattr("_copy_pages")?.call1((
+            pages,
+            offset,
+            &self.page_table_buffer,
+            &self.page_host,
+        ))?;
+
+        let mut buffers = Vec::with_capacity(tables.len());
+        for table in tables {
+            let end = offset + table.len();
+            let units = self.inner.page_units();
+            let pages = self.page_table_buffer.bind(py).get_item(PySlice::new(
+                py,
+                offset as isize,
+                end as isize,
+                1,
+            ))?;
+            let value = self.step_buffer.bind(py).get_item(PySlice::new(
+                py,
+                (offset * units) as isize,
+                (end * units) as isize,
+                1,
+            ))?;
+            buffers.push(Py::new(
+                py,
+                LatentBuffer {
+                    page_table: table,
+                    offset,
+                    pages: pages.unbind(),
+                    value: value.unbind(),
+                },
+            )?);
+            offset = end;
+        }
+        Ok(buffers)
     }
 
     /// Scatter the initial values into bank one. The prepared values become
@@ -377,7 +452,7 @@ impl LatentPool {
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
-        buffer: &Bound<'_, PyAny>,
+        buffer: &Bound<'_, LatentBuffer>,
         latent_units: i64,
     ) -> PyResult<()> {
         self.inner.reap();
@@ -385,9 +460,12 @@ impl LatentPool {
         let pages = self.buffer_pages(py, buffer, latent_units)?;
         self.require_initial(py, slot, &pages)?;
 
-        backend(py)?
-            .getattr("_scatter")?
-            .call1((&self.storage, 1, buffer))?;
+        backend(py)?.getattr("_scatter")?.call1((
+            &self.storage,
+            1,
+            &buffer.get().pages,
+            &buffer.get().value,
+        ))?;
         Ok(())
     }
 
@@ -483,7 +561,7 @@ impl LatentPool {
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
-        buffer: &Bound<'_, PyAny>,
+        buffer: &Bound<'_, LatentBuffer>,
         step: i64,
         generation: i64,
         latent_units: i64,
@@ -505,7 +583,13 @@ impl LatentPool {
         )?;
         Ok(backend(py)?
             .getattr("_gather")?
-            .call1((&self.storage, bank, buffer, latent_units))?
+            .call1((
+                &self.storage,
+                bank,
+                &buffer.get().pages,
+                &buffer.get().value,
+                latent_units,
+            ))?
             .unbind())
     }
 
@@ -516,7 +600,7 @@ impl LatentPool {
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
-        buffer: &Bound<'_, PyAny>,
+        buffer: &Bound<'_, LatentBuffer>,
         expected_step: i64,
         expected_generation: i64,
         latent_units: i64,
@@ -537,9 +621,12 @@ impl LatentPool {
             &pages,
         )?;
         self.require_writable(py, bank, &pages)?;
-        backend(py)?
-            .getattr("_scatter")?
-            .call1((&self.storage, bank, buffer))?;
+        backend(py)?.getattr("_scatter")?.call1((
+            &self.storage,
+            bank,
+            &buffer.get().pages,
+            &buffer.get().value,
+        ))?;
         Ok(())
     }
 
@@ -648,12 +735,24 @@ impl LatentPool {
 
     /// Check every trajectory update before committing any batch output.
     fn validate_updates(&mut self, py: Python<'_>, updates: Vec<Py<LatentUpdate>>) -> PyResult<()> {
-        self.validate(py, &lower_updates(py, &updates)?)
+        self.validate(
+            py,
+            &updates
+                .iter()
+                .map(|update| update.borrow(py).native())
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// The executor applies the same updates without intervening pool changes.
     fn apply_updates(&mut self, py: Python<'_>, updates: Vec<Py<LatentUpdate>>) -> PyResult<()> {
-        self.apply(py, &lower_updates(py, &updates)?)
+        self.apply(
+            py,
+            &updates
+                .iter()
+                .map(|update| update.borrow(py).native())
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// Assign destination pages in bank zero before any read starts. Padding is
@@ -825,6 +924,7 @@ impl LatentPool {
             .call1((&owner.dtype, &owner.device))?;
         owner.storage = empty.get_item(0)?.unbind();
         owner.step_buffer = empty.get_item(1)?.unbind();
+        owner.with_workspace = false;
         owner.page_table_buffer = empty.get_item(2)?.unbind();
         owner.timesteps = empty.get_item(3)?.unbind();
         Ok(())
@@ -927,15 +1027,16 @@ impl LatentPool {
     fn buffer_pages(
         &self,
         py: Python<'_>,
-        buffer: &Bound<'_, PyAny>,
+        buffer: &Bound<'_, LatentBuffer>,
         units: i64,
     ) -> PyResult<Vec<usize>> {
-        let pages = buffer.getattr("page_table")?.extract::<Vec<i64>>()?;
-        let pages = self.validate_pages(py, &pages, units)?;
-        backend(py)?
-            .getattr("_check_buffer")?
-            .call1((buffer, units, &self.storage))?;
-        Ok(pages)
+        let pages: Vec<_> = buffer
+            .get()
+            .page_table
+            .iter()
+            .map(|&page| page as i64)
+            .collect();
+        self.validate_pages(py, &pages, units)
     }
 
     fn require_initial(&self, py: Python<'_>, slot: usize, pages: &[usize]) -> PyResult<()> {
@@ -1027,42 +1128,17 @@ fn request_set(py: Python<'_>, requests: &[Py<PyAny>]) -> PyResult<HashSet<Reque
         .collect()
 }
 
-pub(super) fn lower_updates(
-    py: Python<'_>,
-    updates: &[Py<LatentUpdate>],
-) -> PyResult<Vec<NativeLatentUpdate>> {
-    updates
-        .iter()
-        .map(|update| {
-            let update = update.borrow(py);
-            let params = update
-                .params
-                .as_ref()
-                .map(|params| {
-                    let params = params.bind(py);
-                    Ok::<_, PyErr>(LatentParams {
-                        request_key: request_key(&params.getattr("request_key")?)?,
-                        call_id: call_id(&params.getattr("call_id")?)?,
-                        page_table: params.getattr("page_table")?.extract()?,
-                        latent_units: params.getattr("latent_units")?.extract()?,
-                        height: params.getattr("height")?.extract()?,
-                        width: params.getattr("width")?.extract()?,
-                        start_step: params.getattr("start_step")?.extract()?,
-                        step_count: params.getattr("step_count")?.extract()?,
-                    })
-                })
-                .transpose()?;
-            Ok(NativeLatentUpdate {
-                request_pool_idx: update.request_pool_idx,
-                params,
-                expected_generation: update.expected_generation,
-                expected_step: update.expected_step,
-                generation: update.generation,
-                step: update.step,
-                release: update.release,
-            })
-        })
-        .collect()
+fn latent_params(params: &Bound<'_, PyAny>) -> PyResult<LatentParams> {
+    Ok(LatentParams {
+        request_key: request_key(&params.getattr("request_key")?)?,
+        call_id: call_id(&params.getattr("call_id")?)?,
+        page_table: params.getattr("page_table")?.extract()?,
+        latent_units: params.getattr("latent_units")?.extract()?,
+        height: params.getattr("height")?.extract()?,
+        width: params.getattr("width")?.extract()?,
+        start_step: params.getattr("start_step")?.extract()?,
+        step_count: params.getattr("step_count")?.extract()?,
+    })
 }
 
 fn backend(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {

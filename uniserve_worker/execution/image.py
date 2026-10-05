@@ -361,10 +361,10 @@ def materialization_latent(
         )
 
     row = state.pending_output(call.request_key.request_id)
-    params = row.latent.input_params
-    buffer = row.latent.buffer
+    params = row.latent_params
+    buffer = row.latent_buffer
     if params is None or buffer is None:
-        raise invalid_descriptor("trajectory call has no staged latent inputs")
+        raise invalid_descriptor("trajectory call has no bound latent inputs")
     if int(params.start_step) != int(image_params.steps):
         raise invalid_descriptor(
             "image materialization requires a completed latent trajectory"
@@ -394,14 +394,13 @@ def export_image(
 
     When the call declares a resident image output, the image is also
     committed to the tensor store for later consumers. The call's latent
-    trajectory is staged for release from the ``LatentPool`` at commit.
+    trajectory is released from the ``LatentPool`` at commit.
     """
     request = state.pending_output(call.request_key.request_id)
-    row = state.pending_output(call.request_key.request_id)
-    params = row.latent.input_params
-    buffer = row.latent.buffer
+    params = request.latent_params
+    buffer = request.latent_buffer
     if params is None or buffer is None:
-        raise invalid_descriptor("trajectory call has no staged latent inputs")
+        raise invalid_descriptor("trajectory call has no bound latent inputs")
     latent_input = call.latent_input
     if latent_input is None:
         raise invalid_descriptor("image export lost its latent input")
@@ -425,7 +424,6 @@ def export_image(
                 value_range=image_range,
             ),
         )
-        request = state.pending_output(call.request_key.request_id)
         if request.producer_write is None:
             request.producer_write = write
 
@@ -436,10 +434,7 @@ def export_image(
         max_bytes=int(call.bounds.max_completion_bytes),
         state=state,
     )
-    request.latent.update.params = params
-    request.latent.update.generation = int(latent_input.generation)
-    request.latent.update.step = int(params.start_step)
-    request.latent.update.release = True
+    state.complete_latent(call.request_key.request_id)
     return non_state_outcome(call, completion_tasks=(image_task,), state=state)
 
 
