@@ -258,6 +258,23 @@ class GraphStorage:
     def release(self, owner: object) -> None: ...
     def close(self) -> None: ...
 
+def export_tensor(
+    transports: Mapping[str, Transport],
+    source: torch.Tensor | tuple[torch.Tensor, ...],
+    *,
+    retain: Callable[[Completion], None],
+    offset: tuple[int, ...] | None = None,
+    consumers: Sequence[int] = (),
+    host: bool = False,
+) -> tuple[Locator, ...]:
+    """Export through reachable backends, retaining their retirement signals.
+
+    `offset` locates the source within its logical tensor; omitted coordinates
+    are zero. Empty `consumers` selects every configured mechanism for the
+    product's location. `host` transfers a device product as host bytes.
+    Failed exports revoke preceding locations before propagating the error.
+    """
+
 def release_exports(
     exports: dict[BufferId, ExportLocations], buffers: Iterable[BufferId]
 ) -> None: ...

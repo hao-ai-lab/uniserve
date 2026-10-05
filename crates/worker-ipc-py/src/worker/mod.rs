@@ -42,6 +42,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(fetch::fetch_tensor, module)?)?;
+    module.add_function(wrap_pyfunction!(exports::export_tensor, module)?)?;
     module.add_function(wrap_pyfunction!(exports::release_exports, module)?)?;
     module.add_function(wrap_pyfunction!(
         graph_storage::graph_storage_budget_bytes,
