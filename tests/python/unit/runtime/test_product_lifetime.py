@@ -1427,6 +1427,64 @@ def test_fp8_export_preserves_values_before_a_later_block_scale_growth():
         events.close()
 
 
+@pytest.mark.parametrize("failure", ("capacity", "observer"))
+def test_failed_export_returns_capacity_to_the_next_product(failure) -> None:
+    from uniserve_worker.transport import make_transports
+    from uniserve_worker.transport.exports import export_tensor
+
+    events = EventPool()
+    value = torch.arange(8, dtype=torch.int16)
+    # Local storage fits, but the same shared budget cannot also hold the
+    # shared-memory export. No reader has received either location yet.
+    transports = make_transports(
+        ("local", "shm"),
+        byte_capacity=value.nbytes,
+        ticket_capacity=2,
+        event_pool=events,
+    )
+    retirements = []
+    observer_error = ValueError("storage owner rejected the export")
+
+    def retain(retirement):
+        retirements.append(retirement)
+        if failure == "observer":
+            raise observer_error
+
+    try:
+        with pytest.raises(
+            ValueError if failure == "observer" else WorkerError
+        ) as rejected:
+            export_tensor(transports, value, retain=retain)
+        if failure == "observer":
+            assert rejected.value is observer_error
+        else:
+            assert rejected.value.code is WorkerErrorCode.RESOURCE_ERROR
+        for retirement in retirements:
+            retirement.result(timeout=5)
+
+        local = transports["local"]
+        accepted = []
+        (location,) = export_tensor(
+            {"local": local}, value + 1, retain=accepted.append
+        )
+        try:
+            reader = local.fetch(location, device=torch.device("cpu"))
+            try:
+                torch.testing.assert_close(
+                    reader.result(), value + 1, rtol=0, atol=0
+                )
+            finally:
+                reader.close()
+        finally:
+            local.release(location)
+        for retirement in accepted:
+            retirement.result(timeout=5)
+    finally:
+        for transport in transports.values():
+            transport.close()
+        events.close()
+
+
 def test_a_host_product_is_published_where_its_consumers_are() -> None:
     """Each host mechanism carries a product only to consumers it reaches."""
     from tests.python.fixtures import segment
