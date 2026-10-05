@@ -18,6 +18,7 @@ mod execution;
 mod host;
 mod shared_buffer;
 mod stream;
+mod transfer;
 mod vmm_pool;
 
 #[repr(C)]
@@ -428,6 +429,7 @@ fn register() -> Result<()> {
     shared_buffer::register()?;
     vmm_pool::register()?;
     stream::register()?;
+    transfer::register()?;
     object::<ExecutorObj>();
     object::<SubmissionObj>();
     object::<WorkerRequestObj>();

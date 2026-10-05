@@ -1,9 +1,11 @@
 //! Transfer admission and credit retirement without a language runtime.
 
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread;
 
-use uniserve_worker::{Error, Outcome, ReadReservation, TransferCapacity, TransferTicket};
+use uniserve_worker::{
+    Error, Outcome, ReadBackend, ReadReservation, TransferCapacity, TransferPool, TransferTicket,
+};
 
 type Callback = Box<dyn FnOnce() + Send>;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -12,6 +14,74 @@ fn notify(callbacks: Vec<Callback>) {
     for callback in callbacks {
         callback();
     }
+}
+
+/// A numerical backend reporting that its device access could not be drained.
+struct FailedRead {
+    ticket: Mutex<TransferTicket<(), String, ()>>,
+    _storage: Arc<Vec<u8>>,
+}
+
+impl ReadBackend for FailedRead {
+    type Value = ();
+    type Error = String;
+    type Callback = ();
+
+    fn with_ticket<T>(&self, action: impl FnOnce(&mut TransferTicket<(), String, ()>) -> T) -> T {
+        let mut ticket = self
+            .ticket
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        action(&mut ticket)
+    }
+
+    fn read(&self) -> Result<(), String> {
+        self.with_ticket(|ticket| ticket.mark_undrained(None, None));
+        Err("device access could not be drained".into())
+    }
+
+    fn notify(_: Vec<()>) {}
+    fn wake(_: &()) {}
+
+    fn error(error: Error) -> String {
+        error.to_string()
+    }
+
+    fn report(error: String) {
+        panic!("unexpected cleanup failure: {error}");
+    }
+}
+
+#[test]
+fn unknown_completion_keeps_storage_after_the_pool_is_destroyed() -> TestResult {
+    let capacity = Arc::new(TransferCapacity::new(4, 1, FailedRead::notify)?);
+    let pool = Arc::new(TransferPool::new(
+        Arc::clone(&capacity),
+        1,
+        "transfer-failure",
+    )?);
+    let storage = Arc::new(vec![1, 2, 3, 4]);
+    let retained = Arc::downgrade(&storage);
+    let task = pool.reserve(
+        FailedRead {
+            ticket: Mutex::new(TransferTicket::new(false)),
+            _storage: storage,
+        },
+        4,
+        None,
+    )?;
+    task.submit()?;
+    assert_eq!(
+        pool.close().as_deref().map(String::as_str),
+        Some("device access could not be drained")
+    );
+    drop(task);
+    drop(pool);
+
+    assert_eq!(capacity.used(), 4);
+    assert!(capacity.take_reads(1).is_err());
+    assert!(retained.upgrade().is_some());
+    Ok(())
 }
 
 #[test]

@@ -1,13 +1,16 @@
 //! Transfer admission, readable results, and physical retirement.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::ThreadId;
 
 use crate::cuda::{DeviceGuard, Event, Stream};
 use crate::{Completion, Error, EventPool, Outcome, Result};
+
+mod pool;
+
+pub use pool::{ReadBackend, TransferPool, TransferRead};
 
 /// One source's contribution to a logical tensor fetch, in source-local and
 /// destination-local coordinates. The numerical backend borrows those views.
@@ -372,8 +375,12 @@ impl<V, E, C> TransferTicket<V, E, C> {
     /// Return whether consumers could already have observed a successful view.
     /// Such a failure also invalidates the transport pool, not just this read.
     pub fn fail(&mut self, error: E) -> (bool, Vec<C>) {
+        self.fail_shared(Arc::new(error))
+    }
+
+    pub fn fail_shared(&mut self, error: Arc<E>) -> (bool, Vec<C>) {
         let late = self.value.is_some();
-        self.error = Some(Arc::new(error));
+        self.error = Some(error);
         (late, std::mem::take(&mut self.callbacks))
     }
 
@@ -524,58 +531,5 @@ impl<V, E, C> TransferTicket<V, E, C> {
     /// retirement observers are traced through their shared Completion.
     pub fn visit<R>(&self, visitor: impl FnOnce(Option<&V>, Option<&E>, &[C]) -> R) -> R {
         visitor(self.value(), self.error(), &self.callbacks)
-    }
-}
-
-/// A backend's copy streams and terminal transport failure. Host lanes execute
-/// reads; this pool retains accesses whose physical completion is unknown.
-pub struct TransferPool<E, T> {
-    streams: HashMap<(ThreadId, i32), Arc<Stream>>,
-    error: Option<E>,
-    unretired: Vec<T>,
-}
-
-impl<E, T> Default for TransferPool<E, T> {
-    fn default() -> Self {
-        Self {
-            streams: HashMap::new(),
-            error: None,
-            unretired: Vec::new(),
-        }
-    }
-}
-
-impl<E, T> TransferPool<E, T> {
-    pub fn stream(&mut self, device: i32) -> Result<Arc<Stream>> {
-        let key = (std::thread::current().id(), device);
-        if let Some(stream) = self.streams.get(&key) {
-            return Ok(Arc::clone(stream));
-        }
-
-        let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
-        let stream = Arc::new(Stream::new().map_err(Error::Cuda)?);
-        self.streams.insert(key, Arc::clone(&stream));
-        Ok(stream)
-    }
-
-    pub fn fail(&mut self, error: E, unretired: Option<T>) {
-        if self.error.is_none() {
-            self.error = Some(error);
-        }
-        self.unretired.extend(unretired);
-    }
-
-    pub fn error(&self) -> Option<&E> {
-        self.error.as_ref()
-    }
-
-    pub fn unretired(&self) -> &[T] {
-        &self.unretired
-    }
-
-    /// Called after the host lane joins. Undrained tickets remain retained even
-    /// when the transport reports its terminal failure to the caller.
-    pub fn close(&mut self) {
-        self.streams.clear();
     }
 }

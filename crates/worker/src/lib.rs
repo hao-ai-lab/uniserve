@@ -54,6 +54,7 @@ pub use service::{Service, ServiceBackend};
 pub use shared_buffer::{SHM_HEADER_BYTES, SharedBuffer, SharedMapping, SharedRead};
 pub use stream::CUDAStream;
 pub use transfer::{
-    ReadRegion, ReadReservation, TransferCapacity, TransferPool, TransferTicket, plan_reads,
+    ReadBackend, ReadRegion, ReadReservation, TransferCapacity, TransferPool, TransferRead,
+    TransferTicket, plan_reads,
 };
 pub use weight_prefetch::WeightPrefetch;

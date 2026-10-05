@@ -25,6 +25,16 @@ impl From<Error> for CallbackError {
     }
 }
 
+impl From<uniserve_worker::Error> for CallbackError {
+    fn from(error: uniserve_worker::Error) -> Self {
+        Self {
+            kind: "RuntimeError".into(),
+            message: error.to_string(),
+            backtrace: String::new(),
+        }
+    }
+}
+
 impl CallbackError {
     pub fn to_ffi(&self) -> Error {
         // ErrorKind has no public string constructor in the pinned Rust SDK.
@@ -93,11 +103,7 @@ impl HostAction for Action {
     }
 
     fn error(error: uniserve_worker::Error) -> CallbackError {
-        CallbackError {
-            kind: "RuntimeError".into(),
-            message: error.to_string(),
-            backtrace: String::new(),
-        }
+        error.into()
     }
 
     fn note_cleanup(error: &mut CallbackError, cleanup: CallbackError) {

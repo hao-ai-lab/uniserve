@@ -7,8 +7,15 @@ from threading import Event
 import pytest
 import torch
 import tvm_ffi
-from bindings import CUDAStream, Executor, HostBuffers, VmmPool, load_library
-from uniserve_kernels.peer_storage import empty
+from bindings import (
+    CUDAStream,
+    Executor,
+    HostBuffers,
+    TransferPool,
+    VmmPool,
+    load_library,
+)
+from uniserve_kernels.peer_storage import copy_host_device, empty
 
 from tests.python.fixtures.cuda_stream import blocked_stream
 
@@ -53,6 +60,23 @@ def _retire(library, resource, owner):
                     value = VmmPool(backing)
                     value.reserve(64)
                     output.fill_(17)
+                elif resource == "transfer":
+                    value = TransferPool(
+                        output.numel() * output.element_size(), 1, 1
+                    )
+
+                    def copy(handle):
+                        copy_host_device(
+                            output,
+                            host,
+                            torch.cuda.ExternalStream(handle, device=0),
+                        )
+
+                    value.submit(
+                        tvm_ffi.convert_func(copy),
+                        output,
+                        output.numel() * output.element_size(),
+                    )
                 else:
                     value = CUDAStream(0, stream.cuda_stream, 2)
                     output.fill_(17)
@@ -77,7 +101,7 @@ def _retire(library, resource, owner):
 
 
 @pytest.mark.parametrize(
-    "resource", ("buffers", "executor", "stream", "vmm_pool")
+    "resource", ("buffers", "executor", "stream", "vmm_pool", "transfer")
 )
 @pytest.mark.parametrize("owner", ("object", "array", "any"))
 def test_final_owner_drains_without_blocking_python(request, resource, owner):
