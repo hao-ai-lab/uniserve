@@ -18,6 +18,7 @@ from typing import Any, Generic, ParamSpec, Self, TypeVar, final
 
 import torch
 
+import uniserve_worker.storage.block_tables as block_tables
 import uniserve_worker.storage.kv_cache as kv_cache
 from uniserve.runtime.execution import ExecutionContext
 from uniserve.sampling import SamplingParams
@@ -27,7 +28,7 @@ from uniserve_worker.execution.output import (
     LatentResult,
     TokenUpdate,
 )
-from uniserve_worker.execution.request import RequestProgress, RequestResult
+from uniserve_worker.execution.request import RequestResult
 from uniserve_worker.protocol.batch import (
     Batch,
     BufferAllocation,
@@ -100,6 +101,7 @@ __all__ = [
     "OutputPool",
     "PendingOutput",
     "Request",
+    "RequestProgress",
     "RequestPool",
     "ReadReservation",
     "Server",
@@ -325,7 +327,6 @@ class PendingOutput:
     request: Request
     token_update: TokenUpdate
     latent: LatentResult
-    progress: RequestProgress
     tensor_exports: dict[BufferId, ExportLocations]
     cache_exports: dict[BufferId, ExportLocations]
     exported_locators: list[Locator]
@@ -351,7 +352,20 @@ class PendingOutput:
     ) -> None: ...
     def set_candidates(self, span: tuple[int, int]) -> None: ...
     def set_canvas(self, span: tuple[int, int]) -> None: ...
-    def set_tokens(self, tokens: Sequence[int]) -> None: ...
+    def advance_tokens(
+        self,
+        tokens: int,
+        *,
+        cache_length: int | None = None,
+        position: int | None = None,
+        sampled: bool = False,
+    ) -> None: ...
+    def set_cache_length(self, length: int) -> None: ...
+    def set_flow_step(self, step: int) -> None: ...
+    def set_prompt_logits(self, logits: torch.Tensor) -> None: ...
+    def cache_coordinates(
+        self, tables: block_tables.BlockTables | None
+    ) -> tuple[int, int, int]: ...
     def set_speculation(
         self,
         draft_tokens: Sequence[int],
@@ -376,6 +390,8 @@ class PendingOutput:
     def kind(self) -> CallKind: ...
     @property
     def value(self) -> RequestOutput | None: ...
+    @property
+    def progress(self) -> RequestProgress: ...
     @property
     def status(self) -> CallStatus: ...
     @property
@@ -1464,6 +1480,35 @@ class Request:
     @property
     def retired(self) -> bool: ...
     diffusion: DiffusionState | None
+
+@final
+class RequestProgress:
+    """Immutable native progress.
+
+    KV lengths count tokens; flow_step counts completed solver steps.
+    """
+
+    def __new__(
+        cls,
+        logical_position: int = 0,
+        rng_counter: int = 0,
+        flow_step: int = 0,
+        kv_visible_len: int = 0,
+        kv_computed_len: int = 0,
+        prompt_logits_ready: bool = False,
+    ) -> Self: ...
+    @property
+    def logical_position(self) -> int: ...
+    @property
+    def rng_counter(self) -> int: ...
+    @property
+    def flow_step(self) -> int: ...
+    @property
+    def kv_visible_len(self) -> int: ...
+    @property
+    def kv_computed_len(self) -> int: ...
+    @property
+    def prompt_logits_ready(self) -> bool: ...
 
 @final
 class RequestPool:

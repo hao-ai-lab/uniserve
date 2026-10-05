@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -103,7 +102,7 @@ def execute(
         request = state.pending_output(request_id)
 
         # (request slot, accepted visible length, capacity).
-        cache = calls.cache_coordinates(request, tables=request_tables)
+        cache = request.cache_coordinates(request_tables)
         snapshot = publications.publish(
             request_pool_idx=request.request.request_pool_idx,
             visible_length=cache[1],
@@ -149,11 +148,7 @@ def execute(
         request.cache_installation = (source, output, installed)
 
         outcome = image.non_state_outcome(call, state=state)
-        outcome.progress = replace(
-            outcome.progress,
-            kv_visible_len=int(installed.published_extent),
-            kv_computed_len=int(installed.published_extent),
-        )
+        outcome.set_cache_length(int(installed.published_extent))
     else:
         inputs = call.tensor_inputs()
         outputs = call.tensor_outputs()

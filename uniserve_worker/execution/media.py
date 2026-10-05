@@ -976,15 +976,11 @@ def execute(
             step=start_step + step_count,
             previous=start_step,
         )
-        request.progress = replace(
-            request.progress,
-            flow_step=start_step + step_count,
-        )
 
         # Only the call that completes denoising may declare products, and
         # it publishes the step's result, the final samples.
         if call.outputs:
-            if request.progress.flow_step != media.num_inference_steps:
+            if start_step + step_count != media.num_inference_steps:
                 raise invalid_descriptor(
                     "final latent products require completed denoising"
                 )

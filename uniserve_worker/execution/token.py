@@ -271,7 +271,6 @@ def prepare_sampling(
             return token_outcome(
                 call,
                 tokens=0,
-                committed_tokens=(),
                 request_tables=request_tables,
                 state=state,
             )
@@ -357,10 +356,8 @@ def publish_sample(
     penalty_base = None if sample_work is None else sample_work.penalty_base
 
     if _writes_visual_state(call):
-        request.progress = replace(
-            request.progress,
-            rng_counter=request.progress.rng_counter + (1),
-        )
+        request.advance_tokens(0, sampled=True)
+        progress = request.progress
         flow = image_builder
         logical_position = start + (
             max(1, 1 if flow is None else int(flow.rope_advance))
@@ -372,7 +369,7 @@ def publish_sample(
             sampled,
             penalty_base=penalty_base,
             logical_position=logical_position,
-            sampling_position=request.progress.rng_counter,
+            sampling_position=progress.rng_counter,
             decode_state=decode_state,
         )
         return _finish_visual(
@@ -404,30 +401,29 @@ def publish_sample(
                 )
 
         count = task.query_tokens if mode is ForwardMode.PREFILL else 1
-        progress = request.progress
-        logical_position = (
-            _next_position(task) if writes_context(call) else start + count
-        )
-        rng_counter = progress.rng_counter + 1
-        publish_runtime_sample(
-            request,
-            sampled,
-            penalty_base=penalty_base,
-            logical_position=logical_position,
-            sampling_position=rng_counter,
-            decode_increment=mode is ForwardMode.DECODE,
-            decode_state=decode_state,
-        )
-        return token_outcome(
+        token_outcome(
             call,
             request=request,
             task=task if mode is ForwardMode.DECODE else None,
             tokens=count,
-            logical_position=logical_position,
-            rng_counter=rng_counter,
+            logical_position=_next_position(task)
+            if writes_context(call)
+            else None,
+            sampled=True,
             request_tables=request_tables,
             state=state,
         )
+        progress = request.progress
+        publish_runtime_sample(
+            request,
+            sampled,
+            penalty_base=penalty_base,
+            logical_position=progress.logical_position,
+            sampling_position=progress.rng_counter,
+            decode_increment=mode is ForwardMode.DECODE,
+            decode_state=decode_state,
+        )
+        return request
     else:
         assert sample_work is not None
         draft = sample_work.draft_token_ids
@@ -521,7 +517,7 @@ def _prepare_visual(
             metadata.height,
             metadata.width,
             position,
-            seq_len=calls.cache_coordinates(request, tables=request_tables)[1],
+            seq_len=request.cache_coordinates(request_tables)[1],
             close_image=True,
             logits=sample_token,
             request_tables=request_tables,
@@ -631,13 +627,10 @@ def _finish_visual(
     (at least one); an input image's latent row keeps its position.
     """
     request = state.pending_output(call.request_key.request_id)
-    position = int(request.progress.logical_position)
     if call.completion_output is not None:
         flow = image_builder
-        request.progress = replace(
-            request.progress,
-            logical_position=position
-            + max(1, 1 if flow is None else int(flow.rope_advance)),
+        request.advance_tokens(
+            max(1, 1 if flow is None else int(flow.rope_advance))
         )
     return image.state_outcome(call, request_tables=request_tables, state=state)
 
@@ -699,9 +692,7 @@ def prepare_context(
         start = offset
     if len(tokens) > start:
         segments.append((start, len(tokens)))
-    slot, visible, _capacity = calls.cache_coordinates(
-        request, tables=request_tables
-    )
+    slot, visible, _capacity = request.cache_coordinates(request_tables)
     position = int(request.progress.logical_position)
     device = model_runner.call_devices(call)[0]
     rows: list[TokenRow] = []
@@ -823,10 +814,7 @@ def finish_context(
     if scores_prompt:
         for row, value, _index in scored:
             if not row.causal:
-                request.token_update.runtime_prompt_logits = value[-1].detach()
-                request.progress = replace(
-                    request.progress, prompt_logits_ready=True
-                )
+                request.set_prompt_logits(value[-1].detach())
                 continue
             request.add_prompt_logprobs(
                 prompt_logprob_details(
@@ -852,7 +840,7 @@ def finish_context(
 
     if last.causal:
         start = int(cast(torch.Tensor, last.positions)[0])
-        request.progress = replace(request.progress, logical_position=start)
+        request.advance_tokens(0, position=start)
     sample = build_sampling_metadata(
         call,
         last_value[-1],
@@ -1042,8 +1030,7 @@ def prompt_logprob_details(
         score_logits = torch.cat((previous, logits[:-1]), dim=0)
         targets = tokens
 
-    request.token_update.runtime_prompt_logits = logits[-1].detach()
-    request.progress = replace(request.progress, prompt_logits_ready=True)
+    request.set_prompt_logits(logits[-1].detach())
     if int(targets.numel()) == 0:
         return ()
 
@@ -1076,8 +1063,7 @@ def token_outcome(
     task: TokenRow | None = None,
     tokens: int,
     logical_position: int | None = None,
-    rng_counter: int | None = None,
-    committed_tokens: tuple[int, ...] = (),
+    sampled: bool = False,
     request_tables: BlockTables | None,
 ) -> PendingOutput:
     """Project progress for an ordinary prefill or decode.
@@ -1089,7 +1075,7 @@ def token_outcome(
     if request is None:
         request = state.pending_output(call.request_key.request_id)
 
-    cache = calls.cache_coordinates(request, tables=request_tables)
+    cache = request.cache_coordinates(request_tables)
     published_length = request.token_update.runtime_cache_length
     if published_length is None:
         published_length = (
@@ -1098,19 +1084,12 @@ def token_outcome(
     if isinstance(published_length, torch.Tensor):
         raise RuntimeError("dynamic KV length requires a speculative selection")
 
-    progress = request.progress
-    request.progress = replace(
-        progress,
-        logical_position=progress.logical_position
-        if logical_position is None
-        else logical_position,
-        rng_counter=progress.rng_counter
-        if rng_counter is None
-        else rng_counter,
-        kv_visible_len=int(published_length),
-        kv_computed_len=int(published_length),
+    request.advance_tokens(
+        tokens,
+        cache_length=int(published_length),
+        position=logical_position,
+        sampled=sampled,
     )
-    request.set_tokens(committed_tokens)
     return request
 
 
@@ -1135,8 +1114,7 @@ def token_task(
 
     Raises:
         WorkerError: ``invalid_descriptor`` when any of these checks fails,
-            or the error of ``calls.cache_coordinates`` when it rejects the
-            request's cache coordinates.
+            or the native cache query rejects the request's coordinates.
     """
     if request_indexed_decode:
         if (
@@ -1175,7 +1153,7 @@ def token_task(
     sampling_state = call.sampling_state or SamplingState()
 
     # (request slot, accepted visible length, capacity).
-    cache = calls.cache_coordinates(request, tables=request_tables)
+    cache = request.cache_coordinates(request_tables)
     visible = cache[1] if seq_len is None else int(seq_len)
     if visible != cache[1]:
         raise invalid_descriptor(

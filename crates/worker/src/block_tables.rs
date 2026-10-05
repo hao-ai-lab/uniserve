@@ -262,6 +262,26 @@ impl BlockTables {
         self.lengths.get(&slot).copied().unwrap_or(0)
     }
 
+    /// Resolve one request's visible prefix against every installed KV group.
+    /// The returned capacity is the common extent, including sliding windows.
+    pub fn coordinates(&self, slot: u32, visible: u64) -> Result<(u32, u64, u32)> {
+        for group in 0..self.groups.len() as u32 {
+            if !self.tables.contains_key(&(slot, group)) {
+                return Err(Error::Invalid(
+                    "request slot has no installed block table".into(),
+                ));
+            }
+        }
+
+        let capacity = self.allocated_length(slot);
+        if visible > u64::from(capacity) {
+            return Err(Error::Invalid(
+                "call visibility exceeds scheduler block table".into(),
+            ));
+        }
+        Ok((slot, visible, capacity))
+    }
+
     /// Validate releases together so an invalid slot cannot partially clear
     /// device or host rows. Duplicate slots require only one device write.
     pub fn release_slots(&self, slots: &[u32]) -> Result<Vec<u32>> {
@@ -325,6 +345,39 @@ impl BlockTables {
 mod tests {
     use super::*;
     use uniserve_core::RequestId;
+
+    #[test]
+    fn visible_prefix_requires_every_group_and_fits_the_common_extent() -> Result<()> {
+        let groups = vec![
+            GroupShape::new(4, 1, None)?,
+            GroupShape::new(8, 2, Some(8))?,
+        ];
+        let mut tables = BlockTables::new(groups, 1, 3)?;
+        let update = tables.prepare(&[BlockTable {
+            request_pool_idx: 1,
+            group_id: 0,
+            start_page: 0,
+            unit_ids: vec![UnitId(1), UnitId(2), UnitId(3)],
+            allocated_tokens: 12,
+        }])?;
+        tables.commit(update);
+        assert!(tables.coordinates(1, 8).is_err());
+
+        let update = tables.prepare(&[BlockTable {
+            request_pool_idx: 1,
+            group_id: 1,
+            start_page: 0,
+            unit_ids: vec![UnitId(4), UnitId(5)],
+            allocated_tokens: 8,
+        }])?;
+        tables.commit(update);
+        assert_eq!(tables.coordinates(1, 8)?, (1, 8, 8));
+        assert!(tables.coordinates(1, 9).is_err());
+
+        tables.release(&[1]);
+        assert!(tables.coordinates(1, 0).is_err());
+        Ok(())
+    }
 
     #[test]
     fn token_spans_cover_each_layers_unit_without_crossing_retired_pages() -> Result<()> {

@@ -1,6 +1,5 @@
 """Host results retain their output row until delivery or abandonment."""
 
-from dataclasses import replace
 from multiprocessing import shared_memory
 
 import pytest
@@ -28,7 +27,7 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
-def output():
+def output(request):
     events = EventPool()
     buffers = OutputPool(capacity=1, max_words=4, event_pool=events)
     requests = RequestPool(1)
@@ -38,7 +37,7 @@ def output():
     call = Call(
         request_key=key,
         call_id=CallId(1, 0),
-        coordinates=CallCoordinates(),
+        coordinates=getattr(request, "param", CallCoordinates()),
         kind=MediaCall.IMAGE_DECODING,
         bounds=Bounds(),
     )
@@ -94,16 +93,20 @@ def test_media_delivery_releases_the_output_row(output, finish_callback):
     replacement.abandon()
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        CallCoordinates(
+            logical_position=8,
+            flow_step=3,
+            kv_visible_len=8,
+            kv_computed_len=10,
+        )
+    ],
+    indirect=True,
+)
 def test_failed_host_work_reports_compute_error_and_releases_the_row(output):
     pending, buffer, buffers, lane = output
-    pending.progress = replace(
-        pending.progress,
-        logical_position=8,
-        flow_step=3,
-        rng_counter=2,
-        kv_visible_len=8,
-        kv_computed_len=10,
-    )
 
     def encode():
         raise ValueError("codec failed")

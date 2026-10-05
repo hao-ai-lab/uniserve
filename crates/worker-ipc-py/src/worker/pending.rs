@@ -14,11 +14,12 @@ use uniserve_worker_ipc::{
 
 use crate::convert;
 
-use super::error::native_error;
+use super::block_tables::BlockTables;
+use super::error::{native_error, unsupported};
 use super::host::HostTask;
 use super::latent::LatentUpdate;
 use super::output::OutputBuffer;
-use super::request::{Request, RequestPool, progress_from_py, progress_to_py};
+use super::request::{Request, RequestPool, RequestProgress};
 
 /// One call's result, with borrowed numerical views until execution commits.
 ///
@@ -171,16 +172,57 @@ impl PendingOutput {
     }
 
     #[getter]
-    fn progress(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let progress = self.lock(py)?.progress;
-        progress_to_py(py, progress).map(Bound::unbind)
+    fn progress(&self, py: Python<'_>) -> PyResult<RequestProgress> {
+        Ok(RequestProgress {
+            inner: self.lock(py)?.progress,
+        })
     }
 
-    #[setter]
-    fn set_progress(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let progress = progress_from_py(value)?;
-        self.lock(value.py())?.progress = progress;
+    #[pyo3(signature = (tokens, *, cache_length=None, position=None, sampled=false))]
+    fn advance_tokens(
+        &self,
+        py: Python<'_>,
+        tokens: u64,
+        cache_length: Option<u64>,
+        position: Option<u64>,
+        sampled: bool,
+    ) -> PyResult<()> {
+        self.lock(py)?
+            .advance_tokens(tokens, cache_length, position, sampled);
         Ok(())
+    }
+
+    fn set_cache_length(&self, py: Python<'_>, length: u64) -> PyResult<()> {
+        self.lock(py)?.set_cache_length(length);
+        Ok(())
+    }
+
+    fn set_flow_step(&self, py: Python<'_>, step: u64) -> PyResult<()> {
+        self.lock(py)?.progress.flow_step = step;
+        Ok(())
+    }
+
+    fn set_prompt_logits(&self, py: Python<'_>, logits: Py<PyAny>) -> PyResult<()> {
+        self.token_update
+            .bind(py)
+            .setattr("runtime_prompt_logits", logits)?;
+        self.lock(py)?.progress.prompt_logits_ready = true;
+        Ok(())
+    }
+
+    fn cache_coordinates(&self, tables: &Bound<'_, PyAny>) -> PyResult<(u32, u64, u32)> {
+        let py = tables.py();
+        if tables.is_none() {
+            return Err(unsupported(py, "call requires request-to-token storage"));
+        }
+        let tables = tables.getattr("_tables")?;
+        let tables = tables.extract::<PyRef<'_, BlockTables>>()?;
+        let slot = self.request.borrow(py).request.slot() as u32;
+        let visible = self.lock(py)?.progress.kv_visible_len;
+        tables
+            .tables
+            .coordinates(slot, visible)
+            .map_err(|error| native_error(py, error))
     }
 
     #[getter]
@@ -226,11 +268,6 @@ impl PendingOutput {
 
     fn set_canvas(&self, py: Python<'_>, span: (usize, usize)) -> PyResult<()> {
         self.lock(py)?.canvas_range = Some(span);
-        Ok(())
-    }
-
-    fn set_tokens(&self, py: Python<'_>, tokens: Vec<u32>) -> PyResult<()> {
-        self.lock(py)?.output.committed_tokens = tokens;
         Ok(())
     }
 

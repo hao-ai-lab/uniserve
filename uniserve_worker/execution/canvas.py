@@ -66,9 +66,7 @@ def prepare_rows(
         raise invalid_descriptor("a canvas pass requires a readout")
 
     request = state.pending_output(call.request_key.request_id)
-    slot, visible, _capacity = calls.cache_coordinates(
-        request, tables=request_tables
-    )
+    slot, visible, _capacity = request.cache_coordinates(request_tables)
 
     # Each forward row of the call is one canvas over the visible prefix.
     inputs = state.batch
@@ -169,8 +167,8 @@ def publish(
         state.output_buffer.capture(logprobs.contiguous().view(torch.int32))
     )
 
-    cache = calls.cache_coordinates(request, tables=request_tables)
-    request.progress = calls.execution_runtime(request, cache)
+    cache = request.cache_coordinates(request_tables)
+    request.set_cache_length(cache[1])
     return request
 
 
@@ -213,9 +211,7 @@ def prepare_step(
             "sampling"
         )
     constants = canvas_slots.sampling(sampling)
-    slot, visible, _capacity = calls.cache_coordinates(
-        request, tables=request_tables
-    )
+    slot, visible, _capacity = request.cache_coordinates(request_tables)
 
     inputs = state.batch
     descriptors = state.forward_indices.get(calls.call_identity(call), ())
@@ -312,8 +308,8 @@ def publish_steps(
             writes.append(request.completion_write)
             written_rows.append(row)
 
-        cache = calls.cache_coordinates(request, tables=request_tables)
-        request.progress = calls.execution_runtime(request, cache)
+        cache = request.cache_coordinates(request_tables)
+        request.set_cache_length(cache[1])
 
     if writes:
         outcome_column = block.view(len(steps), width)[:, 0]

@@ -7,11 +7,80 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use uniserve_core::CallId;
-use uniserve_worker::{Request as NativeRequest, RequestPool as NativePool, RequestProgress};
+use uniserve_worker::{
+    Request as NativeRequest, RequestPool as NativePool, RequestProgress as NativeProgress,
+};
 use uniserve_worker_ipc::{CallStatus, NewRequest, RequestKey};
 
 use super::error::{invalid, native_error};
 use super::protocol::{call_id, new_request, request_key};
+
+/// Immutable observation of accepted or projected native request coordinates.
+#[pyclass(frozen, eq, module = "uniserve_worker._uniserve_ipc")]
+#[derive(PartialEq)]
+pub(crate) struct RequestProgress {
+    pub(super) inner: NativeProgress,
+}
+
+#[pymethods]
+impl RequestProgress {
+    #[new]
+    #[pyo3(signature = (logical_position=0, rng_counter=0, flow_step=0, kv_visible_len=0, kv_computed_len=0, prompt_logits_ready=false))]
+    fn new(
+        py: Python<'_>,
+        logical_position: u64,
+        rng_counter: u64,
+        flow_step: u64,
+        kv_visible_len: u64,
+        kv_computed_len: u64,
+        prompt_logits_ready: bool,
+    ) -> PyResult<Self> {
+        if kv_visible_len > kv_computed_len {
+            return Err(invalid(py, "request KV extents are not contained"));
+        }
+
+        Ok(Self {
+            inner: NativeProgress {
+                logical_position,
+                rng_counter,
+                flow_step,
+                kv_visible_len,
+                kv_computed_len,
+                prompt_logits_ready,
+            },
+        })
+    }
+
+    #[getter]
+    fn logical_position(&self) -> u64 {
+        self.inner.logical_position
+    }
+
+    #[getter]
+    fn rng_counter(&self) -> u64 {
+        self.inner.rng_counter
+    }
+
+    #[getter]
+    fn flow_step(&self) -> u64 {
+        self.inner.flow_step
+    }
+
+    #[getter]
+    fn kv_visible_len(&self) -> u64 {
+        self.inner.kv_visible_len
+    }
+
+    #[getter]
+    fn kv_computed_len(&self) -> u64 {
+        self.inner.kv_computed_len
+    }
+
+    #[getter]
+    fn prompt_logits_ready(&self) -> bool {
+        self.inner.prompt_logits_ready
+    }
+}
 
 /// Retain numerical parameters and tensors alongside a native request epoch.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
@@ -80,12 +149,12 @@ impl Request {
     }
 
     #[getter]
-    fn accepted_progress<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let progress = self
+    fn accepted_progress(&self, py: Python<'_>) -> PyResult<RequestProgress> {
+        let inner = self
             .request
             .progress()
             .map_err(|error| native_error(py, error))?;
-        progress_to_py(py, progress)
+        Ok(RequestProgress { inner })
     }
 
     #[getter]
@@ -261,7 +330,7 @@ impl RequestPool {
         let progress = if value.is_none() {
             None
         } else {
-            Some(progress_from_py(&value)?)
+            Some(value.extract::<PyRef<'_, RequestProgress>>()?.inner)
         };
         self.pool
             .apply_result(key, id, status, progress)
@@ -382,31 +451,4 @@ fn pending_calls(calls: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<(RequestKey, Call
             ))
         })
         .collect()
-}
-
-pub(super) fn progress_from_py(value: &Bound<'_, PyAny>) -> PyResult<RequestProgress> {
-    Ok(RequestProgress {
-        logical_position: value.getattr("logical_position")?.extract()?,
-        rng_counter: value.getattr("rng_counter")?.extract()?,
-        flow_step: value.getattr("flow_step")?.extract()?,
-        kv_visible_len: value.getattr("kv_visible_len")?.extract()?,
-        kv_computed_len: value.getattr("kv_computed_len")?.extract()?,
-        prompt_logits_ready: value.getattr("prompt_logits_ready")?.extract()?,
-    })
-}
-
-pub(super) fn progress_to_py(
-    py: Python<'_>,
-    progress: RequestProgress,
-) -> PyResult<Bound<'_, PyAny>> {
-    py.import("uniserve_worker.execution.request")?
-        .getattr("RequestProgress")?
-        .call1((
-            progress.logical_position,
-            progress.rng_counter,
-            progress.flow_step,
-            progress.kv_visible_len,
-            progress.kv_computed_len,
-            progress.prompt_logits_ready,
-        ))
 }
