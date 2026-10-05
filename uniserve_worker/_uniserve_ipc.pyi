@@ -81,6 +81,7 @@ __all__ = [
     "EventPool",
     "EventPoolError",
     "Executor",
+    "GraphStorage",
     "GroupShape",
     "GroupTable",
     "HostLane",
@@ -111,10 +112,37 @@ __all__ = [
     "atomic_store_u32",
     "service_name",
     "release_exports",
+    "graph_storage_budget_bytes",
 ]
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")
+
+def graph_storage_budget_bytes(total_device_bytes: int) -> int: ...
+
+@final
+class GraphStorage:
+    """Shared graph pools and startup residency limits, owned in Rust."""
+
+    def __init__(
+        self, *, budgets: dict[torch.device | str, int] | None = None
+    ) -> None: ...
+    def reserve(
+        self,
+        owner: object,
+        devices: Iterable[torch.device | str],
+        *,
+        share: object | None = None,
+    ) -> dict[torch.device, torch.cuda.MemPool]: ...
+    def allocate(self, owner: object) -> AbstractContextManager[None]: ...
+    def check(self) -> None: ...
+    def set_budget(self, device: torch.device | str, amount: int) -> None: ...
+    def seal(self) -> None: ...
+    def resident_bytes(self) -> dict[torch.device, int]: ...
+    def pool_bytes(self) -> dict[torch.device, int]: ...
+    def owner_bytes(self) -> dict[tuple[Any, torch.device], int]: ...
+    def release(self, owner: object) -> None: ...
+    def close(self) -> None: ...
 
 def release_exports(
     exports: dict[BufferId, ExportLocations], buffers: Iterable[BufferId]

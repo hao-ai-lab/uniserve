@@ -3,11 +3,11 @@
 Bootstrap resolves these stable execution settings before model materialization
 and passes the immutable value into every configured subsystem.
 
-The module also owns the default CUDA graph capture buckets and the storage
-reservations for captured graphs: ``graph_padding_block_count`` derives the KV
+The module also defines the default CUDA graph capture buckets and exposes
+storage reservations: ``graph_padding_block_count`` derives the KV
 pages that graph padding may occupy from the default buckets, and
-``graph_storage_budget_bytes`` sizes the device share for retained graph
-executables. Capacity planning in ``uniserve_worker.bootstrap.report``
+the native ``graph_storage_budget_bytes`` sizes the device share for retained
+graph executables. Capacity planning in ``uniserve_worker.bootstrap.report``
 reserves both before it sizes the request pool, and
 ``uniserve_worker.model_executor.graph_storage`` uses the graph budget as the
 default for a device whose budget has not been set.
@@ -23,6 +23,7 @@ from typing import Any, cast
 from uniserve.runtime.backends.attention.flashinfer import (
     Config as FlashInferConfig,
 )
+from uniserve_worker._uniserve_ipc import graph_storage_budget_bytes
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.batch import CanvasSampling
 from uniserve_worker.protocol.call import (
@@ -35,7 +36,6 @@ from uniserve_worker.protocol.call import (
 
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
-    "DEFAULT_GRAPH_STORAGE_FRACTION",
     "DEFAULT_PREFILL_GRAPH_ROW_BUCKETS",
     "DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS",
     "graph_padding_block_count",
@@ -193,23 +193,6 @@ def graph_padding_block_count(block_size: int) -> int:
     )
     max_padding_tokens = max(decode_tokens, prefill_tokens)
     return (max_padding_tokens + block_size - 1) // block_size
-
-
-# Captured graphs hold their storage for as long as they are retained, so the
-# executable set owns a fixed share of the device rather than growing with the
-# shape diversity a workload happens to present.
-DEFAULT_GRAPH_STORAGE_FRACTION = 0.10
-
-
-def graph_storage_budget_bytes(total_device_bytes: int) -> int:
-    """Return the device-storage budget for retained graph executables."""
-    return max(
-        0,
-        int(
-            float(max(0, int(total_device_bytes)))
-            * DEFAULT_GRAPH_STORAGE_FRACTION
-        ),
-    )
 
 
 # JSON lane selectors (the ``domains`` of a lane descriptor) resolve to call

@@ -10,6 +10,7 @@ mod error;
 mod events;
 mod executor;
 mod exports;
+mod graph_storage;
 mod host;
 mod host_buffers;
 mod inputs;
@@ -27,6 +28,11 @@ mod transfer;
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(exports::release_exports, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        graph_storage::graph_storage_budget_bytes,
+        module
+    )?)?;
+    module.add_class::<graph_storage::GraphStorage>()?;
     module.add_class::<batch::BatchState>()?;
     module.add_class::<block_tables::BlockTables>()?;
     module.add_class::<block_tables::GroupShape>()?;
