@@ -44,12 +44,10 @@ from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.batch import TensorPublication
 from uniserve_worker.protocol.call import (
     Call,
-    CallStatus,
     DrawLayout,
     ForwardMode,
     ImageParams,
 )
-from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import KvTransfer
 from uniserve_worker.sampling.metadata import TokenSelection
@@ -269,11 +267,7 @@ def prepare_latent(
         config=config,
         state=state,
     )
-
-    request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, cache, flow_step=0)
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
     return request
 
@@ -598,16 +592,12 @@ def finish(
         config=config,
         state=state,
     )
-
-    request.status = CallStatus.OK
     kv = kv_conditioning(trajectory)
     request.progress = calls.execution_runtime(
         request,
         kv.cache,
         flow_step=final_step,
     )
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
 
     # Branch prefixes live in pool slots separate from the request's own KV;

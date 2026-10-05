@@ -25,7 +25,6 @@ import numpy as np
 
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.execution import calls
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.mux import (
@@ -34,8 +33,7 @@ from uniserve_worker.media.mux import (
     frame_encoded_unit,
     read_encoded_unit,
 )
-from uniserve_worker.protocol.call import Call, CallStatus, MediaCall
-from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.protocol.call import Call, MediaCall
 from uniserve_worker.protocol.transfer import (
     ChannelTransfer,
     LocalTransfer,
@@ -272,7 +270,7 @@ def execute(
 
     Configures the call's reserved ``HostTask`` slots (one per encoded unit
     position for a video encode, one otherwise) and stages them on the
-    returned ``PendingOutput`` as ``host.tasks``. A video encode also stages
+    returned ``PendingOutput`` as ``host_tasks``. A video encode also stages
     ``host.finish``, which frames and publishes the encoded rows once every
     encode has completed. Audio encodes and unit appends leave their results
     in the request's mux session; the task of the final mux call, which
@@ -292,7 +290,7 @@ def execute(
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("host media call has no admitted media")
-    reservations = request.host.tasks
+    reservations = request.host_tasks
     if not reservations:
         raise RuntimeError("host media call has no reserved lane slots")
 
@@ -516,13 +514,7 @@ def execute(
     else:
         raise invalid_descriptor(f"unsupported host media call {call.kind!r}")
 
-    request.status = CallStatus.OK
-    # Host media calls consume products without advancing any trajectory.
-    request.progress = calls.execution_runtime(request, None)
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
-    request.host.tasks = tasks
-    request.host.finish = finish
+    request.set_host_tasks(tasks, finish=finish)
     # The call has no product at commit; a video encode's ``finish`` sets
     # them once its encodes complete.
     request.products = ()

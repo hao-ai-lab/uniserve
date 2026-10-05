@@ -34,8 +34,7 @@ from uniserve_worker.model_executor.input_batch import (
     CanvasStepRow,
     int64_bits,
 )
-from uniserve_worker.protocol.call import Call, CallStatus, ForwardMode
-from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.protocol.call import Call, ForwardMode
 from uniserve_worker.storage.canvas_slots import STEP_CONTINUED
 
 if TYPE_CHECKING:
@@ -166,16 +165,12 @@ def publish(
         raise invalid_descriptor(
             "canvas readout does not cover the call's candidates"
         )
-    request.token.candidate_range = state.output_buffer.capture(
-        logprobs.contiguous().view(torch.int32)
+    request.set_candidates(
+        state.output_buffer.capture(logprobs.contiguous().view(torch.int32))
     )
 
     cache = calls.cache_coordinates(request, tables=request_tables)
-    request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, cache)
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
-    request.token.committed_tokens = ()
     return request
 
 
@@ -312,17 +307,13 @@ def publish_steps(
     written_rows = []
     for row, (call, _value) in enumerate(steps):
         request = state.pending_output(call.request_key.request_id)
-        request.token.canvas_range = (offset + row * width, width)
+        request.set_canvas((offset + row * width, width))
         if request.completion_write is not None:
             writes.append(request.completion_write)
             written_rows.append(row)
 
         cache = calls.cache_coordinates(request, tables=request_tables)
-        request.status = CallStatus.OK
         request.progress = calls.execution_runtime(request, cache)
-        request.finish_flags = FinishFlags()
-        request.product_generations = calls.output_generations(call)
-        request.token.committed_tokens = ()
 
     if writes:
         outcome_column = block.view(len(steps), width)[:, 0]

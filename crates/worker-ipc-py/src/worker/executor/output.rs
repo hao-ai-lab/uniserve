@@ -4,12 +4,13 @@ use std::collections::HashSet;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use uniserve_worker::request_output;
 use uniserve_worker_ipc::{BatchOutput, CallStatus, ErrorCode, RequestOutput};
 
 use super::{BatchState, PythonBackend};
 use crate::convert;
 use crate::worker::error::native_error;
-use crate::worker::pending::{PendingOutput, request_output};
+use crate::worker::pending::PendingOutput;
 
 impl PythonBackend {
     pub(super) fn materialize(
@@ -33,7 +34,7 @@ impl PythonBackend {
             .iter()
             .map(|output| {
                 PendingOutput::resolve(output)?;
-                Ok(output.borrow().result()?.clone())
+                output.borrow().result(py)
             })
             .collect::<PyResult<Vec<_>>>()?;
         for output in pending {
@@ -107,7 +108,8 @@ impl PythonBackend {
                     .transpose()
                     .map_err(|error| native_error(py, error))?
                     .unwrap_or_default();
-                let mut output = request_output(key, call.call_id, call.code, progress)?;
+                let mut output = request_output(key, call.call_id, call.code, progress)
+                    .map_err(|error| native_error(py, error))?;
                 output.status = CallStatus::Error;
                 output.error_code = Some(code);
                 Ok(output)

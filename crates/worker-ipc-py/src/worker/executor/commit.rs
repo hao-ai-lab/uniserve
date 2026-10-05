@@ -30,6 +30,10 @@ impl PythonBackend {
                 .bind(py)
                 .call_method1("prepare_outputs", (&numerical,))?;
 
+            for (output, call) in outputs.iter().zip(&batch.plan.calls) {
+                output.borrow().validate_output(py, call)?;
+            }
+
             let writes = output_writes(py, &outputs)?;
             self.tensors.get().validate_writes(py, writes.clone())?;
             let updates = outputs
@@ -85,8 +89,8 @@ impl PythonBackend {
                 }
             };
             for output in &outputs {
-                let mut pending = output.borrow_mut();
-                pending.reports_output = reports_output;
+                let pending = output.borrow();
+                pending.lock(py)?.reports_output = reports_output;
                 for product in pending.products.bind(py) {
                     products.append(product)?;
                 }

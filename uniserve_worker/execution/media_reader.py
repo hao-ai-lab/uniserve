@@ -31,7 +31,7 @@ import torch
 from uniserve.model import AudioEncoder, PatchEncoder
 from uniserve_worker.bootstrap.inputs import capability
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import calls, transfer
+from uniserve_worker.execution import transfer
 from uniserve_worker.execution.conditions import (
     CONDITION_PIXELS,
     CONDITION_SAMPLES,
@@ -46,8 +46,6 @@ from uniserve_worker.media.reader import (
     read_image,
     read_video,
 )
-from uniserve_worker.protocol.call import CallStatus
-from uniserve_worker.protocol.output import FinishFlags
 
 if TYPE_CHECKING:
     from uniserve_worker._uniserve_ipc import BatchState
@@ -174,7 +172,7 @@ def execute(
     """
     request = state.pending_output(call.request_key.request_id)
     video = video_admission(request)
-    reservations = request.host.tasks
+    reservations = request.host_tasks
     if len(reservations) != 1:
         raise RuntimeError("media reading has no reserved lane slot")
     vision = capability(model_runner.model, PatchEncoder)
@@ -239,11 +237,6 @@ def execute(
         request.products = published
         state.products = (*state.products, *published)
 
-    request.status = CallStatus.OK
-    request.progress = calls.execution_runtime(request, None)
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
-    request.host.tasks = (task,)
-    request.host.finish = publish
+    request.set_host_tasks((task,), finish=publish)
     request.products = ()
     return request

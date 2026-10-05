@@ -70,14 +70,12 @@ impl PythonBackend {
     }
 
     fn execute_calls(&self, py: Python<'_>, batch: &BatchState) -> PyResult<()> {
-        let active: Vec<_> = batch
-            .pending_outputs(py)
-            .iter()
-            .enumerate()
-            .filter_map(|(index, output)| {
-                (output.borrow().status != CallStatus::Predicated).then_some(index)
-            })
-            .collect();
+        let mut active = Vec::new();
+        for (index, output) in batch.pending_outputs(py).iter().enumerate() {
+            if output.borrow().lock(py)?.output.status != CallStatus::Predicated {
+                active.push(index);
+            }
+        }
 
         if !active.is_empty() {
             self.runner

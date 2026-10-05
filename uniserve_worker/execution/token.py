@@ -35,13 +35,11 @@ from uniserve_worker.execution.output import PendingOutput, capture_logprobs
 from uniserve_worker.model_executor.input_batch import InputRow, TokenRow
 from uniserve_worker.protocol.call import (
     Call,
-    CallStatus,
     DrawLayout,
     ForwardMode,
     SamplingState,
     VisionInput,
 )
-from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.sampling import sampler as sampling
 from uniserve_worker.sampling.metadata import SamplingMetadata, TokenSelection
 from uniserve_worker.sampling.result import (
@@ -344,7 +342,7 @@ def publish_sample(
     chunk; a last vision row advances past its temporal positions without
     scoring image placeholders. A verify binds device tensors offset from
     its base coordinates and records those coordinates
-    on ``request.token`` so host materialization can resolve the accepted
+    in the native pending output so materialization can resolve the accepted
     span. A visual call advances the RNG counter by one and its position as
     ``_finish_visual`` does.
 
@@ -394,13 +392,15 @@ def publish_sample(
                 parameters.return_prompt_logprobs
                 or int(parameters.n_prompt_logprobs) > 0
             ):
-                request.token.prompt_logprob_ranges += prompt_logprob_details(
-                    request,
-                    start,
-                    cast(torch.Tensor, task.token_ids),
-                    logits,
-                    decode_state=decode_state,
-                    state=state,
+                request.add_prompt_logprobs(
+                    prompt_logprob_details(
+                        request,
+                        start,
+                        cast(torch.Tensor, task.token_ids),
+                        logits,
+                        decode_state=decode_state,
+                        state=state,
+                    )
                 )
 
         count = task.query_tokens if mode is ForwardMode.PREFILL else 1
@@ -448,7 +448,9 @@ def publish_sample(
                 )
             device_selected = accepted_device.to(dtype=torch.int32) + 1
 
-        request.token.runtime_cache_length = device_selected + int(task.seq_len)
+        request.token_update.runtime_cache_length = device_selected + int(
+            task.seq_len
+        )
         publish_runtime_sample(
             request,
             sampled,
@@ -460,18 +462,13 @@ def publish_sample(
             decode_state=decode_state,
         )
 
-        request.token.draft_tokens = draft
-        request.token.terminal_prefix = sample_work.terminal_draft_prefix
-        request.token.base_logical_position = start
-        request.token.base_rng_counter = request.progress.rng_counter
-        request.token.base_kv_visible = initialized - task.query_tokens
-        request.token.initialized_kv = initialized
-        return token_outcome(
-            call,
-            tokens=0,
-            request_tables=request_tables,
-            state=state,
+        request.set_speculation(
+            draft,
+            sample_work.terminal_draft_prefix,
+            int(task.seq_len),
+            initialized,
         )
+        return request
 
 
 def _prepare_visual(
@@ -826,18 +823,20 @@ def finish_context(
     if scores_prompt:
         for row, value, _index in scored:
             if not row.causal:
-                request.token.runtime_prompt_logits = value[-1].detach()
+                request.token_update.runtime_prompt_logits = value[-1].detach()
                 request.progress = replace(
                     request.progress, prompt_logits_ready=True
                 )
                 continue
-            request.token.prompt_logprob_ranges += prompt_logprob_details(
-                request,
-                int(cast(torch.Tensor, row.positions)[0]),
-                cast(torch.Tensor, row.token_ids),
-                value,
-                decode_state=decode_state,
-                state=state,
+            request.add_prompt_logprobs(
+                prompt_logprob_details(
+                    request,
+                    int(cast(torch.Tensor, row.positions)[0]),
+                    cast(torch.Tensor, row.token_ids),
+                    value,
+                    decode_state=decode_state,
+                    state=state,
+                )
             )
 
     if not samples:
@@ -1033,7 +1032,7 @@ def prompt_logprob_details(
             raise invalid_descriptor(
                 "continued prompt scoring has no preceding logits"
             )
-        pending = request.token.runtime_prompt_logits
+        pending = request.token_update.runtime_prompt_logits
         if pending is None:
             pending = states.prompt_logits[slot]
         previous = pending.reshape(1, -1).to(
@@ -1043,7 +1042,7 @@ def prompt_logprob_details(
         score_logits = torch.cat((previous, logits[:-1]), dim=0)
         targets = tokens
 
-    request.token.runtime_prompt_logits = logits[-1].detach()
+    request.token_update.runtime_prompt_logits = logits[-1].detach()
     request.progress = replace(request.progress, prompt_logits_ready=True)
     if int(targets.numel()) == 0:
         return ()
@@ -1081,66 +1080,37 @@ def token_outcome(
     committed_tokens: tuple[int, ...] = (),
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Stage request progress and an OK status for one autoregressive call.
+    """Project progress for an ordinary prefill or decode.
 
-    Without a speculative selection, the visible and computed KV length is
-    the runtime cache length staged by ``commit_kv``, else ``task.seq_len +
-    tokens`` when a task is given, else the current accepted length. After a
-    verify, both come from the coordinates ``publish_sample`` recorded: the
-    base visible extent and the extent the verify rows initialized.
-
-    Raises:
-        RuntimeError: When a non-speculative KV length is a device tensor.
-        WorkerError: When ``calls.cache_coordinates`` rejects the request.
+    KV length comes from the numerical update when present, otherwise from
+    the forward's extent or the accepted request length. Speculative calls
+    defer their selected progress to native completion.
     """
     if request is None:
         request = state.pending_output(call.request_key.request_id)
 
-    # (request slot, accepted visible length, capacity).
     cache = calls.cache_coordinates(request, tables=request_tables)
-    initialized = cache[1]
-    if request.token.draft_tokens is None:
-        published_length = request.token.runtime_cache_length
-        if published_length is None:
-            published_length = (
-                int(task.seq_len) + int(tokens)
-                if task is not None
-                else cache[1]
-            )
-        if isinstance(published_length, torch.Tensor):
-            raise RuntimeError(
-                "dynamic KV length requires a speculative selection"
-            )
-        visible_value = int(published_length)
-        initialized = visible_value
-    else:
-        visible_value = int(request.token.base_kv_visible)
-        initialized = request.token.initialized_kv
+    published_length = request.token_update.runtime_cache_length
+    if published_length is None:
+        published_length = (
+            int(task.seq_len) + int(tokens) if task is not None else cache[1]
+        )
+    if isinstance(published_length, torch.Tensor):
+        raise RuntimeError("dynamic KV length requires a speculative selection")
 
     progress = request.progress
-    # Publish one complete projection. Verification keeps the base logical
-    # position and visible extent beside the initialized KV extent; host
-    # completion advances them by the accepted span.
     request.progress = replace(
         progress,
-        logical_position=(
-            request.token.base_logical_position
-            if request.token.draft_tokens is not None
-            else progress.logical_position
-            if logical_position is None
-            else logical_position
-        ),
+        logical_position=progress.logical_position
+        if logical_position is None
+        else logical_position,
         rng_counter=progress.rng_counter
         if rng_counter is None
         else rng_counter,
-        kv_visible_len=visible_value,
-        kv_computed_len=initialized,
+        kv_visible_len=int(published_length),
+        kv_computed_len=int(published_length),
     )
-
-    request.status = CallStatus.OK
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
-    request.token.committed_tokens = committed_tokens
+    request.set_tokens(committed_tokens)
     return request
 
 
@@ -1245,8 +1215,8 @@ def commit_kv(
     The count must lie within the row's query span and the resulting extent
     within the request's allocated page table. With ``publish_runtime`` and a
     ``DecodeState``, the extent is staged as
-    ``request.token.runtime_cache_length`` for the commit; otherwise nothing
-    is staged. A zero count stages nothing and skips the page-table check.
+    ``request.token_update.runtime_cache_length`` for the commit. A zero count
+    leaves the update unchanged and skips the page-table check.
 
     Raises:
         RuntimeError: When the count or extent is out of range, there are no
@@ -1269,7 +1239,7 @@ def commit_kv(
     if publish_runtime and decode_state is not None:
         if int(task.request_pool_idx) != int(request.request.request_pool_idx):
             raise RuntimeError("token KV update crossed request slots")
-        request.token.runtime_cache_length = resulting
+        request.token_update.runtime_cache_length = resulting
 
 
 def resolve_decode_token(
@@ -1328,11 +1298,11 @@ def publish_runtime_sample(
     """
     if decode_state is None:
         return
-    request.token.sampled = sample
-    request.token.runtime_logical_position = logical_position
-    request.token.runtime_sampling_position = sampling_position
-    request.token.runtime_penalty_base = penalty_base
-    request.token.runtime_decode_increment = decode_increment
+    request.token_update.sampled = sample
+    request.token_update.runtime_logical_position = logical_position
+    request.token_update.runtime_sampling_position = sampling_position
+    request.token_update.runtime_penalty_base = penalty_base
+    request.token_update.runtime_decode_increment = decode_increment
 
 
 def publish_token_products(
@@ -1611,12 +1581,12 @@ def _candidate_penalty_counts(
 ) -> torch.Tensor:
     """Add a selection bound on this output but not yet committed.
 
-    ``request.token.sampled`` holds a selection that commit has not yet
+    ``request.token_update.sampled`` holds a selection that commit has not yet
     applied to ``DecodeState.penalty_counts``. Its token is added to a copy
     of ``committed`` when its row is valid and active; without one,
     ``committed`` itself is returned.
     """
-    sampled = request.token.sampled
+    sampled = request.token_update.sampled
     if sampled is None:
         return committed
 

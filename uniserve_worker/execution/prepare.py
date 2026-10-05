@@ -1107,7 +1107,7 @@ def _reserve_host_tasks(
     publication owner (`WorkerInfo.output_rank`), so other ranks reserve
     nothing for it; image decoding reserves on every rank that runs it.
 
-    The slots are stored in the call's `PendingOutput.host.tasks`. A failure
+    The slots are stored in the call's `PendingOutput.host_tasks`. A failure
     abandons the current call's reservations; those of earlier calls stay
     with their records for the native executor to release.
     """
@@ -1140,7 +1140,7 @@ def _reserve_host_tasks(
             continue
 
         pending = state.pending_output(call.request_key.request_id)
-        if pending.host.tasks:
+        if pending.host_tasks:
             raise invalid_descriptor(
                 "materialization repeats its CPU task identity"
             )
@@ -1163,7 +1163,7 @@ def _reserve_host_tasks(
             for reservation in reservations:
                 reservation.abandon()
             raise
-        pending.host.tasks = tuple(reservations)
+        pending.set_host_tasks(reservations)
 
 
 def _reserve_outputs(

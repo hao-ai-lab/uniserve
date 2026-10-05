@@ -1,13 +1,15 @@
 //! Resolve completed numerical work and retire its pinned output row.
 
+use std::sync::{Arc, Mutex, MutexGuard};
+
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::prelude::*;
+use pyo3::sync::MutexExt;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
-use uniserve_core::CallId;
-use uniserve_worker::RequestProgress;
+use uniserve_worker::PendingOutput as NativeOutput;
 use uniserve_worker_ipc::{
-    Call, CallKind, CallStatus, ErrorCode, RequestKey, RequestOutput, TimingCounters,
+    ArtifactHandle, Call, CallStatus, ErrorCode, MediaOutput, RequestOutput,
 };
 
 use crate::convert;
@@ -18,40 +20,24 @@ use super::latent::LatentUpdate;
 use super::output::OutputBuffer;
 use super::request::{Request, RequestPool, progress_from_py, progress_to_py};
 
-// Layouts produced by sampling_columns and the canvas step's device commit.
-const SAMPLING_FIELDS: usize = 4;
-const STEP_STOPPED: i64 = 1;
-const STEP_SKIPPED: i64 = 2;
-
 /// One call's result, with borrowed numerical views until execution commits.
 ///
 /// The output lease and host tasks own completion storage. RequestPool accepts
 /// the resolved progress only after every output in the batch is ready.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct PendingOutput {
-    key: RequestKey,
-    id: CallId,
-    code: CallKind,
-    progress: RequestProgress,
-    accepted: Option<RequestProgress>,
-    pub(super) status: CallStatus,
-    error_code: Option<ErrorCode>,
+    state: Arc<Mutex<NativeOutput>>,
     buffer: Option<Py<OutputBuffer>>,
-    row: usize,
     #[pyo3(get)]
     call: Py<PyAny>,
     #[pyo3(get)]
     pub(super) request: Py<Request>,
     #[pyo3(get)]
-    token: Py<PyAny>,
+    token_update: Py<PyAny>,
     #[pyo3(get)]
     pub(super) latent: Py<PyAny>,
-    #[pyo3(get)]
-    host: Py<PyAny>,
-    #[pyo3(get, set)]
-    finish_flags: Py<PyAny>,
-    #[pyo3(get, set)]
-    product_generations: Py<PyTuple>,
+    host_tasks: Vec<Py<HostTask>>,
+    host_finish: Option<Py<PyAny>>,
     #[pyo3(get)]
     pub(super) tensor_exports: Py<PyDict>,
     #[pyo3(get)]
@@ -79,11 +65,7 @@ pub(crate) struct PendingOutput {
     #[pyo3(get, set)]
     pub(super) producer_write: Option<Py<PyAny>>,
     #[pyo3(get, set)]
-    kv_output: Option<Py<PyAny>>,
-    #[pyo3(get, set)]
     pub(super) products: Py<PyTuple>,
-    pub(super) reports_output: bool,
-    pub(super) value: Option<RequestOutput>,
 }
 
 impl PendingOutput {
@@ -101,7 +83,6 @@ impl PendingOutput {
             .request
             .progress()
             .map_err(|error| native_error(py, error))?;
-        let coordinates = &plan.coordinates;
         let update = Py::new(
             py,
             LatentUpdate::new(
@@ -117,35 +98,19 @@ impl PendingOutput {
         drop(native_request);
 
         Ok(Self {
-            key: plan.request_key,
-            id: plan.call_id,
-            code: plan.code,
-            progress: RequestProgress {
-                logical_position: u64::from(coordinates.logical_position),
-                flow_step: u64::from(coordinates.flow_step),
-                kv_visible_len: u64::from(coordinates.kv_visible_len),
-                kv_computed_len: u64::from(coordinates.kv_computed_len),
-                ..previous
-            },
-            accepted: None,
-            status: CallStatus::Ok,
-            error_code: None,
+            state: Arc::new(Mutex::new(
+                NativeOutput::new(plan, previous, row).map_err(|error| native_error(py, error))?,
+            )),
             buffer: Some(buffer),
-            row,
             call,
             request,
-            token: numerical.getattr("TokenResult")?.call0()?.unbind(),
+            token_update: numerical.getattr("TokenUpdate")?.call0()?.unbind(),
             latent: numerical
                 .getattr("LatentResult")?
                 .call1((update,))?
                 .unbind(),
-            host: numerical.getattr("HostResult")?.call0()?.unbind(),
-            finish_flags: py
-                .import("uniserve_worker.protocol.output")?
-                .getattr("FinishFlags")?
-                .call0()?
-                .unbind(),
-            product_generations: PyTuple::empty(py).unbind(),
+            host_tasks: Vec::new(),
+            host_finish: None,
             tensor_exports: PyDict::new(py).unbind(),
             cache_exports: PyDict::new(py).unbind(),
             exported_locators: PyList::empty(py).unbind(),
@@ -159,10 +124,7 @@ impl PendingOutput {
             transition_write: None,
             completion_write: None,
             producer_write: None,
-            kv_output: None,
             products: PyTuple::empty(py).unbind(),
-            reports_output: true,
-            value: None,
         })
     }
 }
@@ -183,7 +145,11 @@ impl PendingOutput {
 
     #[getter]
     fn value(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        self.value
+        let value = {
+            let state = self.lock(py)?;
+            state.resolved().then(|| state.output.clone())
+        };
+        value
             .as_ref()
             .map(|value| convert::request_output_to_py(py, value))
             .transpose()
@@ -206,55 +172,119 @@ impl PendingOutput {
 
     #[getter]
     fn progress(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        progress_to_py(py, self.progress).map(Bound::unbind)
+        let progress = self.lock(py)?.progress;
+        progress_to_py(py, progress).map(Bound::unbind)
     }
 
     #[setter]
     fn set_progress(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.progress = progress_from_py(value)?;
+        let progress = progress_from_py(value)?;
+        self.lock(value.py())?.progress = progress;
         Ok(())
     }
 
     #[getter]
     fn status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        call_enum(py, "CallStatus", &self.status)
-    }
-
-    #[setter]
-    fn set_status(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.status = pythonize::depythonize(&value.getattr("value")?)?;
-        Ok(())
+        let status = self.lock(py)?.output.status;
+        call_enum(py, "CallStatus", &status)
     }
 
     #[getter]
     fn error_code(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        self.error_code
-            .as_ref()
+        let code = self.lock(py)?.output.error_code;
+        code.as_ref()
             .map(|code| call_enum(py, "ErrorCode", code))
             .transpose()
     }
 
-    #[setter]
-    fn set_error_code(&mut self, value: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-        self.error_code = value
-            .map(|value| pythonize::depythonize(&value.getattr("value")?).map_err(PyErr::from))
-            .transpose()?;
+    #[pyo3(signature = (sampling, logprobs=None))]
+    fn set_sampling(
+        &self,
+        py: Python<'_>,
+        sampling: (usize, usize, usize),
+        logprobs: Option<(usize, usize, usize)>,
+    ) -> PyResult<()> {
+        let mut state = self.lock(py)?;
+        state.sampling_range = Some(sampling);
+        state.logprob_range = logprobs;
         Ok(())
     }
 
-    #[getter(_buffer)]
-    fn buffer(&self, py: Python<'_>) -> Option<Py<OutputBuffer>> {
-        self.buffer.as_ref().map(|buffer| buffer.clone_ref(py))
+    fn add_prompt_logprobs(
+        &self,
+        py: Python<'_>,
+        spans: Vec<(usize, usize, usize)>,
+    ) -> PyResult<()> {
+        self.lock(py)?.prompt_logprob_ranges.extend(spans);
+        Ok(())
+    }
+
+    fn set_candidates(&self, py: Python<'_>, span: (usize, usize)) -> PyResult<()> {
+        self.lock(py)?.candidate_range = Some(span);
+        Ok(())
+    }
+
+    fn set_canvas(&self, py: Python<'_>, span: (usize, usize)) -> PyResult<()> {
+        self.lock(py)?.canvas_range = Some(span);
+        Ok(())
+    }
+
+    fn set_tokens(&self, py: Python<'_>, tokens: Vec<u32>) -> PyResult<()> {
+        self.lock(py)?.output.committed_tokens = tokens;
+        Ok(())
+    }
+
+    fn set_speculation(
+        &self,
+        py: Python<'_>,
+        draft_tokens: Vec<u32>,
+        terminal_prefix: Option<usize>,
+        visible: u64,
+        initialized: u64,
+    ) -> PyResult<()> {
+        self.lock(py)?
+            .set_speculation(draft_tokens, terminal_prefix, visible, initialized);
+        Ok(())
+    }
+
+    #[getter]
+    fn host_tasks(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        PyTuple::new(py, self.host_tasks.iter().map(|task| task.bind(py))).map(Bound::unbind)
+    }
+
+    #[pyo3(signature = (tasks, finish=None))]
+    fn set_host_tasks(slf: &Bound<'_, Self>, tasks: Vec<Py<HostTask>>, finish: Option<Py<PyAny>>) {
+        let retired = {
+            let mut this = slf.borrow_mut();
+            (
+                std::mem::replace(&mut this.host_tasks, tasks),
+                std::mem::replace(&mut this.host_finish, finish),
+            )
+        };
+        drop(retired);
+    }
+
+    fn set_media(&self, media: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = pythonize::depythonize(&media.call_method0("to_mapping")?)?;
+        self.lock(media.py())?.output.media_output = Some(value);
+        Ok(())
+    }
+
+    fn set_kv_output(&self, output: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = convert::kv_transfer_from_py(&output.call_method0("to_mapping")?)
+            .ok_or_else(|| PyRuntimeError::new_err("invalid KV output"))?;
+        self.lock(output.py())?.output.kv_output = Some(value);
+        Ok(())
     }
 
     pub(super) fn ready(slf: &Bound<'_, Self>) -> PyResult<bool> {
         let py = slf.py();
-        let (buffer, host) = {
+        let (buffer, tasks) = {
             let this = slf.borrow();
-            if this.value.is_some() {
+            if this.lock(py)?.resolved() {
                 return Ok(true);
             }
-            (this.buffer(py), this.host.clone_ref(py))
+            (this.buffer(py), this.clone_host_tasks(py))
         };
         let Some(buffer) = buffer else {
             return Ok(false);
@@ -264,26 +294,28 @@ impl PendingOutput {
         if !buffer.get().ready(py)? {
             return Ok(false);
         }
-        Ok(host_tasks(host.bind(py))?
-            .iter()
-            .all(|task| task.borrow(py).done()))
+        Ok(tasks.iter().all(|task| task.borrow(py).done()))
     }
 
     fn materialize(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
         Self::resolve(slf)?;
-        convert::request_output_to_py(slf.py(), slf.borrow().result()?)
+        let value = slf.borrow().result(slf.py())?;
+        convert::request_output_to_py(slf.py(), &value)
     }
 
     pub(super) fn abandon(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        let (host, buffer, row) = {
+        let (tasks, finish, buffer, row) = {
             let mut this = slf.borrow_mut();
-            (this.host.clone_ref(py), this.buffer.take(), this.row)
+            let row = this.lock(py)?.row;
+            (
+                std::mem::take(&mut this.host_tasks),
+                this.host_finish.take(),
+                this.buffer.take(),
+                row,
+            )
         };
-        let host = host.bind(py);
-        let tasks = host_tasks(host)?;
-        host.setattr("tasks", PyTuple::empty(py))?;
-        host.setattr("finish", py.None())?;
+        drop(finish);
 
         // Submitted host work retains its input until it actually finishes.
         // Try every owner even when a task's release callback fails.
@@ -310,11 +342,12 @@ impl PendingOutput {
         visit.call(&self.buffer)?;
         visit.call(&self.call)?;
         visit.call(&self.request)?;
-        visit.call(&self.token)?;
+        visit.call(&self.token_update)?;
         visit.call(&self.latent)?;
-        visit.call(&self.host)?;
-        visit.call(&self.finish_flags)?;
-        visit.call(&self.product_generations)?;
+        for task in &self.host_tasks {
+            visit.call(task)?;
+        }
+        visit.call(&self.host_finish)?;
         visit.call(&self.tensor_exports)?;
         visit.call(&self.cache_exports)?;
         visit.call(&self.exported_locators)?;
@@ -328,14 +361,14 @@ impl PendingOutput {
         visit.call(&self.transition_write)?;
         visit.call(&self.completion_write)?;
         visit.call(&self.producer_write)?;
-        visit.call(&self.kv_output)?;
         visit.call(&self.products)
     }
 
     fn __clear__(&mut self, py: Python<'_>) {
-        self.token = py.None();
+        self.token_update = py.None();
         self.latent = py.None();
-        self.host = py.None();
+        self.host_tasks.clear();
+        self.host_finish = None;
     }
 }
 
@@ -359,7 +392,7 @@ impl PendingOutput {
         self.transition_write = None;
         self.completion_write = None;
         self.producer_write = None;
-        let token = self.token.bind(py);
+        let token = self.token_update.bind(py);
         for field in [
             "sampled",
             "runtime_penalty_base",
@@ -373,25 +406,49 @@ impl PendingOutput {
         Ok(())
     }
 
-    pub(super) fn result(&self) -> PyResult<&RequestOutput> {
-        self.value
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("call output is not resolved"))
+    pub(super) fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, NativeOutput>> {
+        self.state
+            .lock_py_attached(py)
+            .map_err(|_| PyRuntimeError::new_err("pending output lock poisoned"))
+    }
+
+    fn clone_host_tasks(&self, py: Python<'_>) -> Vec<Py<HostTask>> {
+        self.host_tasks
+            .iter()
+            .map(|task| task.clone_ref(py))
+            .collect()
+    }
+
+    fn buffer(&self, py: Python<'_>) -> Option<Py<OutputBuffer>> {
+        self.buffer.as_ref().map(|buffer| buffer.clone_ref(py))
+    }
+
+    pub(super) fn result(&self, py: Python<'_>) -> PyResult<RequestOutput> {
+        let result = self.lock(py)?.result().cloned();
+        result.map_err(|error| native_error(py, error))
+    }
+
+    pub(super) fn validate_output(&self, py: Python<'_>, call: &Call) -> PyResult<()> {
+        let result = {
+            let buffer = self
+                .buffer
+                .as_ref()
+                .ok_or_else(lost_buffer)?
+                .get()
+                .lock(py)?;
+            self.lock(py)?.validate_output(&buffer, call)
+        };
+        result.map_err(|error| native_error(py, error))
     }
 
     pub(super) fn cancel(&self, py: Python<'_>, requests: &mut RequestPool) -> PyResult<()> {
-        if self.value.is_none() {
-            requests
-                .pool
-                .cancel_calls(&[(self.key, self.id)])
-                .map_err(|error| native_error(py, error))?;
-        }
-        Ok(())
+        let result = self.lock(py)?.cancel(&mut requests.pool);
+        result.map_err(|error| native_error(py, error))
     }
 
     pub(super) fn resolve(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        if slf.borrow().value.is_some() {
+        if slf.borrow().lock(py)?.resolved() {
             return Ok(());
         }
         if !Self::ready(slf)? {
@@ -399,367 +456,141 @@ impl PendingOutput {
                 "completion was resolved before query-ready",
             ));
         }
-        let (token, host, buffer, reports, mut status, mut error_code, mut progress, request) = {
+
+        let (state, buffer, request) = {
             let this = slf.borrow();
             (
-                this.token.clone_ref(py),
-                this.host.clone_ref(py),
+                Arc::clone(&this.state),
                 this.buffer(py).ok_or_else(lost_buffer)?,
-                this.reports_output,
-                this.status,
-                this.error_code,
-                this.progress,
                 this.request.clone_ref(py),
             )
         };
-        let accepted_parent = request
+        let parent = request
             .borrow(py)
             .request
             .progress()
             .map_err(|error| native_error(py, error))?;
-        let token = token.bind(py);
-        let host = host.bind(py);
-        let mut tokens: Vec<i64> = token.getattr("committed_tokens")?.extract()?;
-        let mut suppressed = status == CallStatus::Predicated;
-        let mut skipped = false;
-        let mut value = {
-            let this = slf.borrow();
-            request_output(this.key, this.id, this.code, progress)?
+        let (status, reports) = {
+            let state = state
+                .lock_py_attached(py)
+                .map_err(|_| PyRuntimeError::new_err("pending output lock poisoned"))?;
+            (state.output.status, state.reports_output)
         };
 
-        if !suppressed {
-            let decoded = resolve_host(py, host, reports)
-                .and_then(|()| decode_scores(py, token, buffer.get(), &mut value));
-            match decoded {
-                Err(error) if error.is_instance_of::<PyException>(py) => {
-                    log_failure(slf, &error)?;
-                    status = CallStatus::Error;
-                    error_code = Some(ErrorCode::ComputeError);
-                    suppressed = true;
+        // A host callback may update this result. Drop every native lock and
+        // Python borrow before invoking it or dispatching completion observers.
+        let completed = if status == CallStatus::Ok {
+            resolve_host(slf, reports)
+        } else {
+            Ok(())
+        };
+        let completed = completed.and_then(|()| {
+            buffer.get().with_readback(py, |buffer| {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .resolve(parent, buffer)
+            })
+        });
+        match completed {
+            Err(error) if error.is_instance_of::<PyException>(py) => {
+                log_failure(slf, &error)?;
+                {
+                    let mut state = state
+                        .lock_py_attached(py)
+                        .map_err(|_| PyRuntimeError::new_err("pending output lock poisoned"))?;
+                    state.output.status = CallStatus::Error;
+                    state.output.error_code = Some(ErrorCode::ComputeError);
                 }
-                Err(error) => return Err(error),
-                Ok(canvas) => {
-                    if let Some((outcome, canvas)) = canvas {
-                        // Canvas completion is [step outcome | token ids]. A
-                        // step behind a stopped block was a device-side no-op.
-                        skipped = outcome == STEP_SKIPPED;
-                        tokens = if outcome == STEP_STOPPED {
-                            canvas
-                        } else {
-                            Vec::new()
-                        };
-                    }
-                    if let Some((offset, extent, row)) = token
-                        .getattr("sampling_range")?
-                        .extract::<Option<(usize, usize, usize)>>()?
-                    {
-                        let (valid, active, sampled, accepted) =
-                            buffer.get().with_readback(py, |buffer| {
-                                let values = buffer.read_tokens(offset, extent)?;
-                                let count = extent / SAMPLING_FIELDS;
-                                if extent % SAMPLING_FIELDS != 0 || row >= count {
-                                    return Err(uniserve_worker::Error::State(
-                                        "sampling completion vectors do not align",
-                                    ));
-                                }
-                                Ok((
-                                    values[row],
-                                    values[count + row],
-                                    values[count * 2 + row],
-                                    values[count * 3 + row],
-                                ))
-                            })?;
-
-                        // Rows borrow the same native completion snapshot.
-                        // The predicate wins over an invalid distribution in
-                        // an inactive graph row: that row never sampled.
-                        if active == 0 {
-                            status = CallStatus::Predicated;
-                            suppressed = true;
-                        } else if valid == 0 {
-                            status = CallStatus::Error;
-                            error_code = Some(ErrorCode::InvalidCall);
-                            suppressed = true;
-                        } else {
-                            tokens = accepted_tokens(token, sampled, accepted)?;
-                            accept_speculation(token, tokens.len(), &mut progress)?;
-                        }
-                    }
-                }
+                buffer.get().with_readback(py, |buffer| {
+                    state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .resolve(parent, buffer)
+                })?;
             }
+            Err(error) => return Err(error),
+            Ok(()) => {}
         }
 
-        if skipped && status == CallStatus::Ok {
-            status = CallStatus::Predicated;
-            suppressed = true;
-        }
-        if status == CallStatus::Predicated {
-            progress = accepted_parent;
-            error_code = None;
-        }
-        if suppressed {
-            tokens.clear();
-        }
-
-        let row = slf.borrow().row;
-        buffer.get().observe(py, row)?;
-        let (queued_us, device_us, copy_us, host_us) = buffer.get().timing(py)?;
-        slf.borrow_mut().buffer = None;
-
-        let this = slf.borrow();
-        value.status = status;
-        value.error_code = error_code;
-        value.timing_counters = TimingCounters {
-            queued_us,
-            device_us,
-            copy_us,
-            host_us,
+        let retired = {
+            let mut this = slf.borrow_mut();
+            (
+                this.buffer.take(),
+                std::mem::take(&mut this.host_tasks),
+                this.host_finish.take(),
+            )
         };
-        set_progress(&mut value, progress)?;
-        value.committed_tokens = tokens
-            .into_iter()
-            .map(u32::try_from)
-            .collect::<Result<_, _>>()
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        let media = host.getattr("media")?;
-        if !media.is_none() {
-            value.media_output = Some(pythonize::depythonize(&media.call_method0("to_mapping")?)?);
-        }
-        if !suppressed {
-            value.product_generations = this.product_generations.extract(py)?;
-            value.finish_flags =
-                pythonize::depythonize(&this.finish_flags.bind(py).call_method0("to_mapping")?)?;
-            value.kv_output = this
-                .kv_output
-                .as_ref()
-                .map(|output| {
-                    convert::kv_transfer_from_py(&output.bind(py).call_method0("to_mapping")?)
-                        .ok_or_else(|| PyRuntimeError::new_err("invalid KV output"))
-                })
-                .transpose()?;
-        }
-        if suppressed || !reports {
-            value.sampled_logprob = None;
-            value.top_logprobs.clear();
-            value.prompt_logprobs.clear();
-            value.candidate_logprobs.clear();
-        }
-        drop(this);
-
-        host.setattr("tasks", PyTuple::empty(py))?;
-        let mut this = slf.borrow_mut();
-        this.accepted = Some(
-            if matches!(status, CallStatus::Predicated | CallStatus::Error) {
-                accepted_parent
-            } else {
-                progress
-            },
-        );
-        this.status = status;
-        this.error_code = error_code;
-        this.value = Some(value);
+        drop(retired);
         Ok(())
     }
 
     pub(super) fn submit_host_tasks(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        let host = {
+        let tasks = {
             let this = slf.borrow();
-            if this.value.is_some() {
+            if this.lock(py)?.resolved() {
                 return Ok(());
             }
-            this.host.clone_ref(py)
+            this.clone_host_tasks(py)
         };
-        for task in host_tasks(host.bind(py))? {
+        for task in tasks {
             task.borrow(py).submit_if_ready(py)?;
         }
         Ok(())
     }
 
     pub(super) fn accept(&self, py: Python<'_>, requests: &mut RequestPool) -> PyResult<()> {
-        requests
-            .pool
-            .apply_result(self.key, self.id, self.status, self.accepted)
-            .map_err(|error| native_error(py, error))
+        let result = self.lock(py)?.accept(&mut requests.pool);
+        result.map_err(|error| native_error(py, error))
     }
 }
 
-fn host_tasks(host: &Bound<'_, PyAny>) -> PyResult<Vec<Py<HostTask>>> {
-    host.getattr("tasks")?.extract()
-}
-
-fn resolve_host(py: Python<'_>, host: &Bound<'_, PyAny>, reports: bool) -> PyResult<()> {
-    let results = host_tasks(host)?
+fn resolve_host(output: &Bound<'_, PendingOutput>, reports: bool) -> PyResult<()> {
+    let py = output.py();
+    let tasks = output.borrow().clone_host_tasks(py);
+    let results = tasks
         .iter()
         .map(|task| task.borrow(py).result(py, None))
         .collect::<PyResult<Vec<_>>>()?;
-    let finish = host.getattr("finish")?;
-    host.setattr("finish", py.None())?;
-    if !finish.is_none() {
-        finish.call1((PyTuple::new(py, results)?,))?;
+    let finish = output.borrow_mut().host_finish.take();
+    if let Some(finish) = finish {
+        finish.call1(py, (PyTuple::new(py, results)?,))?;
         return Ok(());
     }
 
-    let protocol = py.import("uniserve_worker.protocol.output")?;
-    let media_type = protocol.getattr("MediaOutput")?;
     for result in results {
-        let mut result = result.into_bound(py);
-        if reports && let Ok(bytes) = result.cast::<PyBytes>() {
+        let result = result.bind(py);
+        let media = if let Ok(bytes) = result.cast::<PyBytes>() {
+            if !reports {
+                continue;
+            }
             let name = py
                 .import("uniserve_worker.media.storage")?
-                .call_method1("publish_media_bytes", (&result,))?;
-            let artifact = protocol.getattr("PosixShmArtifact")?.call1((name,))?;
-            result = media_type.call1((artifact, bytes.as_bytes().len()))?;
-        }
-        if result.is_instance(&media_type)? {
-            if !host.getattr("media")?.is_none() {
-                return Err(PyRuntimeError::new_err(
-                    "completion produced more than one media output",
-                ));
+                .call_method1("publish_media_bytes", (result,))?
+                .extract()?;
+            MediaOutput {
+                handle: ArtifactHandle::PosixShm { name },
+                bytes: bytes.as_bytes().len() as u64,
             }
-            host.setattr("media", result)?;
+        } else {
+            let media_type = py
+                .import("uniserve_worker.protocol.output")?
+                .getattr("MediaOutput")?;
+            if !result.is_instance(&media_type)? {
+                continue;
+            }
+            pythonize::depythonize(&result.call_method0("to_mapping")?)?
+        };
+        let this = output.borrow();
+        let mut state = this.lock(py)?;
+        if state.output.media_output.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "completion produced more than one media output",
+            ));
         }
+        state.output.media_output = Some(media);
     }
-    Ok(())
-}
-
-/// Decode copied score columns and an optional canvas completion. Tensor
-/// storage is already query-ready; these routines never wait for device work.
-fn decode_scores(
-    py: Python<'_>,
-    token: &Bound<'_, PyAny>,
-    buffer: &OutputBuffer,
-    output: &mut RequestOutput,
-) -> PyResult<Option<(i64, Vec<i64>)>> {
-    let sampled: Option<(usize, usize, usize)> = token.getattr("logprob_range")?.extract()?;
-    let spans: Vec<(usize, usize, usize)> = token.getattr("prompt_logprob_ranges")?.extract()?;
-    let candidates: Option<(usize, usize)> = token.getattr("candidate_range")?.extract()?;
-    let canvas: Option<(usize, usize)> = token.getattr("canvas_range")?.extract()?;
-    if sampled.is_none() && spans.is_empty() && candidates.is_none() && canvas.is_none() {
-        return Ok(None);
-    }
-
-    buffer.with_readback(py, |buffer| {
-        if let Some(span) = sampled {
-            let values = buffer.logprob_values(span)?;
-            output.sampled_logprob = values.first().map(|entry| entry.logprob);
-            output.top_logprobs = values.to_vec();
-        }
-        output.prompt_logprobs = spans
-            .into_iter()
-            .map(|span| buffer.logprob_values(span).map(<[_]>::to_vec))
-            .collect::<uniserve_worker::Result<_>>()?;
-
-        if let Some((offset, count)) = candidates {
-            output.candidate_logprobs = buffer
-                .read_tokens(offset, count)?
-                .iter()
-                .map(|&word| f32::from_bits(word as u32))
-                .collect();
-        }
-        if let Some((offset, count)) = canvas {
-            let words = buffer.read_tokens(offset, count)?;
-            let Some((&outcome, tokens)) = words.split_first() else {
-                return Err(uniserve_worker::Error::State(
-                    "canvas completion has no step outcome",
-                ));
-            };
-            return Ok(Some((outcome, tokens.to_vec())));
-        }
-        Ok(None)
-    })
-}
-
-/// Initialize the wire result from accepted request coordinates. Numerical
-/// completion and batch failure fill the same result type before delivery.
-pub(super) fn request_output(
-    key: RequestKey,
-    id: CallId,
-    code: CallKind,
-    progress: RequestProgress,
-) -> PyResult<RequestOutput> {
-    let mut output = RequestOutput {
-        request_key: key,
-        call_id: id,
-        code,
-        status: CallStatus::Ok,
-        product_generations: Vec::new(),
-        error_code: None,
-        timing_counters: Default::default(),
-        position: 0,
-        kv_visible_len: 0,
-        kv_computed_len: 0,
-        num_completed_steps: 0,
-        committed_tokens: Vec::new(),
-        sampled_logprob: None,
-        top_logprobs: Vec::new(),
-        prompt_logprobs: Vec::new(),
-        candidate_logprobs: Vec::new(),
-        finish_flags: Default::default(),
-        media_output: None,
-        kv_output: None,
-    };
-    set_progress(&mut output, progress)?;
-    Ok(output)
-}
-
-fn set_progress(output: &mut RequestOutput, progress: RequestProgress) -> PyResult<()> {
-    let narrow = |value| {
-        u32::try_from(value)
-            .map_err(|error: std::num::TryFromIntError| PyRuntimeError::new_err(error.to_string()))
-    };
-    output.position = narrow(progress.logical_position)?;
-    output.kv_visible_len = narrow(progress.kv_visible_len)?;
-    output.kv_computed_len = narrow(progress.kv_computed_len)?;
-    output.num_completed_steps = narrow(progress.flow_step)?;
-    Ok(())
-}
-
-fn accepted_tokens(token: &Bound<'_, PyAny>, sampled: i64, accepted: i64) -> PyResult<Vec<i64>> {
-    let draft: Option<Vec<i64>> = token.getattr("draft_tokens")?.extract()?;
-    let Some(mut draft) = draft.filter(|draft| !draft.is_empty()) else {
-        return Ok(vec![sampled]);
-    };
-    if accepted < 0 || accepted as usize > draft.len() {
-        return Err(PyRuntimeError::new_err(
-            "speculative acceptance count is outside the draft span",
-        ));
-    }
-    let accepted = accepted as usize;
-    draft.truncate(accepted);
-    let terminal: Option<usize> = token.getattr("terminal_prefix")?.extract()?;
-    if terminal.is_none_or(|terminal| accepted < terminal) {
-        draft.push(sampled);
-    }
-    Ok(draft)
-}
-
-fn accept_speculation(
-    token: &Bound<'_, PyAny>,
-    accepted: usize,
-    progress: &mut RequestProgress,
-) -> PyResult<()> {
-    let draft = token.getattr("draft_tokens")?;
-    if draft.is_none() {
-        return Ok(());
-    }
-    let visible = token.getattr("base_kv_visible")?.extract::<u64>()? + accepted as u64;
-    let initialized: u64 = token.getattr("initialized_kv")?.extract()?;
-    if accepted > draft.len()? + 1
-        || progress.kv_computed_len != initialized
-        || visible > initialized
-    {
-        return Err(PyRuntimeError::new_err(
-            "speculative acceptance exceeds initialized KV state",
-        ));
-    }
-
-    // Rejected drafts stay initialized but invisible. Advance all accepted
-    // coordinates together, using the prefix that verification started from.
-    progress.logical_position =
-        token.getattr("base_logical_position")?.extract::<u64>()? + accepted as u64;
-    progress.rng_counter = token.getattr("base_rng_counter")?.extract::<u64>()? + accepted as u64;
-    progress.kv_visible_len = visible;
     Ok(())
 }
 

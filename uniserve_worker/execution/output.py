@@ -1,21 +1,19 @@
-"""Numerical captures and borrowed staging for native PendingOutput results.
+"""Numerical captures and borrowed views for native PendingOutput results.
 
-Python stages sampling, canvas, latent and host work into these per-call views.
+Python supplies sampling, canvas and latent tensors through these views.
 Rust owns readiness, result decoding, request acceptance and output retirement.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import torch
 
 from uniserve_worker._uniserve_ipc import PendingOutput
-from uniserve_worker.execution.host import HostTask
 from uniserve_worker.protocol.batch import LatentParams
 from uniserve_worker.protocol.identity import BufferId
-from uniserve_worker.protocol.output import MediaOutput
 from uniserve_worker.sampling.result import LogprobValues, SamplerRow
 from uniserve_worker.storage.latent_pool import LatentStaging, LatentUpdate
 from uniserve_worker.storage.output import OutputBuffer
@@ -80,58 +78,27 @@ def capture_samples(
             capture = output.capture(metadata)
             span = capture
             spans[key] = span
-        request.token.sampling_range = (*span, sample.index)
+        scores = None
 
         if sample.batch.logprobs is not None:
             key = id(sample.batch.logprobs)
             if key not in details:
                 details[key] = capture_logprobs(sample.batch.logprobs, output)
-            request.token.logprob_range = details[key].get(sample.index)
+            scores = details[key].get(sample.index)
+        request.set_sampling((*span, sample.index), scores)
 
 
 @dataclass(slots=True)
-class TokenResult:
-    """Sampling captures and numerical token-state updates for one call."""
+class TokenUpdate:
+    """Borrowed numerical views retained until DecodeState accepts them."""
 
-    # Tokens reported when no sampling row was captured.
-    committed_tokens: tuple[int, ...] = ()
-    # Spans are `(offset, count, row)` into the call's `OutputBuffer`: the
-    # capture's element offset and length, and the row within the captured
-    # column (the call's sampler row for `sampling_range` and `logprob_range`,
-    # the scored token's index within its prompt chunk for each
-    # `prompt_logprob_ranges` entry).
-    sampling_range: tuple[int, int, int] | None = None
-    logprob_range: tuple[int, int, int] | None = None
-    prompt_logprob_ranges: tuple[tuple[int, int, int], ...] = ()
     sampled: SamplerRow | None = None
-    # A canvas readout's `(offset, count)` span: one word per candidate,
-    # holding its FP32 log-probability's bits sign-extended from int32.
-    candidate_range: tuple[int, int] | None = None
-    # A canvas step's `(offset, count)` span: its stop flag, then its canvas
-    # tokens, which become the committed tokens when the flag is set.
-    canvas_range: tuple[int, int] | None = None
-
-    # These borrowed numerical views survive until DecodeState accepts them.
     runtime_logical_position: int | torch.Tensor = 0
     runtime_sampling_position: int | torch.Tensor = 0
     runtime_penalty_base: torch.Tensor | None = None
     runtime_decode_increment: bool = False
     runtime_cache_length: int | torch.Tensor | None = None
     runtime_prompt_logits: torch.Tensor | None = None
-
-    # Speculative verification (set when `draft_tokens` is not None). The
-    # device selects the accepted span; host completion resolves only the
-    # accepted count, without retaining logits. The `base_*` fields are the
-    # coordinates before the draft span, to which `PendingOutput.materialize`
-    # adds the accepted token count. `initialized_kv` is the KV extent the
-    # verification forward wrote; rejected drafts stay initialized but beyond
-    # the visible length.
-    draft_tokens: tuple[int, ...] | None = None
-    terminal_prefix: int | None = None
-    base_logical_position: int = 0
-    base_rng_counter: int = 0
-    base_kv_visible: int = 0
-    initialized_kv: int = 0
 
 
 @dataclass(slots=True)
@@ -143,15 +110,3 @@ class LatentResult:
     staging: LatentStaging | None = None
     imported: bool = False
     exports: dict[BufferId, ExportLocations] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class HostResult:
-    """Host tasks and media results following numerical execution."""
-
-    tasks: tuple[HostTask, ...] = ()
-    # When set, `PendingOutput.materialize` passes the task results to this
-    # callback (for example to publish deferred product bytes) instead of
-    # interpreting them as media output.
-    finish: Callable[[tuple[object, ...]], None] | None = None
-    media: MediaOutput | None = None

@@ -199,12 +199,6 @@ impl OutputBuffer {
             .map_err(|error| native_error(py, error))
     }
 
-    fn logprob_bytes(&self, py: Python<'_>, spans: Vec<(usize, usize, usize)>) -> PyResult<usize> {
-        self.lock(py)?
-            .logprob_bytes(&spans)
-            .map_err(|error| native_error(py, error))
-    }
-
     pub(super) fn observe(&self, py: Python<'_>, row: usize) -> PyResult<(u64, u64)> {
         self.ready(py)?;
         let timing = self
@@ -298,7 +292,10 @@ impl OutputBuffer {
             .is_some())
     }
 
-    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, NativeBuffer<HostAllocation>>> {
+    pub(super) fn lock(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<MutexGuard<'_, NativeBuffer<HostAllocation>>> {
         self.inner
             .lock_py_attached(py)
             .map_err(|_| invariant(py, "output buffer lock poisoned"))

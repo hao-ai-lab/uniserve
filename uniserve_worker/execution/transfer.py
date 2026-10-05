@@ -125,7 +125,7 @@ def execute(
         )
 
         outcome = image.non_state_outcome(call, state=state)
-        outcome.kv_output = snapshot
+        outcome.set_kv_output(snapshot)
     elif mode is TransferMode.KV_INSTALL:
         publications = kv_cache
         if publications is None:

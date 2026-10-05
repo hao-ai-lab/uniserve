@@ -36,7 +36,6 @@ from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.tensors import TensorOutput, concatenate_views
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.execution import calls
 from uniserve_worker.execution.diffusion_state import (
     DiffusionState,
     SlotLadder,
@@ -49,8 +48,7 @@ from uniserve_worker.protocol.batch import (
     NewRequest,
     TensorPublication,
 )
-from uniserve_worker.protocol.call import Call, CallStatus, MediaCall
-from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.protocol.call import Call, MediaCall
 from uniserve_worker.storage.latent_pool import LatentUpdate
 
 logger = logging.getLogger(__name__)
@@ -1104,13 +1102,6 @@ def execute(
     else:
         raise invalid_descriptor(f"unsupported video call {call.kind!r}")
 
-    request.status = CallStatus.OK
-    # Without cache coordinates the projection copies the output's progress
-    # unchanged: reconstruction and preparation leave it as staged, and a
-    # denoising step keeps the ``flow_step`` it advanced above.
-    request.progress = calls.execution_runtime(request, None)
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
     request.products = products
     return request
 
