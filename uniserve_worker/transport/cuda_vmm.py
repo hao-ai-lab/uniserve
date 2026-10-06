@@ -510,10 +510,7 @@ class CudaVmmTransport(Transport):
                         raise invalid_descriptor(
                             "CUDA export has no live local owner"
                         )
-                    export = owner._buffers.acquire(locator)
-                    ticket.add_retirement_callback(
-                        lambda: owner._buffers.release_reader(locator)
-                    )
+                    export = owner._buffers.acquire(locator, ticket)
                     mapped = export.tensor
                     event = export.event
                 else:

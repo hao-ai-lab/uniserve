@@ -170,6 +170,20 @@ impl<C> TransferCapacity<C> {
         Ok(())
     }
 
+    /// Admit one borrowed or copied read from the rank's shared reservation.
+    pub fn take_read(self: &Arc<Self>, reservation: Option<&ReadReservation<C>>) -> Result<()> {
+        if let Some(reservation) = reservation {
+            if !Arc::ptr_eq(reservation.capacity(), self) {
+                return Err(Error::Invalid(
+                    "read reservation belongs to another transfer capacity".into(),
+                ));
+            }
+            reservation.use_read()
+        } else {
+            self.take_reads(1)
+        }
+    }
+
     /// Return credits only after a physical read retires, or if unused.
     pub fn return_reads(&self, count: usize) -> Result<()> {
         if count == 0 {

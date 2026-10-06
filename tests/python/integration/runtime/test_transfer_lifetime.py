@@ -458,7 +458,7 @@ def test_cuda_vmm_rejects_a_changed_registered_view() -> None:
         event_pool.close()
 
 
-@pytest.mark.parametrize("ending", ("close", "drop"))
+@pytest.mark.parametrize("ending", ("close", "drop", "consumer_close"))
 def test_local_read_keeps_its_producer_fence_after_retirement(
     ending: str,
 ) -> None:
@@ -466,6 +466,10 @@ def test_local_read_keeps_its_producer_fence_after_retirement(
     events = EventPool()
     transport = make_transport(
         "local", byte_capacity=8192, ticket_capacity=2, event_pool=events
+    )
+    reader_events = EventPool()
+    reader = make_transport(
+        "local", byte_capacity=8192, ticket_capacity=2, event_pool=reader_events
     )
     source = torch.zeros(1024, device=device)
     unrelated = torch.full_like(source, 9)
@@ -479,8 +483,8 @@ def test_local_read_keeps_its_producer_fence_after_retirement(
             torch.cuda._sleep(1_000_000_000)
             source.fill_(7)
             locator = transport.export(source)
-        unused = transport.fetch(locator, device=device)
-        retained = transport.fetch(locator, device=device)
+        unused = reader.fetch(locator, device=device)
+        retained = reader.fetch(locator, device=device)
         del unused
         retirement = transport.release(locator)
         assert retirement is not None and not retirement.done()
@@ -489,6 +493,8 @@ def test_local_read_keeps_its_producer_fence_after_retirement(
             value = retained.result(consumer).clone()
         if ending == "close":
             retained.close()
+        elif ending == "consumer_close":
+            reader.close()
         else:
             del retained
         consumer.synchronize()
@@ -502,6 +508,40 @@ def test_local_read_keeps_its_producer_fence_after_retirement(
             transport.release(locator)
         if replacement is not None:
             transport.release(replacement)
+        reader.close()
+        transport.close()
+        reader_events.close()
+        events.close()
+
+
+def test_refused_local_read_returns_its_source_grant() -> None:
+    from uniserve_worker.transport.pool import ReadBackpressureError
+
+    events = EventPool()
+    transport = make_transport(
+        "local", byte_capacity=4, ticket_capacity=1, event_pool=events
+    )
+    locator = None
+    read = None
+    try:
+        locator = transport.export(torch.tensor([7], dtype=torch.int32))
+        read = transport.fetch(locator, device=torch.device("cpu"))
+        with pytest.raises(ReadBackpressureError):
+            transport.fetch(locator, device=torch.device("cpu"))
+
+        retirement = transport.release(locator)
+        assert retirement is not None and not retirement.done()
+        read.close()
+        retirement.result(timeout=5)
+
+        locator = transport.export(torch.tensor([9], dtype=torch.int32))
+        read = transport.fetch(locator, device=torch.device("cpu"))
+        assert torch.equal(read.result(), torch.tensor([9], dtype=torch.int32))
+    finally:
+        if read is not None:
+            read.close()
+        if locator is not None:
+            transport.release(locator)
         transport.close()
         events.close()
 

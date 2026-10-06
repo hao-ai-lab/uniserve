@@ -120,7 +120,7 @@ impl TransportBuffer {
     }
 
     #[getter]
-    fn tensor(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub(in crate::worker) fn tensor(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match &*self.lock(py) {
             Backing::Local { tensor, .. } => Ok(tensor.clone_ref(py)),
             Backing::Cuda(source) => Ok(source.tensor.clone_ref(py)),
@@ -131,7 +131,7 @@ impl TransportBuffer {
     }
 
     #[getter]
-    fn event(&self, py: Python<'_>) -> Option<Py<CUDAEvent>> {
+    pub(in crate::worker) fn event(&self, py: Python<'_>) -> Option<Py<CUDAEvent>> {
         match &*self.lock(py) {
             Backing::Local { event, .. } => event.as_ref().map(|event| event.clone_ref(py)),
             Backing::Cuda(source) => Some(source.event.clone_ref(py)),
@@ -257,7 +257,7 @@ impl TransportBuffer {
         let action = Retirement { buffer, completion };
 
         if let Some(event) = event {
-            events.defer_callback(Arc::clone(&event), action)?;
+            events.defer_callback(vec![Arc::clone(&event)], action)?;
             events.wake_event(py, event.device(), &event)?;
             events.reap(py)
         } else {

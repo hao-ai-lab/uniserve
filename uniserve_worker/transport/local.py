@@ -9,7 +9,6 @@ the owning instance through the process-wide `_endpoints` registry, so any
 
 from __future__ import annotations
 
-import weakref
 from collections.abc import Sequence
 from itertools import count
 from typing import TYPE_CHECKING, Any
@@ -66,10 +65,8 @@ class LocalTransport(Transport):
     ) -> None:
         """Create a process-local tensor table with bounded retained bytes."""
         self.source = source or WorkerEndpoint.local()
-        self._borrowed: weakref.WeakSet[TransferTicket] = weakref.WeakSet()
         self._events = event_pool
         self._next = count()
-        self._completion_wake: Any = None
         self._buffers = BufferRegistry(
             # Each buffer carries at least one byte, so the byte budget also
             # bounds how many registrations can be retained.
@@ -144,7 +141,6 @@ class LocalTransport(Transport):
         return locator
 
     def set_completion_wake(self, wake: Any) -> None:
-        self._completion_wake = wake
         self._reads.set_completion_wake(wake)
 
     def fetch(
@@ -171,84 +167,14 @@ class LocalTransport(Transport):
         if not isinstance(owner, LocalTransport):
             raise invalid_descriptor("local buffer has no live owner")
 
-        source = owner._buffers.acquire(locator)
-        borrowed_ticket = None
-        try:
-            tensor, event = source.tensor, source.event
-            first = tensor[0] if isinstance(tensor, tuple) else tensor
-            if device != first.device:
-                raise invalid_descriptor(
-                    "local binding requires the source device"
-                )
-            if region is not None:
-                if not _slices.within(region, locator.shape):
-                    raise invalid_descriptor(
-                        "read region exceeds the exported view"
-                    )
-                tensor = region_view(tensor, region)
-            target = (
-                None
-                if destination is None
-                else read_destination(locator, device, destination, region)
-            )
-
-            if target is not None:
-                # Copy path: the pool ticket retires when the copy's physical
-                # access ends, then the source's reader count drops.
-                ticket = self._reads.submit(
-                    self._reads.copy,
-                    tensor,
-                    target,
-                    event,
-                    nbytes=locator.nbytes,
-                    destination=target,
-                    reservation=reservation,
-                )
-                ticket.add_retirement_callback(
-                    lambda: owner._buffers.release_reader(locator)
-                )
-                return ticket
-
-            # Borrow path: no copy. The source views themselves are handed out
-            # and the reader count drops when every consumer stream completes.
-            # A borrowed view holds a read ticket, like the copies
-            # `TransferPool` submits, until then.
-            if reservation is None:
-                self.capacity.take_reads(
-                    message="local borrowed-view ticket capacity is exhausted"
-                )
-            else:
-                reservation.use()
-            try:
-                ticket = TransferTicket(
-                    owner._events,
-                    release=lambda: self._finish_borrow(owner, locator),
-                )
-                borrowed_ticket = ticket
-                if self._completion_wake is not None:
-                    ticket.add_done_callback(self._completion_wake)
-                    ticket.add_retirement_callback(self._completion_wake)
-                ticket._complete(tensor, event)
-                self._borrowed.add(ticket)
-            except BaseException:
-                if borrowed_ticket is None:
-                    self.capacity.return_reads()
-                raise
-            return ticket
-        except BaseException:
-            # Once a borrowed ticket owns the grant, its close path returns
-            # both source ownership and credit, including setup failure.
-            if borrowed_ticket is None:
-                owner._buffers.release_reader(locator)
-            else:
-                borrowed_ticket.close()
-            raise
-
-    def _finish_borrow(self, owner: LocalTransport, locator: Locator) -> None:
-        try:
-            owner._buffers.release_reader(locator)
-        finally:
-            self.capacity.return_reads()
+        return self._reads.fetch_local(
+            owner._buffers,
+            locator,
+            device=device,
+            destination=destination,
+            region=region,
+            reservation=reservation,
+        )
 
     def release(self, locator: Locator) -> Completion | None:
         """Revoke new local reads.
@@ -262,8 +188,33 @@ class LocalTransport(Transport):
         try:
             self._reads.close()
         finally:
-            for ticket in tuple(self._borrowed):
-                ticket._drain_consumers()
             self._buffers.close()
             with _endpoint_lock:
                 _endpoints.pop(self.endpoint(), None)
+
+
+def _read_views(
+    tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    locator: Locator,
+    device: torch.device,
+    destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
+    region: tuple[slice, ...] | None,
+) -> tuple[
+    torch.Tensor | tuple[torch.Tensor, ...],
+    torch.Tensor | tuple[torch.Tensor, ...] | None,
+]:
+    """Borrow source spans and validate an optional copy destination."""
+    first = tensor[0] if isinstance(tensor, tuple) else tensor
+    if device != first.device:
+        raise invalid_descriptor("local binding requires the source device")
+    if region is not None:
+        if not _slices.within(region, locator.shape):
+            raise invalid_descriptor("read region exceeds the exported view")
+        tensor = region_view(tensor, region)
+
+    target = (
+        None
+        if destination is None
+        else read_destination(locator, device, destination, region)
+    )
+    return tensor, target
