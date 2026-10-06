@@ -1127,44 +1127,13 @@ impl Scheduler {
             None
         };
 
-        let mut call = Call {
-            consumer_slots: Vec::new(),
-            token_input: None,
-            coordinates: CallCoordinates {
-                logical_position: 0,
-                kv_visible_len: 0,
-                kv_computed_len: 0,
-                flow_step: step,
-            },
-
-            token_output: None,
-            vision_inputs: Vec::new(),
-            latent_feature_input: None,
-            encoder_output: None,
-            latent_input: None,
-            latent_output: None,
-            image_input: None,
-            image_output: None,
-            transition_output: None,
-
-            input_image: None,
-            kv_input: None,
-            kv_output: None,
-            input_token_ids: Vec::new(),
-            readout: None,
-            canvas: None,
-            sampling_state: None,
-            request_key,
-            call_id,
-            component: component.to_owned(),
-            code: work,
-            bounds: Bounds::default(),
-            inputs,
-            outputs,
-            completion_output,
-            predicate,
-            rng: None,
-        };
+        let mut call = Call::new(request_key, call_id, work);
+        call.coordinates.flow_step = step;
+        call.component = component.to_owned();
+        call.inputs = inputs;
+        call.outputs = outputs;
+        call.completion_output = completion_output;
+        call.predicate = predicate;
 
         // Record what this call schedules: the admission it carries, the
         // reservation slice each product binds to, and the cursors that

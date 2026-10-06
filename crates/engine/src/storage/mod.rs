@@ -15,9 +15,7 @@
 //! returns it to the right one. `KvAllocation` has no `free`: its units return
 //! to the `BlockPool` when its tables drop.
 
-use std::collections::BTreeMap;
-
-use uniserve_core::HashAlgo;
+use uniserve_core::{ByteAllocator, HashAlgo};
 use uniserve_worker_ipc::{RequestKey, WorkerInfo};
 
 pub(crate) use crate::kv::KvAllocation;
@@ -211,70 +209,14 @@ impl KVCacheManager {
 /// A first-fit allocator over free byte extents. Adjacent free extents are
 /// coalesced on release.
 pub(crate) struct BufferPool {
-    capacity: u64,
-    /// Free extents as `offset -> length` in bytes, disjoint and ordered by
-    /// offset.
-    free: BTreeMap<u64, u64>,
+    bytes: ByteAllocator,
 }
 
 impl BufferPool {
-    /// Creates an address-space allocator with one initial free extent.
     pub(crate) fn new(capacity: u64) -> Self {
-        let free = (capacity > 0)
-            .then_some((0, capacity))
-            .into_iter()
-            .collect();
-        Self { capacity, free }
-    }
-
-    /// Allocates the first aligned extent large enough for `bytes`.
-    ///
-    /// The alignment applies to the returned offset. The unused head and tail
-    /// of the chosen extent stay free. Returns `None` for a zero size, an
-    /// alignment that is not a nonzero power of two, or no fitting extent.
-    fn reserve(&mut self, bytes: u64, alignment: u32) -> Option<u64> {
-        if bytes == 0 || alignment == 0 || !alignment.is_power_of_two() {
-            return None;
+        Self {
+            bytes: ByteAllocator::new(capacity),
         }
-        let alignment = u64::from(alignment);
-        let candidate = self.free.iter().find_map(|(&offset, &extent)| {
-            let aligned = offset.checked_add(alignment - 1)? & !(alignment - 1);
-            let end = aligned.checked_add(bytes)?;
-            (end <= offset.checked_add(extent)?).then_some((offset, extent, aligned, end))
-        })?;
-        let (offset, extent, aligned, end) = candidate;
-        self.free.remove(&offset);
-        if aligned > offset {
-            self.free.insert(offset, aligned - offset);
-        }
-        let range_end = offset + extent;
-        if end < range_end {
-            self.free.insert(end, range_end - end);
-        }
-        Some(aligned)
-    }
-
-    /// Returns an extent and coalesces it with immediately adjacent free ranges.
-    ///
-    /// The extent is clipped to the pool capacity. Releasing a range that is
-    /// already free is not detected; callers release each span once through
-    /// the consuming `BufferPool::free`.
-    fn release(&mut self, offset: u64, bytes: u64) {
-        let mut start = offset;
-        let mut end = offset.saturating_add(bytes).min(self.capacity);
-        if let Some((&left, &extent)) = self.free.range(..=start).next_back()
-            && left.saturating_add(extent) == start
-        {
-            start = left;
-            self.free.remove(&left);
-        }
-        if let Some((&right, &extent)) = self.free.range(start..).next()
-            && end == right
-        {
-            end = right.saturating_add(extent);
-            self.free.remove(&right);
-        }
-        self.free.insert(start, end.saturating_sub(start));
     }
 }
 
@@ -340,10 +282,13 @@ impl BufferPool {
         if bytes == 0 || alignment == 0 || !alignment.is_power_of_two() {
             return Err(OutOfStorage::InvalidAllocation);
         }
-        let offset = self.reserve(bytes, alignment).ok_or(OutOfStorage::Buffer)?;
+        let range = self
+            .bytes
+            .allocate(bytes, alignment)
+            .ok_or(OutOfStorage::Buffer)?;
         Ok(BufferSpan {
             owner,
-            offset,
+            offset: range.start,
             bytes,
         })
     }
@@ -351,7 +296,7 @@ impl BufferPool {
     /// Return the complete span after its export and transport readers retire.
     pub(crate) fn free(&mut self, allocation: BufferSpan) {
         let BufferSpan { offset, bytes, .. } = allocation;
-        self.release(offset, bytes);
+        self.bytes.free(offset..offset + bytes);
     }
 }
 

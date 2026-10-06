@@ -22,9 +22,7 @@ use super::{EncoderCachePin, FlowPrefixState, Phase, RequestAllocations, Termina
 use crate::kv::{BlockTable, KvAllocation};
 
 use std::collections::HashSet;
-use uniserve_worker_ipc::{
-    CallCoordinates, DEFAULT_COMPONENT, ForwardMode, LatentParams, MediaCall, TransferMode,
-};
+use uniserve_worker_ipc::{ForwardMode, LatentParams, MediaCall, TransferMode};
 
 use uniserve_core::{
     GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput, RequestId, SamplingParams,
@@ -491,41 +489,13 @@ fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRe
 /// key's engine id and epoch are zero placeholders, and the bound is one
 /// token; the `plan_*` builders fill in the rest.
 fn computation(request: &GenerationRequest, code: CallKind) -> Call {
-    Call {
-        consumer_slots: Vec::new(),
-        token_input: None,
-
-        request_key: RequestKey::new(0, request.request_id, 0),
-        call_id: CallId::new(0, 0),
-        coordinates: CallCoordinates::default(),
-        component: DEFAULT_COMPONENT.into(),
+    let mut call = Call::new(
+        RequestKey::new(0, request.request_id, 0),
+        CallId::new(0, 0),
         code,
-        bounds: Bounds {
-            max_tokens: 1,
-            ..Bounds::default()
-        },
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        token_output: None,
-        vision_inputs: Vec::new(),
-        latent_feature_input: None,
-        encoder_output: None,
-        latent_input: None,
-        latent_output: None,
-        image_input: None,
-        image_output: None,
-        completion_output: None,
-        transition_output: None,
-        predicate: None,
-        rng: None,
-        input_image: None,
-        kv_input: None,
-        kv_output: None,
-        input_token_ids: Vec::new(),
-        readout: None,
-        canvas: None,
-        sampling_state: None,
-    }
+    );
+    call.bounds.max_tokens = 1;
+    call
 }
 
 /// Plans a context prefill: prompt tokens `start..end` and the vision

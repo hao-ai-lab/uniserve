@@ -1,6 +1,7 @@
 //! Resource ownership and lifecycle of one model worker rank.
 
 mod bootstrap;
+mod warmup;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -302,8 +303,7 @@ impl Worker {
             options.set_item("tokenizer", tokenizer)?;
             options.set_item("latents", latents)?;
             runner.call_method(py, "capture", (), Some(&options))?;
-            py.import("uniserve_worker.bootstrap.warmup")?
-                .call_method1("warmup_requests", (slf,))?;
+            warmup::run(slf)?;
         }
         if slf.borrow().codec_slot {
             let media = py.import("uniserve_worker.media.container")?;

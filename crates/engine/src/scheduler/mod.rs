@@ -97,7 +97,7 @@ use uniserve_core::{
 use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};
 use uniserve_worker_ipc::{
-    ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
+    ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
     DimBound, ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState,
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
