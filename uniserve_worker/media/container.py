@@ -7,8 +7,8 @@ interpreter lock, which stalls the rank's service thread for that time; a
 host rank has no device work to launch and no other task in flight, so the
 stall only extends the task it belongs to.
 
-This module holds the PyAV work itself; `uniserve_worker.media.mux` decides
-which of these functions runs as which lane task and for which request.
+This module holds the PyAV work itself. Native requests retain containers;
+the executor schedules codec operations on the host lane.
 """
 
 from __future__ import annotations

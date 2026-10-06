@@ -111,6 +111,7 @@ pub(crate) struct Request {
     pub(super) diffusion: Option<Py<PyAny>>,
     pub(super) kv: Option<KVConditioning>,
     pub(super) video: VideoState,
+    pub(super) mux: Option<Arc<super::media::MuxSession>>,
 }
 
 impl Request {
@@ -120,10 +121,11 @@ impl Request {
         }
     }
 
-    fn clear_diffusion(&mut self) {
+    fn clear_media(&mut self) {
         self.diffusion = None;
         self.kv = None;
         self.video = VideoState::default();
+        self.mux = None;
     }
 }
 
@@ -233,7 +235,7 @@ impl Request {
     }
 
     fn __clear__(&mut self) {
-        self.clear_diffusion();
+        self.clear_media();
     }
 }
 
@@ -293,7 +295,7 @@ impl RequestPool {
         for request in self.views.iter().flatten() {
             let mut request = request.borrow_mut(py);
             request.drain_preparation(py);
-            request.clear_diffusion();
+            request.clear_media();
         }
         self.views.iter_mut().for_each(|view| *view = None);
         self.pool.close();
@@ -433,7 +435,7 @@ impl RequestPool {
         self.pool
             .retire(request_id)
             .map_err(|error| native_error(py, error))?;
-        request.borrow_mut(py).clear_diffusion();
+        request.borrow_mut(py).clear_media();
         Ok(())
     }
 
@@ -482,6 +484,7 @@ impl RequestPool {
                     diffusion: None,
                     kv: None,
                     video: VideoState::default(),
+                    mux: None,
                 },
             )?);
         }

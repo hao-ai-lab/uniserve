@@ -54,18 +54,9 @@ impl PythonBackend {
                     return self.execute_video(py, batch, index);
                 }
 
-                let call = batch.call(py, index)?;
-                let options = PyDict::new(py);
-                options.set_item("model_runner", model)?;
-                options.set_item("state", &batch.numerical)?;
-                options.set_item("tensor_store", &self.tensors)?;
-                options.set_item(
-                    "export_transports",
-                    self.worker.bind(py).getattr("export_transports")?,
-                )?;
                 let (module, method) = match kind {
                     CallKind::Media(MediaCall::MediaReading) => {
-                        ("uniserve_worker.execution.media_reader", "execute")
+                        return self.read_media(py, batch, index);
                     }
                     CallKind::Media(MediaCall::VisionEncoding) if videos => {
                         ("uniserve_worker.execution.conditions", "encode_vision")
@@ -79,14 +70,20 @@ impl PythonBackend {
                     CallKind::Media(
                         MediaCall::VideoEncoding | MediaCall::AudioEncoding | MediaCall::Muxing,
                     ) => {
-                        options
-                            .set_item("media_mux", self.worker.bind(py).getattr("media_mux")?)?;
-                        options
-                            .set_item("transports", self.worker.bind(py).getattr("transports")?)?;
-                        ("uniserve_worker.execution.host_media", "execute")
+                        return self.encode_media(py, batch, index);
                     }
                     _ => return Err(invalid(py, format!("unsupported call {}", kind.as_str()))),
                 };
+
+                let call = batch.call(py, index)?;
+                let options = PyDict::new(py);
+                options.set_item("model_runner", model)?;
+                options.set_item("state", &batch.numerical)?;
+                options.set_item("tensor_store", &self.tensors)?;
+                options.set_item(
+                    "export_transports",
+                    self.worker.bind(py).getattr("export_transports")?,
+                )?;
                 py.import(module)?
                     .call_method(method, (&call,), Some(&options))?;
                 Ok(())

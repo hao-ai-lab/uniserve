@@ -1061,7 +1061,6 @@ class PendingOutput:
     device_reads: list[TensorRead]
     feature_reads: list[TensorRead]
     writes: list[Buffer]
-    media_units: tuple[int, ...]
     predicate: tuple[torch.Tensor, bool] | None
     token_write: Buffer | None
     transition_write: Buffer | None
@@ -1076,7 +1075,6 @@ class PendingOutput:
     def set_host_tasks(
         self,
         tasks: Sequence[HostTask[Any]],
-        finish: Callable[[tuple[object, ...]], None] | None = None,
     ) -> None: ...
     @property
     def request_key(self) -> RequestKey: ...

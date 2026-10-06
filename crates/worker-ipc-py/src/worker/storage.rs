@@ -1479,7 +1479,7 @@ impl TensorStore {
         Ok(())
     }
 
-    fn defer_write(&self, py: Python<'_>, write: &Bound<'_, Buffer>) -> PyResult<()> {
+    pub(super) fn defer_write(&self, py: Python<'_>, write: &Bound<'_, Buffer>) -> PyResult<()> {
         let write = BufferHandle::new(write.clone().unbind());
 
         let state = self.lock(py)?;

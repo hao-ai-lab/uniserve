@@ -307,7 +307,7 @@ impl BatchInputs {
         self.inner.input_ready(&buffer_id(buffer)?)
     }
 
-    fn is_borrowed(&self, buffer: &Bound<'_, PyAny>) -> PyResult<bool> {
+    pub(super) fn is_borrowed(&self, buffer: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(matches!(
             self.inner.inputs.get(&buffer_id(buffer)?),
             Some(Input::Borrowed)

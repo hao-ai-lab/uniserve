@@ -11,10 +11,10 @@ use uniserve_worker::{
     Error, HostAction, HostLane, HostTask, Microbatches as NativeMicrobatches, Outcome,
 };
 
-use super::host::PythonAction;
+use super::host::HostOperation;
 
 struct Microbatch {
-    action: PythonAction,
+    action: HostOperation,
     turn: Option<(Arc<NativeMicrobatches>, usize)>,
 }
 
@@ -56,7 +56,7 @@ impl HostAction for Microbatch {
     fn wake(_wake: &()) {}
 
     fn report(error: Self::Error) {
-        PythonAction::report(error);
+        HostOperation::report(error);
     }
 
     fn error(error: Error) -> Self::Error {
@@ -64,7 +64,7 @@ impl HostAction for Microbatch {
     }
 
     fn note_cleanup(error: &mut Self::Error, cleanup: Self::Error) {
-        PythonAction::note_cleanup(error, cleanup);
+        HostOperation::note_cleanup(error, cleanup);
     }
 }
 
@@ -242,7 +242,7 @@ impl Microbatches {
     fn submit(&self, index: usize, call: Py<PyAny>, rotate: bool) -> PyResult<Task> {
         let task = self.lanes[index].reserve().map_err(native_error)?;
         let action = Microbatch {
-            action: PythonAction::numerical(call, "uniserve.microbatch"),
+            action: HostOperation::numerical(call, "uniserve.microbatch"),
             turn: rotate.then(|| (Arc::clone(&self.control), index)),
         };
         if let Err(error) = task.configure(action).and_then(|()| task.submit()) {

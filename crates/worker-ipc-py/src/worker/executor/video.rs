@@ -12,7 +12,6 @@ use crate::worker::error::invalid;
 use crate::worker::host::{HostLane, HostTask};
 use crate::worker::model_results::ExecutionOutput;
 use crate::worker::request::Request;
-use crate::worker::storage::TensorRead;
 
 impl PythonBackend {
     /// Resolve immutable numerical dimensions once for this admitted request.
@@ -122,48 +121,6 @@ impl PythonBackend {
         Ok(())
     }
 
-    /// Acquire complete tensors together and retain every read through completion.
-    fn video_inputs(
-        &self,
-        py: Python<'_>,
-        batch: &BatchState,
-        index: usize,
-    ) -> PyResult<Vec<Py<PyAny>>> {
-        let call = batch.call(py, index)?;
-        let device = self
-            .model_runner
-            .bind(py)
-            .call_method1("call_devices", (&call,))?
-            .get_item(0)?;
-        let id = call.getattr("call_id")?;
-        let inputs = call
-            .getattr("inputs")?
-            .try_iter()?
-            .map(|reference| Ok((reference?, id.clone(), Some(device.clone()))))
-            .collect::<PyResult<Vec<_>>>()?;
-        let reads = self.tensors.get().consume_batch(py, inputs, None)?;
-        let reads = reads.extract::<Vec<Py<TensorRead>>>()?;
-        let pending = batch.pending(py, index);
-        let pending = pending.borrow(py);
-        for read in &reads {
-            pending.device_reads.bind(py).append(read.bind(py))?;
-        }
-
-        reads
-            .iter()
-            .map(|read| {
-                let read = read.borrow(py);
-                if read.region.is_some() || read.tensor.bind(py).is_none() {
-                    return Err(invalid(
-                        py,
-                        "video computation requires complete input coverage",
-                    ));
-                }
-                Ok(read.tensor.clone_ref(py))
-            })
-            .collect()
-    }
-
     pub(super) fn execute_video(
         &self,
         py: Python<'_>,
@@ -203,7 +160,7 @@ impl PythonBackend {
                     .collect::<Vec<_>>();
 
                 if call.code == CallKind::Media(MediaCall::LatentPreparation) {
-                    let inputs = self.video_inputs(py, batch, index)?;
+                    let inputs = self.media_inputs(py, batch, index, 0..call.inputs.len())?;
                     let admission = request.borrow(py).admission.clone_ref(py);
                     let video = admission.bind(py).getattr("video")?;
                     let conditioned =
@@ -327,7 +284,7 @@ impl PythonBackend {
                         "media reconstruction requires one Tensor input",
                     ));
                 }
-                let inputs = self.video_inputs(py, batch, index)?;
+                let inputs = self.media_inputs(py, batch, index, 0..call.inputs.len())?;
                 let result = if call.code == CallKind::Media(MediaCall::VideoDecoding) {
                     let windows = model
                         .getattr("video_decoder")?

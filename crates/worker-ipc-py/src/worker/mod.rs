@@ -23,6 +23,7 @@ mod kv_cache;
 mod kv_import;
 mod latent;
 pub(crate) mod locator;
+mod media;
 mod microbatches;
 mod model_results;
 mod model_runners;

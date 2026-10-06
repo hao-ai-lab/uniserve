@@ -20,7 +20,7 @@ use super::latent::LatentPool;
 use super::output::OutputBuffer;
 use super::pending::PendingOutput;
 use super::request::RequestPool;
-use super::storage::{Buffer, TensorRead, TensorStore};
+use super::storage::{TensorRead, TensorStore};
 
 /// Resources retained until the executor delivers or abandons one submission.
 /// Numerical callbacks borrow this object; they do not advance the executor.
@@ -804,78 +804,15 @@ impl BatchState {
             .get(&request_id)
             .ok_or_else(|| invalid(py, "request has no output in this batch"))?;
         let call = &self.plan.calls[index];
-        if values.len() != call.outputs.len()
-            || regions
-                .as_ref()
-                .is_some_and(|regions| regions.len() != values.len())
-        {
-            return Err(invalid(
-                py,
-                "numerical results disagree with declared tensor outputs",
-            ));
-        }
-
-        let output = self.outputs[index].borrow(py);
-        let writes = output
-            .writes
-            .bind(py)
-            .iter()
-            .map(|write| write.cast_into::<Buffer>())
-            .collect::<Result<Vec<_>, _>>()?;
-        let deferred: Vec<_> = writes
-            .iter()
-            .filter(|write| write.get().deferred(py))
-            .cloned()
-            .collect();
-        let exported = (|| {
-            let mut products = Vec::new();
-            for (index, (product, value)) in call.outputs.iter().zip(&values).enumerate() {
-                let write = writes.iter().find(|write| {
-                    write.get().id(py) == product.buffer_id() && !write.get().feature(py)
-                });
-                let Some(write) = write else {
-                    continue;
-                };
-                tensor_store.write(py, write.clone(), value.clone(), None, None)?;
-                products.push(tensor_store.export_buffer(
-                    py,
-                    call,
-                    product,
-                    write,
-                    transports,
-                    host,
-                    regions.as_ref().map(|regions| regions[index].as_slice()),
-                    &output,
-                )?);
-            }
-            output
-                .lock(py)?
-                .set_products(products)
-                .map_err(|error| native_error(py, error))?;
-
-            if !deferred.is_empty() {
-                let resident = tensor_store.exports.bind(py);
-                let exports = output.tensor_exports.bind(py);
-                super::exports::validate_exports(resident, exports)?;
-                tensor_store.commit_writes(py, deferred.clone())?;
-                resident.update(exports.as_mapping())?;
-            }
-            Ok(())
-        })();
-
-        if !deferred.is_empty() {
-            // These writes finish after batch commit, so failure cleanup
-            // belongs here rather than the executor's pre-commit discard.
-            if exported.is_err() {
-                output.revoke_exports(transports)?;
-                tensor_store.abandon_writes(py, deferred)?;
-            }
-            drop(output);
-            self.outputs[index]
-                .borrow_mut(py)
-                .release_execution_references(py)?;
-        }
-        exported
+        PendingOutput::export_tensors(
+            self.outputs[index].bind(py),
+            call,
+            values,
+            tensor_store,
+            transports,
+            host,
+            regions,
+        )
     }
 
     /// Return the decoder-unit interval assigned to this request's call.

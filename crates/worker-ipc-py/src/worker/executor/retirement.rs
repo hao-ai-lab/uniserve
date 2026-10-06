@@ -373,12 +373,6 @@ impl PythonBackend {
                 .get()
                 .release_request_set(py, &keys, retained)?;
         }
-        let media = worker.getattr("media_mux")?;
-        if !media.is_none() {
-            for id in ids {
-                media.call_method1("drop", (*id,))?;
-            }
-        }
         if !keys.is_empty()
             && let Some(latents) = &self.latents
         {
