@@ -18,9 +18,11 @@ from typing import TYPE_CHECKING, Any
 from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import (
     SHM_HEADER_BYTES,
+    BufferRegistry,
     Completion,
     SharedBuffer,
     SharedRead,
+    TransportBuffer,
 )
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
@@ -28,7 +30,6 @@ from uniserve_worker.protocol.transfer import (
     PosixShmTransfer,
     WorkerEndpoint,
 )
-from uniserve_worker.transport.endpoint import BufferRegistry, TransportBuffer
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     copy_pairs,

@@ -2,9 +2,9 @@
 
 A `local` export is read only within the producer's own address space
 and on the source device. Its locator carries the exporting instance's
-endpoint name and an integer key into that instance's table; a reader finds
-the owning instance through the process-wide `_endpoints` registry, so any
-`LocalTransport` in the process can read another's exports.
+endpoint name and an integer key into that instance's table. Native readers
+resolve the producer through a weak registry shared by transports in the
+process, then retain it through the consumer's final access.
 """
 
 from __future__ import annotations
@@ -15,18 +15,16 @@ from typing import TYPE_CHECKING, Any
 
 from uniserve import _slices
 from uniserve.runtime import EventPool
-from uniserve_worker._uniserve_ipc import Completion
+from uniserve_worker._uniserve_ipc import (
+    BufferRegistry,
+    Completion,
+    TransportBuffer,
+)
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     LocalTransfer,
     Locator,
     WorkerEndpoint,
-)
-from uniserve_worker.transport.endpoint import (
-    BufferRegistry,
-    TransportBuffer,
-    _endpoint_lock,
-    _endpoints,
 )
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
@@ -73,8 +71,6 @@ class LocalTransport(Transport):
             capacity=capacity.capacity,
             event_pool=event_pool,
         )
-        with _endpoint_lock:
-            _endpoints[self.endpoint()] = self
         self.capacity = capacity
         self._reads = TransferPool(
             workers=2,
@@ -158,17 +154,7 @@ class LocalTransport(Transport):
         owns copy capacity; a borrowed view retains its producer's event pool
         until consumer completion returns the source grant.
         """
-        handle = locator.transport
-        if not isinstance(handle, LocalTransfer):
-            raise invalid_descriptor("local read requires a local locator")
-
-        with _endpoint_lock:
-            owner = _endpoints.get(handle.endpoint)
-        if not isinstance(owner, LocalTransport):
-            raise invalid_descriptor("local buffer has no live owner")
-
         return self._reads.fetch_local(
-            owner._buffers,
             locator,
             device=device,
             destination=destination,
@@ -189,8 +175,6 @@ class LocalTransport(Transport):
             self._reads.close()
         finally:
             self._buffers.close()
-            with _endpoint_lock:
-                _endpoints.pop(self.endpoint(), None)
 
 
 def _read_views(

@@ -119,26 +119,6 @@ impl TransportBuffer {
         })
     }
 
-    #[getter]
-    pub(in crate::worker) fn tensor(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        match &*self.lock(py) {
-            Backing::Local { tensor, .. } => Ok(tensor.clone_ref(py)),
-            Backing::Cuda(source) => Ok(source.tensor.clone_ref(py)),
-            Backing::Shared(_) => Err(PyRuntimeError::new_err(
-                "shared buffers expose their mapping through SharedRead",
-            )),
-        }
-    }
-
-    #[getter]
-    pub(in crate::worker) fn event(&self, py: Python<'_>) -> Option<Py<CUDAEvent>> {
-        match &*self.lock(py) {
-            Backing::Local { event, .. } => event.as_ref().map(|event| event.clone_ref(py)),
-            Backing::Cuda(source) => Some(source.event.clone_ref(py)),
-            Backing::Shared(_) => None,
-        }
-    }
-
     /// Retire a backing that was never handed to the registry, such as an
     /// export whose locator construction failed after recording its fence.
     fn retire(slf: &Bound<'_, Self>, events: &EventPool) -> PyResult<()> {
@@ -176,6 +156,24 @@ impl TransportBuffer {
 }
 
 impl TransportBuffer {
+    pub(in crate::worker) fn tensor(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &*self.lock(py) {
+            Backing::Local { tensor, .. } => Ok(tensor.clone_ref(py)),
+            Backing::Cuda(source) => Ok(source.tensor.clone_ref(py)),
+            Backing::Shared(_) => Err(PyRuntimeError::new_err(
+                "shared buffers expose their mapping through SharedRead",
+            )),
+        }
+    }
+
+    pub(in crate::worker) fn event(&self, py: Python<'_>) -> Option<Py<CUDAEvent>> {
+        match &*self.lock(py) {
+            Backing::Local { event, .. } => event.as_ref().map(|event| event.clone_ref(py)),
+            Backing::Cuda(source) => Some(source.event.clone_ref(py)),
+            Backing::Shared(_) => None,
+        }
+    }
+
     fn lock(&self, py: Python<'_>) -> MutexGuard<'_, Backing> {
         self.backing
             .lock_py_attached(py)

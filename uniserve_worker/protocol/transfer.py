@@ -157,7 +157,7 @@ class PosixShmTransfer:
     """Identifies a POSIX shared-memory segment by name.
 
     `endpoint` names the producer's buffer registry (`BufferRegistry.name` in
-    `uniserve_worker.transport.endpoint`), which refuses a release carrying
+    `uniserve_worker._uniserve_ipc`), which refuses a release carrying
     another table's name. Readiness travels in the segment header.
     """
 
