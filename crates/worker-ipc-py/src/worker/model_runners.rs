@@ -72,7 +72,7 @@ impl ModelRunners {
 
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (owner, tasks, *, cache, tables, states))]
-    fn forward(
+    pub(super) fn forward(
         &self,
         py: Python<'_>,
         owner: Py<PyAny>,

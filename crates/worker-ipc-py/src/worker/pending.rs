@@ -280,7 +280,7 @@ impl PendingOutput {
     }
 
     #[pyo3(signature = (sampling, logprobs=None))]
-    fn set_sampling(
+    pub(super) fn set_sampling(
         &self,
         py: Python<'_>,
         sampling: (usize, usize, usize),

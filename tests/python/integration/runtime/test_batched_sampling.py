@@ -108,17 +108,20 @@ def test_logprob_reporting_does_not_change_sample_selection(device, request):
 )
 def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
     with execution_worker(device=device) as worker:
-        # The middle request asks for scores. Compatible sampling rows
-        # therefore remain interleaved in call order, with distinct
-        # tokens in every row.
+        # Interleave requests with different score readouts and distinct
+        # tokens. Each response must retain its own token and score span.
         admissions = (
-            ar_params(21, block_ids=(0,)),
             ar_params(
-                22,
-                block_ids=(1,),
-                sampling=SamplingParams(return_logprobs=True),
+                21,
+                block_ids=(0,),
+                sampling=SamplingParams(return_logprobs=True, n_logprobs=1),
             ),
-            ar_params(23, block_ids=(2,)),
+            ar_params(22, block_ids=(1,)),
+            ar_params(
+                23,
+                block_ids=(2,),
+                sampling=SamplingParams(return_logprobs=True, n_logprobs=2),
+            ),
         )
         prompt_ends = (4, 5, 6)
         primed: list[tuple[Call, BatchOutput]] = []
@@ -129,7 +132,7 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                 predecessor=root_parent(admission),
                 mode=ForwardMode.PREFILL,
                 tokens=(3, prompt_ends[index]),
-                logprobs=index == 1,
+                logprobs=index != 1,
             )
             report = finalized_report(
                 worker,
@@ -164,7 +167,7 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                 predecessor=observation.call_id,
                 mode=ForwardMode.DECODE,
                 tokens=(expected_successor(prompt_ends[index]),),
-                logprobs=index == 1,
+                logprobs=index != 1,
             )
             decode_ops.append(call)
 
@@ -179,8 +182,8 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
             ),
         )
 
-        for completion, prompt_end in zip(
-            result.completions, prompt_ends, strict=True
+        for index, (completion, prompt_end) in enumerate(
+            zip(result.completions, prompt_ends, strict=True)
         ):
             assert completion.committed_tokens == (
                 expected_successor(expected_successor(prompt_end)),
@@ -194,6 +197,15 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                 3,
                 3,
             )
+            if index == 1:
+                assert completion.sampled_logprob is None
+            else:
+                assert completion.sampled_logprob is not None
+                assert len(completion.top_logprobs) == (1 if index == 0 else 2)
+                assert (
+                    completion.top_logprobs[0][0]
+                    == completion.committed_tokens[0]
+                )
 
 
 def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> (

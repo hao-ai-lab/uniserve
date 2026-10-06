@@ -50,13 +50,6 @@ if TYPE_CHECKING:
     from uniserve_worker.storage.tensor_store import TensorStore
     from uniserve_worker.transport.interface import Transport
 
-__all__ = ["HOST_MEDIA_CALLS", "execute"]
-
-#: The calls host ranks serve.
-HOST_MEDIA_CALLS = frozenset(
-    {MediaCall.VIDEO_ENCODING, MediaCall.AUDIO_ENCODING, MediaCall.MUXING}
-)
-
 
 def _input_export(
     call: Call, state: BatchState, index: int = 0

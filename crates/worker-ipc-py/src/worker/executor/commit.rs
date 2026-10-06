@@ -18,10 +18,7 @@ impl PythonBackend {
         let numerical = batch.numerical.clone_ref(py);
         let scope = super::super::batch::BatchState::scope(numerical.bind(py))?;
         with_context(scope.bind(py), || {
-            let started: u64 = py
-                .import("time")?
-                .call_method0("perf_counter_ns")?
-                .extract()?;
+            let started = std::time::Instant::now();
             let outputs = batch.pending_outputs(py);
             self.finish_reads(py, &outputs)?;
             self.write_completion_predicates(py, &outputs)?;
@@ -73,10 +70,14 @@ impl PythonBackend {
             // Keep execution/commit timings at their established sampling
             // point, before cross-resource preflight and device-state updates.
             let started_ns = numerical.borrow(py).started_ns;
-            let stats = self
-                .runner
-                .bind(py)
-                .call_method1("execution_stats", (&numerical, started_ns, started))?;
+            batch.record_component(py, "commit_lane", started)?;
+            let elapsed = (py
+                .import("time")?
+                .call_method0("perf_counter_ns")?
+                .extract::<u64>()?
+                - started_ns)
+                / 1000;
+            let stats = numerical.borrow(py).execution_stats(py)?.inner;
             if let Some(cache) = &self.cache {
                 cache
                     .borrow(py)
@@ -154,7 +155,7 @@ impl PythonBackend {
                 .pool
                 .add_pending(&calls)
                 .map_err(|error| native_error(py, error))?;
-            batch.record_execution(py, &stats)
+            batch.record_execution(py, elapsed, stats)
         })
     }
 

@@ -28,7 +28,7 @@ from uniserve.tensors import adjacent_view
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import image
-from uniserve_worker.execution.output import PendingOutput, capture_logprobs
+from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.call import (
     Call,
@@ -55,20 +55,6 @@ if TYPE_CHECKING:
     from uniserve_worker.storage.tensor_store import TensorStore
 
 
-def writes_context(call: Call) -> bool:
-    """Whether ``call`` is a context prefill that writes vision blocks.
-
-    Such a prefill carries input-image vision blocks between its prompt
-    tokens (``Call.vision_inputs``) and declares no completion output;
-    ``prepare_context`` packs it and ``finish_context`` reads its outputs.
-    """
-    return (
-        call.kind is ForwardMode.PREFILL
-        and bool(call.vision_inputs)
-        and call.completion_output is None
-    )
-
-
 def _writes_visual_state(call: Call) -> bool:
     """Whether a prefill writes one visual-state row of image features.
 
@@ -76,7 +62,7 @@ def _writes_visual_state(call: Call) -> bool:
     closes the image, or an input image's latent block; a context prefill's
     vision blocks are rows of its segments instead.
     """
-    return not writes_context(call) and (
+    return not call.writes_context() and (
         bool(call.vision_inputs) or call.latent_feature_input is not None
     )
 
@@ -111,7 +97,7 @@ def prepare_forward(
         raise invalid_descriptor("sequence call has no admitted sampling state")
 
     mode = call.kind if isinstance(call.kind, ForwardMode) else None
-    if writes_context(call):
+    if call.writes_context():
         raise invalid_descriptor("a context prefill packs one row per segment")
     if mode is ForwardMode.PREFILL and _writes_visual_state(call):
         return _prepare_visual(
@@ -397,7 +383,7 @@ def publish_sample(
             task=task if mode is ForwardMode.DECODE else None,
             tokens=count,
             logical_position=_next_position(task)
-            if writes_context(call)
+            if call.writes_context()
             else None,
             sampled=True,
             request_tables=request_tables,
@@ -919,7 +905,7 @@ def prompt_logprob_details(
         targets,
         (prompt_parameters,) * int(targets.numel()),
     )
-    captured = capture_logprobs(details, state.output_buffer)
+    captured = state.output_buffer.capture_logprobs(details)
     return tuple(captured[index] for index in range(int(targets.numel())))
 
 
@@ -1213,5 +1199,4 @@ __all__ = [
     "prepare_forward",
     "prepare_sampling",
     "publish_sample",
-    "writes_context",
 ]

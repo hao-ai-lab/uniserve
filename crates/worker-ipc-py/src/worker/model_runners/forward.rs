@@ -20,7 +20,7 @@ type Group = (Py<PyAny>, Vec<usize>, bool);
 /// The iterator retains numerical resources and runs only when its consumer
 /// requests the next result. A failed consumer therefore starts no later work.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
-pub(super) struct ModelBatches {
+pub(in crate::worker) struct ModelBatches {
     owner: Py<PyAny>,
     tasks: Py<PyTuple>,
     cache: Py<PyAny>,
@@ -111,6 +111,40 @@ impl ModelBatches {
         &mut self,
         py: Python<'py>,
     ) -> PyResult<Option<(Bound<'py, PyTuple>, Py<PyAny>)>> {
+        self.next(py)?
+            .map(|(indices, result)| Ok((PyTuple::new(py, indices)?, result)))
+            .transpose()
+    }
+
+    fn __clear__(&mut self, py: Python<'_>) {
+        self.owner = py.None();
+        self.tasks = PyTuple::empty(py).unbind();
+        self.cache = py.None();
+        self.tables = py.None();
+        self.states = py.None();
+        self.missing.clear();
+        self.groups.clear();
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.owner)?;
+        visit.call(&self.tasks)?;
+        visit.call(&self.cache)?;
+        visit.call(&self.tables)?;
+        visit.call(&self.states)?;
+        for (runner, _, _) in &self.groups {
+            visit.call(runner)?;
+        }
+        Ok(())
+    }
+}
+
+impl ModelBatches {
+    /// Advance one group; native consumers retain its host row indexes directly.
+    pub(in crate::worker) fn next<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<Option<(Vec<usize>, Py<PyAny>)>> {
         if let Some(index) = self.missing.pop_front() {
             let task = self.tasks.bind(py).get_item(index)?;
             let call = task.get_item(1)?.extract::<PyRef<'_, Call>>()?;
@@ -122,17 +156,13 @@ impl ModelBatches {
                     call.inner.component,
                 ),
             );
-            return Ok(Some((
-                PyTuple::new(py, [index])?,
-                error.into_value(py).into_any(),
-            )));
+            return Ok(Some((vec![index], error.into_value(py).into_any())));
         }
         let Some((runner, indices, preserve)) = self.groups.pop_front() else {
             self.__clear__(py);
             return Ok(None);
         };
         let runner = runner.bind(py);
-        let result_indices = PyTuple::new(py, &indices)?;
         let tasks = self.tasks.bind(py);
         let mut rows = Vec::with_capacity(indices.len());
         let mut calls = Vec::with_capacity(indices.len());
@@ -163,7 +193,7 @@ impl ModelBatches {
             Ok(result.unbind())
         })();
         match result {
-            Ok(result) => Ok(Some((result_indices, result.into_any()))),
+            Ok(result) => Ok(Some((indices, result.into_any()))),
             Err(error) => {
                 let fatal: bool = py
                     .import("uniserve_worker.errors")?
@@ -174,31 +204,9 @@ impl ModelBatches {
                     self.__clear__(py);
                     Err(error)
                 } else {
-                    Ok(Some((result_indices, error.into_value(py).into_any())))
+                    Ok(Some((indices, error.into_value(py).into_any())))
                 }
             }
         }
-    }
-
-    fn __clear__(&mut self, py: Python<'_>) {
-        self.owner = py.None();
-        self.tasks = PyTuple::empty(py).unbind();
-        self.cache = py.None();
-        self.tables = py.None();
-        self.states = py.None();
-        self.missing.clear();
-        self.groups.clear();
-    }
-
-    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.owner)?;
-        visit.call(&self.tasks)?;
-        visit.call(&self.cache)?;
-        visit.call(&self.tables)?;
-        visit.call(&self.states)?;
-        for (runner, _, _) in &self.groups {
-            visit.call(runner)?;
-        }
-        Ok(())
     }
 }

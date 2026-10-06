@@ -1,7 +1,9 @@
 //! Python numerical backend for the shared native batch executor.
 
 mod commit;
+mod dispatch;
 mod execute;
+mod forward;
 mod inputs;
 mod latents;
 mod output;
@@ -64,7 +66,6 @@ impl Submission {
 
 struct PythonBackend {
     worker: Py<PyAny>,
-    runner: Py<PyAny>,
     read_backpressure: Py<PyType>,
     requests: Py<RequestPool>,
     tensors: Py<TensorStore>,
@@ -111,15 +112,14 @@ impl BatchState {
             .collect()
     }
 
-    fn record_execution(&mut self, py: Python<'_>, stats: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.execution_us = Some(stats.get_item(0)?.extract()?);
-        self.stats = Some(
-            stats
-                .get_item(1)?
-                .extract::<PyRef<'_, crate::stats::ForwardStats>>()?
-                .inner
-                .clone(),
-        );
+    fn record_execution(
+        &mut self,
+        py: Python<'_>,
+        elapsed: u64,
+        stats: ForwardStats,
+    ) -> PyResult<()> {
+        self.execution_us = Some(elapsed);
+        self.stats = Some(stats);
         let (buffer, components) = {
             let mut numerical = self.numerical.borrow_mut(py);
             numerical.forward_stats = ForwardStats::default();
@@ -451,17 +451,12 @@ pub(crate) struct Executor {
 impl Executor {
     #[new]
     fn new(py: Python<'_>, worker: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let runner = py
-            .import("uniserve_worker.execution.batch_runner")?
-            .getattr("BatchRunner")?
-            .call1((worker,))?;
         let capacity = worker.getattr("info")?.getattr("queue_depth")?.extract()?;
         let distributed = worker
             .getattr("worker_config")?
             .getattr("world_size")?
             .extract::<usize>()?
             > 1;
-        let collective = runner.getattr("collective")?.extract()?;
         let cache = worker.getattr("kv_cache")?;
         let (cache_manager, cache_imports) = if cache.is_none() {
             (None, None)
@@ -498,6 +493,22 @@ impl Executor {
 
         let info: WorkerInfo = depythonize(&worker.getattr("info")?.call_method0("to_mapping")?)?;
         let model_runner = worker.getattr("runner")?;
+        let mut collective = false;
+        for binding in model_runner
+            .getattr("bindings")?
+            .call_method0("values")?
+            .try_iter()?
+        {
+            let binding = binding?;
+            if binding.getattr("owns")?.extract::<bool>()? {
+                for group in binding.getattr("communicators")?.try_iter()? {
+                    collective |= group?.getattr("size")?.extract::<usize>()? > 1;
+                }
+            }
+        }
+        let sampling_group = worker.getattr("sampling_group")?;
+        collective |=
+            !sampling_group.is_none() && sampling_group.getattr("size")?.extract::<usize>()? > 1;
         let images = !model_runner.getattr("image_builder")?.is_none();
         let videos = !model_runner.getattr("video_postprocessor")?.is_none();
         let forward_calls = info
@@ -514,7 +525,6 @@ impl Executor {
 
         let backend = PythonBackend {
             worker: worker.clone().unbind(),
-            runner: runner.unbind(),
             read_backpressure: py
                 .import("uniserve_worker.transport.pool")?
                 .getattr("ReadBackpressureError")?
@@ -656,7 +666,6 @@ impl Executor {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(executor) = &self.executor {
             visit.call(&executor.backend().worker)?;
-            visit.call(&executor.backend().runner)?;
             visit.call(&executor.backend().read_backpressure)?;
             visit.call(&executor.backend().requests)?;
             visit.call(&executor.backend().tensors)?;
