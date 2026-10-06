@@ -423,7 +423,7 @@ def latent_pool_capacity_bytes(
 ) -> int:
     """Calculate double-buffered latent pool storage.
 
-    Covers latent pages, step storage when the pool stages steps, page
+    Covers latent pages, step storage when the pool prepares steps, page
     tables, and timestep metadata. The result must equal the
     ``persistent_bytes`` of the ``LatentPool`` built from the same
     arguments: ``Worker.__init__`` refuses a pool whose allocation disagrees
@@ -462,9 +462,9 @@ class LatentPoolPlan:
     A worker advertises this geometry, budgets its bytes and allocates exactly
     it. A KV-conditioned image denoiser's trajectories take pages of
     ``block_size`` latent tokens that the scheduler allocates, and the pool
-    stages each step. A standalone denoiser's unit is one sample element:
+    prepares each step. A standalone denoiser's unit is one sample element:
     every request slot owns the same run of consecutive pages after the
-    sentinel page, and the denoiser's runners stage their own steps.
+    sentinel page, and the denoiser's runners prepare their own steps.
     """
 
     request_pool_size: int
@@ -1049,7 +1049,7 @@ def resolve_request_capacity(
 def graph_table_widths(
     model: nn.Module, worker_config: WorkerConfig, pool: KVCacheManager | None
 ) -> tuple[int, ...]:
-    """Return the column width every captured graph stages per block table.
+    """Return the column width every captured graph reads per block table.
 
     A full-attention table spans the longest sequence, capped at the pages
     its group can draw from the pool; a sliding-window table spans the pages

@@ -1,17 +1,17 @@
 """Gather attention columns for multi-token request rows on device.
 
-One Triton launch fills, for every numerical block table, the staged units,
-first staged pages and per-token cache write addresses of a call's rows from
+One Triton launch fills, for every numerical block table, the gathered units,
+first selected pages and per-token cache write addresses of a call's rows from
 the request slots' resident tables (``BlockTables``), together with the
 call's shared query and prefix lengths and offsets. It extends the decode
 gather of ``_decode_inputs`` to rows of any length, prefill chunks, canvas
 readouts and canvas steps alike, the way vLLM derives its slot mapping on
 the device from its block table, positions and query starts
 (``vllm/v1/worker/block_table.py``, ``compute_slot_mapping``). The host
-supplies only per-row scalars, each table's staged page count per row and
+supplies only per-row scalars, each table's selected page count per row and
 each token's row.
 
-``AttentionBuffers.stage_rows`` in ``uniserve_worker.model_executor.
+``AttentionBuffers.gather_rows`` in ``uniserve_worker.model_executor.
 input_buffers`` builds the host columns and the attention batch around it.
 """
 
@@ -29,12 +29,12 @@ except Exception:
 
 # Sections of the int64 host column array, each ``row_stride`` long: slot,
 # prefix, query, writes, query offsets and prefix offsets (``rows + 1``
-# entries each), then one section of staged page counts per table, then
+# entries each), then one section of selected page counts per table, then
 # each token's row.
 ROW_SECTIONS = 6
 
 if triton is not None:
-    # Row, token, cell counts and the staged width change every call;
+    # Row, token, cell counts and the output width change every call;
     # keeping them as unspecialized runtime values means a new count loads
     # no other kernel variant.
     @triton.jit(do_not_specialize=["rows", "tokens", "cell_programs", "width"])
@@ -67,10 +67,10 @@ if triton is not None:
         row_block: tl.constexpr,
         block: tl.constexpr,
     ):
-        """Stage one table's rows, cells or tokens, by program.
+        """Gather one table's rows, cells or tokens, by program.
 
         Axis 1 selects the numerical table. Program 0 writes the table's
-        first staged pages and, on table 0, the shared lengths and offsets;
+        first selected pages and, on table 0, the shared lengths and offsets;
         programs ``1..cell_programs`` copy ``block`` table cells each; the
         rest write ``block`` tokens' cache addresses each. Every program
         reads only the host columns and the resident request tables, and
@@ -96,7 +96,7 @@ if triton is not None:
             offsets = tl.arange(0, row_block)
             row_live = offsets < rows
             row_prefix = tl.load(prefixes_ptr + offsets, mask=row_live, other=0)
-            # A windowed table stages from the first page the row's first
+            # A windowed table selects from the first page the row's first
             # query reaches back to; a full table from page zero.
             row_first = tl.where(
                 window >= 0,
@@ -144,12 +144,12 @@ if triton is not None:
                 0,
             )
             # Row ``slot`` of the resident table holds the units of pages
-            # ``installed..``; cells past the row's staged pages are zero.
+            # ``installed..``; cells past the row's selected pages are zero.
             source = first - installed + cell
-            staged = live & (cell < pages)
+            selected = live & (cell < pages)
             values = tl.load(
                 units + slot * unit_row_stride + source,
-                mask=staged & (source >= 0) & (source < request_width),
+                mask=selected & (source >= 0) & (source < request_width),
                 other=0,
             )
             tl.store(
@@ -217,17 +217,17 @@ def gather_request_rows(
     prefix_offsets: torch.Tensor,
     write_indices: torch.Tensor,
 ) -> None:
-    """Stage every table's columns of ``rows`` request rows.
+    """Gather every table's columns of ``rows`` request rows.
 
     ``columns`` is the device copy of the host column array (sections of
     ``row_columns_stride`` elements, see ``ROW_SECTIONS``): per row its
     request slot, prefix length,
     query length and whether it writes the cache; the exclusive query and
-    prefix offsets (``rows + 1`` each); each table's staged page count per
+    prefix offsets (``rows + 1`` each); each table's selected page count per
     row; and each of the ``tokens`` tokens' row. For table ``t``, described
     by ``table_shapes[t] = (group, page_tokens, window or -1)``, the launch
     writes rows ``0..rows`` of ``block_tables[t]`` (``width`` cells, zero
-    past a row's staged pages) from the first page each row stages (page
+    past a row's selected pages) from the first page each row selects (page
     zero, or for a windowed table ``max(0, prefix - window) //
     page_tokens``) into ``start_pages[t]``, and each token's append address
     into ``write_indices[t]`` (-1 for rows that do not write); and, shared by
@@ -238,7 +238,7 @@ def gather_request_rows(
     Every tensor must reside on one device with unit innermost stride; the
     caller validates the rows against the installed tables
     (``attention.row_tables``). On a device where Triton launches, one
-    kernel stages every table; elsewhere equivalent tensor operations do.
+    kernel gathers every table; elsewhere equivalent tensor operations do.
 
     Raises:
         ValueError: When the tensors are not on one device or the counts are
@@ -341,7 +341,7 @@ def _gather_rows(
     width,
     stride,
 ):
-    """Stage the kernel's outputs with tensor operations, table by table."""
+    """Compute the kernel's outputs with tensor operations, table by table."""
     tables = int(request_unit_tables.shape[0])
     request_width = int(request_unit_tables.shape[2])
     slots = columns[:rows]
@@ -366,7 +366,7 @@ def _gather_rows(
         pages = columns[(ROW_SECTIONS + table) * stride :][:rows]
 
         source = (first - installed)[:, None] + cells[None]
-        staged = (
+        selected = (
             (cells[None] < pages[:, None])
             & (source >= 0)
             & (source < request_width)
@@ -375,7 +375,7 @@ def _gather_rows(
             table, slots[:, None], source.clamp(0, request_width - 1)
         ]
         block_tables[table, :rows, :width] = torch.where(
-            staged, units, torch.zeros_like(units)
+            selected, units, torch.zeros_like(units)
         )
 
         column = position // page_tokens - installed[owner]

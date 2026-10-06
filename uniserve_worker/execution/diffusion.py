@@ -337,7 +337,7 @@ def prepare_step(
     torch.Tensor,
     tuple[tuple[Branch, TokenRow], ...],
 ]:
-    """Stage one solver step's time and resolve each branch's KV prefix.
+    """Fill one solver step's time and resolve each branch's KV prefix.
 
     Prefix tokens are resolved once per branch source and retained in
     ``KVConditioning.prefixes``; each branch's ``(slot, group, materialized
@@ -352,7 +352,7 @@ def prepare_step(
 
     Raises:
         IndexError: ``step_index`` is outside the image schedule.
-        WorkerError: For example when image parameters, staged latents,
+        WorkerError: For example when image parameters, input latents,
             guidance or forward-row metadata are missing, or a prefix exceeds
             its slot's capacity or disagrees with its materialized extent.
     """
@@ -372,7 +372,7 @@ def prepare_step(
     if not 0 <= step_index < schedule.num_steps:
         raise IndexError(step_index)
     times = schedule.timesteps
-    t = latent_pool.stage_timestep(
+    t = latent_pool.fill_timestep(
         row.request.request_pool_idx, float(times[step_index])
     )
 

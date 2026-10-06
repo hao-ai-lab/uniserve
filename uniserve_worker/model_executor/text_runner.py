@@ -1,6 +1,6 @@
 """Worker output selection around the public causal language-model capability.
 
-``TextRunner`` evaluates a ``CausalLM`` backbone once per staged call and
+``TextRunner`` evaluates a ``CausalLM`` backbone once per batch and
 returns, per row, final-token logits, all-token logits or hidden states, or
 an empty value for a row that selects ``TokenSelection.CACHE``. A call whose
 rows all select ``CACHE`` only writes the K/V cache (``CausalLM.fill_cache``).
@@ -40,9 +40,9 @@ from .model_runner import ModelRunner, joining_experts
 
 
 def _host_indices(ranges, device):
-    """Stage the token rows of ``ranges`` as one int64 index vector.
+    """Copy the token rows of ``ranges`` as one int64 index vector.
 
-    The rows are known on the host from staged lengths, so one host-to-device
+    The rows are known on the host from host lengths, so one host-to-device
     copy replaces a device operation per row.
     """
     values = [index for span in ranges for index in span]
@@ -290,7 +290,7 @@ class TextRunner(ModelRunner):
                 selection is TokenSelection.LAST_LOGITS and stop > start
                 for start, stop, selection in rows
             ):
-                # Every row's final token, from the staged device offsets.
+                # Every row's final token, from the input device offsets.
                 indices = queries.offsets[1 : len(rows) + 1] - 1
             else:
                 indices = _host_indices(

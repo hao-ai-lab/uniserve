@@ -2,10 +2,9 @@
 
 ``ModelRunner`` is the base of the per-capability runners that
 ``runner_type`` selects (text, canvas, diffusion, encoder, decoder). The base
-runner
-serves two call paths:
+runner serves two call paths:
 
-- Staged batches: ``prepare_inputs`` stages rows into the runner's
+- Batched calls: ``prepare_inputs`` copies rows into the runner's
   ``InputBuffers``, and ``run_batch`` replays a graph bucket selected by
   ``select_graph_shape`` or runs eagerly. Buckets are captured during startup
   through ``capture_batch``; once ``ModelExecutor.complete_startup`` seals
@@ -320,7 +319,7 @@ class ModelRunner(Execution, ABC):
 
     @torch.inference_mode()
     def eager_batch(self, batch, forward):
-        """Run a staged batch eagerly inside its entry's execution context.
+        """Run a prepared batch eagerly inside its entry's execution context.
 
         Outside an open expert step (a startup call), an expert-parallel
         runner opens one at the exchange's largest capacity: every rank of
@@ -346,7 +345,7 @@ class ModelRunner(Execution, ABC):
 
     @torch.inference_mode()
     def capture_batch(self, batch, forward):
-        """Capture a staged batch's graph on the entry stream, fenced.
+        """Capture a prepared batch's graph on the entry stream, fenced.
 
         The lane stream waits for the caller's current stream first, and the
         caller's stream waits for the lane afterwards, also on failure. A
@@ -480,7 +479,7 @@ class ModelRunner(Execution, ABC):
             borrow=borrow,
         )
         # A decode bucket carries a force-finish column even for a batch
-        # staged without one (see ``TextRunner.select_graph_shape``), so its
+        # prepared without one (see ``TextRunner.select_graph_shape``), so its
         # graph can return greedy continuations that such a batch did not
         # request.
         if batch.decode_force_finish is None:
@@ -489,7 +488,7 @@ class ModelRunner(Execution, ABC):
 
     @torch.inference_mode()
     def run_batch(self, batch, forward, *, eligible, borrow_output=False):
-        """Replay a resident graph for a staged batch or run it eagerly.
+        """Replay a resident graph for a prepared batch or run it eagerly.
 
         With ``borrow_output``, a replayed result views the graph's output
         storage without a clone; the caller must finish reading it before
@@ -555,7 +554,7 @@ class ModelRunner(Execution, ABC):
                 continue
             if exchange.active:
                 return capacity
-            # Keep this capability's staged input intact while a peer's
+            # Keep this capability's input buffers intact while a peer's
             # different capability runs. The join uses only expert backing,
             # never this runner's attention, sampling or input buffers.
             with profile_range(
@@ -568,7 +567,7 @@ class ModelRunner(Execution, ABC):
 
     @torch.inference_mode()
     def run_microbatches(self, batches, *, eligible, borrow_output=False):
-        """Evaluate independently staged whole-row batches in one expert step.
+        """Evaluate independently prepared whole-row batches in one expert step.
 
         Every peer selects its own numerical graph. The transfer capacity
         holds the largest selected extent; an empty peer only participates
@@ -659,7 +658,7 @@ class ModelRunner(Execution, ABC):
         # Padding is reported in query tokens: the live batch's, and the token
         # slots its bucket adds (a text bucket's padding sequences, none for
         # an exact signature). Graph-eligible token and denoising batches
-        # always stage attention with host query lengths.
+        # always prepare attention with host query lengths.
         live_tokens = batch.query_tokens
         bucket_tokens = execution.query_tokens
         assert live_tokens is not None and bucket_tokens is not None

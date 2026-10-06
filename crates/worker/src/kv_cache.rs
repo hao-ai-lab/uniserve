@@ -115,7 +115,7 @@ impl<C> KVCacheManager<C> {
                 ));
             }
 
-            stage_base(transfer, &self.destination_bases, &mut destination_bases)?;
+            validate_next_base(transfer, &self.destination_bases, &mut destination_bases)?;
             resident.insert(*buffer, transfer);
         }
 
@@ -126,7 +126,7 @@ impl<C> KVCacheManager<C> {
                 ));
             }
 
-            stage_base(transfer, &self.installed_bases, &mut installed_bases)?;
+            validate_next_base(transfer, &self.installed_bases, &mut installed_bases)?;
         }
         Ok(())
     }
@@ -202,17 +202,17 @@ fn validate_base(transfer: &KvTransfer, current: Option<(BufferId, u32)>) -> Res
     Ok(())
 }
 
-fn stage_base(
+fn validate_next_base(
     transfer: &KvTransfer,
     resident: &Destinations,
-    staged: &mut Destinations,
+    pending: &mut Destinations,
 ) -> Result<()> {
     let key = (transfer.source.owner, transfer.destination.clone());
     validate_base(
         transfer,
-        staged.get(&key).or_else(|| resident.get(&key)).copied(),
+        pending.get(&key).or_else(|| resident.get(&key)).copied(),
     )?;
-    staged.insert(key, (transfer.source, transfer.exported_extent));
+    pending.insert(key, (transfer.source, transfer.exported_extent));
     Ok(())
 }
 

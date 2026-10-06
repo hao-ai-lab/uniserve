@@ -1,4 +1,4 @@
-"""Stage numerical media inputs for the worker's admitted requests.
+"""Prepare numerical media inputs for the worker's admitted requests.
 
 ``MediaBuilder`` wraps a standalone ``VideoDenoiser`` for serving: it bounds
 admitted sizes, maps each size to the capacity layout whose prepared
@@ -114,7 +114,7 @@ class MediaBuilder:
     capacity layout that holds it (``layout``), so every request of one
     layout binds the same shapes and replays the same captured ladder, and no
     admitted size needs a layout of its own. What distinguishes the request
-    within its layout is state the builder stages with its samples.
+    within its layout is state the builder prepares with its samples.
 
     A request with conditions evaluates instead in a layout of its own: the
     smallest text capacity with the request's own condition region, which
@@ -477,7 +477,7 @@ class MediaBuilder:
 
         The denoiser's device tables, the complete CPU draws (the
         conditions' in one flat ``condition_noise`` field holding every
-        request of the layout), a CPU source for every state field to stage
+        request of the layout), a CPU source for every state field to copy
         from, samples included, and the retained conditioning over the
         layout's text and condition rows, zero past the prompt. The device
         samples live in the latent pool, not here.
@@ -552,7 +552,7 @@ class MediaBuilder:
         return tuple(views)
 
     @torch.inference_mode()
-    def stage_request(
+    def prepare_request(
         self,
         size,
         tensors: Mapping[str, torch.Tensor],

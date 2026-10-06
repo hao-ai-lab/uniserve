@@ -6,12 +6,12 @@ payload (``prepare_image``) or an already decoded RGB tensor
 (``prepare_tensor_image``) is resized to the model's canvas (a patch tower
 keeps the source size) and then to the selected tower's input size with the
 declared resampling, normalized, packed into patches in the declared layout
-for a ``PatchTransform`` tower, and staged on the target device. The input
+for a ``PatchTransform`` tower, and copied to the target device. The input
 rows for vision encoding and image decoding live here as well.
 
 An inline payload's host work (``prepare_host_image``: decoding, resizing,
 normalization, patch packing) touches no device, so it can run on a host
-thread, and ``stage_image`` then issues the asynchronous copies to the
+thread, and ``copy_image`` then issues the asynchronous copies to the
 device. ``prepare_image`` runs both steps in the caller's thread.
 """
 
@@ -176,7 +176,7 @@ def _grid_tensor(grid_shape: tuple[int, int], *, pin: bool) -> torch.Tensor:
 
 
 def _prepared_pixels(processor, transform, pixels, canvas, device):
-    """Pack a device-resident tower input and stage it on ``device``."""
+    """Pack a device-resident tower input and copy it to ``device``."""
     pixels, grid_shape = _packed_pixels(transform, pixels)
     grid = None
     if grid_shape is not None:
@@ -184,7 +184,7 @@ def _prepared_pixels(processor, transform, pixels, canvas, device):
             device, non_blocking=True
         )
     return PreparedImage(
-        _stage(pixels, processor, device), grid, grid_shape, *canvas
+        _copy_pixels(pixels, processor, device), grid, grid_shape, *canvas
     )
 
 
@@ -201,7 +201,7 @@ def prepare_host_image(
     ``input_images`` is the number of input images in the image's request;
     a patch tower whose images share a pixel budget bounds each by its share
     (see ``PatchTransform.pixel_bound``). With ``pin`` the pixels are copied
-    into page-locked memory, so ``stage_image`` can copy them to a CUDA
+    into page-locked memory, so ``copy_image`` can copy them to a CUDA
     device without synchronizing the host with the device.
 
     Touches no device and holds no worker state, so any host thread may run
@@ -255,7 +255,7 @@ def prepare_host_image(
     return HostImage(pixels, grid, grid_shape, *canvas)
 
 
-def stage_image(host: HostImage, device: torch.device) -> PreparedImage:
+def copy_image(host: HostImage, device: torch.device) -> PreparedImage:
     """Copy a host-prepared image to ``device`` on the current stream.
 
     The copies are asynchronous when the host tensors are page-locked. The
@@ -282,9 +282,9 @@ def prepare_image(
     device: torch.device,
     input_images: int,
 ) -> PreparedImage:
-    """Decode a request input image, apply the model's transforms and stage it.
+    """Decode and transform an input image, then copy it to the device.
 
-    Runs ``prepare_host_image`` and ``stage_image`` in the caller's thread;
+    Runs ``prepare_host_image`` and ``copy_image`` in the caller's thread;
     see ``prepare_host_image`` for ``input_images`` and the errors raised.
     """
     host = prepare_host_image(
@@ -294,7 +294,7 @@ def prepare_image(
         input_images=input_images,
         pin=device.type == "cuda",
     )
-    return stage_image(host, device)
+    return copy_image(host, device)
 
 
 def _resample_bytes(image: Image.Image, size: tuple[int, int]) -> torch.Tensor:
@@ -512,7 +512,7 @@ def _output_dtype(processor: ImageProcessor) -> torch.dtype | None:
     return dtype
 
 
-def _stage(
+def _copy_pixels(
     value: torch.Tensor, processor: ImageProcessor, device: torch.device
 ) -> torch.Tensor:
     """Copy preprocessed pixels to the requested dtype and device."""
@@ -524,11 +524,11 @@ def _stage(
 __all__ = [
     "HostImage",
     "PreparedImage",
+    "copy_image",
     "patch_grid_shape",
     "prepare_host_image",
     "prepare_image",
     "prepare_tensor_image",
-    "stage_image",
 ]
 
 

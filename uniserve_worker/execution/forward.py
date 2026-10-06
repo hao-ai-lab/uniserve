@@ -177,7 +177,7 @@ def forward_values(
             yielded by ``ModelExecutor.forward``.
         RuntimeError: When an output lacks statistics or request slot views.
     """
-    # A call's staged CUDA device must be one the batch's output buffer
+    # A call's CUDA input device must be one the batch's output buffer
     # declares; ``register_device`` also fails once the buffer is sealed.
     for row, _call in inputs:
         state.output_buffer.register_device(model_runner.call_devices(_call)[1])
@@ -759,7 +759,7 @@ def integrate_predictions(
     """Apply one mathematical solver step to each denoising prediction.
 
     ``predictions`` holds one denoiser output per guidance branch, in the
-    branch order ``prepare_diffusion_step`` staged. The solver integrates them
+    branch order ``prepare_diffusion_step`` prepared. The solver integrates them
     into the model-visible part of the latent view, preserving page padding.
     The native executor selects which trajectories finish after this step.
     """

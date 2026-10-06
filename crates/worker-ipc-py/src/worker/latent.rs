@@ -723,7 +723,7 @@ impl LatentPool {
         .unbind())
     }
 
-    fn stage_timestep(
+    fn fill_timestep(
         &self,
         py: Python<'_>,
         request_pool_idx: i64,

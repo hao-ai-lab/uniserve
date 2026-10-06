@@ -3,11 +3,11 @@
 //! [`Inflight`] owns everything between planning a call and applying its
 //! result: batches awaiting submission, submitted batches awaiting their
 //! results and command receipts, each request's queue of submitted calls,
-//! completions staged until their call may apply, deferred terminal events,
+//! completions queued until their call may apply, deferred terminal events,
 //! lifecycle commands awaiting a batch, and the transfer reservation count.
 //!
 //! Results arrive in executor order, but a request's calls apply in submission
-//! order: a staged completion is released only when its call is at the front
+//! order: a queued completion is released only when its call is at the front
 //! of the request's queue. The exception is an independent call, one with
 //! `InflightInput::Media` that does not advance state, which applies as soon
 //! as the producers of its tensor inputs have left the queue.
@@ -106,7 +106,7 @@ pub(super) struct Inflight {
     pub(super) next_arrival_seq: u64,
     /// Submitted calls per request, in submission order.
     pub(super) pending_calls: HashMap<RequestId, VecDeque<InflightCall>>,
-    /// Results staged until `take_ready_completions` releases them.
+    /// Results queued until `take_ready_completions` releases them.
     pub(super) pending_completions: HashMap<RequestId, BTreeMap<CallId, PendingCompletion>>,
     /// Terminal events deferred until the request's calls have drained.
     pub(super) pending_finishes: HashMap<RequestId, PendingFinish>,
@@ -200,14 +200,14 @@ impl Inflight {
     /// Stateful calls retain request order. Pure media branches complete
     /// independently once their actual input producers have resolved.
     ///
-    /// Removes and returns the staged completions that may apply now, ordered
+    /// Removes and returns the queued completions that may apply now, ordered
     /// by `completion_priority` and then arrival. A call is ready when it is at
     /// the front of its request's queue, or when it is independent (an
     /// `InflightInput::Media` call that does not advance state) and none of its
     /// tensor inputs is produced by a call still queued. Applying a released
     /// completion can make the next one ready, so the caller repeats until
     /// nothing is returned. Completions of a request with no queued call stay
-    /// staged.
+    /// queued.
     pub(super) fn take_ready_completions(&mut self) -> Vec<PendingCompletion> {
         let mut ready = Vec::new();
         for (id, pending) in &self.pending_completions {
@@ -343,7 +343,7 @@ impl Inflight {
 
     /// Drops every submitted call after an unrecoverable execution failure.
     ///
-    /// Clears the per-request call queues, staged completions, registered
+    /// Clears the per-request call queues, queued completions, registered
     /// batches, and transfer reservations. Returns the ids of requests that
     /// owned a submitted call and the recorded commands of every dropped
     /// batch. `pending_submissions`, `pending_finishes`, and `pending_commands`

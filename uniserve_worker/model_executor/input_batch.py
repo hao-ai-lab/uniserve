@@ -2,7 +2,7 @@
 
 Execution code describes each request's contribution to a call as a row
 (``InputRow`` and its subclasses here, in ``diffusion_inputs`` and in
-``image_inputs``). Runners stage a homogeneous group of rows into their
+``image_inputs``). Runners pack a homogeneous group of rows into their
 fixed backing and evaluate the resulting ``InputBatch``.
 """
 
@@ -203,7 +203,7 @@ class CanvasRow(AttentionRow):
 
 @dataclass(frozen=True, slots=True)
 class ReadoutInput:
-    """Staged canvases of one token-denoising call and their candidate reads.
+    """Input canvases of one token-denoising call and their candidate reads.
 
     ``canvas`` packs every ``CanvasRow`` back to back. ``slot_tokens`` is
     int64 ``[slots]``: each slot's index into the packed canvas tokens, in
@@ -277,12 +277,12 @@ class CanvasStepRow(AttentionRow):
 
 @dataclass(frozen=True, slots=True)
 class CanvasStepInput:
-    """Staged canvas steps of one numerical call.
+    """Prepared canvas steps of one numerical call.
 
     ``canvas`` packs every row's resident canvas back to back, with its
     self-conditioning embeddings. ``state`` is the rows' gathered sampler
     state, whose canvas and self-conditioning rows ``canvas`` reads, and
-    ``views`` the same staged tensors by ``CanvasSlots`` field. ``slots``
+    ``views`` the same input tensors by ``CanvasSlots`` field. ``slots``
     holds the rows' request slots as a device int64 ``[rows]`` vector,
     through which the stepped state returns to its slots, and ``sampling``
     each row's sampler constants. ``first`` is whether every row starts its

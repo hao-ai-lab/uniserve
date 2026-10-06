@@ -290,17 +290,17 @@ def prepare_call(
     return {}, None
 
 
-def _stage_placeholder(builder, size, views, samples, diffusion, layout):
+def _prepare_placeholder(builder, size, views, samples, diffusion, layout):
     """Fill a slot and samples with a request's inputs for startup calls.
 
     Warmup and capture run the numerical calls a request of ``size`` runs in
     ``layout``, with a fixed seed and no prompt. Their results are
-    discarded, and the first real request stages its own draw, tables and
+    discarded, and the first real request prepares its own draw, tables and
     conditioning.
     """
     entry = diffusion.layout(layout)
-    builder.stage_request(size, views, seed=0, layout=layout)
-    staged = builder.initialize(
+    builder.prepare_request(size, views, seed=0, layout=layout)
+    copies = builder.initialize(
         size,
         views,
         samples,
@@ -309,7 +309,7 @@ def _stage_placeholder(builder, size, views, samples, diffusion, layout):
         layout=layout,
     )
     with diffusion.context.activate():
-        for destination, source in staged:
+        for destination, source in copies:
             destination.copy_(source)
         views["text_condition"].zero_()
 
@@ -354,12 +354,12 @@ def prepare_denoising(
         diffusion = runner.diffusion
         schedules = open_state(runner, builder.maximum).schedules
 
-        def ladder(layout, *, staged):
+        def ladder(layout, *, initialize):
             # A placeholder request filling the layout's text capacity on
             # slot one. ``storage[0]`` is slot one's tensors; no request
             # owns a slot while this pass runs. Capture records the step
             # without evaluating it, so only the warm step needs the
-            # placeholder's inputs staged.
+            # placeholder's inputs initialized.
             size = builder.size(
                 layout.num_frames,
                 min(layout.num_text_tokens, builder.max_text_tokens),
@@ -369,8 +369,8 @@ def prepare_denoising(
             samples = builder.sample_views(
                 size, diffusion.samples, layout=layout
             )
-            if staged:
-                _stage_placeholder(
+            if initialize:
+                _prepare_placeholder(
                     builder, size, views, samples, diffusion, layout
                 )
             return diffusion.bind(
@@ -403,13 +403,13 @@ def prepare_denoising(
         maximum = builder.maximum_layout
         warm = layouts if maximum in layouts else (maximum, *layouts)
         for layout in warm:
-            diffusion.warmup(ladder(layout, staged=True))
+            diffusion.warmup(ladder(layout, initialize=True))
             runner.graph_storage.check()
         warmed = time.perf_counter()
         if diffusion.captures:
             # One graph per layout evaluates every solver step.
             for layout in layouts:
-                diffusion.capture(ladder(layout, staged=False))
+                diffusion.capture(ladder(layout, initialize=False))
                 runner.graph_storage.check()
         resident = sum(runner.graph_storage.pool_bytes().values())
         finished = time.perf_counter()
@@ -697,13 +697,13 @@ def video_state(runner: ModelExecutor, request: Request) -> DiffusionState:
 def begin_noise(
     runner: ModelExecutor, request: Request, request_pool: RequestPool
 ) -> None:
-    """Stage an admitted video request's host inputs off the service thread.
+    """Prepare an admitted video request's host inputs off the service thread.
 
     The seeded draw and the request's state tables depend only on the seed
     and the admitted size, so they are prepared on the rank's noise thread
     while the service thread launches other device work, this request's text
     encoding or another request's denoising steps, and latent preparation
-    waits for them. A rank that does not denoise stages none.
+    waits for them. A rank that does not denoise prepares no host inputs.
     """
     media = request.admission.diffusion
     if media is None or runner.noise_draws is None or not runner.state_buffers:
@@ -715,7 +715,7 @@ def begin_noise(
             request.request_pool_idx
         ).view(runner.media_builder.buffers(trajectory.size))
     slot.preparation = runner.noise_draws.reserve().submit(
-        runner.media_builder.stage_request,
+        runner.media_builder.prepare_request,
         trajectory.size,
         slot.tensors["denoising"],
         seed=media.seed,
@@ -802,11 +802,11 @@ def execute(
         conditioning = reads[0]
 
         # Without a preparation task from ``begin_noise``, the seeded draw and
-        # the request's tables are staged here on the service thread.
+        # the request's tables are prepared here on the service thread.
         encoded = conditioning.tensor
         preparation = slot_ladder(trajectory).preparation
         if preparation is None:
-            builder.stage_request(numerical_shape, slot, seed=media.seed)
+            builder.prepare_request(numerical_shape, slot, seed=media.seed)
         else:
             preparation.result()
 

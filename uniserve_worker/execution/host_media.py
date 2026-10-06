@@ -267,8 +267,8 @@ def execute(
     """Schedule one host media call on the rank's lane.
 
     Configures the call's reserved ``HostTask`` slots (one per encoded unit
-    position for a video encode, one otherwise) and stages them on the
-    returned ``PendingOutput`` as ``host_tasks``. A video encode also stages
+    position for a video encode, one otherwise) and retains them on the
+    returned ``PendingOutput`` as ``host_tasks``. A video encode also retains
     ``host.finish``, which frames and publishes the encoded rows once every
     encode has completed. Audio encodes and unit appends leave their results
     in the request's mux session; the task of the final mux call, which

@@ -1,6 +1,6 @@
 """Canvas passes around the public token-denoiser capability.
 
-``CanvasRunner`` evaluates a ``TokenDenoiser`` once over staged canvas rows.
+``CanvasRunner`` evaluates a ``TokenDenoiser`` once over a batch of canvas rows.
 A readout reads the log-probabilities of each answer slot's candidate tokens:
 the vocabulary head projects only the slot rows, so no full-canvas logits are
 materialized. With pipeline parallelism the last stage computes the readout
@@ -72,8 +72,8 @@ from uniserve_worker.storage.canvas_slots import (
 
 from .cuda_graph import CUDAGraphRunner, GraphBucket
 from .graph_inputs import (
+    _copy_offsets,
     _fixed_view,
-    _stage_offsets,
     capture_hidden,
     replay_hidden,
 )
@@ -129,9 +129,9 @@ class CanvasRunner(ModelRunner):
 
     @property
     def max_canvases(self) -> int:
-        """The most canvases one call stages.
+        """The most canvases one call holds.
 
-        With graph pools a readout bucket stages up to twice its canvases
+        With graph pools a readout bucket holds up to twice its canvases
         as sequences, so the input buffers hold twice the canvases (see
         ``canvas_buffer_rows``). The scheduler reuses cached prompt pages
         only up to a whole page before a prompt's last token, which the
@@ -248,7 +248,7 @@ class CanvasRunner(ModelRunner):
             self.sampler_workspace = None
 
     def batch_forward(self, batch, *, padded=False):
-        """Denoise the staged canvases once and read or step them.
+        """Denoise the input canvases once and read or step them.
 
         For a readout, returns one FP32 ``[candidates]`` value per canvas
         row: the natural log-probability of each candidate under the
@@ -265,7 +265,7 @@ class CanvasRunner(ModelRunner):
         """Read the slots of ``inputs`` from the pass's ``attend`` state.
 
         ``state`` holds ``TokenDenoiser.attend``'s per-token state of at
-        least the staged canvas tokens, in the packed order
+        least the input canvas tokens, in the packed order
         ``inputs.slot_tokens`` indexes. The final layer's remainder, the
         output norm and the head evaluate the slot rows alone, gathered once
         for every slot of the call.
@@ -300,7 +300,7 @@ class CanvasRunner(ModelRunner):
         return ExecutionOutput(tuple(values.split(inputs.row_candidates)))
 
     def step(self, inputs: CanvasStepInput) -> tuple[torch.Tensor, ...]:
-        """Run one denoising step of every staged canvas.
+        """Run one denoising step of every input canvas.
 
         Rows at step zero start their canvas before the pass reads it. The
         head then projects the full canvases of at most
@@ -683,8 +683,8 @@ class CanvasRunner(ModelRunner):
                 )
             tail = bucket.graphs[None]
             rows = inputs.slot_tokens[start : start + live]
-            for value, staged in zip(state, tail.inputs.value[0], strict=True):
-                torch.index_select(value, 0, rows, out=staged[:live])
+            for value, buffer in zip(state, tail.inputs.value[0], strict=True):
+                torch.index_select(value, 0, rows, out=buffer[:live])
             normalized = tail.replay()
             parts.append(
                 normalized[:live].gather(
@@ -724,7 +724,7 @@ def _pad_attention(
     widths: tuple[int, ...],
     buffers,
 ):
-    """Append padding sequences to staged canvas attention in place.
+    """Append padding sequences to canvas attention inputs in place.
 
     ``padding`` holds the query tokens of each padding sequence, which reads
     no prefix, table unit zero from page zero and its whole own sequence;
@@ -748,7 +748,7 @@ def _pad_attention(
             torch.tensor(padding, dtype=values.dtype), non_blocking=True
         )
     offsets = _fixed_view(queries.offsets, (rows + 1,))
-    _stage_offsets(offsets, queries.host + padding)
+    _copy_offsets(offsets, queries.host + padding)
     shared = SequenceLengths(
         host=queries.host + padding, values=values, offsets=offsets
     )
@@ -763,7 +763,7 @@ def _pad_attention(
         torch.cumsum(prefix_values, dim=0, out=prefix_offsets[1:])
     else:
         host_prefixes = first.host + (0,) * extra
-        _stage_offsets(prefix_offsets, host_prefixes)
+        _copy_offsets(prefix_offsets, host_prefixes)
     prefixes = SequenceLengths(
         host=host_prefixes, values=prefix_values, offsets=prefix_offsets
     )
@@ -794,7 +794,7 @@ def _pad_attention(
 
 
 def _pad_rows(tensor: torch.Tensor, rows: int, live: int) -> torch.Tensor:
-    """Widen a row-major staged tensor to ``rows`` rows; padding is zero."""
+    """Widen a row-major input tensor to ``rows`` rows; padding is zero."""
     # A view with an empty row (a history of zero depth) holds no elements
     # whose backing could be widened; its widened form is empty as well.
     padded = (
@@ -809,7 +809,7 @@ def _pad_rows(tensor: torch.Tensor, rows: int, live: int) -> torch.Tensor:
 def canvas_buffer_rows(max_rows: int) -> int:
     """Input buffer rows required for at most ``max_rows`` canvases.
 
-    A readout graph of ``rows`` canvases stages up to ``2 * rows``
+    A readout graph of ``rows`` canvases holds up to ``2 * rows``
     sequences (``CanvasRunner.select_graph_shape``); the extra rows consume
     buffers, but no scheduler request slot.
     """
@@ -823,9 +823,9 @@ def _pad_readout(
     widths: tuple[int, ...],
     buffers,
 ) -> InputBatch:
-    """The canvas pass of a readout call as the ``rows`` bucket stages it.
+    """The canvas pass of a readout call as the ``rows`` bucket represents it.
 
-    The bucket stages ``rows * length`` tokens in ``2 * rows`` sequences
+    The bucket holds ``rows * length`` tokens in ``2 * rows`` sequences
     of at most ``length`` tokens: the live canvases, padding sequences of
     ``length`` tokens that make up what the live canvases leave (the last
     shorter when they are shorter than the model's), then empty ones.

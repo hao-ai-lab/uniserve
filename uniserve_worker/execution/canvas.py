@@ -6,7 +6,7 @@ to back in ``input_token_ids`` and the canvas tokens whose logits it reads
 forward row of the call: its prefix is the request's visible KV and its
 query is the canvas. ``prepare_rows`` turns the call into one ``CanvasRow``
 per canvas, and ``publish`` captures the rows' candidate log-probabilities
-into the batch's output buffer and stages the call's outcome.
+into the batch's output buffer and records the call's outcome.
 
 A generating call (``Call.canvas``) runs one denoising step of the canvas
 its request keeps in its slot; ``prepare_step`` turns it into one
@@ -141,7 +141,7 @@ def capture_readout(
     state: BatchState,
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Capture a call's candidate log-probabilities and stage its outcome.
+    """Capture a call's candidate log-probabilities and record its outcome.
 
     ``values`` holds each canvas row's FP32 log-probabilities in row order.
     Their FP32 bit patterns are captured as sign-extended int64 words, which
@@ -256,7 +256,7 @@ def publish_steps(
     request_tables: BlockTables | None,
     tensor_store: TensorStore,
 ) -> None:
-    """Capture a batch's canvas step outcomes and tokens and stage them.
+    """Capture a batch's canvas step outcomes and tokens and record them.
 
     ``steps`` pairs each canvas step call of the batch with its row's int64
     ``[1 + canvas]`` vector (``CanvasRunner.step``): its outcome and its

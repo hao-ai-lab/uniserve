@@ -3,7 +3,7 @@
 Serves ``ImageDenoiser`` networks, whose image sequence attends to a cached
 token prefix chosen per guidance branch. ``ImageBuilder`` wraps the model's
 ``ImageDenoiser`` for the worker's execution code; ``DiffusionRow`` is the
-per-sequence input row the image path stages; ``resolve_prefix`` chooses the
+per-sequence input row the image path prepares; ``resolve_prefix`` chooses the
 token prefix each guidance branch conditions on.
 """
 

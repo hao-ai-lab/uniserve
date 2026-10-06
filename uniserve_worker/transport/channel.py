@@ -124,7 +124,7 @@ class ChannelTransport(Transport):
         self.capacity.acquire(nbytes)
         try:
             # One contiguous host buffer in physical tensor order. A device
-            # product is staged through it, which is the same crossing a host
+            # product is copied through it, which is the same crossing a host
             # product would make to reach any consumer off this device.
             packed = torch.empty(shape, dtype=first.dtype, device="cpu")
             for target, value in copy_pairs(source, packed):
