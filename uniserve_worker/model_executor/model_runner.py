@@ -44,7 +44,6 @@ from .cuda_graph import (
     input_signature,
 )
 from .graph_inputs import (
-    PrefillShape,
     capture_batch,
     replay_batch,
     widen_prefix,
@@ -101,7 +100,6 @@ class ModelRunner(Execution, ABC):
         *,
         storage,
         devices,
-        prefill_graph=True,
         exact_graphs=False,
         cache=None,
         predicates=None,
@@ -114,14 +112,11 @@ class ModelRunner(Execution, ABC):
         self.call_kinds, self.cuda_stream = tuple(kinds), stream
         self.input_buffers = inputs
         self.graph_storage = storage
-        # Text runners replay prefill buckets only with ``prefill_graph``;
-        # other runners capture exact input signatures only with
-        # ``exact_graphs`` (see ``select_graph_shape``).
-        self.prefill_graph, self.exact_graphs = prefill_graph, exact_graphs
+        # Non-text runners capture exact numerical signatures only when
+        # enabled; text and canvas runners select configured graph buckets.
+        self.exact_graphs = exact_graphs
         self.cache, self.decode_predicates = cache, predicates
         self.rank = rank
-        self.decode_shapes: tuple[int, ...] = ()
-        self.prefill_shapes: tuple[PrefillShape, ...] = ()
         # Graph widths of every numerical block table; see
         # ``bootstrap.capacity.graph_table_widths``.
         self.table_widths: tuple[int, ...] = ()
@@ -163,11 +158,7 @@ class ModelRunner(Execution, ABC):
 
     def capture_plan(self):
         """Numerical captures whose startup collectives must pair on peers."""
-        return (
-            tuple(sorted(self.call_kinds)),
-            self.decode_shapes,
-            self.prefill_shapes,
-        )
+        return tuple(sorted(self.call_kinds))
 
     def select_graph_shape(self, batch, *, eligible):
         """Use the exact numerical signature for non-text graph variants.

@@ -17,10 +17,10 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from itertools import accumulate
+from typing import cast
 
 import torch
 
-from uniserve.math import ceil_div
 from uniserve.model import EmbeddingReplacement, TextInput
 from uniserve.nn.attention import (
     AttentionBatch,
@@ -33,6 +33,12 @@ from uniserve.runtime import PrefixCache
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.sampling import greedy
 from uniserve.tensors import adjacent_view
+from uniserve_worker._uniserve_ipc import PrefillShape as PrefillShape
+from uniserve_worker._uniserve_ipc import TextShapes
+from uniserve_worker._uniserve_ipc import prefill_units as prefill_units
+from uniserve_worker._uniserve_ipc import (
+    select_prefill_captures as select_prefill_captures,
+)
 from uniserve_worker.model_executor.cuda_graph import CUDAGraphRunner
 from uniserve_worker.model_executor.input_batch import InputBatch
 from uniserve_worker.model_executor.output import ExecutionOutput
@@ -57,40 +63,6 @@ class DiffusionShape:
     height: int
     width: int
     cfg_branches: int
-
-
-@dataclass(frozen=True, slots=True)
-class PrefillShape:
-    """A prefill capture bucket.
-
-    A prefill graph computes the backbone's hidden states of every token, so
-    one bucket serves rows with any output selection; the runner selects
-    logits or hidden rows after the replay.
-
-    Attributes:
-        token_bucket: Flat token count the bucket pads to.
-        row_bucket: Row count the bucket pads to, including one padding
-            sequence: ``text_shape`` only selects a bucket with more rows than
-            the batch.
-        live_rows: Least row count of the startup capture batch in
-            ``uniserve_worker.model_executor.startup.prepare_prefill``;
-            ``select_prefill_captures`` sets it to the next smaller
-            configured row size, one for the smallest.
-        causal: Attention causality of every row, or None for device flags.
-        embeddings: Whether the call replaces token embeddings with supplied
-            values, as image feature rows and every prefill of a lane with an
-            image builder do.
-        outputs: Whether the graph evaluates the backbone's hidden states,
-            from which rows select their outputs, or only writes the K/V
-            cache, for calls whose rows all select ``TokenSelection.CACHE``.
-    """
-
-    token_bucket: int
-    row_bucket: int
-    live_rows: int
-    causal: bool | None = True
-    embeddings: bool = False
-    outputs: bool = True
 
 
 def select_flow_captures(
@@ -124,85 +96,6 @@ def select_flow_captures(
         and image_tokens(height, width) <= per_image_capacity
         and rows * image_tokens(height, width) <= latent_capacity
     )
-
-
-def prefill_units(pages, rows, tokens):
-    """Return the fewest pool units a prefill of ``rows`` rows holds.
-
-    ``pages`` holds ``(page_tokens, units_per_page)`` of every cache group.
-    A prefill row writes its query tokens into pages of its own in every
-    group, so a call of ``rows`` rows and ``tokens`` query tokens holds at
-    least ``max(rows, ceil(tokens / page_tokens))`` pages of each group,
-    whatever its row lengths and prefixes. ``capture_lengths`` in
-    ``startup`` prepares rows that hold exactly this many.
-    """
-    return sum(
-        units * max(rows, ceil_div(tokens, page)) for page, units in pages
-    )
-
-
-def select_prefill_captures(
-    token_sizes,
-    row_sizes,
-    *,
-    max_rows,
-    max_tokens,
-    variants,
-    outputs=True,
-    pool=None,
-):
-    """Build prefill capture buckets from configured token and row sizes.
-
-    Token buckets are the configured sizes up to ``max_tokens`` and
-    ``max_tokens`` itself, the most tokens one buffered call holds, so every
-    call the buffers hold fits a bucket. ``text_shape`` routes a batch
-    only to a row bucket strictly larger than its row count, leaving room
-    for the padding sequence, so row sizes of one are dropped and each
-    bucket's ``live_rows`` is the next smaller configured row size (one for
-    the smallest). Buckets are built while their ``live_rows`` fits
-    ``max_rows``; a bucket's own row count is the configured size and may
-    exceed ``max_rows``, since a full batch still needs a strictly larger
-    bucket. Every shape is captured once per ``(causal, embeddings)`` pair
-    of ``variants``, evaluating hidden states with ``outputs`` and only the
-    K/V cache without.
-
-    ``pool`` is ``(pages, units)``: the ``prefill_units`` pages of every
-    cache group and the unit pool's allocatable units, or None before the
-    pool is sized. A bucket serves batches of at least its ``live_rows``
-    rows and more tokens than the next smaller token bucket of its row
-    count; a bucket for which even the smallest such batch holds more units
-    than the pool is left out, since the engine never forms a batch it
-    serves. A row count's first token bucket serves batches of one token
-    per row, whose pages fit whenever ``live_rows`` rows fit, so the row
-    buckets, and the prefill row bound they report, are unchanged.
-    """
-    buckets: list[PrefillShape] = []
-    sizes = {int(value) for value in token_sizes if value <= max_tokens}
-    sizes.add(int(max_tokens))
-
-    minimum_rows = 1
-    for rows in sorted({int(value) for value in row_sizes if value > 1}):
-        if minimum_rows > max_rows:
-            break
-        minimum_tokens = minimum_rows if minimum_rows == 1 else minimum_rows + 1
-        # The fewest tokens of a batch the next bucket serves.
-        least = minimum_rows
-        for tokens in sorted(
-            value for value in sizes if value >= minimum_tokens
-        ):
-            if pool is not None:
-                pages, units = pool
-                if prefill_units(pages, minimum_rows, least) > units:
-                    break
-            buckets.extend(
-                PrefillShape(
-                    tokens, rows, minimum_rows, causal, embeddings, outputs
-                )
-                for causal, embeddings in variants
-            )
-            least = tokens + 1
-        minimum_rows = rows
-    return tuple(buckets)
 
 
 def decode_captures(config, *, max_rows, row_units, num_units):
@@ -320,57 +213,61 @@ def bind_attention(static, live):
     return AttentionBatch(entries, queries)
 
 
-def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
-    """Choose a bucket with the call's attention semantics.
+def text_shape(batch, *, shapes: TextShapes, table_widths):
+    """Pair native bucket selection with this input's numerical table widths.
 
-    Returns:
-        ``(rows, tokens, widths, decode)`` for ``pad_text``, where
-        ``widths[t]`` is the width to expose for numerical table ``t``: at
-        least its input width and its ``table_widths`` floor. A decode
-        batch (``ForwardMode.DECODE`` with one query token per row) uses the
-        first configured decode size at least its row count, with ``tokens ==
-        rows``, when its rows are causal and all select last logits. Any other
-        batch uses the smallest prefill shape, by rows then tokens, with the
-        batch's causality and embedding replacement, more rows than the
-        batch and at least its token count; its rows may select any outputs.
-        None when the input is not paged text over tables ``0..n-1``, rows
-        lack device flags for mixed causality, a row has no query token, or
-        no configured shape of the batch's kind fits; a decode batch never
-        uses a prefill shape.
-
-    Raises:
-        ValueError: If the attention input has no host query lengths.
+    Returns ``(padding_shape, outputs)`` or None for eager prefill. Native
+    selection matches causality, embedding replacement and output kind; the
+    tensor backend supplies paged attention and exact host query lengths.
+    No device tensor is read back to choose a graph.
     """
     inputs = batch.inputs
     if not isinstance(inputs, TextInput) or not all(
         isinstance(entry, PagedInput)
         for entry in inputs.attention.entries.values()
     ):
-        return None
+        raise CUDAGraphError("text graphs require paged text inputs")
     if set(inputs.attention.entries) != set(
         range(len(inputs.attention.entries))
     ):
-        return None
+        raise CUDAGraphError("text graph tables must use contiguous indices")
 
-    # Tables share the query domain and causality; they differ only in their
-    # pages.
     entries = tuple(
-        inputs.attention.entries[table]
+        cast(PagedInput, inputs.attention.entries[table])
         for table in range(len(inputs.attention.entries))
     )
     attention = entries[0]
     causal = (
         None if attention.causal_values is not None else attention.causal[0]
     )
-    if causal is not None:
-        if any(value != causal for entry in entries for value in entry.causal):
-            return None
+    if causal is not None and any(
+        value != causal for entry in entries for value in entry.causal
+    ):
+        raise CUDAGraphError(
+            "no prefill graph for mixed causality without device flags"
+        )
     queries = attention.queries.host
     if queries is None:
         raise ValueError("graph shape selection requires host query lengths")
-    if any(length < 1 for length in queries):
+
+    selected = shapes.select(
+        queries,
+        inputs.input_ids.numel(),
+        decode=batch.forward_mode is ForwardMode.DECODE,
+        causal=causal,
+        embeddings=inputs.embeddings is not None,
+        last_logits=all(
+            value is TokenSelection.LAST_LOGITS
+            for value in batch.token_selections
+        ),
+        cache_only=all(
+            value is TokenSelection.CACHE for value in batch.token_selections
+        ),
+    )
+    if selected is None:
         return None
 
+    rows, tokens, decode, outputs = selected
     widths = tuple(
         max(
             table_widths[table] if table < len(table_widths) else 1,
@@ -378,34 +275,7 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
         )
         for table, entry in enumerate(entries)
     )
-    if batch.forward_mode is ForwardMode.DECODE and all(
-        length == 1 for length in queries
-    ):
-        if not causal or any(
-            selection is not TokenSelection.LAST_LOGITS
-            for selection in batch.token_selections
-        ):
-            return None
-        rows = next(
-            (value for value in decode_sizes if value >= batch.row_count), None
-        )
-        return None if rows is None else (rows, rows, widths, True)
-
-    embeddings = inputs.embeddings is not None
-    shapes = tuple(
-        shape
-        for shape in prefill_shapes
-        if shape.causal == causal
-        and shape.embeddings == embeddings
-        and shape.row_bucket > batch.row_count
-        and shape.token_bucket >= inputs.input_ids.numel()
-    )
-    if not shapes:
-        return None
-    shape = min(
-        shapes, key=lambda value: (value.row_bucket, value.token_bucket)
-    )
-    return shape.row_bucket, shape.token_bucket, widths, False
+    return (rows, tokens, widths, decode), outputs
 
 
 def _fixed_view(tensor, shape):

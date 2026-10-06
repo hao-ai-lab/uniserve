@@ -13,6 +13,7 @@ mod executor;
 mod expert_exchange;
 mod exports;
 mod fetch;
+mod graph_shapes;
 mod graph_storage;
 mod host;
 mod host_buffers;
@@ -52,6 +53,13 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_class::<graph_storage::GraphStorage>()?;
+    module.add_class::<graph_shapes::PrefillShape>()?;
+    module.add_class::<graph_shapes::TextShapes>()?;
+    module.add_function(wrap_pyfunction!(graph_shapes::prefill_units, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        graph_shapes::select_prefill_captures,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(microbatches::yield_microbatch, module)?)?;
     module.add_class::<microbatches::Microbatches>()?;
     module.add_class::<weight_prefetch::WeightPrefetch>()?;

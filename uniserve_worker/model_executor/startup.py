@@ -47,6 +47,7 @@ from uniserve_worker.model_executor.input_buffers import (
 )
 from uniserve_worker.model_executor.model_runner import ModelRunner
 from uniserve_worker.model_executor.output import ExecutionOutput
+from uniserve_worker.model_executor.text_runner import TextRunner
 from uniserve_worker.protocol.call import ForwardMode, ImageParams, MediaCall
 from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.storage.block_tables import GroupTable
@@ -325,7 +326,7 @@ def prepare_prefill(
 
 def prepare_decode(
     runner: ModelExecutor,
-    entry: ModelRunner,
+    entry: TextRunner,
     buffers: TokenBuffers,
     forward: Callable[[InputBatch], ExecutionOutput],
 ) -> None:
@@ -338,7 +339,7 @@ def prepare_decode(
     Raises:
         ValueError: A bucket is prepared on a worker without a KV cache.
     """
-    row_counts = tuple(reversed(runner.decode_shapes[entry])) or (1,)
+    row_counts = tuple(reversed(entry.shapes.decode)) or (1,)
     for rows in row_counts:
         cache = runner.kv_cache
         if cache is None:

@@ -26,8 +26,8 @@ import torch
 
 from uniserve.model import TextInput, VocabShard
 from uniserve.runtime.cuda_graph import CUDAGraphError
+from uniserve_worker._uniserve_ipc import TextShapes
 from uniserve_worker.model_executor.output import ExecutionOutput
-from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.sampling.metadata import TokenSelection
 
 from .graph_inputs import (
@@ -59,6 +59,8 @@ class TextRunner(ModelRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.shapes = TextShapes((), ())
+
         # Hidden states of the latest prefill replay: [tokens, hidden] rows
         # every prefill graph writes, sized by the first (largest) capture.
         self._prefill_output: torch.Tensor | None = None
@@ -406,22 +408,12 @@ class TextRunner(ModelRunner):
         if not eligible or not self.pools:
             return None
 
-        decode = (
-            batch.forward_mode is ForwardMode.DECODE
-            and batch.inputs.attention.queries.host == (1,) * batch.row_count
+        selected = text_shape(
+            batch, shapes=self.shapes, table_widths=self.table_widths
         )
-        prefill_shapes = self._prefill_family(batch)
-        if not decode and not prefill_shapes:
+        if selected is None:
             return None
-
-        shape = text_shape(
-            batch,
-            decode_sizes=self.decode_shapes,
-            prefill_shapes=prefill_shapes,
-            table_widths=self.table_widths,
-        )
-        if shape is None:
-            raise CUDAGraphError(self._unserved(batch, decode=decode))
+        shape, outputs = selected
 
         if shape[-1]:
             if batch.decode_force_finish is None:
@@ -461,85 +453,12 @@ class TextRunner(ModelRunner):
             None
             if attention.causal_values is not None
             else attention.causal[0],
-            prefill_shapes[0].outputs,
+            outputs,
         )
         return key, padded, True
 
-    def _prefill_family(self, batch):
-        """The prefill buckets a batch may replay: one outputs kind.
-
-        A batch whose rows all select ``CACHE`` replays a cache-only bucket
-        when the runner has any; every other batch, one that evaluates
-        hidden states.
-        """
-        if not self.prefill_graph:
-            return ()
-        cache_only = all(
-            selection is TokenSelection.CACHE
-            for selection in batch.token_selections
-        )
-        family = tuple(
-            shape for shape in self.prefill_shapes if not shape.outputs
-        )
-        if not (cache_only and family):
-            family = tuple(
-                shape for shape in self.prefill_shapes if shape.outputs
-            )
-        return family
-
-    def _unserved(self, batch, *, decode):
-        """Describe a batch no captured bucket holds and the captured range."""
-        inputs = batch.inputs
-        if decode:
-            captured = (
-                f"its captured decode graphs hold up to "
-                f"{max(self.decode_shapes)} rows"
-                if self.decode_shapes
-                else "no decode graph is captured"
-            )
-            return (
-                f"{self.name} has no decode graph for a call of "
-                f"{batch.row_count} rows; {captured}"
-            )
-        causality = {
-            flag
-            for entry in inputs.attention.entries.values()
-            for flag in entry.causal
-        }
-        kind = (
-            "mixed-causality"
-            if len(causality) > 1
-            else "causal"
-            if True in causality
-            else "non-causal"
-        )
-        embeddings = inputs.embeddings is not None
-        dynamic = any(
-            entry.causal_values is not None
-            for entry in inputs.attention.entries.values()
-        )
-        shapes = tuple(
-            shape
-            for shape in self._prefill_family(batch)
-            if (
-                shape.causal is None if dynamic else causality == {shape.causal}
-            )
-            and shape.embeddings == embeddings
-        )
-        captured = (
-            "its captured prefill graphs hold up to "
-            f"{max(shape.row_bucket for shape in shapes) - 1} rows and "
-            f"{max(shape.token_bucket for shape in shapes)} tokens"
-            if shapes
-            else "no prefill graph of that kind is captured"
-        )
-        return (
-            f"{self.name} has no prefill graph for a {kind} "
-            f"{batch.forward_mode.value} call of {batch.row_count} rows and "
-            f"{inputs.input_ids.numel()} tokens"
-            + (" with embedding replacement" if embeddings else "")
-            + f"; {captured}"
-        )
+    def capture_plan(self):
+        return super().capture_plan(), self.shapes.decode, self.shapes.prefill
 
     def capture_graph(self, key, execution, forward):
         """Capture a prefill bucket's hidden states or its K/V cache writes.
