@@ -99,6 +99,8 @@ __all__ = [
     "Executor",
     "ExpertExchange",
     "GraphStorage",
+    "PrefillShape",
+    "TextShapes",
     "GroupShape",
     "GroupTable",
     "HostLane",
@@ -144,6 +146,8 @@ __all__ = [
     "service_name",
     "release_exports",
     "graph_storage_budget_bytes",
+    "prefill_units",
+    "select_prefill_captures",
     "yield_microbatch",
 ]
 
@@ -1591,6 +1595,69 @@ class GroupShape:
     def units_per_page(self) -> int: ...
     @property
     def window(self) -> int | None: ...
+
+@final
+class PrefillShape:
+    """A prefill capture's capacity, startup rows and attention semantics."""
+
+    def __new__(
+        cls,
+        token_bucket: int,
+        row_bucket: int,
+        live_rows: int,
+        causal: bool | None = True,
+        embeddings: bool = False,
+        outputs: bool = True,
+    ) -> Self: ...
+    @property
+    def token_bucket(self) -> int: ...
+    @property
+    def row_bucket(self) -> int: ...
+    @property
+    def live_rows(self) -> int: ...
+    @property
+    def causal(self) -> bool | None: ...
+    @property
+    def embeddings(self) -> bool: ...
+    @property
+    def outputs(self) -> bool: ...
+
+@final
+class TextShapes:
+    """Native decode/prefill bucket selection for one numerical runner."""
+
+    def __new__(
+        cls, decode: Sequence[int], prefill: Sequence[PrefillShape]
+    ) -> Self: ...
+    @property
+    def decode(self) -> tuple[int, ...]: ...
+    @property
+    def prefill(self) -> tuple[PrefillShape, ...]: ...
+    def select(
+        self,
+        queries: Sequence[int],
+        tokens: int,
+        *,
+        decode: bool,
+        causal: bool | None,
+        embeddings: bool,
+        last_logits: bool,
+        cache_only: bool,
+    ) -> tuple[int, int, bool, bool] | None: ...
+
+def prefill_units(
+    pages: Sequence[tuple[int, int]], rows: int, tokens: int
+) -> int: ...
+def select_prefill_captures(
+    token_sizes: Sequence[int],
+    row_sizes: Sequence[int],
+    *,
+    max_rows: int,
+    max_tokens: int,
+    variants: Sequence[tuple[bool | None, bool]],
+    outputs: bool = True,
+    pool: tuple[Sequence[tuple[int, int]], int] | None = None,
+) -> tuple[PrefillShape, ...]: ...
 
 @final
 class GroupTable:

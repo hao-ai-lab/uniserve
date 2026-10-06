@@ -72,6 +72,7 @@ from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import canonical_device, process_device_bytes
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout
+from uniserve_worker._uniserve_ipc import TextShapes
 from uniserve_worker.bootstrap.components import (
     VIDEO_CODEC_COMPONENT,
     bind_components,
@@ -140,6 +141,7 @@ from uniserve_worker.model_executor.resources import (
     media_state_buffers,
     output_layouts,
 )
+from uniserve_worker.model_executor.text_runner import TextRunner
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.call import (
     Call,
@@ -305,8 +307,6 @@ class ModelExecutor:
         self._preparation_stream: torch.cuda.Stream | None = None
 
         self.graph_storage = GraphStorage()
-        self.decode_shapes: dict[ModelRunner, tuple[int, ...]] = {}
-        self.prefill_shapes: dict[ModelRunner, tuple[PrefillShape, ...]] = {}
         self.flow_captures: tuple[DiffusionShape, ...] = ()
         self.flow_cfg_branches: tuple[int, ...] = ()
         self.table_widths: tuple[int, ...] = ()
@@ -1280,7 +1280,6 @@ class ModelExecutor:
             CanvasRunner,
             canvas_buffer_rows,
         )
-        from uniserve_worker.model_executor.text_runner import TextRunner
 
         if self.entries:
             raise RuntimeError("input execution resources are already bound")
@@ -1525,7 +1524,6 @@ class ModelExecutor:
                             context,
                             inputs,
                             storage=self.graph_storage,
-                            prefill_graph=config.prefill_cuda_graph,
                             exact_graphs=config.flow_cuda_graph,
                             cache=kv_cache.cache,
                             predicates=decode_predicates,
@@ -1571,12 +1569,8 @@ class ModelExecutor:
                     )
                 ] = entry
                 peers.append(entry)
-                self.decode_shapes[entry], self.prefill_shapes[entry] = (
-                    decode,
-                    prefill,
-                )
-
-                entry.decode_shapes, entry.prefill_shapes = decode, prefill
+                if isinstance(entry, TextRunner):
+                    entry.shapes = TextShapes(decode, prefill)
                 entry.table_widths = self.table_widths
                 if isinstance(entry, CanvasRunner):
                     entry.pool_rows = pool_rows
@@ -1899,16 +1893,22 @@ class ModelExecutor:
                 ):
                     # Without captured buckets, one causal token warms the
                     # entry eagerly.
-                    shapes = self.prefill_shapes[entry] or (
+                    text_entry = cast(TextRunner, entry)
+                    shapes = text_entry.shapes.prefill or (
                         PrefillShape(1, 1, 1),
                     )
                     prepare_prefill(
-                        self, entry, entry.input_buffers, forward, shapes
+                        self, text_entry, entry.input_buffers, forward, shapes
                     )
                 elif (
                     phase == "decode" and ForwardMode.DECODE in entry.call_kinds
                 ):
-                    prepare_decode(self, entry, entry.input_buffers, forward)
+                    prepare_decode(
+                        self,
+                        cast(TextRunner, entry),
+                        entry.input_buffers,
+                        forward,
+                    )
                 elif (
                     phase == "canvas"
                     and ForwardMode.TOKEN_DENOISING in entry.call_kinds
