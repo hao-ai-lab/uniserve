@@ -979,10 +979,6 @@ class TransportBuffer:
         grants: DescriptorGrants | None = None,
         export_id: str = "",
     ) -> TransportBuffer: ...
-    @property
-    def tensor(self) -> torch.Tensor | tuple[torch.Tensor, ...]: ...
-    @property
-    def event(self) -> CUDAEvent | None: ...
     def retire(self, events: EventPool) -> None:
         """Retire a failed export that was never registered."""
 
@@ -999,9 +995,6 @@ class BufferRegistry:
     @property
     def name(self) -> str: ...
     def register(self, locator: Locator, source: TransportBuffer) -> None: ...
-    def acquire(
-        self, locator: Locator, ticket: TransferTicket
-    ) -> TransportBuffer: ...
     def release(self, locator: Locator) -> Completion | None: ...
     def retirement(self, locator: Locator) -> Completion: ...
     def awaiting_acknowledgment(self) -> bool: ...
@@ -1069,13 +1062,6 @@ class TransferTicket:
     def close(self) -> None: ...
     def add_done_callback(self, callback: Callable[[], None]) -> None: ...
     def add_retirement_callback(self, callback: Callable[[], None]) -> None: ...
-    def _require_active(self) -> None: ...
-    def _complete(
-        self,
-        value: torch.Tensor | tuple[torch.Tensor, ...],
-        event: CUDAEvent | None = None,
-    ) -> None: ...
-    def _fail(self, error: BaseException) -> bool: ...
 
 @final
 class TransferPool:
@@ -1100,7 +1086,6 @@ class TransferPool:
     ) -> TransferTicket: ...
     def fetch_local(
         self,
-        registry: BufferRegistry,
         locator: Locator,
         *,
         device: torch.device,
@@ -1113,6 +1098,17 @@ class TransferPool:
         locator: Locator,
         *,
         node: str,
+        slot: int,
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        region: tuple[slice, ...] | None = None,
+        reservation: ReadReservation | None = None,
+    ) -> TransferTicket: ...
+    def fetch_cuda(
+        self,
+        locator: Locator,
+        *,
+        source: WorkerEndpoint,
         slot: int,
         device: torch.device,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,

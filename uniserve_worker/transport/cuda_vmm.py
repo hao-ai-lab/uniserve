@@ -30,37 +30,30 @@ from typing import TYPE_CHECKING, Any
 
 from uniserve.profiling import profile_range
 from uniserve.runtime import CUDAEvent, EventPool
-from uniserve_worker._uniserve_ipc import Completion
+from uniserve_worker._uniserve_ipc import (
+    BufferRegistry,
+    Completion,
+    TransportBuffer,
+)
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
     DESCRIPTOR_HANDLE_BYTES,
-    FABRIC_HANDLE_BYTES,
     CudaVmmTransfer,
     Locator,
     WorkerEndpoint,
 )
-from uniserve_worker.transport import descriptor_grants, vmm_pool
 from uniserve_worker.transport.descriptor_grants import DescriptorGrants
-from uniserve_worker.transport.endpoint import (
-    BufferRegistry,
-    TransportBuffer,
-    _endpoint_lock,
-    _endpoints,
-)
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     copy_pairs,
     dtype_name,
     export_views,
-    read_destination,
-    region_view,
     tensor_nbytes,
 )
 from uniserve_worker.transport.pool import (
     ReadReservation,
     TransferCapacity,
     TransferPool,
-    chunk_word,
 )
 from uniserve_worker.transport.ticket import TransferTicket
 from uniserve_worker.transport.vmm_pool import (
@@ -162,9 +155,6 @@ class CudaVmmTransport(Transport):
             name="uniserve-cuda-read",
             event_pool=event_pool,
         )
-
-        with _endpoint_lock:
-            _endpoints[self.endpoint()] = self
 
     def endpoint(self) -> str:
         return self._buffers.name
@@ -435,216 +425,15 @@ class CudaVmmTransport(Transport):
         region: tuple[slice, ...] | None = None,
         reservation: ReadReservation | None = None,
     ) -> TransferTicket:
-        if not isinstance(locator.transport, CudaVmmTransfer):
-            raise invalid_descriptor(
-                "CUDA VMM read requires a CUDA VMM locator"
-            )
-        # A device product reaches another host as a fabric handle and not as
-        # a process descriptor, which names an allocation only within the host
-        # that exported it. The head refuses an edge whose devices cannot
-        # export one, so this is the rank restating what it was given.
-        if (
-            locator.source.node != self.source.node
-            and len(locator.transport.allocation_handle) != FABRIC_HANDLE_BYTES
-        ):
-            raise invalid_descriptor(
-                "a device product crosses hosts only as a fabric handle"
-            )
-        if device.type != "cuda":
-            raise invalid_descriptor(
-                "CUDA VMM destination must be a CUDA device"
-            )
-        target = (
-            None
-            if destination is None
-            else read_destination(locator, device, destination, region)
-        )
-        return self._reads.submit(
-            self._read,
+        return self._reads.fetch_cuda(
             locator,
-            device,
-            target,
-            region,
-            nbytes=locator.nbytes,
-            destination=target,
+            source=self.source,
+            slot=self._acknowledgment_slot,
+            device=device,
+            destination=destination,
+            region=region,
             reservation=reservation,
         )
-
-    def _read(
-        self,
-        ticket: TransferTicket,
-        locator: Locator,
-        device: torch.device,
-        destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
-        region: tuple[slice, ...] | None,
-    ) -> None:
-        import torch
-        from uniserve_kernels.peer_storage import import_handle
-
-        handle = locator.transport
-        assert isinstance(handle, CudaVmmTransfer)
-        # A consumer in another process cannot fully check that a locator
-        # still names an export the producer holds: a descriptor grant is
-        # refused once withdrawn, but a fabric handle is imported unchecked.
-        # The locator is the engine's word. The engine binds only locators the
-        # producing rank reported to it, and frees a product's buffer only
-        # once the batch consuming it has completed.
-        mapped = None
-        event = None
-        import_device = device
-        # A read in the producer's own address space needs no acknowledgment:
-        # the export's own owner reclaims it.
-        acknowledgment = None
-        try:
-            ticket._require_active()
-            # An omitted destination is allocated here, on the read thread.
-            destination = read_destination(locator, device, destination, region)
-
-            with torch.cuda.device(device):
-                if locator.source.address_space == self.source.address_space:
-                    # Same address space: borrow the owner's registered tensor
-                    # and producer fence directly; no IPC mapping is needed.
-                    with _endpoint_lock:
-                        owner = _endpoints.get(handle.endpoint)
-                    if not isinstance(owner, CudaVmmTransport):
-                        raise invalid_descriptor(
-                            "CUDA export has no live local owner"
-                        )
-                    export = owner._buffers.acquire(locator, ticket)
-                    mapped = export.tensor
-                    event = export.event
-                else:
-                    destination_prototype = (
-                        destination[0]
-                        if isinstance(destination, tuple)
-                        else destination
-                    )
-                    itemsize = destination_prototype.element_size()
-                    if any(
-                        offset % itemsize
-                        for offset in handle.storage_offsets_bytes
-                    ):
-                        raise invalid_descriptor(
-                            "CUDA VMM span offset is not element aligned"
-                        )
-                    # A VMM mapping can be granted only to a device that can
-                    # access the producing allocation. Some hosts expose all
-                    # GPUs to one process but grant peer access only inside
-                    # smaller peer islands. Map such an allocation on its
-                    # owning GPU, then let CUDA perform the cross-device copy
-                    # into the destination. CUDA stages through host storage
-                    # when no peer path exists. This decision follows the
-                    # discovered CUDA topology, not a device model or SKU.
-                    source_device = torch.device(locator.device)
-                    if (
-                        locator.source.node == self.source.node
-                        and source_device.type == "cuda"
-                        and source_device != device
-                        and not _can_access_peer(
-                            str(device), str(source_device)
-                        )
-                    ):
-                        import_device = source_device
-                    prototype = (
-                        destination_prototype
-                        if import_device == device
-                        else torch.empty(
-                            0,
-                            dtype=destination_prototype.dtype,
-                            device=import_device,
-                        )
-                    )
-                    # A fabric handle is importable as exported. A descriptor
-                    # names an open file of the producing process, so the
-                    # usable one is received from that rank over its grant
-                    # socket and closed once the allocation, which holds its
-                    # own reference, has been imported.
-                    granted = None
-                    if len(handle.allocation_handle) == DESCRIPTOR_HANDLE_BYTES:
-                        granted = descriptor_grants.fetch(
-                            handle.endpoint, handle.export_id
-                        )
-                        exported = granted.to_bytes(
-                            DESCRIPTOR_HANDLE_BYTES, sys.byteorder
-                        )
-                    else:
-                        exported = handle.allocation_handle
-                    try:
-                        allocation = import_handle(
-                            prototype,
-                            exported,
-                            handle.storage_size_bytes,
-                        )
-                    finally:
-                        if granted is not None:
-                            os.close(granted)
-
-                    # One mapping owns every span; tensor views share its
-                    # deleter.
-                    lengths = (
-                        length
-                        for length, count in zip(
-                            handle.span_lengths, handle.span_counts, strict=True
-                        )
-                        for length in repeat(length, count)
-                    )
-                    mapped = tuple(
-                        allocation.as_strided(
-                            (length, *locator.shape[1:]),
-                            handle.tensor_stride,
-                            byte_offset // itemsize,
-                        )
-                        for byte_offset, length in zip(
-                            handle.storage_offsets_bytes, lengths, strict=True
-                        )
-                    )
-                    # This rank's acknowledgment word inside the source
-                    # chunk's header, written once the copies below complete.
-                    # It shares the mapping's deleter, like the span views.
-                    if handle.acknowledgment_offset >= 0:
-                        acknowledgment = allocation.view(torch.uint8)[
-                            handle.acknowledgment_offset
-                            + self._acknowledgment_slot * ACK_WORD_BYTES :
-                        ][:ACK_WORD_BYTES].view(torch.int32)
-                    del allocation
-                    # A producer whose products cross hosts drained its stream
-                    # before exporting, and its locator carries no fence;
-                    # otherwise the fence is an interprocess event of the
-                    # producer's host.
-                    if handle.ready_event_handle:
-                        event = CUDAEvent.from_ipc_handle(
-                            import_device, handle.ready_event_handle
-                        )
-
-                if region is not None:
-                    mapped = region_view(mapped, region)
-                if event is not None and import_device != device:
-                    # CUDA does not permit the destination device's stream to
-                    # wait on this imported source-device IPC event on every
-                    # topology. Drain the producer on its owning device before
-                    # submitting the host-staged cross-device copy.
-                    event.synchronize()
-                    event = None
-                if acknowledgment is not None and import_device != device:
-                    # The acknowledgment word belongs to the source-device
-                    # mapping. Claim it before the staged copy, then export
-                    # completion only after the destination copy has drained.
-                    with torch.cuda.device(import_device):
-                        acknowledgment.copy_(chunk_word(vmm_pool.CLAIMED))
-                        torch.cuda.current_stream(import_device).synchronize()
-                    self._reads.copy(ticket, mapped, destination, event, None)
-                    with torch.cuda.device(import_device):
-                        acknowledgment.copy_(chunk_word(vmm_pool.ACKNOWLEDGED))
-                        torch.cuda.current_stream(import_device).synchronize()
-                else:
-                    self._reads.copy(
-                        ticket, mapped, destination, event, acknowledgment
-                    )
-        except BaseException as error:
-            # Failure visibility must not wait for the source's retirement
-            # acknowledgement. Physical ownership remains with the backend.
-            ticket._fail(error)
-            raise
 
     def release(self, locator: Locator) -> Completion | None:
         if not isinstance(locator.transport, CudaVmmTransfer):
@@ -682,7 +471,58 @@ class CudaVmmTransport(Transport):
             if self._grants is not None:
                 self._grants.close()
                 self._grants = None
-            with _endpoint_lock:
-                _endpoints.pop(self.endpoint(), None)
         if self._failed_export is not None:
             raise self._failed_export[0]
+
+
+def _import_views(
+    locator: Locator,
+    destination: torch.Tensor | tuple[torch.Tensor, ...],
+    device: torch.device,
+    exported: bytes,
+    slot: int,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor | None]:
+    """Map a granted handle and bind its numerical spans and reader word.
+
+    Every returned view retains the same allocation. The caller owns the
+    descriptor through import and the mapping through all device accesses.
+    """
+    import torch
+    from uniserve_kernels.peer_storage import import_handle
+
+    handle = locator.transport
+    assert isinstance(handle, CudaVmmTransfer)
+    prototype = (
+        destination[0] if isinstance(destination, tuple) else destination
+    )
+    itemsize = prototype.element_size()
+    if any(offset % itemsize for offset in handle.storage_offsets_bytes):
+        raise invalid_descriptor("CUDA VMM span offset is not element aligned")
+    if prototype.device != device:
+        prototype = torch.empty(0, dtype=prototype.dtype, device=device)
+
+    allocation = import_handle(prototype, exported, handle.storage_size_bytes)
+    lengths = (
+        length
+        for length, count in zip(
+            handle.span_lengths, handle.span_counts, strict=True
+        )
+        for length in repeat(length, count)
+    )
+    mapped = tuple(
+        allocation.as_strided(
+            (length, *locator.shape[1:]),
+            handle.tensor_stride,
+            byte_offset // itemsize,
+        )
+        for byte_offset, length in zip(
+            handle.storage_offsets_bytes, lengths, strict=True
+        )
+    )
+    acknowledgment = None
+    if handle.acknowledgment_offset >= 0:
+        start = handle.acknowledgment_offset + slot * ACK_WORD_BYTES
+        acknowledgment = allocation.view(torch.uint8)[
+            start : start + ACK_WORD_BYTES
+        ].view(torch.int32)
+    return mapped, acknowledgment

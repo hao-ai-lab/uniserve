@@ -546,6 +546,33 @@ def test_refused_local_read_returns_its_source_grant() -> None:
         events.close()
 
 
+def test_local_reader_retires_its_source_after_the_producer_is_dropped():
+    events = EventPool()
+    producer, consumer = (
+        make_transport(
+            "local", byte_capacity=4, ticket_capacity=1, event_pool=events
+        )
+        for _ in range(2)
+    )
+    source = torch.tensor([7], dtype=torch.int32)
+    locator = producer.export(source)
+    read = consumer.fetch(locator, device=torch.device("cpu"))
+    retirement = producer.release(locator)
+    del producer
+
+    try:
+        assert not retirement.done()
+        with pytest.raises(WorkerError):
+            consumer.fetch(locator, device=torch.device("cpu"))
+        assert torch.equal(read.result(), source)
+        read.close()
+        retirement.result(timeout=5)
+    finally:
+        read.close()
+        consumer.close()
+        events.close()
+
+
 def _serve_unusable_cuda_handle(channel) -> None:
     """Publish a locator whose handle names no allocation, and hold it."""
     import uuid

@@ -3,6 +3,7 @@
 //! Consumable views and physical retirement are separate completions. Credits
 //! return only after the backend stops accessing source and destination storage.
 
+mod cuda;
 mod ticket;
 
 use ticket::BorrowedReads;
@@ -26,7 +27,7 @@ use uniserve_worker::{
 use super::error::{invalid, native_error, resource};
 use super::events::{CUDAEvent, EventPool};
 use super::host::with_context;
-use super::registry::BufferRegistry;
+use super::registry::Registry;
 use super::shared_buffer::SharedRead;
 
 /// Python access to the rank's shared native transfer budget.
@@ -285,10 +286,9 @@ impl TransferPool {
     }
 
     /// Grant and submit a local read without a Python ownership callback.
-    #[pyo3(signature = (registry, locator, *, device, destination=None, region=None, reservation=None))]
+    #[pyo3(signature = (locator, *, device, destination=None, region=None, reservation=None))]
     fn fetch_local(
         slf: Bound<'_, Self>,
-        registry: &Bound<'_, BufferRegistry>,
         locator: &Bound<'_, PyAny>,
         device: &Bound<'_, PyAny>,
         destination: Option<Bound<'_, PyAny>>,
@@ -301,7 +301,10 @@ impl TransferPool {
             return Err(PyErr::from_value(error.bind(py).clone()));
         }
 
-        let (buffer, source) = BufferRegistry::acquire_read(registry, locator)?;
+        if locator.getattr("backend")?.extract::<String>()? != "local" {
+            return Err(invalid(py, "local read requires a local locator"));
+        }
+        let (buffer, source) = Registry::acquire_read(locator)?;
         let borrowed = destination.is_none();
         let events = if borrowed {
             source.events(py)
@@ -447,6 +450,30 @@ impl TransferPool {
             },
         };
         Self::submit_read(&slf, read, nbytes, destination, reservation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (locator, *, source, slot, device, destination=None, region=None, reservation=None))]
+    fn fetch_cuda(
+        slf: Bound<'_, Self>,
+        locator: Bound<'_, PyAny>,
+        source: Bound<'_, PyAny>,
+        slot: usize,
+        device: Py<PyAny>,
+        destination: Option<Bound<'_, PyAny>>,
+        region: Option<Py<PyAny>>,
+        reservation: Option<Py<ReadReservation>>,
+    ) -> PyResult<Py<TransferTicket>> {
+        cuda::CudaRead::submit(
+            &slf,
+            locator,
+            source,
+            slot,
+            device,
+            destination,
+            region,
+            reservation,
+        )
     }
 
     /// Copy on a transport thread. Readiness exposes a fence before this
@@ -669,6 +696,7 @@ struct PythonRead {
 }
 
 enum ReadCall {
+    Cuda(cuda::CudaRead),
     Python {
         call: Py<PyAny>,
         args: Py<PyTuple>,
@@ -692,6 +720,7 @@ enum ReadCall {
 impl ReadCall {
     fn visit(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
         match self {
+            Self::Cuda(read) => read.visit(visit)?,
             Self::Python { call, args } => {
                 visit.call(call)?;
                 visit.call(args)?;
@@ -756,6 +785,7 @@ impl ReadBackend for PythonRead {
                 with_context(
                     &py.import("torch")?.call_method0("inference_mode")?,
                     || match &self.call {
+                        ReadCall::Cuda(read) => read.run(py, &self.ticket),
                         ReadCall::Python { call, args } => {
                             let mut arguments = vec![self.ticket.bind(py).as_any().clone()];
                             arguments.extend(args.bind(py).iter());

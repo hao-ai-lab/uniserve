@@ -73,6 +73,32 @@ impl TransferRef {
 }
 
 impl TransferTicket {
+    pub(super) fn require_active(&self, py: Python<'_>) -> PyResult<()> {
+        if let Some(error) = self.lock(py)?.ticket.cancellation_error() {
+            return Err(PyErr::from_value(error.bind(py).clone()));
+        }
+        Ok(())
+    }
+
+    pub(super) fn complete(
+        &self,
+        py: Python<'_>,
+        value: Py<PyAny>,
+        event: Option<Py<CUDAEvent>>,
+    ) -> PyResult<()> {
+        let event = event.map(|event| Arc::clone(&event.borrow(py).inner));
+        self.complete_native(py, value, event)
+    }
+
+    pub(super) fn fail(&self, py: Python<'_>, error: Py<PyAny>) -> PyResult<bool> {
+        let mut state = self.lock(py)?;
+        let (late, callbacks) = state.ticket.fail(error);
+        drop(state);
+        self.inner.ready.notify_all();
+        notify(py, callbacks);
+        Ok(late)
+    }
+
     /// Inspect cancellation while a native transport wait has released the GIL.
     pub(in crate::worker) fn check_active(&self) -> uniserve_worker::Result<()> {
         let state = self.state.lock().map_err(|_| {
@@ -153,14 +179,6 @@ impl TransferTicket {
         Ok(())
     }
 
-    #[pyo3(name = "_require_active")]
-    pub(super) fn require_active(&self, py: Python<'_>) -> PyResult<()> {
-        if let Some(error) = self.lock(py)?.ticket.cancellation_error() {
-            return Err(PyErr::from_value(error.bind(py).clone()));
-        }
-        Ok(())
-    }
-
     /// Return views without a host wait. CUDA consumption waits on the read
     /// fence and records every view on the consuming allocator stream.
     #[pyo3(signature = (stream=None))]
@@ -210,27 +228,6 @@ impl TransferTicket {
     /// Copy destinations retain their ordinary tensor ownership.
     pub(crate) fn close(slf: Bound<'_, Self>) -> PyResult<()> {
         slf.get().inner.close(slf.py())
-    }
-
-    #[pyo3(name = "_complete", signature = (value, event=None))]
-    pub(super) fn complete(
-        &self,
-        py: Python<'_>,
-        value: Py<PyAny>,
-        event: Option<Py<CUDAEvent>>,
-    ) -> PyResult<()> {
-        let event = event.map(|event| Arc::clone(&event.borrow(py).inner));
-        self.complete_native(py, value, event)
-    }
-
-    #[pyo3(name = "_fail")]
-    pub(super) fn fail(&self, py: Python<'_>, error: Py<PyAny>) -> PyResult<bool> {
-        let mut state = self.lock(py)?;
-        let (late, callbacks) = state.ticket.fail(error);
-        drop(state);
-        self.inner.ready.notify_all();
-        notify(py, callbacks);
-        Ok(late)
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
