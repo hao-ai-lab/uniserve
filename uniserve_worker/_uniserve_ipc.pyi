@@ -24,7 +24,6 @@ import uniserve_worker.storage.block_tables as block_tables
 import uniserve_worker.storage.kv_cache as kv_cache
 from uniserve.model.logits import VocabShard
 from uniserve.runtime.execution import ExecutionContext
-from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig, OutputLayout
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.model_executor import ModelExecutor
@@ -69,6 +68,166 @@ from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
 from uniserve_worker.worker import Worker
+
+TOKEN_CONTINUATION_BIT: int
+TOKEN_VALUE_MASK: int
+
+@final
+class SamplingParams:
+    def __init__(
+        self,
+        *,
+        temperature: float = ...,
+        top_k: int = ...,
+        top_p: float = ...,
+        ignore_eos: bool = ...,
+        seed: int | None = ...,
+        min_p: float = ...,
+        repetition_penalty: float = ...,
+        frequency_penalty: float = ...,
+        presence_penalty: float = ...,
+        logit_bias: tuple[tuple[int, float], ...] = ...,
+        min_tokens: int = ...,
+        return_logprobs: bool = ...,
+        n_logprobs: int = ...,
+        return_prompt_logprobs: bool = ...,
+        n_prompt_logprobs: int = ...,
+        logprob_token_ids: tuple[int, ...] = ...,
+        bad_words_ids: tuple[tuple[int, ...], ...] = ...,
+        allowed_token_ids: tuple[int, ...] | None = ...,
+        typical_p: float = ...,
+        forced_token_ids: tuple[int, ...] = ...,
+    ) -> None: ...
+    @property
+    def temperature(self) -> float: ...
+    @property
+    def top_k(self) -> int: ...
+    @property
+    def top_p(self) -> float: ...
+    @property
+    def ignore_eos(self) -> bool: ...
+    @property
+    def seed(self) -> int | None: ...
+    @property
+    def min_p(self) -> float: ...
+    @property
+    def repetition_penalty(self) -> float: ...
+    @property
+    def frequency_penalty(self) -> float: ...
+    @property
+    def presence_penalty(self) -> float: ...
+    @property
+    def logit_bias(self) -> tuple[tuple[int, float], ...]: ...
+    @property
+    def min_tokens(self) -> int: ...
+    @property
+    def return_logprobs(self) -> bool: ...
+    @property
+    def n_logprobs(self) -> int: ...
+    @property
+    def return_prompt_logprobs(self) -> bool: ...
+    @property
+    def n_prompt_logprobs(self) -> int: ...
+    @property
+    def logprob_token_ids(self) -> tuple[int, ...]: ...
+    @property
+    def bad_words_ids(self) -> tuple[tuple[int, ...], ...]: ...
+    @property
+    def allowed_token_ids(self) -> tuple[int, ...] | None: ...
+    @property
+    def typical_p(self) -> float: ...
+    @property
+    def forced_token_ids(self) -> tuple[int, ...]: ...
+    @staticmethod
+    def from_mapping(value: Mapping[str, object]) -> SamplingParams: ...
+    def to_mapping(self) -> dict[str, object]: ...
+    def replace(self, **fields: Any) -> SamplingParams: ...
+    def device_greedy(self) -> bool: ...
+    def uses_penalties(self) -> bool: ...
+
+@final
+class SamplingMetadata:
+    def __init__(
+        self,
+        *,
+        logits: torch.Tensor,
+        parameters: SamplingParams,
+        penalty_counts: tuple[torch.Tensor | None, ...],
+        allowed: tuple[tuple[int, ...] | None, ...],
+        suppress: tuple[int, ...],
+        finish_token_ids: tuple[int, ...],
+        transition_token_ids: tuple[int, ...],
+        force_finish: bool,
+        draws: torch.Tensor | None,
+        parameter_values: torch.Tensor | None,
+        draft_token_ids: tuple[int, ...] = ...,
+        terminal_draft_prefix: int | None = ...,
+        return_transition: bool = ...,
+        predicate: torch.Tensor | None = ...,
+        tagged_predicate: bool = ...,
+        request_pool_index: torch.Tensor | None = ...,
+        penalty_base: torch.Tensor | None = ...,
+    ) -> None: ...
+    @property
+    def logits(self) -> torch.Tensor: ...
+    @property
+    def parameters(self) -> SamplingParams: ...
+    @property
+    def penalty_counts(self) -> tuple[torch.Tensor | None, ...]: ...
+    @property
+    def allowed(self) -> tuple[tuple[int, ...] | None, ...]: ...
+    @property
+    def suppress(self) -> tuple[int, ...]: ...
+    @property
+    def finish_token_ids(self) -> tuple[int, ...]: ...
+    @property
+    def transition_token_ids(self) -> tuple[int, ...]: ...
+    @property
+    def force_finish(self) -> bool: ...
+    @property
+    def draws(self) -> torch.Tensor | None: ...
+    @property
+    def parameter_values(self) -> torch.Tensor | None: ...
+    @property
+    def draft_token_ids(self) -> tuple[int, ...]: ...
+    @property
+    def terminal_draft_prefix(self) -> int | None: ...
+    @property
+    def return_transition(self) -> bool: ...
+    @property
+    def predicate(self) -> torch.Tensor | None: ...
+    @property
+    def tagged_predicate(self) -> bool: ...
+    @property
+    def request_pool_index(self) -> torch.Tensor | None: ...
+    @property
+    def penalty_base(self) -> torch.Tensor | None: ...
+    @staticmethod
+    def for_call(
+        call: Call,
+        logits: torch.Tensor,
+        request: PendingOutput,
+        *,
+        positions: tuple[int, ...],
+        request_pool_index: torch.Tensor,
+        decode_state: DecodeState | None,
+        draft_token_ids: tuple[int, ...] = (),
+    ) -> SamplingMetadata: ...
+
+def sample(
+    tasks: Sequence[SamplingMetadata],
+    *,
+    selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[sampling_result.SamplerRow, ...]: ...
+def sample_graph(
+    calls: Sequence[Call],
+    requests: Sequence[PendingOutput],
+    tasks: tuple[InputRow, ...],
+    output: sampling_result.SamplerOutput | None,
+    *,
+    sampling_group: Any,
+    request_pool_indices: torch.Tensor,
+) -> tuple[sampling_result.SamplerRow, ...] | None: ...
 
 @final
 class ForwardStats:

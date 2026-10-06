@@ -166,7 +166,7 @@ def forward_values(
     Runs ``inputs`` through ``ModelExecutor.forward`` and returns one
     ``(value, request_pool_index, graph_sample, layout)`` tuple per input row,
     in input order. ``graph_sample`` is the row's graph-replayed greedy
-    selection when ``token.graph_decode_samples`` accepts it for the whole
+    selection when native ``sample_graph`` accepts it for the whole
     output group, and None when the group is sampled eagerly; eager groups
     are materialized first (waiting on the forward's output event and
     gathering vocabulary shards). Each group's ``ForwardStats`` is appended
@@ -189,7 +189,7 @@ def forward_values(
         states=states,
     )
     values: list[ForwardValue | None] = [None] * len(inputs)
-    from uniserve_worker.execution.token import graph_decode_samples
+    from uniserve_worker._uniserve_ipc import sample_graph
 
     for indexes, output in outputs:
         if isinstance(output, BaseException):
@@ -202,7 +202,7 @@ def forward_values(
         stats = output.stats
         request_pool_indices = output.request_pool_indices
 
-        selected = graph_decode_samples(
+        selected = sample_graph(
             tuple(inputs[index][1] for index in indexes),
             tuple(
                 state.pending_output(

@@ -110,7 +110,7 @@ impl Request {
     }
 
     #[getter]
-    fn sampling<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    pub(super) fn sampling<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let generation = self.admission.bind(py).getattr("generation")?;
         if generation.is_none() {
             Ok(py.None().into_bound(py))

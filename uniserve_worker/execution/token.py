@@ -19,22 +19,19 @@ resolves it on the host against the base coordinates recorded here.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve.nn.rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import adjacent_view
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import image
 from uniserve_worker.execution.output import PendingOutput, capture_logprobs
-from uniserve_worker.model_executor.input_batch import InputRow, TokenRow
+from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.call import (
     Call,
-    DrawLayout,
     ForwardMode,
     SamplingState,
     VisionInput,
@@ -42,15 +39,12 @@ from uniserve_worker.protocol.call import (
 from uniserve_worker.sampling import sampler as sampling
 from uniserve_worker.sampling.metadata import SamplingMetadata, TokenSelection
 from uniserve_worker.sampling.result import (
-    SamplerOutput,
     SamplerRow,
     sample_columns,
 )
-from uniserve_worker.sampling.sampler import broadcast_selection
 from uniserve_worker.storage.tensor_store import Buffer, FeatureMetadata
 
 if TYPE_CHECKING:
-    from uniserve.distributed.mesh import Communicator
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.model_executor.diffusion_inputs import (
         DiffusionRow,
@@ -274,14 +268,13 @@ def prepare_sampling(
                 state=state,
             )
 
-        sample = build_sampling_metadata(
+        sample = SamplingMetadata.for_call(
             call,
             logits[-1],
             request,
             positions=(start + count,),
             request_pool_index=request_pool_index,
             decode_state=decode_state,
-            state=state,
         )
     elif mode is ForwardMode.DECODE:
         commit_kv(
@@ -292,14 +285,13 @@ def prepare_sampling(
             request_tables=request_tables,
             decode_state=decode_state,
         )
-        sample = build_sampling_metadata(
+        sample = SamplingMetadata.for_call(
             call,
             logits[-1],
             request,
             positions=(start + 1,),
             request_pool_index=request_pool_index,
             decode_state=decode_state,
-            state=state,
         )
     else:
         draft = (
@@ -307,7 +299,7 @@ def prepare_sampling(
             if call.predicate is not None
             else call.input_token_ids[1:]
         )
-        sample = build_sampling_metadata(
+        sample = SamplingMetadata.for_call(
             call,
             logits,
             request,
@@ -315,7 +307,6 @@ def prepare_sampling(
             draft_token_ids=draft,
             request_pool_index=request_pool_index,
             decode_state=decode_state,
-            state=state,
         )
     return sample
 
@@ -345,7 +336,7 @@ def publish_sample(
     ``_finish_visual`` does.
 
     ``sample_work`` may be None only for a decode whose selection came from
-    graph replay (``graph_decode_samples``).
+    graph replay (``sample_graph``).
     """
     request = state.pending_output(call.request_key.request_id)
     start = int(request.progress.logical_position)
@@ -572,7 +563,7 @@ def _prepare_visual_sampling(
     if call.token_output is not None:
         assert value is not None
         generation = image_builder
-        sample = build_sampling_metadata(
+        sample = SamplingMetadata.for_call(
             call,
             value[-1],
             request,
@@ -584,7 +575,6 @@ def _prepare_visual_sampling(
             ),
             request_pool_index=request_pool_index,
             decode_state=decode_state,
-            state=state,
         )
         return sample
     return _finish_visual(
@@ -786,7 +776,7 @@ def finish_context(
 
     Raises:
         WorkerError: From ``prompt_logprob_details`` or
-            ``build_sampling_metadata``.
+            ``SamplingMetadata.for_call``.
         RuntimeError: When the KV commit exceeds the request's page tables.
     """
     request = state.pending_output(call.request_key.request_id)
@@ -838,133 +828,15 @@ def finish_context(
     if last.causal:
         start = int(cast(torch.Tensor, last.positions)[0])
         request.advance_tokens(0, position=start)
-    sample = build_sampling_metadata(
+    sample = SamplingMetadata.for_call(
         call,
         last_value[-1],
         request,
         positions=(_next_position(last),),
         request_pool_index=sampling_index,
         decode_state=decode_state,
-        state=state,
     )
     return last, last_value, sample
-
-
-def graph_decode_samples(
-    calls: tuple[Call, ...],
-    requests: tuple[PendingOutput, ...],
-    tasks: tuple[InputRow, ...],
-    output: SamplerOutput | None,
-    *,
-    sampling_group: Communicator | None,
-    request_pool_indices: torch.Tensor,
-) -> tuple[SamplerRow, ...] | None:
-    """Accept a graph-replayed greedy selection for common token export.
-
-    Returns one ``SamplerRow`` per call after broadcasting the tokens over
-    ``sampling_group`` and applying the same finish policy as eager sampling.
-    Returns None when ``output`` is None, when the call list is empty or
-    shapes disagree, or when any row needs eager sampling; the caller then
-    materializes the forward output and samples every row eagerly.
-    """
-    if output is None:
-        return None
-    count = len(calls)
-
-    # Any shape mismatch disqualifies the graph selection; the caller falls
-    # back to eager sampling for the whole group on None.
-    columns = (requests, tasks)
-    vectors = (
-        request_pool_indices,
-        output.tokens,
-        output.valid,
-        output.active,
-        output.finish,
-        output.continuation,
-        output.tagged_tokens,
-    )
-    if (
-        count == 0
-        or any(len(values) != count for values in columns)
-        or any(
-            value is None or int(value.numel()) != count for value in vectors
-        )
-        or int(output.completion.numel())
-        != sampling.SAMPLING_COMPLETION_FIELDS * count
-    ):
-        return None
-
-    finish_sets: list[tuple[int, ...]] = []
-    forced: list[bool] = []
-    for call, request, task in zip(calls, requests, tasks, strict=True):
-        parameters = request.request.sampling
-        sampling_state = call.sampling_state or SamplingState()
-        finish_token_ids = (
-            request.request.finish_token_ids
-            if not sampling_state.finish_token_ids
-            else sampling_state.finish_token_ids
-            if not request.request.finish_token_ids
-            else tuple(
-                sorted(
-                    {
-                        *request.request.finish_token_ids,
-                        *sampling_state.finish_token_ids,
-                    }
-                )
-            )
-        )
-
-        write = request.token_write
-        # Graph selection only covers single-token greedy decode without
-        # per-row host constraints; anything richer needs eager sampling.
-        if (
-            call.kind is not ForwardMode.DECODE
-            or parameters is None
-            or not sampling.device_greedy_parameters(parameters)
-            or parameters.allowed_token_ids is not None
-            or bool(parameters.forced_token_ids)
-            or sampling_state.allowed_token_ids is not None
-            or bool(sampling_state.suppressed_token_ids)
-            or bool(sampling_state.transition_token_ids)
-            or request.transition_write is not None
-            or not isinstance(task, TokenRow)
-            or task.decode_predicate is None
-            or not task.decode_predicate_tagged
-            or bool(sampling_state.force_finish)
-            != bool(task.decode_force_finish)
-            or write is None
-        ):
-            return None
-        finish_sets.append(finish_token_ids)
-        forced.append(bool(sampling_state.force_finish))
-
-    broadcast_selection(sampling_group, output.tokens)
-
-    if any(finish_sets):
-        # Graph selection already resolved logits and device activity. Apply the
-        # same terminal policy as eager sampling without selecting those logits
-        # again; new continuation tensors preserve the borrowed graph storage.
-        finish = sampling.sampled_finish_values(
-            tuple(finish_sets),
-            tuple(forced),
-            output.tokens,
-            output.valid & output.active,
-        )
-        continuation = output.valid & output.active & ~finish
-        output = replace(
-            output,
-            finish=finish,
-            continuation=continuation,
-            tagged_tokens=sampling.tagged_token_values(
-                output.tokens, continuation
-            ),
-        )
-    return tuple(
-        output.row(
-            index, request_pool_index=request_pool_indices[index : index + 1]
-        )
-        for index in range(count)
-    )
 
 
 def prompt_logprob_details(
@@ -1032,8 +904,7 @@ def prompt_logprob_details(
         return ()
 
     parameters = require_sampling(request)
-    prompt_parameters = replace(
-        parameters,
+    prompt_parameters = parameters.replace(
         return_logprobs=True,
         n_logprobs=int(parameters.n_prompt_logprobs),
     )
@@ -1325,257 +1196,6 @@ def publish_token_products(
         else:
             (values,) = sample_columns(selected, ("tagged_tokens",))
         tensor_store.write_scalars(tuple(writes), values.reshape(-1))
-
-
-def build_sampling_metadata(
-    call: Call,
-    logits: torch.Tensor,
-    request: PendingOutput,
-    *,
-    state: BatchState,
-    positions: tuple[int, ...],
-    request_pool_index: torch.Tensor,
-    draft_token_ids: tuple[int, ...] = (),
-    decode_state: DecodeState | None,
-) -> SamplingMetadata:
-    """Build the sampler inputs for one call's logit rows.
-
-    ``logits`` holds one row per entry of ``positions``; a single row may be
-    1-D. Each row receives its allowed or forced tokens, its penalty counts
-    when penalties are enabled and, when sampling is stochastic, a Philox
-    uniform draw. A device-greedy call
-    without drafts or allowed or forced tokens carries no draw or parameter
-    tensors.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when the request has no admitted
-            sampling parameters, stochastic sampling lacks matching
-            target-sampling RNG coordinates, or the logits do not align with
-            ``positions``; ``unsupported_setup`` when penalties
-            are enabled and ``DecodeState`` disagrees with the vocabulary or
-            device.
-        RuntimeError: When penalties are enabled without a ``DecodeState``.
-    """
-    parameters = require_sampling(request)
-    sampling_state = call.sampling_state or SamplingState()
-    allowed_token_ids = (
-        sampling_state.allowed_token_ids
-        if sampling_state.allowed_token_ids is not None
-        else parameters.allowed_token_ids
-    )
-    if not sampling_state.finish_token_ids:
-        finish_token_ids = request.request.finish_token_ids
-    elif not request.request.finish_token_ids:
-        finish_token_ids = sampling_state.finish_token_ids
-    else:
-        finish_token_ids = tuple(
-            sorted(
-                {
-                    *request.request.finish_token_ids,
-                    *sampling_state.finish_token_ids,
-                }
-            )
-        )
-
-    # Draws are addressed by request lineage and semantic position
-    # (`uniserve.nn.rng`), so the call's registered RNG coordinates must
-    # describe exactly these rows: the target-sampling layout, the admitted
-    # seed, and semantic indexes equal to `positions`.
-    rng = call.rng
-    if float(parameters.temperature) > 0.0:
-        if rng is None or rng.draw_layout is not DrawLayout.TARGET_SAMPLING:
-            raise invalid_descriptor(
-                "stochastic sampling requires target-sampling RNG coordinates"
-            )
-        if int(rng.seed) != int(parameters.seed or 0):
-            raise invalid_descriptor(
-                "call RNG seed disagrees with admitted sampling"
-            )
-        expected_positions = tuple(
-            range(
-                int(rng.semantic_index_base),
-                int(rng.semantic_index_base) + len(positions),
-            )
-        )
-        if positions != expected_positions:
-            raise invalid_descriptor(
-                "sampling positions disagree with registered semantic RNG "
-                "coordinates"
-            )
-
-    rng_seed = 0 if rng is None else int(rng.seed)
-    stochastic = float(parameters.temperature) > 0.0
-    draw_key = (
-        sampling_key(
-            rng_seed,
-            int(call.request_key.engine_id),
-            int(call.request_key.request_id),
-            int(call.request_key.request_epoch),
-            DRAW_LAYOUT_TARGET,
-        )
-        if stochastic
-        else 0
-    )
-
-    # rows is [len(positions), vocab]; a single position arrives as 1-D logits.
-    rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
-    if rows.ndim != 2 or int(rows.shape[0]) != len(positions):
-        raise invalid_descriptor(
-            "sampling task positions do not align with its logits"
-        )
-    vocab = int(rows.shape[1])
-
-    uses_penalties = (
-        parameters.repetition_penalty != 1.0
-        or parameters.frequency_penalty != 0.0
-        or parameters.presence_penalty != 0.0
-    )
-    penalty_base = (
-        _request_penalty_base(
-            request, vocab, rows.device, decode_state=decode_state
-        )
-        if uses_penalties
-        else None
-    )
-    penalty_view = (
-        None
-        if penalty_base is None
-        else _candidate_penalty_counts(request, penalty_base)
-    )
-
-    forced_token_ids = parameters.forced_token_ids
-    penalty_counts: list[torch.Tensor | None] = []
-    allowed: list[tuple[int, ...] | None] = []
-    uniform_draws: list[float] = []
-    for index, position in enumerate(positions):
-        if penalty_view is None:
-            row_counts = None
-        elif index == 0 or not draft_token_ids:
-            row_counts = penalty_view
-        else:
-            # Verification rows accumulate penalty counts for the draft
-            # tokens accepted before them in the same span.
-            row_counts = penalty_view.clone()
-            for token_id in draft_token_ids[:index]:
-                row_counts[int(token_id)] += 1
-
-        # Forced-token constraint: point `index` of the call's span narrows
-        # selection to `forced_token_ids[index]`, overriding any allowed-token
-        # whitelist for that point.
-        row_allowed = (
-            (int(forced_token_ids[index]),)
-            if index < len(forced_token_ids)
-            else allowed_token_ids
-        )
-        penalty_counts.append(row_counts)
-        allowed.append(row_allowed)
-        uniform_draws.append(
-            sampling_uniform(draw_key, int(position)) if stochastic else 0.0
-        )
-
-    device_greedy = (
-        not draft_token_ids
-        and sampling.device_greedy_parameters(parameters)
-        and all(value is None for value in allowed)
-    )
-    if device_greedy:
-        draws = None
-        parameter_values = None
-    else:
-        # Upload semantic Philox draws once; no device observation is needed to
-        # construct the call's RNG coordinates or filtering parameters.
-        draws = torch.tensor(
-            uniform_draws, dtype=torch.float32, device=rows.device
-        )
-        parameter_values = torch.tensor(
-            [
-                (
-                    float(parameters.temperature),
-                    float(parameters.top_p),
-                    float(parameters.min_p),
-                )
-            ]
-            * len(positions),
-            dtype=torch.float32,
-            device=rows.device,
-        )
-
-    predicate_value = request.predicate
-    finish_set = set(finish_token_ids)
-    terminal_draft_prefix = next(
-        (
-            index + 1
-            for index, token_id in enumerate(draft_token_ids)
-            if token_id in finish_set
-        ),
-        None,
-    )
-    return SamplingMetadata(
-        logits=rows,
-        parameters=parameters,
-        penalty_counts=tuple(penalty_counts),
-        allowed=tuple(allowed),
-        suppress=sampling_state.suppressed_token_ids,
-        finish_token_ids=finish_token_ids,
-        transition_token_ids=sampling_state.transition_token_ids,
-        force_finish=sampling_state.force_finish,
-        draws=draws,
-        parameter_values=parameter_values,
-        draft_token_ids=tuple(int(value) for value in draft_token_ids),
-        terminal_draft_prefix=terminal_draft_prefix,
-        return_transition=request.transition_write is not None,
-        predicate=None if predicate_value is None else predicate_value[0],
-        tagged_predicate=False
-        if predicate_value is None
-        else predicate_value[1],
-        request_pool_index=request_pool_index,
-        penalty_base=penalty_base,
-    )
-
-
-def _request_penalty_base(
-    request: PendingOutput,
-    vocab: int,
-    device: torch.device,
-    *,
-    decode_state: DecodeState | None,
-) -> torch.Tensor:
-    """Return the fixed request-indexed committed penalty-count row."""
-    states = decode_state
-    if states is None:
-        raise RuntimeError("token sampling has no request runtime-state owner")
-    if states.vocab_size != int(vocab) or states.device != device:
-        raise unsupported_setup(
-            "sampling vocabulary or device disagrees with request runtime state"
-        )
-    return states.penalty_counts[int(request.request.request_pool_idx)]
-
-
-def _candidate_penalty_counts(
-    request: PendingOutput, committed: torch.Tensor
-) -> torch.Tensor:
-    """Add a selection bound on this output but not yet committed.
-
-    ``request.token_update.sampled`` holds a selection that commit has not yet
-    applied to ``DecodeState.penalty_counts``. Its token is added to a copy
-    of ``committed`` when its row is valid and active; without one,
-    ``committed`` itself is returned.
-    """
-    sampled = request.token_update.sampled
-    if sampled is None:
-        return committed
-
-    # Strip the continuation tag bit; the token counts only when its row is
-    # both valid and predicate-active.
-    counts = committed.clone()
-    token = sampled.tokens.reshape(-1)[:1].bitwise_and(
-        sampling.TOKEN_VALUE_MASK
-    )
-    weight = (
-        sampled.valid.reshape(-1)[:1] & sampled.active.reshape(-1)[:1]
-    ).to(dtype=counts.dtype)
-    counts.scatter_add_(0, token.to(dtype=torch.int64), weight)
-    return counts
 
 
 def require_sampling(request: PendingOutput) -> SamplingParams:

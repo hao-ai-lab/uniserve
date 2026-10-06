@@ -31,6 +31,7 @@ mod pending;
 pub(crate) mod protocol;
 mod registry;
 mod request;
+mod sampling;
 mod shared_buffer;
 mod storage;
 mod stream;
@@ -41,6 +42,14 @@ mod weight_prefetch;
 
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<sampling::SamplingMetadata>()?;
+    module.add_function(wrap_pyfunction!(sampling::sample, module)?)?;
+    module.add_function(wrap_pyfunction!(sampling::sample_graph, module)?)?;
+    module.add(
+        "TOKEN_CONTINUATION_BIT",
+        uniserve_worker::TOKEN_CONTINUATION_BIT,
+    )?;
+    module.add("TOKEN_VALUE_MASK", uniserve_worker::TOKEN_VALUE_MASK)?;
     module.add_class::<locator::Locator>()?;
     module.add_function(wrap_pyfunction!(pending::store_media_bytes, module)?)?;
     module.add_class::<descriptor_grants::DescriptorGrants>()?;

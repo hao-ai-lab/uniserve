@@ -24,6 +24,7 @@ mod pending;
 mod profiling;
 mod registry;
 mod request;
+mod sampling;
 mod service;
 mod shared_buffer;
 mod stream;
@@ -56,6 +57,9 @@ pub use output::{LogprobLayout, OutputBuffer, OutputPool, OutputStorage};
 pub use pending::{BatchResult, PendingOutput, request_output};
 pub use registry::{BufferRegistry, RegisteredBuffer};
 pub use request::{Request, RequestPool, RequestProgress};
+pub use sampling::{
+    SamplingMetadata, SamplingPath, TOKEN_CONTINUATION_BIT, TOKEN_VALUE_MASK, finish_token_ids,
+};
 pub use service::{Service, ServiceBackend};
 pub use shared_buffer::{SHM_HEADER_BYTES, SharedBuffer, SharedMapping, SharedRead};
 pub use stream::CUDAStream;

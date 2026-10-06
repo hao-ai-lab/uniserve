@@ -11,7 +11,7 @@ pub(crate) fn new_request(value: &Bound<'_, PyAny>) -> PyResult<NewRequest> {
     Ok(NewRequest {
         request_key: request_key(&value.getattr("request_key")?)?,
         request_pool_idx: value.getattr("request_pool_idx")?.extract()?,
-        ar: parameters(&value.getattr("generation")?)?,
+        ar: generation(&value.getattr("generation")?)?,
         image: parameters(&value.getattr("image")?)?,
         diffusion: parameters(&value.getattr("diffusion")?)?,
         video: if video.is_none() {
@@ -22,6 +22,32 @@ pub(crate) fn new_request(value: &Bound<'_, PyAny>) -> PyResult<NewRequest> {
         prompt_token_ids: value.getattr("prompt_token_ids")?.extract()?,
         input_images: value.getattr("input_images")?.extract()?,
     })
+}
+
+fn generation(value: &Bound<'_, PyAny>) -> PyResult<Option<uniserve_worker_ipc::ArRequestParams>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    let canvas = value.getattr("canvas")?;
+    Ok(Some(uniserve_worker_ipc::ArRequestParams {
+        sampling: value
+            .getattr("sampling")?
+            .extract::<PyRef<'_, crate::sampling::SamplingParams>>()?
+            .inner
+            .clone(),
+        negative_token_ids: value.getattr("negative_token_ids")?.extract()?,
+        finish_token_ids: value.getattr("finish_token_ids")?.extract()?,
+        initial_position: value.getattr("initial_position")?.extract()?,
+        canvas: if canvas.is_none() {
+            None
+        } else {
+            Some(
+                canvas
+                    .extract::<PyRef<'_, crate::batches::CanvasSampling>>()?
+                    .inner,
+            )
+        },
+    }))
 }
 
 fn parameters<T: DeserializeOwned>(value: &Bound<'_, PyAny>) -> PyResult<Option<T>> {

@@ -56,7 +56,7 @@ def test_logprob_reporting_does_not_change_sample_selection(device, request):
     second = ar_params(
         12,
         block_ids=(3,),
-        sampling=replace(sampling, return_logprobs=True, n_logprobs=2),
+        sampling=sampling.replace(return_logprobs=True, n_logprobs=2),
     )
     first_op = token_call(
         first.request_key,
