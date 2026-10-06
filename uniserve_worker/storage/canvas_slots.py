@@ -154,10 +154,15 @@ class CanvasSlots:
         for tensor in tensors.values():
             tensor.zero_()
         self.banks = {name: tensors[name] for name in FIELDS}
-        # uint8 [slots + 1]: 1 while the slot's block continues after the
-        # step it ran last. Step zero sets it, and a step that stops the
-        # block clears it.
-        self.live = tensors["live"]
+
+    @property
+    def live(self) -> torch.Tensor:
+        """Borrow uint8 [slots + 1] flags: one while a block continues.
+
+        Step zero sets the flag; a step that stops the block clears it.
+        The backing owner releases these flags with the other canvas banks.
+        """
+        return self._backing.backing("live")
 
     @classmethod
     def for_denoiser(

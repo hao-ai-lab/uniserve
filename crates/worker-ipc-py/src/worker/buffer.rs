@@ -199,7 +199,7 @@ impl BufferPool {
         self.release_binding(py, &binding.get().binding)
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn close(&self, py: Python<'_>) -> PyResult<()> {
         let arenas = self.lock(py)?.close();
         // Tensor destruction can enter Python, so it follows unlocking.
         drop(arenas);

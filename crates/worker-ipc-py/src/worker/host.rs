@@ -240,7 +240,7 @@ impl HostLane {
         })
     }
 
-    fn abort(&self) {
+    pub(super) fn abort(&self) {
         self.lane.abort();
     }
 

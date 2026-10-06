@@ -106,7 +106,7 @@ impl EventPool {
         }
     }
 
-    fn set_completion_wake(&self, wake_on_stream: Option<Py<PyAny>>) {
+    pub(super) fn set_completion_wake(&self, wake_on_stream: Option<Py<PyAny>>) {
         let previous = std::mem::replace(&mut self.lock().wake, wake_on_stream);
         drop(previous);
     }
@@ -217,7 +217,7 @@ impl EventPool {
         callbacks
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn close(&self, py: Python<'_>) -> PyResult<()> {
         let wait = self.lock().pool.begin_close();
         py.detach(wait).map_err(pool_error)?;
         let owners = self.lock().pool.finish_close();

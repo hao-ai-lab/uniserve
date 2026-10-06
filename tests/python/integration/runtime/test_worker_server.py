@@ -601,6 +601,22 @@ def test_normal_shutdown_restores_gc(worker_channel, gc_enabled) -> None:
         worker.close()
 
 
+def test_rejected_configuration_does_not_retain_the_callers_model() -> None:
+    import gc
+    import weakref
+
+    from uniserve_models.stub import Model
+
+    model = Model()
+    reference = weakref.ref(model)
+    with pytest.raises(WorkerError, match="export backends"):
+        execution_worker(model, transfer_backends=())
+
+    del model
+    gc.collect()
+    assert reference() is None
+
+
 def test_scope_retains_model_after_run_and_releases_it_on_exit(
     worker_channel,
 ) -> None:

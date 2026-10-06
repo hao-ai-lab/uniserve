@@ -36,7 +36,7 @@ def execution_worker(
     host_slots: tuple[int, ...] = (0, 1),
     flow_prompt: FlowPrompt | None = None,
     tokenizer: Any | None = None,
-) -> Worker:
+) -> WorkerClient:
     ready = Model().to(device) if model is None else model
     worker_config = replace(
         stub_worker_config(block_size, max_batch_tokens=max_batch_tokens),
@@ -98,16 +98,7 @@ def execution_worker(
         components=components,
         flow_prompt=flow_prompt,
     )
-    from .depth_one import configure_physical_pool, submitted_batch
-
-    # The fixture stands in for the engine, which states every call's
-    # coordinates from the request state it owns as it submits the batch.
-    submit = worker.submit
-
-    def submit_stamped(batch, *arguments, **options):
-        return submit(submitted_batch(worker, batch), *arguments, **options)
-
-    worker.submit = submit_stamped
+    from .depth_one import configure_physical_pool
 
     # The fixture's scheduler serves one full-attention group whose pages
     # are single units, as the stub model's cache is.
@@ -128,7 +119,35 @@ def execution_worker(
         latent_page_units=worker.info.latent_page_units,
         latent_downsample=1 if flow is None else flow.denoiser.downsample,
     )
-    return worker
+    return WorkerClient(worker)
+
+
+class WorkerClient:
+    """Supply engine-owned call coordinates through the worker's public API."""
+
+    def __init__(self, worker: Worker) -> None:
+        self.worker = worker
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.worker, name)
+
+    def __enter__(self):
+        self.worker.__enter__()
+        return self
+
+    def __exit__(self, *error):
+        return self.worker.__exit__(*error)
+
+    def bind(self, endpoint):
+        self.worker.bind(endpoint)
+        return self
+
+    def submit(self, batch, *, propagate_errors=False):
+        from .depth_one import submitted_batch
+
+        return self.worker.submit(
+            submitted_batch(self, batch), propagate_errors=propagate_errors
+        )
 
 
 __all__ = ["execution_worker"]

@@ -22,12 +22,19 @@ from typing_extensions import Buffer as BufferProtocol
 import uniserve_worker.sampling.result as sampling_result
 import uniserve_worker.storage.block_tables as block_tables
 import uniserve_worker.storage.kv_cache as kv_cache
+from uniserve.distributed.mesh import Communicator
 from uniserve.model.logits import VocabShard
+from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.runtime.execution import ExecutionContext
+from uniserve.runtime.process_groups import ProcessGroups
 from uniserve.tensors import BufferConfig, OutputLayout
+from uniserve_worker.config.deployment import ComponentConfig, WorkerProcessArgs
+from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestResult
+from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.model_executor.input_batch import InputBatch, InputRow
+from uniserve_worker.profiling import WorkerProfiler
 from uniserve_worker.protocol.batch import (
     BatchCommand,
     BlockTable,
@@ -62,11 +69,12 @@ from uniserve_worker.protocol.transfer import (
     TransferTransport,
     WorkerEndpoint,
 )
+from uniserve_worker.protocol.worker_info import WorkerInfo
+from uniserve_worker.storage.canvas_slots import CanvasSlots
 from uniserve_worker.storage.decode_state import DecodeState
 from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
-from uniserve_worker.worker import Worker
 
 TOKEN_CONTINUATION_BIT: int
 TOKEN_VALUE_MASK: int
@@ -2499,6 +2507,88 @@ class Submission:
     @property
     def batch_id(self) -> int: ...
     def notify_ready(self) -> None: ...
+
+class Worker:
+    """Own rank resources and the shared execution/serving executor."""
+
+    model: torch.nn.Module
+    worker_config: WorkerConfig
+    runner: ModelExecutor
+    tokenizer: Any | None
+    attention: Any
+    sampling_group: Communicator | None
+    process_groups: ProcessGroups | None
+    requests: RequestPool
+    decode_state: DecodeState | None
+    block_tables: block_tables.BlockTables | None
+    kv_cache: kv_cache.KVCacheManager | None
+    latent_pool: LatentPool | None
+    canvas_slots: CanvasSlots | None
+    output_pool: OutputPool
+    tensor_store: TensorStore
+    buffer_pool: BufferPool
+    device_events: EventPool
+    host_tasks: HostLane
+    transports: dict[str, Any]
+    export_transports: dict[str, Any]
+    ipc_endpoint: Server | None
+    profiler: WorkerProfiler | None
+    codec_slot: bool
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        worker_config: WorkerConfig,
+        sampling_group: Communicator | None,
+        tokenizer: Any | None,
+        allowed_calls: frozenset[CallKind] | None,
+        queue_depth: int,
+        completion_payload_bytes: int,
+        acknowledgment_slot: int = 0,
+        host_slots: Sequence[int] = (),
+        products_cross_hosts: bool = False,
+        attention: str | None = None,
+        transfer_backends: tuple[str, ...] = ("local",),
+        export_backends: tuple[str, ...] = ("local",),
+        worker_id: str = "worker",
+        image_processor: ImageProcessor | None = None,
+        flow_prompt: FlowPrompt | None = None,
+        components: tuple[tuple[str, ComponentConfig], ...] = (),
+        process_groups: ProcessGroups | None = None,
+        bindings: Mapping[str, ComponentBinding] | None = None,
+        model_name: str | None = None,
+        attention_ranks: int = 0,
+        entry_points: Any | None = None,
+    ) -> None: ...
+    @classmethod
+    def from_config(cls, config: WorkerProcessArgs) -> Self: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+    @property
+    def info(self) -> WorkerInfo: ...
+    @property
+    def executor(self) -> Executor: ...
+    def warmup(self) -> None: ...
+    def close(self, *, aborted: bool = False) -> None: ...
+    def set_completion_wake(
+        self,
+        wake: Callable[[], None] | None,
+        wake_on_stream: Callable[[int], None] | None,
+    ) -> None: ...
+    def bind(self, endpoint: Server) -> Self: ...
+    def run(self) -> None: ...
+    def submit(
+        self, batch: Batch, *, propagate_errors: bool = False
+    ) -> Submission: ...
+    def advance(self) -> None: ...
+    def poll(self, submission: Submission) -> BatchOutput | None: ...
+    def drop_request(self, request_id: int) -> None: ...
 
 @final
 class Executor:

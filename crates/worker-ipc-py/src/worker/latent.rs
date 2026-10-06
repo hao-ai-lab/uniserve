@@ -893,7 +893,7 @@ impl LatentPool {
 
     /// Drop backing only after reads drain. Pending or failed physical access
     /// raises a resource error and keeps the storage retained.
-    fn close(slf: Bound<'_, Self>) -> PyResult<()> {
+    pub(super) fn close(slf: Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let buffers = {
             let owner = slf.borrow();
