@@ -68,16 +68,16 @@ impl Streams {
         }
 
         let py = owner.py();
-        let config = owner.getattr("worker_config")?;
+        let config = crate::worker::config::native(&owner.getattr("worker_config")?)?;
         let device = py
             .import("uniserve.runtime.device")?
-            .call_method1("canonical_device", (config.getattr("device")?,))?;
+            .call_method1("canonical_device", (&config.device,))?;
         let others = capture_devices(owner, &device)?;
-        let lanes = config.getattr("lanes")?;
+        let lanes = &config.lanes;
         let event_slots = event_slots.unwrap_or(self.event_slots);
         let runtime = py.import("uniserve.runtime")?;
 
-        if lanes.is_truthy()? {
+        if !lanes.is_empty() {
             if !others.is_empty() {
                 return Err(PyValueError::new_err(
                     "Green Context lanes require one physical device",
@@ -87,26 +87,11 @@ impl Streams {
             let mut kinds = Vec::new();
             let mut budgets = Vec::new();
             let mut slots = Vec::new();
-            for lane in lanes.try_iter()? {
-                let lane = lane?;
-                let inflight: Option<usize> = lane.getattr("max_inflight")?.extract()?;
-                slots.push(
-                    inflight
-                        .filter(|value| *value != 0)
-                        .unwrap_or(event_slots - 1)
-                        + 1,
-                );
-                budgets.push(lane.getattr("sm_budget")?.extract::<usize>()?);
-                kinds.push(
-                    lane.getattr("call_kinds")?
-                        .try_iter()?
-                        .map(|kind| Ok(pythonize::depythonize(&kind?)?))
-                        .collect::<PyResult<HashSet<CallKind>>>()?,
-                );
-                configs.push(
-                    lane.getattr("max_batch_calls")?
-                        .extract::<Option<usize>>()?,
-                );
+            for lane in lanes {
+                slots.push(lane.max_inflight.unwrap_or(event_slots - 1) + 1);
+                budgets.push(lane.sm_budget);
+                kinds.push(lane.call_kinds.iter().copied().collect::<HashSet<_>>());
+                configs.push(lane.max_batch_calls);
             }
             let options = PyDict::new(py);
             options.set_item("event_slots", PyTuple::new(py, slots)?)?;
@@ -168,10 +153,9 @@ impl Streams {
 
         let stream = match parents.as_slice() {
             [parent] => parent.bind(py).call_method0("fork")?,
-            [] if !owner
-                .getattr("worker_config")?
-                .getattr("lanes")?
-                .is_truthy()? =>
+            [] if crate::worker::config::native(&owner.getattr("worker_config")?)?
+                .lanes
+                .is_empty() =>
             {
                 external(device, self.event_slots)?
             }
@@ -356,18 +340,14 @@ pub(super) fn capture_devices<'py>(
     owner: &Bound<'py, PyAny>,
     current: &Bound<'py, PyAny>,
 ) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let config = owner.getattr("worker_config")?;
+    let config = crate::worker::config::native(&owner.getattr("worker_config")?)?;
     let canonical = owner
         .py()
         .import("uniserve.runtime.device")?
         .getattr("canonical_device")?;
     let mut devices = Vec::new();
     let mut seen: HashSet<_> = cuda_index(current)?.into_iter().collect();
-    for field in ["device", "generation_device"] {
-        let value = config.getattr(field)?;
-        if value.is_none() {
-            continue;
-        }
+    for value in config.devices() {
         let device = canonical.call1((value,))?;
         if let Some(index) = cuda_index(&device)?
             && seen.insert(index)

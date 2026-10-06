@@ -186,13 +186,14 @@ pub(super) fn decode_shapes(
     row_units: usize,
     num_units: usize,
 ) -> PyResult<Vec<usize>> {
-    if config.getattr("graph_policy")?.extract::<String>()? == "off" {
+    let config_native = crate::worker::config::native(config)?;
+    if config_native.graph_policy == "off" {
         return Ok(Vec::new());
     }
-    Ok(config
-        .getattr("decode_graph_batch_sizes")?
-        .extract::<Vec<usize>>()?
-        .into_iter()
+    Ok(config_native
+        .decode_graph_batch_sizes
+        .iter()
+        .copied()
         .filter(|&rows| rows > 0 && rows <= max_rows && rows * row_units < num_units)
         .collect())
 }
@@ -208,9 +209,8 @@ pub(super) fn configured_prefill(
     device_causality: bool,
     pool: Option<(&[(usize, usize)], usize)>,
 ) -> PyResult<Vec<NativePrefillShape>> {
-    if config.getattr("graph_policy")?.extract::<String>()? == "off"
-        || !config.getattr("prefill_cuda_graph")?.extract::<bool>()?
-    {
+    let config_native = crate::worker::config::native(config)?;
+    if config_native.graph_policy == "off" || !config_native.prefill_cuda_graph {
         return Ok(Vec::new());
     }
     let mut variants = vec![(Some(true), image_builder)];
@@ -220,21 +220,13 @@ pub(super) fn configured_prefill(
             variants.push((None, true));
         }
     }
-    let tokens = config
-        .getattr("prefill_graph_token_sizes")?
-        .extract::<Vec<usize>>()?;
-    let rows = config
-        .py()
-        .import("uniserve_worker.config.execution")?
-        .getattr("DEFAULT_PREFILL_GRAPH_ROW_BUCKETS")?
-        .extract::<Vec<usize>>()?;
     Ok(uniserve_worker::prefill_shapes(
-        &tokens,
-        &rows,
+        &config_native.prefill_graph_token_sizes,
+        uniserve_worker::config::PREFILL_ROW_BUCKETS,
         max_rows,
         max_tokens,
         &variants,
-        config.getattr("prefill_outputs")?.extract()?,
+        config_native.prefill_outputs,
         pool,
     ))
 }

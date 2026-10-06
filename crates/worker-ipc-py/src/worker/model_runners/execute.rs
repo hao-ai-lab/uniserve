@@ -56,7 +56,7 @@ pub(super) fn run_batch<'py>(
         .inner
         .component
         .clone();
-    let rank: usize = owner.getattr("worker_config")?.getattr("rank")?.extract()?;
+    let rank: usize = crate::worker::config::native(&owner.getattr("worker_config")?)?.rank;
     let range = py.import("uniserve.profiling")?.call_method1(
         "profile_range",
         (format!(

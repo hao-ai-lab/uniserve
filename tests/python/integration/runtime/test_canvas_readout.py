@@ -100,8 +100,7 @@ def _worker(root, queue_depth=1, **settings):
     further ``WorkerConfig`` fields.
     """
     loaded = models.read_config(root)
-    config = replace(
-        stub_worker_config(PAGE, max_batch_tokens=256),
+    config = stub_worker_config(PAGE, max_batch_tokens=256).replace(
         model_dtype="float32",
         max_sequence_tokens=128,
         **settings,

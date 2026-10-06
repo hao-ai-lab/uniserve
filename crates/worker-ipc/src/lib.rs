@@ -105,11 +105,13 @@ pub use socket::{SocketClient, SocketServer};
 // each module takes the shared imports through `use super::*` and the
 // validation macros through textual scope.
 mod call;
+mod config;
 mod info;
 mod request;
 mod tensor;
 
 pub use call::*;
+pub use config::LaneConfig;
 pub use info::*;
 pub use request::*;
 pub use tensor::*;

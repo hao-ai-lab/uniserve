@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -38,19 +37,18 @@ def execution_worker(
     tokenizer: Any | None = None,
 ) -> WorkerClient:
     ready = Model().to(device) if model is None else model
-    worker_config = replace(
-        stub_worker_config(block_size, max_batch_tokens=max_batch_tokens),
+    worker_config = stub_worker_config(
+        block_size, max_batch_tokens=max_batch_tokens
+    ).replace(
         device=device,
         max_request_pool_size=max_request_pool_size,
     )
     if max_batch_calls is not None:
-        worker_config = replace(
-            worker_config,
+        worker_config = worker_config.replace(
             max_batch_calls=int(max_batch_calls),
         )
     if encoder_cache_entries is not None:
-        worker_config = replace(
-            worker_config,
+        worker_config = worker_config.replace(
             encoder_cache_entries=int(encoder_cache_entries),
         )
     policy = (
@@ -67,8 +65,7 @@ def execution_worker(
         # The fixture is the resource owner for its constructed modules.
         ready.latent_encoder.to(policy.generation_device)
         ready.image_decoder.to(policy.generation_device)
-    worker_config = replace(
-        policy,
+    worker_config = policy.replace(
         device=worker_config.device,
         block_size=worker_config.block_size,
         kv_token_capacity=worker_config.kv_token_capacity,

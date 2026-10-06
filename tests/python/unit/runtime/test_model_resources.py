@@ -200,8 +200,7 @@ def test_worker_info_reports_capabilities_and_cache_limits():
 
 
 def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
-    worker_config = replace(
-        TEST_WORKER_CONFIG,
+    worker_config = TEST_WORKER_CONFIG.replace(
         kv_token_capacity=1024 + 1,
     )
 
@@ -235,7 +234,7 @@ def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
 def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() -> (  # noqa: E501
     None
 ):
-    worker_config = replace(TEST_WORKER_CONFIG, model_dtype="float32")
+    worker_config = TEST_WORKER_CONFIG.replace(model_dtype="float32")
     layout = build_worker_layout(
         TEST_MODEL, worker_config, image_processor=image_processor()
     )
@@ -253,10 +252,10 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
 @pytest.mark.parametrize(
     "worker_config",
     [
-        lambda: replace(TEST_WORKER_CONFIG, rank=1, world_size=1),
-        lambda: replace(TEST_WORKER_CONFIG, world_size=0),
-        lambda: replace(TEST_WORKER_CONFIG, block_size=0),
-        lambda: replace(TEST_WORKER_CONFIG, model_dtype="bf16"),
+        lambda: TEST_WORKER_CONFIG.replace(rank=1, world_size=1),
+        lambda: TEST_WORKER_CONFIG.replace(world_size=0),
+        lambda: TEST_WORKER_CONFIG.replace(block_size=0),
+        lambda: TEST_WORKER_CONFIG.replace(model_dtype="bf16"),
     ],
 )
 def test_worker_worker_config_rejects_invalid_runtime_geometry(worker_config):

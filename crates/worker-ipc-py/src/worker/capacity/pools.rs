@@ -40,7 +40,10 @@ pub(super) fn media_components<'py>(
         .import("uniserve_worker.bootstrap.components")?
         .call_method1(
             "media_components",
-            (model, config.getattr("deployment_components")?),
+            (
+                model,
+                &crate::worker::config::native(config)?.deployment_components,
+            ),
         )
 }
 
@@ -139,11 +142,12 @@ pub(super) fn latent_pool_plan(
     model: &Bound<'_, PyAny>,
     worker_config: &Bound<'_, PyAny>,
 ) -> PyResult<Option<LatentPoolPlan>> {
+    let worker_config_native = crate::worker::config::native(worker_config)?;
     let py = model.py();
-    let slots = worker_config.getattr("max_request_pool_size")?.extract()?;
+    let slots = worker_config_native.max_request_pool_size;
     let flow = image_builder(model)?;
     if !flow.is_none() {
-        let dtype_name: String = worker_config.getattr("model_dtype")?.extract()?;
+        let dtype_name: String = worker_config_native.model_dtype.clone();
         let torch = py.import("torch")?;
         let dtype = torch.getattr(dtype_name.trim_start_matches("torch."))?;
         if !dtype.is_instance(&torch.getattr("dtype")?)? {
@@ -154,13 +158,15 @@ pub(super) fn latent_pool_plan(
         }
 
         let per_image: usize = flow.getattr("max_tokens")?.extract()?;
-        let budget: Option<usize> = worker_config.getattr("kv_token_capacity")?.extract()?;
+        let budget: Option<usize> = worker_config_native.kv_token_capacity;
         let units = if per_image == 0 {
             0
         } else {
             per_image.max(budget.unwrap_or(per_image))
         };
-        let page_units: usize = worker_config.getattr("block_size")?.extract()?;
+        let page_units = worker_config_native
+            .block_size
+            .ok_or_else(|| unsupported(py, "KV page size has not been resolved"))?;
         let denoiser = flow.getattr("denoiser")?;
         let channels: usize = denoiser.getattr("latent_channels")?.extract()?;
         let patch: usize = denoiser.getattr("patch_size")?.extract()?;
@@ -223,8 +229,13 @@ pub(in crate::worker) fn resolve_request_capacity<'py>(
     bindings: Option<&Bound<'py, PyAny>>,
     state_buffers: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let worker_config_native = crate::worker::config::native(worker_config)?;
     let py = model.py();
-    let device = worker_config.getattr("device")?;
+    let device = worker_config_native
+        .device
+        .as_str()
+        .into_pyobject(py)?
+        .into_any();
     if !is_cuda(&device)? {
         return Ok(worker_config.clone());
     }
@@ -233,12 +244,12 @@ pub(in crate::worker) fn resolve_request_capacity<'py>(
         .import("uniserve.runtime.device")?
         .call_method1(
             "device_storage_budget",
-            (&device, worker_config.getattr("kv_storage_fraction")?),
+            (&device, worker_config_native.kv_storage_fraction),
         )?
         .get_item(0)?
         .extract()?;
-    let changes = PyDict::new(py);
-    changes.set_item("pool_storage_bytes", available)?;
+    let mut resolved = (*worker_config_native).clone();
+    resolved.pool_storage_bytes = Some(available as usize);
     let empty = PyDict::new(py).into_any();
     let bindings = bindings.unwrap_or(&empty);
     let builder = media_builder(model, worker_config)?;
@@ -250,13 +261,10 @@ pub(in crate::worker) fn resolve_request_capacity<'py>(
     if schema.is_truthy()? || !capability(model, "VideoPostprocessor")?.is_none() {
         let group = capacity_group
             .ok_or_else(|| unsupported(py, "request tensor sizing requires its rank group"))?;
-        let maximum = worker_config
-            .getattr("max_request_pool_size")?
-            .extract::<usize>()?
+        let maximum = worker_config_native
+            .max_request_pool_size
             .min(queue_depth / 3);
-        let minimum = worker_config
-            .getattr("min_request_pool_size")?
-            .extract::<usize>()?;
+        let minimum = worker_config_native.min_request_pool_size;
         if minimum == 0 || maximum < minimum {
             return Err(PyValueError::new_err(
                 "request tensor capacity requires valid slot bounds",
@@ -285,10 +293,8 @@ pub(in crate::worker) fn resolve_request_capacity<'py>(
             .transpose()?
             .unwrap_or(0);
         let scalar_bytes = scalar_bytes(py)?;
-        let calls = worker_config
-            .getattr("max_batch_calls")?
-            .extract::<usize>()?;
-        let ranks = worker_config.getattr("world_size")?.extract()?;
+        let calls = worker_config_native.max_batch_calls;
+        let ranks = worker_config_native.world_size;
         let mut requirements = Vec::with_capacity(maximum - minimum + 1);
         for count in minimum..=maximum {
             let arena = native::ArenaCapacity::for_requests(
@@ -328,18 +334,11 @@ pub(in crate::worker) fn resolve_request_capacity<'py>(
         }
 
         let slots = tensor_slot_capacity(requirements, group, minimum, available)?;
-        changes.set_item("max_request_pool_size", slots)?;
-        changes.set_item("max_batch_calls", calls.min(slots))?;
-        changes.set_item(
-            "max_batch_tokens",
-            worker_config
-                .getattr("max_batch_tokens")?
-                .extract::<usize>()?
-                .min(slots),
-        )?;
+        resolved.max_request_pool_size = slots;
+        resolved.max_batch_calls = calls.min(slots);
+        resolved.max_batch_tokens = worker_config_native.max_batch_tokens.min(slots);
     }
-    py.import("dataclasses")?
-        .call_method("replace", (worker_config,), Some(&changes))
+    crate::worker::config::updated(worker_config, resolved)
 }
 
 /// Media slots reserve two unresolved outputs and one retirement position.
@@ -349,6 +348,7 @@ pub(super) fn loaded_worker_config<'py>(
     config: &Bound<'py, PyAny>,
     queue_depth: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let config_native = crate::worker::config::native(config)?;
     let py = model.py();
     let decoder = py.import("uniserve.model")?.getattr("VideoDecoder")?;
     let mut media = false;
@@ -362,10 +362,7 @@ pub(super) fn loaded_worker_config<'py>(
         return Ok(config.clone());
     }
 
-    let slots = config
-        .getattr("max_batch_calls")?
-        .extract::<usize>()?
-        .min(queue_depth / 3);
+    let slots = config_native.max_batch_calls.min(queue_depth / 3);
     if slots < 2 {
         return Err(unsupported(
             py,
@@ -375,14 +372,13 @@ pub(super) fn loaded_worker_config<'py>(
             ),
         ));
     }
-    let options = PyDict::new(py);
-    options.set_item("kv_token_capacity", py.None())?;
-    options.set_item("attention_backend", py.None())?;
-    options.set_item("generation_device", py.None())?;
-    options.set_item("max_batch_calls", slots)?;
-    options.set_item("max_batch_tokens", slots)?;
-    options.set_item("max_request_pool_size", slots)?;
-    options.set_item("min_request_pool_size", 2)?;
-    py.import("dataclasses")?
-        .call_method("replace", (config,), Some(&options))
+    let mut resolved = (*config_native).clone();
+    resolved.kv_token_capacity = None;
+    resolved.attention_backend = None;
+    resolved.generation_device = None;
+    resolved.max_batch_calls = slots;
+    resolved.max_batch_tokens = slots;
+    resolved.max_request_pool_size = slots;
+    resolved.min_request_pool_size = 2;
+    crate::worker::config::updated(config, resolved)
 }

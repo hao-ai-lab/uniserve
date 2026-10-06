@@ -294,7 +294,8 @@ impl PythonBackend {
         }
 
         let config = self.worker.bind(py).getattr("worker_config")?;
-        let rank: usize = config.getattr("rank")?.extract()?;
+        let config_native = crate::worker::config::native(&config)?;
+        let rank: usize = config_native.rank;
         if !self.info.components.is_empty() {
             for call in &plan.calls {
                 if !self.info.components.iter().any(|component| {
@@ -311,14 +312,15 @@ impl PythonBackend {
             }
         }
 
-        let max_calls: usize = config.getattr("max_batch_calls")?.extract()?;
+        let max_calls: usize = config_native.max_batch_calls;
         if plan.calls.len() > max_calls {
             return Err(invalid(
                 py,
                 "execution batch exceeds the worker_config call limit",
             ));
         }
-        let max_slots: u32 = config.getattr("max_request_pool_size")?.extract()?;
+        let max_slots = u32::try_from(config_native.max_request_pool_size)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
         if plan
             .block_tables
             .iter()

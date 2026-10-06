@@ -18,7 +18,7 @@
 //! descriptor built from it.
 
 use crate::executor::WorkerResult;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -74,78 +74,7 @@ const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// without a death watcher.
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// One configured model-execution lane passed in [`WorkerProcessArgs`].
-///
-/// The engine only parses and forwards lanes; the worker's `LaneConfig` in
-/// `uniserve_worker.config.execution` resolves and applies them. Unknown
-/// fields are refused here, as the worker refuses them, because the launch
-/// descriptor re-serializes only the fields below and a misspelled limit
-/// would otherwise vanish without an error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LaneConfig {
-    /// Stable lane identity within the worker process.
-    pub lane_id: String,
-    /// Streaming-multiprocessor budget assigned to the lane.
-    pub sm_budget: u32,
-    /// Lane selectors (`prefill`, `decode`, `flow`) that worker startup
-    /// resolves to call kinds through `LANE_COMPUTATION_GROUPS`.
-    pub domains: Vec<String>,
-    /// Optional call-count limit per batch.
-    pub max_batch_calls: Option<u32>,
-    /// Optional token-count limit per batch.
-    pub max_batch_tokens: Option<u32>,
-    /// Optional in-flight limit, from which the worker sizes the lane
-    /// stream's event slots.
-    pub max_inflight: Option<u32>,
-}
-
-impl std::str::FromStr for LaneConfig {
-    type Err = String;
-
-    /// Parses one JSON lane descriptor, as the `--lane` option passes it.
-    ///
-    /// Refuses invalid JSON, a field outside the lane schema, an empty
-    /// `lane_id`, a zero `sm_budget`, and an empty domain list or one with an
-    /// unknown or repeated selector. The worker validates the remaining
-    /// constraints, such as positive batch and in-flight limits, when it
-    /// reads the lane.
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let lane: Self = serde_json::from_str(value)
-            .map_err(|error| format!("invalid execution lane JSON: {error}"))?;
-        if lane.lane_id.is_empty()
-            || lane.sm_budget == 0
-            || lane.domains.is_empty()
-            || lane
-                .domains
-                .iter()
-                .any(|name| !matches!(name.as_str(), "prefill" | "decode" | "flow"))
-            || lane.domains.iter().collect::<HashSet<_>>().len() != lane.domains.len()
-        {
-            return Err("execution lane identity, SM budget, and domains must be valid".into());
-        }
-        Ok(lane)
-    }
-}
-
-impl LaneConfig {
-    /// Serializes the lane as one JSON object string of the launch
-    /// descriptor's `lane` list.
-    ///
-    /// The worker's `_parse_lanes` refuses unknown keys, so the keys written
-    /// here must stay within the set it accepts.
-    pub fn worker_arg(&self) -> String {
-        serde_json::json!({
-            "lane_id": self.lane_id,
-            "sm_budget": self.sm_budget,
-            "domains": self.domains,
-            "max_batch_calls": self.max_batch_calls,
-            "max_batch_tokens": self.max_batch_tokens,
-            "max_inflight": self.max_inflight,
-        })
-        .to_string()
-    }
-}
+pub use uniserve_worker_ipc::LaneConfig;
 
 /// FlashInfer implementation selected in [`WorkerProcessArgs`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,15 +368,7 @@ impl WorkerProcessArgs {
             json!(self.distributed_backend),
         );
         fields.insert("mesh".into(), json!(self.mesh));
-        fields.insert(
-            "lane".into(),
-            json!(
-                self.lanes
-                    .iter()
-                    .map(|lane| lane.worker_arg())
-                    .collect::<Vec<_>>()
-            ),
-        );
+        fields.insert("lane".into(), json!(self.lanes));
         // The worker refuses `no_model` without `allow_stub`, so a stub
         // launch states both.
         fields.insert("no_model".into(), json!(self.stub));
@@ -1602,7 +1523,20 @@ mod tests {
     #[test]
     fn a_lane_naming_an_unknown_field_is_refused() {
         let lane = r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]"#;
-        assert!(format!("{lane}}}").parse::<LaneConfig>().is_ok());
+        let parsed = format!("{lane}}}")
+            .parse::<LaneConfig>()
+            .expect("decode lane");
+        let args = WorkerProcessArgs {
+            lanes: vec![parsed],
+            ..WorkerProcessArgs::default()
+        };
+        let descriptor = args
+            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
+            .expect("descriptor");
+        assert_eq!(
+            descriptor["lane"][0]["call_kinds"],
+            serde_json::json!(["decode", "verify", "token_denoising"])
+        );
 
         for misspelled in [r#""max_batch_token":4096"#, r#""max_inflght":2"#] {
             let parsed = format!("{lane},{misspelled}}}").parse::<LaneConfig>();

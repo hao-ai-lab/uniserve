@@ -19,7 +19,7 @@ pub(super) fn synchronize(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny
     // a runner. Explicit shutdown drains it before freeing model backing.
     let device = py.import("uniserve.runtime.device")?.call_method1(
         "canonical_device",
-        (owner.getattr("worker_config")?.getattr("device")?,),
+        (&crate::worker::config::native(&owner.getattr("worker_config")?)?.device,),
     )?;
     let mut devices = vec![device.clone()];
     devices.extend(super::streams::capture_devices(owner, &device)?);

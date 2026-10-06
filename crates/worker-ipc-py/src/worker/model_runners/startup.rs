@@ -200,10 +200,10 @@ fn prepare_prefill(
     let py = owner.py();
     let backend = py.import("uniserve_worker.model_executor.startup")?;
     let config = owner.getattr("worker_config")?;
-    let row_tokens = config
-        .getattr("max_sequence_tokens")?
-        .extract::<usize>()?
-        .min(config.getattr("max_batch_tokens")?.extract()?)
+    let config_native = crate::worker::config::native(&config)?;
+    let row_tokens = config_native
+        .max_sequence_tokens
+        .min(config_native.max_batch_tokens)
         .max(1);
     let cache = owner.getattr("kv_cache")?;
     let groups: Vec<Py<GroupShape>> = cache.getattr("shapes")?.extract()?;
@@ -354,8 +354,8 @@ fn prepare_flow(
     let py = owner.py();
     let backend = py.import("uniserve_worker.model_executor.startup")?;
     let config = owner.getattr("worker_config")?;
-    let capture_enabled = config.getattr("graph_policy")?.extract::<String>()? != "off"
-        && config.getattr("flow_cuda_graph")?.is_truthy()?;
+    let config_native = crate::worker::config::native(&config)?;
+    let capture_enabled = config_native.graph_policy != "off" && config_native.flow_cuda_graph;
     let builder = owner.getattr("image_builder")?;
     let capacity = builder
         .getattr("max_tokens")?
@@ -542,10 +542,8 @@ fn prepare_images(
                     Execution::capture_images(
                         &execution(runner)?,
                         runner,
-                        owner
-                            .getattr("worker_config")?
-                            .getattr("max_batch_calls")?
-                            .extract()?,
+                        crate::worker::config::native(&owner.getattr("worker_config")?)?
+                            .max_batch_calls,
                         &prepared.get_item(1)?,
                     )?;
                 } else {

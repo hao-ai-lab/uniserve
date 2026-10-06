@@ -36,8 +36,7 @@ def _model() -> Model:
 
 
 def _worker_config(*, token_capacity: int | None):
-    return replace(
-        TEST_WORKER_CONFIG,
+    return TEST_WORKER_CONFIG.replace(
         device="cuda:0",
         block_size=BLOCK_SIZE,
         kv_token_capacity=token_capacity,
@@ -106,8 +105,7 @@ def test_automatic_cuda_kv_capacity_requires_a_host_grant():
 @pytest.mark.gpu
 def test_automatic_capacity_charges_request_and_input_storage() -> None:
     model = _model()
-    config = replace(
-        _worker_config(token_capacity=None),
+    config = _worker_config(token_capacity=None).replace(
         pool_storage_bytes=32 * 1024**3,
         max_request_pool_size=4,
         max_batch_calls=4,
@@ -115,10 +113,10 @@ def test_automatic_capacity_charges_request_and_input_storage() -> None:
     )
     small = build_worker_layout(model, config).info
     larger_requests = build_worker_layout(
-        model, replace(config, max_request_pool_size=128)
+        model, config.replace(max_request_pool_size=128)
     ).info
     larger_input = build_worker_layout(
-        model, replace(config, max_batch_tokens=65536)
+        model, config.replace(max_batch_tokens=65536)
     ).info
     assert small.kv_cache is not None
     assert larger_requests.kv_cache is not None
@@ -131,8 +129,7 @@ def test_automatic_capacity_charges_request_and_input_storage() -> None:
 @pytest.mark.gpu
 def test_explicit_pages_cannot_displace_resident_encoder_storage() -> None:
     model = _model()
-    config = replace(
-        _worker_config(token_capacity=64),
+    config = _worker_config(token_capacity=64).replace(
         pool_storage_bytes=32 * 1024**3,
         max_request_pool_size=4,
         max_batch_calls=4,

@@ -147,13 +147,21 @@ def test_component_quantization_config_reaches_model_launch_config(
     }
 
 
-def test_execution_lanes_are_typed_and_domain_disjoint(tmp_path) -> None:
+def test_execution_lanes_bind_disjoint_calls(tmp_path) -> None:
     config = worker_args(
         tmp_path,
         max_batch_tokens=8192,
         lane=[
-            '{"lane_id":"decode","sm_budget":64,"domains":["decode"]}',
-            '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}',
+            {
+                "lane_id": "decode",
+                "sm_budget": 64,
+                "call_kinds": ["decode", "verify", "token_denoising"],
+            },
+            {
+                "lane_id": "compute",
+                "sm_budget": 88,
+                "call_kinds": ["prefill", "denoising"],
+            },
         ],
     )
 
@@ -163,8 +171,6 @@ def test_execution_lanes_are_typed_and_domain_disjoint(tmp_path) -> None:
         ("decode", 64),
         ("compute", 88),
     )
-    # The decode domain holds the calls that advance admitted requests
-    # without growing their prompt.
     assert config.execution.lanes[0].call_kinds == (
         ForwardMode.DECODE,
         ForwardMode.VERIFY,
@@ -173,7 +179,7 @@ def test_execution_lanes_are_typed_and_domain_disjoint(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
-    "capacity", ['"kv_capacity_tokens":4096', '"latent_capacity_units":8']
+    "capacity", ["kv_capacity_tokens", "latent_capacity_units"]
 )
 def test_execution_lanes_reject_a_pool_capacity(capacity, tmp_path) -> None:
     # A lane partitions compute only; its calls share the worker-wide KV and
@@ -183,21 +189,24 @@ def test_execution_lanes_reject_a_pool_capacity(capacity, tmp_path) -> None:
             tmp_path,
             max_batch_tokens=8192,
             lane=[
-                '{"lane_id":"decode","sm_budget":64,"domains":["decode"],'
-                + capacity
-                + "}"
+                {
+                    "lane_id": "decode",
+                    "sm_budget": 64,
+                    "call_kinds": ["decode"],
+                    capacity: 4096,
+                }
             ],
         )
 
 
-def test_execution_lanes_reject_duplicate_domain_bindings(tmp_path) -> None:
+def test_execution_lanes_reject_duplicate_call_bindings(tmp_path) -> None:
     with pytest.raises(SystemExit):
         worker_args(
             tmp_path,
             max_batch_tokens=8192,
             lane=[
-                '{"lane_id":"a","sm_budget":64,"domains":["decode"]}',
-                '{"lane_id":"b","sm_budget":64,"domains":["decode"]}',
+                {"lane_id": "a", "sm_budget": 64, "call_kinds": ["decode"]},
+                {"lane_id": "b", "sm_budget": 64, "call_kinds": ["decode"]},
             ],
         )
 

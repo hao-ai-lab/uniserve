@@ -41,14 +41,10 @@ pub(super) fn configure(
     owner.setattr("table_widths", &widths)?;
 
     let config = owner.getattr("worker_config")?;
+    let config_native = crate::worker::config::native(&config)?;
     let streams = Arc::clone(&slf.borrow().streams);
     streams.initialize(owner, Some(max_inflight + 1))?;
-    if config
-        .getattr("expert_exchange")?
-        .extract::<Option<String>>()?
-        .as_deref()
-        == Some("dwdp")
-    {
+    if config_native.expert_exchange == "dwdp" {
         if streams.lane_count() > 1 {
             return Err(PyValueError::new_err(
                 "DWDP weight buffers require one execution lane",
@@ -63,7 +59,7 @@ pub(super) fn configure(
     let max_tokens: usize = input_config.getattr("max_tokens")?.extract()?;
     experts::configure(slf, owner, max_tokens)?;
     let has_experts = !slf.borrow().exchanges.is_empty();
-    let microbatches: usize = config.getattr("expert_microbatches")?.extract()?;
+    let microbatches: usize = config_native.expert_microbatches;
 
     let max_rows = max_calls.min(request_slots);
     let num_units: usize = kv_cache.getattr("info")?.getattr("num_units")?.extract()?;
@@ -103,7 +99,7 @@ pub(super) fn configure(
     let attention = owner.getattr("attention")?;
     let cache = kv_cache.getattr("cache")?;
     let storage = owner.getattr("graph_storage")?;
-    let capture = config.getattr("graph_policy")?.extract::<String>()? != "off";
+    let capture = config_native.graph_policy != "off";
     let runtime = py.import("uniserve.runtime")?;
     let models = py.import("uniserve.model")?;
     let buffers = py.import("uniserve_worker.model_executor.input_buffers")?;
@@ -145,15 +141,12 @@ pub(super) fn configure(
                 CallKind::Media(MediaCall::LatentEncoding | MediaCall::ImageDecoding)
             )
         }) {
-            let generation = config.getattr("generation_device")?;
-            py.import("uniserve.runtime.device")?.call_method1(
-                "canonical_device",
-                (if generation.is_none() {
-                    config.getattr("device")?
-                } else {
-                    generation
-                },),
-            )?
+            let generation = config_native
+                .generation_device
+                .as_deref()
+                .unwrap_or(&config_native.device);
+            py.import("uniserve.runtime.device")?
+                .call_method1("canonical_device", (generation,))?
         } else {
             module.binding.bind(py).getattr("device")?
         };
@@ -317,10 +310,10 @@ pub(super) fn configure(
 
                     let options = PyDict::new(py);
                     options.set_item("storage", &storage)?;
-                    options.set_item("exact_graphs", config.getattr("flow_cuda_graph")?)?;
+                    options.set_item("exact_graphs", config_native.flow_cuda_graph)?;
                     options.set_item("cache", &cache)?;
                     options.set_item("predicates", predicates)?;
-                    options.set_item("rank", config.getattr("rank")?)?;
+                    options.set_item("rank", config_native.rank)?;
                     let mut devices = Vec::new();
                     if capture && cuda {
                         devices.push(target.clone());
@@ -432,8 +425,9 @@ fn configure_images(
 ) -> PyResult<()> {
     let py = owner.py();
     let config = owner.getattr("worker_config")?;
-    let sizes: Vec<(usize, usize)> = config.getattr("flow_graph_shapes")?.extract()?;
-    let rows: Vec<usize> = config.getattr("flow_graph_batch_sizes")?.extract()?;
+    let config_native = crate::worker::config::native(&config)?;
+    let sizes: Vec<(usize, usize)> = config_native.flow_graph_shapes.clone();
+    let rows: Vec<usize> = config_native.flow_graph_batch_sizes.clone();
     let capacity: usize = pool.getattr("capacity_units")?.extract()?;
     let image = py.import("uniserve.media.image")?.getattr("Config")?;
     let shape = py

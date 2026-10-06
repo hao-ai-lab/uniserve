@@ -15,6 +15,7 @@ pub(super) fn layout(
     bindings: &Bound<'_, PyAny>,
     outputs: &Bound<'_, PyAny>,
 ) -> PyResult<WorkerLayout> {
+    let config_native = crate::worker::config::native(config)?;
     let py = model.py();
     let text = capability(model, "CausalLM")?;
     let flow = image_builder(model)?;
@@ -61,7 +62,8 @@ pub(super) fn layout(
     };
     let feature_bytes = latent_features.max(vision_features);
     info.encoder_cache_entries = if processor.is_some() {
-        config.getattr("encoder_cache_entries")?.extract()?
+        u32::try_from(config_native.encoder_cache_entries)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?
     } else {
         0
     };
@@ -94,9 +96,9 @@ pub(super) fn layout(
             info.buffer_pool_bytes + arena.device_product_bytes / devices.len() as u64,
         );
     }
-    let generation = config
-        .getattr("generation_device")?
-        .extract::<Option<String>>()?
+    let generation = config_native
+        .generation_device
+        .clone()
         .unwrap_or_else(|| info.device.clone());
     *fixed.entry(generation).or_default() += latent_bytes;
     let input = if text.is_none() {
@@ -134,24 +136,23 @@ pub(super) fn layout(
             .iter()
             .map(|group| (group.page_tokens, group.units_per_page))
             .collect();
-        let padding = py
-            .import("uniserve_worker.config.execution")?
-            .getattr("graph_padding_block_count")?;
         let mut reserved_units = 0;
         for &(tokens, units) in &pages {
-            reserved_units += padding.call1((tokens,))?.extract::<u64>()? * u64::from(units);
+            reserved_units += uniserve_worker::config::graph_padding_block_count(tokens as usize)
+                as u64
+                * u64::from(units);
         }
         reserved_units += uniserve_worker::graph_storage_budget_bytes(device_total_bytes(
-            &config.getattr("device")?,
+            &config_native.device.as_str().into_pyobject(py)?.into_any(),
         )? as i64)
         .div_ceil(cache.unit_bytes);
         reserved_units += fixed[&info.device].div_ceil(cache.unit_bytes);
         let mut capacity = derive_runtime_kv_capacity(
             pages.clone(),
-            config.getattr("kv_token_capacity")?.extract()?,
+            config_native.kv_token_capacity.map(|tokens| tokens as u64),
             cache.unit_bytes,
-            Some(&config.getattr("device")?),
-            config.getattr("pool_storage_bytes")?.extract()?,
+            Some(&config_native.device.as_str().into_pyobject(py)?.into_any()),
+            config_native.pool_storage_bytes.map(|bytes| bytes as u64),
             1,
             None,
             1,
@@ -259,6 +260,7 @@ fn reserve_inputs(
     image: bool,
     fixed: &mut BTreeMap<String, u64>,
 ) -> PyResult<(bool, bool)> {
+    let config_native = crate::worker::config::native(config)?;
     let py = model.py();
     let declarations = py.import("uniserve_worker.bootstrap.components")?;
     let buffers = py.import("uniserve_worker.model_executor.input_buffers")?;
@@ -272,23 +274,20 @@ fn reserve_inputs(
             Ok((kind.extract::<String>()?, kind))
         })
         .collect::<PyResult<BTreeMap<_, _>>>()?;
-    let device: String = config.getattr("device")?.extract()?;
-    let generation = config
-        .getattr("generation_device")?
-        .extract::<Option<String>>()?
+    let device: String = config_native.device.clone();
+    let generation = config_native
+        .generation_device
+        .clone()
         .unwrap_or_else(|| device.clone());
-    let max_rows = config
-        .getattr("max_batch_calls")?
-        .extract::<usize>()?
-        .min(config.getattr("max_request_pool_size")?.extract()?);
-    let copies = config.getattr("expert_microbatches")?.extract::<u64>()?;
-    let mut lanes = config
-        .getattr("lanes")?
-        .try_iter()?
-        .collect::<PyResult<Vec<_>>>()?;
-    if lanes.is_empty() {
-        lanes.push(py.None().into_bound(py));
-    }
+    let max_rows = config_native
+        .max_batch_calls
+        .min(config_native.max_request_pool_size);
+    let copies = config_native.expert_microbatches as u64;
+    let lanes: Vec<_> = if config_native.lanes.is_empty() {
+        vec![None]
+    } else {
+        config_native.lanes.iter().map(Some).collect()
+    };
     let mut prefill = false;
     let mut decode = false;
     for item in declarations
@@ -322,15 +321,16 @@ fn reserve_inputs(
             let target_device = py.import("torch")?.getattr("device")?.call1((&target,))?;
             let cuda = target_device.getattr("type")?.extract::<String>()? == "cuda";
             for lane in &lanes {
-                let selected = if lane.is_none() {
-                    kinds.clone()
-                } else {
-                    let allowed = lane
-                        .getattr("call_kinds")?
-                        .extract::<Vec<String>>()?
-                        .into_iter()
-                        .collect::<BTreeSet<_>>();
-                    kinds.intersection(&allowed).cloned().collect()
+                let selected = match lane {
+                    None => kinds.clone(),
+                    Some(lane) => {
+                        let allowed: BTreeSet<_> = lane
+                            .call_kinds
+                            .iter()
+                            .map(|kind| kind.as_str().to_owned())
+                            .collect();
+                        kinds.intersection(&allowed).cloned().collect()
+                    }
                 };
                 let Some(kind) = selected.first() else {
                     continue;
@@ -346,7 +346,7 @@ fn reserve_inputs(
                     }
                 } else if selected.contains("token_denoising")
                     && cuda
-                    && config.getattr("graph_policy")?.extract::<String>()? != "off"
+                    && config_native.graph_policy != "off"
                 {
                     rows = py
                         .import("uniserve_worker.model_executor.canvas_runner")?
@@ -381,14 +381,12 @@ fn reserve_inputs(
                 let slots = py.import("uniserve_worker.storage.canvas_slots")?;
                 let denoiser =
                     slots.call_method1("generating_denoiser", (call.getattr("module")?,))?;
-                let sampling = config.getattr("canvas_sampling")?;
-                if !denoiser.is_none() && !sampling.is_none() {
+                if let Some(sampling) = &config_native.canvas_sampling
+                    && !denoiser.is_none()
+                {
                     let options = PyDict::new(py);
-                    options.set_item(
-                        "request_pool_size",
-                        config.getattr("max_request_pool_size")?,
-                    )?;
-                    options.set_item("history_depth", sampling.getattr("stability_threshold")?)?;
+                    options.set_item("request_pool_size", config_native.max_request_pool_size)?;
+                    options.set_item("history_depth", sampling.stability_threshold)?;
                     let resident: u64 = slots
                         .getattr("CanvasSlots")?
                         .call_method("denoiser_bytes", (&denoiser,), Some(&options))?
@@ -417,6 +415,7 @@ fn shared_bytes(
     dtype: &Bound<'_, PyAny>,
     info: &WorkerInfo,
 ) -> PyResult<u64> {
+    let config_native = crate::worker::config::native(config)?;
     let py = config.py();
     let shapes = groups
         .iter()
@@ -427,7 +426,7 @@ fn shared_bytes(
     options.set_item("request_pool_size", info.request_slots)?;
     options.set_item(
         "width",
-        inputs::resident_width(planes, config.getattr("max_sequence_tokens")?.extract()?)?,
+        inputs::resident_width(planes, config_native.max_sequence_tokens as u64)?,
     )?;
     let tables = py
         .import("uniserve_worker.storage.block_tables")?

@@ -6,9 +6,8 @@ The engine writes one JSON launch descriptor per rank, and
 it into immutable values, so later bootstrap stages consume typed fields and
 never reparse descriptor text. Values this module rejects raise
 ``ValueError``, which the launch adapter reports as a usage error before the
-worker starts; a value that passes these checks but violates a
-``WorkerConfig`` invariant raises ``WorkerError`` from
-``WorkerConfig.__post_init__`` instead.
+worker starts. Execution settings are normalized by the native
+``WorkerConfig.from_launch`` method.
 
 ``SequenceConfig``, ``ParallelConfig`` and ``ComponentConfig`` mirror the
 component declarations in the ``uniserve-core`` crate's ``parallel`` module:
@@ -19,7 +18,6 @@ rejected.
 from __future__ import annotations
 
 import argparse
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from math import prod
@@ -28,10 +26,7 @@ from typing import Literal
 
 from uniserve.loading import Config as IOConfig
 from uniserve.runtime.process_groups import Rendezvous
-from uniserve_worker.config.execution import (
-    WorkerConfig,
-    worker_config_from_namespace,
-)
+from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.call import (
     CallKind,
     ForwardMode,
@@ -483,8 +478,6 @@ class WorkerProcessArgs:
         Raises:
             ValueError: If a value is malformed, out of range, inconsistent
                 with another value, or names an unsupported option.
-            WorkerError: If execution settings that pass these checks violate
-                a ``WorkerConfig`` invariant.
         """
         role = str(getattr(namespace, "role", "model"))
         supported_calls = (
@@ -510,7 +503,10 @@ class WorkerProcessArgs:
         export_backends = _parse_transfer_backends(namespace.export_backends)
         model_path = str(namespace.model or "").strip()
 
-        _validate_scalars(namespace)
+        if int(namespace.queue_depth) <= 0:
+            raise ValueError("--queue-depth must be positive")
+        if int(namespace.ipc_payload_cap) <= 0:
+            raise ValueError("--ipc-payload-cap must be positive")
 
         # ``no_model`` builds the stub model, which serves synthetic outputs;
         # it is accepted only together with ``allow_stub``.
@@ -564,8 +560,10 @@ class WorkerProcessArgs:
                 backends=backends,
                 export_backends=export_backends,
             ),
-            execution=worker_config_from_namespace(
-                namespace, device=device, generation_device=generation_device
+            execution=WorkerConfig.from_launch(
+                vars(namespace),
+                device=device,
+                generation_device=generation_device,
             ),
             load=_load_config(namespace),
             use_stub_model=use_stub_model,
@@ -574,54 +572,6 @@ class WorkerProcessArgs:
             ),
             expert_parallel=expert_parallel,
         )
-
-
-def _validate_scalars(namespace: argparse.Namespace) -> None:
-    """Validate positive capacities and scalar process settings.
-
-    Raises:
-        ValueError: If a value is out of range; the message names the launch
-            option.
-    """
-    positive_fields = {
-        "--max-batch-calls": namespace.max_batch_calls,
-        "--max-batch-tokens": namespace.max_batch_tokens,
-        "--max-request-pool-size": namespace.max_request_pool_size,
-        "--queue-depth": namespace.queue_depth,
-        "--ipc-payload-cap": namespace.ipc_payload_cap,
-        "--world-size": namespace.world_size,
-        "--max-model-len": namespace.max_model_len,
-        "--flashinfer-workspace-size": namespace.flashinfer_workspace_size,
-    }
-    for option, value in positive_fields.items():
-        if int(value) <= 0:
-            raise ValueError(f"{option} must be positive")
-    if (
-        namespace.kv_token_capacity is not None
-        and int(namespace.kv_token_capacity) <= 0
-    ):
-        raise ValueError("--kv-token-capacity must be positive when provided")
-
-    # The capacity resolves to frames at 24 frames per second, rounded half
-    # to even as the server rounds a request's duration. The server admits
-    # capacities within its video API range; the worker only requires one
-    # that covers at least one frame and fits a u32 once the model's native
-    # windows extend it by up to 16 frames.
-    max_video_seconds = float(namespace.max_video_seconds)
-    if not math.isfinite(max_video_seconds) or max_video_seconds <= 0:
-        raise ValueError(
-            "--max-video-seconds must resolve to a supported frame count"
-        )
-    max_video_frames = round(max_video_seconds * 24.0)
-    if max_video_frames < 1 or max_video_frames > 2**32 - 17:
-        raise ValueError(
-            "--max-video-seconds must resolve to a supported frame count"
-        )
-
-    if int(namespace.rank) < 0 or int(namespace.rank) >= int(
-        namespace.world_size
-    ):
-        raise ValueError("--rank must satisfy 0 <= rank < world-size")
 
 
 def _require_native_cuda_representation(namespace: argparse.Namespace) -> None:

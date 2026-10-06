@@ -1,7 +1,5 @@
 """Cache allocation chooses page sizes supported by every numerical reader."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -27,7 +25,7 @@ def test_hybrid_page_size_serves_every_attention_group():
         group.page_tokens for group in plan_cache(model, config).groups
     ) == [32, 64]
 
-    explicit = replace(config, block_size=64)
+    explicit = config.replace(block_size=64)
     assert resolve_page_size(model, explicit, backend) == explicit
 
 

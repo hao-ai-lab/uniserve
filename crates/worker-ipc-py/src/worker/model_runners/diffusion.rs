@@ -35,8 +35,8 @@ pub(super) fn runner<'py>(
     let stream = module.stream(owner)?;
     let device = binding.get_item(1)?.getattr("device")?;
     let config = owner.getattr("worker_config")?;
-    let captures =
-        !stream.is_none() && config.getattr("graph_policy")?.extract::<String>()? != "off";
+    let config_native = crate::worker::config::native(&config)?;
+    let captures = !stream.is_none() && config_native.graph_policy != "off";
 
     let builder = owner.getattr("media_builder")?;
     let options = PyDict::new(py);
@@ -55,7 +55,7 @@ pub(super) fn runner<'py>(
             .then(|| owner.getattr("diffusion_bank"))
             .transpose()?,
     )?;
-    options.set_item("slots", config.getattr("max_request_pool_size")?)?;
+    options.set_item("slots", config_native.max_request_pool_size)?;
     options.set_item("pool", pool)?;
     options.set_item("pages", builder.getattr("sample_pages")?.getattr("pages")?)?;
     options.set_item("attention", owner.getattr("attention")?)?;
@@ -122,10 +122,8 @@ pub(super) fn layout<'py>(
             .unbind());
     }
 
-    let capacity: usize = owner
-        .getattr("worker_config")?
-        .getattr("max_request_pool_size")?
-        .extract()?;
+    let capacity: usize =
+        crate::worker::config::native(&owner.getattr("worker_config")?)?.max_request_pool_size;
     if serving.len() >= capacity
         && let Some((key, _)) = serving.iter().next()
     {
@@ -152,7 +150,7 @@ pub(super) fn run(
     let py = slf.py();
     let runner = runner(slf, owner)?;
     let started = Instant::now();
-    let rank: usize = owner.getattr("worker_config")?.getattr("rank")?.extract()?;
+    let rank: usize = crate::worker::config::native(&owner.getattr("worker_config")?)?.rank;
     let (values, path) = with_context(
         &dispatch::profile(
             py,

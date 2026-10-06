@@ -171,7 +171,7 @@ def test_h3_worker_advertises_bounded_media_products():
     # Only conditioned tasks carry conditions: this deployment executes
     # text-to-video alone and provisions no condition product, whatever its
     # condition capacity.
-    conditioned = replace(config, max_condition_rows=1000)
+    conditioned = config.replace(max_condition_rows=1000)
     assert {
         value.name
         for values in resolve_outputs(model, conditioned).values()
@@ -289,7 +289,6 @@ def test_sensenova_reader_rejects_inconsistent_checkpoint_math(
 
 
 def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
-    from dataclasses import replace
 
     from uniserve_models.sensenova_u1 import read_config
 
