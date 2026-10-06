@@ -24,11 +24,9 @@ import torch
 from uniserve.diffusion import Renorm
 from uniserve.math import ceil_div
 from uniserve.media import image as media_image
+from uniserve_worker._uniserve_ipc import resolve_prefix
 from uniserve_worker.model_executor.attention import from_tables, table_pages
-from uniserve_worker.model_executor.diffusion_inputs import (
-    DiffusionRow,
-    resolve_prefix,
-)
+from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow
 from uniserve_worker.model_executor.encoder_runner import EncoderRunner
 from uniserve_worker.model_executor.image_inputs import (
     DecodeRow,

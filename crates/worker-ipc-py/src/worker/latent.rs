@@ -95,7 +95,7 @@ pub(crate) struct LatentBuffer {
     #[pyo3(get)]
     pages: Py<PyAny>,
     #[pyo3(get)]
-    value: Py<PyAny>,
+    pub(super) value: Py<PyAny>,
 }
 
 #[pymethods]
@@ -448,7 +448,7 @@ impl LatentPool {
     /// Scatter the initial values into bank one. The prepared values become
     /// visible when the batch applies its trajectory update.
     #[pyo3(signature = (request_pool_idx, buffer, *, latent_units))]
-    fn initialize(
+    pub(super) fn initialize(
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
@@ -557,7 +557,7 @@ impl LatentPool {
     /// Gather the requested committed trajectory, preserving page-table order.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (request_pool_idx, buffer, *, step, generation, latent_units, height, width))]
-    fn gather_current(
+    pub(super) fn gather_current(
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
@@ -596,7 +596,7 @@ impl LatentPool {
     /// Write the hidden successor without changing the committed trajectory.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (request_pool_idx, buffer, *, expected_step, expected_generation, latent_units, height, width))]
-    fn write_inactive(
+    pub(super) fn write_inactive(
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
@@ -723,7 +723,7 @@ impl LatentPool {
         .unbind())
     }
 
-    fn fill_timestep(
+    pub(super) fn fill_timestep(
         &self,
         py: Python<'_>,
         request_pool_idx: i64,

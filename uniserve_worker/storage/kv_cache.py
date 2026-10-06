@@ -649,22 +649,12 @@ class KVCacheManager:
             WorkerError: ``invalid_descriptor`` when any check fails or the
                 export is not resident.
         """
-        export = self.get_export(buffer)
-        if buffer.owner != request_key:
-            raise invalid_descriptor(
-                "KV conditioning buffer belongs to another request"
-            )
-        if (
-            int(visible_length) < export.exported_extent
-            or self.block_tables.allocated_length(request_pool_idx)
-            < export.exported_extent
-        ):
-            raise invalid_descriptor(
-                "KV conditioning allocation disagrees with its export"
-            )
-        for group in range(len(self.shapes)):
-            self.block_tables.table(request_pool_idx, group)
-        return export
+        return self._manager.validate_conditioning(
+            request_key,
+            buffer,
+            request_pool_idx=request_pool_idx,
+            visible_length=visible_length,
+        )
 
     def prepare_install(
         self,

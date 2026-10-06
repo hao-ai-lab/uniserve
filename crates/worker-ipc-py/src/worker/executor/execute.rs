@@ -203,7 +203,7 @@ impl PythonBackend {
                     .filter(|&index| offset + 1 == intervals[index].1)
                     .collect();
                 if !finished.is_empty() {
-                    self.finish_diffusion(py, batch, &finished, &trajectories)?;
+                    self.finish_diffusion(py, batch, &finished)?;
                 }
             }
         }

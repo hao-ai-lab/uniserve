@@ -7,8 +7,8 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from uniserve.processing import BranchSource, FlowPrompt
+from uniserve_worker._uniserve_ipc import resolve_prefix
 from uniserve_worker.errors import WorkerError
-from uniserve_worker.model_executor.diffusion_inputs import resolve_prefix
 
 pytestmark = pytest.mark.unit
 
@@ -24,6 +24,13 @@ pytestmark = pytest.mark.unit
             ((1, 3, 2, 5), False),
         ),
         (BranchSource.CONDITIONING, "  ", "negative", (), ((), True)),
+        (
+            BranchSource.CONDITIONING,
+            "\u001cpositive\u0085",
+            "negative",
+            (),
+            ((1, 3, 2, 5), False),
+        ),
         (
             BranchSource.NEGATIVE_OR_START,
             "positive",

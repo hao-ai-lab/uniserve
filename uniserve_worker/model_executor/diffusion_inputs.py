@@ -3,22 +3,20 @@
 Serves ``ImageDenoiser`` networks, whose image sequence attends to a cached
 token prefix chosen per guidance branch. ``ImageBuilder`` wraps the model's
 ``ImageDenoiser`` for the worker's execution code; ``DiffusionRow`` is the
-per-sequence input row the image path prepares; ``resolve_prefix`` chooses the
-token prefix each guidance branch conditions on.
+per-sequence input row the image path prepares. The native executor resolves
+the token prefix each guidance branch conditions on.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 
 from uniserve.diffusion import Branch, normal_noise
 from uniserve.media import image
 from uniserve.model import ImageDenoiser, LatentInput
-from uniserve.processing import BranchSource, FlowPrompt
-from uniserve_worker.errors import invalid_descriptor
+from uniserve.processing import BranchSource
 from uniserve_worker.model_executor.input_batch import AttentionRow
 
 
@@ -167,51 +165,3 @@ class DiffusionRow(AttentionRow):
     @property
     def query_tokens(self) -> int:
         return self.image_tokens
-
-
-def resolve_prefix(
-    prompt: FlowPrompt | None,
-    source: BranchSource,
-    *,
-    image_prompt: str,
-    negative_prompt: str,
-    negative_token_ids: tuple[int, ...],
-    tokenizer: Any | None,
-) -> tuple[tuple[int, ...], bool]:
-    """Resolve the token prefix one guidance branch conditions on.
-
-    Returns:
-        The branch's prefix token ids and whether the branch instead reuses
-        the request's own conditioning KV. The conditioned branch reuses it
-        when ``image_prompt`` is blank; the negative branch uses
-        ``negative_token_ids`` when present. Otherwise the model's
-        ``FlowPrompt`` encodes the branch text (the image prompt, the negative
-        prompt, or empty text for ``BranchSource.START``), and without a
-        ``FlowPrompt`` the prefix is empty.
-
-    Raises:
-        WorkerError: An ``invalid_descriptor`` error when a non-blank
-            ``image_prompt`` targets a model without a ``FlowPrompt``.
-    """
-    if source is BranchSource.CONDITIONING and not image_prompt.strip():
-        return (), True
-    if source is BranchSource.NEGATIVE_OR_START and negative_token_ids:
-        return negative_token_ids, False
-
-    if prompt is None:
-        if source is BranchSource.CONDITIONING:
-            raise invalid_descriptor(
-                "this model does not accept a generation prompt override"
-            )
-        return (), False
-
-    if source is BranchSource.CONDITIONING:
-        text = image_prompt.strip()
-        conditioned = True
-    elif source is BranchSource.NEGATIVE_OR_START:
-        text = negative_prompt.strip()
-        conditioned = False
-    else:
-        text = ""
-        conditioned = False
-    return prompt.encode(tokenizer, text=text, conditioned=conditioned), False

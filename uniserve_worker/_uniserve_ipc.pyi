@@ -1068,7 +1068,6 @@ class PendingOutput:
     completion_write: Buffer | None
     producer_write: Buffer | None
 
-    def set_cache_length(self, length: int) -> None: ...
     def cache_coordinates(
         self, tables: block_tables.BlockTables | None
     ) -> tuple[int, int, int]: ...
@@ -1497,6 +1496,14 @@ class KVCacheManager:
         buffer: BufferId,
         transports: Mapping[str, Transport],
         consumers: Sequence[int] = (),
+    ) -> KvTransfer: ...
+    def validate_conditioning(
+        self,
+        request: RequestKey,
+        buffer: BufferId,
+        *,
+        request_pool_idx: int,
+        visible_length: int,
     ) -> KvTransfer: ...
     def resident(self, buffer: BufferId) -> KvTransfer | None: ...
     def destination_base(
@@ -2704,3 +2711,13 @@ def atomic_load_u32(buffer: memoryview, offset: int) -> int:
     including writability.
     """
     ...
+
+def resolve_prefix(
+    prompt: Any,
+    source: str,
+    *,
+    image_prompt: str,
+    negative_prompt: str,
+    negative_token_ids: Sequence[int],
+    tokenizer: Any,
+) -> tuple[tuple[int, ...], bool]: ...

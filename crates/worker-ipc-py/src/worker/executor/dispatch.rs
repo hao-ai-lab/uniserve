@@ -32,24 +32,18 @@ impl PythonBackend {
         let images = !model.getattr("image_builder")?.is_none();
         let videos = !model.getattr("video_postprocessor")?.is_none();
         for &index in active {
-            let call = batch.call(py, index)?;
             let scope = super::super::batch::BatchState::scope(batch.numerical.bind(py))?;
             with_context(scope.bind(py), || {
+                let kind = batch.plan.calls[index].code;
+                if kind == CallKind::Media(MediaCall::LatentPreparation) && images {
+                    self.prepare_image_latent(py, batch, index)?;
+                    return Ok(());
+                }
+
+                let call = batch.call(py, index)?;
                 let options = PyDict::new(py);
                 options.set_item("model_runner", model)?;
                 options.set_item("state", &batch.numerical)?;
-                let kind = batch.plan.calls[index].code;
-                if kind == CallKind::Media(MediaCall::LatentPreparation) && images {
-                    options.set_item("kv_cache", self.worker.bind(py).getattr("kv_cache")?)?;
-                    options.set_item("latent_pool", &self.latents)?;
-                    options.set_item(
-                        "request_tables",
-                        self.worker.bind(py).getattr("block_tables")?,
-                    )?;
-                    py.import("uniserve_worker.execution.diffusion")?
-                        .call_method("prepare_latent", (&call,), Some(&options))?;
-                    return Ok(());
-                }
                 options.set_item("tensor_store", &self.tensors)?;
                 options.set_item(
                     "export_transports",

@@ -34,9 +34,9 @@ import torch
 
 from uniserve.math import ceil_div
 from uniserve.media.image import Config as ImageConfig
+from uniserve_worker._uniserve_ipc import resolve_prefix
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution.diffusion import image_state
-from uniserve_worker.model_executor.diffusion_inputs import resolve_prefix
 from uniserve_worker.model_executor.graph_inputs import DiffusionShape
 from uniserve_worker.model_executor.startup import capture_image_parameters
 from uniserve_worker.protocol.batch import (

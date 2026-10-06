@@ -880,7 +880,7 @@ impl BatchState {
 
     /// Record completion only after the numerical consumer has written or read
     /// its latent bank. Ranks without that consumer leave their update empty.
-    fn complete_latent(&self, py: Python<'_>, request_id: u64) -> PyResult<()> {
+    pub(super) fn complete_latent(&self, py: Python<'_>, request_id: u64) -> PyResult<()> {
         let index = self
             .request_indexes
             .get(&request_id)

@@ -26,32 +26,13 @@ impl PythonBackend {
         for &(index, _) in steps {
             let plan = &batch.plan.calls[index];
             if let Some(trajectory) = trajectories.get(&index) {
-                let call = batch.call(py, index)?;
-                let input = &step_inputs[&index];
-                let output = batch.pending(py, index);
-                let values = self.latent_values(py, &output)?;
-                let options = PyDict::new(py);
-                let position = output.borrow(py).lock(py)?.progress.logical_position;
-                options.set_item("conditioning_position", position)?;
-                options.set_item(
-                    "device",
-                    model.call_method1("call_devices", (&call,))?.get_item(1)?,
-                )?;
-                let diffusion = py.import("uniserve_worker.execution.diffusion")?;
-                let rows = diffusion.call_method(
-                    "flow_rows",
-                    (
-                        diffusion.call_method1("require_inputs", (model,))?,
-                        trajectory,
-                        values,
-                        &input.guide,
-                        &input.timestep,
-                    ),
-                    Some(&options),
-                )?;
-                for task in rows.try_iter()? {
-                    forward.push(ForwardRow::new(index, task?.unbind()));
-                }
+                forward.extend(self.prepare_diffusion_rows(
+                    py,
+                    batch,
+                    index,
+                    &step_inputs[&index],
+                    trajectory,
+                )?);
             } else if plan.code == CallKind::Forward(ForwardMode::TokenDenoising) {
                 forward.extend(self.prepare_canvas_rows(py, batch, index)?);
             } else if matches!(plan.code, CallKind::Forward(_)) {

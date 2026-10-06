@@ -55,7 +55,7 @@ struct SampleCandidate {
 }
 
 struct DiffusionStep {
-    guide: Py<PyAny>,
+    branches: Vec<String>,
     timestep: Py<PyAny>,
     step: u32,
 }

@@ -232,10 +232,6 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 )
                 for branch in range(len(branches))
             )
-            trajectory.kv.entries = {
-                branch: (slot + 1, 0, prefix_length, 32)
-                for slot, branch in enumerate(branches)
-            }
 
             def calls(mode):
                 return tuple(
@@ -252,7 +248,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             result = forward_batch(
                 runner,
                 tuple(
-                    prefix_row(tokens, (slot + 1, 0, 32))
+                    prefix_row(tokens, slot + 1, 0)
                     for slot, tokens in enumerate(prefixes)
                 ),
                 calls=calls(ForwardMode.PREFILL),
@@ -329,9 +325,11 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 factory,
                 trajectory,
                 sample,
-                branches,
                 time,
-                conditioning_position=prefix_length,
+                tuple(
+                    (slot + 1, prefix_length, prefix_length)
+                    for slot in range(len(branches))
+                ),
                 device=torch.device("cuda:0"),
             )
             result = forward_batch(
