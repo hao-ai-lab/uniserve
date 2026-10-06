@@ -1,8 +1,8 @@
-//! Bind sampled token results and their pending request coordinates.
+//! Prepare token inputs and bind sampling results to pending request coordinates.
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyInt, PyTuple};
+use pyo3::types::{PyDict, PyInt, PySlice, PyTuple};
 use uniserve_worker_ipc::{Call, CallKind, ForwardMode};
 
 use super::{BatchState, ForwardRow, ForwardValue, PythonBackend, SampleCandidate};
@@ -12,6 +12,90 @@ use crate::worker::sampling::SamplingMetadata;
 use crate::worker::storage::Buffer;
 
 impl PythonBackend {
+    pub(super) fn prepare_token_row(
+        &self,
+        py: Python<'_>,
+        batch: &BatchState,
+        index: usize,
+    ) -> PyResult<ForwardRow> {
+        let call = &batch.plan.calls[index];
+        let pending = batch.pending(py, index);
+        let output = pending.borrow(py);
+        let scores = scores_prompt(py, &output)?;
+        let visible = self.visible_length(py, &output)?;
+        let decode = call.code == CallKind::Forward(ForwardMode::Decode);
+        let verify = call.code == CallKind::Forward(ForwardMode::Verify);
+        let indexed = decode
+            && self.indexed_decode
+            && output
+                .predicate
+                .as_ref()
+                .map(|predicate| predicate.bind(py).get_item(1)?.extract::<bool>())
+                .transpose()?
+                .unwrap_or(false);
+        let relay = call.predicate.is_some()
+            && !indexed
+            && (decode || verify || call.input_token_ids.is_empty());
+        let tokens = if indexed || (decode && relay) {
+            &[][..]
+        } else if decode {
+            call.input_token_ids
+                .get(..1)
+                .ok_or_else(|| invalid(py, "last-sampled token source has no committed token"))?
+        } else {
+            &call.input_token_ids
+        };
+        if verify && !relay && tokens.len() < 2 {
+            return Err(invalid(
+                py,
+                "fixed-parent verification requires current and draft tokens",
+            ));
+        }
+        if tokens.is_empty() && !indexed && !relay {
+            return Err(invalid(py, "text extension requires input tokens"));
+        }
+
+        let selection = if verify || (!decode && scores) {
+            "ALL_LOGITS"
+        } else if decode || call.token_output.is_some() {
+            "LAST_LOGITS"
+        } else {
+            "CACHE"
+        };
+        let position = output.lock(py)?.progress.logical_position;
+        let slot = output.request.borrow(py).request.slot();
+        let options = token_options(py, call.code, tokens, position, slot, visible, selection)?;
+        options.set_item("indexed", indexed)?;
+        options.set_item("predicate", &output.predicate)?;
+        options.set_item(
+            "force_finish",
+            call.sampling_state
+                .as_ref()
+                .is_some_and(|state| state.force_finish),
+        )?;
+        if relay {
+            if output.predicate.is_none() {
+                return Err(invalid(py, "device token continuation is not registered"));
+            }
+            let state = self.decode_state.as_ref().ok_or_else(|| {
+                unsupported(py, "device continuation has no request runtime state")
+            })?;
+            let slot = output.request.borrow(py).request.slot();
+            let current = state
+                .bind(py)
+                .getattr("future_input_tokens")?
+                .get_item((slot, PySlice::new(py, 0, 1, 1)))?;
+            options.set_item("current", current)?;
+        }
+
+        let row = py.import("uniserve_worker.execution.token")?.call_method(
+            "token_row",
+            (),
+            Some(&options),
+        )?;
+        Ok(ForwardRow::new(index, row.unbind()))
+    }
+
     /// Guidance prefixes share this KV extent check but do not update the
     /// request's decode slot. Physical reservation happened before forward.
     pub(super) fn record_token_kv(
@@ -381,4 +465,32 @@ pub(super) fn next_position(py: Python<'_>, task: &Bound<'_, PyAny>) -> PyResult
     py.import("uniserve_worker.execution.token")?
         .call_method1("next_position", (task,))?
         .extract()
+}
+
+/// Common numerical fields selected for a causal prompt run or one token call.
+pub(super) fn token_options<'py>(
+    py: Python<'py>,
+    mode: CallKind,
+    tokens: &[u32],
+    position: u64,
+    slot: usize,
+    visible: u64,
+    selection: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let options = PyDict::new(py);
+    options.set_item(
+        "mode",
+        crate::convert::RequestConversion::new(py)?.kind(mode),
+    )?;
+    options.set_item("tokens", PyTuple::new(py, tokens)?)?;
+    options.set_item("position", position)?;
+    options.set_item("slot", slot)?;
+    options.set_item("visible", visible)?;
+    options.set_item(
+        "selection",
+        py.import("uniserve_worker.sampling.metadata")?
+            .getattr("TokenSelection")?
+            .getattr(selection)?,
+    )?;
+    Ok(options)
 }

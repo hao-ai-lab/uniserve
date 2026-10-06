@@ -65,7 +65,6 @@ if TYPE_CHECKING:
     from uniserve_worker.execution.host import HostLane
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
-    from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.latent_pool import LatentPool
     from uniserve_worker.storage.tensor_store import TensorStore
     from uniserve_worker.transport.interface import Transport
@@ -466,17 +465,16 @@ def encode_row(
 
 
 def vision_state_row(
-    call: Call,
     features: torch.Tensor,
     height: int,
     width: int,
     conditioning_position: int,
     *,
     seq_len: int,
-    state: BatchState,
+    slot: int,
+    input_images: int | None,
     close_image: bool,
     logits: bool,
-    request_tables: BlockTables | None,
     model_runner: ModelExecutor,
 ) -> TokenRow:
     """Build the prefill row that writes one image's vision features into KV.
@@ -492,15 +490,9 @@ def vision_state_row(
 
     Raises:
         WorkerError: When the model declares no feature injection, the
-            features are not ``[tokens, hidden]``, or ``seq_len`` exceeds
-            the request's allocated KV (``PendingOutput.cache_coordinates``).
+            features are not ``[tokens, hidden]``, or the positional layout
+            cannot represent their patch grid.
     """
-    request = state.pending_output(call.request_key.request_id)
-    cache = request.cache_coordinates(request_tables)
-    if seq_len < cache[1] or seq_len > cache[2]:
-        raise invalid_descriptor(
-            "vision row prefix lies outside the request's KV extent"
-        )
     injection = model_runner.image_processor().feature_injection
     if injection is None:
         raise invalid_descriptor(
@@ -548,9 +540,7 @@ def vision_state_row(
         leading=leading,
         trailing=trailing,
         close_image=close_image,
-        input_images=None
-        if close_image
-        else _input_images(request.request.admission.input_images),
+        input_images=input_images,
         model_runner=model_runner,
     )
     return TokenRow(
@@ -564,7 +554,7 @@ def vision_state_row(
         selection=TokenSelection.LAST_LOGITS
         if logits
         else TokenSelection.CACHE,
-        request_pool_idx=cache[0],
+        request_pool_idx=slot,
         seq_len=seq_len,
         write_kv=True,
         causal=False,
@@ -658,14 +648,13 @@ def _vision_positions(
 
 
 def latent_state_row(
-    call: Call,
     latent: torch.Tensor,
     height: int,
     width: int,
     conditioning_position: int,
     *,
-    state: BatchState,
-    request_tables: BlockTables | None,
+    slot: int,
+    seq_len: int,
     model_runner: ModelExecutor,
 ) -> DiffusionRow:
     """Build the denoiser row that writes an image latent into KV.
@@ -697,9 +686,6 @@ def latent_state_row(
     positions[0, 0] = conditioning_position
     positions[0, -1] = conditioning_position + builder.rope_advance
 
-    cache = state.pending_output(call.request_key.request_id).cache_coordinates(
-        request_tables
-    )
     return DiffusionRow(
         forward_mode=MediaCall.DENOISING,
         positions=positions,
@@ -708,8 +694,8 @@ def latent_state_row(
         image_tokens=query,
         image_height=height,
         image_width=width,
-        request_pool_idx=cache[0],
-        seq_len=cache[1],
+        request_pool_idx=slot,
+        seq_len=seq_len,
         write_kv=True,
         causal=False,
     )

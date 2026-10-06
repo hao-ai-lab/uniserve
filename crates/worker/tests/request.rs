@@ -129,3 +129,40 @@ fn observers_keep_the_retired_epoch_after_slot_reuse() -> uniserve_worker::Resul
     assert!(observed.2);
     Ok(())
 }
+
+#[test]
+fn canvas_steps_follow_submission_and_restart_on_slot_reuse() -> uniserve_worker::Result<()> {
+    use uniserve_worker_ipc::CanvasStep;
+
+    let mut pool = RequestPool::new(1)?;
+    let first = admission(7, 1, 1);
+    let key = first.request_key;
+    pool.start(first)?;
+    assert!(
+        pool.advance_canvas(key, CanvasStep { block: 0, step: 1 })
+            .is_err()
+    );
+    pool.advance_canvas(key, CanvasStep { block: 0, step: 0 })?;
+    assert!(
+        pool.advance_canvas(key, CanvasStep { block: 0, step: 0 })
+            .is_err()
+    );
+    pool.advance_canvas(key, CanvasStep { block: 0, step: 1 })?;
+    pool.advance_canvas(key, CanvasStep { block: 1, step: 0 })?;
+
+    pool.finish(key)?;
+    pool.retire(7)?;
+    let second = admission(7, 2, 1);
+    let next = second.request_key;
+    pool.start(second)?;
+    assert!(
+        pool.advance_canvas(key, CanvasStep { block: 1, step: 1 })
+            .is_err()
+    );
+    assert!(
+        pool.advance_canvas(next, CanvasStep { block: 0, step: 1 })
+            .is_err()
+    );
+    pool.advance_canvas(next, CanvasStep { block: 0, step: 0 })?;
+    Ok(())
+}

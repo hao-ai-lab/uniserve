@@ -21,14 +21,12 @@ impl PythonBackend {
     ) -> PyResult<Vec<ForwardRow>> {
         let model = self.model_runner.bind(py);
         let image = py.import("uniserve_worker.execution.image")?;
-        let token = py.import("uniserve_worker.execution.token")?;
-        let canvas = py.import("uniserve_worker.execution.canvas")?;
         let mut forward = Vec::new();
 
         for &(index, _) in steps {
-            let call = batch.call(py, index)?;
             let plan = &batch.plan.calls[index];
             if let Some(trajectory) = trajectories.get(&index) {
+                let call = batch.call(py, index)?;
                 let input = &step_inputs[&index];
                 let output = batch.pending(py, index);
                 let values = self.latent_values(py, &output)?;
@@ -55,47 +53,22 @@ impl PythonBackend {
                     forward.push(ForwardRow::new(index, task?.unbind()));
                 }
             } else if plan.code == CallKind::Forward(ForwardMode::TokenDenoising) {
-                let options = PyDict::new(py);
-                options.set_item("state", &batch.numerical)?;
-                options.set_item(
-                    "request_tables",
-                    self.worker.bind(py).getattr("block_tables")?,
-                )?;
-                if plan.canvas.is_some() {
-                    options.set_item("canvas_slots", model.getattr("canvas_slots")?)?;
-                    let task = canvas.call_method("prepare_step", (&call,), Some(&options))?;
-                    forward.push(ForwardRow::new(index, task.unbind()));
-                } else {
-                    let rows = canvas.call_method("prepare_rows", (&call,), Some(&options))?;
-                    for task in rows.try_iter()? {
-                        forward.push(ForwardRow::new(index, task?.unbind()));
-                    }
-                }
+                forward.extend(self.prepare_canvas_rows(py, batch, index)?);
             } else if matches!(plan.code, CallKind::Forward(_)) {
                 let started = Instant::now();
-                let options = PyDict::new(py);
-                options.set_item("tensor_store", &self.tensors)?;
-                options.set_item(
-                    "request_tables",
-                    self.worker.bind(py).getattr("block_tables")?,
-                )?;
-                options.set_item("model_runner", model)?;
-                options.set_item("state", &batch.numerical)?;
                 if plan.writes_context() {
-                    let rows = token.call_method("prepare_context", (&call,), Some(&options))?;
-                    for task in rows.try_iter()? {
-                        forward.push(ForwardRow::new(index, task?.unbind()));
-                    }
+                    forward.extend(self.prepare_context_rows(py, batch, index)?);
+                } else if plan.writes_visual_state() {
+                    forward.push(self.prepare_visual_row(py, batch, index)?);
                 } else {
-                    options.set_item("decode_state", &self.decode_state)?;
-                    let task = token.call_method("prepare_forward", (&call,), Some(&options))?;
-                    forward.push(ForwardRow::new(index, task.unbind()));
+                    forward.push(self.prepare_token_row(py, batch, index)?);
                 }
                 batch.record_component(py, "text_build_batch", started)?;
             } else if matches!(
                 plan.code,
                 CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
             ) {
+                let call = batch.call(py, index)?;
                 let options = PyDict::new(py);
                 options.set_item("tensor_store", &self.tensors)?;
                 options.set_item("model_runner", model)?;
@@ -108,6 +81,7 @@ impl PythonBackend {
                     image: Some(prepared.unbind()),
                 });
             } else if plan.latent_input.is_none() {
+                let call = batch.call(py, index)?;
                 // A resident decoded image needs only encoding, with no model row.
                 let options = PyDict::new(py);
                 options.set_item("tensor_store", &self.tensors)?;
@@ -115,6 +89,7 @@ impl PythonBackend {
                 options.set_item("state", &batch.numerical)?;
                 image.call_method("diffusion_finalize_frames", (&call,), Some(&options))?;
             } else {
+                let call = batch.call(py, index)?;
                 let pool = self.latents.as_ref().ok_or_else(|| {
                     PyRuntimeError::new_err("image decoding requires a latent pool")
                 })?;

@@ -250,3 +250,32 @@ def test_rows_gather_the_columns_their_host_layout_describes(
         buffers.close()
         reference.close()
         manager.close()
+
+
+@pytest.mark.gpu
+def test_verification_inputs_keep_the_continuation_on_device():
+    from uniserve_worker.execution.token import token_row
+
+    current = torch.tensor([71], dtype=torch.long, device="cuda:0")
+    mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        row = token_row(
+            ForwardMode.VERIFY,
+            (72, 73),
+            12,
+            1,
+            12,
+            TokenSelection.ALL_LOGITS,
+            current=current,
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(mode)
+
+    # Reading values is allowed only after numerical preparation has returned.
+    assert row.token_ids is not None
+    assert row.token_ids.device == current.device
+    assert row.token_ids.cpu().tolist() == [71, 72, 73]
+    assert row.positions is not None
+    assert row.positions.tolist() == [12, 13, 14]
+    assert row.query_tokens == 3
