@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
@@ -19,7 +18,6 @@ impl PythonBackend {
         step_inputs: &HashMap<usize, DiffusionStep>,
         trajectories: &Trajectories,
     ) -> PyResult<Vec<ForwardRow>> {
-        let model = self.model_runner.bind(py);
         let image = py.import("uniserve_worker.execution.image")?;
         let mut forward = Vec::new();
 
@@ -50,43 +48,25 @@ impl PythonBackend {
                 CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
             ) {
                 let call = batch.call(py, index)?;
-                let options = PyDict::new(py);
-                options.set_item("tensor_store", &self.tensors)?;
-                options.set_item("model_runner", model)?;
-                options.set_item("state", &batch.numerical)?;
-                let prepared = image.call_method("prepare_features", (&call,), Some(&options))?;
+                let prepared = self.prepare_features(py, batch, index)?;
                 let task = image.call_method1("encode_row", (call.getattr("kind")?, &prepared))?;
                 forward.push(ForwardRow {
                     index,
                     task: task.unbind(),
-                    image: Some(prepared.unbind()),
+                    image: Some(prepared),
                 });
             } else if plan.latent_input.is_none() {
-                let call = batch.call(py, index)?;
                 // A resident decoded image needs only encoding, with no model row.
-                let options = PyDict::new(py);
-                options.set_item("tensor_store", &self.tensors)?;
-                options.set_item("model_runner", model)?;
-                options.set_item("state", &batch.numerical)?;
-                image.call_method("diffusion_finalize_frames", (&call,), Some(&options))?;
+                self.finalize_image(py, batch, index)?;
             } else {
                 let call = batch.call(py, index)?;
-                let pool = self.latents.as_ref().ok_or_else(|| {
-                    PyRuntimeError::new_err("image decoding requires a latent pool")
-                })?;
-                let options = PyDict::new(py);
-                options.set_item("latent_pool", pool)?;
-                options.set_item("model_runner", model)?;
-                options.set_item("state", &batch.numerical)?;
-                let latent =
-                    image.call_method("materialization_latent", (&call,), Some(&options))?;
-                let output = batch.pending(py, index);
-                let params = output.bind(py).getattr("latent_params")?;
+                let latent = self.image_latent(py, batch, index)?;
+                let params = batch.latent_params(py, index)?;
                 let row = PyDict::new(py);
                 row.set_item("forward_mode", call.getattr("kind")?)?;
                 row.set_item("latent", latent)?;
-                row.set_item("image_height", params.getattr("height")?)?;
-                row.set_item("image_width", params.getattr("width")?)?;
+                row.set_item("image_height", params.height)?;
+                row.set_item("image_width", params.width)?;
                 let task = py
                     .import("uniserve_worker.model_executor.image_inputs")?
                     .getattr("DecodeRow")?

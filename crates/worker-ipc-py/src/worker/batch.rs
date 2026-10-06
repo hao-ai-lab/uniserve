@@ -713,7 +713,6 @@ impl BatchState {
     }
 }
 
-#[pymethods]
 impl BatchState {
     /// Borrow a call's single resident tensor and keep its lease through
     /// commit or discard. Numerical consumers and transfers use this owner.
@@ -788,7 +787,6 @@ impl BatchState {
     /// Export the numerical values owned by this rank. Deferred host writes
     /// remain with their pending output and become visible together here.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (request_id, values, tensor_store, transports, *, host=false, regions=None))]
     pub(super) fn export_tensors(
         &self,
         py: Python<'_>,
@@ -812,26 +810,6 @@ impl BatchState {
             transports,
             host,
             regions,
-        )
-    }
-
-    /// Return the decoder-unit interval assigned to this request's call.
-    fn decode_range<'py>(&self, py: Python<'py>, request_id: u64) -> PyResult<Bound<'py, PyAny>> {
-        let &index = self
-            .request_indexes
-            .get(&request_id)
-            .ok_or_else(|| invalid(py, "request has no output in this batch"))?;
-        let call = &self.plan.calls[index];
-        let params = self
-            .plan
-            .decode_ranges
-            .iter()
-            .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
-            .ok_or_else(|| invalid(py, "video decode call has no decode params"))?;
-        crate::convert::decode_range_to_py(
-            py,
-            params,
-            &mut crate::convert::RequestConversion::new(py)?,
         )
     }
 
@@ -878,7 +856,10 @@ impl BatchState {
 
         Ok(crate::stats::ForwardStats::from(stats))
     }
+}
 
+#[pymethods]
+impl BatchState {
     #[getter]
     fn batch_id(&self) -> u64 {
         self.plan.batch_id

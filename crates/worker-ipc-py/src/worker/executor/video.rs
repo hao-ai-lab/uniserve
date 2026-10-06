@@ -211,7 +211,7 @@ impl PythonBackend {
                         ),
                     )?;
                     if !result.is_none() {
-                        record_result(py, batch, &result.cast_into::<ExecutionOutput>()?)?;
+                        batch.record_result(py, &result.cast_into::<ExecutionOutput>()?)?;
                     }
                     batch
                         .numerical
@@ -252,7 +252,7 @@ impl PythonBackend {
                     let result = model
                         .call_method1("run_denoising", (ladder, params.start_step, source))?
                         .cast_into::<ExecutionOutput>()?;
-                    record_result(py, batch, &result)?;
+                    batch.record_result(py, &result)?;
                     batch
                         .numerical
                         .borrow(py)
@@ -314,7 +314,7 @@ impl PythonBackend {
                         ),
                     )?;
                     let decoded = results.get_item(0)?.cast_into::<ExecutionOutput>()?;
-                    record_result(py, batch, &decoded)?;
+                    batch.record_result(py, &decoded)?;
                     results.get_item(1)?.cast_into::<ExecutionOutput>()?
                 } else {
                     let options = PyDict::new(py);
@@ -330,7 +330,7 @@ impl PythonBackend {
                         )?
                         .cast_into::<ExecutionOutput>()?
                 };
-                record_result(py, batch, &result)?;
+                batch.record_result(py, &result)?;
                 self.export_video_result(py, batch, index, &result, true)?;
             }
             _ => return Err(invalid(py, "unsupported video computation")),
@@ -362,21 +362,4 @@ fn video_config<'py>(py: Python<'py>, size: &Bound<'py, PyAny>) -> PyResult<Boun
     py.import("uniserve.media.video")?
         .getattr("Config")?
         .call1((size.getattr("num_frames")?, size.getattr("canvas")?))
-}
-
-fn record_result(
-    py: Python<'_>,
-    batch: &BatchState,
-    result: &Bound<'_, ExecutionOutput>,
-) -> PyResult<()> {
-    let result = result.borrow();
-    let stats = result
-        .stats
-        .as_ref()
-        .ok_or_else(|| PyRuntimeError::new_err("module output has no execution statistics"))?;
-    batch
-        .numerical
-        .borrow_mut(py)
-        .record_forward(stats.borrow(py));
-    Ok(())
 }

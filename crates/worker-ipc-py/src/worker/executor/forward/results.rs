@@ -5,7 +5,6 @@ use std::time::Instant;
 use indexmap::IndexMap;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use uniserve_worker_ipc::{CallKind, ForwardMode};
 
 use super::{BatchState, ForwardRow, ForwardValue, PythonBackend, SampleCandidate, Trajectories};
@@ -20,7 +19,6 @@ impl PythonBackend {
         values: Vec<Option<ForwardValue>>,
         trajectories: &Trajectories,
     ) -> PyResult<IndexMap<usize, Vec<Py<PyAny>>>> {
-        let image = py.import("uniserve_worker.execution.image")?;
         let mut predictions = IndexMap::<usize, Vec<Py<PyAny>>>::new();
         let mut readouts = IndexMap::<usize, Vec<Py<PyAny>>>::new();
         let mut contexts = IndexMap::<usize, Vec<(ForwardRow, ForwardValue)>>::new();
@@ -67,17 +65,8 @@ impl PythonBackend {
                     selection: result.selection,
                 });
             } else if let Some(prepared) = &row.image {
-                let call = batch.call(py, index)?;
-                let options = PyDict::new(py);
-                options.set_item("tensor_store", &self.tensors)?;
-                options.set_item("state", &batch.numerical)?;
-                image.call_method(
-                    "write_features",
-                    (&call, prepared, result.value),
-                    Some(&options),
-                )?;
+                self.write_features(py, batch, index, prepared.bind(py), result.value.bind(py))?;
             } else {
-                let call = batch.call(py, index)?;
                 let layout = result.layout.bind(py);
                 let range = if layout.is_none() {
                     py.None().into_bound(py)
@@ -89,14 +78,7 @@ impl PythonBackend {
                         "image decoder must declare its numerical range",
                     ));
                 }
-                let options = PyDict::new(py);
-                options.set_item("tensor_store", &self.tensors)?;
-                options.set_item("state", &batch.numerical)?;
-                image.call_method(
-                    "export_image",
-                    (&call, result.value.bind(py).call_method0("detach")?, range),
-                    Some(&options),
-                )?;
+                self.export_image(py, batch, index, result.value.bind(py), &range)?;
             }
         }
 

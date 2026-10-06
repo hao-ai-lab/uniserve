@@ -256,16 +256,6 @@ impl PendingOutput {
             .transpose()
     }
 
-    #[getter]
-    fn host_tasks(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        PyTuple::new(py, self.host_tasks.iter().map(|task| task.bind(py))).map(Bound::unbind)
-    }
-
-    fn set_host_tasks(slf: &Bound<'_, Self>, tasks: Vec<Py<HostTask>>) {
-        let retired = std::mem::replace(&mut slf.borrow_mut().host_tasks, tasks);
-        drop(retired);
-    }
-
     pub(super) fn ready(slf: &Bound<'_, Self>) -> PyResult<bool> {
         let py = slf.py();
         let (buffer, tasks) = {
@@ -371,6 +361,22 @@ impl PendingOutput {
 }
 
 impl PendingOutput {
+    /// Find the reserved write in the call's existing registrations.
+    pub(super) fn write_buffer(
+        &self,
+        py: Python<'_>,
+        buffer: BufferId,
+        feature: bool,
+    ) -> PyResult<Py<Buffer>> {
+        for write in self.writes.bind(py) {
+            let write = write.cast_into::<Buffer>()?;
+            if write.get().id(py) == buffer && write.get().feature(py) == feature {
+                return Ok(write.unbind());
+            }
+        }
+        Err(invalid(py, "tensor output has no reserved write"))
+    }
+
     pub(super) fn release_execution_references(&mut self, py: Python<'_>) -> PyResult<()> {
         // A host task may still be filling its reserved buffers after batch
         // commit. Keep only those writes until its host result is resolved.

@@ -13,7 +13,7 @@ use super::host::HostTask;
 use super::kv_import::{KVImport, KVImporter};
 use super::latent::{LatentImport, LatentPool};
 use super::output::OutputBuffer;
-use super::protocol::{buffer_id, call_id};
+use super::protocol::buffer_id;
 use super::storage::{TensorRead, TensorStore};
 use super::transfer::TransferTicket;
 
@@ -343,20 +343,6 @@ impl BatchInputs {
         Ok(self.cache_import(py, buffer_id(buffer)?))
     }
 
-    fn add_image(&mut self, call: &Bound<'_, PyAny>, task: Py<HostTask>) -> PyResult<()> {
-        self.inner
-            .tasks
-            .insert(call_id(call)?, Dependency::Task(task));
-        Ok(())
-    }
-
-    fn image(&self, py: Python<'_>, call: &Bound<'_, PyAny>) -> PyResult<Option<Py<HostTask>>> {
-        Ok(match self.inner.tasks.get(&call_id(call)?) {
-            Some(Dependency::Task(task)) => Some(task.clone_ref(py)),
-            _ => None,
-        })
-    }
-
     pub(super) fn on_ready(slf: &Bound<'_, Self>, callback: Py<PyAny>) -> PyResult<()> {
         let py = slf.py();
         let (dependencies, wait) = {
@@ -517,5 +503,22 @@ impl BatchInputs {
         self.inner.tasks.clear();
         self.inner.dependencies.clear();
         self.inner.predicate = None;
+    }
+}
+
+impl BatchInputs {
+    pub(super) fn add_image(&mut self, call: uniserve_core::CallId, task: Py<HostTask>) {
+        self.inner.tasks.insert(call, Dependency::Task(task));
+    }
+
+    pub(super) fn image(
+        &self,
+        py: Python<'_>,
+        call: uniserve_core::CallId,
+    ) -> Option<Py<HostTask>> {
+        match self.inner.tasks.get(&call) {
+            Some(Dependency::Task(task)) => Some(task.clone_ref(py)),
+            _ => None,
+        }
     }
 }

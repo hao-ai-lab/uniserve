@@ -1,6 +1,5 @@
 """Batch input observers and cancellation over native resource owners."""
 
-from concurrent.futures import CancelledError
 from threading import Event
 
 import pytest
@@ -9,8 +8,6 @@ import torch
 from tests.python.fixtures.cuda_stream import blocked_stream
 from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import BatchInputs, Completion
-from uniserve_worker.execution.host import HostLane
-from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.storage.buffer_pool import BufferPool
 from uniserve_worker.storage.output import OutputPool
 from uniserve_worker.storage.tensor_store import TensorStore
@@ -56,38 +53,18 @@ def test_ready_observer_can_close_its_inputs(store, immediate: bool) -> None:
     assert inputs.closed
 
 
-def test_closed_inputs_cancel_queued_preparation_and_suppress_wakes(
-    store,
-) -> None:
-    lane = HostLane(max_inflight=2, workers=1)
-    entered, release, notified = Event(), Event(), Event()
-
-    def occupy_lane() -> None:
-        entered.set()
-        assert release.wait(5)
-
-    running = lane.reserve().configure(occupy_lane)
-    running.submit_if_ready()
-    assert entered.wait(5)
-
+def test_closed_inputs_suppress_wakes(store) -> None:
     inputs = BatchInputs()
     dependency = Completion()
     inputs.set_dependencies((dependency,))
-    queued = lane.reserve().configure(lambda: None)
-    inputs.add_image(CallId(1, 0), queued)
-    queued.submit_if_ready()
     inputs.submitted = True
+    notified = Event()
     inputs.on_ready(notified.set)
-    try:
-        inputs.close(store, None, None)
-        with pytest.raises(CancelledError):
-            queued.result(timeout=5)
-        dependency.set_result(None)
-        assert not notified.is_set()
-        inputs.close(store, None, None)
-    finally:
-        release.set()
-        lane.close()
+
+    inputs.close(store, None, None)
+    dependency.set_result(None)
+    assert not notified.is_set()
+    inputs.close(store, None, None)
 
 
 def test_failed_storage_wakes_its_consumer_and_preserves_the_error(

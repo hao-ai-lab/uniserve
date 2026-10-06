@@ -2516,15 +2516,19 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
 
 
 @pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
+@pytest.mark.parametrize(
     ("transfer_image", "encoding_fails"),
     ((False, False), (True, False), (False, True)),
 )
 def test_resident_image_materialization_preserves_the_decoded_artifact(
+    device: str,
     transfer_image: bool,
     encoding_fails: bool,
     monkeypatch,
 ) -> None:
-    worker = execution_worker(transfer_backends=("shm",))
+    worker = execution_worker(device=device, transfer_backends=("shm",))
     admission = umm_params(
         76,
         ImageParams(steps=1, height=16, width=16, seed=31, retain_images=True),
@@ -2613,18 +2617,21 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             bounds=Bounds(max_completion_bytes=65_536),
             image_input=image,
         )
-        if encoding_fails:
+        with monkeypatch.context() as codec:
+            if encoding_fails:
 
-            def fail_encoding(*args, **kwargs):
-                raise OSError("image encoder could not write the artifact")
+                def fail_encoding(*args, **kwargs):
+                    raise OSError("image encoder could not write the artifact")
 
-            # Exercise a third-party codec failure through the actual CPU task
-            # and completion buffer rather than replacing the worker's owners.
-            monkeypatch.setattr(Image.Image, "save", fail_encoding)
-        result = finalized_report(
-            worker,
-            worker.submit(execution_batch(batch_id=6, calls=(materialize,))),
-        )
+                # A third-party codec failure must retire the CPU task and
+                # its completed readback before another image is encoded.
+                codec.setattr(Image.Image, "save", fail_encoding)
+            result = finalized_report(
+                worker,
+                worker.submit(
+                    execution_batch(batch_id=6, calls=(materialize,))
+                ),
+            )
         completion = result.completions[0]
         if encoding_fails:
             assert completion.status is CallStatus.ERROR
@@ -2632,6 +2639,28 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             assert completion.media_output is None
             assert completion.committed_tokens == ()
             assert completion.product_generations == ()
+
+            # A failed request closes. A separate image request must still
+            # acquire a host task and output row on this worker.
+            following = ar_params(77, input_images=1)
+            encode = encode_call(
+                following.request_key,
+                call_id=CallId(7, 0),
+                predecessor=root_parent(following),
+                image_base64=expected.decode("ascii"),
+                encoder_handle=701,
+                component="vision_encoder",
+            )
+            retried = finalized_report(
+                worker,
+                worker.submit(
+                    execution_batch(
+                        batch_id=7, admissions=(following,), calls=(encode,)
+                    )
+                ),
+            )
+            assert retried.completions[0].status is CallStatus.OK
+            assert retried.completions[0].product_generations == (701,)
         else:
             assert completion.status is CallStatus.OK
             assert _media_bytes(completion) == expected
