@@ -16,9 +16,6 @@ from uniserve_worker._uniserve_ipc import (
 from uniserve_worker._uniserve_ipc import (
     TransferCapacity as TransferCapacity,
 )
-from uniserve_worker._uniserve_ipc import (
-    TransferPool as TransferPool,
-)
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.transport.layout import copy_pairs
 

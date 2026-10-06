@@ -9,11 +9,12 @@ use pyo3::types::{PyDict, PySlice, PyTuple};
 use uniserve_worker_ipc::{TensorTransfer, TransferTransport};
 
 use super::error::invalid;
-use super::transfer::{ReadReservation, TransferCapacity, TransferTicket};
+use super::transfer::{ReadReservation, TransferTicket};
+use super::transport::Transport;
 use crate::convert;
 
 pub(super) struct PlannedRead<'py> {
-    transport: Bound<'py, PyAny>,
+    transport: Bound<'py, Transport>,
     location: Bound<'py, PyAny>,
     source_region: Bound<'py, PyTuple>,
     target: Bound<'py, PyAny>,
@@ -73,7 +74,8 @@ pub(super) fn plan_reads<'py>(
             if transport.is_none() {
                 return Ok(None);
             }
-            if transport.getattr("name")?.extract::<String>()? != backend {
+            let transport = transport.cast_into::<Transport>()?;
+            if transport.get().name() != backend {
                 return Err(invalid(
                     py,
                     "bound transport disagrees with the physical edge",
@@ -123,6 +125,7 @@ pub(super) fn plan_native_reads<'py>(
             if transport.is_none() {
                 return Ok(None);
             }
+            let transport = transport.cast_into::<Transport>()?;
             let covered = location
                 .offset
                 .iter()
@@ -156,7 +159,7 @@ fn plan_views<'py, L>(
     destination: &Bound<'py, PyAny>,
     dtype: &str,
     region: &[Range<u64>],
-    locations: impl Iterator<Item = PyResult<(Bound<'py, PyAny>, L, Vec<Range<u64>>)>>,
+    locations: impl Iterator<Item = PyResult<(Bound<'py, Transport>, L, Vec<Range<u64>>)>>,
     mut convert: impl FnMut(&L) -> PyResult<Bound<'py, PyAny>>,
 ) -> PyResult<Vec<PlannedRead<'py>>> {
     let device = target_device(destination)?;
@@ -211,9 +214,9 @@ pub(super) fn submit_reads(
     let Some(first) = reads.first() else {
         return Ok(Vec::new());
     };
-    let capacity: Py<TransferCapacity> = first.transport.getattr("capacity")?.extract()?;
+    let capacity = first.transport.get().capacity.clone_ref(py);
     for read in &reads[1..] {
-        if !read.transport.getattr("capacity")?.is(capacity.bind(py)) {
+        if !read.transport.get().capacity.is(&capacity) {
             return Err(invalid(
                 py,
                 "a fetch's transports must share the rank's transfer capacity",
@@ -228,15 +231,14 @@ pub(super) fn submit_reads(
     let mut tickets: Vec<Py<TransferTicket>> = Vec::with_capacity(reads.len());
     let result = (|| -> PyResult<()> {
         for read in reads {
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("device", target_device(&read.target)?)?;
-            kwargs.set_item("destination", &read.target)?;
-            kwargs.set_item("region", &read.source_region)?;
-            kwargs.set_item("reservation", &reservation)?;
-            let ticket: Py<TransferTicket> = read
-                .transport
-                .call_method("fetch", (&read.location,), Some(&kwargs))?
-                .extract()?;
+            let ticket = read.transport.get().fetch(
+                py,
+                read.location.clone(),
+                target_device(&read.target)?.unbind(),
+                Some(read.target.clone()),
+                Some(read.source_region.clone().into_any().unbind()),
+                Some(reservation.clone_ref(py)),
+            )?;
             tickets.push(ticket.clone_ref(py));
             retain(&ticket)?;
         }

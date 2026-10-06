@@ -1,10 +1,10 @@
 //! Backing storage and retirement shared by registered transport buffers.
 
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 use uniserve_worker::{HostAction, HostTask, Outcome};
@@ -45,10 +45,8 @@ pub(crate) struct TransportBuffer {
     backing: Mutex<Backing>,
 }
 
-#[pymethods]
 impl TransportBuffer {
-    #[staticmethod]
-    fn local(
+    pub(in crate::worker) fn local(
         tensor: Py<PyAny>,
         event: Option<Py<CUDAEvent>>,
         nbytes: u64,
@@ -61,8 +59,11 @@ impl TransportBuffer {
         }
     }
 
-    #[staticmethod]
-    fn shared(py: Python<'_>, storage: Py<SharedBuffer>, capacity: Py<TransferCapacity>) -> Self {
+    pub(in crate::worker) fn shared(
+        py: Python<'_>,
+        storage: Py<SharedBuffer>,
+        capacity: Py<TransferCapacity>,
+    ) -> Self {
         let nbytes = storage
             .get()
             .inner
@@ -77,33 +78,20 @@ impl TransportBuffer {
         }
     }
 
-    #[staticmethod]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (tensor, event, nbytes, capacity, handle, copied_source=None, *, pool=None, consumers=Vec::new(), grants=None, export_id=""))]
-    fn cuda(
+    pub(in crate::worker) fn cuda(
         tensor: Py<PyAny>,
         event: Py<CUDAEvent>,
         nbytes: u64,
         capacity: Py<TransferCapacity>,
-        handle: &[u8],
+        descriptor: Option<OwnedFd>,
         copied_source: Option<Py<PyAny>>,
         pool: Option<(Py<VmmPool>, Py<PoolChunk>)>,
         consumers: Vec<usize>,
         grants: Option<Py<DescriptorGrants>>,
         export_id: &str,
-    ) -> PyResult<Self> {
-        let descriptor = if grants.is_some() && pool.is_none() {
-            let bytes = handle.try_into().map_err(|_| {
-                PyValueError::new_err("descriptor handle must contain a file descriptor")
-            })?;
-            // The direct export transfers its owned descriptor here. Pooled
-            // exports leave the pool's descriptor with its allocation owner.
-            Some(unsafe { OwnedFd::from_raw_fd(i32::from_ne_bytes(bytes)) })
-        } else {
-            None
-        };
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             capacity,
             nbytes,
             backing: Mutex::new(Backing::Cuda(CudaSource {
@@ -116,15 +104,12 @@ impl TransportBuffer {
                 export: export_id.into(),
                 descriptor,
             })),
-        })
+        }
     }
+}
 
-    /// Retire a backing that was never handed to the registry, such as an
-    /// export whose locator construction failed after recording its fence.
-    fn retire(slf: &Bound<'_, Self>, events: &EventPool) -> PyResult<()> {
-        Self::reclaim(slf.py(), slf.clone().unbind(), events, None)
-    }
-
+#[pymethods]
+impl TransportBuffer {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.capacity)?;
         let backing = match self.backing.try_lock() {
@@ -226,7 +211,7 @@ impl TransportBuffer {
         Ok(())
     }
 
-    pub(super) fn reclaim(
+    pub(in crate::worker) fn reclaim(
         py: Python<'_>,
         buffer: Py<Self>,
         events: &EventPool,

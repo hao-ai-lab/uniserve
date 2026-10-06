@@ -112,7 +112,7 @@ impl EventPool {
     }
 
     /// Queue the installed native wake after work already on this stream.
-    fn notify_stream(&self, py: Python<'_>, stream: usize) -> PyResult<()> {
+    pub(in crate::worker) fn notify_stream(&self, py: Python<'_>, stream: usize) -> PyResult<()> {
         let wake = self.lock().wake.as_ref().map(|wake| wake.clone_ref(py));
         if let Some(wake) = wake {
             wake.bind(py).call1((stream,))?;

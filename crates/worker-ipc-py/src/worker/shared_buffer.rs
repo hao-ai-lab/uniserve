@@ -27,7 +27,7 @@ pub(crate) struct SharedBuffer {
 impl SharedBuffer {
     #[new]
     #[pyo3(signature = (nbytes, consumers, device=None))]
-    fn new(
+    pub(in crate::worker) fn new(
         py: Python<'_>,
         nbytes: usize,
         consumers: Vec<usize>,
@@ -42,7 +42,7 @@ impl SharedBuffer {
     }
 
     #[getter]
-    fn name(&self, py: Python<'_>) -> PyResult<String> {
+    pub(in crate::worker) fn name(&self, py: Python<'_>) -> PyResult<String> {
         self.lock(py)?
             .name()
             .map(str::to_owned)
@@ -59,12 +59,12 @@ impl SharedBuffer {
         Ok(self.lock(py)?.is_cuda())
     }
 
-    fn begin_copy(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::worker) fn begin_copy(&self, py: Python<'_>) -> PyResult<()> {
         self.lock(py)?.begin_copy();
         Ok(())
     }
 
-    fn mark_ready(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::worker) fn mark_ready(&self, py: Python<'_>) -> PyResult<()> {
         let mut buffer = self.lock(py)?;
         let buffer = &mut *buffer;
         py.detach(|| buffer.mark_ready())
@@ -82,7 +82,7 @@ impl SharedBuffer {
             .map_err(|error| resource(py, error))
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::worker) fn close(&self, py: Python<'_>) -> PyResult<()> {
         let mut buffer = self.lock(py)?;
         let buffer = &mut *buffer;
         py.detach(|| buffer.close())
@@ -144,7 +144,7 @@ pub(crate) struct SharedRead {
 impl SharedRead {
     #[new]
     #[pyo3(signature = (name, nbytes, slot, *, offset=0, timeout=120.0))]
-    fn new(
+    pub(in crate::worker) fn new(
         py: Python<'_>,
         name: &str,
         nbytes: usize,

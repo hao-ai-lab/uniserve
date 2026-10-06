@@ -9561,6 +9561,7 @@ dependencies = [
  "uniserve-core",
  "uniserve-worker",
  "uniserve-worker-ipc",
+ "uuid",
 ]
 
 [[package]]

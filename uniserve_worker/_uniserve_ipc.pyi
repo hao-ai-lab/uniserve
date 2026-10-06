@@ -60,7 +60,6 @@ from uniserve_worker.protocol.transfer import (
 from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
-from uniserve_worker.transport.interface import Transport
 from uniserve_worker.worker import Worker
 
 class DescriptorGrants:
@@ -90,8 +89,7 @@ __all__ = [
     "Buffer",
     "BufferBinding",
     "BufferPool",
-    "BufferRegistry",
-    "TransportBuffer",
+    "Transport",
     "Completion",
     "CUDAEvent",
     "CUDAStream",
@@ -133,7 +131,6 @@ __all__ = [
     "TensorRead",
     "TensorStore",
     "TransferCapacity",
-    "TransferPool",
     "TransferTicket",
     "fetch_tensor",
     "fetch_descriptor",
@@ -951,58 +948,73 @@ class Completion:
     ) -> None: ...
 
 @final
-class TransportBuffer:
-    """An export's backing, producer event and reserved byte capacity."""
+class Transport:
+    """Physical tensor exports and asynchronous reads through native owners.
 
-    @staticmethod
-    def local(
-        tensor: torch.Tensor | tuple[torch.Tensor, ...],
-        event: CUDAEvent | None,
-        nbytes: int,
-        capacity: TransferCapacity,
-    ) -> TransportBuffer: ...
-    @staticmethod
-    def shared(
-        storage: SharedBuffer, capacity: TransferCapacity
-    ) -> TransportBuffer: ...
-    @staticmethod
-    def cuda(
-        tensor: torch.Tensor | tuple[torch.Tensor, ...],
-        event: CUDAEvent,
-        nbytes: int,
-        capacity: TransferCapacity,
-        handle: bytes,
-        copied_source: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
-        *,
-        pool: tuple[VmmPool, PoolChunk] | None = None,
-        consumers: Sequence[int] = (),
-        grants: DescriptorGrants | None = None,
-        export_id: str = "",
-    ) -> TransportBuffer: ...
-    def retire(self, events: EventPool) -> None:
-        """Retire a failed export that was never registered."""
-
-@final
-class BufferRegistry:
-    """Retain storage through producer completion and granted readers.
-
-    Reclamation returns byte capacity and completes the retirement signal.
-    CUDA host unregistration runs on the native host executor. Close drains
-    producer writes and reclamation before requiring all readers to retire.
+    Every backend shares the rank's byte and read-ticket capacity. A source
+    stays immutable until its retirement completes after release. Reads
+    preserve producer and destination stream order through physical completion.
     """
 
-    def __new__(cls, *, capacity: int, event_pool: EventPool) -> Self: ...
+    def __new__(
+        cls,
+        name: str,
+        *,
+        capacity: TransferCapacity,
+        event_pool: EventPool,
+        source: WorkerEndpoint,
+        acknowledgment_slot: int = 0,
+        host_slots: Sequence[int] = (),
+        cross_host_consumers: bool = False,
+    ) -> Self: ...
     @property
     def name(self) -> str: ...
-    def register(self, locator: Locator, source: TransportBuffer) -> None: ...
-    def release(self, locator: Locator) -> Completion | None: ...
+    @property
+    def source(self) -> WorkerEndpoint: ...
+    @property
+    def capacity(self) -> TransferCapacity: ...
+    def endpoint(self) -> str: ...
+    def export(
+        self,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        *,
+        offset: tuple[int, ...] | None = None,
+        consumers: Sequence[int] = (),
+    ) -> Locator:
+        """Retain immutable spans or copy them into transport-owned storage.
+
+        Consumers name reader acknowledgment slots. Capacity exhaustion fails
+        before a payload is allocated. A channel export carries independent
+        bytes; registered exports retain storage until producer and readers
+        finish.
+        """
+        ...
+    def fetch(
+        self,
+        locator: Locator,
+        *,
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        region: tuple[slice, ...] | None = None,
+        reservation: ReadReservation | None = None,
+    ) -> TransferTicket: ...
+    def borrow(
+        self, locator: Locator, region: tuple[slice, ...] | None = None
+    ) -> SharedRead:
+        """Borrow shared host rows; release the read after its final access."""
+        ...
+    def release(self, locator: Locator) -> Completion | None:
+        """Revoke new readers while retaining backing for existing accesses."""
+        ...
     def retirement(self, locator: Locator) -> Completion: ...
     def awaiting_acknowledgment(self) -> bool: ...
     def set_completion_wake(
         self, wake: Callable[[], object] | None
     ) -> None: ...
     def reap(self) -> None: ...
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Drain reads, producer copies and backing resources."""
+        ...
 
 @final
 class TransferCapacity:
@@ -1062,61 +1074,6 @@ class TransferTicket:
     def close(self) -> None: ...
     def add_done_callback(self, callback: Callable[[], None]) -> None: ...
     def add_retirement_callback(self, callback: Callable[[], None]) -> None: ...
-
-@final
-class TransferPool:
-    """Own bounded read submission, copy streams, and credit retirement."""
-
-    def __new__(
-        cls,
-        *,
-        workers: int,
-        capacity: TransferCapacity,
-        name: str,
-        event_pool: EventPool,
-    ) -> Self: ...
-    def set_completion_wake(self, wake: Callable[[], None] | None) -> None: ...
-    def fetch_channel(
-        self,
-        locator: Locator,
-        *,
-        device: torch.device,
-        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
-        region: tuple[slice, ...] | None = None,
-        reservation: ReadReservation | None = None,
-    ) -> TransferTicket: ...
-    def fetch_local(
-        self,
-        locator: Locator,
-        *,
-        device: torch.device,
-        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
-        region: tuple[slice, ...] | None = None,
-        reservation: ReadReservation | None = None,
-    ) -> TransferTicket: ...
-    def fetch_shared(
-        self,
-        locator: Locator,
-        *,
-        node: str,
-        slot: int,
-        device: torch.device,
-        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
-        region: tuple[slice, ...] | None = None,
-        reservation: ReadReservation | None = None,
-    ) -> TransferTicket: ...
-    def fetch_cuda(
-        self,
-        locator: Locator,
-        *,
-        source: WorkerEndpoint,
-        slot: int,
-        device: torch.device,
-        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
-        region: tuple[slice, ...] | None = None,
-        reservation: ReadReservation | None = None,
-    ) -> TransferTicket: ...
-    def close(self) -> None: ...
 
 @final
 class LatentBuffer:

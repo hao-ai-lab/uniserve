@@ -24,7 +24,7 @@ pyo3::create_exception!(
 pub(crate) struct PoolChunk {
     inner: Arc<NativeChunk>,
     #[pyo3(get)]
-    storage: Py<PyAny>,
+    pub(in crate::worker) storage: Py<PyAny>,
     #[pyo3(get)]
     acknowledgments: Py<PyAny>,
 }
@@ -32,7 +32,7 @@ pub(crate) struct PoolChunk {
 #[pymethods]
 impl PoolChunk {
     #[getter]
-    fn offset(&self) -> usize {
+    pub(in crate::worker) fn offset(&self) -> usize {
         self.inner.offset
     }
 
@@ -42,7 +42,7 @@ impl PoolChunk {
     }
 
     #[getter]
-    fn payload_offset(&self) -> usize {
+    pub(in crate::worker) fn payload_offset(&self) -> usize {
         self.inner.payload_offset()
     }
 
@@ -68,7 +68,11 @@ struct PoolStorage {
 impl VmmPool {
     #[new]
     #[pyo3(signature = (device, *, capacity_bytes))]
-    fn new(py: Python<'_>, device: &Bound<'_, PyAny>, capacity_bytes: usize) -> PyResult<Self> {
+    pub(in crate::worker) fn new(
+        py: Python<'_>,
+        device: &Bound<'_, PyAny>,
+        capacity_bytes: usize,
+    ) -> PyResult<Self> {
         if capacity_bytes == 0 {
             return Err(PyValueError::new_err(
                 "a VMM pool needs a positive capacity",
@@ -105,7 +109,7 @@ impl VmmPool {
     }
 
     #[getter]
-    fn handle<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+    pub(in crate::worker) fn handle<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let pool = self.lock(py)?;
         let storage = pool.backing().map_err(|error| native_error(py, error))?;
         Ok(PyBytes::new(py, &storage.handle))
@@ -120,11 +124,11 @@ impl VmmPool {
     }
 
     #[getter]
-    fn capacity(&self, py: Python<'_>) -> PyResult<usize> {
+    pub(in crate::worker) fn capacity(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(self.lock(py)?.capacity())
     }
 
-    fn reserve(&self, py: Python<'_>, nbytes: usize) -> PyResult<PoolChunk> {
+    pub(in crate::worker) fn reserve(&self, py: Python<'_>, nbytes: usize) -> PyResult<PoolChunk> {
         let stream = current_stream(py, self.device.bind(py))?;
         let (chunk, storage) = {
             let mut pool = self.lock(py)?;
@@ -168,7 +172,7 @@ impl VmmPool {
         }
     }
 
-    fn release(&self, py: Python<'_>, chunk: &PoolChunk) -> PyResult<()> {
+    pub(in crate::worker) fn release(&self, py: Python<'_>, chunk: &PoolChunk) -> PyResult<()> {
         self.lock(py)?
             .release(&chunk.inner)
             .map_err(|error| native_error(py, error))
@@ -191,18 +195,18 @@ impl VmmPool {
             .map_err(|error| native_error(py, error))
     }
 
-    fn reap(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::worker) fn reap(&self, py: Python<'_>) -> PyResult<()> {
         let mut pool = self.lock(py)?;
         let pool = &mut *pool;
         py.detach(|| pool.reap())
             .map_err(|error| native_error(py, error))
     }
 
-    fn awaiting_acknowledgment(&self, py: Python<'_>) -> PyResult<bool> {
+    pub(in crate::worker) fn awaiting_acknowledgment(&self, py: Python<'_>) -> PyResult<bool> {
         Ok(self.lock(py)?.awaiting_acknowledgment())
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::worker) fn close(&self, py: Python<'_>) -> PyResult<()> {
         let backing = {
             let mut pool = self.lock(py)?;
             let pool = &mut *pool;

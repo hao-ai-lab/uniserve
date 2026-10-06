@@ -16,22 +16,27 @@ pub(crate) struct DescriptorGrants {
 #[pymethods]
 impl DescriptorGrants {
     #[new]
-    fn new(py: Python<'_>, endpoint: &str) -> PyResult<Self> {
+    pub(in crate::worker) fn new(py: Python<'_>, endpoint: &str) -> PyResult<Self> {
         Ok(Self {
             inner: ManuallyDrop::new(Arc::new(py.detach(|| NativeGrants::new(endpoint))?)),
         })
     }
 
-    fn register(&self, py: Python<'_>, export: &str, descriptor: RawFd) -> PyResult<()> {
+    pub(in crate::worker) fn register(
+        &self,
+        py: Python<'_>,
+        export: &str,
+        descriptor: RawFd,
+    ) -> PyResult<()> {
         py.detach(|| self.inner.register(export, descriptor))?;
         Ok(())
     }
 
-    fn release(&self, py: Python<'_>, export: &str) {
+    pub(in crate::worker) fn release(&self, py: Python<'_>, export: &str) {
         py.detach(|| self.inner.release(export));
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::worker) fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.inner.close())?;
         Ok(())
     }

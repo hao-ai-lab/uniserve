@@ -17,6 +17,7 @@ serde.workspace = true
 uniserve-core.workspace = true
 uniserve-worker-ipc.workspace = true
 uniserve-worker.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

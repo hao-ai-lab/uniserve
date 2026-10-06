@@ -66,7 +66,10 @@ impl Completion {
         }
     }
 
-    fn set_result(slf: &Bound<'_, Self>, _result: &Bound<'_, PyNone>) -> PyResult<()> {
+    pub(in crate::worker) fn set_result(
+        slf: &Bound<'_, Self>,
+        _result: &Bound<'_, PyNone>,
+    ) -> PyResult<()> {
         let callbacks = slf
             .borrow()
             .inner

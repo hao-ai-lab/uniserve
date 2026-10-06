@@ -157,10 +157,7 @@ def test_encoded_units_cross_hosts_without_transferring_reserved_padding(
     from uniserve.runtime import EventPool
     from uniserve_worker.execution.host_media import read_encoded_units
     from uniserve_worker.protocol.transfer import TensorTransfer
-    from uniserve_worker.transport.channel import ChannelTransport
-    from uniserve_worker.transport.local import LocalTransport
-    from uniserve_worker.transport.pool import TransferCapacity
-    from uniserve_worker.transport.shm import ShmTransport
+    from uniserve_worker.transport import make_transports
 
     config = _config()
     units = (
@@ -169,16 +166,13 @@ def test_encoded_units_cross_hosts_without_transferring_reserved_padding(
     )
     capacity = encoded_unit_bytes(4, 16, 32)
     storage = torch.empty((2, capacity), dtype=torch.uint8)
-    transports = {
-        name: kind(
-            capacity=TransferCapacity(1024 * 1024, 8), event_pool=EventPool()
-        )
-        for name, kind in (
-            ("shm", ShmTransport),
-            ("channel", ChannelTransport),
-            ("local", LocalTransport),
-        )
-    }
+    events = EventPool()
+    transports = make_transports(
+        ("shm", "channel", "local"),
+        byte_capacity=1024 * 1024,
+        ticket_capacity=8,
+        event_pool=events,
+    )
     locations = []
     try:
         for index, (payload, backend) in enumerate(
@@ -202,3 +196,4 @@ def test_encoded_units_cross_hosts_without_transferring_reserved_padding(
             transports[location.backend].release(location)
         for transport in transports.values():
             transport.close()
+        events.close()
