@@ -162,8 +162,8 @@ def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
         block_size=16,
         max_sequence_tokens=64,
         max_batch_tokens=64,
-        max_batch_calls=4,
-        max_request_pool_size=4,
+        max_batch_calls=20,
+        max_request_pool_size=20,
     )
     runner = ModelExecutor(
         model,
@@ -181,7 +181,7 @@ def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
     manager = KVCacheManager(
         cache,
         info=cache_info(model.text, config, num_units=16),
-        request_pool_size=4,
+        request_pool_size=20,
         table_width=4,
     )
     try:
@@ -192,8 +192,8 @@ def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
             kv_cache=manager,
             latent_pool=None,
             decode_predicates=None,
-            max_calls=4,
-            request_slots=4,
+            max_calls=20,
+            request_slots=20,
             latent_capacity_units=0,
             table_widths=(4,) * len(manager.shapes),
             max_inflight=1,
@@ -201,7 +201,12 @@ def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
         runner.capture(tokenizer=None, latents=None)
         runner.complete_startup()
         retained = []
-        for order in ((0, 1, 2), (2, 0)):
+        # Retain results across both groups within a call and later calls.
+        for order, replays in (
+            ((0, 1, 2), 1),
+            ((0, 1, 2) * 5 + (2, 0), 2),
+            ((2, 0), 1),
+        ):
             rows = tuple(
                 VisionRow(
                     MediaCall.VISION_ENCODING,
@@ -225,9 +230,9 @@ def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
             result = forward_batch(
                 runner, rows, calls=calls, cache=None, tables=None, states=None
             )
-            assert result.stats.cuda_graph_replays == 1
+            assert result.stats.cuda_graph_replays == replays
             assert result.stats.cuda_graph_runtime_mode_counts == {
-                "graph_replay": 1
+                "graph_replay": replays
             }
             retained.extend(
                 zip(

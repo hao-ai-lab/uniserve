@@ -14,7 +14,7 @@ use uniserve_worker::{PrefillShape as NativePrefillShape, TextShapes as NativeTe
 )]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PrefillShape {
-    inner: NativePrefillShape,
+    pub(super) inner: NativePrefillShape,
 }
 
 #[pymethods]
