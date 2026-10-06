@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import logging
-import time
 import uuid
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from uniserve import _slices
 from uniserve.profiling import profile_range
 from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import Completion
@@ -23,8 +20,6 @@ from uniserve_worker.transport.layout import (
     copy_pairs,
     dtype_name,
     export_views,
-    read_destination,
-    region_view,
     resolve_dtype,
     tensor_nbytes,
 )
@@ -37,8 +32,6 @@ from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
     import torch
-
-_LOG = logging.getLogger(__name__)
 
 
 class ChannelTransport(Transport):
@@ -69,7 +62,6 @@ class ChannelTransport(Transport):
         host_slots: Sequence[int] = (),
     ) -> None:
         self.capacity = capacity
-        self._events = event_pool
         self.source = source or WorkerEndpoint.local()
         # Slots of the ranks on this host, which shared storage reaches; the
         # channel carries a product only for a consumer elsewhere.
@@ -81,18 +73,6 @@ class ChannelTransport(Transport):
             name="uniserve-channel-read",
             event_pool=event_pool,
         )
-        # What carrying a product on the channel costs this rank. An export
-        # blocks on its own stream and then copies the bytes out, and both are
-        # on the batch's critical path, so each is counted separately from the
-        # payload they move.
-        self._exported = 0
-        self._payload_bytes = 0
-        self._largest_payload = 0
-        self._synchronize_seconds = 0.0
-        self._longest_synchronize = 0.0
-        self._copy_seconds = 0.0
-        self._fetched = 0
-        self._fetch_seconds = 0.0
 
     def endpoint(self) -> str:
         return self._endpoint
@@ -132,23 +112,12 @@ class ChannelTransport(Transport):
             if first.is_cuda:
                 # The producer waits here for its own writes: the bytes leave
                 # with the result, so nothing downstream can fence them. This
-                # is the export's synchronize cost.
-                started = time.perf_counter()
+                # is included in the export's profiler range.
                 with profile_range("channel_export_synchronize"):
                     torch.cuda.current_stream(first.device).synchronize()
-                waited = time.perf_counter() - started
-                self._synchronize_seconds += waited
-                self._longest_synchronize = max(
-                    self._longest_synchronize, waited
-                )
 
-            started = time.perf_counter()
             with profile_range("channel_export_payload"):
                 payload = bytes(packed.flatten().view(torch.uint8).numpy())
-            self._copy_seconds += time.perf_counter() - started
-            self._exported += 1
-            self._payload_bytes += nbytes
-            self._largest_payload = max(self._largest_payload, nbytes)
 
             return Locator(
                 source=self.source,
@@ -178,40 +147,17 @@ class ChannelTransport(Transport):
         region: tuple[slice, ...] | None = None,
         reservation: ReadReservation | None = None,
     ) -> TransferTicket:
-        """Copy the locator's own bytes into a reserved destination."""
-        import torch
+        """Admit a read, then copy the locator's bytes on the read thread.
 
-        handle = locator.transport
-        if not isinstance(handle, ChannelTransfer):
-            raise invalid_descriptor("channel read requires a channel locator")
-        target = read_destination(locator, device, destination, region)
-        started = time.perf_counter()
-        with profile_range("channel_fetch_payload"):
-            payload = torch.frombuffer(
-                bytearray(handle.payload), dtype=resolve_dtype(locator.dtype)
-            ).reshape(locator.shape)
-            # A device destination is filled by an asynchronous copy, which
-            # reads pinned host storage; the bytes arrived pageable.
-            if device.type == "cuda":
-                carried = torch.empty_like(payload, pin_memory=True)
-                carried.copy_(payload)
-            else:
-                carried = payload
-        self._fetch_seconds += time.perf_counter() - started
-        self._fetched += 1
-        if region is not None:
-            if not _slices.within(region, locator.shape):
-                raise invalid_descriptor(
-                    "read region exceeds the exported view"
-                )
-            carried = region_view(carried, region)
-        return self._reads.submit(
-            self._reads.copy,
-            carried,
-            target,
-            None,
-            nbytes=locator.nbytes,
-            destination=target,
+        Supplied destinations are checked before admission. Without one,
+        allocation and shape errors fail the ticket. The native pool retains
+        payload storage and read credits through destination-copy completion.
+        """
+        return self._reads.fetch_channel(
+            locator,
+            device=device,
+            destination=destination,
+            region=region,
             reservation=reservation,
         )
 
@@ -245,24 +191,24 @@ class ChannelTransport(Transport):
         return handle
 
     def close(self) -> None:
-        """Report what the channel cost this rank, then release its reads."""
-        if self._exported or self._fetched:
-            mean = (
-                self._payload_bytes // self._exported if self._exported else 0
-            )
-            _LOG.info(
-                "channel transport retired: exported=%d payload_total=%d "
-                "payload_mean=%d payload_max=%d synchronize_ms_total=%.3f "
-                "synchronize_ms_max=%.3f copy_ms_total=%.3f fetched=%d "
-                "fetch_ms_total=%.3f",
-                self._exported,
-                self._payload_bytes,
-                mean,
-                self._largest_payload,
-                self._synchronize_seconds * 1e3,
-                self._longest_synchronize * 1e3,
-                self._copy_seconds * 1e3,
-                self._fetched,
-                self._fetch_seconds * 1e3,
-            )
+        """Drain accepted reads and release their physical storage."""
         self._reads.close()
+
+
+def _copy_payload(locator: Locator, device: torch.device) -> torch.Tensor:
+    """Make a private tensor from channel bytes, pinned for device DMA."""
+    import torch
+
+    handle = cast(ChannelTransfer, locator.transport)
+    with profile_range("channel_fetch_payload"):
+        payload = torch.frombuffer(
+            bytearray(handle.payload),
+            dtype=resolve_dtype(locator.dtype),
+        ).reshape(locator.shape)
+        if device.type != "cuda":
+            return payload
+
+        # The copy stream needs pinned storage until its DMA completes.
+        carried = torch.empty_like(payload, pin_memory=True)
+        carried.copy_(payload)
+        return carried

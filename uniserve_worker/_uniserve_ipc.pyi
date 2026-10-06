@@ -1076,12 +1076,13 @@ class TransferPool:
         event_pool: EventPool,
     ) -> Self: ...
     def set_completion_wake(self, wake: Callable[[], None] | None) -> None: ...
-    def submit(
+    def fetch_channel(
         self,
-        call: Callable[..., Any],
-        *args: Any,
-        nbytes: int,
+        locator: Locator,
+        *,
+        device: torch.device,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        region: tuple[slice, ...] | None = None,
         reservation: ReadReservation | None = None,
     ) -> TransferTicket: ...
     def fetch_local(
@@ -1115,14 +1116,6 @@ class TransferPool:
         region: tuple[slice, ...] | None = None,
         reservation: ReadReservation | None = None,
     ) -> TransferTicket: ...
-    def copy(
-        self,
-        ticket: TransferTicket,
-        source: torch.Tensor | tuple[torch.Tensor, ...],
-        destination: torch.Tensor | tuple[torch.Tensor, ...],
-        producer: CUDAEvent | None = None,
-        acknowledgment: torch.Tensor | None = None,
-    ) -> None: ...
     def close(self) -> None: ...
 
 @final

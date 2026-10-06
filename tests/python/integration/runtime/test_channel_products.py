@@ -9,7 +9,12 @@ import torch
 
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
+from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.transfer import Locator
+from uniserve_worker.transport.pool import (
+    ReadBackpressureError,
+    ReadReservation,
+)
 
 pytestmark = [pytest.mark.integration]
 
@@ -90,8 +95,6 @@ def test_a_channel_locator_from_another_endpoint_is_refused(
     The bytes are indistinguishable once they travel, so the endpoint is what
     identifies whose export a locator is.
     """
-    from uniserve_worker.errors import WorkerError
-
     producer = make_transport(
         "channel", byte_capacity=1 << 20, ticket_capacity=2, event_pool=events
     )
@@ -178,4 +181,110 @@ def test_a_channel_product_reaches_a_device_destination(
         )
         assert torch.equal(destination.cpu(), source)
     finally:
+        transport.close()
+
+
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
+@pytest.mark.parametrize("fragmented", (False, True))
+def test_channel_regions_survive_backpressure_and_source_retirement(
+    events: EventPool, device: str, fragmented: bool
+) -> None:
+    transport = make_transport(
+        "channel", byte_capacity=128, ticket_capacity=1, event_pool=events
+    )
+    source = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    expected = source[1:5, 1:3].clone()
+    locator = transport.export(source)
+    transport.release(locator)
+    source.fill_(-1)
+    target_device = torch.device(device)
+    target = (
+        torch.full((4, 2), -2.0, device=target_device) if fragmented else None
+    )
+    destination = None if target is None else (target[:1], target[1:])
+    region = (slice(1, 5), slice(1, 3))
+
+    try:
+        with ReadReservation(transport.capacity, 1):
+            with pytest.raises(ReadBackpressureError):
+                transport.fetch(
+                    locator,
+                    device=target_device,
+                    destination=destination,
+                    region=region,
+                )
+            if target is not None:
+                torch.testing.assert_close(
+                    target.cpu(), torch.full((4, 2), -2.0)
+                )
+
+        ticket = transport.fetch(
+            locator,
+            device=target_device,
+            destination=destination,
+            region=region,
+        )
+        result = _await_ticket(ticket)
+        result = torch.cat(result) if fragmented else result
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+        transport.close()
+        assert ticket.retirement_ready()
+        assert transport.capacity.used == 0
+    finally:
+        transport.close()
+
+
+def test_failed_channel_preparation_returns_read_capacity(
+    events: EventPool,
+) -> None:
+    transport = make_transport(
+        "channel", byte_capacity=16, ticket_capacity=1, event_pool=events
+    )
+    source = torch.arange(4, dtype=torch.float32)
+    locator = transport.export(source)
+    device = torch.device("cpu")
+
+    try:
+        ticket = transport.fetch(locator, device=device, region=(slice(0, 5),))
+        retired = threading.Event()
+        ticket.add_retirement_callback(retired.set)
+        with pytest.raises(WorkerError, match="read region exceeds"):
+            _await_ticket(ticket)
+        assert retired.wait(5), "failed channel read did not retire"
+
+        replacement = transport.fetch(locator, device=device)
+        torch.testing.assert_close(
+            _await_ticket(replacement), source, rtol=0, atol=0
+        )
+        transport.close()
+        assert replacement.retirement_ready()
+        assert transport.capacity.used == 0
+    finally:
+        transport.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ("channel", "shm"))
+def test_host_payload_allocation_uses_the_submitting_threads_cuda_device(
+    events: EventPool, backend: str
+) -> None:
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+
+    transport = make_transport(
+        backend, byte_capacity=128, ticket_capacity=1, event_pool=events
+    )
+    source = torch.arange(8, dtype=torch.float32)
+    locator = transport.export(source, consumers=(0,))
+
+    try:
+        with torch.cuda.device(1):
+            ticket = transport.fetch(locator, device=torch.device("cuda"))
+        result = _await_ticket(ticket)
+        assert result.device == torch.device("cuda:1")
+        torch.testing.assert_close(result.cpu(), source, rtol=0, atol=0)
+    finally:
+        transport.release(locator)
         transport.close()
