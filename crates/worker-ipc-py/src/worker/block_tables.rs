@@ -23,7 +23,7 @@ use super::protocol::request_key;
 )]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GroupShape {
-    shape: NativeGroupShape,
+    pub(super) shape: NativeGroupShape,
 }
 
 #[pymethods]
@@ -73,7 +73,12 @@ pub(crate) struct GroupTable {
 #[pymethods]
 impl GroupTable {
     #[new]
-    fn new(shape: &GroupShape, start_page: u32, units: Vec<u32>, allocated_tokens: u32) -> Self {
+    pub(super) fn new(
+        shape: &GroupShape,
+        start_page: u32,
+        units: Vec<u32>,
+        allocated_tokens: u32,
+    ) -> Self {
         Self {
             table: Arc::new(NativeGroupTable {
                 shape: shape.shape,

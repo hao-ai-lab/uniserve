@@ -1,14 +1,19 @@
 //! Startup ordering for numerical preparation and expert participation.
 
+use std::cmp::Reverse;
 use std::collections::HashSet;
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyDict, PySlice, PyTuple};
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
-use super::{ModelRunners, execution, experts, resources};
+use super::{ModelRunners, context, execution, experts, graphs, resources};
+use crate::worker::block_tables::{GroupShape, GroupTable};
+use crate::worker::execution::{Execution, on_stream};
 use crate::worker::expert_exchange::ExpertExchange;
-use crate::worker::host::with_context;
+use crate::worker::graph_shapes::PrefillShape;
+use crate::worker::host::{with_context, with_entered};
 
 pub(super) fn prepare(
     slf: &Bound<'_, ModelRunners>,
@@ -65,7 +70,6 @@ pub(super) fn prepare(
                     .collect::<PyResult<HashSet<CallKind>>>()?;
                 prepared.push((runner, kinds));
             }
-            let backend = py.import("uniserve_worker.model_executor.startup")?;
             for kind in [
                 CallKind::Forward(ForwardMode::Prefill),
                 CallKind::Forward(ForwardMode::Decode),
@@ -89,42 +93,22 @@ pub(super) fn prepare(
                                     .call1((1, 1, 1))?;
                                 shapes = PyTuple::new(py, [shape])?.into_any();
                             }
-                            backend.call_method1(
-                                "prepare_prefill",
-                                (
-                                    owner,
-                                    runner,
-                                    runner.getattr("input_buffers")?,
-                                    runner.getattr("batch_forward")?,
-                                    shapes,
-                                ),
-                            )?;
+                            prepare_prefill(owner, runner, &shapes)?;
                         }
                         CallKind::Forward(ForwardMode::Decode) => {
-                            backend.call_method1(
-                                "prepare_decode",
-                                (
-                                    owner,
-                                    runner,
-                                    runner.getattr("input_buffers")?,
-                                    runner.getattr("batch_forward")?,
-                                ),
-                            )?;
+                            prepare_decode(owner, runner)?;
                         }
                         CallKind::Forward(ForwardMode::TokenDenoising) => {
-                            backend.call_method1("prepare_canvas", (owner, runner))?;
+                            prepare_canvas(owner, runner)?;
                         }
                         CallKind::Media(MediaCall::Denoising) => {
-                            backend.call_method1(
-                                "prepare_flow",
-                                (owner, runner, latents, tokenizer),
-                            )?;
+                            prepare_flow(slf, owner, runner, latents, tokenizer)?;
                         }
                         _ => unreachable!("fixed startup call kinds"),
                     }
                 }
             }
-            backend.call_method1("prepare_images", (owner, latents))?;
+            prepare_images(owner, &prepared, latents)?;
             if let Some(control) = control
                 && owner.getattr("attention_ranks")?.is_truthy()?
             {
@@ -144,6 +128,472 @@ pub(super) fn seal(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny>) -> P
     }
     for expert in &slf.borrow().expert_executions {
         expert.borrow_mut(slf.py()).sealed = true;
+    }
+    Ok(())
+}
+
+/// Borrow whole scratch pages, bind numerical tables, and retire the lease on
+/// either exit. Request allocation remains with the scheduler.
+fn with_tables<'py, T>(
+    cache: &Bound<'py, PyAny>,
+    lengths: &[usize],
+    operation: impl FnOnce(Bound<'py, PyTuple>) -> PyResult<T>,
+) -> PyResult<T> {
+    let py = cache.py();
+    if cache.is_none() {
+        return Err(PyValueError::new_err(
+            "graph preparation requires the worker KV cache",
+        ));
+    }
+    let groups: Vec<Py<GroupShape>> = cache.getattr("shapes")?.extract()?;
+    let count: usize = lengths
+        .iter()
+        .flat_map(|&length| {
+            groups.iter().map(move |group| {
+                let shape = group.get().shape;
+                length.max(1).div_ceil(shape.page_tokens as usize) * shape.units_per_page as usize
+            })
+        })
+        .sum();
+    with_entered(&cache.call_method1("startup_units", (count,))?, |scratch| {
+        let units: Vec<u32> = scratch.extract()?;
+        let mut cursor = 0;
+        let mut tables = Vec::with_capacity(lengths.len());
+        for &length in lengths {
+            let mut row = Vec::with_capacity(groups.len());
+            for group in &groups {
+                let shape = group.get().shape;
+                let pages = length.max(1).div_ceil(shape.page_tokens as usize);
+                let count = pages * shape.units_per_page as usize;
+                row.push(Py::new(
+                    py,
+                    GroupTable::new(
+                        group.get(),
+                        0,
+                        units[cursor..cursor + count].to_vec(),
+                        pages as u32 * shape.page_tokens,
+                    ),
+                )?);
+                cursor += count;
+            }
+            tables.push(PyTuple::new(py, row)?);
+        }
+        operation(PyTuple::new(py, tables)?)
+    })
+}
+
+fn eager(runner: &Bound<'_, PyAny>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
+    on_stream(&context(runner)?, &runner.getattr("device")?, || {
+        graphs::run_eager(runner, batch, &runner.getattr("batch_forward")?).map(drop)
+    })
+}
+
+fn capture(runner: &Bound<'_, PyAny>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
+    graphs::capture(runner, batch, &runner.getattr("batch_forward")?)
+}
+
+fn prepare_prefill(
+    owner: &Bound<'_, PyAny>,
+    runner: &Bound<'_, PyAny>,
+    shapes: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let py = owner.py();
+    let backend = py.import("uniserve_worker.model_executor.startup")?;
+    let config = owner.getattr("worker_config")?;
+    let row_tokens = config
+        .getattr("max_sequence_tokens")?
+        .extract::<usize>()?
+        .min(config.getattr("max_batch_tokens")?.extract()?)
+        .max(1);
+    let cache = owner.getattr("kv_cache")?;
+    let groups: Vec<Py<GroupShape>> = cache.getattr("shapes")?.extract()?;
+    let pages: Vec<_> = groups
+        .iter()
+        .map(|group| {
+            let shape = group.get().shape;
+            (shape.page_tokens as usize, shape.units_per_page as usize)
+        })
+        .collect();
+    let units = cache
+        .getattr("info")?
+        .getattr("num_units")?
+        .extract::<usize>()?
+        - 1;
+    let mut shapes: Vec<Py<PrefillShape>> = shapes.extract()?;
+    shapes.sort_by_key(|shape| {
+        Reverse((
+            shape.get().inner.token_bucket * shape.get().inner.row_bucket,
+            shape.get().inner.token_bucket,
+        ))
+    });
+    let selection = py
+        .import("uniserve_worker.sampling.metadata")?
+        .getattr("TokenSelection")?;
+    // Largest footprints first let smaller captures reuse output backing and
+    // workspaces without pinning successive allocator growth in separate graphs.
+    for shape in shapes {
+        let lengths = shape.get().inner.scratch_lengths(row_tokens, &pages, units);
+        with_tables(&cache, &lengths, |tables| {
+            let options = PyDict::new(py);
+            options.set_item(
+                "selection",
+                selection.getattr(if shape.get().inner.outputs {
+                    "LAST_LOGITS"
+                } else {
+                    "CACHE"
+                })?,
+            )?;
+            options.set_item("causal", shape.get().inner.causal)?;
+            options.set_item("embeddings", shape.get().inner.embeddings)?;
+            let tokens = PyTuple::new(py, lengths.iter().map(|&length| vec![0i64; length]))?;
+            let batch = backend.call_method(
+                "make_text_batch",
+                (runner.getattr("input_buffers")?, tokens, tables),
+                Some(&options),
+            )?;
+            capture(runner, &batch)
+        })?;
+    }
+    Ok(())
+}
+
+fn prepare_decode(owner: &Bound<'_, PyAny>, runner: &Bound<'_, PyAny>) -> PyResult<()> {
+    let py = owner.py();
+    let backend = py.import("uniserve_worker.model_executor.startup")?;
+    let buffers = runner.getattr("input_buffers")?;
+    let cache = owner.getattr("kv_cache")?;
+    let mut rows: Vec<usize> = runner.getattr("shapes")?.getattr("decode")?.extract()?;
+    if rows.is_empty() {
+        rows.push(1);
+    }
+    for rows in rows.into_iter().rev() {
+        with_tables(&cache, &vec![2; rows], |tables| {
+            let tokens = PyTuple::new(py, vec![(0i64,); rows])?;
+            let prompt = backend.call_method1("make_text_batch", (&buffers, &tokens, &tables))?;
+            // Decode attends to real model-produced K/V, including the eager
+            // representative used when this runner has no decode graphs.
+            eager(runner, &prompt)?;
+            let options = PyDict::new(py);
+            options.set_item("prefixes", vec![1; rows])?;
+            options.set_item("decode", true)?;
+            let batch = backend.call_method(
+                "make_text_batch",
+                (&buffers, tokens, tables),
+                Some(&options),
+            )?;
+            let predicates = owner.getattr("decode_predicates")?;
+            let saved = if predicates.is_none() {
+                None
+            } else {
+                Some(predicates.call_method0("clone")?)
+            };
+            let result = (|| {
+                if saved.is_some() {
+                    predicates.set_item(PySlice::new(py, 1, (rows + 1) as isize, 1), true)?;
+                }
+                capture(runner, &batch)
+            })();
+            let restored = saved.map_or(Ok(()), |saved| {
+                predicates.call_method1("copy_", (saved,)).map(drop)
+            });
+            result?;
+            restored
+        })?;
+    }
+    Ok(())
+}
+
+fn prepare_canvas(owner: &Bound<'_, PyAny>, runner: &Bound<'_, PyAny>) -> PyResult<()> {
+    let py = owner.py();
+    let backend = py.import("uniserve_worker.model_executor.startup")?;
+    let cache = owner.getattr("kv_cache")?;
+    let slots = runner.getattr("canvas_slots")?;
+    let lengths: Vec<usize> = runner.getattr("readout_lengths")?.extract()?;
+    let mut kinds: Vec<_> = lengths
+        .into_iter()
+        .rev()
+        .map(|length| (py.None(), 0, length))
+        .collect();
+    if !slots.is_none() {
+        let length = runner.getattr("canvas_length")?.extract()?;
+        for step in [0, 1] {
+            kinds.push((slots.getattr("constants")?.unbind(), step, length));
+        }
+    }
+    let rows: Vec<usize> = if execution(runner)?.borrow().pools.bind(py).is_empty() {
+        vec![1]
+    } else {
+        runner.getattr("canvas_rows")?.extract()?
+    };
+    for rows in rows.into_iter().rev() {
+        for (sampling, step, length) in &kinds {
+            with_tables(&cache, &vec![1; rows], |tables| {
+                let options = PyDict::new(py);
+                options.set_item("length", length)?;
+                options.set_item("sampling", sampling)?;
+                options.set_item("step", step)?;
+                let batch = backend.call_method(
+                    "make_canvas_batch",
+                    (runner.getattr("input_buffers")?, tables),
+                    Some(&options),
+                )?;
+                capture(runner, &batch)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_flow(
+    slf: &Bound<'_, ModelRunners>,
+    owner: &Bound<'_, PyAny>,
+    runner: &Bound<'_, PyAny>,
+    latents: &Bound<'_, PyAny>,
+    tokenizer: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let py = owner.py();
+    let backend = py.import("uniserve_worker.model_executor.startup")?;
+    let config = owner.getattr("worker_config")?;
+    let capture_enabled = config.getattr("graph_policy")?.extract::<String>()? != "off"
+        && config.getattr("flow_cuda_graph")?.is_truthy()?;
+    let builder = owner.getattr("image_builder")?;
+    let capacity = builder
+        .getattr("max_tokens")?
+        .extract::<usize>()?
+        .min(latents.getattr("capacity_units")?.extract()?);
+    let side = capacity.isqrt().max(1)
+        * builder
+            .getattr("denoiser")?
+            .getattr("downsample")?
+            .extract::<usize>()?;
+    let configured: Vec<Py<PyAny>> = owner.getattr("flow_captures")?.extract()?;
+    let mut shapes = if capture_enabled && !configured.is_empty() {
+        configured
+    } else {
+        let branches: Vec<usize> = owner.getattr("flow_cfg_branches")?.extract()?;
+        let mut selected = Vec::new();
+        for branches in branches {
+            let mut matching = None;
+            for shape in configured.iter().rev() {
+                if shape.bind(py).getattr("cfg_branches")?.extract::<usize>()? == branches {
+                    matching = Some(shape.clone_ref(py));
+                    break;
+                }
+            }
+            selected.push(match matching {
+                Some(shape) => shape,
+                None => py
+                    .import("uniserve_worker.model_executor.graph_inputs")?
+                    .getattr("DiffusionShape")?
+                    .call1((1, side, side, branches))?
+                    .unbind(),
+            });
+        }
+        selected
+    };
+    let mut ordered = Vec::new();
+    for shape in shapes.drain(..) {
+        let mut footprint = 1usize;
+        for name in ["rows", "height", "width", "cfg_branches"] {
+            footprint *= shape.bind(py).getattr(name)?.extract::<usize>()?;
+        }
+        ordered.push((footprint, shape));
+    }
+    ordered.sort_by_key(|(footprint, _)| Reverse(*footprint));
+    let component: String = runner.getattr("name")?.extract()?;
+    let prefix = slf
+        .borrow()
+        .inner
+        .get(&component, CallKind::Forward(ForwardMode::Prefill))
+        .map(|runner| runner.clone_ref(py))
+        .ok_or_else(|| PyValueError::new_err("image denoising requires a prefill runner"))?;
+    let prefix = prefix.bind(py);
+    let cache = owner.getattr("kv_cache")?;
+    on_stream(&context(runner)?, &runner.getattr("device")?, || {
+        for (_, shape) in ordered {
+            let shape = shape.bind(py);
+            let rows: usize = shape.getattr("rows")?.extract()?;
+            let branches: usize = shape.getattr("cfg_branches")?.extract()?;
+            let prepared = backend.call_method1("flow_prefixes", (owner, shape, tokenizer))?;
+            let schedule = prepared.get_item(0)?;
+            let prefixes = prepared.get_item(1)?.cast_into::<PyTuple>()?;
+            let lengths = prefixes
+                .iter()
+                .map(|prefix| prefix.len())
+                .collect::<PyResult<Vec<_>>>()?;
+            let size = py
+                .import("uniserve.media.image")?
+                .getattr("Config")?
+                .call1((shape.getattr("height")?, shape.getattr("width")?))?;
+            let units = builder
+                .getattr("denoiser")?
+                .call_method1("latent_shape", ("image", size))?
+                .get_item(0)?;
+            with_tables(&cache, &lengths, |tables| {
+                with_entered(
+                    &latents.call_method1("startup_values", (rows, units))?,
+                    |values| {
+                        let selected: Vec<_> = lengths
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, &length)| (length > 0).then_some(index))
+                            .collect();
+                        if !selected.is_empty() {
+                            let options = PyDict::new(py);
+                            options.set_item(
+                                "selection",
+                                py.import("uniserve_worker.sampling.metadata")?
+                                    .getattr("TokenSelection")?
+                                    .getattr("HIDDEN")?,
+                            )?;
+                            options.set_item(
+                                "slots",
+                                selected
+                                    .iter()
+                                    .map(|index| 1 + index / branches)
+                                    .collect::<Vec<_>>(),
+                            )?;
+                            let tokens = selected
+                                .iter()
+                                .map(|&index| prefixes.get_item(index))
+                                .collect::<PyResult<Vec<_>>>()?;
+                            let prefix_tables = selected
+                                .iter()
+                                .map(|&index| tables.get_item(index))
+                                .collect::<PyResult<Vec<_>>>()?;
+                            let batch = backend.call_method(
+                                "make_text_batch",
+                                (
+                                    prefix.getattr("input_buffers")?,
+                                    PyTuple::new(py, tokens)?,
+                                    PyTuple::new(py, prefix_tables)?,
+                                ),
+                                Some(&options),
+                            )?;
+                            eager(prefix, &batch)?;
+                        }
+                        let batch = backend.call_method1(
+                            "make_flow_batch",
+                            (owner, runner, shape, schedule, prefixes, tables, values),
+                        )?;
+                        if capture_enabled {
+                            capture(runner, &batch)
+                        } else {
+                            eager(runner, &batch)
+                        }
+                    },
+                )
+            })?;
+        }
+        Ok(())
+    })
+}
+
+fn prepare_images(
+    owner: &Bound<'_, PyAny>,
+    runners: &[(Py<PyAny>, HashSet<CallKind>)],
+    latents: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let py = owner.py();
+    let backend = py.import("uniserve_worker.model_executor.startup")?;
+    let builder = owner.getattr("image_builder")?;
+    let side = if builder.is_none() {
+        64
+    } else {
+        2 * builder
+            .getattr("denoiser")?
+            .getattr("downsample")?
+            .extract::<usize>()?
+    };
+    let size = py
+        .import("uniserve.media.image")?
+        .getattr("Config")?
+        .call1((side, side))?;
+    let features = !builder.is_none()
+        && !latents.is_none()
+        && builder.getattr("framing")?.extract::<usize>()? == 2
+        && runners
+            .iter()
+            .any(|(_, kinds)| kinds.contains(&CallKind::Media(MediaCall::LatentEncoding)));
+    let processor = owner.getattr("processor")?;
+    for (runner, kinds) in runners {
+        let runner = runner.bind(py);
+        on_stream(&context(runner)?, &runner.getattr("device")?, || {
+            for (kind, name) in [
+                (MediaCall::VisionEncoding, "VISION_ENCODING"),
+                (MediaCall::LatentEncoding, "LATENT_ENCODING"),
+            ] {
+                if !kinds.contains(&CallKind::Media(kind)) || processor.is_none() {
+                    continue;
+                }
+                let kind_value = py
+                    .import("uniserve_worker.protocol.call")?
+                    .getattr("MediaCall")?
+                    .getattr(name)?;
+                let prepared = backend
+                    .call_method1("make_image_batch", (&processor, runner, kind_value, side))?;
+                if kind == MediaCall::VisionEncoding
+                    && runner
+                        .getattr_opt("packs_images")?
+                        .map(|value| value.is_truthy())
+                        .transpose()?
+                        .unwrap_or(false)
+                {
+                    Execution::capture_images(
+                        &execution(runner)?,
+                        runner,
+                        owner
+                            .getattr("worker_config")?
+                            .getattr("max_batch_calls")?
+                            .extract()?,
+                        &prepared.get_item(1)?,
+                    )?;
+                } else {
+                    eager(runner, &prepared.get_item(0)?)?;
+                }
+            }
+            if kinds.contains(&CallKind::Media(MediaCall::ImageDecoding))
+                && !builder.is_none()
+                && !latents.is_none()
+            {
+                let units = builder
+                    .getattr("denoiser")?
+                    .call_method1("latent_shape", ("image", &size))?
+                    .get_item(0)?;
+                with_entered(
+                    &latents.call_method1("startup_values", (1, units))?,
+                    |values| {
+                        let batch = backend.call_method1(
+                            "make_decoding_batch",
+                            (runner, side, values.get_item(0)?),
+                        )?;
+                        eager(runner, &batch)
+                    },
+                )?;
+            }
+            if features && kinds.contains(&CallKind::Media(MediaCall::Denoising)) {
+                let query = builder
+                    .call_method1("sequence_length", (&size,))?
+                    .extract()?;
+                let units = builder
+                    .getattr("denoiser")?
+                    .call_method1("latent_shape", ("image", &size))?
+                    .get_item(0)?;
+                with_tables(&owner.getattr("kv_cache")?, &[query], |tables| {
+                    with_entered(
+                        &latents.call_method1("startup_values", (1, units))?,
+                        |values| {
+                            let batch = backend.call_method1(
+                                "make_latent_feature_batch",
+                                (owner, runner, &size, tables, values.get_item(0)?),
+                            )?;
+                            eager(runner, &batch)
+                        },
+                    )
+                })?;
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }

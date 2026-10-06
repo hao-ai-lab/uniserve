@@ -6,7 +6,7 @@ use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use uniserve_worker_ipc::ForwardStats as NativeStats;
 
 use crate::stats::ForwardStats;
-use crate::worker::execution::GraphBucket;
+use crate::worker::execution::{GraphBucket, graph_error};
 use crate::worker::expert_exchange::ExpertExchange;
 use crate::worker::host::with_context;
 use crate::worker::microbatches::Microbatches;
@@ -58,17 +58,6 @@ pub(super) fn exchange<'py>(
 pub(super) fn profile<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
     py.import("uniserve.profiling")?
         .call_method1("profile_range", (name,))
-}
-
-pub(super) fn graph_error(py: Python<'_>, message: String) -> PyErr {
-    match py
-        .import("uniserve.runtime.cuda_graph")
-        .and_then(|module| module.getattr("CUDAGraphError"))
-        .and_then(|class| class.call1((message,)))
-    {
-        Ok(value) => PyErr::from_value(value),
-        Err(error) => error,
-    }
 }
 
 fn extent(

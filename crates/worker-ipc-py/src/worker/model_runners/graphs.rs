@@ -7,11 +7,11 @@ use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker_ipc::ForwardStats as NativeStats;
 
 use crate::stats::ForwardStats;
-use crate::worker::execution::on_stream;
+use crate::worker::execution::{Execution, graph_error, on_stream};
 use crate::worker::host::with_context;
 use crate::worker::model_results::ExecutionOutput;
 
-use super::dispatch::{exchange, graph_error, select};
+use super::dispatch::{exchange, select};
 use super::{context, execution};
 
 /// Evaluate prepared tensors in the caller's active numerical context.
@@ -21,6 +21,10 @@ pub(super) fn run_eager(
     forward: &Bound<'_, PyAny>,
 ) -> PyResult<Py<ExecutionOutput>> {
     let py = runner.py();
+    let owner = execution(runner)?;
+    if owner.borrow().image_capacity > 0 {
+        return Execution::encode_images(&owner, runner, &batch.getattr("inputs")?);
+    }
     let numerical = context(runner)?;
     if let Some(attention) = batch.getattr("inputs")?.getattr_opt("attention")?
         && !attention.is_none()

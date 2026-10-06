@@ -20,6 +20,94 @@ pub struct PrefillShape {
     pub outputs: bool,
 }
 
+impl PrefillShape {
+    /// Fit capture rows into the scratch KV pool without exceeding a row's
+    /// token limit. Tokens that do not fit become graph padding.
+    ///
+    /// Cache groups supply `(tokens per page, units per page)`. Page sizes are
+    /// positive powers of two; the pool holds at least one page of each group.
+    pub fn scratch_lengths(
+        &self,
+        row_tokens: usize,
+        pages: &[(usize, usize)],
+        units: usize,
+    ) -> Vec<usize> {
+        let row_units: usize = pages.iter().map(|&(_, count)| count).sum();
+        let rows = self
+            .live_rows
+            .max(self.token_bucket.div_ceil(row_tokens))
+            .min(self.row_bucket.saturating_sub(1))
+            .min(units / row_units)
+            .max(1);
+        let mut fitted = vec![1; rows];
+        let mut low = rows;
+        let mut high = self.token_bucket.min(rows * row_tokens);
+
+        // One token in every row fits. Search for the fullest numerical batch
+        // whose whole pages fit all groups, leaving only graph padding unused.
+        while low < high {
+            let tokens = low + (high - low).div_ceil(2);
+            let candidate = spread(rows, tokens, row_tokens, pages);
+            if let Some(lengths) = candidate.filter(|lengths| {
+                let count: usize = lengths
+                    .iter()
+                    .flat_map(|&length| {
+                        pages
+                            .iter()
+                            .map(move |&(page, count)| count * length.div_ceil(page))
+                    })
+                    .sum();
+                count <= units
+            }) {
+                low = tokens;
+                fitted = lengths;
+            } else {
+                high = tokens - 1;
+            }
+        }
+        fitted
+    }
+}
+
+/// Distribute tokens using the minimum whole pages in every cache group.
+/// Overfilled groups have smaller pages; their largest page divides the
+/// others. Rows use whole such pages, with the final row taking the remainder.
+fn spread(
+    rows: usize,
+    tokens: usize,
+    row_tokens: usize,
+    pages: &[(usize, usize)],
+) -> Option<Vec<usize>> {
+    let step = pages
+        .iter()
+        .filter_map(|&(page, _)| (tokens.div_ceil(page) > rows).then_some(page))
+        .max()
+        .unwrap_or(1);
+    let cap = pages
+        .iter()
+        .filter_map(|&(page, _)| (tokens.div_ceil(page) <= rows).then_some(page))
+        .min()
+        .unwrap_or(row_tokens)
+        .min(row_tokens);
+    if cap < step {
+        return None;
+    }
+
+    let steps = tokens / step;
+    let base = steps / rows;
+    let extra = steps % rows;
+    let lengths: Vec<_> = (0..rows)
+        .map(|index| {
+            (base + usize::from(index < extra)) * step
+                + if index + 1 == rows { tokens % step } else { 0 }
+        })
+        .collect();
+    lengths
+        .iter()
+        .all(|&length| length > 0 && length <= cap)
+        .then_some(lengths)
+}
+
 /// Fewest units held by independent rows over all cache groups.
 /// Each group supplies `(tokens per page, pool units per page)` in `pages`.
 pub fn prefill_units(pages: &[(usize, usize)], rows: usize, tokens: usize) -> usize {
@@ -165,6 +253,40 @@ impl TextShapes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scratch_capture_fits_hybrid_pages_and_per_request_limits() {
+        let shape = PrefillShape {
+            token_bucket: 257,
+            row_bucket: 9,
+            live_rows: 4,
+            causal: Some(true),
+            embeddings: false,
+            outputs: true,
+        };
+        let lengths = shape.scratch_lengths(128, &[(16, 2), (64, 1)], 24);
+        assert_eq!(lengths.len(), 4);
+        // Twenty-four units hold ten small pages and four large pages. The
+        // small pages therefore bound the useful capture to 160 tokens.
+        assert_eq!(lengths.iter().sum::<usize>(), 160);
+        assert!(lengths.iter().all(|&length| length <= 128));
+        let used: usize = lengths
+            .iter()
+            .map(|length| 2 * length.div_ceil(16) + length.div_ceil(64))
+            .sum();
+        assert_eq!(used, 24);
+
+        let limited = PrefillShape {
+            token_bucket: 64,
+            row_bucket: 5,
+            live_rows: 1,
+            ..shape
+        };
+        let lengths = limited.scratch_lengths(8, &[(16, 1)], 8);
+        assert_eq!(lengths.len(), 4);
+        assert_eq!(lengths.iter().sum::<usize>(), 32);
+        assert!(lengths.iter().all(|&length| length <= 8));
+    }
 
     fn prefill(rows: usize, tokens: usize, causal: Option<bool>, outputs: bool) -> PrefillShape {
         PrefillShape {

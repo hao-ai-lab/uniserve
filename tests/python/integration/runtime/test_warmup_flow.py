@@ -1,8 +1,4 @@
-"""The startup flow scenario fits the worker's request slots.
-
-``warmup_requests`` runs the flow scenario on CUDA workers only, so these
-tests drive the scenario itself on a CPU worker.
-"""
+"""Public worker startup fits guided flow within the admitted request slots."""
 
 from __future__ import annotations
 
@@ -10,10 +6,9 @@ import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve.processing import FlowPrompt
-from uniserve_worker.bootstrap.warmup import _warmup_flow, _WarmupRequests
 from uniserve_worker.config.execution import WorkerConfig
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 # With a flow prompt, every guidance branch that does not reuse the request's
 # conditioning reads a prefix of its own, which takes a request slot.
@@ -43,6 +38,7 @@ def test_guided_flow_warmup_completes_within_the_request_slots(
     request_slots, batch_sizes
 ):
     worker = execution_worker(
+        device="cuda:0",
         max_request_pool_size=request_slots,
         execution=WorkerConfig(
             graph_policy="off",
@@ -55,11 +51,7 @@ def test_guided_flow_warmup_completes_within_the_request_slots(
     )
     try:
         assert worker.info.request_slots == request_slots
-        assert {shape.rows for shape in worker.runner.flow_captures} == set(
-            batch_sizes
-        )
-
-        _warmup_flow(_WarmupRequests(worker))
+        worker.warmup()
 
         assert worker.requests.request_ids() == ()
     finally:

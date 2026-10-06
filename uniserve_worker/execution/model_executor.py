@@ -1291,7 +1291,7 @@ class ModelExecutor:
         Captures each entry's configured prefill, decode, canvas and flow
         graphs, running one eager call of each kind that captures none, then
         runs one synthetic image through every image encoding and decoding
-        entry (see ``startup.prepare_images``), so every buffered call kind has
+        entry, so every buffered call kind has
         prepared its call sites and chosen its kernels.
         """
         self.batch_runners.prepare_batches(self, tokenizer, latents)

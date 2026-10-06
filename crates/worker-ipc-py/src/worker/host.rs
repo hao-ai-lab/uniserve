@@ -500,9 +500,18 @@ pub(super) fn with_context<T>(
     context: &Bound<'_, PyAny>,
     operation: impl FnOnce() -> PyResult<T>,
 ) -> PyResult<T> {
+    with_entered(context, |_| operation())
+}
+
+/// Keep the value borrowed from a Python resource scope alive through its use.
+/// Both resource scopes and numerical contexts share the same exit handling.
+pub(super) fn with_entered<'py, T>(
+    context: &Bound<'py, PyAny>,
+    operation: impl FnOnce(Bound<'py, PyAny>) -> PyResult<T>,
+) -> PyResult<T> {
     let py = context.py();
-    context.call_method0("__enter__")?;
-    match operation() {
+    let value = context.call_method0("__enter__")?;
+    match operation(value) {
         Ok(value) => {
             context.call_method1("__exit__", (py.None(), py.None(), py.None()))?;
             Ok(value)

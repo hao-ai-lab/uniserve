@@ -1,6 +1,7 @@
 //! Prepared numerical resources and graph retirement.
 
 mod denoising;
+mod images;
 mod joins;
 pub(super) use denoising::DenoisingBuffers;
 pub(super) use joins::JoinGraphs;
@@ -111,6 +112,7 @@ pub(crate) struct Execution {
     pub(super) joins: Option<Py<JoinGraphs>>,
     pub(super) microbatch_joins: Option<Py<JoinGraphs>>,
     denoising: Option<denoising::Denoising>,
+    pub(super) image_capacity: usize,
     closed: bool,
 }
 
@@ -145,6 +147,7 @@ impl Execution {
                 joins: None,
                 microbatch_joins: None,
                 denoising: None,
+                image_capacity: 0,
                 closed: false,
             },
         )?;
@@ -155,6 +158,15 @@ impl Execution {
             .call_method("reserve", (&owner, devices), Some(&kwargs))?;
         owner.borrow_mut(py).pools = pools.extract()?;
         Ok(owner)
+    }
+
+    /// Encode image groups while retaining results across graph buffer reuse.
+    pub(super) fn encode_images(
+        slf: &Bound<'_, Self>,
+        runner: &Bound<'_, PyAny>,
+        inputs: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<super::model_results::ExecutionOutput>> {
+        images::encode(slf, runner, inputs)
     }
 
     fn configure_denoising(&mut self, py: Python<'_>, maximum: Py<PyAny>) {
@@ -314,6 +326,7 @@ impl Execution {
         };
         let (joins, microbatch_joins) = {
             let mut owner = slf.borrow_mut();
+            owner.image_capacity = 0;
             (owner.joins.take(), owner.microbatch_joins.take())
         };
         close_all(
@@ -383,10 +396,21 @@ impl Execution {
         self.joins = None;
         self.microbatch_joins = None;
         self.denoising = None;
+        self.image_capacity = 0;
     }
 }
 
 impl Execution {
+    /// Capture every packed image count through the bounded vision capacity.
+    pub(super) fn capture_images(
+        slf: &Bound<'_, Self>,
+        runner: &Bound<'_, PyAny>,
+        max_images: usize,
+        dtype: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        images::capture(slf, runner, max_images, dtype)
+    }
+
     pub(super) fn has_denoising_layout(
         &self,
         py: Python<'_>,
@@ -458,4 +482,15 @@ pub(super) fn on_stream<T>(
     let result = result?;
     joined?;
     Ok(result)
+}
+
+pub(super) fn graph_error(py: Python<'_>, message: String) -> PyErr {
+    match py
+        .import("uniserve.runtime.cuda_graph")
+        .and_then(|module| module.getattr("CUDAGraphError"))
+        .and_then(|class| class.call1((message,)))
+    {
+        Ok(value) => PyErr::from_value(value),
+        Err(error) => error,
+    }
 }
