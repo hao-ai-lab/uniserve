@@ -90,6 +90,50 @@ def test_borrowed_tensor_survives_shared_buffer_close():
     torch.testing.assert_close(tensor, torch.arange(1, 5, dtype=torch.float32))
 
 
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
+def test_failed_shared_read_returns_source_and_destination_capacity(device):
+    events = EventPool()
+    producer, consumer = (
+        make_transports(
+            ("shm",), byte_capacity=32, ticket_capacity=1, event_pool=events
+        )["shm"]
+        for _ in range(2)
+    )
+    source = torch.arange(8, dtype=torch.float32)
+    location = producer.export(source, consumers=(0,))
+    try:
+        # Without a supplied destination, shape validation runs on the read
+        # thread. Its failure must end the source claim as well as the task.
+        failed = consumer.fetch(
+            location, device=torch.device(device), region=(slice(0, 9),)
+        )
+        retired = threading.Event()
+        failed.add_retirement_callback(retired.set)
+        assert retired.wait(5), "failed read retained destination capacity"
+        with pytest.raises(WorkerError, match="region exceeds"):
+            failed.result()
+        retirement = producer.release(location)
+        producer.reap()
+        retirement.result(timeout=5)
+
+        # Both endpoints have exactly one payload's capacity. Another full
+        # transfer must succeed after the failed read, using the same owners.
+        location = producer.export(source + 1, consumers=(0,))
+        read = consumer.fetch(location, device=torch.device(device))
+        ready = threading.Event()
+        read.add_done_callback(ready.set)
+        assert ready.wait(5), "replacement read did not complete"
+        torch.testing.assert_close(read.result().cpu(), source + 1)
+        read.close()
+    finally:
+        producer.release(location)
+        consumer.close()
+        producer.close()
+        events.close()
+
+
 @pytest.mark.gpu
 def test_reaping_a_cuda_export_does_not_block_the_execution_thread():
     events = EventPool()

@@ -717,7 +717,6 @@ class SharedRead(BufferProtocol):
         slot: int,
         *,
         offset: int = 0,
-        ticket: TransferTicket | None = None,
         timeout: float = 120.0,
     ) -> None: ...
     def __buffer__(self, flags: int) -> memoryview: ...
@@ -1104,6 +1103,17 @@ class TransferPool:
         registry: BufferRegistry,
         locator: Locator,
         *,
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        region: tuple[slice, ...] | None = None,
+        reservation: ReadReservation | None = None,
+    ) -> TransferTicket: ...
+    def fetch_shared(
+        self,
+        locator: Locator,
+        *,
+        node: str,
+        slot: int,
         device: torch.device,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,

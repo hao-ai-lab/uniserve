@@ -34,7 +34,6 @@ from uniserve_worker.transport.layout import (
     copy_pairs,
     dtype_name,
     export_views,
-    read_destination,
     resolve_dtype,
     row_span,
     tensor_nbytes,
@@ -194,56 +193,6 @@ class ShmTransport(Transport):
                 self.capacity.release(nbytes)
             raise
 
-    def _read_tensor(
-        self,
-        ticket: TransferTicket,
-        locator: Locator,
-        device: torch.device,
-        destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
-        region: tuple[slice, ...] | None,
-    ) -> None:
-        """Copy the payload out of the segment, then acknowledge it.
-
-        The segment is mapped and claimed only until the payload has been
-        copied into a private buffer, and it is acknowledged as soon as that
-        copy ends. The private buffer is pinned for a CUDA destination and
-        feeds the possibly asynchronous destination copy.
-        """
-        import torch
-
-        handle = locator.transport
-        if not isinstance(handle, PosixShmTransfer):
-            raise invalid_descriptor(
-                "shared storage read requires a SHM locator"
-            )
-        try:
-            with SharedRead(
-                handle.name,
-                locator.nbytes,
-                self._acknowledgment_slot,
-                ticket=ticket,
-            ) as read:
-                view = torch.frombuffer(
-                    read, dtype=resolve_dtype(locator.dtype)
-                ).reshape(locator.shape)
-                # The read ticket retains this private buffer through DMA.
-                # Copy directly from the mapped bytes; no bytearray or second
-                # host mapping is needed between the producer and this owner.
-                source = torch.empty(
-                    view.shape,
-                    dtype=view.dtype,
-                    pin_memory=device.type == "cuda",
-                )
-                source.copy_(view)
-        except BaseException as error:
-            ticket._fail(error)
-            raise
-
-        target = read_destination(locator, device, destination, region)
-        if region is not None:
-            source = source[region]
-        self._reads.copy(ticket, source, target)
-
     def fetch(
         self,
         locator: Locator,
@@ -257,28 +206,18 @@ class ShmTransport(Transport):
 
         Raises:
             WorkerError: `invalid_descriptor` when the export lies on
-                another node or, with a `destination`, when `region` exceeds
-                the exported view or `destination` does not match it;
-                without one, those errors fail the ticket instead. Errors
-                from `TransferPool.submit` propagate.
+                another node, uses another backend, or, with a `destination`,
+                when `region` exceeds the exported view or `destination` does
+                not match it. Without a destination, shape errors fail the
+                ticket. Admission errors propagate to the submitting caller.
         """
-        if locator.source.node != self.source.node:
-            raise invalid_descriptor(
-                "shared storage transport requires the source node"
-            )
-        target = (
-            None
-            if destination is None
-            else read_destination(locator, device, destination, region)
-        )
-        return self._reads.submit(
-            self._read_tensor,
+        return self._reads.fetch_shared(
             locator,
-            device,
-            target,
-            region,
-            nbytes=locator.nbytes,
-            destination=target,
+            node=self.source.node,
+            slot=self._acknowledgment_slot,
+            device=device,
+            destination=destination,
+            region=region,
             reservation=reservation,
         )
 
@@ -319,3 +258,23 @@ class ShmTransport(Transport):
             self._reads.close()
         finally:
             self._buffers.close()
+
+
+def _copy_payload(
+    read: SharedRead, locator: Locator, device: torch.device
+) -> torch.Tensor:
+    """Copy mapped bytes into private host storage, pinned for device DMA.
+
+    The caller holds the source claim through this synchronous host copy.
+    The returned tensor owns its storage independently of the mapping.
+    """
+    import torch
+
+    view = torch.frombuffer(read, dtype=resolve_dtype(locator.dtype)).reshape(
+        locator.shape
+    )
+    source = torch.empty(
+        view.shape, dtype=view.dtype, pin_memory=device.type == "cuda"
+    )
+    source.copy_(view)
+    return source

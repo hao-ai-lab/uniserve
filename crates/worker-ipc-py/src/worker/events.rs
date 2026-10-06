@@ -247,9 +247,12 @@ impl EventPool {
         Ok(())
     }
 
-    fn __clear__(&mut self, py: Python<'_>) {
-        let state = std::mem::take(self.state.get_mut().unwrap_or_else(PoisonError::into_inner));
-        py.detach(move || drop(state));
+    fn __clear__(&self, py: Python<'_>) {
+        // GC may clear the pool before tickets retained by an exception's
+        // traceback. Keep shutdown terminal so their later releases are safe.
+        if let Err(error) = self.close(py) {
+            error.write_unraisable(py, None);
+        }
     }
 }
 
