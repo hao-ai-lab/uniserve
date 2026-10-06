@@ -236,7 +236,7 @@ def prepare_call(
 
     Returns the request's slot views for the call and the prepared
     resources whose constants and workspace it uses: the ``"denoising"``
-    views and the request layout's ``LayoutEntry`` for preparation and
+    views and the request layout's ``DenoisingBuffers`` for preparation and
     denoising, the ``"video_overlap"`` views and the post-processor's context
     for a video decode round, whose decoder context the round's segment
     selects when it decodes (``decode_video_unit``), and no views for an
@@ -278,14 +278,14 @@ def prepare_call(
             )
         return slot.tensors["video_overlap"], runner.prepare_module(
             call.component, output, method="forward"
-        ).context
+        ).execution.context
 
     if kind is MediaCall.AUDIO_DECODING:
         decoder = runner.component(kind)
         frames = decoder.latent_frames(audio_samples(runner, size.num_frames))
         return {}, runner.prepare_module(
             call.component, frames, method="decode"
-        ).context
+        ).execution.context
 
     return {}, None
 
@@ -308,7 +308,7 @@ def _prepare_placeholder(builder, size, views, samples, diffusion, layout):
         workspace=entry.workspace,
         layout=layout,
     )
-    with diffusion.context.activate():
+    with diffusion.execution.context.activate():
         for destination, source in copies:
             destination.copy_(source)
         views["text_condition"].zero_()

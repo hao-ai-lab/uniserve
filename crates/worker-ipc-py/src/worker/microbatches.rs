@@ -77,7 +77,7 @@ pub(crate) struct Microbatches {
     control: Arc<NativeMicrobatches>,
     lanes: Vec<HostLane<Microbatch>>,
     #[pyo3(get)]
-    contexts: Py<PyTuple>,
+    pub(super) contexts: Py<PyTuple>,
     #[pyo3(get)]
     device: Py<PyAny>,
 }
@@ -85,7 +85,7 @@ pub(crate) struct Microbatches {
 #[pymethods]
 impl Microbatches {
     #[new]
-    fn new(py: Python<'_>, contexts: Vec<Py<PyAny>>) -> PyResult<Self> {
+    pub(super) fn new(py: Python<'_>, contexts: Vec<Py<PyAny>>) -> PyResult<Self> {
         let control = Arc::new(NativeMicrobatches::new(contexts.len()).map_err(native_error)?);
         let contexts = PyTuple::new(py, contexts)?;
         let backend = backend(py)?;
@@ -127,7 +127,11 @@ impl Microbatches {
 
     /// Run one numerical call per context and return results in input order.
     /// Failures wake suspended peers and all host turns retire before return.
-    fn __call__(&self, py: Python<'_>, calls: Vec<Py<PyAny>>) -> PyResult<Vec<Py<PyAny>>> {
+    pub(super) fn __call__(
+        &self,
+        py: Python<'_>,
+        calls: Vec<Py<PyAny>>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
         self.control.begin(calls.len()).map_err(native_error)?;
         let mut tasks = Vec::with_capacity(calls.len());
         let mut current = None;
@@ -207,7 +211,7 @@ impl Microbatches {
     }
 
     /// Join persistent threads after invocations and captured readers retire.
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.control.close().map_err(native_error)?;
         let errors = py.detach(|| {
             self.lanes

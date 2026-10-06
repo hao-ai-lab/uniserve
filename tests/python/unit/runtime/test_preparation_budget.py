@@ -6,12 +6,15 @@ import gc
 import weakref
 
 import pytest
+import torch
 
 from tests.python.fixtures.device_storage import (
     DeviceStorage,
     install_device_storage,
 )
+from uniserve.runtime import ExecutionContext
 from uniserve.runtime.cuda_graph import CUDAGraphError
+from uniserve_worker.model_executor.cuda_graph import Execution
 from uniserve_worker.model_executor.graph_storage import GraphStorage
 
 pytestmark = pytest.mark.unit
@@ -43,13 +46,13 @@ def test_bound_budget_charges_storage_prepared_outside_the_pools(
 
 
 def test_graph_storage_releases_unreachable_execution_owners():
-    class Execution:
-        pass
-
     storage = GraphStorage()
-    owner = Execution()
-    owner.storage = storage
-    storage.reserve(owner, ("cpu",))
+    owner = Execution(
+        "encode",
+        ExecutionContext(torch.nn.Identity()),
+        devices=(),
+        storage=storage,
+    )
     observed = weakref.ref(owner)
     del owner, storage
 

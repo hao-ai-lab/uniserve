@@ -11,6 +11,7 @@ use uniserve_worker::ModelRunners as NativeModelRunners;
 use uniserve_worker_ipc::CallKind;
 
 use super::error::native_error;
+use super::execution::Execution;
 use super::model_results::ExecutionOutput;
 
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
@@ -36,10 +37,9 @@ impl ModelRunners {
         forward: &Bound<'_, PyAny>,
     ) -> PyResult<Py<ExecutionOutput>> {
         super::host::with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
-            super::host::with_context(
-                &runner.getattr("context")?.call_method0("activate")?,
-                || graphs::run_eager(runner, batch, forward),
-            )
+            super::host::with_context(&context(runner)?.call_method0("activate")?, || {
+                graphs::run_eager(runner, batch, forward)
+            })
         })
     }
 
@@ -105,6 +105,19 @@ impl ModelRunners {
         self.inner.clear();
     }
 
+    /// Bind whole-row numerical peers to their shared native execution group.
+    fn bind_microbatches(&self, py: Python<'_>, peers: &Bound<'_, PyTuple>) -> PyResult<()> {
+        let executions = peers
+            .iter()
+            .map(|peer| execution(&peer).map(Bound::unbind))
+            .collect::<PyResult<Vec<_>>>()?;
+        Execution::bind_microbatches(py, executions)?;
+        for peer in peers {
+            peer.setattr("peers", peers)?;
+        }
+        Ok(())
+    }
+
     fn bind(
         &mut self,
         py: Python<'_>,
@@ -139,4 +152,16 @@ impl ModelRunners {
             .first(pythonize::depythonize(kind)?)
             .map(|runner| runner.clone_ref(py)))
     }
+}
+
+pub(super) fn execution<'py>(runner: &Bound<'py, PyAny>) -> PyResult<Bound<'py, Execution>> {
+    Ok(runner.getattr("execution")?.cast_into()?)
+}
+
+pub(super) fn context<'py>(runner: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    Ok(execution(runner)?
+        .borrow()
+        .context
+        .bind(runner.py())
+        .clone())
 }

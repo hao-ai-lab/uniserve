@@ -16,11 +16,11 @@ class DecoderRunner(ModelRunner):
         # context views.
         if isinstance(self.model, VideoPostprocessor):
             return {
-                "constants": self.context.constants,
-                "workspace": self.context.workspace,
+                "constants": self.execution.context.constants,
+                "workspace": self.execution.context.workspace,
             }
         if isinstance(self.model, AudioDecoder):
-            return {"workspace": self.context.workspace}
+            return {"workspace": self.execution.context.workspace}
         return {}
 
     def batch_forward(self, batch, *, padded=False):

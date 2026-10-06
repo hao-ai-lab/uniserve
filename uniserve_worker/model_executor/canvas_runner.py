@@ -117,7 +117,9 @@ class CanvasRunner(ModelRunner):
         # expert exchange once per step at the step's agreed capacity; a
         # rank-local tail replays graphs per slot bucket. Experts are
         # partitioned at loading, before the runner is built.
-        self.local_tail = not tail_exchanges(self.model, self.context.experts)
+        self.local_tail = not tail_exchanges(
+            self.model, self.execution.context.experts
+        )
         # All readout graphs on this runner execute serially. The largest
         # capture owns their common per-token output, including EP variants.
         self._readout_state: tuple[torch.Tensor, ...] | None = None
@@ -139,7 +141,9 @@ class CanvasRunner(ModelRunner):
         call reads more canvases than the KV unit pool has ``pool_rows``.
         """
         buffers = self.input_buffers
-        rows = buffers.max_rows // 2 if self.pools else buffers.max_rows
+        rows = (
+            buffers.max_rows // 2 if self.execution.pools else buffers.max_rows
+        )
         if self.pool_rows is not None:
             rows = min(rows, self.pool_rows)
         return min(rows, buffers.max_tokens // self.canvas_length)
@@ -403,7 +407,10 @@ class CanvasRunner(ModelRunner):
         # With graphs, the last pipeline stage's readout tails replay graphs
         # per slot bucket, or run eagerly when the tail exchanges tokens
         # with other ranks (``local_tail``).
-        if self.pools and self.pipeline.rank == self.pipeline.size - 1:
+        if (
+            self.execution.pools
+            and self.pipeline.rank == self.pipeline.size - 1
+        ):
             records.append(
                 {
                     "path": "readout_tail",
@@ -482,7 +489,7 @@ class CanvasRunner(ModelRunner):
             CUDAGraphError: The call holds more canvases than every bucket,
                 or a canvas longer than the model's.
         """
-        if not eligible or not self.pools:
+        if not eligible or not self.execution.pools:
             return None
         inputs = batch.inputs
         length = self.canvas_length
@@ -565,22 +572,22 @@ class CanvasRunner(ModelRunner):
             return super().capture_graph(key, execution, forward)
 
         def attend(batch):
-            exchange = self.context.experts
+            exchange = self.execution.context.experts
             if exchange is not None:
                 exchange.reset_layers()
             return self._attend_state(batch)
 
         graph = capture_hidden(
-            self.context,
+            self.execution.context,
             execution,
             attend,
-            pools=self.pools,
+            pools=self.execution.pools,
             cache=self.cache,
             # Expert-only peers execute a complete layer sequence during
             # startup. Complete the eager warmup's tail, while the captured
             # graph stops at attention for the live readout's selected slots.
-            warmup=lambda value: self.warm_experts(
-                joining_experts(attend, self.context), value
+            warmup=lambda value: self.execution.warm_experts(
+                joining_experts(attend, self.execution.context), value
             ),
         )
         # The tails read attend states of every readout bucket alike, so the
@@ -589,7 +596,7 @@ class CanvasRunner(ModelRunner):
             self.pipeline.rank == self.pipeline.size - 1
             and self.local_tail
             and any(
-                ("canvas_tail", slots) not in self.buckets
+                ("canvas_tail", slots) not in self.execution.buckets
                 for slots in SLOT_BUCKETS
             )
         ):
@@ -609,7 +616,7 @@ class CanvasRunner(ModelRunner):
         """
         for slots in SLOT_BUCKETS:
             key = ("canvas_tail", slots)
-            if key in self.buckets:
+            if key in self.execution.buckets:
                 continue
             # The fixed rows come from the ordinary allocator: the graph pool
             # already backs the readout graphs, whose replays reuse its free
@@ -622,10 +629,13 @@ class CanvasRunner(ModelRunner):
                 ),
                 torch.arange(slots, dtype=torch.int64, device=self.device),
             )
-            self.buckets[key] = GraphBucket(
+            self.execution.buckets[key] = GraphBucket(
                 {
                     None: CUDAGraphRunner.capture(
-                        self.context, static, self._tail, pools=self.pools
+                        self.execution.context,
+                        static,
+                        self._tail,
+                        pools=self.execution.pools,
                     )
                 }
             )
@@ -651,7 +661,7 @@ class CanvasRunner(ModelRunner):
         if key[0] != "canvas":
             return super().replay_graph(key, execution, batch, borrow=borrow)
         state = replay_hidden(self.batch_graph(key), execution)
-        with self.context.activate():
+        with self.execution.context.activate():
             if self.local_tail:
                 return self._replay_tails(state, batch.inputs)
             return self.readout(state, batch.inputs)
@@ -676,12 +686,12 @@ class CanvasRunner(ModelRunner):
         for start in range(0, total, largest):
             live = min(largest, total - start)
             slots = next(size for size in SLOT_BUCKETS if size >= live)
-            bucket = self.buckets.get(("canvas_tail", slots))
+            bucket = self.execution.buckets.get(("canvas_tail", slots))
             if bucket is None:
                 raise CUDAGraphError(
                     f"{self.name} has no readout tail graph of {slots} slots"
                 )
-            tail = bucket.graphs[None]
+            tail = bucket[None]
             rows = inputs.slot_tokens[start : start + live]
             for value, buffer in zip(state, tail.inputs.value[0], strict=True):
                 torch.index_select(value, 0, rows, out=buffer[:live])

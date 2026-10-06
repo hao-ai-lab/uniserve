@@ -6,11 +6,13 @@ use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use uniserve_worker_ipc::ForwardStats as NativeStats;
 
 use crate::stats::ForwardStats;
+use crate::worker::execution::GraphBucket;
 use crate::worker::expert_exchange::ExpertExchange;
 use crate::worker::host::with_context;
+use crate::worker::microbatches::Microbatches;
 use crate::worker::model_results::ExecutionOutput;
 
-use super::graphs;
+use super::{context, execution, graphs};
 
 /// The numerical backend supplies a key and its padded or exact input view.
 pub(super) struct Selection {
@@ -45,7 +47,7 @@ pub(super) fn exchange<'py>(
     if !runner.getattr("expert_step")?.is_truthy()? {
         return Ok(None);
     }
-    let exchange = runner.getattr("context")?.getattr("experts")?;
+    let exchange = context(runner)?.getattr("experts")?;
     if exchange.is_none() {
         Ok(None)
     } else {
@@ -113,7 +115,7 @@ fn agree(
             || {
                 let joins = runner.getattr("expert_joins")?;
                 if joins.is_none() {
-                    runner.call_method1("join_expert_step", (capacity,))?;
+                    execution(runner)?.borrow().join_expert_step(py, capacity)?;
                 } else {
                     joins.call_method1("replay", (capacity,))?;
                 }
@@ -132,7 +134,7 @@ fn forward(
     borrow: bool,
 ) -> PyResult<Py<ExecutionOutput>> {
     let py = runner.py();
-    let buckets = runner.getattr("buckets")?.cast_into::<PyDict>()?;
+    let buckets = execution(runner)?.borrow().buckets.bind(py).clone();
     let mut captured = false;
     let selected = match selected {
         Some(shape) if buckets.contains(shape.key.bind(py))? => Some(shape),
@@ -172,10 +174,13 @@ fn forward(
     };
 
     if let Some(exchange) = exchange(runner)? {
-        let bucket = buckets.as_any().get_item(shape.key.bind(py))?;
+        let bucket = buckets
+            .as_any()
+            .get_item(shape.key.bind(py))?
+            .cast_into::<GraphBucket>()?;
         exchange
             .borrow()
-            .record_layers(&bucket.getattr("expert_layers")?)?;
+            .record_layers(bucket.borrow().layers.clone());
     }
     let live: u64 = batch.getattr("query_tokens")?.extract()?;
     let padded: u64 = shape.inputs.bind(py).getattr("query_tokens")?.extract()?;
@@ -219,7 +224,7 @@ fn single(
     borrow: bool,
 ) -> PyResult<Py<ExecutionOutput>> {
     let py = runner.py();
-    let context = runner.getattr("context")?;
+    let context = context(runner)?;
     with_context(&context.call_method0("activate")?, || {
         let selected = select(runner, batch, eligible)?;
         let call = runner.getattr("batch_forward")?;
@@ -254,6 +259,7 @@ fn microbatches(
     batches: &Bound<'_, PyTuple>,
     eligible: bool,
     borrow: bool,
+    rotation: &Bound<'_, Microbatches>,
 ) -> PyResult<Py<ExecutionOutput>> {
     let py = runner.py();
     let peers = runner.getattr("peers")?.cast_into::<PyTuple>()?;
@@ -262,83 +268,86 @@ fn microbatches(
             "microbatch inputs must match prepared peers",
         ));
     }
-    with_context(
-        &runner.getattr("context")?.call_method0("activate")?,
-        || {
-            let mut selected = Vec::with_capacity(peers.len());
-            let mut tokens = 0;
-            for (peer, batch) in peers.iter().zip(batches.iter()) {
-                let shape = if batch.is_none() {
-                    None
-                } else {
-                    select(&peer, &batch, eligible)?
-                };
-                if !batch.is_none() {
-                    tokens = tokens.max(extent(&peer, &batch, shape.as_ref())?);
-                }
-                selected.push(shape);
+    with_context(&context(runner)?.call_method0("activate")?, || {
+        let mut selected = Vec::with_capacity(peers.len());
+        let mut tokens = 0;
+        for (peer, batch) in peers.iter().zip(batches.iter()) {
+            let shape = if batch.is_none() {
+                None
+            } else {
+                select(&peer, &batch, eligible)?
+            };
+            if !batch.is_none() {
+                tokens = tokens.max(extent(&peer, &batch, shape.as_ref())?);
             }
-            let exchange = exchange(runner)?
-                .ok_or_else(|| PyValueError::new_err("microbatches require expert execution"))?;
-            let capacity = agree(runner, &exchange, tokens)?;
-            runner.call_method1("begin_expert_step", (capacity,))?;
-            let result = (|| {
-                let mut calls = Vec::with_capacity(peers.len());
-                for ((peer, batch), shape) in peers.iter().zip(batches.iter()).zip(selected) {
-                    let peer = peer.unbind();
-                    let batch = batch.unbind();
-                    calls.push(PyCFunction::new_closure(
-                        py,
-                        None,
-                        None,
-                        move |args, _kwargs| -> PyResult<Py<PyAny>> {
-                            let py = args.py();
-                            let peer = peer.bind(py);
-                            let batch = batch.bind(py);
-                            if batch.is_none() {
-                                let joins = peer.getattr("microbatch_joins")?;
-                                if !joins.is_none() {
-                                    joins.call_method1("replay", (capacity,))?;
-                                    return Ok(py.None());
-                                }
+            selected.push(shape);
+        }
+        let exchange = exchange(runner)?
+            .ok_or_else(|| PyValueError::new_err("microbatches require expert execution"))?;
+        let capacity = agree(runner, &exchange, tokens)?;
+        execution(runner)?
+            .borrow()
+            .begin_expert_step(py, capacity)?;
+        let result = (|| {
+            let mut calls = Vec::with_capacity(peers.len());
+            for ((peer, batch), shape) in peers.iter().zip(batches.iter()).zip(selected) {
+                let peer = peer.unbind();
+                let batch = batch.unbind();
+                calls.push(PyCFunction::new_closure(
+                    py,
+                    None,
+                    None,
+                    move |args, _kwargs| -> PyResult<Py<PyAny>> {
+                        let py = args.py();
+                        let peer = peer.bind(py);
+                        let batch = batch.bind(py);
+                        if batch.is_none() {
+                            let joins = peer.getattr("microbatch_joins")?;
+                            if !joins.is_none() {
+                                joins.call_method1("replay", (capacity,))?;
+                                return Ok(py.None());
                             }
-                            let result = if batch.is_none() {
-                                py.None()
-                            } else {
-                                let result = forward(
-                                    peer,
-                                    batch,
-                                    &peer.getattr("batch_forward")?,
-                                    shape.as_ref(),
-                                    borrow,
-                                )?;
-                                result.borrow(py).validate_for(py, batch)?;
-                                result.into_any()
-                            };
-                            peer.getattr("context")?
-                                .call_method0("join_expert_layers")?;
-                            Ok(result)
-                        },
-                    )?);
+                        }
+                        let result = if batch.is_none() {
+                            py.None()
+                        } else {
+                            let result = forward(
+                                peer,
+                                batch,
+                                &peer.getattr("batch_forward")?,
+                                shape.as_ref(),
+                                borrow,
+                            )?;
+                            result.borrow(py).validate_for(py, batch)?;
+                            result.into_any()
+                        };
+                        context(peer)?.call_method0("join_expert_layers")?;
+                        Ok(result)
+                    },
+                )?);
+            }
+            // The shared rotation joins all streams and retires host calls,
+            // including failures, before any result is combined or reused.
+            let results = rotation.borrow().__call__(
+                py,
+                calls
+                    .into_iter()
+                    .map(|call| call.unbind().into_any())
+                    .collect(),
+            )?;
+            let mut populated = Vec::new();
+            for result in results {
+                if !result.is_none(py) {
+                    populated.push(result);
                 }
-                // The shared rotation joins all streams and retires host calls,
-                // including failures, before any result is combined or reused.
-                let results = runner.getattr("microbatches")?.call1((calls,))?;
-                let mut populated = Vec::new();
-                for result in results.try_iter()? {
-                    let result = result?;
-                    if !result.is_none() {
-                        populated.push(result);
-                    }
-                }
-                ExecutionOutput::combine(py, PyTuple::new(py, populated)?.as_any())
-            })();
-            let ended = runner.call_method0("end_expert_step");
-            let result = result?;
-            ended?;
-            Ok(result)
-        },
-    )
+            }
+            ExecutionOutput::combine(py, PyTuple::new(py, populated)?.as_any())
+        })();
+        let ended = execution(runner)?.borrow().end_expert_step(py);
+        let result = result?;
+        ended?;
+        Ok(result)
+    })
 }
 
 pub(super) fn run(
@@ -349,13 +358,18 @@ pub(super) fn run(
 ) -> PyResult<(Py<ExecutionOutput>, Option<u64>)> {
     let py = runner.py();
     with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
-        let result = if runner.getattr("microbatches")?.is_none() {
+        let rotation = execution(runner)?
+            .borrow()
+            .microbatches
+            .as_ref()
+            .map(|rotation| rotation.clone_ref(py));
+        let result = if let Some(rotation) = rotation {
+            microbatches(runner, batches, eligible, borrow, rotation.bind(py))?
+        } else {
             let batch = batches.get_item(0)?;
             let result = single(runner, &batch, eligible, borrow)?;
             result.borrow(py).validate_for(py, &batch)?;
             result
-        } else {
-            microbatches(runner, batches, eligible, borrow)?
         };
         let mut tokens = Some(0);
         for batch in batches {

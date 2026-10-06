@@ -11,6 +11,7 @@ use crate::worker::host::with_context;
 use crate::worker::model_results::ExecutionOutput;
 
 use super::dispatch::{exchange, graph_error, select};
+use super::{context, execution};
 
 /// Evaluate prepared tensors in the caller's active numerical context.
 pub(super) fn run_eager(
@@ -19,11 +20,11 @@ pub(super) fn run_eager(
     forward: &Bound<'_, PyAny>,
 ) -> PyResult<Py<ExecutionOutput>> {
     let py = runner.py();
-    let context = runner.getattr("context")?;
+    let numerical = context(runner)?;
     if let Some(attention) = batch.getattr("inputs")?.getattr_opt("attention")?
         && !attention.is_none()
     {
-        context.call_method1("bind_attention", (attention,))?;
+        numerical.call_method1("bind_attention", (attention,))?;
     }
 
     let exchange = exchange(runner)?;
@@ -31,18 +32,21 @@ pub(super) fn run_eager(
         return Ok(forward.call1((batch,))?.extract()?);
     };
 
-    let capacity = context.getattr("experts")?.getattr("max_tokens")?;
+    let capacity = numerical.getattr("experts")?.getattr("max_tokens")?;
     exchange.borrow().warmup(py, capacity.extract()?)?;
-    runner.call_method1("begin_expert_step", (&capacity,))?;
+    execution(runner)?
+        .borrow()
+        .begin_expert_step(py, capacity.extract()?)?;
     let result: PyResult<Py<ExecutionOutput>> = (|| {
         let joined = py
             .import("uniserve_worker.model_executor.model_runner")?
-            .call_method1("joining_experts", (forward, &context))?;
-        Ok(runner
-            .call_method1("warm_experts", (joined, batch))?
-            .extract()?)
+            .call_method1("joining_experts", (forward, &numerical))?;
+        Ok(execution(runner)?
+            .borrow()
+            .warm_experts(py, &joined, batch)?
+            .extract(py)?)
     })();
-    let ended = runner.call_method0("end_expert_step");
+    let ended = execution(runner)?.borrow().end_expert_step(py);
     let result = result?;
     ended?;
     Ok(result)
@@ -52,14 +56,14 @@ pub(super) fn run_eager(
 /// exceptional exits. The context itself restores PyTorch's current stream.
 fn on_stream<T>(runner: &Bound<'_, PyAny>, call: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     let py = runner.py();
-    let context = runner.getattr("context")?;
-    let stream = context.getattr("stream")?;
+    let numerical = context(runner)?;
+    let stream = numerical.getattr("stream")?;
     let cuda = py.import("torch.cuda")?;
     let current = || cuda.call_method1("current_stream", (runner.getattr("device")?,));
     if !stream.is_none() {
         stream.call_method1("wait", (current()?,))?;
     }
-    let result = with_context(&context.call_method0("activate")?, call);
+    let result = with_context(&numerical.call_method0("activate")?, call);
     let joined = if stream.is_none() {
         Ok(())
     } else {
@@ -97,24 +101,27 @@ fn capture_batch(
         return Ok(());
     };
     let key = selected.key.bind(py);
-    let buckets = runner.getattr("buckets")?.cast_into::<PyDict>()?;
+    let buckets = execution(runner)?.borrow().buckets.bind(py).clone();
     if buckets.contains(key)? {
         return Ok(());
     }
 
     let backend = py.import("uniserve_worker.model_executor.cuda_graph")?;
-    let storage = runner.getattr("graph_storage")?;
-    let inputs = with_context(&storage.call_method1("allocate", (runner,))?, || {
-        // Configured buckets already own fixed addresses. Exact numerical
-        // signatures may borrow a request's latents, so give them backing.
-        if selected.bucketed {
-            Ok(selected.inputs.bind(py).clone())
-        } else {
-            backend.call_method1("clone_inputs", (selected.inputs.bind(py),))
-        }
-    })?;
+    let storage = execution(runner)?.getattr("storage")?;
+    let inputs = with_context(
+        &storage.call_method1("allocate", (execution(runner)?,))?,
+        || {
+            // Configured buckets already own fixed addresses. Exact numerical
+            // signatures may borrow a request's latents, so give them backing.
+            if selected.bucketed {
+                Ok(selected.inputs.bind(py).clone())
+            } else {
+                backend.call_method1("clone_inputs", (selected.inputs.bind(py),))
+            }
+        },
+    )?;
     let exchange = if exchange(runner)?.is_some() {
-        Some(runner.getattr("context")?.getattr("experts")?)
+        Some(context(runner)?.getattr("experts")?)
     } else {
         None
     };
@@ -150,13 +157,15 @@ fn capture_batch(
     let bucket = backend.getattr("GraphBucket")?.call0()?;
     for capacity in capacities {
         let captured: PyResult<()> = (|| {
-            if let Some(exchange) = &exchange {
+            if let (Some(exchange), Some(capacity)) = (&exchange, capacity) {
                 exchange.call_method1("warmup", (capacity,))?;
-                runner.call_method1("begin_expert_step", (capacity,))?;
+                execution(runner)?
+                    .borrow()
+                    .begin_expert_step(py, capacity)?;
             }
             let captured: PyResult<()> = (|| {
                 let graph = runner.call_method1("capture_graph", (key, &inputs, &call))?;
-                bucket.getattr("graphs")?.set_item(capacity, graph)?;
+                bucket.set_item(capacity, graph)?;
                 // Ending the step clears the invoked layer set. Retain it
                 // before that reset because replay runs no host layer hooks.
                 if let Some(exchange) = &exchange {
@@ -165,7 +174,7 @@ fn capture_batch(
                 Ok(())
             })();
             let ended = if exchange.is_some() {
-                runner.call_method0("end_expert_step").map(drop)
+                execution(runner)?.borrow().end_expert_step(py)
             } else {
                 Ok(())
             };
@@ -208,18 +217,18 @@ pub(super) fn run_module(
         let backend = py.import("uniserve_worker.model_executor.cuda_graph")?;
         let values = (args, kwargs);
         let key = backend.call_method1("input_signature", (values,))?;
-        let buckets = runner.getattr("buckets")?.cast_into::<PyDict>()?;
+        let buckets = execution(runner)?.borrow().buckets.bind(py).clone();
         let bucket = buckets.get_item(&key)?;
         let graph = bucket
             .as_ref()
-            .map(|bucket| bucket.getattr("graphs")?.get_item(py.None()))
+            .map(|bucket| bucket.get_item(py.None()))
             .transpose()?;
         let resources = runner.call_method0("resources")?.cast_into::<PyDict>()?;
         let numerical = py
             .import("uniserve_worker.model_executor.model_runner")?
             .getattr("_module_forward")?;
         let forward = runner.getattr("call")?.getattr("forward")?;
-        let pools = runner.getattr("pools")?;
+        let pools = execution(runner)?.borrow().pools.bind(py).clone();
         let result = if pools.is_truthy()?
             && (graph.is_some() || !runner.getattr("_startup_complete")?.is_truthy()?)
         {
@@ -229,11 +238,11 @@ pub(super) fn run_module(
                     graph
                 }
                 None => {
-                    let storage = runner.getattr("graph_storage")?;
-                    let inputs =
-                        with_context(&storage.call_method1("allocate", (runner,))?, || {
-                            backend.call_method1("clone_inputs", (values,))
-                        })?;
+                    let storage = execution(runner)?.getattr("storage")?;
+                    let inputs = with_context(
+                        &storage.call_method1("allocate", (execution(runner)?,))?,
+                        || backend.call_method1("clone_inputs", (values,)),
+                    )?;
                     let capture_kwargs = PyDict::new(py);
                     capture_kwargs.set_item("pools", &pools)?;
                     let call = py
@@ -242,7 +251,7 @@ pub(super) fn run_module(
                         .call1((&numerical, &forward, &resources))?;
                     let graph = backend.getattr("CUDAGraphRunner")?.call_method(
                         "capture",
-                        (runner.getattr("context")?, &inputs, call),
+                        (context(runner)?, &inputs, call),
                         Some(&capture_kwargs),
                     )?;
                     if let Err(error) = storage.call_method0("check") {

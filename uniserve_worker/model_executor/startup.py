@@ -471,7 +471,7 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
             (slots.constants, 1, entry.canvas_length),
         )
     )
-    for rows in reversed(entry.canvas_rows if entry.pools else (1,)):
+    for rows in reversed(entry.canvas_rows if entry.execution.pools else (1,)):
         for sampling, step, length in kinds:
             with cache.startup_units(rows * cache.page_units(1)) as scratch:
                 batch = make_canvas_batch(
@@ -552,11 +552,11 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     forward = entry.batch_forward
     prefix_entry = runner.batch_runners.get(entry.name, ForwardMode.PREFILL)
     assert prefix_entry is not None
-    stream = entry.context.stream
+    stream = entry.execution.context.stream
     if stream is not None:
         stream.wait(torch.cuda.current_stream(entry.device))
 
-    with entry.context.activate():
+    with entry.execution.context.activate():
         for shape in sorted(
             shapes,
             key=lambda item: (
@@ -640,7 +640,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                             for index in selected
                         ),
                     )
-                    prefix_stream = prefix_entry.context.stream
+                    prefix_stream = prefix_entry.execution.context.stream
                     if prefix_stream is not None:
                         prefix_stream.wait(
                             torch.cuda.current_stream(entry.device)
@@ -733,7 +733,7 @@ def prepare_images(runner: ModelExecutor, latents) -> None:
         )
     )
     for entry in runner.entries.values():
-        stream = entry.context.stream
+        stream = entry.execution.context.stream
         if stream is not None:
             stream.wait(torch.cuda.current_stream(entry.device))
         for kind in (MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING):
@@ -752,7 +752,7 @@ def prepare_images(runner: ModelExecutor, latents) -> None:
                 encode_grid=prepared.grid,
                 encode_grid_shape=prepared.grid_shape,
             )
-            with entry.context.activate():
+            with entry.execution.context.activate():
                 batch = entry.prepare_inputs((row,), forward_mode=kind)
             # A patch encoder that packs image slots serves vision calls
             # through its captured slot counts. Capture warms those same
@@ -778,7 +778,7 @@ def prepare_images(runner: ModelExecutor, latents) -> None:
             units = builder.denoiser.latent_shape("image", size)[0]
             with latents.startup_values(1, units) as (latent,):
                 latent.zero_()
-                with entry.context.activate():
+                with entry.execution.context.activate():
                     batch = entry.prepare_inputs(
                         (
                             DecodeRow(
@@ -843,7 +843,7 @@ def _write_latent_feature(runner, entry, latents, size):
             write_kv=True,
             causal=False,
         )
-        with entry.context.activate():
+        with entry.execution.context.activate():
             batch = entry.prepare_inputs(
                 (row,), forward_mode=MediaCall.DENOISING, attention=attention
             )

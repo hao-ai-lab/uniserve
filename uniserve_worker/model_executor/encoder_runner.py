@@ -13,7 +13,7 @@ from uniserve_worker.errors import InputError
 from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.storage.host_buffers import HostBuffers
 
-from .cuda_graph import CUDAGraphRunner
+from .cuda_graph import CUDAGraphRunner, GraphBucket
 from .model_runner import ModelRunner
 from .output import ExecutionOutput
 
@@ -48,16 +48,14 @@ class EncoderRunner(ModelRunner):
         super().__init__(*args, **kwargs)
         self._tokens: torch.Tensor | None = None
         self._host: HostBuffers | None = None
-        # Captured packed vision graphs by slot count; each retains its
-        # static ``(pixels, grids)`` input, the pixels a leading view of one
-        # buffer every count shares.
-        self._packed: dict[int, CUDAGraphRunner] = {}
+        # Numerical slot counts; graph backing belongs to Execution.
+        self._packed_capacities: tuple[int, ...] = ()
 
     @property
     def packs_images(self) -> bool:
         """Whether vision calls run through packed image graphs."""
         return (
-            bool(self.pools)
+            bool(self.execution.pools)
             and isinstance(self.model, PatchEncoder)
             and self.model.max_patches is not None
         )
@@ -124,7 +122,7 @@ class EncoderRunner(ModelRunner):
             CUDAGraphError: After startup is sealed, or when graph residency
                 exceeds its byte budget.
         """
-        if not self.packs_images or self._packed:
+        if not self.packs_images or self._packed_capacities:
             return
         if self._startup_complete:
             raise CUDAGraphError("packed capture is outside startup")
@@ -136,7 +134,7 @@ class EncoderRunner(ModelRunner):
 
         # Only one packed call runs at a time on the runner's stream, so
         # every capacity reads the leading slots of one pixel buffer.
-        with self.graph_storage.allocate(self):
+        with self.execution.storage.allocate(self.execution):
             buffer = torch.zeros(
                 (max(capacities) * encoder.max_patches, row),
                 dtype=dtype,
@@ -148,24 +146,25 @@ class EncoderRunner(ModelRunner):
         # because the captured kernels still address it.
         for slots in reversed(capacities):
             pixels = buffer[: slots * encoder.max_patches]
-            with self.graph_storage.allocate(self):
+            with self.execution.storage.allocate(self.execution):
                 grids = torch.tensor(
                     encoder.packed_grids((), slots),
                     dtype=torch.long,
                     device=self.device,
                 )
             graph = CUDAGraphRunner.capture(
-                self.context,
+                self.execution.context,
                 (pixels, grids),
                 lambda inputs: encoder.encode_packed(*inputs),
-                pools=self.pools,
+                pools=self.execution.pools,
             )
             try:
-                self.graph_storage.check()
+                self.execution.storage.check()
             except BaseException:
                 graph.close()
                 raise
-            self._packed[slots] = graph
+            self.execution.buckets["images", slots] = GraphBucket({None: graph})
+        self._packed_capacities = capacities
 
     def _forward_packed(self, inputs: VisionInput) -> ExecutionOutput:
         """Replay packed vision slots, preserving each image's feature rows.
@@ -174,9 +173,9 @@ class EncoderRunner(ModelRunner):
         the smallest captured capacity that holds it. A copy retains the
         group's outputs before another replay reuses the captured backing.
         """
-        if not self._packed:
+        if not self._packed_capacities:
             raise CUDAGraphError("packed vision graphs are not resident")
-        largest = max(self._packed)
+        largest = max(self._packed_capacities)
         values: list[torch.Tensor] = []
         for start in range(0, inputs.batch_size, largest):
             stop = min(start + largest, inputs.batch_size)
@@ -204,8 +203,10 @@ class EncoderRunner(ModelRunner):
 
         # Every slot count through the cap is captured, so selecting the
         # smallest sufficient count adds no empty image slots.
-        slots = min(count for count in self._packed if count >= len(images))
-        graph = self._packed[slots]
+        slots = min(
+            count for count in self._packed_capacities if count >= len(images)
+        )
+        graph = self.execution.buckets["images", slots][None]
         if any(
             shape is None
             or image.ndim != 2
@@ -247,8 +248,7 @@ class EncoderRunner(ModelRunner):
     def close(self):
         close_resources(
             super().close,
-            *(graph.close for graph in self._packed.values()),
             *(() if self._host is None else (self._host.close,)),
         )
-        self._packed.clear()
+        self._packed_capacities = ()
         self._tokens = self._host = None
