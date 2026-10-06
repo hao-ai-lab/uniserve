@@ -4,8 +4,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PySlice, PyTuple};
 use uniserve_worker_ipc::ForwardStats as NativeStats;
 
-use super::{Execution, GraphBucket, graph_error};
+use super::{Execution, GraphBucket};
 use crate::stats::ForwardStats;
+use crate::worker::cuda_graph::{CUDAGraphError, CUDAGraphRunner};
 use crate::worker::host::with_context;
 use crate::worker::model_results::ExecutionOutput;
 
@@ -24,7 +25,7 @@ pub(super) fn capture(
         return Ok(());
     }
     if execution.borrow().sealed {
-        return Err(graph_error(py, "packed capture is outside startup".into()));
+        return Err(CUDAGraphError::new_err("packed capture is outside startup"));
     }
 
     let capacity = max_images.min(MAX_IMAGES);
@@ -66,9 +67,8 @@ pub(super) fn encode(
     let py = execution.py();
     let capacity = execution.borrow().image_capacity;
     if capacity == 0 {
-        return Err(graph_error(
-            py,
-            "packed vision graphs are not resident".into(),
+        return Err(CUDAGraphError::new_err(
+            "packed vision graphs are not resident",
         ));
     }
 
@@ -96,7 +96,11 @@ pub(super) fn encode(
                 &shapes,
             ),
         )?;
-        let output = graph.call_method0(py, "replay")?;
+        let output = graph
+            .bind(py)
+            .cast::<CUDAGraphRunner>()?
+            .borrow()
+            .replay(py, None)?;
         let features = runner.call_method1("unpack_packed", (output, shapes))?;
         values.extend(features.cast::<PyTuple>()?.iter().map(Bound::unbind));
     }

@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 use super::{Execution, GraphBucket, close_all, on_stream};
+use crate::worker::cuda_graph::{CUDAGraphError, CUDAGraphRunner};
 use crate::worker::host::with_context;
 
 /// Numerical backing for one layout. Graph input views borrow the execution's
@@ -422,11 +423,9 @@ pub(super) fn capture(
         ));
     }
     if execution.borrow().sealed {
-        let error = py
-            .import("uniserve.runtime.cuda_graph")?
-            .getattr("CUDAGraphError")?
-            .call1(("denoising capture is outside startup preparation",))?;
-        return Err(PyErr::from_value(error));
+        return Err(CUDAGraphError::new_err(
+            "denoising capture is outside startup preparation",
+        ));
     }
     let entry = layout(execution, &ladder.getattr("layout")?)?;
     if !entry.borrow().warmed {
@@ -484,7 +483,11 @@ pub(super) fn step(
                         ladder.getattr("schedules")?,
                         ladder.getattr("temporal")?.get_item(index)?,
                     );
-                    graph.call_method1(py, "replay", (temporal,))?;
+                    graph
+                        .bind(py)
+                        .cast::<CUDAGraphRunner>()?
+                        .borrow()
+                        .replay(py, Some(temporal.into_pyobject(py)?.into_any().unbind()))?;
                     Ok((
                         runner
                             .call_method1("_step_values", (ladder, index))?
