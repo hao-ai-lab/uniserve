@@ -30,7 +30,6 @@ from uniserve.processing import (
 )
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import transfer
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.codec import (
@@ -47,33 +46,25 @@ from uniserve_worker.model_executor.image_inputs import (
     stage_image,
 )
 from uniserve_worker.model_executor.input_batch import TokenRow
-from uniserve_worker.protocol.batch import TensorExport
 from uniserve_worker.protocol.call import (
     Call,
     ForwardMode,
     MediaCall,
 )
 from uniserve_worker.protocol.tensor import TensorRef
-from uniserve_worker.protocol.transfer import (
-    EncoderTransferValue,
-    TensorTransfer,
-)
 from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.storage.tensor_store import (
     Buffer,
     FeatureMetadata,
     ImageMetadata,
 )
-from uniserve_worker.transport.exports import export_tensor
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.host import HostLane
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.latent_pool import LatentPool
     from uniserve_worker.storage.tensor_store import TensorStore
@@ -122,18 +113,16 @@ def text(
             "text encoder output declarations disagree with the loaded entry"
         )
 
-    products = transfer.export_tensors(
-        call,
+    state.export_tensors(
+        call.request_key.request_id,
         result.values,
-        tensor_store=tensor_store,
-        export_transports=export_transports,
-        state=state,
+        tensor_store,
+        export_transports,
     )
     if result.stats is None:
         raise RuntimeError("module output has no execution statistics")
     state.forward_stats.append(result.stats)
 
-    request.set_products(products)
     return request
 
 
@@ -273,62 +262,26 @@ def _input_images(count: int) -> int:
     return int(count)
 
 
-def export_features(
+def write_features(
     call: Call,
     prepared: PreparedImage,
     output: torch.Tensor,
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
-    export_transports: Mapping[str, Transport],
-    config: WorkerConfig,
 ) -> PendingOutput:
-    """Commit encoded features to the tensor store and export them if needed.
-
-    The features always land in the call's encoder-cache write. They are
-    also exported as a product when any non-local export transport is
-    bound and this rank is the component's output rank.
-    """
+    """Write encoded features; the native executor supplies remote exports."""
     request = state.pending_output(call.request_key.request_id)
     feature_output = call.encoder_output
     if feature_output is None:
         raise invalid_descriptor("encoder output has no feature reference")
-    features = output.detach()
     write = bound_encoder_write(feature_output, state=state)
-    resident = tensor_store.write(
+    tensor_store.write(
         write,
-        features,
+        output.detach(),
         metadata=FeatureMetadata(height=prepared.height, width=prepared.width),
     )
-
-    products: tuple[TensorExport, ...] = ()
-    if any(
-        name != "local" for name in export_transports
-    ) and config.rank == worker_info.output_rank(call.component):
-        locations = export_tensor(
-            export_transports,
-            resident,
-            retain=partial(tensor_store.retain_export, write),
-            consumers=call.consumer_slots,
-        )
-        request.exported_locators.extend(locations)
-        request.tensor_exports[feature_output.buffer_id] = tuple(
-            (export_transports[location.backend], location)
-            for location in locations
-        )
-        descriptor = EncoderTransferValue(
-            tensor=TensorTransfer(
-                shape=tuple(resident.shape), locations=locations
-            ),
-            payload_kind="vision_feature"
-            if call.kind is MediaCall.VISION_ENCODING
-            else "latent_feature",
-            height=prepared.height,
-            width=prepared.width,
-        )
-        products = (TensorExport(product=feature_output, value=descriptor),)
-    return non_state_outcome(call, products=products, state=state)
+    return request
 
 
 def materialization_latent(
@@ -442,10 +395,9 @@ def state_outcome(
     call: Call,
     *,
     state: BatchState,
-    products: tuple[TensorExport, ...] = (),
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Stage the successful outcome of a visual-state call, which wrote KV.
+    """Record the successful outcome of a visual-state call, which wrote KV.
 
     The reported KV length is the pending ``cache_length`` when one
     exists, otherwise the request's visible KV length as checked against its
@@ -454,7 +406,7 @@ def state_outcome(
     Raises:
         WorkerError: When the native cache query rejects the request's
             KV coordinates.
-        RuntimeError: When the staged length is a device tensor.
+        RuntimeError: When the completed length is a device tensor.
     """
     request = state.pending_output(call.request_key.request_id)
     cache = request.cache_coordinates(request_tables)
@@ -464,7 +416,6 @@ def state_outcome(
     if not isinstance(selected, int):
         raise RuntimeError("visual state completion has a dynamic KV length")
     request.set_cache_length(selected)
-    request.set_products(products)
     return request
 
 
@@ -472,16 +423,14 @@ def non_state_outcome(
     call: Call,
     *,
     state: BatchState,
-    products: tuple[TensorExport, ...] = (),
     completion_tasks: tuple[HostTask, ...] = (),
 ) -> PendingOutput:
-    """Record a stateless completion and its already materialized products.
+    """Record the host tasks finishing a stateless numerical call.
 
     ``completion_tasks`` become the call's ``host_tasks``, which must finish
     before its output is ready.
     """
     request = state.pending_output(call.request_key.request_id)
-    request.set_products(products)
     request.set_host_tasks(completion_tasks)
     return request
 
@@ -806,12 +755,12 @@ def diffusion_finalize_frames(
     Used for an image-decoding call without a latent input. A product whose
     metadata records no value range is treated as ``(-1, 1)``.
     """
-    image, metadata = transfer.fetch_product(
-        call,
-        tensor_store=tensor_store,
-        model_runner=model_runner,
-        state=state,
+    read = state.consume_tensor(
+        call.request_key.request_id,
+        tensor_store,
+        model_runner.call_devices(call)[0],
     )
+    image, metadata = read.tensor, read.metadata
     if (
         not isinstance(metadata, ImageMetadata)
         or min(metadata.height, metadata.width) < 1
@@ -947,7 +896,7 @@ def bound_encoder_write(reference: TensorRef, *, state: BatchState) -> Buffer:
 __all__ = [
     "text",
     "prepare_features",
-    "export_features",
+    "write_features",
     "materialization_latent",
     "export_image",
 ]

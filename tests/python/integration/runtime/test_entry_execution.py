@@ -44,6 +44,7 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     CallStatus,
+    ErrorCode,
     MediaCall,
     TransferMode,
 )
@@ -603,22 +604,44 @@ def test_text_encoder_call_publishes_consumable_conditioning(
             inputs=(reference,),
             outputs=(copied,),
         )
-        prepared = worker.submit(
-            Batch(
-                batch_id=2,
-                collective_seq=3,
-                calls=(consumer,),
-                input_products=(TensorExport(reference, product.value),),
-                buffer_allocations=(
-                    BufferAllocation(
-                        reference.buffer_id, 0, reference.max_bytes
-                    ),
-                    BufferAllocation(copied.buffer_id, 256, copied.max_bytes),
-                ),
-            )
+        transfer = Batch(
+            batch_id=2,
+            collective_seq=3,
+            calls=(consumer,),
+            input_products=(TensorExport(reference, product.value),),
+            buffer_allocations=(
+                BufferAllocation(reference.buffer_id, 0, reference.max_bytes),
+                BufferAllocation(copied.buffer_id, 256, copied.max_bytes),
+            ),
         )
-        prepared = finalized_report(worker, prepared)
-        result = prepared
+
+        # Refuse the destination export after consuming the source. Its
+        # read lease and output reservation must retire so a retry can use
+        # the same source and physical destination on every execution lane.
+        capacity = worker.transports["local"].capacity
+        reserved = capacity.capacity - capacity.used
+        capacity.acquire(reserved)
+        try:
+            refused = finalized_report(worker, worker.submit(transfer))
+        finally:
+            capacity.release(reserved)
+        assert refused.completions[0].status is CallStatus.ERROR
+        assert refused.completions[0].error_code is ErrorCode.RESOURCE_EXHAUSTED
+        assert not refused.products
+
+        copied = replace(copied, producer_call_id=CallId(3, 0))
+        consumer = replace(consumer, call_id=CallId(3, 0), outputs=(copied,))
+        transfer = replace(
+            transfer,
+            batch_id=3,
+            collective_seq=4,
+            calls=(consumer,),
+            buffer_allocations=(
+                transfer.buffer_allocations[0],
+                BufferAllocation(copied.buffer_id, 256, copied.max_bytes),
+            ),
+        )
+        result = finalized_report(worker, worker.submit(transfer))
         assert result.completions[0].status is CallStatus.OK
         copied_value = result.products[0].value.tensor
         tickets = fetch_tensor(

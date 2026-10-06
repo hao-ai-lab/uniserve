@@ -40,15 +40,12 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from uniserve.distributed.mesh import Communicator
-    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
     from uniserve_worker.storage.tensor_store import TensorStore
-    from uniserve_worker.transport.interface import Transport
 
 
 ForwardValue = tuple[
@@ -74,15 +71,12 @@ def forward_step(
     state: BatchState,
     kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
-    export_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
-    config: WorkerConfig,
 ) -> tuple[int, ...]:
     """Evaluate one step and return the integrated trajectory indexes."""
     if trajectories:
@@ -138,13 +132,10 @@ def forward_step(
         scheduled,
         state=state,
         tensor_store=tensor_store,
-        worker_info=worker_info,
-        export_transports=export_transports,
         model_runner=model_runner,
         request_tables=request_tables,
         decode_state=decode_state,
         sampling_group=sampling_group,
-        config=config,
     )
 
     if predictions:
@@ -612,13 +603,10 @@ def publish_forward_values(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    worker_info: WorkerInfo,
-    export_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
-    config: WorkerConfig,
 ) -> dict[int, list[torch.Tensor]]:
     """Publish completed numerical values and retain diffusion predictions.
 
@@ -699,14 +687,11 @@ def publish_forward_values(
                 if not isinstance(selection, PendingOutput):
                     samples.append((index, task, value, selection, None))
         elif index in images:
-            image.export_features(
+            image.write_features(
                 call,
                 images[index],
                 value,
                 tensor_store=tensor_store,
-                worker_info=worker_info,
-                export_transports=export_transports,
-                config=config,
                 state=state,
             )
         else:

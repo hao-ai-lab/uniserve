@@ -20,7 +20,7 @@ use super::latent::LatentPool;
 use super::output::OutputBuffer;
 use super::pending::PendingOutput;
 use super::request::RequestPool;
-use super::storage::TensorStore;
+use super::storage::{Buffer, TensorRead, TensorStore};
 
 /// Resources retained until the executor delivers or abandons one submission.
 /// Numerical callbacks borrow this object; they do not advance the executor.
@@ -716,6 +716,169 @@ impl BatchState {
 
 #[pymethods]
 impl BatchState {
+    /// Borrow a call's single resident tensor and keep its lease through
+    /// commit or discard. Numerical consumers and transfers use this owner.
+    pub(super) fn consume_tensor(
+        &self,
+        py: Python<'_>,
+        request_id: u64,
+        tensor_store: &TensorStore,
+        device: Bound<'_, PyAny>,
+    ) -> PyResult<Py<TensorRead>> {
+        let &index = self
+            .request_indexes
+            .get(&request_id)
+            .ok_or_else(|| invalid(py, "request has no output in this batch"))?;
+        let call = &self.plan.calls[index];
+        let output = self.outputs[index].borrow(py);
+        let numerical = output.call.bind(py);
+        let feature_count =
+            call.vision_inputs.len() + usize::from(call.latent_feature_input.is_some());
+        let reference = if feature_count != 0 {
+            if feature_count != 1 {
+                return Err(invalid(py, "feature transfer requires one source"));
+            }
+            if call.vision_inputs.is_empty() {
+                numerical.getattr("latent_feature_input")?
+            } else {
+                numerical
+                    .getattr("vision_inputs")?
+                    .get_item(0)?
+                    .getattr("feature")?
+            }
+        } else {
+            if call.inputs.len()
+                + usize::from(call.token_input.is_some())
+                + usize::from(call.image_input.is_some())
+                != 1
+            {
+                return Err(invalid(py, "tensor transfer requires one resident source"));
+            }
+            if !call.inputs.is_empty() {
+                numerical.getattr("inputs")?.get_item(0)?
+            } else if call.token_input.is_some() {
+                numerical.getattr("token_input")?
+            } else {
+                numerical.getattr("image_input")?
+            }
+        };
+        let read =
+            tensor_store.consume(py, reference, numerical.getattr("call_id")?, Some(device))?;
+        let reads = if feature_count != 0 {
+            &output.feature_reads
+        } else {
+            &output.device_reads
+        };
+        reads.bind(py).append(read.bind(py))?;
+        if feature_count != 0 {
+            let source = read.borrow(py);
+            let feature = match &source.metadata {
+                Some(metadata) => metadata.bind(py).is_instance(
+                    &py.import("uniserve_worker.storage.tensor_store")?
+                        .getattr("FeatureMetadata")?,
+                )?,
+                None => false,
+            };
+            if !feature {
+                return Err(invalid(py, "feature transfer requires spatial metadata"));
+            }
+        }
+        Ok(read)
+    }
+
+    /// Export the numerical values owned by this rank. Deferred host writes
+    /// remain with their pending output and become visible together here.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (request_id, values, tensor_store, transports, *, host=false, regions=None))]
+    fn export_tensors(
+        &self,
+        py: Python<'_>,
+        request_id: u64,
+        values: Vec<Bound<'_, PyAny>>,
+        tensor_store: &TensorStore,
+        transports: &Bound<'_, PyAny>,
+        host: bool,
+        regions: Option<Vec<Vec<Bound<'_, PyTuple>>>>,
+    ) -> PyResult<()> {
+        let &index = self
+            .request_indexes
+            .get(&request_id)
+            .ok_or_else(|| invalid(py, "request has no output in this batch"))?;
+        let call = &self.plan.calls[index];
+        if values.len() != call.outputs.len()
+            || regions
+                .as_ref()
+                .is_some_and(|regions| regions.len() != values.len())
+        {
+            return Err(invalid(
+                py,
+                "numerical results disagree with declared tensor outputs",
+            ));
+        }
+
+        let output = self.outputs[index].borrow(py);
+        let writes = output
+            .writes
+            .bind(py)
+            .iter()
+            .map(|write| write.cast_into::<Buffer>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let deferred: Vec<_> = writes
+            .iter()
+            .filter(|write| write.get().deferred(py))
+            .cloned()
+            .collect();
+        let exported = (|| {
+            let mut products = Vec::new();
+            for (index, (product, value)) in call.outputs.iter().zip(&values).enumerate() {
+                let write = writes.iter().find(|write| {
+                    write.get().id(py) == product.buffer_id() && !write.get().feature(py)
+                });
+                let Some(write) = write else {
+                    continue;
+                };
+                tensor_store.write(py, write.clone(), value.clone(), None, None)?;
+                products.push(tensor_store.export_buffer(
+                    py,
+                    call,
+                    product,
+                    write,
+                    transports,
+                    host,
+                    regions.as_ref().map(|regions| regions[index].as_slice()),
+                    &output,
+                )?);
+            }
+            output
+                .lock(py)?
+                .set_products(products)
+                .map_err(|error| native_error(py, error))?;
+
+            if !deferred.is_empty() {
+                let resident = tensor_store.exports.bind(py);
+                let exports = output.tensor_exports.bind(py);
+                super::exports::validate_exports(resident, exports)?;
+                tensor_store.commit_writes(py, deferred.clone())?;
+                resident.update(exports.as_mapping())?;
+            }
+            Ok(())
+        })();
+
+        if !deferred.is_empty() {
+            // These writes finish after batch commit, so failure cleanup
+            // belongs here rather than the executor's pre-commit discard.
+            if exported.is_err() {
+                output.revoke_exports(transports)?;
+                tensor_store.abandon_writes(py, deferred)?;
+            }
+            drop(output);
+            self.outputs[index]
+                .borrow_mut(py)
+                .release_execution_references(py)?;
+        }
+        exported
+    }
+
     /// Record completion only after the numerical consumer has written or read
     /// its latent bank. Ranks without that consumer leave their update empty.
     fn complete_latent(&self, py: Python<'_>, request_id: u64) -> PyResult<()> {

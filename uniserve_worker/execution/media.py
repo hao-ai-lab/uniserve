@@ -46,7 +46,6 @@ from uniserve_worker.protocol.batch import (
     DecodeRange,
     MediaTrack,
     NewRequest,
-    TensorExport,
 )
 from uniserve_worker.protocol.call import Call, MediaCall
 
@@ -767,12 +766,9 @@ def execute(
         else None,
     )
 
-    from uniserve_worker.execution import transfer
-
     builder = model_runner.media_builder
     pool = model_runner.latent_pool
     slot_index = request.request.request_pool_idx
-    products: tuple[TensorExport, ...] = ()
     if call.kind is MediaCall.LATENT_PREPARATION:
         # Batch preparation validated the call's pages and interval.
         params = request.latent_params
@@ -927,12 +923,11 @@ def execute(
                 raise invalid_descriptor(
                     "final latent products require completed denoising"
                 )
-            products = transfer.export_tensors(
-                call,
+            state.export_tensors(
+                call.request_key.request_id,
                 result.values,
-                tensor_store=tensor_store,
-                export_transports=export_transports,
-                state=state,
+                tensor_store,
+                export_transports,
             )
 
     elif call.kind in {MediaCall.VIDEO_DECODING, MediaCall.AUDIO_DECODING}:
@@ -1030,18 +1025,16 @@ def execute(
         # Decoded media units are host products: a host rank's encoder reads
         # them in place from the segment this rank publishes, over the host
         # mechanism of its edges.
-        products = transfer.export_tensors(
-            call,
+        state.export_tensors(
+            call.request_key.request_id,
             values,
-            tensor_store=tensor_store,
-            export_transports=export_transports,
-            state=state,
+            tensor_store,
+            export_transports,
             host=True,
         )
     else:
         raise invalid_descriptor(f"unsupported video call {call.kind!r}")
 
-    request.set_products(products)
     return request
 
 

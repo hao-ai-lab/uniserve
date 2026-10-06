@@ -226,6 +226,34 @@ def _host_array(value: torch.Tensor) -> np.ndarray:
     )
 
 
+def _encoded_rows(
+    call: Call,
+    *,
+    state: BatchState,
+    count: int,
+):
+    """Return the product rows reserved for this rank's encoded media units.
+
+    The rows are filled and published when the host tasks that encode the
+    units complete. Nothing reads them before then: the muxer's call is
+    scheduled only once every encode round has completed.
+    """
+    from uniserve_worker.execution.image import bound_device_write
+
+    outputs = call.outputs
+    if len(outputs) != 1:
+        raise invalid_descriptor(
+            "encoded media units require exactly one declared product"
+        )
+    write = bound_device_write(outputs[0], state=state)
+    rows = write.tensor
+    if rows.ndim != 2 or rows.shape[0] != count:
+        raise invalid_descriptor(
+            "encoded media unit product must reserve one row per unit"
+        )
+    return write, rows
+
+
 def execute(
     call: Call,
     *,
@@ -253,7 +281,6 @@ def execute(
         RuntimeError: When the call has no reserved lane slots, or
             ``HostTask.configure`` rejects one.
     """
-    from uniserve_worker.execution import transfer
     from uniserve_worker.execution.media import mux_config
 
     request = state.pending_output(call.request_key.request_id)
@@ -349,12 +376,10 @@ def execute(
         # The encoded rows are this call's product: reserved now at the
         # rank's positions of the round, filled and published once every
         # encode has completed.
-        write, rows = transfer.reserved_unit_rows(
-            call, state=state, count=len(positions)
-        )
+        write, rows = _encoded_rows(call, state=state, count=len(positions))
         tensor_store.defer_write(write)
 
-        def publish(results: tuple[object, ...]) -> None:
+        def finish_units(results: tuple[object, ...]) -> None:
             regions = []
             for index, (row, result) in enumerate(
                 zip(rows.unbind(0), results, strict=True)
@@ -365,20 +390,16 @@ def execute(
                 regions.append(
                     (slice(index, index + 1), slice(0, framed.numel()))
                 )
-            products = (
-                transfer.export_deferred_product(
-                    call.outputs[0],
-                    write,
-                    rows,
-                    tensor_store=tensor_store,
-                    export_transports=export_transports,
-                    consumers=call.consumer_slots,
-                    regions=regions,
-                ),
+            state.export_tensors(
+                call.request_key.request_id,
+                (rows,),
+                tensor_store,
+                export_transports,
+                host=True,
+                regions=(regions,),
             )
-            request.set_products(products)
 
-        finish = publish
+        finish = finish_units
 
     elif call.kind is MediaCall.AUDIO_ENCODING:
         if media_mux is None:
