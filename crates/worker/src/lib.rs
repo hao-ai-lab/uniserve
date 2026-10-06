@@ -30,7 +30,9 @@ mod transfer;
 pub mod vmm_pool;
 mod weight_prefetch;
 
-pub use block_tables::{BlockTableUpdate, BlockTables, GroupShape, GroupTable};
+pub use block_tables::{
+    AttentionRow, BlockTableUpdate, BlockTables, GroupShape, GroupTable, TablePages, table_pages,
+};
 pub use buffer::{BufferBinding, BufferPool};
 pub use completion::{Completion, Outcome};
 pub use descriptor_grants::{DescriptorGrants, fetch_descriptor};

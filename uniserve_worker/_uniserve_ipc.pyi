@@ -127,6 +127,7 @@ __all__ = [
     "SHM_HEADER_BYTES",
     "StreamSignal",
     "Submission",
+    "TablePages",
     "TensorImport",
     "TensorRead",
     "TensorStore",
@@ -135,6 +136,7 @@ __all__ = [
     "fetch_tensor",
     "fetch_descriptor",
     "store_media_bytes",
+    "table_pages",
     "open_shared_memory",
     "WeightPrefetch",
     "atomic_load_u32",
@@ -883,8 +885,6 @@ class KVCacheManager:
     def clear_resident(self) -> None: ...
     @property
     def has_pending_accesses(self) -> bool: ...
-    @property
-    def has_transfers(self) -> bool: ...
     def retain_execution(
         self,
         request: RequestKey,
@@ -909,9 +909,9 @@ class KVCacheManager:
     def write_dependencies(
         self, spans: Sequence[tuple[int, int, int]]
     ) -> tuple[Completion, ...]: ...
-    def require_writable(
-        self, spans: Sequence[tuple[int, int, int]]
-    ) -> None: ...
+    def prepare_attention(
+        self, rows: Sequence[tuple[int, int, int, bool]]
+    ) -> tuple[TablePages, ...]: ...
     def require_reusable(
         self, spans: Sequence[tuple[int, int, int]]
     ) -> None: ...
@@ -1615,6 +1615,30 @@ class GroupTable:
     def spans(
         self, start: int, length: int
     ) -> tuple[tuple[int, int, int], ...]: ...
+
+@final
+class TablePages:
+    """Borrowed page ranges of one numerical attention table."""
+
+    @property
+    def block_size(self) -> int: ...
+    @property
+    def windowed(self) -> bool: ...
+    @property
+    def width(self) -> int: ...
+    @property
+    def start_pages(self) -> tuple[int, ...]: ...
+    @property
+    def lengths(self) -> tuple[int, ...]: ...
+    @property
+    def rows(self) -> tuple[tuple[int, ...], ...]: ...
+
+def table_pages(
+    tables: Sequence[Sequence[GroupTable]],
+    *,
+    prefix_lengths: Sequence[int],
+    query_lengths: Sequence[int],
+) -> tuple[TablePages, ...]: ...
 
 @final
 class BlockTables:

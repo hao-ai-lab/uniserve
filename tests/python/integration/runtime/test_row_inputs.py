@@ -22,9 +22,7 @@ from uniserve.math import ceil_div
 from uniserve.nn.attention import PagedInput
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.model_executor.attention import (
-    first_page,
     from_tables,
-    row_tables,
     table_pages,
 )
 from uniserve_worker.model_executor.graph_inputs import pad_text
@@ -86,7 +84,9 @@ def _rows(manager, extents, generator, *, write, causal):
             )
             if all(
                 table.shape.window is None
-                or first_page(table, prefix) >= table.start_page
+                or max(0, prefix - table.shape.window)
+                // table.shape.page_tokens
+                >= table.start_page
                 for table in groups
             ):
                 break
@@ -117,7 +117,13 @@ def _host_layout(rows, manager):
     prefixes = tuple(row.seq_len for row in rows)
     return from_tables(
         table_pages(
-            row_tables(rows, tables=manager.block_tables, cache=manager),
+            tuple(
+                tuple(
+                    manager.block_tables.table(row.request_pool_idx, group)
+                    for group in range(len(manager.block_tables.groups))
+                )
+                for row in rows
+            ),
             prefix_lengths=prefixes,
             query_lengths=queries,
         ),

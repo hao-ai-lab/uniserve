@@ -237,7 +237,7 @@ def gather_request_rows(
 
     Every tensor must reside on one device with unit innermost stride; the
     caller validates the rows against the installed tables
-    (``attention.row_tables``). On a device where Triton launches, one
+    (``attention.prepare_attention``). On a device where Triton launches, one
     kernel gathers every table; elsewhere equivalent tensor operations do.
 
     Raises:

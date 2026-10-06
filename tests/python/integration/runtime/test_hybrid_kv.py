@@ -15,6 +15,7 @@ from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
 from uniserve_worker.bootstrap.cache import plan_cache, table_widths
 from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.errors import WorkerError
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import (
     TokenBufferConfig,
@@ -58,6 +59,36 @@ def _layers(pool):
         table = pool.block_tables.table(1, group)
         for index, name in enumerate(values.layers):
             yield name, table, index // columns
+
+
+def test_attention_pages_retain_assignments_and_bound_reads_and_writes():
+    pool = hybrid_pool(hybrid_model(), _config("cpu"), num_units=64)
+    try:
+        _install(pool, PRODUCER)
+        selected = pool.prepare_attention(((1, 40, 1, True),))
+        expected = [((unit,),) for unit in range(16, 21)] + [((1, 2),)]
+        assert [table.rows for table in selected] == expected
+
+        # Read-only canvases can extend beyond capacity; they consume the
+        # retained prefix and keep their current tokens outside the cache.
+        readonly = pool.prepare_attention(((1, 48, 24, False),))
+        assert [table.rows for table in readonly] == expected
+        with pytest.raises(WorkerError, match="scheduler block table"):
+            pool.prepare_attention(((1, 48, 1, True),))
+        with pytest.raises(WorkerError, match="retired window pages"):
+            pool.prepare_attention(((1, 23, 1, True),))
+        for prefix, query in ((40, 0), (40, -1), (-1, 1)):
+            with pytest.raises(WorkerError, match="lengths are invalid"):
+                pool.prepare_attention(((1, prefix, query, True),))
+
+        _install(pool, CONSUMER)
+        current = pool.prepare_attention(((1, 40, 1, True),))
+        assert [table.rows for table in current] == [
+            ((unit,),) for unit in range(21, 26)
+        ] + [((3, 4),)]
+        assert [table.rows for table in selected] == expected
+    finally:
+        pool.close()
 
 
 def _history(pool, device):

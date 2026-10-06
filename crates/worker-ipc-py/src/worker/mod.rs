@@ -60,6 +60,8 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<block_tables::BlockTables>()?;
     module.add_class::<block_tables::GroupShape>()?;
     module.add_class::<block_tables::GroupTable>()?;
+    module.add_class::<block_tables::TablePages>()?;
+    module.add_function(wrap_pyfunction!(block_tables::table_pages, module)?)?;
     module.add_class::<completion::Completion>()?;
     module.add_class::<events::CUDAEvent>()?;
     module.add_class::<stream::CUDAStream>()?;

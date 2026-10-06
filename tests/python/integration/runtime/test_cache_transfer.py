@@ -289,7 +289,7 @@ def test_failed_kv_export_releases_partial_views_and_source_reservation() -> (
                 transports={"local": transport},
             )
         assert failure.value.code is WorkerErrorCode.RESOURCE_ERROR
-        pool.require_writable(pool.block_tables.table(1, 0), start=0, length=4)
+        pool.prepare_attention(((1, 0, 4, True),))
 
         # Retrying the same buffer with a smaller extent requires both the
         # cache reservation and the first export's transport bytes to be free.
