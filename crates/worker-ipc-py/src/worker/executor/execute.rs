@@ -109,8 +109,14 @@ impl PythonBackend {
             for &index in &active {
                 let selected = self
                     .model_runner
-                    .bind(py)
-                    .call_method1("call_devices", (calls.get_item(index)?,))?;
+                    .borrow(py)
+                    .call_devices(
+                        py,
+                        &*calls
+                            .get_item(index)?
+                            .extract::<PyRef<crate::calls::Call>>()?,
+                    )?
+                    .into_bound(py);
                 for device in selected.try_iter()? {
                     let device = device?;
                     if !devices.contains(&device)? {

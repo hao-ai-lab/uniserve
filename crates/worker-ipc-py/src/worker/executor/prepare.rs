@@ -333,11 +333,14 @@ impl PythonBackend {
 
         // Latent preparation opens the video trajectory, so it must follow
         // admission rather than an already submitted state-producing call.
-        if !self
-            .model_runner
-            .bind(py)
-            .getattr("video_postprocessor")?
-            .is_none()
+        if !{
+            self.model_runner
+                .borrow(py)
+                .video_postprocessor
+                .bind(py)
+                .clone()
+        }
+        .is_none()
         {
             for (call, previous) in plan.calls.iter().zip(&batch.predecessors) {
                 if call.code == CallKind::Media(MediaCall::LatentPreparation)

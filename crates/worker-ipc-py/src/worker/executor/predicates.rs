@@ -40,8 +40,14 @@ impl PythonBackend {
         for &index in &selected {
             devices.push(
                 self.model_runner
-                    .bind(py)
-                    .call_method1("call_devices", (calls.get_item(index)?,))?
+                    .borrow(py)
+                    .call_devices(
+                        py,
+                        &*calls
+                            .get_item(index)?
+                            .extract::<PyRef<crate::calls::Call>>()?,
+                    )?
+                    .into_bound(py)
                     .get_item(0)?,
             );
         }

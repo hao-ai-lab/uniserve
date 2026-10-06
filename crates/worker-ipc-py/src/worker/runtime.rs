@@ -3,6 +3,7 @@
 mod bootstrap;
 mod warmup;
 
+use super::model_executor::ModelExecutor;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -36,7 +37,7 @@ pub(crate) struct Worker {
     #[pyo3(get)]
     model: Option<Py<PyAny>>,
     #[pyo3(get)]
-    runner: Option<Py<PyAny>>,
+    runner: Option<Py<ModelExecutor>>,
     #[pyo3(get)]
     tokenizer: Option<Py<PyAny>>,
     #[pyo3(get)]
@@ -195,7 +196,7 @@ impl Worker {
                     host.borrow(py).abort();
                 }
                 if let Some(runner) = &worker.runner {
-                    results.push(abort(py, runner.bind(py)));
+                    results.push(ModelExecutor::close(runner.bind(py), true));
                 }
                 close_all(py, results)
             })();
@@ -299,7 +300,7 @@ impl Worker {
                 "warmup must precede the first serving submission",
             ));
         }
-        if runner.bind(py).getattr("numerical")?.is_truthy()? {
+        if runner.borrow(py).numerical {
             slf.borrow().bind_graph_budgets(py)?;
             let (slots, tokenizer, latents) = {
                 let worker = slf.borrow();
@@ -315,11 +316,16 @@ impl Worker {
                     worker.latent_pool.as_ref().map(|value| value.clone_ref(py)),
                 )
             };
-            runner.call_method1(py, "warmup", (slots,))?;
-            let options = PyDict::new(py);
-            options.set_item("tokenizer", tokenizer)?;
-            options.set_item("latents", latents)?;
-            runner.call_method(py, "capture", (), Some(&options))?;
+            ModelExecutor::warmup(runner.bind(py), &slots)?;
+            ModelExecutor::capture(
+                runner.bind(py),
+                &tokenizer
+                    .map(|value| value.into_bound(py))
+                    .unwrap_or_else(|| py.None().into_bound(py)),
+                &latents
+                    .map(|value| value.into_bound(py).into_any())
+                    .unwrap_or_else(|| py.None().into_bound(py)),
+            )?;
             warmup::run(slf)?;
         }
         if slf.borrow().codec_slot {
@@ -329,7 +335,7 @@ impl Worker {
                 (media.getattr("VIDEO_CODEC")?, media.getattr("AUDIO_CODEC")?),
             )?;
         }
-        runner.call_method0(py, "complete_startup")?;
+        ModelExecutor::complete_startup(runner.bind(py))?;
         if slf
             .borrow()
             .requests
@@ -591,7 +597,7 @@ impl Worker {
             host.borrow(py).abort();
         }
         if let Some(runner) = &self.runner {
-            results.push(abort(py, runner.bind(py)));
+            results.push(ModelExecutor::close(runner.bind(py), true));
         }
         if let Some(groups) = &self.process_groups {
             results.push(abort(py, groups.bind(py)));
@@ -603,7 +609,7 @@ impl Worker {
         let runner = self.runner.as_ref().map(|value| value.bind(py));
         let mut results = Vec::new();
         if let Some(runner) = runner {
-            results.push(runner.call_method0("synchronize").map(drop));
+            results.push(ModelExecutor::synchronize(runner));
         }
         if let Some(profiler) = &self.profiler {
             results.push(profiler.call_method0(py, "close").map(drop));
@@ -639,7 +645,7 @@ impl Worker {
             results.push(output.borrow(py).close(py));
         }
         if let Some(runner) = runner {
-            results.push(runner.call_method0("close_graphs").map(drop));
+            results.push(ModelExecutor::close_graphs(runner));
         }
         if let Some(cache) = &self.kv_cache {
             results.push(cache.call_method0(py, "close").map(drop));
@@ -660,7 +666,7 @@ impl Worker {
             results.push(events.borrow(py).close(py));
         }
         if let Some(runner) = runner {
-            results.push(runner.call_method0("close").map(drop));
+            results.push(ModelExecutor::close(runner, false));
         }
         if let Some(requests) = &self.requests {
             results.push(requests.borrow_mut(py).close(py));

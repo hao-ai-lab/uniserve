@@ -14,7 +14,7 @@ use crate::worker::events::EventPool;
 use crate::worker::execution::close_all;
 use crate::worker::host::HostLane;
 use crate::worker::latent::LatentPool;
-use crate::worker::model_runners::ModelRunners;
+use crate::worker::model_executor::ModelExecutor;
 use crate::worker::output::OutputPool;
 use crate::worker::request::RequestPool;
 use crate::worker::storage::TensorStore;
@@ -234,11 +234,11 @@ impl Worker {
         }
         options.set_item("attention_ranks", attention_ranks)?;
         let runner = py
-            .import("uniserve_worker.execution.model_executor")?
-            .getattr("ModelExecutor")?
-            .call((&model, &config), Some(&options))?;
+            .get_type::<ModelExecutor>()
+            .call((&model, &config), Some(&options))?
+            .cast_into::<ModelExecutor>()?;
         self.runner = Some(runner.clone().unbind());
-        self.attention = Some(runner.getattr("attention")?.unbind());
+        self.attention = Some({ runner.borrow().attention.bind(py).clone() }.unbind());
 
         // Capacity is measured after model inputs and workspaces are bound.
         // The page size is resolved first so every later pool uses that size.
@@ -249,18 +249,18 @@ impl Worker {
             self.attention.as_ref().ok_or_else(closed)?.bind(py),
             capacity_group,
         )?;
-        runner.setattr("worker_config", &config)?;
+        runner.borrow_mut().set_config(py, config.extract()?);
         config = pools::resolve_request_capacity(
             model,
             &config,
             queue_depth,
             capacity_group,
             bindings.as_ref().map(|value| value.bind(py)),
-            Some(&runner.getattr("state_buffers")?),
+            Some(&{ runner.borrow().state_buffers.bind(py).clone() }),
         )?;
         let config_native = crate::worker::config::native(&config)?;
         self.worker_config = config.clone().unbind();
-        runner.setattr("worker_config", &config)?;
+        runner.borrow_mut().set_config(py, config.extract()?);
 
         let endpoint = py
             .import("uniserve_worker.protocol.transfer")?
@@ -288,7 +288,7 @@ impl Worker {
                 .getattr("name")?
                 .extract::<String>()?,
             bindings.as_ref().map(|value| value.bind(py)),
-            Some(&runner.getattr("state_buffers")?),
+            Some(&{ runner.borrow().state_buffers.bind(py).clone() }),
         )?;
         self.check_auxiliary_storage(py, &layout)?;
         let info = &layout.info;
@@ -305,7 +305,7 @@ impl Worker {
         }
 
         let options = PyDict::new(py);
-        let state_buffers = runner.getattr("state_buffers")?;
+        let state_buffers = { runner.borrow().state_buffers.bind(py).clone() };
         if state_buffers.is_truthy()? {
             options.set_item("state_buffers", state_buffers)?;
         }
@@ -347,7 +347,7 @@ impl Worker {
             );
         }
 
-        let denoises = runner.getattr("denoises")?.is_truthy()?;
+        let denoises = runner.borrow().denoises(py);
         let generation_device = config_native
             .generation_device
             .as_deref()
@@ -370,12 +370,14 @@ impl Worker {
             );
         }
         if denoises {
-            runner.call_method1(
-                "bind_diffusion_storage",
-                (
-                    requests.getattr("storage")?.getattr("bank")?,
-                    &self.latent_pool,
-                ),
+            ModelExecutor::bind_diffusion_storage(
+                &runner,
+                &requests.getattr("storage")?.getattr("bank")?,
+                self.latent_pool
+                    .as_ref()
+                    .ok_or_else(closed)?
+                    .clone_ref(py)
+                    .into_any(),
             )?;
         }
 
@@ -441,7 +443,7 @@ impl Worker {
         )?);
 
         let mut transfer_bytes = arena.transfer_bytes as usize;
-        if runner.getattr("state_buffers")?.is_truthy()?
+        if { runner.borrow().state_buffers.bind(py).clone() }.is_truthy()?
             || !inputs
                 .call_method1(
                     "capability",
@@ -478,11 +480,7 @@ impl Worker {
         if let Some(decode_state) = &self.decode_state {
             let cache = self.kv_cache.as_ref().ok_or_else(closed)?.bind(py);
             let widths = capacity_inputs::graph_table_widths(model, &config, cache)?;
-            let runners = runner
-                .getattr("batch_runners")?
-                .cast_into::<ModelRunners>()?;
-            ModelRunners::configure_inputs(
-                &runners,
+            ModelExecutor::configure_inputs(
                 &runner,
                 layout.input_config.as_ref().ok_or_else(closed)?.bind(py),
                 cache,
@@ -499,7 +497,11 @@ impl Worker {
                 queue_depth,
             )?;
 
-            let canvas = runner.getattr("canvas_runner")?;
+            let canvas = runner
+                .borrow()
+                .canvas_runner(py)
+                .map(|value| value.into_bound(py))
+                .unwrap_or_else(|| py.None().into_bound(py));
             let sampling = config.getattr("canvas_sampling")?;
             if !canvas.is_none() && !sampling.is_none() {
                 let slots = py.import("uniserve_worker.storage.canvas_slots")?;
@@ -516,16 +518,14 @@ impl Worker {
                             .call_method("for_denoiser", (denoiser,), Some(&options))?
                             .unbind(),
                     );
-                    runner.call_method1("bind_canvas_slots", (&self.canvas_slots,))?;
+                    ModelExecutor::bind_canvas_slots(
+                        &runner,
+                        self.canvas_slots.as_ref().ok_or_else(closed)?.clone_ref(py),
+                    )?;
                 }
             }
         } else if config_native.role == "experts" {
-            ModelRunners::configure_experts(
-                &runner
-                    .getattr("batch_runners")?
-                    .cast_into::<ModelRunners>()?,
-                &runner,
-            )?;
+            ModelExecutor::configure_experts(&runner)?;
         }
         Ok(())
     }
@@ -656,8 +656,8 @@ impl Worker {
             .runner
             .as_ref()
             .ok_or_else(closed)?
-            .bind(py)
-            .getattr("graph_storage")?;
+            .borrow(py)
+            .graph_storage(py)?;
         let resident = storage.call_method0("resident_bytes")?;
         let products = self.device_product_bytes / devices.len() as u64;
         let tensors = self.tensor_store.as_ref().ok_or_else(closed)?.bind(py);

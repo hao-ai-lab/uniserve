@@ -28,8 +28,9 @@ impl PythonBackend {
         let call = batch.call(py, index)?;
         let device = self
             .model_runner
-            .bind(py)
-            .call_method1("call_devices", (&call,))?
+            .borrow(py)
+            .call_devices(py, &*call.extract::<PyRef<crate::calls::Call>>()?)?
+            .into_bound(py)
             .get_item(0)?;
         let id = call.getattr("call_id")?;
         let values = call.getattr("inputs")?;
@@ -107,11 +108,17 @@ impl PythonBackend {
         let loading = py.import("uniserve_worker.bootstrap.inputs")?;
         let vision = loading.call_method1(
             "capability",
-            (model.getattr("model")?, library.getattr("PatchEncoder")?),
+            (
+                { model.borrow().model.bind(py).clone() },
+                library.getattr("PatchEncoder")?,
+            ),
         )?;
         let audio = loading.call_method1(
             "capability",
-            (model.getattr("model")?, library.getattr("AudioEncoder")?),
+            (
+                { model.borrow().model.bind(py).clone() },
+                library.getattr("AudioEncoder")?,
+            ),
         )?;
         if vision.is_none() || audio.is_none() {
             return Err(invalid(py, "media reading requires the condition encoders"));
@@ -153,7 +160,10 @@ impl PythonBackend {
 
         options.set_item("vision", vision)?;
         options.set_item("sample_rate", audio.getattr("sample_rate")?)?;
-        options.set_item("ffmpeg", model.getattr("worker_config")?.getattr("ffmpeg")?)?;
+        options.set_item(
+            "ffmpeg",
+            { model.borrow().worker_config.bind(py).clone() }.getattr("ffmpeg")?,
+        )?;
 
         let conditions = video.getattr("conditions")?;
         let function = py

@@ -29,10 +29,13 @@ Harnesses capture the line from the worker log as their artifact.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable
 from typing import Any
 
-from uniserve.runtime.device import canonical_device
+import torch
+
+from uniserve.runtime.device import canonical_device, process_device_bytes
 
 KERNEL_TABLE_TAG = "uniserve-kernel-table"
 
@@ -207,3 +210,36 @@ class KernelRecords:
 def format_kernel_table(table: dict) -> str:
     """Render the table as its single tagged log line."""
     return f"{KERNEL_TABLE_TAG} {json.dumps(table, separators=(',', ':'))}"
+
+
+def log_startup_memory(storage) -> None:
+    """Report process, allocator, and graph pool memory after warmup."""
+    logger = logging.getLogger(__name__)
+    # Resident storage by device and, for graph pools, by runner kind,
+    # for sizing. Scratch and eager warm calls allocate outside the pools,
+    # and graph executables, communicators and loaded modules outside the
+    # caching allocator, so the process's whole device footprint is
+    # reported alongside the allocator's reservation and the pools.
+    for device, pooled in sorted(storage.pool_bytes().items(), key=str):
+        logger.info(
+            "device storage on %s: %.2f GiB held by this process at "
+            "startup, %.2f GiB of it reserved by the caching allocator "
+            "and %.2f GiB of that in graph pools",
+            device,
+            process_device_bytes(device) / 2**30,
+            torch.cuda.memory_reserved(device) / 2**30,
+            pooled / 2**30,
+        )
+    totals: dict = {}
+    for (owner, device), used in storage.owner_bytes().items():
+        label = owner.name
+        totals[device, label] = totals.get((device, label), 0) + used
+    for (device, label), used in sorted(
+        totals.items(), key=lambda item: (str(item[0][0]), item[0][1])
+    ):
+        logger.info(
+            "graph storage on %s: %s holds %.2f GiB at startup",
+            device,
+            label,
+            used / 2**30,
+        )

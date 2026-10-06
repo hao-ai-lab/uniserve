@@ -15,8 +15,8 @@ impl PythonBackend {
         active: &[usize],
     ) -> PyResult<()> {
         let model = self.model_runner.bind(py);
-        let images = !model.getattr("image_builder")?.is_none();
-        let videos = !model.getattr("video_postprocessor")?.is_none();
+        let images = !{ model.borrow().image_builder.bind(py).clone() }.is_none();
+        let videos = !{ model.borrow().video_postprocessor.bind(py).clone() }.is_none();
         for &index in active {
             let scope = super::super::batch::BatchState::scope(batch.numerical.bind(py))?;
             with_context(scope.bind(py), || {

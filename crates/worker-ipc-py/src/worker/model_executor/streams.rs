@@ -3,10 +3,12 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use super::ModelExecutor;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
+use std::sync::Arc;
 use uniserve_worker_ipc::CallKind;
 
 use super::modules::input_error;
@@ -60,7 +62,7 @@ impl Streams {
 
     pub(super) fn initialize(
         &self,
-        owner: &Bound<'_, PyAny>,
+        owner: &Bound<'_, ModelExecutor>,
         event_slots: Option<usize>,
     ) -> PyResult<()> {
         if self.lock().initialized {
@@ -68,7 +70,7 @@ impl Streams {
         }
 
         let py = owner.py();
-        let config = crate::worker::config::native(&owner.getattr("worker_config")?)?;
+        let config = Arc::clone(&owner.borrow().config);
         let device = py
             .import("uniserve.runtime.device")?
             .call_method1("canonical_device", (&config.device,))?;
@@ -130,7 +132,7 @@ impl Streams {
 
     pub(super) fn module<'py>(
         &self,
-        owner: &Bound<'py, PyAny>,
+        owner: &Bound<'py, ModelExecutor>,
         device: &Bound<'py, PyAny>,
         kinds: &HashSet<CallKind>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -153,10 +155,7 @@ impl Streams {
 
         let stream = match parents.as_slice() {
             [parent] => parent.bind(py).call_method0("fork")?,
-            [] if crate::worker::config::native(&owner.getattr("worker_config")?)?
-                .lanes
-                .is_empty() =>
-            {
+            [] if Arc::clone(&owner.borrow().config).lanes.is_empty() => {
                 external(device, self.event_slots)?
             }
             [] => {
@@ -337,10 +336,10 @@ fn external<'py>(device: &Bound<'py, PyAny>, event_slots: usize) -> PyResult<Bou
 
 /// Other CUDA devices that can allocate in this executor's graphs.
 pub(super) fn capture_devices<'py>(
-    owner: &Bound<'py, PyAny>,
+    owner: &Bound<'py, ModelExecutor>,
     current: &Bound<'py, PyAny>,
 ) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let config = crate::worker::config::native(&owner.getattr("worker_config")?)?;
+    let config = Arc::clone(&owner.borrow().config);
     let canonical = owner
         .py()
         .import("uniserve.runtime.device")?

@@ -14,7 +14,7 @@ use crate::worker::request::{KVConditioning, Request, resolve_prefix};
 
 impl PythonBackend {
     fn image_builder<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let builder = self.model_runner.bind(py).getattr("image_builder")?;
+        let builder = { self.model_runner.borrow(py).image_builder.bind(py).clone() };
         if builder.is_none() {
             return Err(invalid(
                 py,
@@ -410,8 +410,14 @@ impl PythonBackend {
         options.set_item(
             "device",
             self.model_runner
-                .bind(py)
-                .call_method1("call_devices", (batch.call(py, index)?,))?
+                .borrow(py)
+                .call_devices(
+                    py,
+                    &*batch
+                        .call(py, index)?
+                        .extract::<PyRef<crate::calls::Call>>()?,
+                )?
+                .into_bound(py)
                 .get_item(1)?,
         )?;
         let rows = py
@@ -446,8 +452,14 @@ impl PythonBackend {
             let latent = self.latent_values(py, batch, index)?;
             let runner = self
                 .model_runner
-                .bind(py)
-                .call_method1("diffusion_entry", (batch.call(py, index)?,))?;
+                .borrow(py)
+                .diffusion_entry(
+                    py,
+                    &*batch
+                        .call(py, index)?
+                        .extract::<PyRef<crate::calls::Call>>()?,
+                )?
+                .into_bound(py);
             runner.call_method1(
                 "integrate",
                 (
@@ -554,7 +566,7 @@ impl KVConditioning {
                 std::collections::hash_map::Entry::Occupied(prefix) => prefix.into_mut(),
                 std::collections::hash_map::Entry::Vacant(prefix) => prefix.insert(resolve_prefix(
                     py,
-                    &model.getattr("flow_prompt")?,
+                    &{ model.borrow().flow_prompt.bind(py).clone() },
                     &source,
                     image.image_prompts.first().map_or("", String::as_str),
                     &image.negative_prompt,

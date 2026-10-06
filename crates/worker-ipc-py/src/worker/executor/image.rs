@@ -23,7 +23,7 @@ impl PythonBackend {
             return Ok(());
         }
         let model = self.model_runner.bind(py);
-        let processor = model.call_method0("image_processor")?;
+        let processor = model.borrow().image_processor(py)?.into_bound(py);
         let prepare = py
             .import("uniserve_worker.model_executor.image_inputs")?
             .getattr("prepare_host_image")?;
@@ -39,7 +39,11 @@ impl PythonBackend {
                 return Err(invalid(py, "request admission declares no input images"));
             }
             let call = batch.call(py, index)?;
-            let device = model.call_method1("call_devices", (&call,))?.get_item(1)?;
+            let device = model
+                .borrow()
+                .call_devices(py, &*call.extract::<PyRef<crate::calls::Call>>()?)?
+                .into_bound(py)
+                .get_item(1)?;
             let task = self.host_tasks.get().reserve(py)?;
             batch
                 .inputs
@@ -86,7 +90,10 @@ impl PythonBackend {
         }
         let call = batch.call(py, index)?;
         let model = self.model_runner.bind(py);
-        let devices = model.call_method1("call_devices", (&call,))?;
+        let devices = model
+            .borrow()
+            .call_devices(py, &*call.extract::<PyRef<crate::calls::Call>>()?)?
+            .into_bound(py);
         let target = devices.get_item(1)?;
         let numerical = py.import("uniserve_worker.model_executor.image_inputs")?;
 
@@ -121,7 +128,7 @@ impl PythonBackend {
             .call_method(
                 "prepare_tensor_image",
                 (
-                    model.call_method0("image_processor")?,
+                    model.borrow().image_processor(py)?.into_bound(py),
                     call.getattr("kind")?,
                     &read.tensor,
                 ),
@@ -256,8 +263,9 @@ impl PythonBackend {
         let call = batch.call(py, index)?;
         let device = self
             .model_runner
-            .bind(py)
-            .call_method1("call_devices", (&call,))?
+            .borrow(py)
+            .call_devices(py, &*call.extract::<PyRef<crate::calls::Call>>()?)?
+            .into_bound(py)
             .get_item(0)?;
         let read = batch.numerical.borrow(py).consume_tensor(
             py,

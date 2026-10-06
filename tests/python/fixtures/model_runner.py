@@ -3,9 +3,7 @@
 
 def forward_batch(executor, rows, *, calls, cache, tables, states):
     """Run one prepared batch, including per-row attention causality."""
-    runner = executor.batch_runners.get(
-        calls[0].component, rows[0].forward_mode
-    )
+    runner = executor.get(calls[0].component, rows[0].forward_mode)
     if runner is None:
         raise ValueError("numerical fixture requires a bound runner")
 

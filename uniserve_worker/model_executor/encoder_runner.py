@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from uniserve.model import PatchEncoder
+from uniserve.model import PatchEncoder, TextSize
 from uniserve.nn.vae import PatchAutoencoder
 from uniserve.runtime.device import fill_cpu_ints
 from uniserve.runtime.resources import close_resources
@@ -14,6 +14,38 @@ from uniserve_worker.storage.host_buffers import HostBuffers
 from .cuda_graph import CUDAGraphRunner
 from .model_runner import ModelRunner
 from .output import ExecutionOutput
+
+
+def encoder_inputs(kind, values):
+    """Flatten text sequences and describe the numerical preparation size."""
+    if kind == "text":
+        values = tuple(value.reshape(-1) for value in values)
+        return values, TextSize(
+            sum(value.numel() for value in values), len(values)
+        )
+    return values, tuple(value.shape for value in values)
+
+
+def text_positions(encoder, tokens, device, image_grids, video_grids):
+    """Place the encoder's rotary coordinates beside its input tokens."""
+    return encoder.positions(
+        tokens, image_grids=image_grids, video_grids=video_grids
+    ).to(device, non_blocking=True)
+
+
+def conditioning_inputs(features, capacity):
+    """Pad text features and retain the valid length for attention masking."""
+    count = features.shape[0]
+    padded = features.new_zeros((capacity, *features.shape[1:]))
+    padded[:count].copy_(features)
+    lengths = torch.full((1,), count, dtype=torch.int32, device=features.device)
+    return padded, lengths
+
+
+def text_features(encoder, capacity, dtype, device):
+    """Construct startup features in the text encoder's output layout."""
+    layout = encoder.output_layout(capacity, dtype)["conditioning"]
+    return torch.zeros(layout.shape, dtype=layout.dtype, device=device)
 
 
 class EncoderRunner(ModelRunner):

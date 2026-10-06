@@ -23,6 +23,7 @@ import uniserve_worker.sampling.result as sampling_result
 import uniserve_worker.storage.block_tables as block_tables
 import uniserve_worker.storage.kv_cache as kv_cache
 from uniserve.distributed.mesh import Communicator
+from uniserve.model import VisionInput as ModelVisionInput
 from uniserve.model.logits import VocabShard
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.runtime.backends.attention import Backend
@@ -34,11 +35,13 @@ from uniserve.runtime.prefix_cache import Planes
 from uniserve.runtime.process_groups import ProcessGroups
 from uniserve.tensors import BufferConfig, OutputLayout
 from uniserve_worker.config.deployment import ComponentConfig, WorkerProcessArgs
-from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestResult
+from uniserve_worker.model_executor.canvas_runner import CanvasRunner
 from uniserve_worker.model_executor.component_binding import ComponentBinding
+from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
 from uniserve_worker.model_executor.input_batch import InputBatch, InputRow
 from uniserve_worker.model_executor.input_buffers import TokenBufferConfig
+from uniserve_worker.model_executor.model_runner import ModelRunner
 from uniserve_worker.profiling import WorkerProfiler
 from uniserve_worker.protocol.batch import (
     BatchCommand,
@@ -752,139 +755,150 @@ class Call:
     def buffer_inputs(self) -> tuple[TensorRef, ...]: ...
     def buffer_outputs(self) -> tuple[TensorRef, ...]: ...
 
-RunnerT = TypeVar("RunnerT")
+class ModelExecutor:
+    model: torch.nn.Module
+    worker_config: WorkerConfig
+    expert_group: Any
+    attention_ranks: int
+    attention: Backend
+    processor: ImageProcessor | None
+    flow_prompt: FlowPrompt | None
+    image_builder: Any
+    media_builder: Any
+    text: Any
+    video_decoder: Any
+    audio_decoder: Any
+    video_postprocessor: Any
+    outputs: Any
+    bindings: Mapping[str, ComponentBinding]
+    numerical: bool
+    state_buffers: dict[str, BufferConfig]
+    graph_storage: GraphStorage
+    flow_captures: tuple[Any, ...]
+    flow_cfg_branches: tuple[int, ...]
+    table_widths: tuple[int, ...]
+    decode_predicates: Any
+    kv_cache: KVCacheManager | None
+    expert_weights: WeightPrefetch | None
+    diffusion_bank: Mapping[str, torch.Tensor]
+    latent_pool: LatentPool | None
+    canvas_slots: CanvasSlots | None
+    noise_draws: HostLane | None
+    sealed: bool
 
-class ModelRunners(Generic[RunnerT]):
-    """Own prepared methods and route homogeneous numerical batches."""
-
-    def __init__(self, *, event_slots: int = 2) -> None: ...
-    def register(
+    def __init__(
         self,
-        name: str,
-        binding: Any,
-        call: Any,
-        kinds: Iterable[CallKind],
-        outputs: tuple[Any, ...],
+        model: torch.nn.Module,
+        worker_config: WorkerConfig,
         *,
-        encoder: str | None = None,
+        bindings=None,
+        entry_points=None,
+        attention=None,
+        image_processor=None,
+        flow_prompt=None,
+        max_inflight=1,
+        expert_group=None,
+        attention_ranks=0,
+    ): ...
+    def component(self, kind, *, capability_type=None): ...
+    def prepare_module(self, name, size, *, method=None, path=None): ...
+    def module_stream(self, name, *, method=None, path=None): ...
+    def diffusion_entry(self, call) -> DiffusionRunner: ...
+    def call_stream(self, call): ...
+    @property
+    def encoder_kinds(self): ...
+    def run_encoder(self, kind, *values, **options): ...
+    def encode_vision(self, inputs: ModelVisionInput) -> ExecutionOutput: ...
+    def encode_text(
+        self,
+        token_ids,
+        *,
+        visual: torch.Tensor | None = None,
+        image_grids: tuple[tuple[int, int, int], ...] = (),
+        video_grids: tuple[tuple[int, int, int], ...] = (),
+    ) -> ExecutionOutput: ...
+    def encode_conditioning(
+        self, features: torch.Tensor
+    ) -> ExecutionOutput: ...
+    def prepare_text_capacities(self) -> None: ...
+    def run_module(
+        self, name, *args, method=None, path=None, size=None, **kwargs
+    ): ...
+    @property
+    def denoises(self) -> bool: ...
+    def bind_diffusion_storage(
+        self, bank: Mapping[str, torch.Tensor], pool: LatentPool
     ) -> None: ...
-    def calls(self) -> tuple[tuple[str, Any, Any], ...]: ...
-    def component(
-        self, kind: CallKind, *, capability_type: type | None = None
-    ) -> Any: ...
-    def encoder(self, kind: str) -> tuple[str, Any]: ...
     @property
-    def encoder_kinds(self) -> frozenset[str]: ...
-    def call_stream(self, owner: ModelExecutor, call: Call) -> Any: ...
-    def prepare_module(
-        self,
-        owner: ModelExecutor,
-        name: str,
-        size: Any,
-        *,
-        method: str | None = None,
-        path: str | None = None,
-    ) -> RunnerT: ...
-    def module_stream(
-        self,
-        owner: ModelExecutor,
-        name: str,
-        *,
-        method: str | None = None,
-        path: str | None = None,
-    ) -> Any: ...
+    def canvas_runner(self) -> CanvasRunner | None: ...
+    def bind_canvas_slots(self, slots: CanvasSlots) -> None: ...
     @property
-    def prepared(self) -> tuple[RunnerT, ...]: ...
+    def diffusion(self) -> DiffusionRunner: ...
+    def prepare_layouts(self) -> tuple: ...
+    def diffusion_layout(self, layout): ...
+    def run_denoising(self, ladder, index, bank): ...
+    def output_layout(
+        self,
+        entry,
+        output_index,
+        media,
+        decode,
+        num_prompt_tokens,
+        conditions=None,
+    ): ...
     def configure_inputs(
         self,
-        owner: ModelExecutor,
         *,
-        input_config: Any,
-        kv_cache: Any,
-        latent_pool: Any,
-        decode_predicates: Any,
-        max_calls: int,
-        request_slots: int,
-        latent_capacity_units: int,
-        table_widths: tuple[int, ...],
-        max_inflight: int,
-    ) -> None: ...
+        input_config,
+        kv_cache,
+        latent_pool,
+        decode_predicates,
+        max_calls,
+        request_slots,
+        latent_capacity_units,
+        table_widths,
+        max_inflight,
+    ): ...
     @property
-    def buffered(self) -> tuple[RunnerT, ...]: ...
-    @property
-    def experts(self) -> Any: ...
-    @property
-    def sealed(self) -> bool: ...
-    @property
-    def has_diffusion(self) -> bool: ...
-    def diffusion(self, owner: Any) -> Any: ...
-    def prepare_layouts(self, owner: Any) -> tuple: ...
-    def diffusion_layout(self, owner: Any, layout: Any) -> DenoisingBuffers: ...
-    def run_denoising(
-        self, owner: Any, ladder: Any, index: int, bank: int
-    ) -> ExecutionOutput: ...
-    def prepare_denoising(self, owner: Any, storage: Any) -> None: ...
-    def configure_experts(self, owner: ModelExecutor) -> None: ...
+    def experts(self): ...
+    def configure_experts(self): ...
     def join_expert_step(self, *, leaving: bool = False) -> bool: ...
-    def prepare_batches(
-        self, owner: ModelExecutor, tokenizer: Any, latents: Any
-    ) -> None: ...
-    def seal(self, owner: ModelExecutor) -> None: ...
-    def all(self) -> tuple[RunnerT, ...]: ...
+    def call_devices(self, call): ...
+    def warmup(self, storage): ...
+    def capture(self, *, tokenizer, latents): ...
+    def complete_startup(self): ...
+    def synchronize(self): ...
+    def close_graphs(self): ...
+    def close(self, *, aborted: bool = False): ...
+    def prepare_text_tokens(self, tokens: tuple[int, ...]) -> torch.Tensor: ...
     def preparing_inputs(
-        self,
-        owner: ModelExecutor,
-        transfers: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+        self, transfers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
     ) -> AbstractContextManager[None]: ...
-    def synchronize(self, owner: ModelExecutor) -> None: ...
-    def close_graphs(self) -> None: ...
-    def close(self, owner: ModelExecutor, *, aborted: bool = False) -> None: ...
-    def get(self, component: str, kind: CallKind) -> RunnerT | None: ...
-    def first(self, kind: CallKind) -> RunnerT | None: ...
-    def clear(self) -> None: ...
-    def run_eager(
+    def image_processor(self) -> ImageProcessor: ...
+    def forward(
         self,
-        runner: RunnerT,
-        batch: InputBatch,
-        forward: Callable[[InputBatch], ExecutionOutput],
-    ) -> ExecutionOutput: ...
-    def capture(
-        self,
-        runner: RunnerT,
-        batch: InputBatch,
-        forward: Callable[[InputBatch], ExecutionOutput],
-    ) -> None: ...
-    def run_module(
-        self,
-        owner: ModelExecutor,
-        name: str,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
+        tasks: tuple[tuple[InputRow, Call], ...],
         *,
-        size: Any = None,
-        method: str | None = None,
-        path: str | None = None,
-    ) -> ExecutionOutput: ...
+        cache: KVCacheManager | None,
+        tables: BlockTables | None,
+        states: DecodeState | None,
+    ) -> Iterator[tuple[tuple[int, ...], ExecutionOutput | BaseException]]: ...
     def run_batch(
         self,
-        owner: ModelExecutor,
-        runner: RunnerT,
+        runner: ModelRunner,
         rows: tuple[InputRow, ...],
         *,
         calls: tuple[Call, ...],
-        cache: kv_cache.KVCacheManager | None,
-        tables: block_tables.BlockTables | None,
+        cache: KVCacheManager | None,
+        tables: BlockTables | None,
         states: DecodeState | None,
     ) -> ExecutionOutput: ...
-    def forward(
-        self,
-        owner: ModelExecutor,
-        tasks: tuple[tuple[InputRow, Call], ...],
-        *,
-        cache: kv_cache.KVCacheManager | None,
-        tables: block_tables.BlockTables | None,
-        states: DecodeState | None,
-    ) -> Iterator[tuple[tuple[int, ...], ExecutionOutput | BaseException]]: ...
+    def calls(self) -> tuple[Any, ...]: ...
+    def get(self, component: str, kind: CallKind) -> Any: ...
+    def run_eager(
+        self, runner: Any, batch: Any, forward: Any
+    ) -> ExecutionOutput: ...
+    def prepare_denoising(self, storage: Any) -> None: ...
 
 class DescriptorGrants:
     """Own local allocation grants and their native socket service."""
@@ -945,7 +959,7 @@ __all__ = [
     "LatentPool",
     "LatentUpdate",
     "Microbatches",
-    "ModelRunners",
+    "ModelExecutor",
     "OutputBuffer",
     "OutputPool",
     "PendingOutput",

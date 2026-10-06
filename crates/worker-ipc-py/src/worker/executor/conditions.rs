@@ -113,8 +113,7 @@ impl PythonBackend {
                                 "condition encoding exceeds the admitted units",
                             ));
                         }
-                        let run = model
-                            .getattr("bindings")?
+                        let run = { model.borrow().bindings.bind(py).clone() }
                             .get_item(&call.component)?
                             .call_method1("media_units", (decode.cursor, decode.max_units))?;
                         if !run.is_truthy()? {

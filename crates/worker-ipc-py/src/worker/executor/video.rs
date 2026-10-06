@@ -10,9 +10,9 @@ use uniserve_worker_ipc::{CallKind, MediaCall};
 use super::{BatchState, PythonBackend};
 use crate::worker::error::invalid;
 use crate::worker::execution::Execution;
-use crate::worker::host::{HostLane, HostTask};
+use crate::worker::host::HostTask;
+use crate::worker::model_executor::ModelExecutor;
 use crate::worker::model_results::ExecutionOutput;
-use crate::worker::model_runners::ModelRunners;
 use crate::worker::request::Request;
 
 impl PythonBackend {
@@ -41,7 +41,7 @@ impl PythonBackend {
         denoising: bool,
     ) -> PyResult<Py<PyAny>> {
         let model = self.model_runner.bind(py);
-        if denoising && !model.getattr("denoises")?.is_truthy()? {
+        if denoising && !model.borrow().denoises(py) {
             return Err(PyRuntimeError::new_err(
                 "rank does not own denoising execution",
             ));
@@ -60,12 +60,9 @@ impl PythonBackend {
         }
 
         let buffers = if denoising {
-            model
-                .getattr("media_builder")?
-                .call_method1("buffers", (size,))?
+            { model.borrow().media_builder.bind(py).clone() }.call_method1("buffers", (size,))?
         } else {
-            model
-                .getattr("video_postprocessor")?
+            { model.borrow().video_postprocessor.bind(py).clone() }
                 .call_method1("state_buffers", (video_config(py, size)?,))?
         };
         let slot = request.borrow(py).request.slot();
@@ -92,8 +89,15 @@ impl PythonBackend {
         request: &Py<Request>,
     ) -> PyResult<()> {
         let model = self.model_runner.bind(py);
-        let lane = model.getattr("noise_draws")?;
-        if lane.is_none() || !model.getattr("state_buffers")?.is_truthy()? {
+        let Some(lane) = model
+            .borrow()
+            .noise_draws
+            .as_ref()
+            .map(|lane| lane.clone_ref(py))
+        else {
+            return Ok(());
+        };
+        if !{ model.borrow().state_buffers.bind(py).clone() }.is_truthy()? {
             return Ok(());
         }
         let state = self.video_state(py, request)?;
@@ -110,11 +114,10 @@ impl PythonBackend {
         let options = PyDict::new(py);
         options.set_item("seed", seed)?;
         let args = PyTuple::new(py, [size, views.bind(py).clone()])?;
-        let function = model
-            .getattr("media_builder")?
+        let function = { model.borrow().media_builder.bind(py).clone() }
             .getattr("prepare_request")?
             .unbind();
-        let task = lane.cast::<HostLane>()?.borrow().reserve(py)?;
+        let task = lane.get().reserve(py)?;
         if let Err(error) = HostTask::submit(task.bind(py), function, &args, Some(&options)) {
             task.borrow(py).abandon(py)?;
             return Err(error);
@@ -148,9 +151,9 @@ impl PythonBackend {
             CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising) => {
                 let params = batch.latent_params(py, index)?;
                 let views = self.video_views(py, &request, &size, true)?;
-                let builder = model.getattr("media_builder")?;
+                let builder = { model.borrow().media_builder.bind(py).clone() };
                 let layout = builder.call_method1("layout", (&size,))?;
-                let context = model.call_method1("diffusion_layout", (&layout,))?;
+                let context = ModelExecutor::diffusion_layout(model, &layout)?.into_bound(py);
                 let pool = self
                     .latents
                     .as_ref()
@@ -236,10 +239,7 @@ impl PythonBackend {
                         .ladder
                         .as_ref()
                         .map(|value| value.clone_ref(py));
-                    let runners = model
-                        .getattr("batch_runners")?
-                        .cast_into::<ModelRunners>()?;
-                    let diffusion = ModelRunners::diffusion(&runners, model)?;
+                    let diffusion = ModelExecutor::diffusion(model)?;
                     let reusable = match &ladder {
                         Some(ladder) => Execution::binds_denoising(
                             &diffusion.getattr("execution")?.cast_into::<Execution>()?,
@@ -261,8 +261,7 @@ impl PythonBackend {
                             bound
                         }
                     };
-                    let result = ModelRunners::run_denoising(
-                        &runners,
+                    let result = ModelExecutor::run_denoising(
                         model,
                         ladder.bind(py),
                         params.start_step as usize,
@@ -302,8 +301,7 @@ impl PythonBackend {
                 }
                 let inputs = self.media_inputs(py, batch, index, 0..call.inputs.len())?;
                 let result = if call.code == CallKind::Media(MediaCall::VideoDecoding) {
-                    let windows = model
-                        .getattr("video_decoder")?
+                    let windows = { model.borrow().video_decoder.bind(py).clone() }
                         .call_method1("frame_slices", (media.num_frames,))?;
                     let units = numerical.call_method1(
                         "assigned_units",

@@ -55,10 +55,10 @@ impl Warmup {
     }
 
     pub(super) fn canvas(&mut self, py: Python<'_>) -> PyResult<()> {
-        let runner = self.runner.bind(py).getattr("canvas_runner")?;
-        if runner.is_none() {
+        let Some(runner) = self.runner.borrow(py).canvas_runner(py) else {
             return Ok(());
-        }
+        };
+        let runner = runner.bind(py);
 
         let slots = runner.getattr("canvas_slots")?;
         if slots.is_none() {

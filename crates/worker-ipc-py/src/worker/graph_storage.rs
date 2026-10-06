@@ -110,7 +110,7 @@ impl GraphStorage {
     }
 
     /// Raise CUDAGraphError if any preparation or capture exceeds its budget.
-    fn check(&self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn check(&self, py: Python<'_>) -> PyResult<()> {
         if let Err(error) = self.inner.check(&self.residency(py)?) {
             let exception = py
                 .import("uniserve.runtime.cuda_graph")?
@@ -145,7 +145,7 @@ impl GraphStorage {
     }
 
     /// After startup, charge only pools; serving growth uses the worker grant.
-    fn seal(&mut self) {
+    pub(super) fn seal(&mut self) {
         self.inner.seal();
     }
 
@@ -185,7 +185,7 @@ impl GraphStorage {
         drop(retired);
     }
 
-    fn close(mut slf: PyRefMut<'_, Self>) {
+    pub(super) fn close(mut slf: PyRefMut<'_, Self>) {
         let retired = slf.inner.close();
         // Finalizers may inspect storage or release another resource. They
         // run after native state is updated and its exclusive borrow ends.
