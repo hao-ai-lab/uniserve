@@ -1,6 +1,7 @@
 """Batch submission preserves parameters and rejects unsafe KV assignments."""
 
 import pickle
+from types import MappingProxyType
 
 import pytest
 
@@ -98,3 +99,9 @@ def test_batch_rejects_canvas_without_denoising_steps():
 
     with pytest.raises(WorkerError, match="canvas sampling max_steps"):
         Batch.from_mapping(data)
+
+
+@pytest.mark.parametrize("mapping", (dict, MappingProxyType))
+def test_sampling_mapping_rejects_boolean_token_limits(mapping):
+    with pytest.raises(WorkerError):
+        GenerationParams.from_mapping({"sampling": mapping({"top_k": True})})

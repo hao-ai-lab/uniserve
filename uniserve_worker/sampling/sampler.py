@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from typing import cast
 
 import torch
@@ -30,6 +31,7 @@ from uniserve.sampling import (
 )
 from uniserve.sampling.top_k import top_k_candidates
 from uniserve.tensors import adjacent_view
+from uniserve_worker._uniserve_ipc import sample as sample
 from uniserve_worker.errors import (
     invalid_descriptor,
     unsupported_setup,
@@ -38,179 +40,10 @@ from uniserve_worker.sampling.metadata import SamplingMetadata
 from uniserve_worker.sampling.result import (
     SAMPLING_COMPLETION_FIELDS,
     TOKEN_CONTINUATION_BIT,
-    TOKEN_VALUE_MASK,
     LogprobValues,
     SamplerOutput,
     SamplerRow,
 )
-
-
-def device_greedy_parameters(parameters: SamplingParams) -> bool:
-    """Return whether parameters reduce exactly to unpenalized greedy selection.
-
-    Any logprob request also disqualifies, because the device greedy path
-    produces no logprobs. Callers additionally require no allowed-token
-    restriction and no drafts before taking that path.
-    """
-    return (
-        float(parameters.temperature) <= 0.0
-        and parameters.top_k == 0
-        and parameters.top_p == 1.0
-        and parameters.typical_p == 1.0
-        and not parameters.return_logprobs
-        and int(parameters.n_logprobs) == 0
-        and not parameters.logprob_token_ids
-        and not parameters.logit_bias
-        and parameters.repetition_penalty == 1.0
-        and parameters.frequency_penalty == 0.0
-        and parameters.presence_penalty == 0.0
-    )
-
-
-@torch.inference_mode()
-def sample(
-    tasks: Sequence[SamplingMetadata],
-    *,
-    selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None = None,
-) -> tuple[SamplerRow, ...]:
-    """Shape and draw every compatible sampling row in each device batch.
-
-    Args:
-        tasks: One ``SamplingMetadata`` per sampled call.
-        selection_broadcast: Publishes the source rank's selection tensor to
-            every tensor-parallel rank. It must overwrite the tensor it is
-            given in place: the greedy and fused paths ignore its return
-            value, and the general path reads the broadcast tensor back.
-
-    Returns:
-        One ``SamplerRow`` per task, in ``tasks`` order. Rows of one group
-        share a ``SamplerOutput`` batch.
-
-    Raises:
-        WorkerError: ``INVALID_DESCRIPTOR`` when a task's logits, rows, draws,
-            parameter values, or draft tokens are malformed;
-            ``UNSUPPORTED_SETUP`` when its vocabulary exceeds the tagged-token
-            range or fused top-k sampling cannot launch on its device.
-    """
-    # Validate each task and assign it to a (device, vocab, path) group.
-    grouped: dict[
-        tuple[torch.device, int, int], list[tuple[int, SamplingMetadata]]
-    ] = defaultdict(list)
-    for index, task in enumerate(tasks):
-        if (
-            task.logits.ndim != 2
-            or not task.logits.is_floating_point()
-            or int(task.logits.shape[0]) < 1
-            or int(task.logits.shape[1]) < 1
-            or int(task.logits.shape[0]) != len(task.allowed)
-            or len(task.penalty_counts) != len(task.allowed)
-        ):
-            raise invalid_descriptor(
-                "sampling task logits must be shaped [rows, vocab]"
-            )
-
-        device_greedy = (
-            not task.draft_token_ids
-            and device_greedy_parameters(task.parameters)
-            and all(value is None for value in task.allowed)
-        )
-        if device_greedy:
-            if (
-                any(
-                    value is not None
-                    for value in (
-                        task.draws,
-                        task.parameter_values,
-                    )
-                )
-                or task.draft_token_ids
-                or len(task.allowed) != 1
-            ):
-                raise invalid_descriptor(
-                    "greedy sampling task has shaped metadata"
-                )
-        else:
-            draws = cast(torch.Tensor, task.draws)
-            parameter_values = cast(torch.Tensor, task.parameter_values)
-            if (
-                draws.device != task.logits.device
-                or tuple(draws.shape) != (len(task.allowed),)
-                or not draws.is_floating_point()
-            ):
-                raise invalid_descriptor(
-                    "sampling task draws must align with its rows"
-                )
-
-            if (
-                parameter_values.device != task.logits.device
-                or parameter_values.shape
-                != (
-                    len(task.allowed),
-                    3,
-                )
-            ):
-                raise invalid_descriptor(
-                    "sampling task parameter vectors do not align"
-                )
-
-        if task.draft_token_ids:
-            if len(task.allowed) != len(task.draft_token_ids) + 1:
-                raise invalid_descriptor(
-                    "speculative sampling rows do not cover the draft chain"
-                )
-        elif len(task.allowed) != 1:
-            raise invalid_descriptor(
-                "ordinary sampling tasks must contain exactly one row"
-            )
-
-        vocab = int(task.logits.shape[1])
-        if vocab > TOKEN_VALUE_MASK:
-            raise unsupported_setup(
-                "vocabulary exceeds the device token decision range"
-            )
-        if any(value < 0 or value >= vocab for value in task.draft_token_ids):
-            raise invalid_descriptor(
-                "speculative draft token is outside the model vocabulary"
-            )
-
-        # Path key: -2 suppressed greedy, -1 plain greedy, 0 generic row-wise
-        # sampling, or a positive fused top-k width for the compiled kernel.
-        sampling_path = (
-            (-2 if task.suppress else -1)
-            if device_greedy
-            else _fused_top_k(task, vocab)
-        )
-        grouped[(task.logits.device, vocab, sampling_path)].append(
-            (index, task)
-        )
-
-    # Sample each group with one batched selection and scatter its rows back
-    # to their task positions.
-    result: list[SamplerRow | None] = [None] * len(tasks)
-    for (_device, _vocab, sampling_path), compatible in grouped.items():
-        indexes, group = zip(*compatible, strict=True)
-
-        if sampling_path < 0:
-            sampled_group = sample_device_greedy_group(
-                tuple(group),
-                apply_suppression=sampling_path == -2,
-                selection_broadcast=selection_broadcast,
-            )
-        elif sampling_path > 0:
-            sampled_group = _sample_fused_top_k_group(
-                tuple(group),
-                sampling_path,
-                selection_broadcast=selection_broadcast,
-            )
-        else:
-            sampled_group = _sample_task_group(
-                tuple(group),
-                selection_broadcast=selection_broadcast,
-            )
-
-        for index, sampled in zip(indexes, sampled_group, strict=True):
-            result[index] = sampled
-    return tuple(cast(SamplerRow, value) for value in result)
 
 
 def sample_device_greedy_group(
@@ -289,40 +122,6 @@ def sample_device_greedy_group(
         )
         for index, task in enumerate(tasks)
     )
-
-
-def _fused_top_k(task: SamplingMetadata, vocab: int) -> int:
-    """Return the task's fused top-k width, or 0 when the kernel cannot run it.
-
-    The compiled sampler applies temperature, top-p, and min-p within an
-    exact top-k candidate set. It supports no penalties, allowed-token
-    restriction, suppression, logit bias, typical-p, or drafts, and this
-    path is taken only for CUDA logits. The ``top_k <= 128`` and
-    ``top_k < vocab`` bounds match the ones ``sample_top_k`` itself enforces.
-    """
-    if task.logits.device.type != "cuda":
-        return 0
-    if task.draft_token_ids:
-        return 0
-    parameters = task.parameters
-    top_k = int(parameters.top_k)
-    uses_penalties = (
-        parameters.repetition_penalty != 1.0
-        or parameters.frequency_penalty != 0.0
-        or parameters.presence_penalty != 0.0
-    )
-    if (
-        uses_penalties
-        or task.allowed[0] is not None
-        or task.suppress
-        or parameters.logit_bias
-        or float(parameters.typical_p) < 1.0
-        or top_k <= 0
-        or top_k > 128
-        or top_k >= vocab
-    ):
-        return 0
-    return top_k
 
 
 def _sample_fused_top_k_group(
@@ -1369,3 +1168,32 @@ def broadcast_selection(
     With no communicator the value is returned unchanged.
     """
     return value if group is None else group.broadcast(value, src=0)
+
+
+def finish_graph(
+    output: SamplerOutput,
+    finish_sets: tuple[tuple[int, ...], ...],
+    forced: tuple[bool, ...],
+    sampling_group: Communicator | None,
+    request_pool_indices: torch.Tensor,
+) -> tuple[SamplerRow, ...]:
+    """Apply terminal policy to a captured selection."""
+    broadcast_selection(sampling_group, output.tokens)
+    if any(finish_sets):
+        # New continuation columns preserve the graph's reusable output views.
+        finish = sampled_finish_values(
+            finish_sets, forced, output.tokens, output.valid & output.active
+        )
+        continuation = output.valid & output.active & ~finish
+        output = replace(
+            output,
+            finish=finish,
+            continuation=continuation,
+            tagged_tokens=tagged_token_values(output.tokens, continuation),
+        )
+    return tuple(
+        output.row(
+            index, request_pool_index=request_pool_indices[index : index + 1]
+        )
+        for index in range(len(finish_sets))
+    )

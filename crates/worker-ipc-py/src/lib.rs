@@ -16,6 +16,7 @@ mod calls;
 mod client;
 mod convert;
 mod ids;
+mod sampling;
 mod stats;
 mod worker;
 
@@ -397,6 +398,7 @@ fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<calls::Call>()?;
     m.add_class::<batches::Batch>()?;
     m.add_class::<batches::CanvasSampling>()?;
+    m.add_class::<sampling::SamplingParams>()?;
     worker::register(m)?;
     m.add_class::<PyServer>()?;
     m.add_class::<client::PyClient>()?;

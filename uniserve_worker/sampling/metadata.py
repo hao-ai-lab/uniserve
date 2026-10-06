@@ -1,19 +1,26 @@
 """Numerical inputs of worker token sampling.
 
 ``SamplingMetadata`` carries one sampled call's candidate logits and controls;
-``uniserve_worker.execution.token`` builds it and
-``uniserve_worker.sampling.sampler.sample`` consumes it. ``TokenSelection``
-names the output a token input row requests from the forward.
+Rust resolves its host controls and this module prepares their tensor inputs.
+The native sampler dispatches numerical selectors in ``sampling.sampler``.
+``TokenSelection`` names the output a token input row requests from the forward.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import torch
 
 from uniserve.sampling import SamplingParams
+from uniserve_worker._uniserve_ipc import SamplingMetadata as SamplingMetadata
+from uniserve_worker.errors import unsupported_setup
+from uniserve_worker.sampling.result import TOKEN_VALUE_MASK
+
+if TYPE_CHECKING:
+    from uniserve_worker.sampling.result import SamplerRow
+    from uniserve_worker.storage.decode_state import DecodeState
 
 
 class TokenSelection(StrEnum):
@@ -30,59 +37,72 @@ class TokenSelection(StrEnum):
     CACHE = "cache"
 
 
-@dataclass(frozen=True, slots=True)
-class SamplingMetadata:
-    """Numerical sampling controls for a call's candidate logits.
+def prepare_inputs(
+    logits: torch.Tensor,
+    parameters: SamplingParams,
+    slot: int,
+    decode_state: DecodeState | None,
+    sampled: SamplerRow | None,
+    draft_token_ids: list[int],
+    uniforms: list[float] | None,
+) -> tuple[
+    torch.Tensor,
+    tuple[torch.Tensor | None, ...],
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Materialize numerical columns for native sampling controls.
 
-    Parameters and terminal policy apply to the complete call. Only allowed
-    tokens, penalty histories, and RNG draws vary along a speculative chain;
-    those columns align with the first dimension of logits. The dataclass
-    itself validates nothing; ``sample`` checks the logits and row shapes,
-    rejects draws or parameter values on device-greedy calls, and checks
-    their alignment on the others.
+    Penalties borrow the committed slot row. Uncommitted selections and draft
+    prefixes accumulate into copies, leaving the committed counts unchanged.
+    Draws already use the request's semantic Philox coordinates.
     """
+    rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
+    penalty_base = None
+    if parameters.uses_penalties():
+        if decode_state is None:
+            raise RuntimeError(
+                "token sampling has no request runtime-state owner"
+            )
+        if (
+            decode_state.vocab_size != rows.shape[1]
+            or decode_state.device != rows.device
+        ):
+            raise unsupported_setup(
+                "sampling vocabulary or device disagrees with "
+                "request runtime state"
+            )
+        penalty_base = decode_state.penalty_counts[slot]
 
-    # [rows, vocab] floating candidate logits. An ordinary call has one row;
-    # a speculative verification call has len(draft_token_ids) + 1 rows,
-    # where row i verifies draft i and the last row is the bonus position.
-    logits: torch.Tensor
-    parameters: SamplingParams
-    # Per row, a dense [vocab] generated-token count vector for repetition,
-    # frequency, and presence penalties, or None when the request uses no
-    # penalties. Verification rows also count the draft tokens that precede
-    # them.
-    penalty_counts: tuple[torch.Tensor | None, ...]
-    # Per row, the only selectable token ids, or None for no restriction. A
-    # forced-token point narrows its row to that single id.
-    allowed: tuple[tuple[int, ...] | None, ...]
-    # Call-wide token ids masked to -inf on every row.
-    suppress: tuple[int, ...]
-    finish_token_ids: tuple[int, ...]
-    transition_token_ids: tuple[int, ...]
-    # Finish on any valid, active selection regardless of its token.
-    force_finish: bool
-    # [rows] float32 uniform draws in [0, 1) on the logits device, and the
-    # [rows, 3] float32 (temperature, top_p, min_p) matrix. Both are None
-    # exactly for device-greedy calls: greedy parameters, no allowed-token
-    # restriction, and no drafts. The column order is shared with
-    # ``uniserve.sampling.sample_top_k``.
-    draws: torch.Tensor | None
-    parameter_values: torch.Tensor | None
-    draft_token_ids: tuple[int, ...] = ()
-    # 1-based length of the draft prefix ending at the first draft token that
-    # is a finish token; accepting that whole prefix finishes the call.
-    terminal_draft_prefix: int | None = None
-    # Whether the call publishes a device transition decision.
-    return_transition: bool = False
-    # Device tensor whose first element gates the call, or None for an
-    # always-active call. With ``tagged_predicate`` that element is an int64
-    # token relay whose ``TOKEN_CONTINUATION_BIT`` marks activity; otherwise
-    # it is a flag converted to bool.
-    predicate: torch.Tensor | None = None
-    tagged_predicate: bool = False
-    # Device request slot, passed through unchanged to ``SamplerRow``.
-    request_pool_index: torch.Tensor | None = None
-    # The request's committed row of ``DecodeState.penalty_counts``. The
-    # sampler does not read it; commit accumulates the accepted selection
-    # into it through ``DecodeState.apply_tokens``.
-    penalty_base: torch.Tensor | None = None
+    penalty_view = penalty_base
+    if penalty_base is not None and sampled is not None:
+        # A selection counts only when valid and predicate-active. Its tag is
+        # continuation state, not part of the vocabulary token.
+        penalty_view = penalty_base.clone()
+        token = sampled.tokens.reshape(-1)[:1].bitwise_and(TOKEN_VALUE_MASK)
+        weight = (
+            sampled.valid.reshape(-1)[:1] & sampled.active.reshape(-1)[:1]
+        ).to(dtype=penalty_view.dtype)
+        penalty_view.scatter_add_(0, token.to(dtype=torch.int64), weight)
+
+    counts: list[torch.Tensor | None] = []
+    for index in range(rows.shape[0]):
+        if penalty_view is None or index == 0 or not draft_token_ids:
+            counts.append(penalty_view)
+            continue
+        row = penalty_view.clone()
+        for token_id in draft_token_ids[:index]:
+            row[token_id] += 1
+        counts.append(row)
+
+    draws = parameter_values = None
+    if uniforms is not None:
+        draws = torch.tensor(uniforms, dtype=torch.float32, device=rows.device)
+        parameter_values = torch.tensor(
+            [(parameters.temperature, parameters.top_p, parameters.min_p)]
+            * len(uniforms),
+            dtype=torch.float32,
+            device=rows.device,
+        )
+    return rows, tuple(counts), draws, parameter_values, penalty_base

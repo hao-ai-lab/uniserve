@@ -265,8 +265,6 @@ impl RequestTypes {
         records.insert("Raster", class(&module, "Config")?);
         let module = py.import("uniserve_worker.protocol.call")?;
         records.insert("ImageParams", class(&module, "ImageParams")?);
-        let module = py.import("uniserve.sampling")?;
-        records.insert("SamplingParams", class(&module, "SamplingParams")?);
         let module = py.import("uniserve_worker.protocol.transfer")?;
         records.insert("WorkerEndpoint", class(&module, "WorkerEndpoint")?);
         records.insert("Locator", class(&module, "Locator")?);
@@ -1001,65 +999,13 @@ fn diffusion_params_to_py<'py>(
 
 /// Converts sampling controls into the worker's typed parameters.
 fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<Bound<'py, PyAny>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "temperature"), sampling.temperature)?;
-    dict.set_item(intern!(py, "top_k"), sampling.top_k)?;
-    dict.set_item(intern!(py, "top_p"), sampling.top_p)?;
-    dict.set_item(intern!(py, "ignore_eos"), sampling.ignore_eos)?;
-    dict.set_item(intern!(py, "seed"), sampling.seed)?;
-    dict.set_item(intern!(py, "min_p"), sampling.min_p)?;
-    dict.set_item(
-        intern!(py, "repetition_penalty"),
-        sampling.repetition_penalty,
-    )?;
-    dict.set_item(intern!(py, "frequency_penalty"), sampling.frequency_penalty)?;
-    dict.set_item(intern!(py, "presence_penalty"), sampling.presence_penalty)?;
-
-    // Python `SamplingParams.logit_bias` is a tuple of `(token_id, bias)`
-    // pairs rather than a mapping.
-    dict.set_item(
-        intern!(py, "logit_bias"),
-        PyTuple::new(
-            py,
-            sampling
-                .logit_bias
-                .iter()
-                .map(|(token, bias)| (*token, *bias)),
-        )?,
-    )?;
-    dict.set_item(intern!(py, "min_tokens"), sampling.min_tokens)?;
-    dict.set_item(intern!(py, "return_logprobs"), sampling.return_logprobs)?;
-    dict.set_item(intern!(py, "n_logprobs"), sampling.n_logprobs)?;
-    dict.set_item(
-        intern!(py, "return_prompt_logprobs"),
-        sampling.return_prompt_logprobs,
-    )?;
-    dict.set_item(intern!(py, "n_prompt_logprobs"), sampling.n_prompt_logprobs)?;
-    dict.set_item(
-        intern!(py, "logprob_token_ids"),
-        u32_tuple(py, &sampling.logprob_token_ids)?,
-    )?;
-
-    let bad_words = sampling
-        .bad_words_ids
-        .iter()
-        .map(|tokens| u32_tuple(py, tokens))
-        .collect::<PyResult<Vec<_>>>()?;
-    dict.set_item(intern!(py, "bad_words_ids"), PyTuple::new(py, bad_words)?)?;
-    dict.set_item(
-        intern!(py, "allowed_token_ids"),
-        sampling
-            .allowed_token_ids
-            .as_deref()
-            .map(|tokens| u32_tuple(py, tokens))
-            .transpose()?,
-    )?;
-    dict.set_item(intern!(py, "typical_p"), sampling.typical_p)?;
-    dict.set_item(
-        intern!(py, "forced_token_ids"),
-        u32_tuple(py, &sampling.forced_token_ids)?,
-    )?;
-    construct(py, "SamplingParams", &dict)
+    Bound::new(
+        py,
+        crate::sampling::SamplingParams {
+            inner: sampling.clone(),
+        },
+    )
+    .map(Bound::into_any)
 }
 
 /// Converts image-generation controls into the worker's typed parameters.

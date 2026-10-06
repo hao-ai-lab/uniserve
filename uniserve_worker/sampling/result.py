@@ -18,18 +18,17 @@ from typing import Literal, TypeAlias
 
 import torch
 
+# Token relays reserve bit 31 for continuation; Rust and kernels share the mask.
+from uniserve_worker._uniserve_ipc import (
+    TOKEN_CONTINUATION_BIT as TOKEN_CONTINUATION_BIT,
+)
+from uniserve_worker._uniserve_ipc import TOKEN_VALUE_MASK as TOKEN_VALUE_MASK
+
 # The completion column packs four field sections, each one row per call:
 # [valid | active | token | accepted] (``sampling_columns`` in
 # ``uniserve_worker.sampling.sampler``). The native PendingOutput decoder
 # uses the same field count.
 SAMPLING_COMPLETION_FIELDS = 4
-
-# Tagged token relays set bit 31 to flag continuation; the low 31 bits carry
-# the token id, which bounds the vocabulary usable by device-side decisions
-# (``sample`` rejects a larger vocabulary). Relay values are non-negative
-# int64, so ``value >= TOKEN_CONTINUATION_BIT`` tests the flag.
-TOKEN_CONTINUATION_BIT = 1 << 31
-TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 
 # Packed integer bit patterns and row dimensions are enough to decode logprobs.
 # The tensor stays on the producing device; the output owner performs any D2H

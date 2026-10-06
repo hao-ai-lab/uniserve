@@ -118,8 +118,8 @@ class GenerationParams:
         """
         data = _map(value, where)
         return cls(
-            sampling=call._sampling_params_from_mapping(
-                data.get("sampling", {}), f"{where}.sampling"
+            sampling=sampling.SamplingParams.from_mapping(
+                _map(data.get("sampling", {}), f"{where}.sampling")
             ),
             negative_token_ids=_uints(
                 data.get("negative_token_ids", ()),
@@ -139,7 +139,7 @@ class GenerationParams:
     def to_mapping(self) -> dict[str, object]:
         """Serialize autoregressive sampling and token controls."""
         return {
-            "sampling": call._sampling_params_to_mapping(self.sampling),
+            "sampling": self.sampling.to_mapping(),
             "negative_token_ids": list(self.negative_token_ids),
             "finish_token_ids": list(self.finish_token_ids),
             "initial_position": self.initial_position,

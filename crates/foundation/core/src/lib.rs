@@ -329,8 +329,8 @@ pub struct KvCacheDtypeParseError(String);
 ///
 /// The worker receives these fields through the worker IPC codec's flatbuffer
 /// `SamplingParams` table, the PyO3 `_uniserve_ipc` extension's conversion,
-/// and the Python `uniserve.sampling.SamplingParams`; a new field needs all
-/// of them, plus the worker's mapping codec in `uniserve_worker.protocol.call`.
+/// and the public Python `uniserve.sampling.SamplingParams` binding. All
+/// consumers share this FP32 representation and its numerical validation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
     /// Softmax temperature; zero selects greedy decoding.
@@ -457,6 +457,25 @@ pub enum SamplingParamsError {
 }
 
 impl SamplingParams {
+    /// Whether token-count penalties affect selection.
+    pub fn uses_penalties(&self) -> bool {
+        self.repetition_penalty != 1.0
+            || self.frequency_penalty != 0.0
+            || self.presence_penalty != 0.0
+    }
+
+    /// Parameters that permit unpenalized device argmax without score readout.
+    /// Per-call token masks and draft chains are checked by the sampler.
+    pub fn device_greedy(&self) -> bool {
+        self.temperature <= 0.0
+            && self.top_k == 0
+            && self.top_p == 1.0
+            && self.typical_p == 1.0
+            && !self.generated_logprobs_requested()
+            && self.logit_bias.is_empty()
+            && !self.uses_penalties()
+    }
+
     /// Returns whether generated-token logprobs are enabled.
     pub fn generated_logprobs_requested(&self) -> bool {
         self.return_logprobs || self.n_logprobs > 0 || !self.logprob_token_ids.is_empty()
