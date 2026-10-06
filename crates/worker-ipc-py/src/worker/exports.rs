@@ -9,6 +9,7 @@ use uniserve_worker_ipc::{BufferId, RequestKey};
 
 use super::completion::Completion;
 use super::error::{resource, unsupported};
+use super::locator::Locator;
 use super::protocol::buffer_id;
 use super::transport::Transport;
 use super::vmm_pool::PoolExhaustedError;
@@ -126,9 +127,9 @@ pub(super) fn export<'py>(
 
 fn retain_location<'py>(
     transport: &Bound<'py, Transport>,
-    location: Bound<'py, PyAny>,
+    location: Bound<'py, Locator>,
     retain: &mut impl FnMut(Py<Completion>) -> PyResult<()>,
-    locations: &mut Vec<(Bound<'py, Transport>, Bound<'py, PyAny>)>,
+    locations: &mut Vec<(Bound<'py, Transport>, Bound<'py, Locator>)>,
 ) -> PyResult<()> {
     // Include this location in failure cleanup even when its retirement
     // lookup or the storage owner's retention callback raises an error.
@@ -180,12 +181,9 @@ pub(super) fn release(exports: &Bound<'_, PyDict>, buffers: &[Py<PyAny>]) -> PyR
     for buffer in buffers {
         if let Some(locations) = exports.get_item(buffer)? {
             for location in locations.try_iter()? {
-                let (transport, locator): (Bound<'_, PyAny>, Bound<'_, PyAny>) =
+                let (transport, locator): (Bound<'_, Transport>, Bound<'_, Locator>) =
                     location?.extract()?;
-                transport
-                    .cast::<Transport>()?
-                    .get()
-                    .release(exports.py(), &locator)?;
+                transport.get().release(exports.py(), &locator)?;
             }
         }
     }

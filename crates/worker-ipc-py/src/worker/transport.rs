@@ -6,9 +6,13 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use pyo3::buffer::PyBuffer;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::PyTuple;
+use uniserve_worker_ipc::{Locator as NativeLocator, TransferTransport, WorkerEndpoint};
+
+use super::locator::{Locator, endpoint_from_py, endpoint_to_py};
 
 use super::completion::Completion;
 use super::error::{invalid, native_error};
@@ -38,8 +42,7 @@ enum Backend {
 /// Python supplies borrowed tensor views and numerical copies.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct Transport {
-    #[pyo3(get)]
-    source: Py<PyAny>,
+    source: WorkerEndpoint,
     #[pyo3(get)]
     pub(super) capacity: Py<TransferCapacity>,
     events: Py<EventPool>,
@@ -62,6 +65,7 @@ impl Transport {
         host_slots: Vec<usize>,
         cross_host_consumers: bool,
     ) -> PyResult<Self> {
+        let source = endpoint_from_py(source.bind(py))?;
         let registry = |limit| Py::new(py, BufferRegistry::new(limit, event_pool.clone_ref(py))?);
         let backend = match name {
             "local" => Backend::Local {
@@ -111,6 +115,11 @@ impl Transport {
     }
 
     #[getter]
+    fn source<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        endpoint_to_py(py, &self.source)
+    }
+
+    #[getter]
     pub(super) fn name(&self) -> &'static str {
         match self.backend {
             Backend::Local { .. } => "local",
@@ -139,7 +148,7 @@ impl Transport {
         tensor: &Bound<'py, PyAny>,
         offset: Option<&Bound<'py, PyAny>>,
         consumers: Vec<usize>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Bound<'py, Locator>> {
         let view = ExportView::new(tensor, offset)?;
         match &self.backend {
             Backend::Cuda(cuda) => {
@@ -165,9 +174,10 @@ impl Transport {
                 let result = (|| {
                     let payload = numerical(py, "channel")?
                         .call_method1("_export_payload", (&view.tensor, &view.shape))?;
-                    let handle = transfer_types(py)?
-                        .getattr("ChannelTransfer")?
-                        .call1((endpoint, payload))?;
+                    let handle = TransferTransport::Channel {
+                        endpoint: endpoint.clone(),
+                        payload: PyBuffer::<u8>::get(&payload)?.to_vec(py)?,
+                    };
                     view.locator(self, handle)
                 })();
                 self.return_bytes(py, view.nbytes)?;
@@ -180,7 +190,7 @@ impl Transport {
     pub(super) fn fetch(
         &self,
         py: Python<'_>,
-        locator: Bound<'_, PyAny>,
+        locator: Bound<'_, Locator>,
         device: Py<PyAny>,
         destination: Option<Bound<'_, PyAny>>,
         region: Option<Py<PyAny>>,
@@ -199,7 +209,7 @@ impl Transport {
             Backend::Shared { slot, .. } => TransferPool::fetch_shared(
                 pool,
                 locator,
-                &self.source.bind(py).getattr("node")?.extract::<String>()?,
+                &self.source.node,
                 *slot,
                 device,
                 destination,
@@ -209,7 +219,7 @@ impl Transport {
             Backend::Cuda(cuda) => TransferPool::fetch_cuda(
                 pool,
                 locator,
-                self.source.bind(py).clone(),
+                &self.source,
                 cuda.slot,
                 device,
                 destination,
@@ -227,23 +237,13 @@ impl Transport {
     fn borrow(
         &self,
         py: Python<'_>,
-        locator: &Bound<'_, PyAny>,
+        locator: &Bound<'_, Locator>,
         region: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<SharedRead> {
         let Backend::Shared { slot, .. } = &self.backend else {
             return Err(invalid(py, "only shared storage supports host borrowing"));
         };
-        if locator.getattr("backend")?.extract::<String>()? != "shm" {
-            return Err(invalid(
-                py,
-                "shared storage borrow requires a shared storage locator",
-            ));
-        }
-        if !locator
-            .getattr("source")?
-            .getattr("node")?
-            .eq(self.source.bind(py).getattr("node")?)?
-        {
+        if locator.get().inner.source.node != self.source.node {
             return Err(invalid(
                 py,
                 "shared storage transport requires the source node",
@@ -253,10 +253,15 @@ impl Transport {
             .import("uniserve_worker.transport.layout")?
             .call_method1("row_span", (locator, region))?
             .extract()?;
-        let name: String = locator.getattr("transport")?.getattr("name")?.extract()?;
+        let TransferTransport::PosixShm { name, .. } = &locator.get().inner.transport else {
+            return Err(invalid(
+                py,
+                "shared storage borrow requires a shared storage locator",
+            ));
+        };
         SharedRead::open(
             py,
-            &name,
+            name,
             nbytes,
             *slot,
             offset,
@@ -268,7 +273,7 @@ impl Transport {
     pub(super) fn release(
         &self,
         py: Python<'_>,
-        locator: &Bound<'_, PyAny>,
+        locator: &Bound<'_, Locator>,
     ) -> PyResult<Option<Py<Completion>>> {
         if let Some(buffers) = self.buffers() {
             buffers.get().release(py, locator)
@@ -281,7 +286,7 @@ impl Transport {
     pub(super) fn retirement(
         &self,
         py: Python<'_>,
-        locator: &Bound<'_, PyAny>,
+        locator: &Bound<'_, Locator>,
     ) -> PyResult<Py<Completion>> {
         if let Some(buffers) = self.buffers() {
             buffers.get().retirement(py, locator)
@@ -334,7 +339,6 @@ impl Transport {
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.source)?;
         visit.call(&self.capacity)?;
         visit.call(&self.events)?;
         visit.call(&self.reads)?;
@@ -378,14 +382,8 @@ impl Transport {
         }
     }
 
-    fn require_channel(&self, locator: &Bound<'_, PyAny>) -> PyResult<()> {
-        if locator.getattr("backend")?.extract::<String>()? != "channel"
-            || locator
-                .getattr("transport")?
-                .getattr("endpoint")?
-                .extract::<String>()?
-                != self.endpoint()
-        {
+    fn require_channel(&self, locator: &Bound<'_, Locator>) -> PyResult<()> {
+        if locator.get().backend() != "channel" || locator.get().endpoint() != self.endpoint() {
             return Err(invalid(
                 locator.py(),
                 "channel export belongs to another endpoint",
@@ -420,7 +418,7 @@ impl Transport {
         view: &ExportView<'py>,
         buffers: &Py<BufferRegistry>,
         next: &AtomicU64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Bound<'py, Locator>> {
         let py = view.tensor.py();
         let source = (|| {
             let event = if view.first.getattr("is_cuda")?.extract()? {
@@ -446,9 +444,10 @@ impl Transport {
             }
         };
         let result = (|| {
-            let handle = transfer_types(py)?
-                .getattr("LocalTransfer")?
-                .call1((self.endpoint(), next.fetch_add(1, Ordering::Relaxed)))?;
+            let handle = TransferTransport::Local {
+                endpoint: self.endpoint().to_owned(),
+                key: next.fetch_add(1, Ordering::Relaxed),
+            };
             let locator = view.locator(self, handle)?;
             buffers
                 .get()
@@ -466,7 +465,7 @@ impl Transport {
         view: &ExportView<'py>,
         buffers: &Py<BufferRegistry>,
         consumers: Vec<usize>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Bound<'py, Locator>> {
         let py = view.tensor.py();
         let mut storage = None;
         let mut registered = None;
@@ -493,9 +492,10 @@ impl Transport {
                 SharedBuffer::new(py, view.nbytes as usize, consumers, device)?,
             )?;
             storage = Some(buffer.clone_ref(py));
-            let handle = transfer_types(py)?
-                .getattr("PosixShmTransfer")?
-                .call1((self.endpoint(), buffer.get().name(py)?))?;
+            let handle = TransferTransport::PosixShm {
+                endpoint: self.endpoint().to_owned(),
+                name: buffer.get().name(py)?,
+            };
             let locator = view.locator(self, handle)?;
             let backing = Py::new(
                 py,
@@ -572,31 +572,32 @@ impl<'py> ExportView<'py> {
         })
     }
 
-    fn locator(&self, owner: &Transport, handle: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        let py = self.tensor.py();
-        let args = PyDict::new(py);
-        args.set_item("source", &owner.source)?;
-        args.set_item("transport", handle)?;
-        args.set_item("nbytes", self.nbytes)?;
-        args.set_item(
-            "dtype",
-            self.first
-                .getattr("dtype")?
-                .str()?
-                .to_str()?
-                .trim_start_matches("torch."),
-        )?;
-        args.set_item("shape", &self.shape)?;
-        args.set_item("offset", &self.offset)?;
-        args.set_item("device", self.first.getattr("device")?.str()?)?;
-        transfer_types(py)?
-            .getattr("Locator")?
-            .call((), Some(&args))
+    fn locator(
+        &self,
+        owner: &Transport,
+        transport: TransferTransport,
+    ) -> PyResult<Bound<'py, Locator>> {
+        let dtype = self
+            .first
+            .getattr("dtype")?
+            .str()?
+            .to_str()?
+            .trim_start_matches("torch.")
+            .to_owned();
+        let device = self.first.getattr("device")?.str()?.to_str()?.to_owned();
+        Locator::wrap(
+            self.tensor.py(),
+            NativeLocator {
+                source: owner.source.clone(),
+                transport,
+                nbytes: self.nbytes,
+                dtype,
+                shape: self.shape.extract()?,
+                offset: self.offset.extract()?,
+                device,
+            },
+        )
     }
-}
-
-fn transfer_types(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
-    py.import("uniserve_worker.protocol.transfer")
 }
 
 fn numerical<'py>(py: Python<'py>, backend: &str) -> PyResult<Bound<'py, PyModule>> {

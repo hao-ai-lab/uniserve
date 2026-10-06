@@ -9,13 +9,13 @@ use pyo3::types::{PyDict, PySlice, PyTuple};
 use uniserve_worker_ipc::{TensorTransfer, TransferTransport};
 
 use super::error::invalid;
+use super::locator::Locator;
 use super::transfer::{ReadReservation, TransferTicket};
 use super::transport::Transport;
-use crate::convert;
 
 pub(super) struct PlannedRead<'py> {
     transport: Bound<'py, Transport>,
-    location: Bound<'py, PyAny>,
+    location: Bound<'py, Locator>,
     source_region: Bound<'py, PyTuple>,
     target: Bound<'py, PyAny>,
 }
@@ -57,12 +57,12 @@ pub(super) fn plan_reads<'py>(
         .getattr("locations")?
         .try_iter()?
         .map(|location| {
-            let location = location?;
-            let backend: String = location.getattr("backend")?.extract()?;
+            let location = location?.cast_into::<Locator>()?;
+            let backend = location.get().backend();
             Ok((location, backend))
         })
         .collect::<PyResult<Vec<_>>>()?;
-    ordered.sort_by_key(|(_, backend)| backend != "local");
+    ordered.sort_by_key(|(_, backend)| *backend != "local");
 
     // Resolve bounds only until coverage is complete. Keep handles borrowed,
     // without copying channel payloads or inspecting unused replica metadata.
@@ -70,7 +70,7 @@ pub(super) fn plan_reads<'py>(
         .into_iter()
         .map(|(location, backend)| {
             let transport =
-                bindings.call_method1("get", ((location.getattr("source")?, &backend),))?;
+                bindings.call_method1("get", ((location.get().source(py)?, &backend),))?;
             if transport.is_none() {
                 return Ok(None);
             }
@@ -82,12 +82,12 @@ pub(super) fn plan_reads<'py>(
                 ));
             }
 
-            let offset: Vec<u64> = location.getattr("offset")?.extract()?;
-            let shape: Vec<u64> = location.getattr("shape")?.extract()?;
+            let offset = &location.get().inner.offset;
+            let shape = &location.get().inner.shape;
             let covered = offset
-                .into_iter()
+                .iter()
                 .zip(shape)
-                .map(|(start, extent)| start..start + extent)
+                .map(|(&start, &extent)| start..start + extent)
                 .collect::<Vec<_>>();
             Ok(Some((transport, location, covered)))
         })
@@ -106,7 +106,7 @@ pub(super) fn plan_native_reads<'py>(
     destination: &Bound<'py, PyAny>,
     transports: &Bound<'py, PyAny>,
     region: &[Range<u64>],
-    locators: &mut [Option<Bound<'py, PyAny>>],
+    locators: &mut [Option<Bound<'py, Locator>>],
 ) -> PyResult<Vec<PlannedRead<'py>>> {
     let mut ordered: Vec<_> = tensor.locations.iter().enumerate().collect();
     ordered.sort_by_key(|(_, location)| {
@@ -147,7 +147,7 @@ pub(super) fn plan_native_reads<'py>(
             if let Some(location) = &locators[index] {
                 return Ok(location.clone());
             }
-            let location = convert::transfer_locator_to_py(py, location)?;
+            let location = Locator::wrap(py, location.clone())?;
             locators[index] = Some(location.clone());
             Ok(location)
         },
@@ -160,7 +160,7 @@ fn plan_views<'py, L>(
     dtype: &str,
     region: &[Range<u64>],
     locations: impl Iterator<Item = PyResult<(Bound<'py, Transport>, L, Vec<Range<u64>>)>>,
-    mut convert: impl FnMut(&L) -> PyResult<Bound<'py, PyAny>>,
+    mut convert: impl FnMut(&L) -> PyResult<Bound<'py, Locator>>,
 ) -> PyResult<Vec<PlannedRead<'py>>> {
     let device = target_device(destination)?;
 

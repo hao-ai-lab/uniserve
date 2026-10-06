@@ -125,7 +125,12 @@ impl TensorStore {
                 .exported_locators
                 .bind(py)
                 .call_method1("extend", (&accepted,))?;
-            locations.extend(accepted.iter());
+            locations.extend(
+                accepted
+                    .iter()
+                    .map(|value| Ok(value.cast_into::<crate::worker::locator::Locator>()?))
+                    .collect::<PyResult<Vec<_>>>()?,
+            );
             Ok(())
         };
         if let Some(regions) = regions {
@@ -144,7 +149,7 @@ impl TensorStore {
 
         let registrations = locations
             .iter()
-            .map(|location| Ok((transports.get_item(location.getattr("backend")?)?, location)))
+            .map(|location| Ok((transports.get_item(location.get().backend())?, location)))
             .collect::<PyResult<Vec<_>>>()?;
         output.tensor_exports.bind(py).set_item(
             convert::buffer_id_to_py(py, &product.buffer_id())?,
@@ -152,11 +157,8 @@ impl TensorStore {
         )?;
         let locations = locations
             .iter()
-            .map(|location| {
-                convert::transfer_locator_from_py(&location.call_method0("to_mapping")?)
-                    .ok_or_else(|| invalid(py, "transport returned an invalid tensor location"))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+            .map(|location| location.get().inner.as_ref().clone())
+            .collect();
         let tensor = TensorTransfer { shape, locations };
         let value = match source_kind {
             Some(payload_kind) => TransferHandle::Encoder {

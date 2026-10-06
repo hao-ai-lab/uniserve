@@ -20,6 +20,7 @@ mod inputs;
 mod kv_cache;
 mod kv_import;
 mod latent;
+pub(crate) mod locator;
 mod microbatches;
 mod output;
 mod pending;
@@ -36,6 +37,7 @@ mod weight_prefetch;
 
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<locator::Locator>()?;
     module.add_function(wrap_pyfunction!(pending::store_media_bytes, module)?)?;
     module.add_class::<descriptor_grants::DescriptorGrants>()?;
     module.add_function(wrap_pyfunction!(

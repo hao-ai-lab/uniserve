@@ -14,10 +14,12 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 use uniserve_worker::{BufferRegistry as NativeBufferRegistry, HostLane, RegisteredBuffer};
+use uniserve_worker_ipc::{Locator as NativeLocator, TransferTransport};
 
 use super::completion::{Completion, CompletionRef};
 use super::error::{invalid, invariant, native_error};
 use super::events::EventPool;
+use super::locator::Locator;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum BufferKey {
@@ -27,7 +29,7 @@ enum BufferKey {
 }
 
 struct Source {
-    locator: Py<PyAny>,
+    locator: Arc<NativeLocator>,
     value: Py<TransportBuffer>,
 }
 
@@ -108,7 +110,7 @@ impl BufferRegistry {
     pub(in crate::worker) fn register(
         &self,
         py: Python<'_>,
-        locator: Py<PyAny>,
+        locator: Py<Locator>,
         source: Py<TransportBuffer>,
     ) -> PyResult<()> {
         let key = self.key(locator.bind(py))?;
@@ -118,7 +120,7 @@ impl BufferRegistry {
             .register(
                 key,
                 Source {
-                    locator,
+                    locator: Arc::clone(&locator.get().inner),
                     value: source,
                 },
                 CompletionRef::new(py, retirement),
@@ -131,7 +133,7 @@ impl BufferRegistry {
     pub(in crate::worker) fn release(
         &self,
         py: Python<'_>,
-        locator: &Bound<'_, PyAny>,
+        locator: &Bound<'_, Locator>,
     ) -> PyResult<Option<Py<Completion>>> {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
@@ -149,7 +151,7 @@ impl BufferRegistry {
     pub(in crate::worker) fn retirement(
         &self,
         py: Python<'_>,
-        locator: &Bound<'_, PyAny>,
+        locator: &Bound<'_, Locator>,
     ) -> PyResult<Py<Completion>> {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
@@ -261,7 +263,6 @@ impl Registry {
             Err(TryLockError::WouldBlock) => return Ok(()),
         };
         for buffer in state.buffers() {
-            visit.call(&buffer.source().locator)?;
             visit.call(&buffer.source().value)?;
             visit.call(&buffer.retirement().owner)?;
         }
@@ -271,17 +272,14 @@ impl Registry {
 
 impl Registry {
     pub(super) fn acquire_read(
-        locator: &Bound<'_, PyAny>,
+        locator: &Bound<'_, Locator>,
     ) -> PyResult<(Py<TransportBuffer>, BufferRead)> {
         let py = locator.py();
-        let endpoint: String = locator
-            .getattr("transport")?
-            .getattr("endpoint")?
-            .extract()?;
+        let endpoint = locator.get().endpoint();
         let owner = ENDPOINTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&endpoint)
+            .get(endpoint)
             .and_then(Weak::upgrade);
         let owner = owner.ok_or_else(|| invalid(py, "local buffer has no live owner"))?;
         let key = owner.key(locator)?;
@@ -314,31 +312,32 @@ impl Registry {
             .map_err(|_| invariant(py, "buffer registry lock is poisoned"))
     }
 
-    fn key(&self, locator: &Bound<'_, PyAny>) -> PyResult<BufferKey> {
+    fn key(&self, locator: &Bound<'_, Locator>) -> PyResult<BufferKey> {
         let py = locator.py();
-        let handle = locator.getattr("transport")?;
-        if handle.getattr("endpoint")?.extract::<String>()? != self.name {
+        if locator.get().endpoint() != self.name {
             return Err(invalid(py, "buffer belongs to another endpoint"));
         }
-        match locator.getattr("backend")?.extract::<String>()?.as_str() {
-            "local" => Ok(BufferKey::Local(handle.getattr("key")?.extract()?)),
-            "shm" => Ok(BufferKey::Shm(handle.getattr("name")?.extract()?)),
-            "cuda_vmm" => Ok(BufferKey::Cuda(handle.getattr("export_id")?.extract()?)),
-            _ => Err(invalid(py, "transport does not register source storage")),
+        match &locator.get().inner.transport {
+            TransferTransport::Local { key, .. } => Ok(BufferKey::Local(*key)),
+            TransferTransport::PosixShm { name, .. } => Ok(BufferKey::Shm(name.clone())),
+            TransferTransport::CudaVmm { export_id, .. } => Ok(BufferKey::Cuda(export_id.clone())),
+            TransferTransport::Channel { .. } => {
+                Err(invalid(py, "transport does not register source storage"))
+            }
         }
     }
 
     fn buffer<'a>(
         state: &'a mut BufferTable,
         key: &BufferKey,
-        locator: &Bound<'_, PyAny>,
+        locator: &Bound<'_, Locator>,
     ) -> PyResult<&'a mut RegisteredBuffer<Source, CompletionRef>> {
         let buffer = state
             .get_mut(key)
             .ok_or_else(|| invalid(locator.py(), "buffer is no longer registered"))?;
         // The immutable locator describes the actual view, including its fence.
         // Comparing it directly avoids serializing and hashing tensor metadata.
-        if !buffer.source().locator.bind(locator.py()).eq(locator)? {
+        if buffer.source().locator != locator.get().inner {
             return Err(invalid(
                 locator.py(),
                 "buffer locator changed its registered view",

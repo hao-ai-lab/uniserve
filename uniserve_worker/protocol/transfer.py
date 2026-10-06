@@ -9,12 +9,10 @@ tensor, and a transport handle (`LocalTransfer`, `PosixShmTransfer`,
 the `TransferValue` variants add product metadata to it, and `KvTransfer`
 carries a published KV extent.
 
-These records mirror the worker-ipc crate's `Locator`, `TensorTransfer`, and
-`KvTransfer`, whose validators the crate's codec runs whenever it encodes or
-decodes a batch or a batch result, so the two sides must change together.
-`Locator.to_mapping` writes, and `Locator.from_mapping` reads, a flattened
-form with a plain ``transport`` string beside the handle's fields; the PyO3
-extension decodes that form rather than the crate's serde representation.
+`Locator` owns the native worker-ipc description shared by Rust transport
+owners and read consumers. Python accesses its immutable tensor metadata and
+transport fields for numerical copies. `to_mapping` and `from_mapping` serve
+the Python IPC records; native consumers use the description directly.
 """
 
 from __future__ import annotations
@@ -25,12 +23,10 @@ import uuid
 from dataclasses import dataclass
 from typing import TypeAlias
 
+from uniserve_worker._uniserve_ipc import Locator as Locator
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity
 from uniserve_worker.protocol.validation import (
-    _bytes,
-    _int,
-    _ints,
     _map,
     _seq,
     _str,
@@ -146,11 +142,6 @@ class LocalTransfer:
     endpoint: str
     key: int
 
-    def __post_init__(self) -> None:
-        """Validate the process-local endpoint and registry key."""
-        if not self.endpoint or self.key < 0:
-            raise invalid_descriptor("local transfer handle is invalid")
-
 
 @dataclass(frozen=True, slots=True)
 class PosixShmTransfer:
@@ -163,13 +154,6 @@ class PosixShmTransfer:
     endpoint: str
     name: str
 
-    def __post_init__(self) -> None:
-        """Validate the shared-storage name and publishing endpoint."""
-        if not self.endpoint or not self.name:
-            raise invalid_descriptor(
-                "shared-storage transfer handle is invalid"
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class CudaVmmTransfer:
@@ -181,7 +165,7 @@ class CudaVmmTransfer:
     with one entry per axis. `span_lengths` and `span_counts` run-length
     encode the spans' first-axis lengths: ``span_counts[i]`` consecutive spans
     each hold ``span_lengths[i]`` rows, keeping page maps compact without
-    changing logical coverage. `Locator.__post_init__` checks that the
+    changing logical coverage. `Locator` checks that the
     expanded lengths sum to the view's first extent.
 
     `endpoint` names the producer's export table and, for a descriptor
@@ -210,36 +194,6 @@ class CudaVmmTransfer:
     # storage exported where it lies rather than copied into the device pool.
     acknowledgment_offset: int = -1
 
-    def __post_init__(self) -> None:
-        """Validate native CUDA handles and the declared allocation bounds."""
-        if (
-            not self.endpoint
-            or len(self.export_id) != 32
-            or self.storage_size_bytes < 1
-            or not self.storage_offsets_bytes
-            or len(self.span_counts) != len(self.span_lengths)
-            or sum(self.span_counts) != len(self.storage_offsets_bytes)
-            or any(count < 1 for count in self.span_counts)
-            or any(
-                not 0 <= offset < self.storage_size_bytes
-                for offset in self.storage_offsets_bytes
-            )
-            or any(length < 1 for length in self.span_lengths)
-            or any(stride < 0 for stride in self.tensor_stride)
-            # A 64-byte CUDA IPC event handle fences the export for
-            # consumers on the producer's host. A producing rank with any
-            # consumer on another host publishes no fence, because an event
-            # handle does not reach there; it synchronizes its stream before
-            # publishing instead. Any other length is not a handle a consumer
-            # could import.
-            or len(self.ready_event_handle) not in (0, 64)
-            # A fabric handle is 64 bytes and a process descriptor is 4; any
-            # other length is not a handle this rank can import.
-            or len(self.allocation_handle)
-            not in (DESCRIPTOR_HANDLE_BYTES, FABRIC_HANDLE_BYTES)
-        ):
-            raise invalid_descriptor("CUDA VMM transfer handle is incomplete")
-
 
 @dataclass(frozen=True, slots=True)
 class ChannelTransfer:
@@ -253,215 +207,10 @@ class ChannelTransfer:
     endpoint: str
     payload: bytes
 
-    def __post_init__(self) -> None:
-        """Validate the publishing endpoint and the carried bytes."""
-        # The bytes are the product; a locator without them names nothing.
-        if not self.endpoint or not self.payload:
-            raise invalid_descriptor("channel transfer handle is invalid")
-
 
 TransferTransport: TypeAlias = (
     LocalTransfer | PosixShmTransfer | CudaVmmTransfer | ChannelTransfer
 )
-
-
-@dataclass(frozen=True, slots=True)
-class Locator:
-    """One physical shard or replica of a logical tensor.
-
-    `shape` and `offset` place this view as a box inside the owning
-    `TensorTransfer`'s logical shape, in elements with one entry per axis;
-    `nbytes` is the view's size and `dtype` its element type name.
-    `transport` is the handle a consumer opens and `source` the publishing
-    rank. Except for a `ChannelTransfer`, whose payload is the bytes, the
-    publishing rank's transport keeps the storage until the export
-    retires after the engine releases it.
-    """
-
-    source: WorkerEndpoint
-    transport: TransferTransport
-    nbytes: int
-    dtype: str
-    shape: tuple[int, ...]
-    offset: tuple[int, ...]
-    device: str
-
-    @property
-    def backend(self) -> str:
-        """Return the name of the transport that owns this export.
-
-        The names are the `WorkerInfo.transfer_backends` vocabulary and key a
-        rank's transport table. A `PosixShmTransfer` is ``"shm"`` here but
-        ``"posix_shm"`` in the wire mapping.
-        """
-        if isinstance(self.transport, LocalTransfer):
-            return "local"
-        if isinstance(self.transport, PosixShmTransfer):
-            return "shm"
-        if isinstance(self.transport, ChannelTransfer):
-            return "channel"
-        if isinstance(self.transport, CudaVmmTransfer):
-            return "cuda_vmm"
-        raise invalid_descriptor("tensor locator names an unknown transport")
-
-    def __post_init__(self) -> None:
-        """Validate the view's bounds and, for CUDA VMM, its span layout.
-
-        Placement inside the logical tensor is checked by
-        `TensorTransfer.__post_init__`, which sees the logical shape.
-        """
-        if (
-            self.nbytes < 1
-            or not self.dtype
-            or not self.shape
-            or any(extent < 1 for extent in self.shape)
-            or not self.device
-            or len(self.offset) != len(self.shape)
-            or any(start < 0 for start in self.offset)
-        ):
-            raise invalid_descriptor(
-                "transfer locator has invalid tensor bounds"
-            )
-        if isinstance(self.transport, CudaVmmTransfer) and (
-            len(self.transport.tensor_stride) != len(self.shape)
-            or sum(
-                length * count
-                for length, count in zip(
-                    self.transport.span_lengths,
-                    self.transport.span_counts,
-                    strict=True,
-                )
-            )
-            != self.shape[0]
-        ):
-            raise invalid_descriptor(
-                "CUDA VMM physical spans do not match its shape"
-            )
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "transfer locator"
-    ) -> Locator:
-        """Parse a locator from the flattened mapping `to_mapping` writes.
-
-        The ``transport`` key selects the handle type (``local``,
-        ``channel``, ``posix_shm``, or ``cuda_vmm``), and the handle's fields
-        sit beside it. Each constructed record validates itself.
-        """
-        data = _map(value, where)
-        kind = _str(data.get("transport"), f"{where}.transport")
-
-        if kind == "local":
-            transport: TransferTransport = LocalTransfer(
-                endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                key=_uint(data.get("key"), f"{where}.key"),
-            )
-        elif kind == "channel":
-            transport = ChannelTransfer(
-                endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                payload=_bytes(data.get("payload"), f"{where}.payload"),
-            )
-        elif kind == "posix_shm":
-            transport = PosixShmTransfer(
-                endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                name=_str(data.get("name"), f"{where}.name"),
-            )
-        elif kind == "cuda_vmm":
-            transport = CudaVmmTransfer(
-                endpoint=_str(data.get("endpoint"), f"{where}.endpoint"),
-                export_id=_str(data.get("export_id"), f"{where}.export_id"),
-                storage_size_bytes=_uint(
-                    data.get("storage_size_bytes"),
-                    f"{where}.storage_size_bytes",
-                ),
-                storage_offsets_bytes=tuple(
-                    _ints(
-                        data.get("storage_offsets_bytes"),
-                        f"{where}.storage_offsets_bytes",
-                    )
-                ),
-                span_lengths=tuple(
-                    _ints(data.get("span_lengths"), f"{where}.span_lengths")
-                ),
-                span_counts=tuple(
-                    _ints(data.get("span_counts"), f"{where}.span_counts")
-                ),
-                tensor_stride=tuple(
-                    _ints(data.get("tensor_stride"), f"{where}.tensor_stride")
-                ),
-                ready_event_handle=_bytes(
-                    data.get("ready_event_handle"),
-                    f"{where}.ready_event_handle",
-                ),
-                allocation_handle=_bytes(
-                    data.get("allocation_handle"),
-                    f"{where}.allocation_handle",
-                ),
-                acknowledgment_offset=_int(
-                    data.get("acknowledgment_offset"),
-                    f"{where}.acknowledgment_offset",
-                ),
-            )
-        else:
-            raise invalid_descriptor(f"{where}.transport is invalid")
-
-        return cls(
-            source=WorkerEndpoint.from_mapping(
-                data.get("source"), f"{where}.source"
-            ),
-            transport=transport,
-            nbytes=_uint(data.get("nbytes"), f"{where}.nbytes"),
-            dtype=_str(data.get("dtype"), f"{where}.dtype"),
-            shape=tuple(_uints(data.get("shape"), f"{where}.shape")),
-            offset=tuple(_uints(data.get("offset"), f"{where}.offset")),
-            device=_str(data.get("device"), f"{where}.device"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Encode the view and its handle as one flattened wire mapping."""
-        output: dict[str, object] = {
-            "source": self.source.to_mapping(),
-            "nbytes": self.nbytes,
-            "dtype": self.dtype,
-            "shape": list(self.shape),
-            "offset": list(self.offset),
-            "device": self.device,
-        }
-
-        transport = self.transport
-        if isinstance(transport, LocalTransfer):
-            output.update(
-                transport="local",
-                endpoint=transport.endpoint,
-                key=transport.key,
-            )
-        elif isinstance(transport, PosixShmTransfer):
-            output.update(
-                transport="posix_shm",
-                endpoint=transport.endpoint,
-                name=transport.name,
-            )
-        elif isinstance(transport, ChannelTransfer):
-            output.update(
-                transport="channel",
-                endpoint=transport.endpoint,
-                payload=transport.payload,
-            )
-        else:
-            output.update(
-                transport="cuda_vmm",
-                endpoint=transport.endpoint,
-                export_id=transport.export_id,
-                storage_size_bytes=transport.storage_size_bytes,
-                storage_offsets_bytes=list(transport.storage_offsets_bytes),
-                span_lengths=list(transport.span_lengths),
-                span_counts=list(transport.span_counts),
-                tensor_stride=list(transport.tensor_stride),
-                ready_event_handle=transport.ready_event_handle,
-                allocation_handle=transport.allocation_handle,
-                acknowledgment_offset=transport.acknowledgment_offset,
-            )
-        return output
 
 
 @dataclass(frozen=True, slots=True)

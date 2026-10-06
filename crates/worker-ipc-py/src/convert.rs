@@ -1253,90 +1253,12 @@ fn tensor_export_to_py<'py>(
     construct(py, "TensorExport", &dict)
 }
 
-/// Converts tensor metadata and transport coordinates into a Python record.
-///
-/// The transport becomes a nested typed record (`LocalTransfer`,
-/// `PosixShmTransfer`, `CudaVmmTransfer`, or `ChannelTransfer`); the CUDA VMM
-/// event and allocation handles and channel payloads cross as `bytes`.
-/// `dtype` here is the torch dtype name string, not the `DType` enum used by
-/// tensor references.
+/// Share native tensor coordinates with Python numerical consumers.
 pub(crate) fn transfer_locator_to_py<'py>(
     py: Python<'py>,
     locator: &Locator,
 ) -> PyResult<Bound<'py, PyAny>> {
-    // Tensor metadata is common to every transport family.
-    let dict = PyDict::new(py);
-    let source = PyDict::new(py);
-    source.set_item("worker_id", &locator.source.worker_id)?;
-    source.set_item("rank", locator.source.rank)?;
-    source.set_item("node", &locator.source.node)?;
-    source.set_item("address_space", &locator.source.address_space)?;
-    source.set_item("incarnation", &locator.source.incarnation)?;
-    dict.set_item("source", construct(py, "WorkerEndpoint", &source)?)?;
-    dict.set_item(intern!(py, "nbytes"), locator.nbytes)?;
-    dict.set_item(intern!(py, "dtype"), locator.dtype.as_str())?;
-    dict.set_item(intern!(py, "shape"), PyTuple::new(py, &locator.shape)?)?;
-    dict.set_item(intern!(py, "device"), locator.device.as_str())?;
-    dict.set_item(intern!(py, "offset"), PyTuple::new(py, &locator.offset)?)?;
-
-    // The transport tag determines the remaining coordinate fields.
-    let handle = PyDict::new(py);
-    let name = match &locator.transport {
-        TransferTransport::Local { endpoint, key } => {
-            handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
-            handle.set_item(intern!(py, "key"), key)?;
-            "LocalTransfer"
-        }
-        TransferTransport::PosixShm { endpoint, name } => {
-            handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
-            handle.set_item(intern!(py, "name"), name.as_str())?;
-            "PosixShmTransfer"
-        }
-        TransferTransport::CudaVmm {
-            endpoint,
-            export_id,
-            storage_size_bytes,
-            storage_offsets_bytes,
-            span_lengths,
-            span_counts,
-            tensor_stride,
-            ready_event_handle,
-            allocation_handle,
-            acknowledgment_offset,
-        } => {
-            handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
-            handle.set_item(intern!(py, "export_id"), export_id.as_str())?;
-            handle.set_item(intern!(py, "storage_size_bytes"), storage_size_bytes)?;
-            handle.set_item(
-                intern!(py, "storage_offsets_bytes"),
-                PyTuple::new(py, storage_offsets_bytes)?,
-            )?;
-            handle.set_item(intern!(py, "span_lengths"), PyTuple::new(py, span_lengths)?)?;
-            handle.set_item(intern!(py, "span_counts"), PyTuple::new(py, span_counts)?)?;
-            handle.set_item(
-                intern!(py, "tensor_stride"),
-                PyTuple::new(py, tensor_stride)?,
-            )?;
-            handle.set_item(
-                intern!(py, "ready_event_handle"),
-                PyBytes::new(py, ready_event_handle),
-            )?;
-            handle.set_item(
-                intern!(py, "allocation_handle"),
-                PyBytes::new(py, allocation_handle),
-            )?;
-            handle.set_item(intern!(py, "acknowledgment_offset"), acknowledgment_offset)?;
-            "CudaVmmTransfer"
-        }
-        TransferTransport::Channel { endpoint, payload } => {
-            handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
-            handle.set_item(intern!(py, "payload"), PyBytes::new(py, payload))?;
-            "ChannelTransfer"
-        }
-    };
-    dict.set_item("transport", construct(py, name, &handle)?)?;
-
-    construct(py, "Locator", &dict)
+    crate::worker::locator::Locator::wrap(py, locator.clone()).map(Bound::into_any)
 }
 
 /// Encodes the persistent buffer that identifies a KV export.
@@ -2599,6 +2521,18 @@ mod tests {
         let expected = result_response();
 
         Python::attach(|py| {
+            // Use the module linked into this test process. Loading a separate
+            // extension would give Python and Rust different native class types.
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item(
+                    "uniserve_worker._uniserve_ipc",
+                    pyo3::wrap_pymodule!(crate::_uniserve_ipc)(py),
+                )
+                .unwrap();
+
             // Import `uniserve_worker` and the `uniserve_kernels` package it
             // loads from this repository's source tree; the kernels package
             // keeps its modules under `uniserve_kernels/src`.

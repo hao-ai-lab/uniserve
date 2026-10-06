@@ -8,6 +8,7 @@ use pyo3::types::PyTuple;
 
 use super::{Copy, TransferRef, TransferTicket, Workspace, drain, native_error};
 use crate::worker::fetch;
+use crate::worker::locator::Locator;
 
 impl Copy {
     pub(super) fn copy_groups(&self, py: Python<'_>, workspace: &Workspace) -> PyResult<()> {
@@ -68,7 +69,7 @@ impl Copy {
         workspace: &Workspace,
         index: usize,
         axes: [Range<u64>; 3],
-        locators: &mut [Vec<Option<Bound<'py, PyAny>>>],
+        locators: &mut [Vec<Option<Bound<'py, Locator>>>],
     ) -> PyResult<()> {
         let owner = self.owner.borrow(py);
         let pool = owner.pool.bind(py);
@@ -143,7 +144,7 @@ impl Copy {
         workspace: &Workspace,
         index: usize,
         axes: [Range<u64>; 3],
-        locators: &mut [Vec<Option<Bound<'py, PyAny>>>],
+        locators: &mut [Vec<Option<Bound<'py, Locator>>>],
     ) -> PyResult<()> {
         let owner = self.owner.borrow(py);
         let pool = owner.pool.bind(py);
@@ -268,7 +269,7 @@ impl Copy {
         field: usize,
         destination: &Bound<'py, PyAny>,
         region: &[Range<u64>],
-        locators: &mut [Option<Bound<'py, PyAny>>],
+        locators: &mut [Option<Bound<'py, Locator>>],
     ) -> PyResult<Vec<Py<TransferTicket>>> {
         let owner = self.owner.borrow(py);
         let write = self.write.get();
