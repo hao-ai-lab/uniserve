@@ -11,7 +11,7 @@ numerical execution. ``BufferPool`` binds scheduler-assigned storage and issues
 its numerical ``BufferBinding`` views.
 """
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from types import TracebackType
 from typing import Any, Generic, ParamSpec, Self, TypeVar, final
@@ -26,7 +26,10 @@ from uniserve.runtime.execution import ExecutionContext
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
+from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestResult
+from uniserve_worker.model_executor.input_batch import InputRow
+from uniserve_worker.model_executor.output import ExecutionOutput
 from uniserve_worker.protocol.batch import (
     BatchCommand,
     BlockTable,
@@ -62,6 +65,7 @@ from uniserve_worker.protocol.transfer import (
     TransferTransport,
     WorkerEndpoint,
 )
+from uniserve_worker.storage.decode_state import DecodeState
 from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
@@ -282,12 +286,26 @@ class ModelRunners(Generic[RunnerT]):
     def get(self, component: str, kind: CallKind) -> RunnerT | None: ...
     def first(self, kind: CallKind) -> RunnerT | None: ...
     def clear(self) -> None: ...
-    def group(
+    def run_batch(
         self,
-        rows: Iterable[
-            tuple[Call, CallKind, type, tuple[int, ...], bool | None]
-        ],
-    ) -> tuple[list[int], list[tuple[RunnerT, tuple[int, ...], bool]]]: ...
+        owner: ModelExecutor,
+        runner: RunnerT,
+        rows: tuple[InputRow, ...],
+        *,
+        calls: tuple[Call, ...],
+        cache: kv_cache.KVCacheManager | None,
+        tables: block_tables.BlockTables | None,
+        states: DecodeState | None,
+    ) -> ExecutionOutput: ...
+    def forward(
+        self,
+        owner: ModelExecutor,
+        tasks: tuple[tuple[InputRow, Call], ...],
+        *,
+        cache: kv_cache.KVCacheManager | None,
+        tables: block_tables.BlockTables | None,
+        states: DecodeState | None,
+    ) -> Iterator[tuple[tuple[int, ...], ExecutionOutput | BaseException]]: ...
 
 class DescriptorGrants:
     """Own local allocation grants and their native socket service."""

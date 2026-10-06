@@ -1,6 +1,7 @@
 """Captured worker calls preserve live text values and prefix state."""
 
 from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ from uniserve_models.stub import image_processor as stub_image_processor
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.inputs import capability
 from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.errors import WorkerError, WorkerErrorCode
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import TokenBufferConfig
@@ -487,6 +489,59 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
                     value, expected, rtol=2e-2, atol=2e-2
                 )
             assert result.request_pool_indices.tolist() == [1, 2]
+
+        # Prefill and decode use the same numerical runner. Retaining its
+        # results across groups must preserve the logits of both requests.
+        outputs = runner.forward(
+            (
+                (rows[0], calls[0]),
+                (
+                    replace(rows[1], forward_mode=ForwardMode.PREFILL),
+                    calls[1].replace(kind=ForwardMode.PREFILL),
+                ),
+            ),
+            cache=manager,
+            tables=manager.block_tables,
+            states=None,
+        )
+        retained = []
+        for indexes, output in outputs:
+            assert not isinstance(output, BaseException)
+            retained.append((indexes, output))
+        assert tuple(index for indexes, _ in retained for index in indexes) == (
+            0,
+            1,
+        )
+        for indexes, output in retained:
+            for index, value in zip(
+                indexes, output.materialize().values, strict=True
+            ):
+                expected = reference(
+                    torch.tensor(sequences[index], device="cuda:0")[None]
+                ).logits[0, -1:]
+                torch.testing.assert_close(
+                    value, expected, rtol=2e-2, atol=2e-2
+                )
+
+        # A consumer stopping at a routing error must leave every later
+        # request's KV untouched, even when its rows could otherwise execute.
+        saved = _snapshot(cache)
+        outputs = runner.forward(
+            (
+                (rows[0], calls[0].replace(component="unbound")),
+                (replace(rows[1], token_ids=torch.tensor([13])), calls[1]),
+            ),
+            cache=manager,
+            tables=manager.block_tables,
+            states=None,
+        )
+        indexes, error = next(outputs)
+        assert indexes == (0,)
+        assert isinstance(error, WorkerError)
+        assert error.code is WorkerErrorCode.INVALID_DESCRIPTOR
+        del outputs
+        for actual, expected in saved:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     finally:
         runner.close()
         manager.close()

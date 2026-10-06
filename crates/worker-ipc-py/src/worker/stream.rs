@@ -67,11 +67,11 @@ impl CUDAStream {
         Ok(self.lock(py)?.closed())
     }
 
-    fn wait(&self, py: Python<'_>, producer: usize) -> PyResult<()> {
+    pub(super) fn wait(&self, py: Python<'_>, producer: usize) -> PyResult<()> {
         self.lock(py)?.wait(producer).map_err(error)
     }
 
-    fn record(&self, py: Python<'_>, consumer: usize) -> PyResult<Option<CUDAEvent>> {
+    pub(super) fn record(&self, py: Python<'_>, consumer: usize) -> PyResult<Option<CUDAEvent>> {
         self.lock(py)?
             .record(consumer)
             .map(|event| event.map(|inner| CUDAEvent { inner }))
