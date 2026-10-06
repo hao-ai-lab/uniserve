@@ -90,7 +90,7 @@ fn capture_batch(
     forward: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     let py = runner.py();
-    if runner.getattr("_startup_complete")?.is_truthy()? {
+    if execution(runner)?.borrow().sealed {
         return Err(graph_error(
             py,
             "batch capture is outside startup preparation".into(),
@@ -230,7 +230,7 @@ pub(super) fn run_module(
         let forward = runner.getattr("call")?.getattr("forward")?;
         let pools = execution(runner)?.borrow().pools.bind(py).clone();
         let result = if pools.is_truthy()?
-            && (graph.is_some() || !runner.getattr("_startup_complete")?.is_truthy()?)
+            && (graph.is_some() || !execution(runner)?.borrow().sealed)
         {
             let graph = match graph {
                 Some(graph) => {

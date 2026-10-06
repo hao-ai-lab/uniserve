@@ -2,11 +2,13 @@
 
 mod dispatch;
 mod execute;
+mod experts;
 mod forward;
 mod graphs;
 mod inputs;
 mod modules;
 mod resources;
+mod startup;
 mod streams;
 
 use std::collections::HashMap;
@@ -36,6 +38,13 @@ pub(crate) struct ModelRunners {
     // Creation order matters when closing communicators shared by ranks.
     streams: Arc<streams::Streams>,
     closed: bool,
+    #[pyo3(get)]
+    sealed: bool,
+    exchanges: Vec<Py<PyAny>>,
+    expert_executions: Vec<Py<Execution>>,
+    // Buffered numerical calls in collective order, each with its microbatch
+    // executions. Idle participation needs no Python runner lookup.
+    expert_runners: Vec<Vec<Py<Execution>>>,
 }
 
 #[pymethods]
@@ -368,13 +377,78 @@ impl ModelRunners {
         self.streams.batch_streams(device, microbatches)
     }
 
-    fn fork_microbatch(&self, py: Python<'_>) -> PyResult<()> {
-        self.streams.fork_microbatch(py)
+    #[getter]
+    fn buffered<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            self.inner
+                .iter()
+                .map(|runner| runner.clone_ref(py))
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[getter]
-    fn expert_streams<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        self.streams.expert_streams(py)
+    pub(super) fn experts(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.exchanges
+            .first()
+            .map(|exchange| exchange.clone_ref(py))
+    }
+
+    fn exchange(&self, py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
+        self.exchanges
+            .get(index)
+            .map(|exchange| exchange.clone_ref(py))
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err(index))
+    }
+
+    fn configure_exchanges(
+        slf: &Bound<'_, Self>,
+        owner: &Bound<'_, PyAny>,
+        max_tokens: usize,
+    ) -> PyResult<()> {
+        experts::configure(slf, owner, max_tokens)
+    }
+
+    fn configure_experts(slf: &Bound<'_, Self>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
+        experts::configure_worker(slf, owner)
+    }
+
+    #[pyo3(signature = (*, leaving=false))]
+    pub(super) fn join_expert_step(slf: &Bound<'_, Self>, leaving: bool) -> PyResult<bool> {
+        experts::idle(slf, leaving)
+    }
+
+    fn prepare_batches(
+        slf: &Bound<'_, Self>,
+        owner: &Bound<'_, PyAny>,
+        tokenizer: &Bound<'_, PyAny>,
+        latents: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        startup::prepare(slf, owner, tokenizer, latents)
+    }
+
+    fn seal(slf: &Bound<'_, Self>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
+        startup::seal(slf, owner)
+    }
+
+    fn all<'py>(
+        slf: &Bound<'py, Self>,
+        owner: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let py = slf.py();
+        let mut runners: Vec<_> = slf
+            .borrow()
+            .inner
+            .iter()
+            .map(|runner| runner.bind(py).clone())
+            .collect();
+        runners.extend(slf.borrow().prepared(py)?.iter());
+        let diffusion = owner.getattr("_diffusion")?;
+        if !diffusion.is_none() {
+            runners.push(diffusion);
+        }
+        PyTuple::new(py, runners)
     }
 
     fn preparing_inputs(
@@ -488,6 +562,9 @@ impl ModelRunners {
         self.inner.clear();
         self.modules.clear();
         self.outputs.clear();
+        self.exchanges.clear();
+        self.expert_executions.clear();
+        self.expert_runners.clear();
         self.streams.clear();
     }
 
@@ -501,6 +578,15 @@ impl ModelRunners {
             if Arc::strong_count(module) == 1 {
                 module.traverse(&visit)?;
             }
+        }
+        for exchange in &self.exchanges {
+            visit.call(exchange)?;
+        }
+        for execution in &self.expert_executions {
+            visit.call(execution)?;
+        }
+        for runner in self.expert_runners.iter().flatten() {
+            visit.call(runner)?;
         }
         self.streams.traverse(&visit)?;
         Ok(())

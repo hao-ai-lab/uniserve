@@ -110,12 +110,6 @@ class ModelRunner(ABC):
         # Graph widths of every numerical block table; see
         # ``bootstrap.capacity.graph_table_widths``.
         self.table_widths: tuple[int, ...] = ()
-        self._startup_complete = False
-        # Bound by execution when this capability reaches expert layers.
-        self.expert_step = False
-        self.expert_order = 0
-        self.expert_joins = None
-        self.microbatch_joins = None
 
     @abstractmethod
     def batch_forward(
@@ -238,7 +232,7 @@ class ModelRunner(ABC):
         """Return the local bucket's variant for the current expert step."""
         capacity = (
             self.execution.context.experts.capacity
-            if self.expert_step
+            if self.execution.expert_order is not None
             else None
         )
         return self.execution.buckets[key][capacity]

@@ -727,10 +727,10 @@ def prepare_images(runner: ModelExecutor, latents) -> None:
         and latents is not None
         and any(
             MediaCall.LATENT_ENCODING in entry.call_kinds
-            for entry in runner.entries.values()
+            for entry in runner.batch_runners.buffered
         )
     )
-    for entry in runner.entries.values():
+    for entry in runner.batch_runners.buffered:
         stream = entry.execution.context.stream
         if stream is not None:
             stream.wait(torch.cuda.current_stream(entry.device))

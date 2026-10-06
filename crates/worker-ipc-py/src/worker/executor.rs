@@ -37,11 +37,13 @@ use uniserve_worker_ipc::{
 
 use super::block_tables::BlockTables;
 use super::events::EventPool;
+use super::expert_exchange::ExpertExchange;
 use super::host::{HostLane, with_context};
 use super::inputs::BatchInputs;
 use super::kv_cache::KVCacheManager;
 use super::kv_import::KVImporter;
 use super::latent::LatentPool;
+use super::model_runners::ModelRunners;
 use super::output::OutputPool;
 use super::pending::PendingOutput;
 use super::request::RequestPool;
@@ -449,13 +451,22 @@ impl ServiceBackend for PythonBackend {
     fn join_expert_step(&self, leaving: bool) -> Result<(bool, bool), Py<PyBaseException>> {
         Python::attach(|py| {
             let join = || -> PyResult<_> {
-                let runner = self.model_runner.bind(py);
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("leaving", leaving)?;
-                let advanced = runner
-                    .call_method("join_expert_step", (), Some(&kwargs))?
-                    .extract()?;
-                let released = runner.getattr("experts")?.getattr("released")?.extract()?;
+                let runners = self
+                    .model_runner
+                    .bind(py)
+                    .getattr("batch_runners")?
+                    .cast_into::<ModelRunners>()?;
+                let advanced = ModelRunners::join_expert_step(&runners, leaving)?;
+                let exchange = runners.borrow().experts(py);
+                let released = match exchange {
+                    Some(exchange) => exchange
+                        .bind(py)
+                        .getattr("_control")?
+                        .cast_into::<ExpertExchange>()?
+                        .borrow()
+                        .released(),
+                    None => true,
+                };
                 Ok((advanced, released))
             };
             join().map_err(|error| error.into_value(py))

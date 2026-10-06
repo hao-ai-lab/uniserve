@@ -185,7 +185,7 @@ impl ExpertExchange {
     }
 
     #[getter]
-    fn released(&self) -> bool {
+    pub(super) fn released(&self) -> bool {
         self.state().released()
     }
 

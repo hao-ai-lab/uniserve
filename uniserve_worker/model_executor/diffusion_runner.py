@@ -738,7 +738,7 @@ class DiffusionRunner(ModelRunner):
         """
         if not self.captures:
             raise RuntimeError("denoising graph capture requires a stream")
-        if self._startup_complete:
+        if self.execution.sealed:
             raise CUDAGraphError(
                 "denoising capture is outside startup preparation"
             )

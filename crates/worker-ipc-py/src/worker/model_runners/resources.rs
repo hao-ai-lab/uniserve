@@ -1,7 +1,7 @@
 //! Drain readers, retire graphs and contexts, then close shared streams.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::PyDict;
 
 use super::ModelRunners;
 use super::streams::cuda_index;
@@ -46,35 +46,21 @@ pub(super) fn close_graphs(
     owner: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     let py = slf.py();
-    let mut runners = owner
-        .getattr("entries")?
-        .call_method0("values")?
-        .try_iter()?
-        .collect::<PyResult<Vec<_>>>()?;
-    runners.extend(slf.borrow().prepared(py)?.iter());
-    let diffusion = owner.getattr("_diffusion")?;
-    if !diffusion.is_none() {
-        runners.push(diffusion);
-    }
-    let joins = owner.getattr("_expert_joins")?;
-    owner.setattr("_expert_joins", py.None())?;
-    let microbatches = owner.getattr("_microbatch_joins")?;
-    owner.setattr("_microbatch_joins", PyList::empty(py))?;
-
-    let mut results: Vec<_> = runners
+    let mut results: Vec<_> = ModelRunners::all(slf, owner)?
         .iter()
         .map(|runner| runner.call_method0("close_graphs").map(drop))
         .collect();
-    if !joins.is_none() {
-        results.push(joins.call_method0("close").map(drop));
-    }
-    for joins in microbatches.try_iter()? {
-        results.push(
-            joins
-                .and_then(|joins| joins.call_method0("close"))
-                .map(drop),
-        );
-    }
+    let experts: Vec<_> = slf
+        .borrow()
+        .expert_executions
+        .iter()
+        .map(|execution| execution.clone_ref(py))
+        .collect();
+    results.extend(
+        experts
+            .iter()
+            .map(|execution| execution.call_method0(py, "close_graphs").map(drop)),
+    );
     close_all(py, results)
 }
 
@@ -130,30 +116,40 @@ pub(super) fn close(
         if !diffusion.is_none() {
             results.push(diffusion.call_method0("close").map(drop));
         }
-        for runner in owner
-            .getattr("entries")?
-            .call_method0("values")?
-            .try_iter()?
-        {
-            results.push(
-                runner
-                    .and_then(|runner| runner.call_method0("close"))
-                    .map(drop),
-            );
-        }
+        let runners = slf
+            .borrow()
+            .inner
+            .iter()
+            .map(|runner| runner.clone_ref(py))
+            .collect::<Vec<_>>();
+        results.extend(
+            runners
+                .iter()
+                .map(|runner| runner.call_method0(py, "close").map(drop)),
+        );
         let weights = owner.getattr("expert_weights")?;
         if !weights.is_none() {
             results.push(weights.call_method0("close").map(drop));
         }
-        for field in ["_expert_executions", "_expert_exchanges"] {
-            for resource in owner.getattr(field)?.try_iter()? {
-                results.push(
-                    resource
-                        .and_then(|resource| resource.call_method0("close"))
-                        .map(drop),
-                );
-            }
-        }
+        let experts = {
+            let runners = slf.borrow();
+            runners
+                .expert_executions
+                .iter()
+                .map(|execution| execution.clone_ref(py).into_any())
+                .chain(
+                    runners
+                        .exchanges
+                        .iter()
+                        .map(|exchange| exchange.clone_ref(py)),
+                )
+                .collect::<Vec<_>>()
+        };
+        results.extend(
+            experts
+                .iter()
+                .map(|expert| expert.call_method0(py, "close").map(drop)),
+        );
         results.extend(
             streams
                 .iter()
@@ -163,10 +159,7 @@ pub(super) fn close(
     })();
 
     slf.borrow_mut().clear();
-    owner.getattr("entries")?.call_method0("clear")?;
     owner.setattr("_diffusion", py.None())?;
-    owner.setattr("_expert_exchanges", PyTuple::empty(py))?;
-    owner.setattr("_expert_executions", PyTuple::empty(py))?;
     close_all(
         py,
         [
