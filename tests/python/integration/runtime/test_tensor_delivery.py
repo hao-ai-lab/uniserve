@@ -34,8 +34,6 @@ from uniserve_worker.transport.fetch import fetch_tensor
 from uniserve_worker.transport.pool import (
     ReadBackpressureError,
     ReadReservation,
-    TransferCapacity,
-    TransferPool,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -1132,26 +1130,34 @@ def test_transfer_orders_destination_writes_before_its_copy(
 def test_queued_copy_does_not_wait_for_later_destination_stream_work() -> None:
     device = torch.device("cuda:0")
     events = EventPool()
-    capacity = TransferCapacity(byte_capacity=16, ticket_capacity=1)
-    pool = TransferPool(
-        workers=1, capacity=capacity, name="tensor-read", event_pool=events
+    transport = make_transport(
+        "channel", byte_capacity=32, ticket_capacity=2, event_pool=events
     )
     source = torch.arange(4, dtype=torch.float32, pin_memory=True)
+    locator = transport.export(source)
     # Load the fill kernel before any stream is deliberately blocked.
     destination = torch.full((4,), -1.0, device=device)
     initializer = torch.cuda.Stream(device=device)
     allow_copy = threading.Event()
+    occupied = threading.Event()
     retired = threading.Event()
 
-    def read(ticket):
+    def consume_first():
+        # A real completion observer keeps the read thread occupied while
+        # the next read captures its destination handoff on the caller.
+        occupied.set()
         assert allow_copy.wait(30), "read was not released"
-        pool.copy(ticket, source, destination)
 
     try:
+        transport.set_completion_wake(consume_first)
+        first = transport.fetch(locator, device=torch.device("cpu"))
+        assert occupied.wait(30), "first read never became consumable"
         with blocked_stream(device) as unrelated:
             with torch.cuda.stream(initializer):
                 destination.fill_(-1)
-                ticket = pool.submit(read, nbytes=16, destination=destination)
+                ticket = transport.fetch(
+                    locator, device=device, destination=destination
+                )
                 ticket.add_retirement_callback(retired.set)
 
                 # Work submitted after the read may itself depend on its
@@ -1163,8 +1169,9 @@ def test_queued_copy_does_not_wait_for_later_destination_stream_work() -> None:
             torch.testing.assert_close(
                 ticket.result().cpu(), source, rtol=0, atol=0
             )
+            torch.testing.assert_close(first.result(), source, rtol=0, atol=0)
     finally:
         allow_copy.set()
-        pool.close()
+        transport.close()
         initializer.synchronize()
         events.close()
