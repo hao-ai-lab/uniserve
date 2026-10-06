@@ -99,7 +99,11 @@ impl OutputBuffer {
         Ok((offset, count))
     }
 
-    fn capture_bytes(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    pub(super) fn capture_bytes(
+        &self,
+        py: Python<'_>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
         let numerical = py.import("uniserve_worker.storage.output")?;
         let value = numerical.call_method1("_bytes", (value,))?;
         let count = value.call_method0("numel")?.extract()?;
@@ -210,17 +214,12 @@ impl OutputBuffer {
     }
 
     fn retain_cpu_reader(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        slf.get()
-            .lock(slf.py())?
-            .retain_reader()
-            .map_err(|error| native_error(slf.py(), error))?;
+        slf.get().retain_reader(slf.py())?;
         Ok(slf.getattr("_release_cpu_reader")?.unbind())
     }
 
     fn _release_cpu_reader(&self, py: Python<'_>) -> PyResult<()> {
-        self.lock(py)?
-            .release_reader()
-            .map_err(|error| native_error(py, error))
+        self.release_reader(py)
     }
 
     fn _copies_finished(&self, py: Python<'_>) -> PyResult<()> {
@@ -245,6 +244,19 @@ impl OutputBuffer {
 }
 
 impl OutputBuffer {
+    /// Keep captured storage live while host encoding reads it.
+    pub(super) fn retain_reader(&self, py: Python<'_>) -> PyResult<()> {
+        self.lock(py)?
+            .retain_reader()
+            .map_err(|error| native_error(py, error))
+    }
+
+    pub(super) fn release_reader(&self, py: Python<'_>) -> PyResult<()> {
+        self.lock(py)?
+            .release_reader()
+            .map_err(|error| native_error(py, error))
+    }
+
     /// Capture one numerical score column and retain its native row layout.
     pub(super) fn capture_logprobs(
         &self,

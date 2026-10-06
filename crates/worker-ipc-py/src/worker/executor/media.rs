@@ -71,15 +71,11 @@ impl PythonBackend {
     ) -> PyResult<Py<Buffer>> {
         let reference = &batch.plan.calls[index].outputs[output];
         let pending = batch.pending(py, index);
-        let writes = pending.borrow(py).writes.clone_ref(py);
-        for write in writes.bind(py) {
-            let write = write.cast_into::<Buffer>()?;
-            if write.get().id(py) == reference.buffer_id() && !write.get().feature(py) {
-                self.tensors.get().defer_write(py, &write)?;
-                return Ok(write.unbind());
-            }
-        }
-        Err(invalid(py, "host media output has no reserved storage"))
+        let write = pending
+            .borrow(py)
+            .write_buffer(py, reference.buffer_id(), false)?;
+        self.tensors.get().defer_write(py, write.bind(py))?;
+        Ok(write)
     }
 
     pub(super) fn read_media(

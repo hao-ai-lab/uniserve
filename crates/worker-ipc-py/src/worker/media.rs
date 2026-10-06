@@ -4,13 +4,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use pyo3::buffer::PyBuffer;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
 use pyo3::types::{PyBytes, PyDict, PySlice, PyTuple};
 use uniserve_worker_ipc::{TensorTransfer, TransferTransport};
 
+use super::completion::Completion;
 use super::error::invalid;
 use super::locator::Locator;
+use super::output::OutputBuffer;
 use super::pending::PendingOutput;
 use super::shared_buffer::SharedRead;
 use super::storage::TensorStore;
@@ -64,6 +67,11 @@ impl Drop for MuxSession {
 }
 
 pub(super) enum MediaTask {
+    Image {
+        pixels: Py<PyAny>,
+        buffer: Py<OutputBuffer>,
+        maximum: usize,
+    },
     Video {
         config: Py<PyAny>,
         source: Py<PyAny>,
@@ -82,8 +90,36 @@ pub(super) enum MediaTask {
 }
 
 impl MediaTask {
+    pub(super) fn ready(&self, py: Python<'_>) -> PyResult<bool> {
+        match self {
+            Self::Image { buffer, .. } => buffer.get().ready(py),
+            _ => Ok(true),
+        }
+    }
+
+    pub(super) fn completion(&self, py: Python<'_>) -> PyResult<Option<Py<Completion>>> {
+        match self {
+            Self::Image { buffer, .. } => buffer.get().completion(py).map(Some),
+            _ => Ok(None),
+        }
+    }
+
     pub(super) fn run(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self {
+            Self::Image {
+                pixels, maximum, ..
+            } => {
+                let encoded = py
+                    .import("uniserve_worker.media.codec")?
+                    .call_method1("uint8_image_to_png_base64_bytes", (pixels,))?;
+                let size = encoded.len()?;
+                if size == 0 || size > *maximum {
+                    return Err(PyRuntimeError::new_err(
+                        "encoded image is empty or exceeds its completion byte bound",
+                    ));
+                }
+                Ok(encoded.unbind())
+            }
             Self::Video { config, source } => py
                 .import("uniserve_worker.media.mux")?
                 .call_method1("encode_unit", (config, source))
@@ -127,6 +163,9 @@ impl MediaTask {
     }
 
     pub(super) fn release(&self, py: Python<'_>) -> PyResult<()> {
+        if let Self::Image { buffer, .. } = self {
+            return buffer.get().release_reader(py);
+        }
         if let Self::Video { source, .. } = self
             && let Ok(borrow) = source.bind(py).cast::<SharedRead>()
         {
@@ -137,6 +176,10 @@ impl MediaTask {
 
     pub(super) fn traverse(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
         match self {
+            Self::Image { pixels, buffer, .. } => {
+                visit.call(pixels)?;
+                visit.call(buffer)?;
+            }
             Self::Video { config, source } => {
                 visit.call(config)?;
                 visit.call(source)?;

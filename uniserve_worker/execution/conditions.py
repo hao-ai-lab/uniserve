@@ -1,25 +1,11 @@
-"""Condition products of a video request: their layouts and encodings.
+"""Numerical layouts and encodings for ordered video conditions.
 
-A conditioned video request (``fl2va``, ``ref2va``) runs three calls before
-latent preparation, each publishing products the engine reserved at
-admission with the request's exact leading extents:
-
-- ``MediaReading`` (``uniserve_worker.execution.media_reader``) decodes the
-  condition media on a host rank: ``condition_pixels``, the RGB24 frames the
-  video encoder encodes; ``condition_samples``, the PCM the audio encoder
-  encodes; and ``vision_pixels``, the vision encoder's packed patch rows.
-- ``VisionEncoding`` (``encode_vision``) turns the patch rows into
-  ``vision_features``, one row per vision placeholder of the presentation,
-  which text encoding splices into the prompt (``vision_inputs``).
-- ``LatentEncoding`` (``encode_latents``) turns the pixels into
-  ``condition_video_latents`` in rounds of temporal units, each round
-  covering the next units its component's ranks encode together, and the
-  PCM into ``condition_audio_latents`` in one call.
-
-Every product concatenates its conditions in request order. The server
-presents the vision blocks in request order too, so the vision features are
-in the order of the presentation's placeholders. Latent preparation reads
-the text features and every condition latent (``condition_latents``).
+Host reading produces RGB24 pixels, model-rate stereo PCM and packed vision
+patches. Vision encoding produces one feature row per prompt placeholder.
+Video and audio encoders produce latent rows consumed by latent preparation.
+Every product concatenates conditions in request order. Visual latent rows
+follow temporal encoding units; the native executor selects each rank's run
+and retains input tensors through completion.
 """
 
 from __future__ import annotations
@@ -42,9 +28,7 @@ from uniserve_worker.protocol.video import VideoAdmission
 from uniserve_worker.storage.tensor_store import device_product_storage
 
 if TYPE_CHECKING:
-    from uniserve_worker._uniserve_ipc import BatchState
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.execution.output import PendingOutput
     from uniserve_worker.model_executor.component_binding import (
         ComponentBinding,
     )
@@ -52,8 +36,6 @@ if TYPE_CHECKING:
     from uniserve_worker.protocol.batch import DecodeRange
     from uniserve_worker.protocol.call import Call
     from uniserve_worker.protocol.tensor import OutputInfo
-    from uniserve_worker.storage.tensor_store import TensorStore
-    from uniserve_worker.transport.interface import Transport
 
 #: RGB24 pixels of every visual condition, ``[pixels, 3]`` uint8.
 CONDITION_PIXELS = "condition_pixels"
@@ -79,18 +61,6 @@ CONDITION_PRODUCTS = frozenset(
         CONDITION_AUDIO_LATENTS,
     }
 )
-
-
-def video_admission(request: PendingOutput) -> VideoAdmission:
-    """Return a conditioned video request's admission.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` for a request without conditions.
-    """
-    video = request.request.admission.video
-    if video is None or not video.conditions:
-        raise invalid_descriptor("a condition call requires conditions")
-    return video
 
 
 def library_conditions(video: VideoAdmission) -> tuple[Condition, ...]:
@@ -248,87 +218,6 @@ def condition_layout(
     )
 
 
-def _consume_whole(
-    call: Call,
-    index: int,
-    *,
-    state: BatchState,
-    tensor_store: TensorStore,
-    model_runner: ModelExecutor,
-) -> torch.Tensor:
-    """Read one of a call's inputs whole on the call's compute device.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when the input is missing or
-            arrives only in part.
-    """
-    if index >= len(call.inputs):
-        raise invalid_descriptor("a condition call lacks one of its inputs")
-    request = state.pending_output(call.request_key.request_id)
-    read = tensor_store.consume(
-        call.inputs[index],
-        consumer_call_id=call.call_id,
-        device=model_runner.call_devices(call)[0],
-    )
-    request.device_reads.append(read)
-    if read.region is not None or read.tensor is None:
-        raise invalid_descriptor("a condition call requires its whole input")
-    return read.tensor
-
-
-def _outcome(
-    request: PendingOutput,
-    result: ExecutionOutput,
-    state: BatchState,
-) -> PendingOutput:
-    """Record a condition call's numerical execution statistics."""
-    if result.stats is None:
-        raise RuntimeError("module output has no execution statistics")
-    state.record_forward(result.stats)
-    return request
-
-
-def encode_vision(
-    call: Call,
-    *,
-    state: BatchState,
-    tensor_store: TensorStore,
-    export_transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
-) -> PendingOutput:
-    """Encode a request's vision blocks into one row per placeholder.
-
-    The call reads ``vision_pixels``, one packed sample per condition the
-    conditioner reads, and publishes ``vision_features``: every sample's
-    rows, in request order.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when the inputs or outputs
-            disagree with the request's conditions.
-    """
-    request = state.pending_output(call.request_key.request_id)
-    video = video_admission(request)
-    if len(call.outputs) != 1:
-        raise invalid_descriptor(
-            "vision encoding publishes one product of the request's blocks"
-        )
-    patches = _consume_whole(
-        call,
-        0,
-        state=state,
-        tensor_store=tensor_store,
-        model_runner=model_runner,
-    )
-    features, result = vision_features(video, patches, model_runner)
-    state.export_tensors(
-        call.request_key.request_id,
-        (features,),
-        tensor_store,
-        export_transports,
-    )
-    return _outcome(request, result, state)
-
-
 def vision_features(
     video: VideoAdmission, patches: torch.Tensor, model_runner: ModelExecutor
 ) -> tuple[torch.Tensor, ExecutionOutput]:
@@ -390,41 +279,6 @@ def vision_grids(
         "image_grids": tuple(view.grid for view, moving in views if not moving),
         "video_grids": tuple(view.grid for view, moving in views if moving),
     }
-
-
-def vision_inputs(
-    call: Call,
-    *,
-    state: BatchState,
-    tensor_store: TensorStore,
-    model_runner: ModelExecutor,
-) -> dict[str, object]:
-    """Return text encoding's vision inputs for a conditioned prompt.
-
-    A text encoding call of a request with vision blocks reads their
-    ``vision_features``. The result holds them as ``visual`` with the
-    blocks' grids (``vision_grids``), the keywords
-    ``ModelExecutor.encode_text`` takes; it is empty for a call without
-    inputs.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when the call reads features of
-            a request without vision blocks, or more than one input.
-    """
-    if not call.inputs:
-        return {}
-    request = state.pending_output(call.request_key.request_id)
-    video = video_admission(request)
-    if len(call.inputs) != 1:
-        raise invalid_descriptor("text encoding reads one vision product")
-    visual = _consume_whole(
-        call,
-        0,
-        state=state,
-        tensor_store=tensor_store,
-        model_runner=model_runner,
-    )
-    return {"visual": visual, **vision_grids(video)}
 
 
 def _condition_offsets(video: VideoAdmission) -> tuple[int, ...]:
@@ -537,65 +391,6 @@ def encode_tracks(
     return torch.cat(result.values), result
 
 
-def encode_latents(
-    call: Call,
-    *,
-    state: BatchState,
-    tensor_store: TensorStore,
-    export_transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
-) -> PendingOutput:
-    """Encode one round of a request's condition latents.
-
-    A visual round reads ``condition_pixels`` and publishes the rows of the
-    units this rank takes of the round; the audio call reads
-    ``condition_samples`` and publishes every track's rows. The call's
-    decode range names the round's units, counted from the request's first
-    visual unit, or the audio call's one unit.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when the inputs, the round or
-            the encoded rows disagree with the request's conditions.
-    """
-    request = state.pending_output(call.request_key.request_id)
-    video = video_admission(request)
-    encoder = condition_encoder(call, model_runner.outputs)
-    if encoder is None or len(call.outputs) != 1:
-        raise invalid_descriptor(
-            "latent encoding publishes one condition latent product"
-        )
-    source = _consume_whole(
-        call,
-        0,
-        state=state,
-        tensor_store=tensor_store,
-        model_runner=model_runner,
-    )
-    if encoder is VideoEncoder:
-        # This rank encodes its share of the round's units, which follow
-        # the earlier rounds' units.
-        covered = _round_units(
-            video, state.decode_range(call.request_key.request_id)
-        )
-        run = model_runner.bindings[call.component].media_units(
-            covered.start, len(covered)
-        )
-        if not run:
-            raise invalid_descriptor(
-                "a latent encoding round assigns this rank no unit"
-            )
-        rows, result = encode_units(video, run, source, model_runner)
-    else:
-        rows, result = encode_tracks(video, source, model_runner)
-    state.export_tensors(
-        call.request_key.request_id,
-        (rows,),
-        tensor_store,
-        export_transports,
-    )
-    return _outcome(request, result, state)
-
-
 def condition_latents(
     video: VideoAdmission, reads: Sequence[torch.Tensor]
 ) -> tuple[torch.Tensor, ...]:
@@ -646,13 +441,9 @@ __all__ = [
     "condition_latents",
     "condition_layout",
     "condition_units",
-    "encode_latents",
     "encode_tracks",
     "encode_units",
-    "encode_vision",
     "library_conditions",
-    "video_admission",
     "vision_features",
     "vision_grids",
-    "vision_inputs",
 ]

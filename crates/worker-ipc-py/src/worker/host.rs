@@ -60,6 +60,9 @@ impl HostAction for HostOperation {
 
     fn ready(&self) -> Result<bool, Self::Error> {
         Python::attach(|py| {
+            if let Action::Media(action) = &self.action {
+                return action.ready(py).map_err(|error| error.into_value(py));
+            }
             self.input_ready
                 .as_ref()
                 .map_or(Ok(true), |ready| ready.bind(py).call0()?.is_truthy())
@@ -448,11 +451,14 @@ impl HostTask {
         action: MediaTask,
         profile_name: String,
     ) -> PyResult<()> {
+        let input_completion = action
+            .completion(py)?
+            .map(|owner| CompletionRef::new(py, owner));
         let operation = HostOperation {
             action: Action::Media(action),
             dependencies: Vec::new(),
             input_ready: None,
-            input_completion: None,
+            input_completion,
             release: None,
             profile_name,
         };

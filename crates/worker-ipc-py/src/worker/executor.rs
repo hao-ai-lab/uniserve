@@ -1,9 +1,11 @@
 //! Python numerical backend for the shared native batch executor.
 
 mod commit;
+mod conditions;
 mod dispatch;
 mod execute;
 mod forward;
+mod image;
 mod inputs;
 mod latents;
 mod media;
@@ -106,6 +108,22 @@ struct BatchState {
 }
 
 impl BatchState {
+    fn record_result(
+        &self,
+        py: Python<'_>,
+        result: &Bound<'_, super::model_results::ExecutionOutput>,
+    ) -> PyResult<()> {
+        let result = result.borrow();
+        let stats = result
+            .stats
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("module output has no execution statistics"))?;
+        self.numerical
+            .borrow_mut(py)
+            .record_forward(stats.borrow(py));
+        Ok(())
+    }
+
     fn pending_outputs<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PendingOutput>> {
         self.numerical
             .borrow(py)

@@ -983,28 +983,6 @@ class BatchState:
     def forward_rows(self, request_id: int) -> tuple[int, ...]:
         """Return numerical forward rows in scheduler order."""
     def pending_outputs(self) -> tuple[PendingOutput, ...]: ...
-    def decode_range(self, request_id: int) -> DecodeRange: ...
-    def complete_latent(self, request_id: int) -> None: ...
-    def record_forward(self, stats: ForwardStats) -> None: ...
-    def execution_stats(self) -> ForwardStats: ...
-    def consume_tensor(
-        self,
-        request_id: int,
-        tensor_store: TensorStore,
-        device: torch.device,
-    ) -> TensorRead:
-        """Borrow the call's resident source through completion."""
-    def export_tensors(
-        self,
-        request_id: int,
-        values: Sequence[torch.Tensor],
-        tensor_store: TensorStore,
-        transports: Mapping[str, Transport],
-        *,
-        host: bool = False,
-        regions: Sequence[Sequence[tuple[slice, ...]]] | None = None,
-    ) -> None:
-        """Export this rank's numerical outputs and retain native results."""
     def pending_output(self, request_id: int) -> PendingOutput: ...
 
 @final
@@ -1030,8 +1008,6 @@ class BatchInputs:
     ) -> None: ...
     def tensor(self, buffer: BufferId) -> TensorRead | None: ...
     def cache(self, buffer: BufferId) -> KVImport | None: ...
-    def add_image(self, call: CallId, task: HostTask) -> None: ...
-    def image(self, call: CallId) -> HostTask | None: ...
     def on_ready(self, callback: Callable[[], None]) -> None:
         """Notify once this snapshot of dependencies is consumable."""
     def close(
@@ -1070,12 +1046,6 @@ class PendingOutput:
     def cache_coordinates(
         self, tables: block_tables.BlockTables | None
     ) -> tuple[int, int, int]: ...
-    @property
-    def host_tasks(self) -> tuple[HostTask[Any], ...]: ...
-    def set_host_tasks(
-        self,
-        tasks: Sequence[HostTask[Any]],
-    ) -> None: ...
     @property
     def request_key(self) -> RequestKey: ...
     @property
