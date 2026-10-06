@@ -583,9 +583,49 @@ class Call:
 RunnerT = TypeVar("RunnerT")
 
 class ModelRunners(Generic[RunnerT]):
-    """Route component operations and assemble homogeneous numerical batches."""
+    """Own prepared methods and route homogeneous numerical batches."""
 
     def __init__(self) -> None: ...
+    def register(
+        self,
+        name: str,
+        binding: Any,
+        call: Any,
+        kinds: Iterable[CallKind],
+        outputs: tuple[Any, ...],
+        *,
+        encoder: str | None = None,
+    ) -> None: ...
+    def calls(self) -> tuple[tuple[str, Any, Any], ...]: ...
+    def component(
+        self, kind: CallKind, *, capability_type: type | None = None
+    ) -> Any: ...
+    def encoder(self, kind: str) -> tuple[str, Any]: ...
+    @property
+    def encoder_kinds(self) -> frozenset[str]: ...
+    def call_stream(self, owner: ModelExecutor, call: Call) -> Any: ...
+    def prepare_module(
+        self,
+        owner: ModelExecutor,
+        name: str,
+        size: Any,
+        *,
+        method: str | None = None,
+        path: str | None = None,
+    ) -> RunnerT: ...
+    def module_stream(
+        self,
+        owner: ModelExecutor,
+        name: str,
+        *,
+        method: str | None = None,
+        path: str | None = None,
+    ) -> Any: ...
+    @property
+    def prepared(self) -> tuple[RunnerT, ...]: ...
+    @property
+    def module_streams(self) -> tuple[Any, ...]: ...
+    def close_modules(self) -> None: ...
     def bind(
         self, component: str, kinds: Iterable[CallKind], runner: RunnerT
     ) -> None: ...
@@ -606,7 +646,15 @@ class ModelRunners(Generic[RunnerT]):
         forward: Callable[[InputBatch], ExecutionOutput],
     ) -> None: ...
     def run_module(
-        self, runner: RunnerT, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self,
+        owner: ModelExecutor,
+        name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        size: Any = None,
+        method: str | None = None,
+        path: str | None = None,
     ) -> ExecutionOutput: ...
     def run_batch(
         self,

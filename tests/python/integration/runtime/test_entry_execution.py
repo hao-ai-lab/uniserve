@@ -1,5 +1,6 @@
 """Public component execution, export and component participation."""
 
+import gc
 import threading
 from types import SimpleNamespace
 
@@ -310,40 +311,62 @@ def test_module_call_statistics_count_the_call_without_tokens():
     assert output.stats.mode_tokens == {}
 
 
-@pytest.mark.gpu
-def test_module_graphs_preserve_results_and_run_unseen_shapes_after_startup():
-    model = EncodedModel().to("cuda:0")
+@pytest.mark.parametrize(
+    ("device", "graph_policy"),
+    (("cpu", "off"), pytest.param("cuda:0", "full", marks=pytest.mark.gpu)),
+)
+def test_module_execution_preserves_results_across_serving_size_eviction(
+    device, graph_policy
+):
+    model = EncodedModel().to(device)
     runner = ModelExecutor(
         model,
-        WorkerConfig(device="cuda:0", graph_policy="full"),
+        WorkerConfig(
+            device=device, graph_policy=graph_policy, max_request_pool_size=1
+        ),
         bindings=_encoder_bindings(
-            model, (("text_encoder", ComponentConfig((0,))),), "cuda:0"
+            model, (("text_encoder", ComponentConfig((0,))),), device
         ),
     )
     try:
         retained = []
-        for tokens, path in (
-            ((2, 5), "graph_capture"),
-            ((3, 1), "graph_replay"),
-            ((2, 4, 7), "eager"),
+        for index, (tokens, path) in enumerate(
+            (
+                ((2, 5), "graph_capture"),
+                ((3, 1), "graph_replay"),
+                ((2, 4, 7), "eager"),
+                ((1, 4, 3, 6), "eager"),
+                ((7, 2, 1), "eager"),
+                ((6, 4), "graph_replay"),
+            )
         ):
-            inputs = torch.tensor(tokens, device="cuda:0")
+            inputs = torch.tensor(tokens, device=device)
             result = runner.run_encoder("text", inputs)
             expected = (
-                inputs[:, None] * 4 + torch.arange(4, device="cuda:0")
+                inputs[:, None] * 4 + torch.arange(4, device=device)
             ).float()
             retained.append((result.values[0], expected))
-            assert result.stats.cuda_graph_runtime_mode_counts == {path: 1}
+            mode = path if graph_policy == "full" else "eager"
+            assert result.stats.cuda_graph_runtime_mode_counts == {mode: 1}
             assert result.stats.mode_tokens == {}
-            if path == "graph_capture":
+            if index == 0:
                 runner.complete_startup()
 
         # Later module calls may reuse numerical backing. Previously returned
-        # results still belong to their callers, including across eager work.
+        # results survive eager context eviction. Startup graphs stay resident
+        # while the one serving slot cycles through other numerical sizes.
         for actual, expected in retained:
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     finally:
-        runner.close()
+        # Closing numerical resources allocates Python objects. Collection
+        # during those allocations must be able to visit their native owners.
+        thresholds = gc.get_threshold()
+        gc.collect()
+        gc.set_threshold(1, *thresholds[1:])
+        try:
+            runner.close()
+        finally:
+            gc.set_threshold(*thresholds)
 
 
 @pytest.mark.parametrize("rank", [0, 1])
