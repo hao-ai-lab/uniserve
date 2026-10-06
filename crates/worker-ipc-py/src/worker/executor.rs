@@ -756,6 +756,35 @@ impl Executor {
 }
 
 impl Executor {
+    pub(super) fn info(&self) -> PyResult<&WorkerInfo> {
+        self.executor
+            .as_ref()
+            .map(|executor| &executor.backend().info)
+            .ok_or_else(|| PyRuntimeError::new_err("executor is closed"))
+    }
+
+    /// Execute a native batch synchronously through the serving executor.
+    /// Numerical callbacks acquire the GIL themselves; progress and result
+    /// delivery require no Python batch-output construction or polling loop.
+    pub(super) fn run(&mut self, py: Python<'_>, plan: Arc<BatchPlan>) -> PyResult<BatchResult> {
+        plan.validate()
+            .map_err(|error| super::error::invalid(py, error.to_string()))?;
+        let executor = self.executor_mut()?;
+        let batch = Bound::new(py, crate::batches::Batch::from(Arc::clone(&plan)))?;
+        let state = executor.backend().batch_state(py, &batch, true)?;
+        py.detach(|| {
+            let submission = executor.submit(Batch::from_plan(&plan, state), true)?;
+            loop {
+                executor.advance()?;
+                if let Some(output) = executor.poll(&submission)? {
+                    return Ok(output);
+                }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        })
+        .map_err(|error: Py<PyBaseException>| PyErr::from_value(error.into_bound(py).into_any()))
+    }
+
     fn executor_mut(&mut self) -> PyResult<&mut NativeExecutor<PythonBackend>> {
         self.executor
             .as_mut()

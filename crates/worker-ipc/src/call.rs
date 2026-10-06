@@ -627,6 +627,42 @@ pub struct Call {
 }
 
 impl Call {
+    /// Create a computation with no inputs or outputs and zero resource bounds.
+    /// The caller fills its numerical coordinates and limits before submission.
+    pub fn new(request_key: RequestKey, call_id: CallId, code: CallKind) -> Self {
+        Self {
+            request_key,
+            call_id,
+            code,
+            component: DEFAULT_COMPONENT.into(),
+            coordinates: CallCoordinates::default(),
+            bounds: Bounds::default(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            consumer_slots: Vec::new(),
+            token_input: None,
+            token_output: None,
+            vision_inputs: Vec::new(),
+            latent_feature_input: None,
+            encoder_output: None,
+            latent_input: None,
+            latent_output: None,
+            image_input: None,
+            image_output: None,
+            completion_output: None,
+            transition_output: None,
+            predicate: None,
+            rng: None,
+            sampling_state: None,
+            input_token_ids: Vec::new(),
+            readout: None,
+            canvas: None,
+            input_image: None,
+            kv_input: None,
+            kv_output: None,
+        }
+    }
+
     /// A context prefill interleaves prompt tokens and input-image blocks.
     pub fn writes_context(&self) -> bool {
         self.code == CallKind::Forward(ForwardMode::Prefill)

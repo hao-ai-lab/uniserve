@@ -8,6 +8,8 @@
 //! an engine waiting for commands.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+mod allocation;
+pub use allocation::ByteAllocator;
 mod parallel;
 pub use parallel::{
     ComponentConfig, ComponentDistribution, ParallelConfig, ParallelConfigError, SequenceParallel,
