@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use indexmap::IndexMap;
 use uniserve_core::CallId;
-use uniserve_worker_ipc::{CallStatus, NewRequest, RequestKey};
+use uniserve_worker_ipc::{CallStatus, CanvasStep, NewRequest, RequestKey};
 
 use crate::{Error, Result};
 
@@ -26,6 +26,8 @@ pub struct RequestProgress {
 #[derive(Debug, Default)]
 struct RequestState {
     progress: RequestProgress,
+    // Last submitted canvas step, independent of accepted device results.
+    canvas: Option<CanvasStep>,
     accepted_call: CallId,
     state_call: CallId,
     // Insertion order is submission order, which need not equal call-id order.
@@ -278,6 +280,42 @@ impl RequestPool {
                 .find_map(|(&id, &advances)| advances.then_some(id))
                 .unwrap_or(state.state_call),
         ))
+    }
+
+    /// Submit the next canvas step of a retained request epoch.
+    ///
+    /// Queued steps can precede device completion, so these coordinates are
+    /// distinct from accepted progress. A new epoch starts without a canvas;
+    /// its device banks are initialized by step zero before their first read.
+    pub fn advance_canvas(&self, key: RequestKey, step: CanvasStep) -> Result<()> {
+        let request = self.get(key.request_id.0)?;
+        let mut state = request.state()?;
+        if request.key() != key || state.retired {
+            return Err(Error::Invalid(
+                "canvas step requires the retained request epoch".into(),
+            ));
+        }
+
+        let follows = if step.step == 0 {
+            state
+                .canvas
+                .is_none_or(|last| last.block.checked_add(1) == Some(step.block))
+        } else {
+            state.canvas
+                == Some(CanvasStep {
+                    block: step.block,
+                    step: step.step - 1,
+                })
+        };
+        if !follows {
+            return Err(Error::Invalid(format!(
+                "canvas step {step:?} does not continue {:?}",
+                state.canvas
+            )));
+        }
+
+        state.canvas = Some(step);
+        Ok(())
     }
 
     /// Retire one call's pending state. Stale epochs and duplicate results

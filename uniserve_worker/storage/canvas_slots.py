@@ -11,13 +11,10 @@ Concurrent executions own separate input buffers and sampler workspaces while
 sharing these banks for disjoint request slots. Slot ``0`` is the padding
 sentinel, as in ``DecodeState``.
 
-Every canvas uses the one block-diffusion sampling the deployment serves
-(``WorkerConfig.canvas_sampling``): its stability threshold sizes the
-argmax history, and a request that carries other sampling is refused
-(``sampling``). The host records the step each slot ran last, so a call that
-skips or repeats a step of its canvas is refused before any device work
-(``advance``); ``reset`` forgets a slot's canvas when a request is admitted
-to it or released from it.
+Every canvas uses the block-diffusion sampling the deployment serves
+(``WorkerConfig.canvas_sampling``); its stability threshold sizes the
+argmax history. The native executor checks the admitted sampling and
+advances submitted canvas coordinates in the request pool.
 
 A step may be queued behind the one before it, before that one's result is
 known. Each slot therefore also keeps, on the device, whether its block
@@ -28,15 +25,12 @@ result row reports ``STEP_SKIPPED``.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import torch
 
 from uniserve.diffusion import canvas as sampler
 from uniserve.model import CanvasTokens, TokenDenoiser
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
-from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.batch import CanvasSampling
 
 # Sampler state fields kept per slot, each a bank with one row per slot.
@@ -164,9 +158,6 @@ class CanvasSlots:
         # step it ran last. Step zero sets it, and a step that stops the
         # block clears it.
         self.live = tensors["live"]
-        # Per slot, the (block, step) it ran last; absent for a slot whose
-        # canvas has not started since its request was admitted.
-        self._last: dict[int, tuple[int, int]] = {}
 
     @classmethod
     def for_denoiser(
@@ -257,53 +248,6 @@ class CanvasSlots:
         self.banks = {}
         self._backing.close()
 
-    def sampling(self, admitted: CanvasSampling) -> sampler.CanvasSampling:
-        """The sampler constants of a request's admitted canvas sampling.
-
-        Every request carries the sampling the deployment serves, so these
-        are ``constants``.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when ``admitted`` is not the
-                served sampling.
-        """
-        if admitted != self.served:
-            raise invalid_descriptor(
-                "the admitted canvas sampling is not the sampling this "
-                "worker serves"
-            )
-        return self.constants
-
-    def advance(self, slot: int, block: int, step: int) -> None:
-        """Record that ``slot`` runs step ``step`` of its block ``block``.
-
-        Step zero starts a canvas: the slot's first, or the one after the
-        block it ran last. Any other step must follow the slot's last step
-        of the same block.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` for a slot outside the pool
-                or a step that does not continue the slot's canvas.
-        """
-        self._validate((slot,))
-        last = self._last.get(slot)
-        if step == 0:
-            expected = last is None or block == last[0] + 1
-        else:
-            expected = last == (block, step - 1)
-        if not expected:
-            raise invalid_descriptor(
-                f"canvas step {(block, step)} does not continue slot {slot}'s "
-                f"canvas at {last}"
-            )
-        self._last[slot] = (block, step)
-
-    def reset(self, slots: Sequence[int]) -> None:
-        """Forget the canvases of ``slots``; their next step must be zero."""
-        self._validate(slots)
-        for slot in slots:
-            self._last.pop(int(slot), None)
-
     def gather(
         self, slots: torch.Tensor, views: dict[str, torch.Tensor]
     ) -> None:
@@ -341,7 +285,3 @@ class CanvasSlots:
             else:
                 selected = slots > 0
                 bank[slots[selected]] = values[selected]
-
-    def _validate(self, slots: Sequence[int]) -> None:
-        if any(not 1 <= int(slot) <= self.request_pool_size for slot in slots):
-            raise invalid_descriptor("canvas state slot is outside the pool")

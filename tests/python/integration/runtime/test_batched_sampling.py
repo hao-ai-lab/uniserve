@@ -331,10 +331,14 @@ def test_verify_commits_every_accepted_position() -> None:
         ),
     ],
 )
+@pytest.mark.parametrize("relay", (False, True))
 def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     device: str,
+    relay: bool,
+    request,
 ) -> None:
     worker = execution_worker(device=device, queue_depth=2)
+    request.addfinalizer(worker.close)
     admission = ar_params(5, block_ids=(4,))
     extend = token_call(
         admission.request_key,
@@ -362,6 +366,11 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
         tokens=(prime.completions[0].committed_tokens[0], 900, 901),
     )
 
+    if relay:
+        verify = verify.replace(
+            input_token_ids=(900, 901), predicate=extend.token_output
+        )
+
     result = finalized_report(
         worker, worker.submit(execution_batch(batch_id=2, calls=(verify,)))
     )
@@ -381,7 +390,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
         worker,
         execution_batch(batch_id=3, calls=(successor,)).replace(
             seq_lens=(
-                len(extend.input_token_ids) + len(verify.input_token_ids) + 1,
+                len(extend.input_token_ids) + verify.bounds.max_tokens + 1,
             ),
         ),
     )

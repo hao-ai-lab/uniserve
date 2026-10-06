@@ -268,11 +268,8 @@ impl PythonBackend {
             return Ok(());
         }
         let slots = PyTuple::new(py, slots)?;
-        for name in ["decode_state", "canvas_slots"] {
-            let state = self.worker.bind(py).getattr(name)?;
-            if !state.is_none() {
-                state.call_method1("reset", (&slots,))?;
-            }
+        if let Some(state) = &self.decode_state {
+            state.bind(py).call_method1("reset", (&slots,))?;
         }
         Ok(())
     }

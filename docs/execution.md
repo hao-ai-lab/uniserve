@@ -160,9 +160,11 @@ Native `SharedRead` owns a consumer's mapping and acknowledgment slot. It waits 
 
 Prefill, token decode and token denoising use separate homogeneous numerical calls. A prefill can write context without projecting logits or sampling. Readout canvases attend to that context without changing its KV entries; their candidate probabilities are normalized over the full vocabulary.
 
+Rust prepares token and canvas inputs from the native batch descriptors. It selects logits, device continuations and request coordinates, partitions readout candidates, and retains visual feature reads through the shared tensor store. Python constructs numerical rows from those tensors and scalar coordinates; visual builders compute framing and M-RoPE positions without reading request state. A predicated verifier concatenates its device token and draft tokens on device. Indexed decode borrows tokens and positions directly from its request slot.
+
 Block-diffusion generation retains each request's canvas tokens, stopping history and self-conditioning embeddings in its request slot. Each scheduled denoising call advances one step. A completed block publishes its tokens together, and a causal prefill commits those tokens to context before the next block starts. EOS, token limits and stop strings apply to the delivered prefix of the block.
 
-The engine may queue a successor before its predecessor completes. Device continuation predicates make successors of a stopped canvas no-ops. The worker validates block and step progression before execution, and completion is accepted only for the current request epoch and submitted call. Cancellation retains request resources until outstanding readers retire; only then can another request reuse the slot.
+The engine may queue a successor before its predecessor completes. Device continuation predicates make successors of a stopped canvas no-ops. The native request pool tracks submitted block and step coordinates independently of accepted device results, and rejects skipped or repeated steps before execution. New request epochs start with no submitted canvas. Completion is accepted only for the current request epoch and submitted call. Cancellation retains request resources until outstanding readers retire; only then can another request reuse the slot.
 
 ## Prepared execution
 

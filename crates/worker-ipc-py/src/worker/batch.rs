@@ -49,7 +49,7 @@ pub(crate) struct BatchState {
     pub(super) forward_stats: uniserve_worker_ipc::ForwardStats,
     #[pyo3(get)]
     pub(super) component_us: Py<PyDict>,
-    forward_indices: Vec<Vec<usize>>,
+    pub(super) forward_indices: Vec<Vec<usize>>,
 }
 
 impl BatchState {

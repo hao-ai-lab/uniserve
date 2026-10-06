@@ -72,6 +72,7 @@ struct PythonBackend {
     output_pool: Py<OutputPool>,
     host_tasks: Py<HostLane>,
     decode_state: Option<Py<PyAny>>,
+    indexed_decode: bool,
     sampling_columns: usize,
     latents: Option<Py<LatentPool>>,
     cache: Option<Py<KVCacheManager>>,
@@ -523,6 +524,22 @@ impl Executor {
             })
             .collect();
 
+        let decode_state: Option<Py<PyAny>> = worker.getattr("decode_state")?.extract()?;
+        let block_tables = worker.getattr("block_tables")?;
+        // Placement is fixed for this executor. Only the continuation tag
+        // varies per call; indexed inputs require collocated CUDA storage.
+        let indexed_decode = if let Some(state) = &decode_state {
+            let device = state.bind(py).getattr("device")?;
+            !block_tables.is_none()
+                && device.getattr("type")?.extract::<String>()? == "cuda"
+                && block_tables
+                    .getattr("unit_tables")?
+                    .getattr("device")?
+                    .eq(device)?
+        } else {
+            false
+        };
+
         let backend = PythonBackend {
             worker: worker.clone().unbind(),
             read_backpressure: py
@@ -534,7 +551,8 @@ impl Executor {
             tensors: worker.getattr("tensor_store")?.extract()?,
             output_pool: worker.getattr("output_pool")?.extract()?,
             host_tasks: worker.getattr("host_tasks")?.extract()?,
-            decode_state: worker.getattr("decode_state")?.extract()?,
+            decode_state,
+            indexed_decode,
             sampling_columns: py
                 .import("uniserve_worker.sampling.result")?
                 .getattr("SAMPLING_COMPLETION_FIELDS")?
