@@ -225,11 +225,6 @@ impl PendingOutput {
         })
     }
 
-    fn set_cache_length(&self, py: Python<'_>, length: u64) -> PyResult<()> {
-        self.lock(py)?.set_cache_length(length);
-        Ok(())
-    }
-
     fn cache_coordinates(&self, tables: &Bound<'_, PyAny>) -> PyResult<(u32, u64, u32)> {
         let py = tables.py();
         if tables.is_none() {

@@ -124,6 +124,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<shared_buffer::SharedRead>()?;
     module.add("SHM_HEADER_BYTES", uniserve_worker::SHM_HEADER_BYTES)?;
     module.add_function(wrap_pyfunction!(shared_buffer::open_shared_memory, module)?)?;
+    module.add_function(wrap_pyfunction!(request::resolve_prefix_py, module)?)?;
     module.add_class::<request::Request>()?;
     module.add_class::<request::RequestProgress>()?;
     module.add_class::<request::RequestPool>()?;

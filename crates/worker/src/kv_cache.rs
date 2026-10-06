@@ -7,7 +7,7 @@ use std::sync::Arc;
 use uniserve_core::CallId;
 use uniserve_worker_ipc::{BufferId, KvTransfer, RequestKey};
 
-use crate::{Completion, Error, Result};
+use crate::{BlockTables, Completion, Error, Result};
 
 type Ranges = HashMap<u32, Range<u64>>;
 type Destinations = HashMap<(RequestKey, String), (BufferId, u32)>;
@@ -63,6 +63,36 @@ impl<C> Default for KVCacheManager<C> {
 impl<C> KVCacheManager<C> {
     pub fn resident(&self, buffer: BufferId) -> Option<&Arc<KvTransfer>> {
         self.resident.get(&buffer)
+    }
+
+    /// Borrow a conditioning export covered by the request's installed KV.
+    pub fn validate_conditioning(
+        &self,
+        request: RequestKey,
+        buffer: BufferId,
+        slot: u32,
+        visible: u64,
+        tables: &BlockTables,
+    ) -> Result<&Arc<KvTransfer>> {
+        let export = self
+            .resident(buffer)
+            .ok_or_else(|| Error::Invalid("KV export buffer is not resident".into()))?;
+        if buffer.owner != request {
+            return Err(Error::Invalid(
+                "KV conditioning buffer belongs to another request".into(),
+            ));
+        }
+        if visible < u64::from(export.exported_extent)
+            || tables.allocated_length(slot) < export.exported_extent
+        {
+            return Err(Error::Invalid(
+                "KV conditioning allocation disagrees with its export".into(),
+            ));
+        }
+        for group in 0..tables.groups().len() as u32 {
+            tables.table(slot, group)?;
+        }
+        Ok(export)
     }
 
     /// The latest extent sent to this destination, retained even after its

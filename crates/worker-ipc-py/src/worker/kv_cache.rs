@@ -187,6 +187,29 @@ impl KVCacheManager {
             .transpose()
     }
 
+    #[pyo3(signature = (request, buffer, *, request_pool_idx, visible_length))]
+    fn validate_conditioning(
+        &self,
+        py: Python<'_>,
+        request: Bound<'_, PyAny>,
+        buffer: Bound<'_, PyAny>,
+        request_pool_idx: u32,
+        visible_length: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let tables = self.tables.borrow(py);
+        let export = self
+            .inner
+            .validate_conditioning(
+                request_key(&request)?,
+                buffer_id(&buffer)?,
+                request_pool_idx,
+                visible_length,
+                &tables.tables,
+            )
+            .map_err(|error| native_error(py, error))?;
+        convert::kv_transfer_to_py(py, export).map(Bound::unbind)
+    }
+
     fn destination_base(
         &self,
         py: Python<'_>,

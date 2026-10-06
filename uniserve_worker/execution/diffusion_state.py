@@ -9,36 +9,10 @@ from typing import Any
 
 import torch
 
-from uniserve.diffusion import Branch, Guidance, Schedule
+from uniserve.diffusion import Guidance, Schedule
 from uniserve.model import ImageDenoiser
-from uniserve.processing import BranchSource
 from uniserve_worker.execution.host import HostTask
 from uniserve_worker.model_executor.diffusion_runner import Ladder
-
-
-@dataclass(slots=True)
-class KVConditioning:
-    """Where a KV-conditioned request's guidance branches read their prefix.
-
-    Solver samples borrow the pending call's latent buffer and are not
-    retained here. Physical prefix coordinates follow each submission's
-    descriptors, so ``cache`` and ``entries`` refresh per call; prefix tokens
-    and rotary positions are retained for the request's lifetime.
-    """
-
-    # Prefix token ids per source, with a flag that is true when the branch
-    # reads the request's own conditioning KV (``cache``) in place.
-    prefixes: dict[BranchSource, tuple[tuple[int, ...], bool]] = field(
-        default_factory=dict
-    )
-    # ``ImageBuilder.positions`` coordinates keyed by temporal position.
-    positions: dict[int, torch.Tensor] = field(default_factory=dict)
-    # The request's conditioning KV as (slot, visible length, token
-    # capacity), from ``PendingOutput.cache_coordinates``.
-    cache: tuple[int, int, int] = (0, 0, 0)
-    # Each branch's prefix as (slot, materialized prefix length, token
-    # capacity); the slot is the request's own or an alternative-prefix slot.
-    entries: dict[Branch, tuple[int, int, int]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -65,8 +39,9 @@ class DiffusionState:
     ``size`` is the admitted numerical size and ``schedules`` the fixed
     schedule of every sample modality. ``guidance`` selects and combines the
     branch predictions of a denoiser evaluated once per branch, and is
-    ``None`` for a denoiser with one prediction per step. ``open`` sets
-    exactly one of ``kv`` and ``slot``, by how the denoiser is conditioned.
+    ``None`` for a denoiser with one prediction per step. Standalone denoisers
+    borrow their request slot through ``slot``; image denoisers retain only
+    numerical position tensors here and borrow KV coordinates from Rust.
     Accepted progress and product generations belong to the request, not
     this state.
     """
@@ -74,7 +49,7 @@ class DiffusionState:
     size: Any
     schedules: Mapping[str, Schedule]
     guidance: Guidance | None = None
-    kv: KVConditioning | None = None
+    positions: dict[int, torch.Tensor] = field(default_factory=dict)
     slot: SlotLadder | None = None
 
     def close(self) -> None:
@@ -109,6 +84,5 @@ class DiffusionState:
             size,
             dict(denoiser.make_schedules(steps, shift=shift, device=device)),
             guidance,
-            kv=KVConditioning() if attends else None,
             slot=None if attends else SlotLadder(),
         )

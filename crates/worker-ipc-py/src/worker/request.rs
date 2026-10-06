@@ -1,11 +1,12 @@
 //! Numerical request views backed by the native request pool.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyString, PyTuple};
 use uniserve_core::CallId;
 use uniserve_worker::{
     Request as NativeRequest, RequestPool as NativePool, RequestProgress as NativeProgress,
@@ -82,6 +83,16 @@ impl RequestProgress {
     }
 }
 
+/// Guidance prefixes retained by one image request. Branch coordinates refresh
+/// for each submitted interval; tokenization survives between intervals.
+#[derive(Default)]
+pub(super) struct KVConditioning {
+    pub(super) prefixes: HashMap<String, (Vec<u32>, bool)>,
+    // (request slot, visible KV tokens, allocated token capacity).
+    pub(super) cache: (u32, u64, u32),
+    pub(super) branches: HashMap<String, (u32, u64, u32)>,
+}
+
 /// Retain numerical parameters and tensors alongside a native request epoch.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct Request {
@@ -90,6 +101,14 @@ pub(crate) struct Request {
     pub(super) admission: Py<PyAny>,
     #[pyo3(get, set)]
     pub(super) diffusion: Option<Py<PyAny>>,
+    pub(super) kv: Option<KVConditioning>,
+}
+
+impl Request {
+    fn clear_diffusion(&mut self) {
+        self.diffusion = None;
+        self.kv = None;
+    }
 }
 
 #[pymethods]
@@ -193,7 +212,7 @@ impl Request {
     }
 
     fn __clear__(&mut self) {
-        self.diffusion = None;
+        self.clear_diffusion();
     }
 }
 
@@ -251,7 +270,7 @@ impl RequestPool {
 
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         for request in self.views.iter().flatten() {
-            request.borrow_mut(py).diffusion = None;
+            request.borrow_mut(py).clear_diffusion();
         }
         self.views.iter_mut().for_each(|view| *view = None);
         self.pool.close();
@@ -386,7 +405,7 @@ impl RequestPool {
         self.pool
             .retire(request_id)
             .map_err(|error| native_error(py, error))?;
-        self.get(py, request_id)?.borrow_mut(py).diffusion = None;
+        self.get(py, request_id)?.borrow_mut(py).clear_diffusion();
         Ok(())
     }
 
@@ -433,6 +452,7 @@ impl RequestPool {
                     request,
                     admission: admission.clone().unbind(),
                     diffusion: None,
+                    kv: None,
                 },
             )?);
         }
@@ -451,4 +471,81 @@ fn pending_calls(calls: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<(RequestKey, Call
             ))
         })
         .collect()
+}
+
+/// Select a guidance prefix and delegate only text framing/tokenization.
+/// The tuple flag selects the request's resident conditioning KV.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_prefix(
+    py: Python<'_>,
+    prompt: &Bound<'_, PyAny>,
+    source: &str,
+    image_prompt: &str,
+    negative_prompt: &str,
+    negative_token_ids: &[u32],
+    tokenizer: &Bound<'_, PyAny>,
+) -> PyResult<(Vec<u32>, bool)> {
+    if source == "negative_or_start" && !negative_token_ids.is_empty() {
+        return Ok((negative_token_ids.to_vec(), false));
+    }
+
+    let conditioned = source == "conditioning";
+    let text = match source {
+        "conditioning" => image_prompt,
+        "negative_or_start" => negative_prompt,
+        _ => "",
+    };
+    // Preserve the tokenizer-facing Python text normalization, including
+    // its treatment of Unicode whitespace, once when resolving the prefix.
+    let text = PyString::new(py, text).call_method0("strip")?;
+    if conditioned && text.len()? == 0 {
+        return Ok((Vec::new(), true));
+    }
+
+    if prompt.is_none() {
+        return if conditioned {
+            Err(invalid(
+                py,
+                "this model does not accept a generation prompt override",
+            ))
+        } else {
+            Ok((Vec::new(), false))
+        };
+    }
+
+    let options = PyDict::new(py);
+    options.set_item("text", text)?;
+    options.set_item("conditioned", conditioned)?;
+    let tokens = prompt
+        .call_method("encode", (tokenizer,), Some(&options))?
+        .extract()?;
+    Ok((tokens, false))
+}
+
+/// Resolve a guidance source into token IDs and a flag for reusing current KV.
+/// A blank conditioned prompt reuses KV; explicit negative tokens take
+/// precedence over text. Other prefixes use the supplied prompt framing and
+/// tokenizer. A positive prompt override requires a framing configuration.
+#[pyfunction(name = "resolve_prefix")]
+#[pyo3(signature = (prompt, source, *, image_prompt, negative_prompt, negative_token_ids, tokenizer))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_prefix_py<'py>(
+    py: Python<'py>,
+    prompt: Bound<'py, PyAny>,
+    source: &str,
+    image_prompt: &str,
+    negative_prompt: &str,
+    negative_token_ids: Vec<u32>,
+    tokenizer: Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyTuple>, bool)> {
+    let (tokens, conditioning) = resolve_prefix(
+        py,
+        &prompt,
+        source,
+        image_prompt,
+        negative_prompt,
+        &negative_token_ids,
+        &tokenizer,
+    )?;
+    Ok((PyTuple::new(py, tokens)?, conditioning))
 }
