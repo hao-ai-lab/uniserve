@@ -135,14 +135,17 @@ impl PythonBackend {
     fn batch_state(
         &self,
         py: Python<'_>,
-        batch: &Bound<'_, PyAny>,
-        plan: &BatchPlan,
+        batch: &Bound<'_, crate::batches::Batch>,
         propagate_errors: bool,
     ) -> PyResult<BatchState> {
-        let plan = Arc::new(plan.clone());
+        let plan = Arc::clone(&batch.borrow().inner);
         let numerical = Py::new(
             py,
-            super::batch::BatchState::new(py, batch.clone().unbind(), Arc::clone(&plan))?,
+            super::batch::BatchState::new(
+                py,
+                batch.clone().into_any().unbind(),
+                Arc::clone(&plan),
+            )?,
         )?;
         let inputs = numerical.borrow(py).inputs.clone_ref(py);
         let retirement = Retirement::new(&plan);
@@ -349,7 +352,7 @@ impl Backend for PythonBackend {
 }
 
 impl ServiceBackend for PythonBackend {
-    fn batch(&self, plan: &BatchPlan) -> Result<BatchState, Py<PyBaseException>> {
+    fn batch(&self, plan: Arc<BatchPlan>) -> Result<BatchState, Py<PyBaseException>> {
         Python::attach(|py| {
             let build = || {
                 let range = py
@@ -357,8 +360,8 @@ impl ServiceBackend for PythonBackend {
                     .getattr("profile_range")?
                     .call1(("uniserve.worker.batch_decode",))?;
                 with_context(&range, || {
-                    let batch = convert::batch_to_py(py, plan)?;
-                    self.batch_state(py, &batch, plan, false)
+                    let batch = Bound::new(py, crate::batches::Batch::from(plan))?;
+                    self.batch_state(py, &batch, false)
                 })
             };
             build().map_err(|error: PyErr| error.into_value(py))
@@ -551,14 +554,14 @@ impl Executor {
     fn submit(
         &mut self,
         py: Python<'_>,
-        batch: &Bound<'_, PyAny>,
+        batch: &Bound<'_, crate::batches::Batch>,
         propagate_errors: bool,
     ) -> PyResult<Submission> {
         let executor = self.executor_mut()?;
-        let plan = convert::batch_from_object(batch)?;
+        let plan = Arc::clone(&batch.borrow().inner);
         let state = executor
             .backend()
-            .batch_state(py, batch, &plan, propagate_errors)?;
+            .batch_state(py, batch, propagate_errors)?;
         let submission = executor
             .submit(Batch::from_plan(&plan, state), propagate_errors)
             .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))?;

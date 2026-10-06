@@ -431,7 +431,7 @@ def stamp_batch(worker: object, batch: Batch) -> Batch:
         if rule is not None:
             ledger[call.request_key] = _projected(entry, rule)
         stamped.append(call.replace(coordinates=entry))
-    return replace(batch, calls=tuple(stamped))
+    return batch.replace(calls=tuple(stamped))
 
 
 def submitted_batch(worker: object, batch: Batch) -> Batch:

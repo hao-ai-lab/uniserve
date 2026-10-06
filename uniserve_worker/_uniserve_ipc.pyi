@@ -28,10 +28,14 @@ from uniserve.tensors import BufferConfig
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.request import RequestResult
 from uniserve_worker.protocol.batch import (
-    Batch,
+    BatchCommand,
+    BlockTable,
     BufferAllocation,
+    CacheUnitAllocation,
+    DecodeRange,
     LatentParams,
     NewRequest,
+    TensorExport,
 )
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -62,6 +66,102 @@ from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
 from uniserve_worker.worker import Worker
+
+@final
+class CanvasSampling:
+    """Block-diffusion sampling in the scheduler's numerical representation."""
+
+    def __init__(
+        self,
+        canvas_length: int,
+        max_steps: int,
+        entropy_bound: float,
+        t_min: float,
+        t_max: float,
+        confidence_threshold: float,
+        stability_threshold: int,
+    ) -> None: ...
+    @staticmethod
+    def from_mapping(value: object) -> CanvasSampling: ...
+    def to_mapping(self) -> dict[str, Any]: ...
+    def replace(self, **fields: Any) -> CanvasSampling: ...
+    @property
+    def canvas_length(self) -> int: ...
+    @property
+    def max_steps(self) -> int: ...
+    @property
+    def entropy_bound(self) -> float: ...
+    @property
+    def t_min(self) -> float: ...
+    @property
+    def t_max(self) -> float: ...
+    @property
+    def confidence_threshold(self) -> float: ...
+    @property
+    def stability_threshold(self) -> int: ...
+
+@final
+class Batch:
+    """Immutable validated submission shared with native execution."""
+
+    def __init__(
+        self,
+        batch_id: int,
+        collective_seq: int = ...,
+        *,
+        calls: tuple[Call, ...] = ...,
+        block_tables: tuple[BlockTable, ...] = ...,
+        new_cache_units: tuple[CacheUnitAllocation, ...] = ...,
+        forward_call_indices: tuple[int, ...] = ...,
+        request_pool_indices: tuple[int, ...] = ...,
+        seq_lens: tuple[int, ...] = ...,
+        query_lens: tuple[int, ...] = ...,
+        write_kv: tuple[bool, ...] = ...,
+        latent_params: tuple[LatentParams, ...] = ...,
+        decode_ranges: tuple[DecodeRange, ...] = ...,
+        buffer_allocations: tuple[BufferAllocation, ...] = ...,
+        commands: tuple[BatchCommand, ...] = ...,
+        input_products: tuple[TensorExport, ...] = ...,
+        kv_inputs: tuple[KvTransfer, ...] = ...,
+    ) -> None: ...
+    def replace(self, **fields: Any) -> Batch: ...
+    @staticmethod
+    def from_mapping(value: object) -> Batch: ...
+    def to_mapping(self) -> dict[str, Any]: ...
+    @property
+    def batch_id(self) -> int: ...
+    @property
+    def collective_seq(self) -> int: ...
+    @property
+    def calls(self) -> tuple[Call, ...]: ...
+    @property
+    def block_tables(self) -> tuple[BlockTable, ...]: ...
+    @property
+    def new_cache_units(self) -> tuple[CacheUnitAllocation, ...]: ...
+    @property
+    def forward_call_indices(self) -> tuple[int, ...]: ...
+    @property
+    def request_pool_indices(self) -> tuple[int, ...]: ...
+    @property
+    def seq_lens(self) -> tuple[int, ...]: ...
+    @property
+    def query_lens(self) -> tuple[int, ...]: ...
+    @property
+    def write_kv(self) -> tuple[bool, ...]: ...
+    @property
+    def latent_params(self) -> tuple[LatentParams, ...]: ...
+    @property
+    def decode_ranges(self) -> tuple[DecodeRange, ...]: ...
+    @property
+    def buffer_allocations(self) -> tuple[BufferAllocation, ...]: ...
+    @property
+    def commands(self) -> tuple[BatchCommand, ...]: ...
+    @property
+    def input_products(self) -> tuple[TensorExport, ...]: ...
+    @property
+    def kv_inputs(self) -> tuple[KvTransfer, ...]: ...
+    @property
+    def admissions(self) -> tuple[NewRequest, ...]: ...
 
 @final
 class Call:
@@ -210,6 +310,8 @@ def open_shared_memory(name: str) -> int:
     ...
 
 __all__ = [
+    "Batch",
+    "CanvasSampling",
     "RequestKey",
     "CallId",
     "Call",

@@ -23,8 +23,6 @@ class WorkerChannel:
 
     def submit(self, request: dict[str, object]) -> None:
         request = dict(request)
-        if "batch" in request:
-            request["batch"] = request["batch"].to_mapping()
         if request.get("message_id") is None:
             request["message_id"] = self._next_id
         self._next_id = max(self._next_id, request["message_id"] + 1)

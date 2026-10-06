@@ -26,7 +26,7 @@ mod microbatches;
 mod model_runners;
 mod output;
 mod pending;
-mod protocol;
+pub(crate) mod protocol;
 mod registry;
 mod request;
 mod shared_buffer;

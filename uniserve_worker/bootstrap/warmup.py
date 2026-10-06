@@ -526,7 +526,7 @@ def _build_warmup_batch(
     """Derive allocations for a warmup submission and assemble its batch.
 
     Takes the next batch id, so each call's ``CallId`` must already name
-    ``requests._batch_id + 1`` (``Batch.validate`` rejects calls of another
+    ``requests._batch_id + 1`` (native validation rejects calls of another
     batch). Reserves buffer spans for the calls' persistent products, binds
     request slots from the worker's rows or ``admissions``, grows the KV
     leases of KV-using calls to cover ``kv_visible_len`` plus, for token
@@ -540,7 +540,7 @@ def _build_warmup_batch(
             slot, a KV admission has a nonzero initial position, the worker
             has no KV cache, a lease would shrink, or KV, latent, or buffer
             capacity is exhausted, and from `_warmup_flow_tables` and
-            ``Batch.validate``.
+            native batch validation.
     """
     requests._batch_id += 1
     admissions_by_key = {

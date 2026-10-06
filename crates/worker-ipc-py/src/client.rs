@@ -46,13 +46,20 @@ impl PyClient {
         })
     }
 
-    /// Send a mapping containing a distinct message_id and, for Submit, a batch mapping.
+    /// Send a request containing a distinct message_id and, for Submit, a native batch.
     fn send(&mut self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<()> {
         let kind: RequestKind = depythonize(&request.get_item("kind")?)?;
         let request: WorkerRequest = if kind == RequestKind::Submit {
             WorkerRequest::Submit {
                 message_id: request.get_item("message_id")?.extract()?,
-                batch: Box::new(convert::batch_from_py(&request.get_item("batch")?)?),
+                batch: Box::new(
+                    request
+                        .get_item("batch")?
+                        .extract::<PyRef<'_, crate::batches::Batch>>()?
+                        .inner
+                        .as_ref()
+                        .clone(),
+                ),
             }
         } else {
             depythonize(request)?

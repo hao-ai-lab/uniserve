@@ -364,8 +364,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     # The decode must use the accepted prefix rather than the initialized tail.
     successor_batch = stamp_batch(
         worker,
-        replace(
-            execution_batch(batch_id=3, calls=(successor,)),
+        execution_batch(batch_id=3, calls=(successor,)).replace(
             seq_lens=(
                 len(extend.input_token_ids) + len(verify.input_token_ids) + 1,
             ),

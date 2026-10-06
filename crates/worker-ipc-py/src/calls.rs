@@ -9,7 +9,10 @@ use pyo3::types::{PyDict, PyTuple};
 use serde::de::DeserializeOwned;
 use uniserve_worker_ipc::{Call as NativeCall, CallKind};
 
-use crate::convert::RequestConversion;
+use crate::convert::{
+    RequestConversion, cached, mapping_from_py as mapping, record_from_py as record,
+    records_from_py as records,
+};
 use crate::ids::{BufferId, CallId, RequestKey};
 use crate::worker::error::invalid;
 
@@ -490,30 +493,9 @@ impl Call {
     }
 }
 
-fn cached<'py>(
-    py: Python<'py>,
-    cache: &PyOnceLock<Py<PyAny>>,
-    build: impl FnOnce() -> PyResult<Bound<'py, PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    cache
-        .get_or_try_init(py, || build().map(Bound::unbind))
-        .map(|value| value.bind(py).clone())
-}
-
 fn call_kind(py: Python<'_>, value: &str) -> PyResult<CallKind> {
     serde_json::from_value(serde_json::Value::String(value.into()))
         .map_err(|error| invalid(py, error.to_string()))
-}
-
-/// Explicit Python mappings keep booleans distinct from integer coordinates.
-/// Serving already has a validated native call and never takes this path.
-fn mapping<T: DeserializeOwned>(value: &Bound<'_, PyAny>) -> PyResult<T> {
-    let value: serde_json::Value = pythonize::depythonize(value)?;
-    serde_json::from_value(value).map_err(|error| PyTypeError::new_err(error.to_string()))
-}
-
-fn record<T: DeserializeOwned>(value: &Bound<'_, PyAny>) -> PyResult<T> {
-    mapping(&value.call_method0("to_mapping")?)
 }
 
 fn optional<T: DeserializeOwned>(value: &Bound<'_, PyAny>) -> PyResult<Option<T>> {
@@ -522,10 +504,6 @@ fn optional<T: DeserializeOwned>(value: &Bound<'_, PyAny>) -> PyResult<Option<T>
     } else {
         record(value).map(Some)
     }
-}
-
-fn records<T: DeserializeOwned>(values: &Bound<'_, PyAny>) -> PyResult<Vec<T>> {
-    values.try_iter()?.map(|value| record(&value?)).collect()
 }
 
 fn apply_fields(call: &mut NativeCall, fields: Option<&Bound<'_, PyDict>>) -> PyResult<()> {

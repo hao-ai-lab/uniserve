@@ -11,6 +11,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod batches;
 mod calls;
 mod client;
 mod convert;
@@ -393,6 +394,8 @@ fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ids::CallId>()?;
     m.add_class::<ids::BufferId>()?;
     m.add_class::<calls::Call>()?;
+    m.add_class::<batches::Batch>()?;
+    m.add_class::<batches::CanvasSampling>()?;
     worker::register(m)?;
     m.add_class::<PyServer>()?;
     m.add_class::<client::PyClient>()?;

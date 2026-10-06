@@ -1,16 +1,14 @@
 //! Conversion between native batches and public Python numerical records.
 //!
-//! The service receives native request envelopes directly. This module builds
-//! the Python batches consumed by numerical execution and reads completed
-//! outputs back into native values. Direct submission uses the same batch
-//! representation.
+//! The service and direct submission share native batches. This module builds
+//! their Python numerical views and reads completed outputs into native values.
 //!
 //! Most mapping fields use serde. Python transfer locators flatten transport
 //! coordinates beside tensor metadata, so those fields share explicit
 //! conversion in both directions.
 //!
-//! Cached record constructors follow Python dataclass field order. An inbound
-//! batch is assembled after wire validation without repeating Batch's checks.
+//! Cached record constructors follow Python dataclass field order. IPC batches
+//! have already been validated before their numerical views are requested.
 
 use std::collections::{BTreeMap, HashMap};
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
@@ -18,6 +16,7 @@ use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
 use pythonize::{depythonize, pythonize};
 use serde::de::DeserializeOwned;
@@ -38,6 +37,34 @@ use uniserve_worker_ipc::{
 #[cfg(test)]
 use uniserve_worker_ipc::Bounds;
 
+pub(crate) fn cached<'py>(
+    py: Python<'py>,
+    cache: &PyOnceLock<Py<PyAny>>,
+    build: impl FnOnce() -> PyResult<Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    cache
+        .get_or_try_init(py, || build().map(Bound::unbind))
+        .map(|value| value.bind(py).clone())
+}
+
+/// Decode an explicit mapping with the IPC's integer and boolean types.
+/// Native serving values bypass this conversion.
+pub(crate) fn mapping_from_py<T: DeserializeOwned>(value: &Bound<'_, PyAny>) -> PyResult<T> {
+    let value: serde_json::Value = depythonize(value)?;
+    serde_json::from_value(value).map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+pub(crate) fn record_from_py<T: DeserializeOwned>(value: &Bound<'_, PyAny>) -> PyResult<T> {
+    mapping_from_py(&value.call_method0("to_mapping")?)
+}
+
+pub(crate) fn records_from_py<T: DeserializeOwned>(values: &Bound<'_, PyAny>) -> PyResult<Vec<T>> {
+    values
+        .try_iter()?
+        .map(|value| record_from_py(&value?))
+        .collect()
+}
+
 /// Read the public Python batch mapping, sharing locator decoding with outputs.
 pub(crate) fn batch_from_py(value: &Bound<'_, PyAny>) -> PyResult<Batch> {
     let source = value.cast::<PyDict>()?;
@@ -50,7 +77,7 @@ pub(crate) fn batch_from_py(value: &Bound<'_, PyAny>) -> PyResult<Batch> {
     fields.set_item("input_products", PyList::empty(value.py()))?;
     fields.set_item("kv_inputs", PyList::empty(value.py()))?;
 
-    let mut batch: Batch = depythonize(fields.as_any())?;
+    let mut batch: Batch = mapping_from_py(fields.as_any())?;
     for product in products.try_iter()? {
         batch.input_products.push(
             tensor_export_from_py(&product?)
@@ -66,75 +93,6 @@ pub(crate) fn batch_from_py(value: &Bound<'_, PyAny>) -> PyResult<Batch> {
     }
 
     Ok(batch)
-}
-
-/// Read a direct submission, retaining its already-native calls. Only Python
-/// allocation and numerical parameter records need decoding here.
-pub(crate) fn batch_from_object(value: &Bound<'_, PyAny>) -> PyResult<Batch> {
-    let calls = value
-        .getattr("calls")?
-        .try_iter()?
-        .map(|call| {
-            Ok(call?
-                .extract::<PyRef<'_, crate::calls::Call>>()?
-                .inner
-                .as_ref()
-                .clone())
-        })
-        .collect::<PyResult<_>>()?;
-    let command_to_mapping = value
-        .py()
-        .import("uniserve_worker.protocol.batch")?
-        .getattr("command_to_mapping")?;
-    let commands = value
-        .getattr("commands")?
-        .try_iter()?
-        .map(|command| depythonize(&command_to_mapping.call1((command?,))?).map_err(Into::into))
-        .collect::<PyResult<_>>()?;
-    let input_products = value
-        .getattr("input_products")?
-        .try_iter()?
-        .map(|product| {
-            tensor_export_from_py(&product?.call_method0("to_mapping")?)
-                .ok_or_else(|| PyValueError::new_err("invalid batch tensor product"))
-        })
-        .collect::<PyResult<_>>()?;
-    let kv_inputs = value
-        .getattr("kv_inputs")?
-        .try_iter()?
-        .map(|input| {
-            kv_transfer_from_py(&input?.call_method0("to_mapping")?)
-                .ok_or_else(|| PyValueError::new_err("invalid batch KV transfer"))
-        })
-        .collect::<PyResult<_>>()?;
-
-    Ok(Batch {
-        batch_id: value.getattr("batch_id")?.extract()?,
-        collective_seq: value.getattr("collective_seq")?.extract()?,
-        calls,
-        block_tables: records_from_py(&value.getattr("block_tables")?)?,
-        new_cache_units: records_from_py(&value.getattr("new_cache_units")?)?,
-        forward: uniserve_worker_ipc::ForwardBatch {
-            call_indices: value.getattr("forward_call_indices")?.extract()?,
-            request_pool_indices: value.getattr("request_pool_indices")?.extract()?,
-            seq_lens: value.getattr("seq_lens")?.extract()?,
-            query_lens: value.getattr("query_lens")?.extract()?,
-            write_kv: value.getattr("write_kv")?.extract()?,
-        },
-        latent_params: records_from_py(&value.getattr("latent_params")?)?,
-        decode_ranges: records_from_py(&value.getattr("decode_ranges")?)?,
-        buffer_allocations: records_from_py(&value.getattr("buffer_allocations")?)?,
-        commands,
-        input_products,
-        kv_inputs,
-    })
-}
-
-fn records_from_py<T: DeserializeOwned>(values: &Bound<'_, PyAny>) -> PyResult<Vec<T>> {
-    values
-        .try_iter()?
-        .map(|value| depythonize(&value?.call_method0("to_mapping")?).map_err(Into::into))
-        .collect()
 }
 
 /// Return the public Python response mapping with its flattened transfer records.
@@ -198,9 +156,7 @@ pub(crate) fn request_output_to_py(py: Python<'_>, output: &RequestOutput) -> Py
 ///
 /// Returns a `dict` with `kind`, `message_id`, and a typed `batch`. Fails with
 /// `ValueError` for any other request kind, and propagates errors from
-/// resolving the Python types and exceptions raised by record constructors.
-/// Nested records that define `__post_init__` still run it; only `Batch`
-/// itself skips it.
+/// creating the native batch wrapper.
 pub(crate) fn execute_request_to_py<'py>(
     py: Python<'py>,
     request: &WorkerRequest,
@@ -241,7 +197,6 @@ struct RequestTypes {
     start: Py<PyAny>,
     finish: Py<PyAny>,
     free: Py<PyAny>,
-    batch_from_validated: Py<PyAny>,
     dtypes: [Py<PyAny>; 7],
     draw_layouts: [Py<PyAny>; 3],
     forward_modes: [Py<PyAny>; ForwardMode::ALL.len()],
@@ -292,7 +247,6 @@ impl RequestTypes {
         records.insert("BufferAllocation", class(&module, "BufferAllocation")?);
         records.insert("NewRequest", class(&module, "NewRequest")?);
         records.insert("GenerationParams", class(&module, "GenerationParams")?);
-        records.insert("CanvasSampling", class(&module, "CanvasSampling")?);
         records.insert("DiffusionParams", class(&module, "DiffusionParams")?);
         records.insert("TensorExport", class(&module, "TensorExport")?);
         let module = py.import("uniserve_worker.protocol.video")?;
@@ -353,16 +307,8 @@ impl RequestTypes {
             start: class(&batch, "Start")?,
             finish: class(&batch, "Finish")?,
             free: class(&batch, "Free")?,
-            batch_from_validated: class(
-                &py.import("uniserve_worker.protocol.construction")?,
-                "batch_from_validated",
-            )?,
-
-            // The `dtypes` and `draw_layouts` spellings sit at the indices that
-            // `dtype` and the draw-layout match in `RequestConversion::rng`
-            // hardcode (the Rust discriminant values). `kind` indexes the other
-            // three with `as usize`, which relies on each `ALL` array listing
-            // variants in declaration order.
+            // Dtype and draw-layout indices match the native enum values;
+            // computation kinds use each enum's declaration order.
             dtypes: enum_members(
                 &tensor,
                 "DType",
@@ -535,7 +481,7 @@ impl<'py> RequestConversion<'py> {
     }
 
     /// Borrow the native computation without reconstructing its Python fields.
-    fn call(&self, call: &Call) -> PyResult<Bound<'py, PyAny>> {
+    pub(crate) fn call(&self, call: &Call) -> PyResult<Bound<'py, PyAny>> {
         Bound::new(self.py, crate::calls::Call::from(call.clone())).map(Bound::into_any)
     }
 
@@ -651,7 +597,7 @@ impl<'py> RequestConversion<'py> {
     }
 
     /// Constructs a typed Python KV unit table.
-    fn block_table(&self, table: &BlockTable) -> PyResult<Bound<'py, PyAny>> {
+    pub(crate) fn block_table(&self, table: &BlockTable) -> PyResult<Bound<'py, PyAny>> {
         self.types.block_table.bind(self.py).call1((
             table.request_pool_idx,
             table.group_id,
@@ -662,7 +608,7 @@ impl<'py> RequestConversion<'py> {
     }
 
     /// Constructs a typed Python KV unit allocation.
-    fn cache_unit_allocation(
+    pub(crate) fn cache_unit_allocation(
         &self,
         allocation: &CacheUnitAllocation,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -673,8 +619,42 @@ impl<'py> RequestConversion<'py> {
         ))
     }
 
+    pub(crate) fn command_from_py(&self, command: &Bound<'_, PyAny>) -> PyResult<BatchCommand> {
+        if command.is_instance(self.types.start.bind(self.py))? {
+            Ok(BatchCommand::Start {
+                request: Box::new(crate::worker::protocol::new_request(
+                    &command.getattr("request")?,
+                )?),
+            })
+        } else if command.is_instance(self.types.finish.bind(self.py))? {
+            let retained = command
+                .getattr("retained_buffers")?
+                .try_iter()?
+                .map(|value| Ok(value?.extract::<PyRef<'_, crate::ids::BufferId>>()?.inner))
+                .collect::<PyResult<_>>()?;
+            Ok(BatchCommand::Finish {
+                request_key: command
+                    .getattr("request_key")?
+                    .extract::<PyRef<'_, crate::ids::RequestKey>>()?
+                    .inner,
+                retained_buffers: retained,
+            })
+        } else if command.is_instance(self.types.free.bind(self.py))? {
+            Ok(BatchCommand::Free {
+                buffer: command
+                    .getattr("buffer")?
+                    .extract::<PyRef<'_, crate::ids::BufferId>>()?
+                    .inner,
+            })
+        } else {
+            Err(pyo3::exceptions::PyTypeError::new_err(
+                "batch commands must be Start, Finish, or Free",
+            ))
+        }
+    }
+
     /// Constructs the typed Python variant for one batch control command.
-    fn command(&mut self, command: &BatchCommand) -> PyResult<Bound<'py, PyAny>> {
+    pub(crate) fn command(&mut self, command: &BatchCommand) -> PyResult<Bound<'py, PyAny>> {
         match command {
             BatchCommand::Start { request } => {
                 let request = admission_to_py(self.py, request, self)?;
@@ -703,87 +683,18 @@ impl<'py> RequestConversion<'py> {
     }
 }
 
-/// Constructs a fully typed Python batch from the validated wire record.
-///
-/// Calls retain their native descriptions. One `RequestConversion` shares
-/// immutable leaf values across the allocation and transfer views; each call
-/// creates its numerical views only when Python consumes them.
+/// Wrap a native batch for Python callers consuming a decoded request.
 pub(crate) fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>> {
-    let mut native = RequestConversion::new(py)?;
-
-    let calls = run
-        .calls
-        .iter()
-        .map(|call| native.call(call))
-        .collect::<PyResult<Vec<_>>>()?;
-    let block_tables = run
-        .block_tables
-        .iter()
-        .map(|table| native.block_table(table))
-        .collect::<PyResult<Vec<_>>>()?;
-    let new_cache_units = run
-        .new_cache_units
-        .iter()
-        .map(|allocation| native.cache_unit_allocation(allocation))
-        .collect::<PyResult<Vec<_>>>()?;
-    let commands = run
-        .commands
-        .iter()
-        .map(|command| native.command(command))
-        .collect::<PyResult<Vec<_>>>()?;
-
-    let input_products = record_tuple(py, &run.input_products, |payload| {
-        tensor_export_to_py(py, payload, &mut native)
-    })?;
-
-    // `batch_from_validated` sets these fields on a bare `Batch` without
-    // running `Batch.__post_init__`, because the frame was validated when it
-    // was decoded. Arguments are positional and follow its parameter order;
-    // the forward tuple is unpacked by index into `forward_call_indices`,
-    // `request_pool_indices`, `seq_lens`, `query_lens`, and `write_kv`.
-    let arguments = pyo3::types::PyTuple::new(
+    Bound::new(
         py,
-        [
-            run.batch_id.into_pyobject(py)?.into_any(),
-            run.collective_seq.into_pyobject(py)?.into_any(),
-            pyo3::types::PyTuple::new(py, calls)?.into_any(),
-            pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
-            pyo3::types::PyTuple::new(py, new_cache_units)?.into_any(),
-            (
-                pyo3::types::PyTuple::new(py, &run.forward.call_indices)?,
-                pyo3::types::PyTuple::new(py, &run.forward.request_pool_indices)?,
-                pyo3::types::PyTuple::new(py, &run.forward.seq_lens)?,
-                pyo3::types::PyTuple::new(py, &run.forward.query_lens)?,
-                pyo3::types::PyTuple::new(py, &run.forward.write_kv)?,
-            )
-                .into_pyobject(py)?
-                .into_any(),
-            record_tuple(py, &run.latent_params, |params| {
-                latent_params_with_context(py, params, &mut native)
-            })?
-            .into_any(),
-            record_tuple(py, &run.decode_ranges, |params| {
-                decode_range_to_py(py, params, &mut native)
-            })?
-            .into_any(),
-            record_tuple(py, &run.buffer_allocations, |params| {
-                buffer_allocation_to_py(py, params, &mut native)
-            })?
-            .into_any(),
-            pyo3::types::PyTuple::new(py, commands)?.into_any(),
-            input_products.into_any(),
-            record_tuple(py, &run.kv_inputs, |transfer| {
-                kv_transfer_to_py(py, transfer)
-            })?
-            .into_any(),
-        ],
-    )?;
-    native.types.batch_from_validated.bind(py).call1(arguments)
+        crate::batches::Batch::from(std::sync::Arc::new(run.clone())),
+    )
+    .map(Bound::into_any)
 }
 
 /// Converts one trajectory's solver-step range and latent page table into a
 /// Python `LatentParams` record.
-fn latent_params_with_context<'py>(
+pub(crate) fn latent_params_with_context<'py>(
     py: Python<'py>,
     params: &LatentParams,
     context: &mut RequestConversion<'py>,
@@ -818,7 +729,7 @@ pub(crate) fn latent_params_to_py<'py>(
 
 /// Converts the cursor and unit bound of one diffusion decode call into a
 /// Python `DecodeRange` record.
-fn decode_range_to_py<'py>(
+pub(crate) fn decode_range_to_py<'py>(
     py: Python<'py>,
     params: &DecodeRange,
     context: &mut RequestConversion<'py>,
@@ -838,7 +749,7 @@ fn decode_range_to_py<'py>(
 }
 
 /// Converts a persistent-buffer byte span into its Python allocation record.
-fn buffer_allocation_to_py<'py>(
+pub(crate) fn buffer_allocation_to_py<'py>(
     py: Python<'py>,
     params: &BufferAllocation,
     context: &mut RequestConversion<'py>,
@@ -851,7 +762,7 @@ fn buffer_allocation_to_py<'py>(
 }
 
 /// Converts a Rust slice into a tuple of Python records.
-fn record_tuple<'py, T, F>(
+pub(crate) fn record_tuple<'py, T, F>(
     py: Python<'py>,
     items: &[T],
     mut convert: F,
@@ -872,7 +783,7 @@ fn u32_tuple<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyTupl
 }
 
 /// Converts a request admission and its selected parameter family.
-fn admission_to_py<'py>(
+pub(crate) fn admission_to_py<'py>(
     py: Python<'py>,
     admission: &NewRequest,
     context: &mut RequestConversion<'py>,
@@ -1067,21 +978,7 @@ fn canvas_sampling_to_py<'py>(
     py: Python<'py>,
     canvas: &uniserve_worker_ipc::CanvasSampling,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "canvas_length"), canvas.canvas_length)?;
-    dict.set_item(intern!(py, "max_steps"), canvas.max_steps)?;
-    dict.set_item(intern!(py, "entropy_bound"), canvas.entropy_bound)?;
-    dict.set_item(intern!(py, "t_min"), canvas.t_min)?;
-    dict.set_item(intern!(py, "t_max"), canvas.t_max)?;
-    dict.set_item(
-        intern!(py, "confidence_threshold"),
-        canvas.confidence_threshold,
-    )?;
-    dict.set_item(
-        intern!(py, "stability_threshold"),
-        canvas.stability_threshold,
-    )?;
-    construct(py, "CanvasSampling", &dict)
+    Bound::new(py, crate::batches::CanvasSampling { inner: *canvas }).map(Bound::into_any)
 }
 
 /// Converts diffusion admission parameters and resolved media geometry.
@@ -1196,7 +1093,7 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
 }
 
 /// Converts a tensor export into its Python record.
-fn tensor_export_to_py<'py>(
+pub(crate) fn tensor_export_to_py<'py>(
     py: Python<'py>,
     payload: &TensorExport,
     context: &mut RequestConversion<'py>,

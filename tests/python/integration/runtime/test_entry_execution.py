@@ -561,7 +561,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
                 worker.submit(Batch(batch_id=0, commands=run.commands)),
             )
             assert not started.completions
-            run = replace(run, commands=())
+            run = run.replace(commands=())
         report = finalized_report(worker, worker.submit(run))
         (completion,) = report.completions
         assert completion.status is CallStatus.OK
@@ -631,8 +631,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
 
         copied = replace(copied, producer_call_id=CallId(3, 0))
         consumer = consumer.replace(call_id=CallId(3, 0), outputs=(copied,))
-        transfer = replace(
-            transfer,
+        transfer = transfer.replace(
             batch_id=3,
             collective_seq=4,
             calls=(consumer,),
