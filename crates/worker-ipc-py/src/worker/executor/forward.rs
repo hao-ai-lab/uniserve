@@ -1,15 +1,18 @@
 //! Batch numerical execution: prepare rows, run homogeneous groups and bind results.
 
+mod canvas;
+mod context;
 mod diffusion;
 mod inputs;
 mod results;
+mod token;
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use pyo3::exceptions::{PyBaseException, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PySlice, PyTuple};
+use pyo3::types::{PySlice, PyTuple};
 
 use super::{BatchState, PythonBackend};
 use crate::calls::Call;
@@ -218,21 +221,5 @@ impl PythonBackend {
             }
         }
         Ok(results)
-    }
-
-    /// Numerical call options contain only the owners used by these helpers.
-    fn token_options<'py>(
-        &self,
-        py: Python<'py>,
-        batch: &BatchState,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let options = PyDict::new(py);
-        options.set_item("state", &batch.numerical)?;
-        options.set_item(
-            "request_tables",
-            self.worker.bind(py).getattr("block_tables")?,
-        )?;
-        options.set_item("decode_state", &self.decode_state)?;
-        Ok(options)
     }
 }

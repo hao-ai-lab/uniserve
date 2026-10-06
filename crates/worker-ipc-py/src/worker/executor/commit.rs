@@ -205,7 +205,7 @@ impl PythonBackend {
                 let output = output.borrow();
                 (
                     output.request.borrow(py).request.slot(),
-                    output.token_update.borrow(py).clone_ref(py),
+                    output.token_update.clone_ref(py),
                 )
             })
             .collect();

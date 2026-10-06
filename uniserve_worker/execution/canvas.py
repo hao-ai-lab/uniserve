@@ -1,19 +1,9 @@
-"""Token-denoising calls: canvases over a cached prompt, read or stepped.
+"""Numerical canvas inputs and completion columns.
 
-A readout ``TOKEN_DENOISING`` call carries one or more token canvases back
-to back in ``input_token_ids`` and the canvas tokens whose logits it reads
-(``Call.readout``). The engine describes each canvas as one read-only
-forward row of the call: its prefix is the request's visible KV and its
-query is the canvas. ``prepare_rows`` turns the call into one ``CanvasRow``
-per canvas, and ``publish`` captures the rows' candidate log-probabilities
-into the batch's output buffer and records the call's outcome.
-
-A generating call (``Call.canvas``) runs one denoising step of the canvas
-its request keeps in its slot; ``prepare_step`` turns it into one
-``CanvasStepRow``, and ``publish_steps`` captures every stepped row's stop
-flag and tokens of a batch together, which each completion reports as its
-committed tokens once its step stops the canvas. A canvas pass writes no
-KV, so the request's coordinates stay where the call found them.
+Readout calls borrow a cached prompt and evaluate read-only canvas rows.
+Generating calls advance their resident canvas through a numerical step.
+The native executor captures candidate scores and canvas outcomes, binds
+continuation writes, and retains the request's unchanged KV coordinates.
 """
 
 from __future__ import annotations
@@ -27,7 +17,6 @@ import torch
 from uniserve.tensors import adjacent_view
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.model_executor.input_batch import (
     CanvasRow,
     CanvasStepRow,
@@ -39,7 +28,6 @@ from uniserve_worker.storage.canvas_slots import STEP_CONTINUED
 if TYPE_CHECKING:
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.canvas_slots import CanvasSlots
-    from uniserve_worker.storage.tensor_store import TensorStore
 
 
 def prepare_rows(
@@ -134,41 +122,14 @@ def prepare_rows(
     return tuple(rows)
 
 
-def capture_readout(
-    call: Call,
-    values: list[torch.Tensor],
-    *,
-    state: BatchState,
-    request_tables: BlockTables | None,
-) -> PendingOutput:
-    """Capture a call's candidate log-probabilities and record its outcome.
-
-    ``values`` holds each canvas row's FP32 log-probabilities in row order.
-    Their FP32 bit patterns are captured as sign-extended int64 words, which
-    ``PendingOutput.materialize`` decodes. The outcome reports the request's
-    coordinates unchanged, since the pass wrote no KV.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when the rows' values do not
-            cover the call's candidates.
-    """
-    readout = call.readout
-    assert readout is not None
-    request = state.pending_output(call.request_key.request_id)
-    logprobs = torch.cat(values) if len(values) > 1 else values[0]
-    if logprobs.dtype != torch.float32 or logprobs.numel() != len(
-        readout.candidate_ids
-    ):
+def readout_values(values: Sequence[torch.Tensor], count: int) -> torch.Tensor:
+    """Pack FP32 candidate scores as integer words for completion capture."""
+    logprobs = torch.cat(tuple(values)) if len(values) > 1 else values[0]
+    if logprobs.dtype != torch.float32 or logprobs.numel() != count:
         raise invalid_descriptor(
             "canvas readout does not cover the call's candidates"
         )
-    request.set_candidates(
-        state.output_buffer.capture(logprobs.contiguous().view(torch.int32))
-    )
-
-    cache = request.cache_coordinates(request_tables)
-    request.set_cache_length(cache[1])
-    return request
+    return logprobs.contiguous().view(torch.int32)
 
 
 def prepare_step(
@@ -249,73 +210,35 @@ def prepare_step(
     )
 
 
-def publish_steps(
-    steps: Sequence[tuple[Call, torch.Tensor]],
-    *,
-    state: BatchState,
-    request_tables: BlockTables | None,
-    tensor_store: TensorStore,
-) -> None:
-    """Capture a batch's canvas step outcomes and tokens and record them.
+def step_values(
+    values: Sequence[torch.Tensor], widths: Sequence[int]
+) -> torch.Tensor:
+    """Borrow adjacent result rows for one completion copy.
 
-    ``steps`` pairs each canvas step call of the batch with its row's int64
-    ``[1 + canvas]`` vector (``CanvasRunner.step``): its outcome and its
-    truncated argmax canvas, in the forward's row order. The rows are
-    adjacent views of one ``[rows, 1 + canvas]`` block. ``CanvasRunner.step``
-    unbinds one result tensor, and a replayed graph's output clone keeps
-    same-dtype rows in one allocation. So the batch captures every row with
-    one copy into its output buffer, which reaches the host with the batch's
-    one completion copy, and each row's span follows the last.
-    ``PendingOutput.materialize`` reports a row's tokens as its call's
-    committed tokens when the step stopped the block, and a skipped step as
-    predicated.
-
-    Each call's completion output receives, on the device, whether its block
-    continues after the step: the predicate of a step queued behind it. One
-    export covers every row, so each row's completion becomes visible
-    together with its values, after the same producer point on the stream.
-    The outcomes report the requests' coordinates unchanged, since a step
-    writes no KV.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when a value does not hold its
-            call's canvas, or the rows are not adjacent rows of one block.
+    Each int64 row contains the stop outcome followed by its canvas tokens.
+    Graph outputs preserve these rows together when copying reusable storage.
     """
-    if not steps:
-        return
-    width = 1 + steps[0][0].bounds.max_tokens
+    width = widths[0]
     if any(
         value.dtype != torch.int64
-        or value.shape != (1 + call.bounds.max_tokens,)
-        or value.shape != (width,)
-        for call, value in steps
+        or value.shape != (expected,)
+        or expected != width
+        for value, expected in zip(values, widths, strict=True)
     ):
         raise invalid_descriptor("a canvas step does not cover its canvas")
-    block = adjacent_view(tuple(value for _call, value in steps))
+    block = adjacent_view(tuple(values))
     if block is None:
         raise invalid_descriptor(
             "the canvas steps of a batch are not adjacent rows of one result"
         )
+    return block
 
-    offset, _count = state.output_buffer.capture(block)
-    writes = []
-    written_rows = []
-    for row, (call, _value) in enumerate(steps):
-        request = state.pending_output(call.request_key.request_id)
-        request.set_canvas((offset + row * width, width))
-        if request.completion_write is not None:
-            writes.append(request.completion_write)
-            written_rows.append(row)
 
-        cache = request.cache_coordinates(request_tables)
-        request.set_cache_length(cache[1])
-
-    if writes:
-        outcome_column = block.view(len(steps), width)[:, 0]
-        if len(written_rows) != len(steps):
-            outcome_column = outcome_column[written_rows]
-        (view, *_views) = tensor_store.producer_write_views(tuple(writes))
-        tensor_store.write_scalars(
-            tuple(writes),
-            (outcome_column == STEP_CONTINUED).to(view.dtype),
-        )
+def step_continuations(
+    block: torch.Tensor, width: int, rows: Sequence[int], dtype: torch.dtype
+) -> torch.Tensor:
+    """Select device continuation flags for the reserved output rows."""
+    outcomes = block.view(-1, width)[:, 0]
+    if len(rows) != outcomes.numel():
+        outcomes = outcomes[list(rows)]
+    return (outcomes == STEP_CONTINUED).to(dtype)

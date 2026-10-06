@@ -17,7 +17,7 @@ use super::pending::PendingOutput;
 /// Speculative rows carry the penalties and constraints of each draft prefix.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct SamplingMetadata {
-    inner: NativeMetadata,
+    pub(super) inner: NativeMetadata,
     // [rows, vocab], with one row per draft token and one bonus row for verify.
     #[pyo3(get)]
     logits: Py<PyAny>,
@@ -41,7 +41,7 @@ pub(crate) struct SamplingMetadata {
     request_pool_index: Option<Py<PyAny>>,
     // Committed counts are only updated by the executor after selection.
     #[pyo3(get)]
-    penalty_base: Option<Py<PyAny>>,
+    pub(super) penalty_base: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -115,7 +115,7 @@ impl SamplingMetadata {
     #[staticmethod]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (call, logits, request, *, positions, request_pool_index, decode_state, draft_token_ids=Vec::new()))]
-    fn for_call(
+    pub(super) fn for_call(
         py: Python<'_>,
         call: &Call,
         logits: &Bound<'_, PyAny>,
@@ -154,7 +154,6 @@ impl SamplingMetadata {
 
         let sampled = request
             .token_update
-            .borrow(py)
             .sampled
             .as_ref()
             .map(|value| value.clone_ref(py));

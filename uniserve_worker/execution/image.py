@@ -391,34 +391,6 @@ def export_image(
     return non_state_outcome(call, completion_tasks=(image_task,), state=state)
 
 
-def state_outcome(
-    call: Call,
-    *,
-    state: BatchState,
-    request_tables: BlockTables | None,
-) -> PendingOutput:
-    """Record the successful outcome of a visual-state call, which wrote KV.
-
-    The reported KV length is the pending ``cache_length`` when one
-    exists, otherwise the request's visible KV length as checked against its
-    block table by ``PendingOutput.cache_coordinates``.
-
-    Raises:
-        WorkerError: When the native cache query rejects the request's
-            KV coordinates.
-        RuntimeError: When the completed length is a device tensor.
-    """
-    request = state.pending_output(call.request_key.request_id)
-    cache = request.cache_coordinates(request_tables)
-    selected = request.token_update.cache_length
-    if selected is None:
-        selected = cache[1]
-    if not isinstance(selected, int):
-        raise RuntimeError("visual state completion has a dynamic KV length")
-    request.set_cache_length(selected)
-    return request
-
-
 def non_state_outcome(
     call: Call,
     *,
