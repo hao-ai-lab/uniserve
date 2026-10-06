@@ -1,5 +1,6 @@
 //! Fixed host collective buffers for native expert-step coordination.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -148,17 +149,12 @@ impl ExpertExchange {
         self.state().pending_layers(modules).map_err(error)
     }
 
-    fn reset_layers(&self) {
+    pub(super) fn reset_layers(&self) {
         self.state().reset_layers();
     }
 
-    pub(super) fn record_layers(&self, modules: &Bound<'_, PyAny>) -> PyResult<()> {
-        let modules = modules
-            .try_iter()?
-            .map(|module| module?.extract::<usize>())
-            .collect::<PyResult<Vec<_>>>()?;
+    pub(super) fn record_layers(&self, modules: BTreeSet<usize>) {
         self.state().record_layers(modules);
-        Ok(())
     }
 
     #[getter]

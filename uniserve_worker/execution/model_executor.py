@@ -529,7 +529,7 @@ class ModelExecutor:
             try:
                 if stream is not None:
                     stream.wait(torch.cuda.current_stream(binding.device))
-                with self.graph_storage.allocate(entry):
+                with self.graph_storage.allocate(entry.execution):
                     context.prepare(size)
                 self.graph_storage.check()
             except BaseException:
@@ -729,8 +729,8 @@ class ModelExecutor:
         """
         self._startup_modules.discard(key)
         entry = self._module_entries.pop(key)
-        if entry.context.stream is not None:
-            entry.context.stream.synchronize()
+        if entry.execution.context.stream is not None:
+            entry.execution.context.stream.synchronize()
         entry.close()
 
     @property
@@ -1535,9 +1535,9 @@ class ModelExecutor:
                             if token_runner
                             else None,
                         )
-                        if token_runner and entry.pools:
+                        if token_runner and entry.execution.pools:
                             token_pools.setdefault(pool_key, entry)
-                        with self.graph_storage.allocate(entry):
+                        with self.graph_storage.allocate(entry.execution):
                             context.prepare(size)
                         self.graph_storage.check()
                 except BaseException as error:
@@ -1577,7 +1577,7 @@ class ModelExecutor:
                 if not microbatch:
                     self.batch_runners.bind(name, kinds, entry)
             if token_runner and self.worker_config.expert_microbatches > 1:
-                peers[0].bind_microbatches(peers)
+                self.batch_runners.bind_microbatches(tuple(peers))
 
     def _configure_exchanges(self, max_tokens):
         """Allocate a distinct expert buffer and stream per microbatch."""
@@ -1612,6 +1612,7 @@ class ModelExecutor:
                 self.model, stream=stream, experts=exchange
             )
             entry = Execution(
+                "experts",
                 context,
                 storage=self.graph_storage,
                 devices=()
@@ -1624,7 +1625,7 @@ class ModelExecutor:
                 context.prepare(TextSize(exchange.max_tokens, 1))
         self._expert_execution = peers[0]
         if len(peers) > 1:
-            peers[0].bind_microbatches(peers)
+            Execution.bind_microbatches(peers)
 
     def _expert_exchange(self, max_tokens):
         """Build the worker's all-to-all exchange for expert-parallel layers.
@@ -1730,7 +1731,7 @@ class ModelExecutor:
         for entry in self.entries.values():
             if entry.peers[0] is not entry:
                 continue
-            if entry.context.experts is not exchange or not (
+            if entry.execution.context.experts is not exchange or not (
                 {ForwardMode.PREFILL, ForwardMode.TOKEN_DENOISING}
                 & set(entry.call_kinds)
             ):
@@ -1781,7 +1782,7 @@ class ModelExecutor:
             capacity = exchange.agree(0, leaving=leaving)
         if not capacity:
             return False
-        runner = self._expert_execution or self._expert_runners[0]
+        runner = self._expert_execution or self._expert_runners[0].execution
         stream = runner.context.stream
         if stream is not None:
             stream.wait(torch.cuda.current_stream(stream.device))
@@ -1940,7 +1941,7 @@ class ModelExecutor:
             self._expert_runners or self._expert_execution
         ):
             return
-        runner = self._expert_execution or self._expert_runners[0]
+        runner = self._expert_execution or self._expert_runners[0].execution
         if not runner.pools:
             return
         self._expert_joins = JoinGraphs(
@@ -1960,12 +1961,12 @@ class ModelExecutor:
         # The complete join above warms every peer at every capacity. Each
         # independent join now captures in that peer's own allocation pool,
         # so it can overlap a populated peer without sharing its scratch.
-        for index, peer in enumerate(runner.peers):
+        for index, peer in enumerate(self._expert_runners[0].peers):
             joins = JoinGraphs(
-                peer.context,
-                peer.context.experts,
+                peer.execution.context,
+                peer.execution.context.experts,
                 exchange.capacities,
-                pools=peer.pools,
+                pools=peer.execution.pools,
                 warm=False,
             )
             self._microbatch_joins.append(joins)
@@ -2000,10 +2001,7 @@ class ModelExecutor:
             )
         totals: dict = {}
         for (owner, device), used in self.graph_storage.owner_bytes().items():
-            method = getattr(getattr(owner, "call", None), "entry_point", None)
-            label = f"{getattr(owner, 'name', type(owner).__name__)}" + (
-                f".{method.method}" if method is not None else ""
-            )
+            label = owner.name
             totals[device, label] = totals.get((device, label), 0) + used
         for (device, label), used in sorted(
             totals.items(), key=lambda item: (str(item[0][0]), item[0][1])
@@ -2345,13 +2343,13 @@ def _prepare_inputs(
     All tensor work runs under the invocation's input-copy stream. Empty
     partitions retain their peer position for collective participation.
     """
-    if runner.microbatches is not None:
+    if runner.execution.microbatches is not None:
         runner.input_buffers.validate_rows(rows)
 
     batches = tuple(
         None
         if not part
-        else cast(ModelRunner, peer).prepare_inputs(
+        else peer.prepare_inputs(
             part,
             forward_mode=rows[0].forward_mode,
             cache=cache,

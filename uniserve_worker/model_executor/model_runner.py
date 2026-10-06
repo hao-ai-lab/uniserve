@@ -12,6 +12,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import Self
 
 import torch
 
@@ -63,7 +64,7 @@ def _masked_starts(table):
     return replace(table, start_page_host=(0,) * len(table.start_page_host))
 
 
-class ModelRunner(Execution, ABC):
+class ModelRunner(ABC):
     """Own one bound numerical capability on a borrowed execution-lane stream.
 
     The execution owner selects homogeneous work and grants the stream. This
@@ -72,7 +73,7 @@ class ModelRunner(Execution, ABC):
     """
 
     def __init__(
-        self,
+        self: Self,
         name,
         call,
         device,
@@ -89,12 +90,18 @@ class ModelRunner(Execution, ABC):
         rank=0,
         share=None,
     ):
-        super().__init__(context, storage=storage, devices=devices, share=share)
+        self.execution = Execution(
+            f"{name}.{call.entry_point.method}",
+            context,
+            storage=storage,
+            devices=devices,
+            share=None if share is None else share.execution,
+        )
+        self.peers: tuple[Self, ...] = (self,)
         self.name, self.call, self.device = name, call, device
         self.model = call.module
         self.call_kinds, self.cuda_stream = tuple(kinds), stream
         self.input_buffers = inputs
-        self.graph_storage = storage
         # Non-text runners capture exact numerical signatures only when
         # enabled; text and canvas runners select configured graph buckets.
         self.exact_graphs = exact_graphs
@@ -154,7 +161,7 @@ class ModelRunner(Execution, ABC):
         keys are never bucketed. The local numerical shape is independent
         of the transfer capacity of an expert step.
         """
-        if not eligible or not self.pools or not self.exact_graphs:
+        if not eligible or not self.execution.pools or not self.exact_graphs:
             return None
 
         # Only token and denoising batches reach this point: ``ModelExecutor``
@@ -207,22 +214,34 @@ class ModelRunner(Execution, ABC):
         that calls kernels outside its model's layers adds theirs. The worker
         kernel table (``execution.kernel_table``) gathers them.
         """
-        return self.context.kernels()
+        return self.execution.context.kernels()
+
+    def close_graphs(self):
+        """Retire captured computation before releasing numerical resources."""
+        self.execution.close_graphs()
 
     def close(self):
-        close_resources(
-            super().close,
-            *(
-                ()
-                if self.input_buffers is None
-                else (self.input_buffers.close,)
-            ),
-        )
+        try:
+            close_resources(
+                self.close_graphs,
+                self.execution.close,
+                *(
+                    ()
+                    if self.input_buffers is None
+                    else (self.input_buffers.close,)
+                ),
+            )
+        finally:
+            self.peers = ()
 
     def batch_graph(self, key):
         """Return the local bucket's variant for the current expert step."""
-        capacity = self.context.experts.capacity if self.expert_step else None
-        return self.buckets[key].graphs[capacity]
+        capacity = (
+            self.execution.context.experts.capacity
+            if self.expert_step
+            else None
+        )
+        return self.execution.buckets[key][capacity]
 
     def capture_graph(self, key, execution, forward):
         """Capture the graph of ``key`` over its fixed input ``execution``.
@@ -235,13 +254,13 @@ class ModelRunner(Execution, ABC):
         ``replay_graph``.
         """
         return capture_batch(
-            self.context,
+            self.execution.context,
             execution,
-            joining_experts(forward, self.context),
-            pools=self.pools,
+            joining_experts(forward, self.execution.context),
+            pools=self.execution.pools,
             cache=self.cache,
             predicates=self.decode_predicates,
-            warmup=self.warm_experts,
+            warmup=self.execution.warm_experts,
         )
 
     def replay_graph(self, key, execution, batch, *, borrow):

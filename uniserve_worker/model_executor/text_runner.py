@@ -211,7 +211,7 @@ class TextRunner(ModelRunner):
                 )
             # Later captures reuse free blocks of the shared pools, so this
             # persistent allocation precedes the first prefill capture.
-            with self.graph_storage.allocate(self):
+            with self.execution.storage.allocate(self.execution):
                 backing = torch.empty_like(hidden)
             self._prefill_output = backing
         if (
@@ -405,7 +405,7 @@ class TextRunner(ModelRunner):
             CUDAGraphError: No decode bucket holds a decode batch, or prefill
                 graphs are enabled and no prefill bucket holds another batch.
         """
-        if not eligible or not self.pools:
+        if not eligible or not self.execution.pools:
             return None
 
         selected = text_shape(
@@ -478,15 +478,15 @@ class TextRunner(ModelRunner):
                 if outputs
                 else self.model.fill_cache(static.inputs)
             ),
-            self.context,
+            self.execution.context,
         )
         return capture_hidden(
-            self.context,
+            self.execution.context,
             execution,
             call,
-            pools=self.pools,
+            pools=self.execution.pools,
             cache=self.cache,
-            warmup=lambda value: self.warm_experts(call, value),
+            warmup=lambda value: self.execution.warm_experts(call, value),
         )
 
     def replay_graph(self, key, execution, batch, *, borrow):
@@ -502,7 +502,7 @@ class TextRunner(ModelRunner):
         hidden = replay_hidden(self.batch_graph(key), execution)
         if not key[-1]:
             return self._cache_rows(batch.row_count)
-        with self.context.activate():
+        with self.execution.context.activate():
             return self.select_outputs(
                 hidden,
                 batch.inputs,
