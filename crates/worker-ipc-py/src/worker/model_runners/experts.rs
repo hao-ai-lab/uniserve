@@ -17,26 +17,118 @@ pub(super) fn configure(
     max_tokens: usize,
 ) -> PyResult<()> {
     let py = slf.py();
-    let count: usize = owner
-        .getattr("worker_config")?
-        .getattr("expert_microbatches")?
-        .extract()?;
-    let exchange = owner.call_method1("_expert_exchange", (max_tokens,))?;
-    if exchange.is_none() {
+    let config = owner.getattr("worker_config")?;
+    let count: usize = config.getattr("expert_microbatches")?.extract()?;
+    let attention_ranks: usize = owner.getattr("attention_ranks")?.extract()?;
+    let fused = py.import("uniserve.nn.moe")?.getattr("FusedMoE")?;
+    let mut layers = Vec::new();
+    if owner.getattr("expert_weights")?.is_none() {
+        for module in owner
+            .getattr("model")?
+            .call_method0("modules")?
+            .try_iter()?
+        {
+            let module = module?;
+            if module.is_instance(&fused)?
+                && (attention_ranks != 0
+                    || module
+                        .getattr("expert_group")?
+                        .getattr("size")?
+                        .extract::<usize>()?
+                        > 1)
+            {
+                layers.push(module);
+            }
+        }
+    }
+    let Some(first) = layers.first() else {
         if count != 1 {
             return Err(PyValueError::new_err(
                 "microbatch execution requires routed experts",
             ));
         }
         return Ok(());
+    };
+    let group = if attention_ranks != 0 {
+        owner.getattr("expert_group")?
+    } else {
+        first.getattr("expert_group")?
+    };
+    for layer in &layers[1..] {
+        let same_group = attention_ranks != 0 || group.eq(layer.getattr("expert_group")?)?;
+        let same_shape =
+            ["num_experts", "top_k", "hidden_size"]
+                .iter()
+                .try_fold(true, |same, field| {
+                    Ok::<_, PyErr>(same && layer.getattr(*field)?.eq(first.getattr(*field)?)?)
+                })?;
+        if !same_group || !same_shape {
+            return Err(PyValueError::new_err(
+                "expert-parallel layers share one group, expert count, top-k and hidden size",
+            ));
+        }
     }
-    slf.borrow_mut().exchanges.push(exchange.unbind());
     let streams = std::sync::Arc::clone(&slf.borrow().streams);
-    for _ in 1..count {
-        let exchange = owner.call_method1("_expert_exchange", (max_tokens,))?;
+    if streams.lane_count() > 1 {
+        return Err(PyValueError::new_err(
+            "an expert-parallel worker runs its forwards on one lane",
+        ));
+    }
+
+    let mut max_tokens = max_tokens;
+    if attention_ranks != 0 {
+        // Expert-only ranks borrow the source's capacity, including graph
+        // padding and multimodal rows. All microbatches use this same bound.
+        let torch = py.import("torch")?;
+        let options = PyDict::new(py);
+        options.set_item("dtype", torch.getattr("int64")?)?;
+        options.set_item("device", "cpu")?;
+        let capacity = torch.call_method("tensor", (max_tokens,), Some(&options))?;
+        let options = PyDict::new(py);
+        options.set_item("src", group.getattr("ranks")?.get_item(0)?)?;
+        options.set_item("group", group.call_method0("_require")?)?;
+        py.import("torch.distributed")?
+            .call_method("broadcast", (&capacity,), Some(&options))?;
+        max_tokens = capacity.call_method0("item")?.extract()?;
+    }
+    let options = PyDict::new(py);
+    if attention_ranks != 0 && config.getattr("role")?.extract::<String>()? != "experts" {
+        let first_rank = group.getattr("rank")?.extract::<usize>()?
+            - config.getattr("rank")?.extract::<usize>()?;
+        let width: usize = config.getattr("world_size")?.extract()?;
+        let ranks: Vec<usize> = group.getattr("ranks")?.extract()?;
+        options.set_item(
+            "source_group",
+            PyTuple::new(py, &ranks[first_rank..first_rank + width])?,
+        )?;
+    }
+    options.set_item("max_tokens", max_tokens)?;
+    for field in [
+        "top_k",
+        "num_experts",
+        "hidden_size",
+        "intermediate_size",
+        "activation",
+    ] {
+        options.set_item(field, first.getattr(field)?)?;
+    }
+    options.set_item(
+        "device",
+        py.import("uniserve.runtime.device")?
+            .call_method1("canonical_device", (config.getattr("device")?,))?,
+    )?;
+    options.set_item("attention_ranks", attention_ranks)?;
+    options.set_item("transport", config.getattr("expert_exchange")?)?;
+    let exchange_type = py
+        .import("uniserve.runtime.expert_exchange")?
+        .getattr("ExpertExchange")?;
+    for index in 0..count {
+        let exchange = exchange_type.call((&group,), Some(&options))?;
         // Retain every accepted exchange before another allocation can fail.
         slf.borrow_mut().exchanges.push(exchange.unbind());
-        streams.fork_microbatch(py)?;
+        if index != 0 {
+            streams.fork_microbatch(py)?;
+        }
     }
     Ok(())
 }

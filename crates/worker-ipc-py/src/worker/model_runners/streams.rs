@@ -13,10 +13,17 @@ use super::modules::input_error;
 use crate::worker::execution::close_all;
 
 struct Lane {
-    config: Py<PyAny>,
+    max_rows: Option<usize>,
     device: i32,
     kinds: Option<HashSet<CallKind>>,
     stream: Py<PyAny>,
+}
+
+pub(super) struct BatchStream {
+    pub(super) kinds: Option<HashSet<CallKind>>,
+    pub(super) max_rows: Option<usize>,
+    pub(super) stream: Py<PyAny>,
+    pub(super) microbatch: usize,
 }
 
 #[derive(Default)]
@@ -65,13 +72,13 @@ impl Streams {
         let device = py
             .import("uniserve.runtime.device")?
             .call_method1("canonical_device", (config.getattr("device")?,))?;
-        let others = owner.call_method1("_capture_devices", (&device,))?;
+        let others = capture_devices(owner, &device)?;
         let lanes = config.getattr("lanes")?;
         let event_slots = event_slots.unwrap_or(self.event_slots);
         let runtime = py.import("uniserve.runtime")?;
 
         if lanes.is_truthy()? {
-            if others.is_truthy()? {
+            if !others.is_empty() {
                 return Err(PyValueError::new_err(
                     "Green Context lanes require one physical device",
                 ));
@@ -96,7 +103,10 @@ impl Streams {
                         .map(|kind| Ok(pythonize::depythonize(&kind?)?))
                         .collect::<PyResult<HashSet<CallKind>>>()?,
                 );
-                configs.push(lane.unbind());
+                configs.push(
+                    lane.getattr("max_batch_calls")?
+                        .extract::<Option<usize>>()?,
+                );
             }
             let options = PyDict::new(py);
             options.set_item("event_slots", PyTuple::new(py, slots)?)?;
@@ -107,7 +117,7 @@ impl Streams {
             for ((config, kinds), stream) in configs.into_iter().zip(kinds).zip(streams.try_iter()?)
             {
                 self.lock().lanes.push(Lane {
-                    config,
+                    max_rows: config,
                     device,
                     kinds: Some(kinds),
                     stream: stream?.unbind(),
@@ -115,12 +125,12 @@ impl Streams {
             }
         } else {
             let mut devices = vec![device];
-            devices.extend(others.try_iter()?.collect::<PyResult<Vec<_>>>()?);
+            devices.extend(others);
             for device in devices {
                 if let Some(index) = cuda_index(&device)? {
                     let stream = external(&device, event_slots)?;
                     self.lock().lanes.push(Lane {
-                        config: py.None(),
+                        max_rows: None,
                         device: index,
                         kinds: None,
                         stream: stream.unbind(),
@@ -194,36 +204,52 @@ impl Streams {
         self.lock().lanes.len()
     }
 
-    pub(super) fn batch_streams<'py>(
+    /// Buffered calls borrow the lane's limits directly. A CPU call has one
+    /// streamless execution; expert microbatches fork the sole CUDA lane.
+    pub(super) fn batch_streams(
         &self,
-        device: &Bound<'py, PyAny>,
+        device: &Bound<'_, PyAny>,
         microbatches: bool,
-    ) -> PyResult<Bound<'py, PyTuple>> {
+    ) -> PyResult<Vec<BatchStream>> {
         let py = device.py();
         let index = cuda_index(device)?;
-        let streams = {
-            let state = self.lock();
-            let mut streams: Vec<_> = state
-                .lanes
-                .iter()
-                .filter(|lane| Some(lane.device) == index)
-                .map(|lane| (lane.config.clone_ref(py), lane.stream.clone_ref(py), 0))
-                .collect();
-            if microbatches && let Some((lane, _, _)) = streams.first() {
-                let lane = lane.clone_ref(py);
-                streams.extend(
-                    state
-                        .microbatches
-                        .iter()
-                        .enumerate()
-                        .map(|(index, stream)| {
-                            (lane.clone_ref(py), stream.clone_ref(py), index + 1)
-                        }),
-                );
-            }
-            streams
-        };
-        PyTuple::new(py, streams)
+        let state = self.lock();
+        let mut streams: Vec<_> = state
+            .lanes
+            .iter()
+            .filter(|lane| Some(lane.device) == index)
+            .map(|lane| BatchStream {
+                kinds: lane.kinds.clone(),
+                max_rows: lane.max_rows,
+                stream: lane.stream.clone_ref(py),
+                microbatch: 0,
+            })
+            .collect();
+        if microbatches && let Some(first) = streams.first() {
+            let kinds = first.kinds.clone();
+            let max_rows = first.max_rows;
+            streams.extend(
+                state
+                    .microbatches
+                    .iter()
+                    .enumerate()
+                    .map(|(index, stream)| BatchStream {
+                        kinds: kinds.clone(),
+                        max_rows,
+                        stream: stream.clone_ref(py),
+                        microbatch: index + 1,
+                    }),
+            );
+        }
+        if streams.is_empty() {
+            streams.push(BatchStream {
+                kinds: None,
+                max_rows: None,
+                stream: py.None(),
+                microbatch: 0,
+            });
+        }
+        Ok(streams)
     }
 
     pub(super) fn fork_microbatch(&self, py: Python<'_>) -> PyResult<()> {
@@ -283,7 +309,6 @@ impl Streams {
     pub(super) fn traverse(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
         let state = self.lock();
         for lane in &state.lanes {
-            visit.call(&lane.config)?;
             visit.call(&lane.stream)?;
         }
         for stream in state
@@ -324,4 +349,31 @@ fn external<'py>(device: &Bound<'py, PyAny>, event_slots: usize) -> PyResult<Bou
     py.import("uniserve.runtime")?
         .getattr("CUDAStream")?
         .call_method("external", (stream,), Some(&options))
+}
+
+/// Other CUDA devices that can allocate in this executor's graphs.
+pub(super) fn capture_devices<'py>(
+    owner: &Bound<'py, PyAny>,
+    current: &Bound<'py, PyAny>,
+) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    let config = owner.getattr("worker_config")?;
+    let canonical = owner
+        .py()
+        .import("uniserve.runtime.device")?
+        .getattr("canonical_device")?;
+    let mut devices = Vec::new();
+    let mut seen: HashSet<_> = cuda_index(current)?.into_iter().collect();
+    for field in ["device", "generation_device"] {
+        let value = config.getattr(field)?;
+        if value.is_none() {
+            continue;
+        }
+        let device = canonical.call1((value,))?;
+        if let Some(index) = cuda_index(&device)?
+            && seen.insert(index)
+        {
+            devices.push(device);
+        }
+    }
+    Ok(devices)
 }

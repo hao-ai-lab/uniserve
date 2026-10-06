@@ -14,6 +14,7 @@ use crate::worker::events::EventPool;
 use crate::worker::execution::close_all;
 use crate::worker::host::HostLane;
 use crate::worker::latent::LatentPool;
+use crate::worker::model_runners::ModelRunners;
 use crate::worker::output::OutputPool;
 use crate::worker::request::RequestPool;
 use crate::worker::storage::TensorStore;
@@ -489,30 +490,28 @@ impl Worker {
         self.export_transports = Some(exports.unbind());
 
         if let Some(decode_state) = &self.decode_state {
-            let options = PyDict::new(py);
-            options.set_item("input_config", &layout.input_config)?;
-            options.set_item("kv_cache", &self.kv_cache)?;
-            options.set_item("latent_pool", &self.latent_pool)?;
-            options.set_item(
-                "decode_predicates",
-                decode_state.bind(py).getattr("predicates")?,
+            let cache = self.kv_cache.as_ref().ok_or_else(closed)?.bind(py);
+            let widths = capacity_inputs::graph_table_widths(model, &config, cache)?;
+            let runners = runner
+                .getattr("batch_runners")?
+                .cast_into::<ModelRunners>()?;
+            ModelRunners::configure_inputs(
+                &runners,
+                &runner,
+                layout.input_config.as_ref().ok_or_else(closed)?.bind(py),
+                cache,
+                &self
+                    .latent_pool
+                    .as_ref()
+                    .map(|pool| pool.bind(py).as_any().clone())
+                    .unwrap_or_else(|| py.None().into_bound(py)),
+                &decode_state.bind(py).getattr("predicates")?,
+                max_calls,
+                info.request_slots as usize,
+                (info.latent_pages.saturating_sub(1) * info.latent_page_units) as usize,
+                widths.extract()?,
+                queue_depth,
             )?;
-            options.set_item("max_calls", max_calls)?;
-            options.set_item("request_slots", info.request_slots)?;
-            options.set_item(
-                "latent_capacity_units",
-                info.latent_pages.saturating_sub(1) * info.latent_page_units,
-            )?;
-            options.set_item(
-                "table_widths",
-                capacity_inputs::graph_table_widths(
-                    model,
-                    &config,
-                    self.kv_cache.as_ref().ok_or_else(closed)?.bind(py),
-                )?,
-            )?;
-            options.set_item("max_inflight", queue_depth)?;
-            runner.call_method("configure_inputs", (), Some(&options))?;
 
             let canvas = runner.getattr("canvas_runner")?;
             let sampling = config.getattr("canvas_sampling")?;
@@ -535,7 +534,12 @@ impl Worker {
                 }
             }
         } else if config.getattr("role")?.extract::<String>()? == "experts" {
-            runner.call_method0("configure_experts")?;
+            ModelRunners::configure_experts(
+                &runner
+                    .getattr("batch_runners")?
+                    .cast_into::<ModelRunners>()?,
+                &runner,
+            )?;
         }
         Ok(())
     }

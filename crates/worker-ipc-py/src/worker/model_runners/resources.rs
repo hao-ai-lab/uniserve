@@ -22,12 +22,7 @@ pub(super) fn synchronize(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny
         (owner.getattr("worker_config")?.getattr("device")?,),
     )?;
     let mut devices = vec![device.clone()];
-    devices.extend(
-        owner
-            .call_method1("_capture_devices", (&device,))?
-            .try_iter()?
-            .collect::<PyResult<Vec<_>>>()?,
-    );
+    devices.extend(super::streams::capture_devices(owner, &device)?);
     let cuda = py.import("torch.cuda")?;
     for device in devices {
         if cuda_index(&device)?.is_some() {

@@ -46,12 +46,7 @@ pub(super) fn runner<'py>(
     let mut devices = Vec::new();
     if captures {
         devices.push(device);
-        devices.extend(
-            owner
-                .call_method1("_capture_devices", (&devices[0],))?
-                .try_iter()?
-                .collect::<PyResult<Vec<_>>>()?,
-        );
+        devices.extend(super::streams::capture_devices(owner, &devices[0])?);
     }
     options.set_item("devices", PyTuple::new(py, devices)?)?;
     options.set_item(

@@ -7,14 +7,12 @@ padding inert. Decode buckets capture the call together with
 graph-capturable greedy decoding (``capture_batch``/``replay_batch``);
 prefill buckets capture the backbone's hidden states alone
 (``capture_hidden``/``replay_hidden``), and the runner selects each row's
-logits or hidden rows from them after the replay. The ``select_*`` helpers
-turn configured sizes into the capture shapes ``ModelExecutor`` prepares at
-startup.
+logits or hidden rows from them after the replay. Native capture planning
+selects configured sizes for startup.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from itertools import accumulate
 from typing import cast
@@ -35,10 +33,10 @@ from uniserve.sampling import greedy
 from uniserve.tensors import adjacent_view
 from uniserve_worker._uniserve_ipc import PrefillShape as PrefillShape
 from uniserve_worker._uniserve_ipc import TextShapes
-from uniserve_worker._uniserve_ipc import prefill_units as prefill_units
 from uniserve_worker._uniserve_ipc import (
-    select_prefill_captures as select_prefill_captures,
+    prefill_captures as prefill_captures,
 )
+from uniserve_worker._uniserve_ipc import prefill_units as prefill_units
 from uniserve_worker.model_executor.cuda_graph import CUDAGraphRunner
 from uniserve_worker.model_executor.input_batch import InputBatch
 from uniserve_worker.model_executor.output import ExecutionOutput
@@ -63,125 +61,6 @@ class DiffusionShape:
     height: int
     width: int
     cfg_branches: int
-
-
-def select_flow_captures(
-    shapes: Sequence[tuple[int, int]],
-    request_counts: Sequence[int],
-    cfg_branches: Sequence[int],
-    *,
-    max_calls: int,
-    max_tokens: int,
-    per_image_capacity: int,
-    latent_capacity: int,
-    physical_tokens: Callable[[int, int], int],
-    image_tokens: Callable[[int, int], int],
-) -> tuple[DiffusionShape, ...]:
-    """Keep the configured shape combinations that fit buffer capacity.
-
-    Every combination of image shape, request count and guidance-branch
-    count is kept when the request count is positive and at most
-    ``max_calls``, its requests times branches sequences fit ``max_tokens``
-    flat tokens as counted by ``physical_tokens``, one image fits
-    ``per_image_capacity`` latent units, and all images fit
-    ``latent_capacity``.
-    """
-    return tuple(
-        DiffusionShape(rows, height, width, branches)
-        for height, width in shapes
-        for rows in request_counts
-        for branches in cfg_branches
-        if 0 < rows <= max_calls
-        and rows * physical_tokens(height, width) * branches <= max_tokens
-        and image_tokens(height, width) <= per_image_capacity
-        and rows * image_tokens(height, width) <= latent_capacity
-    )
-
-
-def decode_captures(config, *, max_rows, row_units, num_units):
-    """Select the decode batch sizes a CUDA text entry captures at startup.
-
-    ``config`` is the ``WorkerConfig``. A configured size is kept when it is
-    positive, at most ``max_rows``, and its rows fit the KV pool's
-    allocatable units: capturing ``rows`` decode rows requires one page of
-    every cache group per row (``row_units`` units) on the ``num_units``
-    pool, whose unit zero is the sentinel. The sizes keep their configured
-    order. Empty when the graph policy is off, which leaves decode calls
-    eager.
-    """
-    if config.graph_policy == "off":
-        return ()
-    return tuple(
-        value
-        for value in config.decode_graph_batch_sizes
-        if 0 < value <= max_rows and value * row_units < num_units
-    )
-
-
-def prefill_captures(
-    config,
-    *,
-    max_rows,
-    max_tokens,
-    image_builder,
-    feature_injection,
-    device_causality,
-    pool=None,
-):
-    """Select the prefill buckets a CUDA text entry captures at startup.
-
-    ``config`` is the ``WorkerConfig``: its ``prefill_graph_token_sizes``
-    and the fixed ``DEFAULT_PREFILL_GRAPH_ROW_BUCKETS`` size the buckets up to
-    ``max_rows`` rows and ``max_tokens`` tokens, the most one buffered call
-    holds, keeping those whose batches fit the unit ``pool`` (see
-    ``select_prefill_captures``). Causal text is always captured, with
-    embedding replacement when the lane has an ``image_builder`` (every
-    prefill of such a lane replaces embeddings); a model whose image
-    processor declares ``feature_injection`` also appends non-causal image
-    feature rows and mixed text/image contexts, which replace embeddings.
-    Mixed contexts carry device causal flags through graph replay and are
-    captured only when the attention provider accepts that representation
-    (its ``device_causality`` capability).
-    The graphs evaluate
-    hidden states when the deployment's prefill calls select outputs
-    (``prefill_outputs``) and only write the K/V cache otherwise. Empty when
-    the graph policy is off or prefill graphs are disabled, which leaves
-    prefill calls eager.
-    """
-    from uniserve_worker.config.execution import (
-        DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
-    )
-
-    if config.graph_policy == "off" or not config.prefill_cuda_graph:
-        return ()
-    variants: tuple[tuple[bool | None, bool], ...] = (
-        (True, bool(image_builder)),
-    )
-    if feature_injection:
-        variants += ((False, True),)
-        if device_causality:
-            variants += ((None, True),)
-    return select_prefill_captures(
-        config.prefill_graph_token_sizes,
-        DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
-        max_rows=max_rows,
-        max_tokens=max_tokens,
-        variants=variants,
-        outputs=config.prefill_outputs,
-        pool=pool,
-    )
-
-
-def prefill_rows(shapes, *, max_rows):
-    """Return the most rows one prefill call may hold with ``shapes``.
-
-    A bucket serves batches with fewer rows than it pads to, so the bound is
-    one less than the widest bucket, at most ``max_rows``. None without
-    shapes, when prefill calls run eagerly and only ``max_rows`` applies.
-    """
-    if not shapes:
-        return None
-    return min(max_rows, max(shape.row_bucket for shape in shapes) - 1)
 
 
 def bind_attention(static, live):

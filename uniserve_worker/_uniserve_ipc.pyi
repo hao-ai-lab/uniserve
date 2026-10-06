@@ -635,24 +635,26 @@ class ModelRunners(Generic[RunnerT]):
     ) -> Any: ...
     @property
     def prepared(self) -> tuple[RunnerT, ...]: ...
-    @property
-    def lane_count(self) -> int: ...
-    def initialize_streams(
-        self, owner: ModelExecutor, *, event_slots: int | None = None
+    def configure_inputs(
+        self,
+        owner: ModelExecutor,
+        *,
+        input_config: Any,
+        kv_cache: Any,
+        latent_pool: Any,
+        decode_predicates: Any,
+        max_calls: int,
+        request_slots: int,
+        latent_capacity_units: int,
+        table_widths: tuple[int, ...],
+        max_inflight: int,
     ) -> None: ...
-    def batch_streams(
-        self, device: torch.device, *, microbatches: bool = False
-    ) -> tuple[tuple[Any, Any, int], ...]: ...
     @property
     def buffered(self) -> tuple[RunnerT, ...]: ...
     @property
     def experts(self) -> Any: ...
     @property
     def sealed(self) -> bool: ...
-    def exchange(self, index: int) -> Any: ...
-    def configure_exchanges(
-        self, owner: ModelExecutor, max_tokens: int
-    ) -> None: ...
     @property
     def has_diffusion(self) -> bool: ...
     def diffusion(self, owner: Any) -> Any: ...
@@ -677,13 +679,9 @@ class ModelRunners(Generic[RunnerT]):
     def synchronize(self, owner: ModelExecutor) -> None: ...
     def close_graphs(self) -> None: ...
     def close(self, owner: ModelExecutor, *, aborted: bool = False) -> None: ...
-    def bind(
-        self, component: str, kinds: Iterable[CallKind], runner: RunnerT
-    ) -> None: ...
     def get(self, component: str, kind: CallKind) -> RunnerT | None: ...
     def first(self, kind: CallKind) -> RunnerT | None: ...
     def clear(self) -> None: ...
-    def bind_microbatches(self, peers: tuple[RunnerT, ...]) -> None: ...
     def run_eager(
         self,
         runner: RunnerT,
@@ -822,7 +820,7 @@ __all__ = [
     "release_exports",
     "graph_storage_budget_bytes",
     "prefill_units",
-    "select_prefill_captures",
+    "prefill_captures",
     "yield_microbatch",
 ]
 
@@ -2414,14 +2412,14 @@ class TextShapes:
 def prefill_units(
     pages: Sequence[tuple[int, int]], rows: int, tokens: int
 ) -> int: ...
-def select_prefill_captures(
-    token_sizes: Sequence[int],
-    row_sizes: Sequence[int],
+def prefill_captures(
+    config: Any,
     *,
     max_rows: int,
     max_tokens: int,
-    variants: Sequence[tuple[bool | None, bool]],
-    outputs: bool = True,
+    image_builder: bool,
+    feature_injection: bool,
+    device_causality: bool,
     pool: tuple[Sequence[tuple[int, int]], int] | None = None,
 ) -> tuple[PrefillShape, ...]: ...
 

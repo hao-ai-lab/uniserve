@@ -6,7 +6,8 @@ their capabilities, and owns everything that executes them: CUDA streams
 contexts and captured graphs, whose allocations its ``GraphStorage``
 accounts against per-device budgets. Native ``ModelRunners`` owns bound
 methods, prepared contexts, execution streams, input-copy dependencies and
-resource shutdown. Python constructs numerical inputs and graph shapes.
+resource shutdown, input binding and capture-size selection. Python supplies
+numerical buffers and model contexts.
 The executor uses three kinds of runner:
 
 - batch runners, created once by ``configure_inputs`` per (component, path,
@@ -31,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator, Mapping
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
 from dataclasses import replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
@@ -45,12 +46,10 @@ from uniserve.model import (
     AudioEncoder,
     CausalLM,
     Denoiser,
-    ImageDenoiser,
     PatchEncoder,
     TextConditioner,
     TextEncoder,
     TextSize,
-    TokenDenoiser,
     VideoDecoder,
     VideoEncoder,
     VideoPostprocessor,
@@ -58,15 +57,13 @@ from uniserve.model import (
 )
 from uniserve.nn.vae import PatchAutoencoder
 from uniserve.processing import ImageProcessor
-from uniserve.runtime import ExecutionContext
 from uniserve.runtime.backends import kernel_choices
 from uniserve.runtime.backends.attention import resolve as attention_backend
 from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import canonical_device, process_device_bytes
-from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout
-from uniserve_worker._uniserve_ipc import ModelRunners, TextShapes
+from uniserve_worker._uniserve_ipc import ModelRunners
 from uniserve_worker.bootstrap.components import (
     VIDEO_CODEC_COMPONENT,
     bind_components,
@@ -107,9 +104,6 @@ from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow
 from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
 from uniserve_worker.model_executor.graph_inputs import (
     DiffusionShape,
-    decode_captures,
-    prefill_captures,
-    select_flow_captures,
 )
 from uniserve_worker.model_executor.graph_storage import GraphStorage
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
@@ -119,19 +113,12 @@ from uniserve_worker.model_executor.input_batch import (
     InputRow,
     TokenRow,
 )
-from uniserve_worker.model_executor.input_buffers import (
-    DiffusionBuffers,
-    TokenBuffers,
-    buffered_kinds,
-    input_buffer_config,
-)
-from uniserve_worker.model_executor.model_runner import ModelRunner, runner_type
+from uniserve_worker.model_executor.model_runner import ModelRunner
 from uniserve_worker.model_executor.output import ExecutionOutput
 from uniserve_worker.model_executor.resources import (
     media_state_buffers,
     output_layouts,
 )
-from uniserve_worker.model_executor.text_runner import TextRunner
 from uniserve_worker.protocol.call import (
     Call,
     ForwardMode,
@@ -322,21 +309,6 @@ class ModelExecutor:
                     f"execution resource cleanup failed: {cleanup!r}"
                 )
             raise
-
-    def _capture_devices(self, device):
-        """List CUDA devices besides ``device`` that graphs may allocate on."""
-        return tuple(
-            value
-            for value in dict.fromkeys(
-                canonical_device(value)
-                for value in (
-                    self.worker_config.device,
-                    self.worker_config.generation_device,
-                )
-                if value is not None
-            )
-            if value.type == "cuda" and value != device
-        )
 
     def component(self, kind, *, capability_type=None):
         """Return the single module that provides ``kind`` on this rank.
@@ -832,307 +804,23 @@ class ModelExecutor:
         table_widths,
         max_inflight,
     ):
-        """Bind input buffers and graph budgets for every capability.
+        """Bind fixed numerical inputs, contexts and graph pools per lane.
 
-        Creates one capability runner per (entry, path, lane) covering a
-        computation kind, with its input buffers, execution context, decode /
-        prefill capture shapes, and CUDA graph storage pools: private ones,
-        except that the text and canvas runners of one lane stream share
-        theirs. Prefill buckets reach the text tokens ``input_config`` holds
-        per call, and ``max_calls`` and ``request_slots`` bound their live
-        rows. Callable once: a second call raises ``RuntimeError`` when the
-        first bound any entry. Raises ``ValueError`` when two batch runners
-        of one component cover the same computation kind, and as
-        ``ModelRunners.initialize_streams`` does.
+        Native ModelRunners selects each lane's calls, padding capacities and
+        shared token graph pools. Existing bindings cannot be replaced.
         """
-        from uniserve_worker.model_executor.canvas_runner import (
-            CanvasRunner,
-            canvas_buffer_rows,
+        self.batch_runners.configure_inputs(
+            self,
+            input_config=input_config,
+            kv_cache=kv_cache,
+            latent_pool=latent_pool,
+            decode_predicates=decode_predicates,
+            max_calls=max_calls,
+            request_slots=request_slots,
+            latent_capacity_units=latent_capacity_units,
+            table_widths=table_widths,
+            max_inflight=max_inflight,
         )
-
-        if self.batch_runners.buffered:
-            raise RuntimeError("input execution resources are already bound")
-
-        self.kv_cache, self.decode_predicates = kv_cache, decode_predicates
-        self.table_widths = tuple(table_widths)
-        config = self.worker_config
-        self.batch_runners.initialize_streams(
-            self, event_slots=max_inflight + 1
-        )
-        if config.expert_exchange == "dwdp":
-            from uniserve.runtime.weight_prefetch import WeightPrefetch
-
-            if self.batch_runners.lane_count > 1:
-                raise ValueError(
-                    "DWDP weight buffers require one execution lane"
-                )
-            self.expert_weights = WeightPrefetch(self.model)
-        self.batch_runners.configure_exchanges(self, input_config.max_tokens)
-
-        # A decode or prefill row, and the request of every canvas a call
-        # reads, holds at least one page of every cache group, so the pool's
-        # allocatable units bound the rows of each call. A prefill call holds
-        # at most the text tokens its input buffers hold, the batch token budget
-        # plus one image's feature span, and at most the tokens the pool's
-        # units cover.
-        max_rows = min(max_calls, request_slots)
-        pool_rows = (kv_cache.info.num_units - 1) // kv_cache.row_units
-        decode_sizes = decode_captures(
-            config,
-            max_rows=max_rows,
-            row_units=kv_cache.row_units,
-            num_units=kv_cache.info.num_units,
-        )
-        feature_injection = (
-            self.processor is not None
-            and self.processor.feature_injection is not None
-        )
-        if self.image_builder is not None:
-            from uniserve.media import image
-
-            self.flow_cfg_branches = (1, 2, 3)
-            self.flow_captures = select_flow_captures(
-                config.flow_graph_shapes,
-                config.flow_graph_batch_sizes,
-                self.flow_cfg_branches,
-                max_calls=max_rows,
-                max_tokens=input_config.max_tokens,
-                per_image_capacity=latent_capacity_units,
-                latent_capacity=latent_pool.capacity_units,
-                physical_tokens=lambda height, width: (
-                    self.image_builder.sequence_length(
-                        image.Config(height, width)
-                    )
-                ),
-                image_tokens=lambda height, width: (
-                    self.image_builder.denoiser.latent_shape(
-                        "image", image.Config(height, width)
-                    )[0]
-                ),
-            )
-
-        buffered = buffered_kinds(diffusion=self.image_builder is not None)
-        # The first text or canvas runner with graph pools on each (device,
-        # lane stream). A lane stream runs one call at a time and every such
-        # runner allocates its persistent graph storage before the first
-        # capture, so their graphs share one pool: each capture reuses the
-        # blocks the others' intermediates free, and the pool holds the
-        # largest call's intermediates rather than one copy per runner.
-        token_pools: dict[tuple[str, int], ModelRunner] = {}
-
-        for name, placement, call in self.batch_runners.calls():
-            entry_kinds = call_kinds((call,)) & buffered
-            if not entry_kinds:
-                continue
-
-            # An entry covering latent encoding or image decoding runs on
-            # the generation device, or the worker device when none is
-            # configured; any other entry on its component's placement device.
-            target = (
-                canonical_device(config.generation_device or config.device)
-                if entry_kinds
-                & {MediaCall.LATENT_ENCODING, MediaCall.IMAGE_DECODING}
-                else placement.device
-            )
-            runner_class = runner_type(call.module)
-            token_runner = issubclass(runner_class, (TextRunner, CanvasRunner))
-            streams = self.batch_runners.batch_streams(
-                target, microbatches=token_runner and self.experts is not None
-            )
-            # One runner per stream on the target device whose lane covers
-            # some of the entry's kinds (a full-device stream covers all);
-            # with no stream there, as on a CPU device, one runner without.
-            peers = []
-            for lane, stream, microbatch in streams or ((None, None, 0),):
-                kinds = (
-                    entry_kinds
-                    if lane is None
-                    else entry_kinds.intersection(lane.call_kinds)
-                )
-                if not kinds:
-                    continue
-
-                rows = (
-                    max_rows
-                    if lane is None
-                    else min(max_rows, lane.max_batch_calls or max_rows)
-                )
-                # Graph pools exist only on CUDA, where every decode call
-                # replays a captured bucket; a lane with none can serve no
-                # decode call there.
-                decode = (
-                    tuple(value for value in decode_sizes if value <= rows)
-                    if ForwardMode.DECODE in kinds and target.type == "cuda"
-                    else ()
-                )
-                if (
-                    ForwardMode.DECODE in kinds
-                    and target.type == "cuda"
-                    and config.graph_policy != "off"
-                    and not decode
-                ):
-                    raise ValueError(
-                        f"no configured decode graph size fits {rows} rows "
-                        f"and a KV pool of {kv_cache.info.num_units} units, "
-                        f"whose rows hold {kv_cache.row_units} units each"
-                    )
-                # Graph pools exist only on CUDA, where every prefill call
-                # replays a captured bucket.
-                prefill = (
-                    prefill_captures(
-                        config,
-                        max_rows=min(rows, pool_rows),
-                        max_tokens=min(
-                            input_config.max_text_tokens,
-                            kv_cache.token_capacity,
-                        ),
-                        image_builder=self.image_builder is not None,
-                        feature_injection=feature_injection,
-                        device_causality=self.attention.device_causality,
-                        pool=(
-                            tuple(
-                                (group.page_tokens, group.units_per_page)
-                                for group in kv_cache.shapes
-                            ),
-                            kv_cache.info.num_units - 1,
-                        ),
-                    )
-                    if ForwardMode.PREFILL in kinds and target.type == "cuda"
-                    else ()
-                )
-                # A prefill bucket includes a padding sequence beyond admitted
-                # requests, and a canvas readout bucket padding sequences
-                # (``canvas_runner.canvas_buffer_rows``). They consume
-                # input buffers, but no scheduler request slot.
-                fields = (
-                    replace(
-                        input_config,
-                        max_rows=max(
-                            input_config.max_rows,
-                            *(shape.row_bucket for shape in prefill),
-                        ),
-                    )
-                    if prefill
-                    else replace(
-                        input_config,
-                        max_rows=canvas_buffer_rows(input_config.max_rows),
-                    )
-                    if ForwardMode.TOKEN_DENOISING in kinds
-                    and target.type == "cuda"
-                    and config.graph_policy != "off"
-                    else input_config
-                )
-                inputs = context = entry = None
-                try:
-                    if stream is not None:
-                        stream.wait(torch.cuda.current_stream(target))
-                    with (
-                        nullcontext()
-                        if stream is None
-                        else torch.cuda.stream(stream.stream)
-                    ):
-                        buffer_type, buffer_config = input_buffer_config(
-                            next(iter(kinds)), fields
-                        )
-                        inputs = buffer_type(
-                            config=buffer_config,
-                            device=target,
-                            max_inflight=max_inflight,
-                            **(
-                                {"image_builder": self.image_builder}
-                                if buffer_type
-                                in (TokenBuffers, DiffusionBuffers)
-                                else {}
-                            ),
-                        )
-                        # Token passes and image denoising read the paged
-                        # KV cache; canvas passes read it without writing.
-                        reads_cache = isinstance(
-                            call.module,
-                            (CausalLM, ImageDenoiser, TokenDenoiser),
-                        )
-                        # Input preparation supplies every host sequence length
-                        # and start page, so attention planning never copies
-                        # them from the device while serving.
-                        context = ExecutionContext(
-                            call.module,
-                            cache=kv_cache.cache if reads_cache else None,
-                            attention=self.attention,
-                            stream=stream,
-                            groups=call.groups,
-                            derive_host_lengths=False,
-                            experts=self.batch_runners.exchange(microbatch)
-                            if self.experts is not None
-                            else None,
-                            weights=self.expert_weights,
-                        )
-                        # Text input capacity counts canonical tokens. Spatial
-                        # codecs and vision towers expand those into different
-                        # query domains, so layer plans use the actual numerical
-                        # shapes encountered during preparation/eager execution.
-                        size = (
-                            TextSize(fields.max_tokens, fields.max_rows)
-                            if reads_cache
-                            else None
-                        )
-                        pool_key = (str(target), id(stream))
-                        entry = runner_class(
-                            name,
-                            call,
-                            target,
-                            kinds,
-                            stream,
-                            context,
-                            inputs,
-                            storage=self.graph_storage,
-                            exact_graphs=config.flow_cuda_graph,
-                            cache=kv_cache.cache,
-                            predicates=decode_predicates,
-                            rank=config.rank,
-                            devices=(target, *self._capture_devices(target))
-                            if config.graph_policy != "off"
-                            and target.type == "cuda"
-                            else (),
-                            share=token_pools.get(pool_key)
-                            if token_runner
-                            else None,
-                        )
-                        if token_runner and entry.execution.pools:
-                            token_pools.setdefault(pool_key, entry)
-                        with self.graph_storage.allocate(entry.execution):
-                            context.prepare(size)
-                        self.graph_storage.check()
-                    self.batch_runners.bind(
-                        name, () if microbatch else kinds, entry
-                    )
-                except BaseException as error:
-                    try:
-                        close_resources(
-                            *(
-                                owner.close
-                                for owner in (
-                                    (entry,)
-                                    if entry is not None
-                                    else (context, inputs)
-                                )
-                                if owner is not None
-                            )
-                        )
-                    except BaseException as cleanup:
-                        error.add_note(
-                            f"input resource cleanup failed: {cleanup!r}"
-                        )
-                    raise
-
-                peers.append(entry)
-                if isinstance(entry, TextRunner):
-                    entry.shapes = TextShapes(decode, prefill)
-                entry.table_widths = self.table_widths
-                if isinstance(entry, CanvasRunner):
-                    entry.pool_rows = pool_rows
-
-            if token_runner and self.worker_config.expert_microbatches > 1:
-                self.batch_runners.bind_microbatches(tuple(peers))
 
     @property
     def experts(self):
@@ -1142,93 +830,6 @@ class ModelExecutor:
     def configure_experts(self):
         """Prepare expert-only execution through the shared native owner."""
         self.batch_runners.configure_experts(self)
-
-    def _expert_exchange(self, max_tokens):
-        """Build the worker's all-to-all exchange for expert-parallel layers.
-
-        Every expert-parallel ``FusedMoE`` of the model shares the exchange
-        of its group, sized for ``max_tokens`` tokens per rank, the most one
-        buffered call holds, over the transport ``WorkerConfig.expert_exchange``
-        names; ``None`` when no layer is expert-parallel.
-        Construction maps peer memory collectively, so every rank of the
-        group builds it at this same point of its startup. The exchange
-        serializes its layers on one stream, so an expert-parallel worker
-        runs its forwards on one execution lane.
-
-        Raises:
-            ValueError: The layers span several expert groups or shapes, or
-                the worker has several execution lanes.
-        """
-        from uniserve.nn.moe import FusedMoE
-        from uniserve.runtime.expert_exchange import ExpertExchange
-
-        if self.expert_weights is not None:
-            return None
-        layers = [
-            module
-            for module in self.model.modules()
-            if isinstance(module, FusedMoE)
-            and (self.attention_ranks or module.expert_group.size > 1)
-        ]
-        if not layers:
-            return None
-        first = layers[0]
-        shape = (
-            self.expert_group if self.attention_ranks else first.expert_group,
-            first.num_experts,
-            first.top_k,
-            first.hidden_size,
-        )
-        if any(
-            (
-                self.expert_group
-                if self.attention_ranks
-                else layer.expert_group,
-                layer.num_experts,
-                layer.top_k,
-                layer.hidden_size,
-            )
-            != shape
-            for layer in layers
-        ):
-            raise ValueError(
-                "expert-parallel layers share one group, expert count, top-k "
-                "and hidden size"
-            )
-        if self.batch_runners.lane_count > 1:
-            raise ValueError(
-                "an expert-parallel worker runs its forwards on one lane"
-            )
-        if self.attention_ranks:
-            # The source's numerical buffers include graph padding and
-            # multimodal rows, which expert-only ranks do not allocate.
-            # Borrow that bound before allocating collective workspaces.
-            capacity = torch.tensor(max_tokens, dtype=torch.int64)
-            torch.distributed.broadcast(
-                capacity,
-                src=self.expert_group.ranks[0],
-                group=self.expert_group._require(),
-            )
-            max_tokens = int(capacity.item())
-        source_group = None
-        if self.attention_ranks and self.worker_config.role != "experts":
-            first_rank = self.expert_group.rank - self.worker_config.rank
-            source_group = self.expert_group.ranks[
-                first_rank : first_rank + self.worker_config.world_size
-            ]
-        return ExpertExchange(
-            self.expert_group if self.attention_ranks else first.expert_group,
-            max_tokens=max_tokens,
-            top_k=first.top_k,
-            num_experts=first.num_experts,
-            hidden_size=first.hidden_size,
-            device=canonical_device(self.worker_config.device),
-            attention_ranks=self.attention_ranks,
-            source_group=source_group,
-            transport=self.worker_config.expert_exchange,
-            intermediate_size=first.intermediate_size,
-            activation=first.activation,
-        )
 
     def join_expert_step(self, *, leaving: bool = False) -> bool:
         """Take part in the next expert step when this rank has no forward.

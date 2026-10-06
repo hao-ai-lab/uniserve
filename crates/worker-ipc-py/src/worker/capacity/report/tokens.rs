@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::worker::block_tables::GroupShape;
+use crate::worker::graph_shapes;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn layout(
@@ -165,7 +166,6 @@ pub(super) fn layout(
             .map(|group| u64::from(group.units_per_page))
             .sum::<u64>();
         let max_rows = info.max_batch_calls.min(info.request_slots) as usize;
-        let graphs = py.import("uniserve_worker.model_executor.graph_inputs")?;
         if prefill {
             let rows = max_rows.min(((capacity.num_units - 1) / row_units) as usize);
             let shapes = prefill_shapes(
@@ -176,24 +176,23 @@ pub(super) fn layout(
                 rows,
                 Some((&pages, capacity.num_units - 1)),
             )?;
-            let options = PyDict::new(py);
-            options.set_item("max_rows", rows)?;
-            info.max_prefill_calls = graphs
-                .call_method("prefill_rows", (shapes,), Some(&options))?
-                .extract::<Option<u32>>()?
+            info.max_prefill_calls = shapes
+                .iter()
+                .map(|shape| shape.row_bucket - 1)
+                .max()
+                .map(|limit| limit.min(rows) as u32)
                 .unwrap_or(0);
         }
         if decode {
-            let options = PyDict::new(py);
-            options.set_item("max_rows", max_rows)?;
-            options.set_item("row_units", row_units)?;
-            options.set_item("num_units", capacity.num_units)?;
-            info.max_decode_calls = graphs
-                .call_method("decode_captures", (config,), Some(&options))?
-                .extract::<Vec<u32>>()?
-                .into_iter()
-                .max()
-                .unwrap_or(0);
+            info.max_decode_calls = graph_shapes::decode_shapes(
+                config,
+                max_rows,
+                row_units as usize,
+                capacity.num_units as usize,
+            )?
+            .into_iter()
+            .max()
+            .unwrap_or(0) as u32;
         }
         // The arena's slot counts are independent of KV capacity. Only its
         // transfer byte reservation changes after the pool has been fitted.
@@ -215,21 +214,25 @@ pub(super) fn layout(
     })
 }
 
-fn prefill_shapes<'py>(
-    config: &Bound<'py, PyAny>,
-    input: &Bound<'py, PyAny>,
-    processor: Option<&Bound<'py, PyAny>>,
+fn prefill_shapes(
+    config: &Bound<'_, PyAny>,
+    input: &Bound<'_, PyAny>,
+    processor: Option<&Bound<'_, PyAny>>,
     image: bool,
     rows: usize,
     pool: Option<(&[(u32, u32)], u64)>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let py = config.py();
-    let options = PyDict::new(py);
-    options.set_item("max_rows", rows)?;
-    options.set_item("max_tokens", input.getattr("max_text_tokens")?)?;
-    options.set_item("image_builder", image)?;
-    options.set_item(
-        "feature_injection",
+) -> PyResult<Vec<uniserve_worker::PrefillShape>> {
+    let pages = pool.map(|(pages, _)| {
+        pages
+            .iter()
+            .map(|&(tokens, units)| (tokens as usize, units as usize))
+            .collect::<Vec<_>>()
+    });
+    graph_shapes::configured_prefill(
+        config,
+        rows,
+        input.getattr("max_text_tokens")?.extract()?,
+        image,
         processor
             .map(|processor| {
                 processor
@@ -238,13 +241,12 @@ fn prefill_shapes<'py>(
             })
             .transpose()?
             .unwrap_or(false),
-    )?;
-    options.set_item("device_causality", true)?;
-    if let Some((pages, units)) = pool {
-        options.set_item("pool", (pages.to_vec(), units))?;
-    }
-    py.import("uniserve_worker.model_executor.graph_inputs")?
-        .call_method("prefill_captures", (config,), Some(&options))
+        true,
+        pages
+            .as_ref()
+            .zip(pool)
+            .map(|(pages, (_, units))| (pages.as_slice(), units as usize)),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,8 +341,8 @@ fn reserve_inputs(
                 let mut rows = input.getattr("max_rows")?.extract::<usize>()?;
                 if selected.contains("prefill") && cuda {
                     let shapes = prefill_shapes(config, input, processor, image, max_rows, None)?;
-                    for shape in shapes.try_iter()? {
-                        rows = rows.max(shape?.getattr("row_bucket")?.extract()?);
+                    for shape in shapes {
+                        rows = rows.max(shape.row_bucket);
                     }
                 } else if selected.contains("token_denoising")
                     && cuda
