@@ -12,6 +12,7 @@ mod prepare;
 mod reserve;
 mod retirement;
 mod tensors;
+mod video;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -668,7 +669,7 @@ impl Executor {
     fn drop_request(&mut self, py: Python<'_>, request_id: u64) -> PyResult<()> {
         let backend = self.executor_mut()?.backend();
         backend.release_requests(py, &[request_id], &Default::default())?;
-        backend.requests.borrow_mut(py).drop_request(request_id);
+        backend.requests.borrow_mut(py).drop_request(py, request_id);
         Ok(())
     }
 

@@ -481,7 +481,12 @@ impl LatentPool {
 
     /// Borrow a contiguous bank range without a gather. The caller orders
     /// accesses and uses initial_bank or step_banks before writing.
-    fn bank_view(&self, py: Python<'_>, bank: i64, page_table: Vec<i64>) -> PyResult<Py<PyAny>> {
+    pub(super) fn bank_view(
+        &self,
+        py: Python<'_>,
+        bank: i64,
+        page_table: Vec<i64>,
+    ) -> PyResult<Py<PyAny>> {
         if !(0..=1).contains(&bank)
             || page_table.is_empty()
             || page_table[0] < 1
@@ -509,7 +514,7 @@ impl LatentPool {
     }
 
     #[pyo3(signature = (request_pool_idx, page_table, *, latent_units))]
-    fn initial_bank(
+    pub(super) fn initial_bank(
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,
@@ -526,7 +531,7 @@ impl LatentPool {
     /// Select the committed input bank and a writable successor bank.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (request_pool_idx, page_table, *, step, generation, latent_units, height, width))]
-    fn step_banks(
+    pub(super) fn step_banks(
         &mut self,
         py: Python<'_>,
         request_pool_idx: i64,

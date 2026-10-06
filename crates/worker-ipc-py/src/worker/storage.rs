@@ -236,7 +236,7 @@ pub(crate) struct TensorRead {
     #[pyo3(get)]
     pub(super) tensor: Py<PyAny>,
     #[pyo3(get)]
-    region: Option<Py<PyAny>>,
+    pub(super) region: Option<Py<PyAny>>,
     #[pyo3(get)]
     pub(super) metadata: Option<Py<PyAny>>,
     inner: NativeRead,

@@ -789,7 +789,7 @@ impl BatchState {
     /// remain with their pending output and become visible together here.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (request_id, values, tensor_store, transports, *, host=false, regions=None))]
-    fn export_tensors(
+    pub(super) fn export_tensors(
         &self,
         py: Python<'_>,
         request_id: u64,
@@ -878,6 +878,26 @@ impl BatchState {
         exported
     }
 
+    /// Return the decoder-unit interval assigned to this request's call.
+    fn decode_range<'py>(&self, py: Python<'py>, request_id: u64) -> PyResult<Bound<'py, PyAny>> {
+        let &index = self
+            .request_indexes
+            .get(&request_id)
+            .ok_or_else(|| invalid(py, "request has no output in this batch"))?;
+        let call = &self.plan.calls[index];
+        let params = self
+            .plan
+            .decode_ranges
+            .iter()
+            .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
+            .ok_or_else(|| invalid(py, "video decode call has no decode params"))?;
+        crate::convert::decode_range_to_py(
+            py,
+            params,
+            &mut crate::convert::RequestConversion::new(py)?,
+        )
+    }
+
     /// Record completion only after the numerical consumer has written or read
     /// its latent bank. Ranks without that consumer leave their update empty.
     pub(super) fn complete_latent(&self, py: Python<'_>, request_id: u64) -> PyResult<()> {
@@ -901,7 +921,7 @@ impl BatchState {
     }
 
     /// Add one completed numerical invocation without retaining Python results.
-    fn record_forward(&mut self, stats: PyRef<'_, crate::stats::ForwardStats>) {
+    pub(super) fn record_forward(&mut self, stats: PyRef<'_, crate::stats::ForwardStats>) {
         self.forward_stats.merge(&stats.inner);
     }
 

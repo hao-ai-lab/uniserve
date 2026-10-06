@@ -557,8 +557,6 @@ def encode_latents(
         WorkerError: ``invalid_descriptor`` when the inputs, the round or
             the encoded rows disagree with the request's conditions.
     """
-    from uniserve_worker.execution.media import decode_range
-
     request = state.pending_output(call.request_key.request_id)
     video = video_admission(request)
     encoder = condition_encoder(call, model_runner.outputs)
@@ -576,7 +574,9 @@ def encode_latents(
     if encoder is VideoEncoder:
         # This rank encodes its share of the round's units, which follow
         # the earlier rounds' units.
-        covered = _round_units(video, decode_range(call, state=state))
+        covered = _round_units(
+            video, state.decode_range(call.request_key.request_id)
+        )
         run = model_runner.bindings[call.component].media_units(
             covered.start, len(covered)
         )
