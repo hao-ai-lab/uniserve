@@ -173,7 +173,7 @@ impl ExecutionOutput {
     /// Concatenate completed microbatches after joining their streams.
     /// Graph-greedy outputs carry four row-length completion sections.
     #[staticmethod]
-    fn combine(py: Python<'_>, outputs: &Bound<'_, PyAny>) -> PyResult<Py<Self>> {
+    pub(super) fn combine(py: Python<'_>, outputs: &Bound<'_, PyAny>) -> PyResult<Py<Self>> {
         let outputs = outputs
             .try_iter()?
             .map(|output| Ok(output?.extract::<Py<Self>>()?))
@@ -240,7 +240,7 @@ impl ExecutionOutput {
         Self::copy(slf)
     }
 
-    fn validate_for(&self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub(super) fn validate_for(&self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         if self.values.bind(py).len() != batch.getattr("row_count")?.extract::<usize>()? {
             return Err(PyValueError::new_err(
                 "model output count does not match forward rows",

@@ -310,6 +310,42 @@ def test_module_call_statistics_count_the_call_without_tokens():
     assert output.stats.mode_tokens == {}
 
 
+@pytest.mark.gpu
+def test_module_graphs_preserve_results_and_run_unseen_shapes_after_startup():
+    model = EncodedModel().to("cuda:0")
+    runner = ModelExecutor(
+        model,
+        WorkerConfig(device="cuda:0", graph_policy="full"),
+        bindings=_encoder_bindings(
+            model, (("text_encoder", ComponentConfig((0,))),), "cuda:0"
+        ),
+    )
+    try:
+        retained = []
+        for tokens, path in (
+            ((2, 5), "graph_capture"),
+            ((3, 1), "graph_replay"),
+            ((2, 4, 7), "eager"),
+        ):
+            inputs = torch.tensor(tokens, device="cuda:0")
+            result = runner.run_encoder("text", inputs)
+            expected = (
+                inputs[:, None] * 4 + torch.arange(4, device="cuda:0")
+            ).float()
+            retained.append((result.values[0], expected))
+            assert result.stats.cuda_graph_runtime_mode_counts == {path: 1}
+            assert result.stats.mode_tokens == {}
+            if path == "graph_capture":
+                runner.complete_startup()
+
+        # Later module calls may reuse numerical backing. Previously returned
+        # results still belong to their callers, including across eager work.
+        for actual, expected in retained:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        runner.close()
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
     model = EncodedModel()

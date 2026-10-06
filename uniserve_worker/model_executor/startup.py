@@ -321,7 +321,7 @@ def prepare_prefill(
                 causal=shape.causal,
                 embeddings=shape.embeddings,
             )
-            entry.capture_batch(batch, forward)
+            runner.batch_runners.capture(entry, batch, forward)
 
 
 def prepare_decode(
@@ -351,7 +351,7 @@ def prepare_decode(
             # Prefill the one-token prompt eagerly so the decode capture below
             # attends over K/V the model wrote rather than zeroed scratch.
             prompt = make_text_batch(buffers, ((0,),) * rows, tables)
-            entry.eager_batch(prompt, forward)
+            runner.batch_runners.run_eager(entry, prompt, forward)
 
             batch = make_text_batch(
                 buffers,
@@ -368,7 +368,7 @@ def prepare_decode(
             try:
                 if predicates is not None:
                     predicates[1 : rows + 1] = True
-                entry.capture_batch(batch, forward)
+                runner.batch_runners.capture(entry, batch, forward)
             finally:
                 if saved is not None and predicates is not None:
                     predicates.copy_(saved)
@@ -481,7 +481,7 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
                     sampling=sampling,
                     step=step,
                 )
-                entry.capture_batch(batch, entry.batch_forward)
+                runner.batch_runners.capture(entry, batch, entry.batch_forward)
 
 
 def capture_image_parameters(cfg_branches, *, steps, height, width):
@@ -645,7 +645,8 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                         prefix_stream.wait(
                             torch.cuda.current_stream(entry.device)
                         )
-                    prefix_entry.eager_batch(
+                    runner.batch_runners.run_eager(
+                        prefix_entry,
                         batch,
                         prefix_entry.batch_forward,
                     )
@@ -691,9 +692,9 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     attention=attention,
                 )
                 if capture:
-                    entry.capture_batch(batch, forward)
+                    runner.batch_runners.capture(entry, batch, forward)
                 else:
-                    entry.eager_batch(batch, forward)
+                    runner.batch_runners.run_eager(entry, batch, forward)
 
     if stream is not None:
         torch.cuda.current_stream(entry.device).wait_stream(stream.stream)
@@ -753,9 +754,9 @@ def prepare_images(runner: ModelExecutor, latents) -> None:
             )
             with entry.context.activate():
                 batch = entry.prepare_inputs((row,), forward_mode=kind)
-            entry.eager_batch(batch, entry.batch_forward)
             # A patch encoder that packs image slots serves vision calls
-            # only through graphs of every slot count a batch can need.
+            # through its captured slot counts. Capture warms those same
+            # numerical shapes; other encoders warm the prepared image batch.
             if (
                 kind is MediaCall.VISION_ENCODING
                 and isinstance(entry, EncoderRunner)
@@ -764,6 +765,10 @@ def prepare_images(runner: ModelExecutor, latents) -> None:
                 entry.capture_packed(
                     max_images=runner.worker_config.max_batch_calls,
                     dtype=prepared.pixels.dtype,
+                )
+            else:
+                runner.batch_runners.run_eager(
+                    entry, batch, entry.batch_forward
                 )
         if (
             MediaCall.IMAGE_DECODING in entry.call_kinds
@@ -785,7 +790,9 @@ def prepare_images(runner: ModelExecutor, latents) -> None:
                         ),
                         forward_mode=MediaCall.IMAGE_DECODING,
                     )
-                entry.eager_batch(batch, entry.batch_forward)
+                runner.batch_runners.run_eager(
+                    entry, batch, entry.batch_forward
+                )
         if latent_features and MediaCall.DENOISING in entry.call_kinds:
             _write_latent_feature(runner, entry, latents, size)
         # Activation has restored the caller's stream.
@@ -840,4 +847,4 @@ def _write_latent_feature(runner, entry, latents, size):
             batch = entry.prepare_inputs(
                 (row,), forward_mode=MediaCall.DENOISING, attention=attention
             )
-        entry.eager_batch(batch, entry.batch_forward)
+        runner.batch_runners.run_eager(entry, batch, entry.batch_forward)

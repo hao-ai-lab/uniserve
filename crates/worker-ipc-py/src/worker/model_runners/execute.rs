@@ -97,7 +97,7 @@ pub(super) fn run_batch<'py>(
                         (runner, rows, PyTuple::new(py, partitions)?),
                         Some(&kwargs),
                     )?
-                    .extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>, bool)>()
+                    .extract::<(Bound<'_, PyTuple>, Bound<'_, PyAny>, bool)>()
             })
         })();
         let (batches, slots, borrow) = match prepared {
@@ -110,13 +110,15 @@ pub(super) fn run_batch<'py>(
 
         let mut completed = None;
         let executed = (|| {
-            let (output, tokens): (Bound<'_, ExecutionOutput>, Option<u64>) = backend
-                .call_method1("_run_inputs", (runner, rows, batches, eligible, borrow))?
-                .extract()?;
+            let (output, tokens) = super::dispatch::run(runner, &batches, eligible, borrow)?;
+            backend.call_method1(
+                "_validate_outputs",
+                (output.borrow(py).values.bind(py), rows, &device),
+            )?;
 
             completed = record(py, stream.as_ref(), &cuda, &device)?;
             let elapsed = started.elapsed().as_micros() as u64;
-            let mut output = output.borrow().clone_ref(py);
+            let mut output = output.borrow(py).clone_ref(py);
             let mut stats = output
                 .stats
                 .as_ref()

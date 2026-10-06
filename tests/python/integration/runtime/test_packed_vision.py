@@ -12,11 +12,25 @@ import pytest
 import torch
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
+from tests.python.fixtures.model_runner import forward_batch
 from uniserve.loading import weights
-from uniserve.model import VisionInput
-from uniserve.runtime import ExecutionContext
+from uniserve.model import ComponentEntry, EntryPoint, VisionInput
+from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve.runtime.cuda_graph import CUDAGraph
 from uniserve_models import loading as models
+from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.capacity import input_buffer_config
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.execution.model_executor import ModelExecutor
+from uniserve_worker.model_executor.image_inputs import VisionRow
+from uniserve_worker.protocol.call import (
+    Bounds,
+    Call,
+    CallCoordinates,
+    MediaCall,
+)
+from uniserve_worker.protocol.identity import CallId, RequestKey
+from uniserve_worker.storage.kv_cache import KVCacheManager
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -120,3 +134,111 @@ def test_packed_images_encode_as_they_do_alone(tmp_path):
                     torch.testing.assert_close(actual, alone[index])
         finally:
             graph.close()
+
+
+@torch.inference_mode()
+def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
+    diffusion_gemma_checkpoint(tmp_path, vision=VISION)
+    source = models.read_config(tmp_path)
+    model = models.load_model(
+        source, device=DEVICE, weights=weights.Config(dtype=torch.bfloat16)
+    ).model
+    encoder = model.vision_encoder
+    generator = torch.Generator(device=DEVICE).manual_seed(3)
+    images = tuple(
+        torch.rand(rows * columns, 48, device=DEVICE, generator=generator)
+        for rows, columns in SHAPES
+    )
+    grids = tuple(torch.tensor([shape], device=DEVICE) for shape in SHAPES)
+    with ExecutionContext(encoder) as context:
+        context.prepare(None)
+        with context.activate():
+            expected = encoder.encode(VisionInput(images, grids, SHAPES))
+
+    config = WorkerConfig(
+        device=str(DEVICE),
+        model_dtype="bfloat16",
+        graph_policy="full",
+        block_size=16,
+        max_sequence_tokens=64,
+        max_batch_tokens=64,
+        max_batch_calls=4,
+        max_request_pool_size=4,
+    )
+    runner = ModelExecutor(
+        model,
+        config,
+        image_processor=source.image_processor,
+        entry_points={
+            "vision_encoder": ComponentEntry(
+                "vision_encoder", (EntryPoint("encode"),)
+            )
+        },
+    )
+    cache = PrefixCache(
+        model.text.cache_config, num_units=16, block_size=16, device=DEVICE
+    )
+    manager = KVCacheManager(
+        cache,
+        info=cache_info(model.text, config, num_units=16),
+        request_pool_size=4,
+        table_width=4,
+    )
+    try:
+        runner.configure_inputs(
+            input_config=input_buffer_config(
+                model, config, processor=source.image_processor
+            ),
+            kv_cache=manager,
+            latent_pool=None,
+            decode_predicates=None,
+            max_calls=4,
+            request_slots=4,
+            latent_capacity_units=0,
+            table_widths=(4,) * len(manager.shapes),
+            max_inflight=1,
+        )
+        runner.capture(tokenizer=None, latents=None)
+        runner.complete_startup()
+        retained = []
+        for order in ((0, 1, 2), (2, 0)):
+            rows = tuple(
+                VisionRow(
+                    MediaCall.VISION_ENCODING,
+                    encode_pixels=images[index],
+                    encode_grid=grids[index],
+                    encode_grid_shape=SHAPES[index],
+                )
+                for index in order
+            )
+            calls = tuple(
+                Call(
+                    RequestKey(1, slot, 0),
+                    CallId(1, 0),
+                    CallCoordinates(),
+                    MediaCall.VISION_ENCODING,
+                    Bounds(),
+                    component="vision_encoder",
+                )
+                for slot in range(len(rows))
+            )
+            result = forward_batch(
+                runner, rows, calls=calls, cache=None, tables=None, states=None
+            )
+            assert result.stats.cuda_graph_replays == 1
+            assert result.stats.cuda_graph_runtime_mode_counts == {
+                "graph_replay": 1
+            }
+            retained.extend(
+                zip(
+                    result.values,
+                    (expected[index] for index in order),
+                    strict=True,
+                )
+            )
+
+        for actual, reference in retained:
+            torch.testing.assert_close(actual, reference)
+    finally:
+        runner.close()
+        manager.close()

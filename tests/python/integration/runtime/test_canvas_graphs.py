@@ -283,7 +283,7 @@ def _eager(runner, manager, rows):
         cache=manager,
         tables=manager.block_tables,
     )
-    return entry.eager_batch(batch, entry.batch_forward)
+    return runner.batch_runners.run_eager(entry, batch, entry.batch_forward)
 
 
 def _request(slot):
