@@ -905,7 +905,7 @@ impl BatchState {
         self.forward_stats.merge(&stats.inner);
     }
 
-    fn execution_stats(&self, py: Python<'_>) -> PyResult<crate::stats::ForwardStats> {
+    pub(super) fn execution_stats(&self, py: Python<'_>) -> PyResult<crate::stats::ForwardStats> {
         if self.started_ns == 0 {
             return Ok(crate::stats::ForwardStats::from(
                 uniserve_worker_ipc::ForwardStats::default(),

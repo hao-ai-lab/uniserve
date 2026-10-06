@@ -93,9 +93,7 @@ impl PythonBackend {
         self.release_predecessors(py, batch, false)?;
         batch.retirement.revoke(py, self)?;
         self.prepare_storage(py, batch)?;
-        self.runner
-            .bind(py)
-            .call_method1("prepare", (&batch.numerical,))?;
+        self.prepare_images(py, batch)?;
         Ok(())
     }
 

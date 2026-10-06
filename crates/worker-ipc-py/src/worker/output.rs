@@ -53,7 +53,11 @@ impl OutputBuffer {
         Ok(self.lock(py)?.sealed())
     }
 
-    fn register_device(&self, py: Python<'_>, device: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub(super) fn register_device(
+        &self,
+        py: Python<'_>,
+        device: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         let (device, _) = stream(py, device)?;
         self.lock(py)?
             .register_device(device)
@@ -177,30 +181,80 @@ impl OutputBuffer {
         Ok(PyTuple::new(py, words)?.into_any().unbind())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn register_logprobs(
+    /// Capture one numerical score column and retain its native row layout.
+    pub(super) fn capture_logprobs(
         &self,
         py: Python<'_>,
-        span: (usize, usize),
-        rows: Vec<usize>,
-        counts: Vec<usize>,
-        requested_ids: Vec<Vec<u32>>,
-        max_count: usize,
-        max_requested: usize,
-    ) -> PyResult<()> {
+        details: &Bound<'_, PyAny>,
+    ) -> PyResult<std::collections::HashMap<usize, (usize, usize, usize)>> {
+        if details.is_none() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let packed = details.get_item(0)?;
+        let rows: Vec<usize> = details.get_item(1)?.extract()?;
+        let span = self.capture(py, &packed)?;
+        let layout = LogprobLayout {
+            rows: rows.clone(),
+            counts: details.get_item(2)?.extract()?,
+            requested_ids: details.get_item(3)?.extract()?,
+            max_count: details.get_item(4)?.extract()?,
+            max_requested: details.get_item(5)?.extract()?,
+        };
         self.lock(py)?
-            .register_logprobs(
-                span.0,
-                span.1,
-                LogprobLayout {
-                    rows,
-                    counts,
-                    requested_ids,
-                    max_count,
-                    max_requested,
-                },
-            )
-            .map_err(|error| native_error(py, error))
+            .register_logprobs(span.0, span.1, layout)
+            .map_err(|error| native_error(py, error))?;
+        Ok(rows
+            .into_iter()
+            .map(|index| (index, (span.0, span.1, index)))
+            .collect())
+    }
+
+    /// Copy shared selection columns once, then bind each call's result span.
+    /// The caller keeps samples alive and seals this buffer on their producer
+    /// stream after capture, so pointer keys stay unique throughout this call.
+    pub(super) fn capture_samples(
+        &self,
+        py: Python<'_>,
+        samples: Vec<Py<PyAny>>,
+        requests: Vec<Py<super::pending::PendingOutput>>,
+    ) -> PyResult<()> {
+        use std::collections::HashMap;
+
+        if samples.len() != requests.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "sampling results must align with their requests",
+            ));
+        }
+        let mut columns = HashMap::new();
+        let mut scores = HashMap::new();
+        for (sample, request) in samples.iter().zip(requests) {
+            let sample = sample.bind(py);
+            let batch = sample.getattr("batch")?;
+            let column = batch.getattr("completion")?;
+            let span = match columns.entry(column.as_ptr()) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    *entry.insert(self.capture(py, &column)?)
+                }
+            };
+            let index: usize = sample.getattr("index")?.extract()?;
+            let details = batch.getattr("logprobs")?;
+            let logprobs = if details.is_none() {
+                None
+            } else {
+                let rows = match scores.entry(details.as_ptr()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(self.capture_logprobs(py, &details)?)
+                    }
+                };
+                rows.get(&index).copied()
+            };
+            request
+                .borrow(py)
+                .set_sampling(py, (span.0, span.1, index), logprobs)?;
+        }
+        Ok(())
     }
 
     pub(super) fn observe(&self, py: Python<'_>, row: usize) -> PyResult<(u64, u64)> {

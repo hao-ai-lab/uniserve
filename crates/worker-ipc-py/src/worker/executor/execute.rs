@@ -24,11 +24,19 @@ impl PythonBackend {
         }
 
         let numerical = batch.numerical.clone_ref(py);
-        let runner = self.runner.bind(py);
         let clock = py.import("time")?.getattr("perf_counter_ns")?;
         let started: u64 = clock.call0()?.extract()?;
-        let scope = runner.call_method1("profile_step", (&numerical,))?;
-        with_context(&scope, || {
+        let profiler = self.worker.bind(py).getattr("profiler")?;
+        let scope = if profiler.is_none() {
+            None
+        } else {
+            let first = &batch.plan.calls[0];
+            Some(profiler.call_method1(
+                "step",
+                (format!("batch:{}:{}", first.code.as_str(), first.component),),
+            )?)
+        };
+        let execute = || {
             let mut phase = "batch registration";
             let executed = (|| {
                 self.reserve_batch(py, batch)?;
@@ -62,17 +70,19 @@ impl PythonBackend {
             }
 
             let bound_at = numerical.borrow(py).started_ns;
-            let stats = runner.call_method1(
-                "execution_stats",
-                (
-                    &numerical,
-                    if bound_at == 0 { started } else { bound_at },
-                    py.None(),
-                ),
-            )?;
-            batch.record_execution(py, &stats)?;
+            let elapsed = (clock.call0()?.extract::<u64>()?
+                - if bound_at == 0 { started } else { bound_at })
+                / 1000;
+            let stats = numerical.borrow(py).execution_stats(py)?.inner;
+            batch.record_execution(py, elapsed, stats)?;
             Ok(classified)
-        })
+        };
+        if let Some(scope) = scope {
+            with_context(&scope, execute)
+        } else {
+            let mut execute = execute;
+            execute()
+        }
     }
 
     fn execute_calls(&self, py: Python<'_>, batch: &BatchState) -> PyResult<()> {
@@ -124,9 +134,7 @@ impl PythonBackend {
             let scope = super::super::batch::BatchState::scope(batch.numerical.bind(py))?;
             with_context(scope.bind(py), || self.execute_tensors(py, batch, &active))?;
         } else {
-            self.runner
-                .bind(py)
-                .call_method1("execute", (&batch.numerical, &active))?;
+            self.execute_media(py, batch, &active)?;
         }
         if active.iter().any(|&index| {
             batch.plan.calls[index].latent_output.is_some()
@@ -150,7 +158,6 @@ impl PythonBackend {
         batch: &BatchState,
         active: &[usize],
     ) -> PyResult<()> {
-        let runner = self.runner.bind(py);
         let denoising = batch.plan.calls[0].code == CallKind::Media(MediaCall::Denoising);
         let mut intervals = vec![(0, 0); batch.plan.calls.len()];
         if denoising {
@@ -173,9 +180,9 @@ impl PythonBackend {
             }
         }
         let trajectories = if denoising {
-            runner.call_method1("prepare_diffusion", (&batch.numerical, active))?
+            self.initialize_trajectories(py, batch, active)?
         } else {
-            PyDict::new(py).into_any()
+            HashMap::new()
         };
         let step_count = intervals.iter().map(|&(_, count)| count).max().unwrap_or(0);
 
@@ -186,22 +193,17 @@ impl PythonBackend {
                 .filter(|&(_, &(_, count))| offset < count)
                 .map(|(index, &(start, _))| (index, start + offset))
                 .collect();
-            let integrated =
-                runner.call_method1("forward", (&batch.numerical, steps, &trajectories))?;
+            let integrated = self.forward_step(py, batch, &steps, &trajectories)?;
 
             if denoising {
                 // Pipeline ranks without a numerical output have no latent
                 // result to capture, even on the interval's final step.
                 let finished: Vec<_> = integrated
-                    .extract::<Vec<usize>>()?
                     .into_iter()
                     .filter(|&index| offset + 1 == intervals[index].1)
                     .collect();
                 if !finished.is_empty() {
-                    runner.call_method1(
-                        "finish_diffusion",
-                        (&batch.numerical, finished, &trajectories),
-                    )?;
+                    self.finish_diffusion(py, batch, &finished, &trajectories)?;
                 }
             }
         }

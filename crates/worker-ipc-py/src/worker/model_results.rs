@@ -28,9 +28,9 @@ pub(crate) struct ExecutionOutput {
     #[pyo3(get)]
     pub(super) stats: Option<Py<ForwardStats>>,
     #[pyo3(get)]
-    greedy: Option<Py<PyAny>>,
+    pub(super) greedy: Option<Py<PyAny>>,
     #[pyo3(get)]
-    layouts: Py<PyTuple>,
+    pub(super) layouts: Py<PyTuple>,
 }
 
 impl ExecutionOutput {
@@ -226,7 +226,7 @@ impl ExecutionOutput {
         )
     }
 
-    fn materialize(slf: &Bound<'_, Self>) -> PyResult<Py<Self>> {
+    pub(super) fn materialize(slf: &Bound<'_, Self>) -> PyResult<Py<Self>> {
         let py = slf.py();
         slf.borrow().wait(py)?;
         Ok(backend(py)?

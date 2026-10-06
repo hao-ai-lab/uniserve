@@ -1,13 +1,12 @@
 """Image diffusion calls conditioned on a request's KV prefixes.
 
 These functions serve a worker whose ``ModelExecutor`` has an
-``image_builder``. ``uniserve_worker.execution.schedule`` sends latent
-preparation to ``prepare_latent``, and ``uniserve_worker.execution.forward``
-drives each denoising call through ``initialize``, then ``prepare_step`` and
-``flow_rows`` once per solver step, then ``finish`` after the last step of
-the call's declared interval. The solver update between steps runs in
-``forward.integrate_predictions``. A standalone video denoiser's calls go to
-``uniserve_worker.execution.media`` instead.
+``image_builder``. The native executor invokes ``prepare_latent`` for latent
+preparation and drives denoising through ``initialize``, ``prepare_step`` and
+``flow_rows``, then ``finish`` after the call's declared interval. It executes
+missing guidance prefixes before denoising and calls the numerical runner's
+solver integration between steps. Standalone video denoisers use
+``uniserve_worker.execution.media``.
 
 The solver sample lives in the worker's ``LatentPool``. Preparation writes
 the seeded noise to bank one of the request's pages; each denoising call
@@ -465,7 +464,7 @@ def prepare_step(
                 "state"
             )
 
-        # ``forward.prepare_diffusion_step`` forwards the prefill rows and
+        # The native executor forwards the prefill rows and
         # advances each entry's materialized length by the rows it wrote.
         initialize_prefix = entry[1] == 0 and prefix_length > 0
         entries[branch] = entry

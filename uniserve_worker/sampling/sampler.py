@@ -406,7 +406,7 @@ def sampling_columns(
 
     The result is ``[valid | active | token | accepted]``, each section one
     row per call, with every value promoted to one common dtype.
-    ``capture_samples`` in ``uniserve_worker.execution.output`` copies this
+    ``OutputBuffer.capture_samples`` copies this
     column into completion storage, and graph-replayed greedy decode builds
     the same layout.
 

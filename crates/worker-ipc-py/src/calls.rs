@@ -173,6 +173,10 @@ impl Call {
             .map_err(|error| invalid(py, error.to_string()))
     }
 
+    fn writes_context(&self) -> bool {
+        self.inner.writes_context()
+    }
+
     #[getter]
     fn advances_state(&self) -> bool {
         self.inner.advances_state()

@@ -627,6 +627,13 @@ pub struct Call {
 }
 
 impl Call {
+    /// A context prefill interleaves prompt tokens and input-image blocks.
+    pub fn writes_context(&self) -> bool {
+        self.code == CallKind::Forward(ForwardMode::Prefill)
+            && !self.vision_inputs.is_empty()
+            && self.completion_output.is_none()
+    }
+
     /// Tensor dependencies in the computation signature, excluding its predicate.
     ///
     /// Includes `token_input` and `latent_input`, which [`Self::buffer_inputs`]
