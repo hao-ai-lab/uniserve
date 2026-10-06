@@ -5,8 +5,8 @@ continuation state of token calls: the next input token and its
 continuation predicate, the logical position, the sampling counter that
 mirrors the request's ``rng_counter``, committed penalty counts, and, when
 prompt scoring is requested, the last prompt logits of a prefill chunk.
-Execution supplies the values through each ``PendingOutput.token_update``;
-the native executor applies them when the batch commits. The
+The native executor retains each call's pending numerical values and applies
+them when the batch commits. The
 executor resets a slot's rows when a request is admitted to it and when the
 request's storage is released. Input preparation (``TokenBuffers``) reads next
 tokens and logical lengths by slot, and token sampling reads the committed
@@ -285,8 +285,7 @@ class DecodeState:
         """Copy one slot's last prompt logits into its ``prompt_logits`` row.
 
         Prompt scoring of the request's next prefill chunk
-        (``token.prompt_logprob_details``) reads this row to score that
-        chunk's first token.
+        reads this row to score that chunk's first token.
         """
         self._validate_host_indices((slot,))
         self.prompt_logits[slot].copy_(

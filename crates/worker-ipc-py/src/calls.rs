@@ -177,6 +177,10 @@ impl Call {
         self.inner.writes_context()
     }
 
+    fn writes_visual_state(&self) -> bool {
+        self.inner.writes_visual_state()
+    }
+
     #[getter]
     fn advances_state(&self) -> bool {
         self.inner.advances_state()

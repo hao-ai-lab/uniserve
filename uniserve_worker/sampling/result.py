@@ -5,18 +5,19 @@
 ``uniserve_worker.model_executor.graph_inputs``. ``SamplerRow`` addresses one
 call within it. Output capture (``uniserve_worker.execution.output``) copies
 a batch's shared ``completion`` and ``logprobs`` columns once; the native
-executor and ``uniserve_worker.execution.token``
-gather per-call columns through ``sample_columns`` without splitting them per
-row.
+executor gathers per-call columns through ``sample_columns`` without
+splitting them per row.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, cast
 
 import torch
+
+from uniserve.tensors import adjacent_view
 
 # Token relays reserve bit 31 for continuation; Rust and kernels share the mask.
 from uniserve_worker._uniserve_ipc import (
@@ -213,3 +214,13 @@ def sample_columns(
             )
         columns.append(parts[0] if len(parts) == 1 else torch.cat(parts, dim=0))
     return tuple(columns)
+
+
+def transition_values(rows: Sequence[SamplerRow]) -> torch.Tensor:
+    """Assemble transition payloads, borrowing an adjacent span if possible."""
+    values = tuple(row.transition for row in rows)
+    if any(value is None for value in values):
+        raise RuntimeError("sampling result lost a declared transition output")
+    tensors = cast(tuple[torch.Tensor, ...], values)
+    view = adjacent_view(tensors)
+    return torch.cat(tensors, dim=0) if view is None else view

@@ -573,6 +573,7 @@ class Call:
     @property
     def canvas(self) -> CanvasStep | None: ...
     def writes_context(self) -> bool: ...
+    def writes_visual_state(self) -> bool: ...
     @property
     def advances_state(self) -> bool: ...
     def tensor_inputs(self) -> tuple[TensorRef, ...]: ...
@@ -1042,18 +1043,6 @@ class BatchInputs:
         """Release consumers once, attempting every resource after failures."""
 
 @final
-class TokenUpdate:
-    """Borrowed sampling views and device coordinates awaiting commit."""
-
-    sampled: sampling_result.SamplerRow | None
-    logical_position: int | torch.Tensor
-    sampling_position: int | torch.Tensor
-    penalty_base: torch.Tensor | None
-    decode_increment: bool
-    cache_length: int | torch.Tensor | None
-    prompt_logits: torch.Tensor | None
-
-@final
 class PendingOutput:
     """Own result decoding and output retirement for one numerical call."""
 
@@ -1063,7 +1052,6 @@ class PendingOutput:
 
     call: Call
     request: Request
-    token_update: TokenUpdate
     @property
     def latent_params(self) -> LatentParams | None: ...
     @property
@@ -1080,36 +1068,10 @@ class PendingOutput:
     completion_write: Buffer | None
     producer_write: Buffer | None
 
-    def set_sampling(
-        self,
-        sampling: tuple[int, int, int],
-        logprobs: tuple[int, int, int] | None = None,
-    ) -> None: ...
-    def add_prompt_logprobs(
-        self, spans: Sequence[tuple[int, int, int]]
-    ) -> None: ...
-    def set_candidates(self, span: tuple[int, int]) -> None: ...
-    def set_canvas(self, span: tuple[int, int]) -> None: ...
-    def advance_tokens(
-        self,
-        tokens: int,
-        *,
-        cache_length: int | None = None,
-        position: int | None = None,
-        sampled: bool = False,
-    ) -> None: ...
     def set_cache_length(self, length: int) -> None: ...
-    def set_prompt_logits(self, logits: torch.Tensor) -> None: ...
     def cache_coordinates(
         self, tables: block_tables.BlockTables | None
     ) -> tuple[int, int, int]: ...
-    def set_speculation(
-        self,
-        draft_tokens: Sequence[int],
-        terminal_prefix: int | None,
-        visible: int,
-        initialized: int,
-    ) -> None: ...
     @property
     def host_tasks(self) -> tuple[HostTask[Any], ...]: ...
     def set_host_tasks(
@@ -1150,14 +1112,6 @@ class OutputBuffer:
     def register_device(self, device: torch.device | str) -> None: ...
     def begin_device(self, device: torch.device | str) -> None: ...
     def capture(self, tokens: torch.Tensor) -> tuple[int, int]: ...
-    def capture_logprobs(
-        self, details: sampling_result.LogprobValues | None
-    ) -> dict[int, tuple[int, int, int]]: ...
-    def capture_samples(
-        self,
-        samples: Sequence[sampling_result.SamplerRow],
-        requests: Sequence[PendingOutput],
-    ) -> None: ...
     def capture_bytes(self, value: torch.Tensor) -> torch.Tensor:
         """Borrow copied bytes; wait for completion and retain CPU readers."""
     def seal(self) -> None: ...

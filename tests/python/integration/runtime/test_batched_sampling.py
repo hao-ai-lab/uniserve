@@ -169,7 +169,10 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
                 tokens=(expected_successor(prompt_ends[index]),),
                 logprobs=index != 1,
             )
-            decode_ops.append(call)
+            # A response still samples when it needs no downstream token relay.
+            decode_ops.append(
+                call.replace(token_output=None) if index == 0 else call
+            )
 
         result = finalized_report(
             worker,
@@ -452,8 +455,14 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> (
     assert completion.committed_tokens == (1001,)
 
 
-def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
-    worker = execution_worker()
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
+def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits(
+    device: str, request: pytest.FixtureRequest
+) -> None:
+    worker = execution_worker(device=device)
+    request.addfinalizer(worker.close)
     admission = ar_params(
         31,
         block_ids=(7,),

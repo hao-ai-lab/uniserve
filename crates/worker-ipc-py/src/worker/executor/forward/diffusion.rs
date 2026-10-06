@@ -102,10 +102,6 @@ impl PythonBackend {
             }
         }
         let values = self.forward_values(py, batch, &prefixes)?;
-        let token = py.import("uniserve_worker.execution.token")?;
-        let options = self.token_options(py, batch)?;
-        options.del_item("state")?;
-        options.set_item("publish_runtime", false)?;
         for ((prefix, branch), result) in prefixes.into_iter().zip(branches).zip(values) {
             if result.is_none() {
                 continue;
@@ -113,10 +109,12 @@ impl PythonBackend {
             // Guidance writes its own KV slot, without advancing request KV.
             let task = prefix.task.bind(py);
             let count: usize = task.getattr("query_tokens")?.extract()?;
-            token.call_method(
-                "commit_kv",
-                (task, count, batch.pending(py, prefix.index)),
-                Some(&options),
+            self.record_token_kv(
+                py,
+                &mut batch.pending(py, prefix.index).borrow_mut(py),
+                task,
+                count as u64,
+                false,
             )?;
             let kv = diffusion.call_method1("kv_conditioning", (&trajectories[&prefix.index],))?;
             let entries = kv.getattr("entries")?;

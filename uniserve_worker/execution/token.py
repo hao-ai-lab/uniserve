@@ -1,20 +1,8 @@
-"""Token and visual-state packing and export.
+"""Numerical token and visual inputs, prompt scores and device coordinates.
 
-This module is the autoregressive half of the numerical path that
-``forward`` drives. ``prepare_forward`` packs a prefill, decode or verify
-call into a ``TokenRow``, or into a visual-state row when a prefill writes
-generated-image feedback or an input image's latent. ``prepare_context``
-packs a context prefill, whose prompt tokens run between input-image vision
-blocks, into one row per segment, and ``finish_context`` reads its rows'
-outputs. ``prepare_sampling`` turns the model's logits into
-``SamplingMetadata`` for the sampler, or into a direct outcome when the call
-samples nothing. ``publish_sample`` records the sampled result and the
-request progress it implies on the call's ``PendingOutput``.
-
-Device state is only bound here: the views in ``PendingOutput.token_update``
-are applied to ``DecodeState`` by the native executor at batch commit. A verify
-call leaves its accepted span on device; ``PendingOutput`` materialization
-resolves it on the host against the base coordinates recorded here.
+The native executor owns sampling dispatch, accepted progress and output
+capture. This module builds borrowed model rows and computes prompt scores
+and speculative device coordinates with ordinary tensor operations.
 """
 
 from __future__ import annotations
@@ -24,7 +12,6 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from uniserve.sampling import SamplingParams
-from uniserve.tensors import adjacent_view
 from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import image
@@ -37,34 +24,18 @@ from uniserve_worker.protocol.call import (
     VisionInput,
 )
 from uniserve_worker.sampling import sampler as sampling
-from uniserve_worker.sampling.metadata import SamplingMetadata, TokenSelection
-from uniserve_worker.sampling.result import (
-    SamplerRow,
-    sample_columns,
-)
-from uniserve_worker.storage.tensor_store import Buffer, FeatureMetadata
+from uniserve_worker.sampling.metadata import TokenSelection
+from uniserve_worker.sampling.result import LogprobValues, SamplerRow
+from uniserve_worker.storage.tensor_store import FeatureMetadata
 
 if TYPE_CHECKING:
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.model_executor.diffusion_inputs import (
         DiffusionRow,
-        ImageBuilder,
     )
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.tensor_store import TensorStore
-
-
-def _writes_visual_state(call: Call) -> bool:
-    """Whether a prefill writes one visual-state row of image features.
-
-    That is generated-image feedback, whose single vision or latent feature
-    closes the image, or an input image's latent block; a context prefill's
-    vision blocks are rows of its segments instead.
-    """
-    return not call.writes_context() and (
-        bool(call.vision_inputs) or call.latent_feature_input is not None
-    )
 
 
 def prepare_forward(
@@ -99,7 +70,7 @@ def prepare_forward(
     mode = call.kind if isinstance(call.kind, ForwardMode) else None
     if call.writes_context():
         raise invalid_descriptor("a context prefill packs one row per segment")
-    if mode is ForwardMode.PREFILL and _writes_visual_state(call):
+    if mode is ForwardMode.PREFILL and call.writes_visual_state():
         return _prepare_visual(
             call,
             request,
@@ -128,7 +99,7 @@ def prepare_forward(
             or int(sampling.n_prompt_logprobs) > 0
         )
         # A chunk that neither samples its next token nor scores its prompt
-        # only writes the K/V cache (``prepare_sampling`` reads no logits).
+        # only writes the K/V cache (no result logits are needed).
         task = token_task(
             call,
             request,
@@ -196,249 +167,6 @@ def prepare_forward(
             request_tables=request_tables,
         )
     return task
-
-
-def prepare_sampling(
-    call: Call,
-    task: TokenRow | DiffusionRow,
-    output: torch.Tensor,
-    *,
-    state: BatchState,
-    request_pool_index: torch.Tensor,
-    tensor_store: TensorStore,
-    image_builder: ImageBuilder | None,
-    request_tables: BlockTables | None,
-    decode_state: DecodeState | None,
-) -> SamplingMetadata | PendingOutput:
-    """Turn a call's forward output into sampling work or a direct outcome.
-
-    A prefill commits every query token and, with a ``DecodeState``, retains
-    the resulting runtime cache length; a decode commits one token without
-    preparing it; a verify commits nothing here.
-    Returns a finished ``PendingOutput`` when a prefill declares no token
-    output or a visual call samples nothing. Otherwise returns
-    ``SamplingMetadata`` positioned after the tokens the call computed; a
-    verify samples one position per row.
-    """
-    request = state.pending_output(call.request_key.request_id)
-    start = int(request.progress.logical_position)
-    mode = call.kind
-
-    if _writes_visual_state(call):
-        return _prepare_visual_sampling(
-            call,
-            task,
-            output,
-            request_pool_index=request_pool_index,
-            image_builder=image_builder,
-            request_tables=request_tables,
-            decode_state=decode_state,
-            state=state,
-        )
-
-    logits = output
-    if mode is ForwardMode.PREFILL:
-        count = task.query_tokens
-        commit_kv(
-            task,
-            count,
-            request,
-            request_tables=request_tables,
-            decode_state=decode_state,
-        )
-        if call.token_output is None:
-            return token_outcome(
-                call,
-                tokens=0,
-                request_tables=request_tables,
-                state=state,
-            )
-
-        sample = SamplingMetadata.for_call(
-            call,
-            logits[-1],
-            request,
-            positions=(start + count,),
-            request_pool_index=request_pool_index,
-            decode_state=decode_state,
-        )
-    elif mode is ForwardMode.DECODE:
-        commit_kv(
-            task,
-            1,
-            request,
-            publish_runtime=False,
-            request_tables=request_tables,
-            decode_state=decode_state,
-        )
-        sample = SamplingMetadata.for_call(
-            call,
-            logits[-1],
-            request,
-            positions=(start + 1,),
-            request_pool_index=request_pool_index,
-            decode_state=decode_state,
-        )
-    else:
-        draft = (
-            call.input_token_ids
-            if call.predicate is not None
-            else call.input_token_ids[1:]
-        )
-        sample = SamplingMetadata.for_call(
-            call,
-            logits,
-            request,
-            positions=tuple(range(start + 1, start + len(draft) + 2)),
-            draft_token_ids=draft,
-            request_pool_index=request_pool_index,
-            decode_state=decode_state,
-        )
-    return sample
-
-
-def publish_sample(
-    call: Call,
-    task: TokenRow | DiffusionRow,
-    logits: torch.Tensor,
-    sample_work: SamplingMetadata | None,
-    sampled: SamplerRow,
-    *,
-    state: BatchState,
-    image_builder: ImageBuilder | None,
-    request_tables: BlockTables | None,
-    decode_state: DecodeState | None,
-) -> PendingOutput:
-    """Record a sampled selection and the request progress it implies.
-
-    A prefill or decode advances the logical position by its computed tokens
-    and the RNG counter by one; a prefill's prompt scoring adds to the ranges
-    already recorded. A context prefill's last text row publishes as a prompt
-    chunk; a last vision row advances past its temporal positions without
-    scoring image placeholders. A verify binds device tensors offset from
-    its base coordinates and records those coordinates
-    in the native pending output so materialization can resolve the accepted
-    span. A visual call advances the RNG counter by one and its position as
-    ``_finish_visual`` does.
-
-    ``sample_work`` may be None only for a decode whose selection came from
-    graph replay (``sample_graph``).
-    """
-    request = state.pending_output(call.request_key.request_id)
-    start = int(request.progress.logical_position)
-    mode = call.kind
-    if sample_work is None and mode is not ForwardMode.DECODE:
-        raise RuntimeError("only captured decode may omit sampling inputs")
-    penalty_base = None if sample_work is None else sample_work.penalty_base
-
-    if _writes_visual_state(call):
-        request.advance_tokens(0, sampled=True)
-        progress = request.progress
-        flow = image_builder
-        logical_position = start + (
-            max(1, 1 if flow is None else int(flow.rope_advance))
-            if call.completion_output is not None
-            else 1
-        )
-        publish_runtime_sample(
-            request,
-            sampled,
-            penalty_base=penalty_base,
-            logical_position=logical_position,
-            sampling_position=progress.rng_counter,
-            decode_state=decode_state,
-        )
-        return _finish_visual(
-            call,
-            task,
-            image_builder=image_builder,
-            request_tables=request_tables,
-            state=state,
-        )
-
-    if mode in (ForwardMode.PREFILL, ForwardMode.DECODE):
-        # Only visual extension builds a diffusion row, and it returned above.
-        assert isinstance(task, TokenRow)
-        if mode is ForwardMode.PREFILL and task.causal:
-            parameters = require_sampling(request)
-            if (
-                parameters.return_prompt_logprobs
-                or int(parameters.n_prompt_logprobs) > 0
-            ):
-                request.add_prompt_logprobs(
-                    prompt_logprob_details(
-                        request,
-                        start,
-                        cast(torch.Tensor, task.token_ids),
-                        logits,
-                        decode_state=decode_state,
-                        state=state,
-                    )
-                )
-
-        count = task.query_tokens if mode is ForwardMode.PREFILL else 1
-        token_outcome(
-            call,
-            request=request,
-            task=task if mode is ForwardMode.DECODE else None,
-            tokens=count,
-            logical_position=_next_position(task)
-            if call.writes_context()
-            else None,
-            sampled=True,
-            request_tables=request_tables,
-            state=state,
-        )
-        progress = request.progress
-        publish_runtime_sample(
-            request,
-            sampled,
-            penalty_base=penalty_base,
-            logical_position=progress.logical_position,
-            sampling_position=progress.rng_counter,
-            decode_increment=mode is ForwardMode.DECODE,
-            decode_state=decode_state,
-        )
-        return request
-    else:
-        assert sample_work is not None
-        draft = sample_work.draft_token_ids
-        initialized = task.seq_len + task.query_tokens
-
-        # The verifier selects the accepted span on device; host completion
-        # resolves it later against these base coordinates. The accepted
-        # token count is the accepted drafts plus a correction or bonus token,
-        # which is omitted when acceptance reaches the terminal draft prefix.
-        # It stays a device tensor, so the pending cache length and positions
-        # below are device values as well.
-        device_selected = sampled.accepted_token_count
-        if device_selected is None:
-            accepted_device = sampled.accepted_draft_count
-            if accepted_device is None:
-                raise RuntimeError(
-                    "speculative sampling lost its selected point"
-                )
-            device_selected = accepted_device.to(dtype=torch.int32) + 1
-
-        request.token_update.cache_length = device_selected + int(task.seq_len)
-        publish_runtime_sample(
-            request,
-            sampled,
-            penalty_base=penalty_base,
-            logical_position=device_selected + start,
-            sampling_position=(
-                device_selected + int(request.progress.rng_counter)
-            ),
-            decode_state=decode_state,
-        )
-
-        request.set_speculation(
-            draft,
-            sample_work.terminal_draft_prefix,
-            int(task.seq_len),
-            initialized,
-        )
-        return request
 
 
 def _prepare_visual(
@@ -517,62 +245,7 @@ def _prepare_visual(
     return task
 
 
-def _prepare_visual_sampling(
-    call: Call,
-    task: TokenRow | DiffusionRow,
-    output: torch.Tensor,
-    *,
-    state: BatchState,
-    request_pool_index: torch.Tensor,
-    image_builder: ImageBuilder | None,
-    request_tables: BlockTables | None,
-    decode_state: DecodeState | None,
-) -> SamplingMetadata | PendingOutput:
-    """Commit a visual row's KV, then sample its next token or finish it.
-
-    When the call declares a token output, returns ``SamplingMetadata`` for
-    the request's logical position advanced by the image builder's RoPE
-    advance (at least one); only vision rows produce logits. Otherwise
-    finishes the call through ``_finish_visual``.
-    """
-    request = state.pending_output(call.request_key.request_id)
-
-    value = output if call.vision_inputs else None
-    commit_kv(
-        task,
-        task.query_tokens,
-        request,
-        request_tables=request_tables,
-        decode_state=decode_state,
-    )
-
-    if call.token_output is not None:
-        assert value is not None
-        generation = image_builder
-        sample = SamplingMetadata.for_call(
-            call,
-            value[-1],
-            request,
-            positions=(
-                int(request.progress.logical_position)
-                + max(
-                    1, 1 if generation is None else int(generation.rope_advance)
-                ),
-            ),
-            request_pool_index=request_pool_index,
-            decode_state=decode_state,
-        )
-        return sample
-    return _finish_visual(
-        call,
-        task,
-        image_builder=image_builder,
-        request_tables=request_tables,
-        state=state,
-    )
-
-
-def _next_position(row: TokenRow) -> int:
+def next_position(row: TokenRow) -> int:
     """Return the logical position after a context row.
 
     A row occupies the positions of its temporal axis: a prompt run one per
@@ -584,28 +257,6 @@ def _next_position(row: TokenRow) -> int:
         raise RuntimeError("a context row has no positions")
     temporal = positions if positions.ndim == 1 else positions[0]
     return int(temporal.max()) + 1
-
-
-def _finish_visual(
-    call: Call,
-    task: TokenRow | DiffusionRow,
-    *,
-    state: BatchState,
-    image_builder: ImageBuilder | None,
-    request_tables: BlockTables | None,
-) -> PendingOutput:
-    """Advance the logical position past a visual row and record its outcome.
-
-    A call that closes the image advances by the image builder's RoPE advance
-    (at least one); an input image's latent row keeps its position.
-    """
-    request = state.pending_output(call.request_key.request_id)
-    if call.completion_output is not None:
-        flow = image_builder
-        request.advance_tokens(
-            max(1, 1 if flow is None else int(flow.rope_advance))
-        )
-    return image.state_outcome(call, request_tables=request_tables, state=state)
 
 
 def prepare_context(
@@ -623,7 +274,7 @@ def prepare_context(
     row over its encoder features (``image.vision_state_row``), and each run
     of prompt tokens before, between or after the blocks as one causal row.
     Each row continues where the previous one ends, in KV and in logical
-    position (``_next_position``). The rows form one numerical call whose
+    position (``next_position``). The rows form one numerical call whose
     attention writes every row's KV before any row reads it, so each row
     attends to the request's prefix and the rows before it, and a block's
     features attend to each other in both directions.
@@ -714,7 +365,7 @@ def prepare_context(
                 causal=True,
             )
         rows.append(row)
-        position = _next_position(row)
+        position = next_position(row)
         visible += row.query_tokens
 
     # The engine sizes the call's KV and forward rows from the blocks'
@@ -737,214 +388,65 @@ def prepare_context(
     return tuple(rows)
 
 
-def finish_context(
-    call: Call,
-    rows: tuple[tuple[TokenRow, torch.Tensor, torch.Tensor], ...],
-    *,
-    state: BatchState,
-    request_tables: BlockTables | None,
-    decode_state: DecodeState | None,
-) -> tuple[TokenRow, torch.Tensor, SamplingMetadata] | PendingOutput:
-    """Commit a context prefill's KV and read its prompt runs' outputs.
-
-    ``rows`` are the call's ``(row, value, request_pool_index)`` triples from
-    ``prepare_context``, in context order. The call commits every row's KV.
-    Prompt runs are scored in order when prompt log probabilities are
-    requested (``prompt_logprob_details``). Vision blocks score nothing;
-    their final logits predict the following text token.
-
-    A call that samples nothing records its outcome at the position after its
-    last row. A sampling call reads the final row's last logits, whether
-    that row is text or vision. A final prompt run publishes as a prompt
-    chunk from its starting position; a final vision block contributes no
-    prompt scores. ``publish_sample`` advances past the final row's temporal
-    positions and publishes the sampled token.
-
-    Raises:
-        WorkerError: From ``prompt_logprob_details`` or
-            ``SamplingMetadata.for_call``.
-        RuntimeError: When the KV commit exceeds the request's page tables.
-    """
-    request = state.pending_output(call.request_key.request_id)
-    parameters = require_sampling(request)
-    scores_prompt = bool(
-        parameters.return_prompt_logprobs
-        or int(parameters.n_prompt_logprobs) > 0
-    )
-    last, last_value, sampling_index = rows[-1]
-    commit_kv(
-        last,
-        last.query_tokens,
-        request,
-        request_tables=request_tables,
-        decode_state=decode_state,
-    )
-
-    # A sampled call's last run is scored when its sample publishes; prompt
-    # runs are the causal rows.
-    samples = call.token_output is not None
-    scored = rows[:-1] if samples and last.causal else rows
-    if scores_prompt:
-        for row, value, _index in scored:
-            if not row.causal:
-                request.set_prompt_logits(value[-1].detach())
-                continue
-            request.add_prompt_logprobs(
-                prompt_logprob_details(
-                    request,
-                    int(cast(torch.Tensor, row.positions)[0]),
-                    cast(torch.Tensor, row.token_ids),
-                    value,
-                    decode_state=decode_state,
-                    state=state,
-                )
-            )
-
-    if not samples:
-        return token_outcome(
-            call,
-            request=request,
-            task=last,
-            tokens=last.query_tokens,
-            logical_position=_next_position(last),
-            request_tables=request_tables,
-            state=state,
-        )
-
-    if last.causal:
-        start = int(cast(torch.Tensor, last.positions)[0])
-        request.advance_tokens(0, position=start)
-    sample = SamplingMetadata.for_call(
-        call,
-        last_value[-1],
-        request,
-        positions=(_next_position(last),),
-        request_pool_index=sampling_index,
-        decode_state=decode_state,
-    )
-    return last, last_value, sample
-
-
-def prompt_logprob_details(
-    request: PendingOutput,
-    start: int,
+def prompt_logprobs(
     tokens: torch.Tensor,
     logits: torch.Tensor,
-    *,
-    state: BatchState,
-    decode_state: DecodeState | None,
-) -> tuple[tuple[int, int, int], ...]:
-    """Score one prompt chunk and capture its log-probability ranges.
+    previous: torch.Tensor | None,
+    parameters: SamplingParams,
+) -> tuple[torch.Tensor, LogprobValues | None]:
+    """Score a prompt run and return the logits for the next run.
 
-    The first chunk (``start == 0``) scores every token after the first. A
-    continued chunk also scores its first token, using the last logits of the
-    previous chunk from the request's retained runtime logits or
-    ``DecodeState.prompt_logits``. This chunk's last logits are retained for
-    the next chunk and ``prompt_logits_ready`` is set.
-
-    Returns:
-        One ``(offset, count, row)`` completion-buffer span per scored token.
-
-    Raises:
-        WorkerError: When, for example, the logits do not align with
-            ``tokens``, there is no decode state, or a continued chunk has no
-            preceding logits.
+    The executor supplies preceding logits for a continued run. Without
+    them, the first token has no prediction and is excluded from scoring.
+    All score tensors remain on the logits' device until output capture.
     """
-    # logits is [num_tokens, vocab]; each token is scored by the logits of the
-    # preceding position.
     tokens = tokens.reshape(-1).to(device=logits.device, dtype=torch.long)
     if logits.ndim != 2 or int(logits.shape[0]) != int(tokens.numel()):
         raise invalid_descriptor(
             "prompt scoring logits do not align with input tokens"
         )
 
-    states = decode_state
-    if states is None:
-        raise unsupported_setup(
-            "prompt scoring has no request-indexed runtime state"
-        )
-    slot = int(request.request.request_pool_idx)
-
-    if start == 0:
-        score_logits = logits[:-1]
-        targets = tokens[1:]
+    if previous is None:
+        score_logits, targets = logits[:-1], tokens[1:]
     else:
-        # Continued prompts prepend the carried-over logits of the last token
-        # of the previous chunk so its first token is also scored.
-        if not request.progress.prompt_logits_ready:
-            raise invalid_descriptor(
-                "continued prompt scoring has no preceding logits"
-            )
-        pending = request.token_update.prompt_logits
-        if pending is None:
-            pending = states.prompt_logits[slot]
-        previous = pending.reshape(1, -1).to(
-            device=logits.device,
-            dtype=logits.dtype,
+        previous = previous.reshape(1, -1).to(
+            device=logits.device, dtype=logits.dtype
         )
         score_logits = torch.cat((previous, logits[:-1]), dim=0)
         targets = tokens
 
-    request.set_prompt_logits(logits[-1].detach())
-    if int(targets.numel()) == 0:
-        return ()
+    retained = logits[-1].detach()
+    if targets.numel() == 0:
+        return retained, None
 
-    parameters = require_sampling(request)
-    prompt_parameters = parameters.replace(
-        return_logprobs=True,
-        n_logprobs=int(parameters.n_prompt_logprobs),
-    )
     indexes = torch.arange(
-        int(targets.numel()),
-        dtype=torch.long,
-        device=score_logits.device,
+        int(targets.numel()), dtype=torch.long, device=score_logits.device
     )
     details = sampling.logprob_details(
         score_logits.float(),
         indexes,
         targets,
-        (prompt_parameters,) * int(targets.numel()),
+        (parameters,) * int(targets.numel()),
     )
-    captured = state.output_buffer.capture_logprobs(details)
-    return tuple(captured[index] for index in range(int(targets.numel())))
+    return retained, details
 
 
-def token_outcome(
-    call: Call,
-    *,
-    state: BatchState,
-    request: PendingOutput | None = None,
-    task: TokenRow | None = None,
-    tokens: int,
-    logical_position: int | None = None,
-    sampled: bool = False,
-    request_tables: BlockTables | None,
-) -> PendingOutput:
-    """Project progress for an ordinary prefill or decode.
+def speculative_positions(
+    sampled: SamplerRow, visible: int, position: int, sampling_position: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Offset device-selected acceptance counts from their host coordinates.
 
-    KV length comes from the numerical update when present, otherwise from
-    the forward's extent or the accepted request length. Speculative calls
-    defer their selected progress to native completion.
+    Accepted drafts include a correction or bonus token unless a draft
+    finished the request. The selected extent stays on device for queued
+    execution; native result materialization resolves it after completion.
     """
-    if request is None:
-        request = state.pending_output(call.request_key.request_id)
-
-    cache = request.cache_coordinates(request_tables)
-    published_length = request.token_update.cache_length
-    if published_length is None:
-        published_length = (
-            int(task.seq_len) + int(tokens) if task is not None else cache[1]
-        )
-    if isinstance(published_length, torch.Tensor):
-        raise RuntimeError("dynamic KV length requires a speculative selection")
-
-    request.advance_tokens(
-        tokens,
-        cache_length=int(published_length),
-        position=logical_position,
-        sampled=sampled,
-    )
-    return request
+    count = sampled.accepted_token_count
+    if count is None:
+        accepted = sampled.accepted_draft_count
+        if accepted is None:
+            raise RuntimeError("speculative sampling lost its selected point")
+        count = accepted.to(dtype=torch.int32) + 1
+    return count + visible, count + position, count + sampling_position
 
 
 def token_task(
@@ -1033,47 +535,6 @@ def token_task(
     )
 
 
-def commit_kv(
-    task: TokenRow | DiffusionRow,
-    tokens: int,
-    request: PendingOutput,
-    *,
-    publish_runtime: bool = True,
-    request_tables: BlockTables | None,
-    decode_state: DecodeState | None,
-) -> None:
-    """Validate a row's computed KV extent after ``tokens`` query tokens.
-
-    The count must lie within the row's query span and the resulting extent
-    within the request's allocated page table. With ``publish_runtime`` and a
-    ``DecodeState``, the extent is recorded as
-    ``request.token_update.cache_length`` for the commit. A zero count
-    leaves the update unchanged and skips the page-table check.
-
-    Raises:
-        RuntimeError: When the count or extent is out of range, there are no
-            page tables, or, when preparing inputs, the row belongs to another
-            request slot.
-    """
-    count = int(tokens)
-    if count < 0 or count > task.query_tokens:
-        raise RuntimeError("KV commit count is outside the task query span")
-    if count == 0:
-        return
-
-    resulting = int(task.seq_len) + count
-    page_tables = request_tables
-    if page_tables is None:
-        raise RuntimeError("KV commit requires request page tables")
-    if resulting > page_tables.allocated_length(task.request_pool_idx):
-        raise RuntimeError("KV task exceeds its scheduler block table")
-
-    if publish_runtime and decode_state is not None:
-        if int(task.request_pool_idx) != int(request.request.request_pool_idx):
-            raise RuntimeError("token KV update crossed request slots")
-        request.token_update.cache_length = resulting
-
-
 def resolve_decode_token(
     call: Call,
     request: PendingOutput,
@@ -1113,77 +574,6 @@ def resolve_decode_token(
     return int(tokens[0])
 
 
-def publish_runtime_sample(
-    request: PendingOutput,
-    sample: SamplerRow,
-    *,
-    penalty_base: torch.Tensor | None,
-    logical_position: int | torch.Tensor,
-    sampling_position: int | torch.Tensor,
-    decode_increment: bool = False,
-    decode_state: DecodeState | None,
-) -> None:
-    """Bind one call's selection for the batch's device state update.
-
-    Does nothing without a ``DecodeState``. The native executor applies
-    the bound values when the batch commits.
-    """
-    if decode_state is None:
-        return
-    request.token_update.sampled = sample
-    request.token_update.logical_position = logical_position
-    request.token_update.sampling_position = sampling_position
-    request.token_update.penalty_base = penalty_base
-    request.token_update.decode_increment = decode_increment
-
-
-def publish_token_products(
-    calls: tuple[Call, ...],
-    samples: tuple[SamplerRow, ...],
-    *,
-    state: BatchState,
-    tensor_store: TensorStore,
-) -> None:
-    """Publish sampled token and transition values into their reserved writes.
-
-    Transition products are published in one pass and token products in a
-    second; each pass publishes every call that reserved that write through
-    one ``TensorStore.write_scalars`` call. Token products receive the
-    tagged token values. Transition payloads are concatenated unless they
-    already form one adjacent view.
-    """
-    for transitions in (True, False):
-        writes: list[Buffer] = []
-        selected: list[SamplerRow] = []
-        for call, sample in zip(calls, samples, strict=True):
-            request = state.pending_output(call.request_key.request_id)
-            write = (
-                request.transition_write if transitions else request.token_write
-            )
-            if write is not None:
-                writes.append(write)
-                selected.append(sample)
-
-        if not writes:
-            continue
-
-        if transitions:
-            transition_values = tuple(sample.transition for sample in selected)
-            if any(value is None for value in transition_values):
-                raise RuntimeError(
-                    "sampling result lost a declared transition output"
-                )
-            tensors = tuple(
-                cast(torch.Tensor, value) for value in transition_values
-            )
-            values = adjacent_view(tensors)
-            if values is None:
-                values = torch.cat(tensors, dim=0)
-        else:
-            (values,) = sample_columns(selected, ("tagged_tokens",))
-        tensor_store.write_scalars(tuple(writes), values.reshape(-1))
-
-
 def require_sampling(request: PendingOutput) -> SamplingParams:
     """Return the sampling parameters required by an autoregressive request."""
     if request.request.sampling is None:
@@ -1193,10 +583,4 @@ def require_sampling(request: PendingOutput) -> SamplingParams:
     return request.request.sampling
 
 
-__all__ = [
-    "finish_context",
-    "prepare_context",
-    "prepare_forward",
-    "prepare_sampling",
-    "publish_sample",
-]
+__all__ = ["prepare_context", "prepare_forward"]

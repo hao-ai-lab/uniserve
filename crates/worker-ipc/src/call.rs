@@ -634,6 +634,13 @@ impl Call {
             && self.completion_output.is_none()
     }
 
+    /// Image feedback or a latent input writes one visual-state row.
+    /// Context-prefill vision blocks instead belong to its prompt segments.
+    pub fn writes_visual_state(&self) -> bool {
+        !self.writes_context()
+            && (!self.vision_inputs.is_empty() || self.latent_feature_input.is_some())
+    }
+
     /// Tensor dependencies in the computation signature, excluding its predicate.
     ///
     /// Includes `token_input` and `latent_input`, which [`Self::buffer_inputs`]

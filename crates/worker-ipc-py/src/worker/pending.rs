@@ -21,21 +21,13 @@ use super::output::OutputBuffer;
 use super::request::{Request, RequestPool, RequestProgress};
 
 /// Borrowed sampling views and device coordinates awaiting batch commit.
-#[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct TokenUpdate {
-    #[pyo3(get, set)]
     pub(super) sampled: Option<Py<PyAny>>,
-    #[pyo3(get, set)]
     pub(super) logical_position: Py<PyAny>,
-    #[pyo3(get, set)]
     pub(super) sampling_position: Py<PyAny>,
-    #[pyo3(get, set)]
     pub(super) penalty_base: Option<Py<PyAny>>,
-    #[pyo3(get, set)]
     pub(super) decode_increment: bool,
-    #[pyo3(get, set)]
     pub(super) cache_length: Option<Py<PyAny>>,
-    #[pyo3(get, set)]
     pub(super) prompt_logits: Option<Py<PyAny>>,
 }
 
@@ -64,11 +56,8 @@ impl TokenUpdate {
             prompt_logits: self.prompt_logits.as_ref().map(|value| value.clone_ref(py)),
         }
     }
-}
 
-#[pymethods]
-impl TokenUpdate {
-    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+    fn traverse(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.sampled)?;
         visit.call(&self.logical_position)?;
         visit.call(&self.sampling_position)?;
@@ -77,7 +66,7 @@ impl TokenUpdate {
         visit.call(&self.prompt_logits)
     }
 
-    fn __clear__(&mut self, py: Python<'_>) {
+    fn clear(&mut self, py: Python<'_>) {
         *self = Self::new(py);
     }
 }
@@ -94,8 +83,7 @@ pub(crate) struct PendingOutput {
     pub(super) call: Py<PyAny>,
     #[pyo3(get)]
     pub(super) request: Py<Request>,
-    #[pyo3(get)]
-    pub(super) token_update: Py<TokenUpdate>,
+    pub(super) token_update: TokenUpdate,
     #[pyo3(get)]
     pub(super) latent_params: Option<Py<PyAny>>,
     #[pyo3(get)]
@@ -131,6 +119,18 @@ pub(crate) struct PendingOutput {
 }
 
 impl PendingOutput {
+    pub(super) fn set_sampling(
+        &self,
+        py: Python<'_>,
+        sampling: (usize, usize, usize),
+        logprobs: Option<(usize, usize, usize)>,
+    ) -> PyResult<()> {
+        let mut state = self.lock(py)?;
+        state.sampling_range = Some(sampling);
+        state.logprob_range = logprobs;
+        Ok(())
+    }
+
     pub(super) fn for_call(
         py: Python<'_>,
         call: Py<PyAny>,
@@ -153,7 +153,7 @@ impl PendingOutput {
             buffer: Some(buffer),
             call,
             request,
-            token_update: Py::new(py, TokenUpdate::new(py))?,
+            token_update: TokenUpdate::new(py),
             latent_params: None,
             latent_buffer: None,
             latent_exports: PyDict::new(py).unbind(),
@@ -225,28 +225,8 @@ impl PendingOutput {
         })
     }
 
-    #[pyo3(signature = (tokens, *, cache_length=None, position=None, sampled=false))]
-    fn advance_tokens(
-        &self,
-        py: Python<'_>,
-        tokens: u64,
-        cache_length: Option<u64>,
-        position: Option<u64>,
-        sampled: bool,
-    ) -> PyResult<()> {
-        self.lock(py)?
-            .advance_tokens(tokens, cache_length, position, sampled);
-        Ok(())
-    }
-
     fn set_cache_length(&self, py: Python<'_>, length: u64) -> PyResult<()> {
         self.lock(py)?.set_cache_length(length);
-        Ok(())
-    }
-
-    fn set_prompt_logits(&self, py: Python<'_>, logits: Py<PyAny>) -> PyResult<()> {
-        self.token_update.borrow_mut(py).prompt_logits = Some(logits);
-        self.lock(py)?.progress.prompt_logits_ready = true;
         Ok(())
     }
 
@@ -277,51 +257,6 @@ impl PendingOutput {
         code.as_ref()
             .map(|code| call_enum(py, "ErrorCode", code))
             .transpose()
-    }
-
-    #[pyo3(signature = (sampling, logprobs=None))]
-    pub(super) fn set_sampling(
-        &self,
-        py: Python<'_>,
-        sampling: (usize, usize, usize),
-        logprobs: Option<(usize, usize, usize)>,
-    ) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        state.sampling_range = Some(sampling);
-        state.logprob_range = logprobs;
-        Ok(())
-    }
-
-    fn add_prompt_logprobs(
-        &self,
-        py: Python<'_>,
-        spans: Vec<(usize, usize, usize)>,
-    ) -> PyResult<()> {
-        self.lock(py)?.prompt_logprob_ranges.extend(spans);
-        Ok(())
-    }
-
-    fn set_candidates(&self, py: Python<'_>, span: (usize, usize)) -> PyResult<()> {
-        self.lock(py)?.candidate_range = Some(span);
-        Ok(())
-    }
-
-    fn set_canvas(&self, py: Python<'_>, span: (usize, usize)) -> PyResult<()> {
-        self.lock(py)?.canvas_range = Some(span);
-        Ok(())
-    }
-
-    fn set_speculation(
-        &self,
-        py: Python<'_>,
-        draft_tokens: Vec<u32>,
-        terminal_prefix: Option<usize>,
-        visible: u64,
-        initialized: u64,
-    ) -> PyResult<()> {
-        self.lock(py)?
-            .set_speculation(draft_tokens, terminal_prefix, visible, initialized);
-        Ok(())
     }
 
     #[getter]
@@ -417,7 +352,7 @@ impl PendingOutput {
         visit.call(&self.buffer)?;
         visit.call(&self.call)?;
         visit.call(&self.request)?;
-        visit.call(&self.token_update)?;
+        self.token_update.traverse(&visit)?;
         visit.call(&self.latent_params)?;
         visit.call(&self.latent_buffer)?;
         visit.call(&self.latent_exports)?;
@@ -439,7 +374,7 @@ impl PendingOutput {
     }
 
     fn __clear__(&mut self, py: Python<'_>) {
-        self.token_update.borrow_mut(py).__clear__(py);
+        self.token_update.clear(py);
         self.latent_params = None;
         self.latent_buffer = None;
         self.latent_exports.bind(py).clear();
@@ -478,7 +413,7 @@ impl PendingOutput {
         self.transition_write = None;
         self.completion_write = None;
         self.producer_write = None;
-        self.token_update.borrow_mut(py).__clear__(py);
+        self.token_update.clear(py);
         Ok(())
     }
 
