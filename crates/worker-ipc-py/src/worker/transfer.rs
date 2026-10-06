@@ -9,6 +9,7 @@ use ticket::BorrowedReads;
 pub(crate) use ticket::{TransferRef, TransferTicket};
 
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::Duration;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -26,6 +27,7 @@ use super::error::{invalid, native_error, resource};
 use super::events::{CUDAEvent, EventPool};
 use super::host::with_context;
 use super::registry::BufferRegistry;
+use super::shared_buffer::SharedRead;
 
 /// Python access to the rank's shared native transfer budget.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
@@ -389,6 +391,64 @@ impl TransferPool {
         Ok(ticket)
     }
 
+    /// Submit a shared-memory read on the same lane as local copies. A private
+    /// host tensor ends the source claim before destination DMA begins.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (locator, *, node, slot, device, destination=None, region=None, reservation=None))]
+    fn fetch_shared(
+        slf: Bound<'_, Self>,
+        locator: Bound<'_, PyAny>,
+        node: &str,
+        slot: usize,
+        device: Py<PyAny>,
+        destination: Option<Bound<'_, PyAny>>,
+        region: Option<Py<PyAny>>,
+        reservation: Option<Py<ReadReservation>>,
+    ) -> PyResult<Py<TransferTicket>> {
+        let py = slf.py();
+        if locator
+            .getattr("source")?
+            .getattr("node")?
+            .extract::<String>()?
+            != node
+        {
+            return Err(invalid(
+                py,
+                "shared storage transport requires the source node",
+            ));
+        }
+        if locator.getattr("backend")?.extract::<String>()? != "shm" {
+            return Err(invalid(py, "shared storage read requires a SHM locator"));
+        }
+
+        // Supplied destinations must be valid before recording their handoff.
+        // Otherwise allocation stays on the read thread, after admission.
+        let destination = destination
+            .map(|destination| {
+                py.import("uniserve_worker.transport.layout")?
+                    .getattr("read_destination")?
+                    .call1((&locator, &device, destination, region.as_ref()))
+            })
+            .transpose()?;
+        let nbytes = locator.getattr("nbytes")?.extract()?;
+        let ticket = Py::new(
+            py,
+            TransferTicket::new(slf.get().events.clone_ref(py), None),
+        )?;
+        let read = PythonRead {
+            ticket,
+            call: ReadCall::Shared {
+                pool: slf.clone().unbind(),
+                locator: locator.unbind(),
+                slot,
+                device,
+                destination: destination.as_ref().map(|value| value.clone().unbind()),
+                region,
+            },
+        };
+        Self::submit_read(&slf, read, nbytes, destination, reservation)
+    }
+
     /// Copy on a transport thread. Readiness exposes a fence before this
     /// method drains its stream; its task retires only after the drain.
     #[pyo3(signature = (ticket, source, destination, producer=None, acknowledgment=None))]
@@ -619,6 +679,14 @@ enum ReadCall {
         destination: Py<PyAny>,
         producer: Option<Py<CUDAEvent>>,
     },
+    Shared {
+        pool: Py<TransferPool>,
+        locator: Py<PyAny>,
+        slot: usize,
+        device: Py<PyAny>,
+        destination: Option<Py<PyAny>>,
+        region: Option<Py<PyAny>>,
+    },
 }
 
 impl ReadCall {
@@ -638,6 +706,20 @@ impl ReadCall {
                 visit.call(source)?;
                 visit.call(destination)?;
                 visit.call(producer)?;
+            }
+            Self::Shared {
+                pool,
+                locator,
+                device,
+                destination,
+                region,
+                ..
+            } => {
+                visit.call(pool)?;
+                visit.call(locator)?;
+                visit.call(device)?;
+                visit.call(destination)?;
+                visit.call(region)?;
             }
         }
         Ok(())
@@ -693,6 +775,59 @@ impl ReadBackend for PythonRead {
                             producer.as_ref().map(|event| event.clone_ref(py)),
                             None,
                         ),
+                        ReadCall::Shared {
+                            pool,
+                            locator,
+                            slot,
+                            device,
+                            destination,
+                            region,
+                        } => {
+                            let locator = locator.bind(py);
+                            let name = locator.getattr("transport")?.getattr("name")?;
+                            let read = Py::new(
+                                py,
+                                SharedRead::open(
+                                    py,
+                                    name.extract()?,
+                                    locator.getattr("nbytes")?.extract()?,
+                                    *slot,
+                                    0,
+                                    Duration::from_secs(120),
+                                    || self.ticket.get().check_active(),
+                                )?,
+                            )?;
+
+                            // The numerical call makes a private host copy.
+                            // Release the source claim even if allocation or
+                            // conversion fails; no device reads it directly.
+                            let source = py
+                                .import("uniserve_worker.transport.shm")?
+                                .getattr("_copy_payload")?
+                                .call1((&read, locator, device))
+                                .map(Bound::unbind);
+                            read.get().release(py)?;
+                            let source = source?.into_bound(py);
+                            let source = match region {
+                                Some(region) => source.get_item(region)?,
+                                None => source,
+                            };
+                            let target = match destination {
+                                Some(destination) => destination.bind(py).clone(),
+                                None => py
+                                    .import("uniserve_worker.transport.layout")?
+                                    .getattr("read_destination")?
+                                    .call1((locator, device, py.None(), region.as_ref()))?,
+                            };
+                            pool.get().copy(
+                                py,
+                                self.ticket.clone_ref(py),
+                                source,
+                                target,
+                                None,
+                                None,
+                            )
+                        }
                     },
                 )
             };

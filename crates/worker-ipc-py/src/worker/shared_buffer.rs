@@ -10,7 +10,6 @@ use pyo3::sync::MutexExt;
 use uniserve_worker::{SharedBuffer as NativeBuffer, SharedMapping, SharedRead as NativeRead};
 
 use super::error::{invariant, native_error, resource};
-use super::transfer::TransferTicket;
 
 /// Hand an open POSIX descriptor to a codec's ordinary file interface.
 #[pyfunction]
@@ -144,32 +143,19 @@ pub(crate) struct SharedRead {
 #[pymethods]
 impl SharedRead {
     #[new]
-    #[pyo3(signature = (name, nbytes, slot, *, offset=0, ticket=None, timeout=120.0))]
+    #[pyo3(signature = (name, nbytes, slot, *, offset=0, timeout=120.0))]
     fn new(
         py: Python<'_>,
         name: &str,
         nbytes: usize,
         slot: usize,
         offset: usize,
-        ticket: Option<&TransferTicket>,
         timeout: f64,
     ) -> PyResult<Self> {
         let timeout = Duration::try_from_secs_f64(timeout).map_err(|_| {
             PyValueError::new_err("readiness timeout must be finite and nonnegative")
         })?;
-        let inner = py
-            .detach(|| {
-                let read = NativeRead::open(name, offset, nbytes, slot)?;
-                read.wait(timeout, || {
-                    ticket.map_or(Ok(()), TransferTicket::check_active)
-                })?;
-                Ok::<_, uniserve_worker::Error>(read)
-            })
-            .map_err(|error| native_error(py, error))?;
-
-        Ok(Self {
-            inner: Mutex::new(inner),
-        })
+        Self::open(py, name, nbytes, slot, offset, timeout, || Ok(()))
     }
 
     #[getter]
@@ -183,7 +169,7 @@ impl SharedRead {
             .map_err(|error| native_error(py, error))
     }
 
-    fn release(&self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn release(&self, py: Python<'_>) -> PyResult<()> {
         self.lock(py)?.release();
         Ok(())
     }
@@ -225,6 +211,30 @@ impl SharedRead {
 }
 
 impl SharedRead {
+    /// Open a borrowed payload while observing the caller's cancellation.
+    /// Waiting and failed-read cleanup do not require the interpreter.
+    pub(super) fn open(
+        py: Python<'_>,
+        name: &str,
+        nbytes: usize,
+        slot: usize,
+        offset: usize,
+        timeout: Duration,
+        check: impl FnMut() -> uniserve_worker::Result<()> + Send,
+    ) -> PyResult<Self> {
+        let inner = py
+            .detach(|| {
+                let read = NativeRead::open(name, offset, nbytes, slot)?;
+                read.wait(timeout, check)?;
+                Ok::<_, uniserve_worker::Error>(read)
+            })
+            .map_err(|error| native_error(py, error))?;
+
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
     fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, NativeRead>> {
         self.inner
             .lock_py_attached(py)
