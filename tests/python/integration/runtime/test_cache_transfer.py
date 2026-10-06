@@ -783,6 +783,7 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     "mechanisms,device",
     (
         (("local", "shm"), "cpu"),
+        pytest.param(("local", "channel"), "cpu", id="channel"),
         pytest.param(("local", "cuda_vmm"), "cuda:0", marks=pytest.mark.gpu),
     ),
 )

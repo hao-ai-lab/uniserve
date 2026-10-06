@@ -6,8 +6,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySlice, PyTuple};
 
+use uniserve_worker_ipc::{TensorTransfer, TransferTransport};
+
 use super::error::invalid;
 use super::transfer::{ReadReservation, TransferCapacity, TransferTicket};
+use crate::convert;
 
 pub(super) struct PlannedRead<'py> {
     transport: Bound<'py, PyAny>,
@@ -48,20 +51,6 @@ pub(super) fn plan_reads<'py>(
     bindings: &Bound<'py, PyAny>,
     region: &[Range<u64>],
 ) -> PyResult<Vec<PlannedRead<'py>>> {
-    let device = target_device(destination)?;
-
-    let layout = py.import("uniserve_worker.transport.layout")?;
-    let kwargs = PyDict::new(py);
-    kwargs.set_item(
-        "shape",
-        PyTuple::new(py, region.iter().map(|axis| axis.end - axis.start))?,
-    )?;
-    kwargs.set_item("dtype", tensor.getattr("dtype")?)?;
-    kwargs.set_item("device", &device)?;
-    layout
-        .getattr("validate_destination")?
-        .call((destination,), Some(&kwargs))?;
-
     // Prefer a process-local replica; other locations keep export order.
     let mut ordered = tensor
         .getattr("locations")?
@@ -76,7 +65,6 @@ pub(super) fn plan_reads<'py>(
 
     // Resolve bounds only until coverage is complete. Keep handles borrowed,
     // without copying channel payloads or inspecting unused replica metadata.
-    let mut bound = Vec::new();
     let locations = ordered
         .into_iter()
         .map(|(location, backend)| {
@@ -99,11 +87,99 @@ pub(super) fn plan_reads<'py>(
                 .zip(shape)
                 .map(|(start, extent)| start..start + extent)
                 .collect::<Vec<_>>();
-            let index = bound.len();
-            bound.push((transport, location));
-            Ok(Some((index, covered)))
+            Ok(Some((transport, location, covered)))
         })
         .filter_map(Result::transpose);
+    let dtype: String = tensor.getattr("dtype")?.extract()?;
+    plan_views(py, destination, &dtype, region, locations, |location| {
+        Ok(location.clone())
+    })
+}
+
+/// Native callers retain their descriptor and convert only selected physical
+/// locators for the numerical transport. Channel payloads are not round-tripped.
+pub(super) fn plan_native_reads<'py>(
+    py: Python<'py>,
+    tensor: &TensorTransfer,
+    destination: &Bound<'py, PyAny>,
+    transports: &Bound<'py, PyAny>,
+    region: &[Range<u64>],
+    locators: &mut [Option<Bound<'py, PyAny>>],
+) -> PyResult<Vec<PlannedRead<'py>>> {
+    let mut ordered: Vec<_> = tensor.locations.iter().enumerate().collect();
+    ordered.sort_by_key(|(_, location)| {
+        !matches!(location.transport, TransferTransport::Local { .. })
+    });
+    let locations = ordered
+        .into_iter()
+        .map(|(index, location)| {
+            let name = match location.transport {
+                TransferTransport::Local { .. } => "local",
+                TransferTransport::PosixShm { .. } => "shm",
+                TransferTransport::CudaVmm { .. } => "cuda_vmm",
+                TransferTransport::Channel { .. } => "channel",
+            };
+            let transport = transports.call_method1("get", (name,))?;
+            if transport.is_none() {
+                return Ok(None);
+            }
+            let covered = location
+                .offset
+                .iter()
+                .zip(&location.shape)
+                .map(|(&start, &extent)| start..start + extent)
+                .collect();
+            Ok(Some((transport, (index, location), covered)))
+        })
+        .filter_map(Result::transpose);
+    plan_views(
+        py,
+        destination,
+        &tensor.locations[0].dtype,
+        region,
+        locations,
+        |&(index, location)| {
+            // A KV import can read many layers from the same descriptor.
+            // Retain one Python locator so channel bytes cross only once.
+            if let Some(location) = &locators[index] {
+                return Ok(location.clone());
+            }
+            let location = convert::transfer_locator_to_py(py, location)?;
+            locators[index] = Some(location.clone());
+            Ok(location)
+        },
+    )
+}
+
+fn plan_views<'py, L>(
+    py: Python<'py>,
+    destination: &Bound<'py, PyAny>,
+    dtype: &str,
+    region: &[Range<u64>],
+    locations: impl Iterator<Item = PyResult<(Bound<'py, PyAny>, L, Vec<Range<u64>>)>>,
+    mut convert: impl FnMut(&L) -> PyResult<Bound<'py, PyAny>>,
+) -> PyResult<Vec<PlannedRead<'py>>> {
+    let device = target_device(destination)?;
+
+    let layout = py.import("uniserve_worker.transport.layout")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(
+        "shape",
+        PyTuple::new(py, region.iter().map(|axis| axis.end - axis.start))?,
+    )?;
+    kwargs.set_item("dtype", dtype)?;
+    kwargs.set_item("device", &device)?;
+    layout
+        .getattr("validate_destination")?
+        .call((destination,), Some(&kwargs))?;
+
+    let mut bound = Vec::new();
+    let locations = locations.map(|location| -> PyResult<_> {
+        let (transport, location, covered) = location?;
+        let index = bound.len();
+        bound.push((transport, location));
+        Ok((index, covered))
+    });
     let reads = uniserve_worker::plan_reads(region, locations)?.ok_or_else(|| {
         invalid(
             py,
@@ -118,7 +194,7 @@ pub(super) fn plan_reads<'py>(
         let target_region = slices(py, &read.destination)?;
         planned.push(PlannedRead {
             transport: transport.clone(),
-            location: location.clone(),
+            location: convert(location)?,
             source_region: slices(py, &read.source)?,
             target: region_view.call1((destination, target_region))?,
         });

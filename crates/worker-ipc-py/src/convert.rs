@@ -1260,7 +1260,10 @@ fn tensor_export_to_py<'py>(
 /// event and allocation handles and channel payloads cross as `bytes`.
 /// `dtype` here is the torch dtype name string, not the `DType` enum used by
 /// tensor references.
-fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn transfer_locator_to_py<'py>(
+    py: Python<'py>,
+    locator: &Locator,
+) -> PyResult<Bound<'py, PyAny>> {
     // Tensor metadata is common to every transport family.
     let dict = PyDict::new(py);
     let source = PyDict::new(py);

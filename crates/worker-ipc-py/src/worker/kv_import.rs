@@ -1,5 +1,7 @@
 //! Numerical KV copies on native import lanes and bounded conversion storage.
 
+mod copy;
+
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,7 +20,7 @@ use uniserve_worker_ipc::{BufferId, KvTransfer};
 
 use super::block_tables::{BlockTables, GroupTable};
 use super::completion::{Completion, CompletionRef, cancelled};
-use super::error::{invalid, invariant, native_error};
+use super::error::{invalid, native_error};
 use super::host::with_context;
 use super::kv_cache::{KVCacheManager, transfer_from_py};
 use super::protocol::{buffer_id, request_key};
@@ -54,35 +56,8 @@ pub(crate) struct KVImport {
 #[pymethods]
 impl KVImport {
     #[getter]
-    fn tables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let tables = self
-            .tables
-            .iter()
-            .map(|table| {
-                Py::new(
-                    py,
-                    GroupTable {
-                        table: Arc::clone(table),
-                    },
-                )
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        PyTuple::new(py, tables)
-    }
-
-    #[getter]
-    fn export<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        convert::kv_transfer_to_py(py, &self.export)
-    }
-
-    #[getter]
     pub(super) fn request_pool_idx(&self) -> usize {
         self.inner.request_pool_idx
-    }
-
-    #[getter]
-    fn initialized_units<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, &self.initialized_units)
     }
 
     #[getter]
@@ -572,61 +547,6 @@ impl KVImporter {
             .map_err(|error| native_error(py, error))
     }
 
-    fn _require_active(&self, py: Python<'_>, write: &KVImport) -> PyResult<()> {
-        self.inner
-            .require_active(&write.inner)
-            .map_err(|error| native_error(py, error))
-    }
-
-    fn _retain(
-        slf: &Bound<'_, Self>,
-        write: &KVImport,
-        ticket: Py<TransferTicket>,
-    ) -> PyResult<()> {
-        let py = slf.py();
-        let read = Arc::new(TransferRef::new(py, ticket.clone_ref(py))?);
-        let cancelled = write.inner.retain(read);
-        ticket
-            .get()
-            .add_retirement_callback(py, slf.getattr("_reap")?.unbind())?;
-        if cancelled {
-            ticket.get().cancel(py)?;
-        }
-        Ok(())
-    }
-
-    fn _consume(
-        &self,
-        py: Python<'_>,
-        write: &KVImport,
-        tickets: Vec<Py<TransferTicket>>,
-    ) -> PyResult<()> {
-        let workspace = write
-            .inner
-            .workspace()
-            .ok_or_else(|| invariant(py, "KV import has no copy workspace"))?;
-        let stream = workspace.torch_stream.bind(py);
-        for ticket in tickets {
-            ticket.get().wait_ready(py)?;
-            ticket.get().result(
-                py,
-                if stream.is_none() {
-                    None
-                } else {
-                    Some(stream.clone())
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    fn _drain(&self, py: Python<'_>, write: &KVImport) -> PyResult<()> {
-        if let Some(workspace) = write.inner.workspace() {
-            drain(py, &workspace)?;
-        }
-        Ok(())
-    }
-
     fn _reap(&self, py: Python<'_>) -> PyResult<()> {
         self.notify_retired(py, self.inner.reap())
     }
@@ -763,21 +683,8 @@ impl ImportBackend for Copy {
 
     fn copy(&self, workspace: &Workspace) -> Result<(), Self::Error> {
         Python::attach(|py| {
-            numerical_scope(py, workspace, || {
-                py.import("uniserve_worker.storage.cache_imports")?
-                    .call_method1(
-                        "_copy",
-                        (
-                            self.owner.borrow(py).pool.bind(py),
-                            self.owner.bind(py),
-                            self.write.bind(py),
-                            self.transports.bind(py),
-                            workspace.values.bind(py),
-                        ),
-                    )?;
-                Ok(())
-            })
-            .map_err(|error| error.into_value(py).into_any())
+            numerical_scope(py, workspace, || self.copy_groups(py, workspace))
+                .map_err(|error| error.into_value(py).into_any())
         })
     }
 
