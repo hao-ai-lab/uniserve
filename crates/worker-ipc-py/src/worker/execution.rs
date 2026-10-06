@@ -300,7 +300,10 @@ fn control<'py>(context: &Bound<'py, PyAny>) -> PyResult<Bound<'py, ExpertExchan
 }
 
 /// Attempt every release and retain the first error, adding later failures.
-fn close_all(py: Python<'_>, results: impl IntoIterator<Item = PyResult<()>>) -> PyResult<()> {
+pub(super) fn close_all(
+    py: Python<'_>,
+    results: impl IntoIterator<Item = PyResult<()>>,
+) -> PyResult<()> {
     let mut failure: Option<PyErr> = None;
     for result in results {
         if let Err(error) = result {

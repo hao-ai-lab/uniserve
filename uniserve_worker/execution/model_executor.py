@@ -5,7 +5,8 @@ their capabilities, and owns everything that executes them: CUDA streams
 (execution lanes and their forks), input buffers, and prepared execution
 contexts and captured graphs, whose allocations its ``GraphStorage``
 accounts against per-device budgets. Native ``ModelRunners`` owns bound
-methods, their prepared contexts and shared stream and scratch lifetime.
+methods, prepared contexts, execution streams, input-copy dependencies and
+resource shutdown. Python constructs numerical inputs and graph shapes.
 The executor uses three kinds of runner:
 
 - batch runners, created once by ``configure_inputs`` per (component, path,
@@ -32,9 +33,8 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
-from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
@@ -61,7 +61,7 @@ from uniserve.model import (
 from uniserve.nn.vae import PatchAutoencoder
 from uniserve.processing import ImageProcessor
 from uniserve.profiling import profile_range
-from uniserve.runtime import CUDAStream, ExecutionContext, partition_streams
+from uniserve.runtime import ExecutionContext
 from uniserve.runtime.backends import kernel_choices
 from uniserve.runtime.backends.attention import resolve as attention_backend
 from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
@@ -83,7 +83,7 @@ from uniserve_worker.bootstrap.inputs import (
 )
 from uniserve_worker.bootstrap.outputs import resolve_outputs
 from uniserve_worker.config.deployment import ComponentConfig
-from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import (
     ComputeError,
     InputError,
@@ -219,7 +219,6 @@ class ModelExecutor:
     ):
         self.model, self.worker_config = model, worker_config
         self.expert_group, self.attention_ranks = expert_group, attention_ranks
-        self._event_slots = max_inflight + 1
         self.attention = attention_backend(
             attention or worker_config.attention_backend or "auto",
             device=canonical_device(worker_config.device),
@@ -281,10 +280,9 @@ class ModelExecutor:
         )
 
         self.entries: dict[tuple[str, str, str | None, int], ModelRunner] = {}
-        self.batch_runners: ModelRunners[ModelRunner] = ModelRunners()
-
-        self._lane_streams: list[tuple[LaneConfig | None, CUDAStream]] = []
-        self._preparation_stream: torch.cuda.Stream | None = None
+        self.batch_runners: ModelRunners[ModelRunner] = ModelRunners(
+            event_slots=max_inflight + 1
+        )
 
         self.graph_storage = GraphStorage()
         self.flow_captures: tuple[DiffusionShape, ...] = ()
@@ -297,7 +295,6 @@ class ModelExecutor:
         # runners stepping through it are registered at capture.
         self.experts = None
         self._expert_exchanges = ()
-        self._microbatch_streams = []
         self.expert_weights: WeightPrefetch | None = None
         self._expert_runners: list[ModelRunner] = []
         # With graphs, a rank without a forward of its own joins each expert
@@ -321,8 +318,7 @@ class ModelExecutor:
         # rank runs token denoising (``bind_canvas_slots``).
         self.canvas_slots: CanvasSlots | None = None
 
-        self.uses_lanes = False
-        self._startup_complete = self._closed = False
+        self._startup_complete = False
         # Kernel records of every runner, and the process's kernel choice
         # count when they were last gathered (see ``_report_new_kernels``).
         self._kernels = KernelRecords()
@@ -450,54 +446,6 @@ class ModelExecutor:
         and propagates the errors of ``module_stream``.
         """
         return self.batch_runners.call_stream(self, call)
-
-    def _initialize_streams(self, *, event_slots):
-        """Realize execution grants for both batched and standalone calls.
-
-        Once streams exist, later calls keep them, whatever their
-        ``event_slots``. With lanes configured it partitions the worker
-        device's SMs into one stream per lane, and raises ``ValueError`` if
-        graphs may also allocate on another device; without lanes it creates
-        one full-device stream per CUDA device the worker computes or
-        captures on.
-        """
-        if self._lane_streams:
-            return
-
-        config, device = (
-            self.worker_config,
-            canonical_device(self.worker_config.device),
-        )
-        self.uses_lanes = bool(config.lanes)
-        if config.lanes:
-            # Lanes partition one device's SMs, so multi-device capture is
-            # incompatible with a lane configuration.
-            if self._capture_devices(device):
-                raise ValueError(
-                    "Green Context lanes require one physical device"
-                )
-            slots = tuple(
-                int(lane.max_inflight or (event_slots - 1)) + 1
-                for lane in config.lanes
-            )
-            streams = partition_streams(
-                device,
-                tuple(lane.sm_budget for lane in config.lanes),
-                event_slots=slots,
-            )
-            self._lane_streams.extend(zip(config.lanes, streams, strict=True))
-        else:
-            for target in (device, *self._capture_devices(device)):
-                if target.type == "cuda":
-                    self._lane_streams.append(
-                        (
-                            None,
-                            CUDAStream.external(
-                                torch.cuda.Stream(device=target),
-                                event_slots=event_slots,
-                            ),
-                        )
-                    )
 
     @property
     def encoder_kinds(self):
@@ -994,7 +942,7 @@ class ModelExecutor:
         rows. Callable once: a second call raises ``RuntimeError`` when the
         first bound any entry. Raises ``ValueError`` when two batch runners
         of one component cover the same computation kind, and as
-        ``_initialize_streams`` does.
+        ``ModelRunners.initialize_streams`` does.
         """
         from uniserve_worker.model_executor.canvas_runner import (
             CanvasRunner,
@@ -1007,11 +955,13 @@ class ModelExecutor:
         self.kv_cache, self.decode_predicates = kv_cache, decode_predicates
         self.table_widths = tuple(table_widths)
         config = self.worker_config
-        self._initialize_streams(event_slots=max_inflight + 1)
+        self.batch_runners.initialize_streams(
+            self, event_slots=max_inflight + 1
+        )
         if config.expert_exchange == "dwdp":
             from uniserve.runtime.weight_prefetch import WeightPrefetch
 
-            if len(self._lane_streams) > 1:
+            if self.batch_runners.lane_count > 1:
                 raise ValueError(
                     "DWDP weight buffers require one execution lane"
                 )
@@ -1086,16 +1036,9 @@ class ModelExecutor:
             )
             runner_class = runner_type(call.module)
             token_runner = issubclass(runner_class, (TextRunner, CanvasRunner))
-            streams = [
-                (lane, stream, 0)
-                for lane, stream in self._lane_streams
-                if stream.device == target
-            ]
-            if token_runner and self.experts is not None:
-                streams.extend(
-                    (streams[0][0], stream, index)
-                    for index, stream in enumerate(self._microbatch_streams, 1)
-                )
+            streams = self.batch_runners.batch_streams(
+                target, microbatches=token_runner and self.experts is not None
+            )
             # One runner per stream on the target device whose lane covers
             # some of the entry's kinds (a full-device stream covers all);
             # with no stream there, as on a CPU device, one runner without.
@@ -1306,10 +1249,9 @@ class ModelExecutor:
                 raise ValueError("microbatch execution requires routed experts")
             return
         exchanges = [self.experts]
-        stream = self._lane_streams[0][1]
         for _ in range(1, self.worker_config.expert_microbatches):
             exchanges.append(self._expert_exchange(max_tokens))
-            self._microbatch_streams.append(stream.fork())
+            self.batch_runners.fork_microbatch()
         self._expert_exchanges = tuple(exchanges)
 
     def configure_experts(self):
@@ -1317,13 +1259,13 @@ class ModelExecutor:
         from uniserve_worker.model_executor.cuda_graph import Execution
 
         config = self.worker_config
-        self._initialize_streams(event_slots=self._event_slots)
+        self.batch_runners.initialize_streams(self)
         self._configure_exchanges(config.max_batch_tokens)
         if self.experts is None:
             raise ValueError("expert workers require an expert exchange")
         peers = []
         for stream, exchange in zip(
-            (self._lane_streams[0][1], *self._microbatch_streams),
+            self.batch_runners.expert_streams,
             self._expert_exchanges,
             strict=True,
         ):
@@ -1398,7 +1340,7 @@ class ModelExecutor:
                 "expert-parallel layers share one group, expert count, top-k "
                 "and hidden size"
             )
-        if len(self._lane_streams) > 1:
+        if self.batch_runners.lane_count > 1:
             raise ValueError(
                 "an expert-parallel worker runs its forwards on one lane"
             )
@@ -1789,31 +1731,7 @@ class ModelExecutor:
         on. Every stream is attempted even if one fails; the first failure is
         raised.
         """
-        streams = [self._preparation_stream]
-        streams.extend(stream.stream for _, stream in self._lane_streams)
-        streams.extend(stream.stream for stream in self._microbatch_streams)
-        streams.extend(
-            stream.stream for stream in self.batch_runners.module_streams
-        )
-
-        devices = {
-            canonical_device(self.worker_config.device),
-            *self._capture_devices(canonical_device(self.worker_config.device)),
-        }
-        streams.extend(
-            torch.cuda.current_stream(device)
-            for device in devices
-            if device.type == "cuda"
-        )
-
-        close_resources(
-            *(
-                stream.synchronize
-                for stream in dict.fromkeys(
-                    stream for stream in streams if stream is not None
-                )
-            )
-        )
+        self.batch_runners.synchronize(self)
 
     def close_graphs(self):
         """Destroy every runner's captured graphs, keeping their contexts.
@@ -1822,20 +1740,7 @@ class ModelExecutor:
         worker close calls this before releasing the KV cache, latent pool and
         product backing the graphs reference.
         """
-        actions = [
-            entry.close_graphs
-            for entry in (
-                *self.entries.values(),
-                *self.batch_runners.prepared,
-                *(() if self._diffusion is None else (self._diffusion,)),
-            )
-        ]
-        joins, self._expert_joins = self._expert_joins, None
-        if joins is not None:
-            actions.append(joins.close)
-        microbatch_joins, self._microbatch_joins = self._microbatch_joins, []
-        actions.extend(joins.close for joins in microbatch_joins)
-        close_resources(*actions)
+        self.batch_runners.close_graphs(self)
 
     def close(self, *, aborted: bool = False):
         """Release every owned context, buffer, graph and stream exactly once.
@@ -1845,75 +1750,7 @@ class ModelExecutor:
         neither returns when the peers are still serving or the device already
         holds stuck work, so an aborted release does neither.
         """
-        if self._closed:
-            return
-        self._closed = True
-
-        # A draw writes request storage, so it completes before its owners
-        # release anything; an aborted release leaves it running until exit.
-        # A constructor failure closes before ``noise_draws`` is assigned.
-        noise_draws = getattr(self, "noise_draws", None)
-        if noise_draws is not None:
-            noise_draws.abort()
-            if not aborted:
-                noise_draws.close()
-
-        if aborted:
-            from uniserve.runtime.resources import retain_until_exit
-
-            # Each stream owner retains its communicators, windows and native
-            # stream without waiting for peers or the device.
-            retain_until_exit(self)
-            close_resources(
-                *(
-                    partial(owner.close, aborted=True)
-                    for owner in (
-                        *self.batch_runners.module_streams,
-                        *self._microbatch_streams,
-                        *(owner for _, owner in self._lane_streams),
-                    )
-                )
-            )
-            return
-
-        actions = [self.synchronize]
-        actions.append(self.close_graphs)
-        actions.append(self.batch_runners.close_modules)
-        if self._diffusion is not None:
-            actions.append(self._diffusion.close)
-        for entry in self.entries.values():
-            actions.append(entry.close)
-        if self.expert_weights is not None:
-            actions.append(self.expert_weights.close)
-        actions.extend(entry.close for entry in self._expert_executions)
-        actions.extend(exchange.close for exchange in self._expert_exchanges)
-
-        # Each stream retires the communicators every context on it shared,
-        # then its native resources. Streams close in reverse creation order
-        # so forks retire before the lane streams they borrow from, on every
-        # rank in the same order.
-        actions.extend(
-            stream.close
-            for stream in reversed(self.batch_runners.module_streams)
-        )
-        actions.extend(
-            stream.close for stream in reversed(self._microbatch_streams)
-        )
-        actions.extend(
-            stream.close for _, stream in reversed(self._lane_streams)
-        )
-
-        try:
-            close_resources(*actions)
-        finally:
-            self.batch_runners.clear()
-            self.entries.clear()
-            self._diffusion = None
-            self.graph_storage.close()
-            self._lane_streams.clear()
-            self._microbatch_streams.clear()
-            self._expert_exchanges = ()
-            self._expert_executions = ()
+        self.batch_runners.close(self, aborted=aborted)
 
     def prepare_text_tokens(self, tokens: tuple[int, ...]) -> torch.Tensor:
         """Prepare the text encoder's input using its own reusable backing."""
@@ -1929,10 +1766,9 @@ class ModelExecutor:
             ),
         )
 
-    @contextmanager
     def preparing_inputs(
         self, transfers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
-    ) -> Iterator[None]:
+    ) -> AbstractContextManager[None]:
         """Overlap reserved input copies with computation, then join order.
 
         Each ``(destination, source)`` pair is copied on the executor's
@@ -1945,35 +1781,7 @@ class ModelExecutor:
         Raises ``RuntimeError`` without a live CUDA executor and ``ValueError``
         when a pair differs in shape or dtype.
         """
-        stream = self._preparation_stream
-        if (
-            self._closed
-            or canonical_device(self.worker_config.device).type != "cuda"
-        ):
-            raise RuntimeError(
-                "input preparation requires a live CUDA execution owner"
-            )
-        if stream is None:
-            stream = torch.cuda.Stream(device=self.worker_config.device)
-            self._preparation_stream = stream
-
-        try:
-            with torch.cuda.stream(stream):
-                for destination, source in transfers:
-                    if (
-                        destination.shape != source.shape
-                        or destination.dtype != source.dtype
-                    ):
-                        raise ValueError(
-                            "prepared input must match destination shape and "
-                            "dtype"
-                        )
-                    destination.copy_(source, non_blocking=True)
-            yield
-        finally:
-            torch.cuda.current_stream(self.worker_config.device).wait_stream(
-                stream
-            )
+        return self.batch_runners.preparing_inputs(self, transfers)
 
     def image_processor(self) -> ImageProcessor:
         """Require image preprocessing settings for the active call."""

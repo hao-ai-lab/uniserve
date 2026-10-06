@@ -32,9 +32,7 @@ pub(super) fn run_batch<'py>(
     states: &Bound<'py, PyAny>,
     join: bool,
 ) -> PyResult<Bound<'py, ExecutionOutput>> {
-    if owner.getattr("_closed")?.extract::<bool>()? {
-        return Err(PyRuntimeError::new_err("model runner is closed"));
-    }
+    super::modules::ensure_open(owner)?;
 
     let started = Instant::now();
     let mode = rows.get_item(0)?.getattr("forward_mode")?;
