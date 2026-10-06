@@ -10,14 +10,13 @@ graph variants and allocation pools charged to the worker's ``GraphStorage``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, is_dataclass
+from dataclasses import is_dataclass
 from types import MappingProxyType
-from typing import Any
 
 import torch
 from torch.utils import _pytree as pytree
 
-from uniserve.runtime import CUDAGraph
+from uniserve_worker._uniserve_ipc import CUDAGraphRunner as CUDAGraphRunner
 from uniserve_worker._uniserve_ipc import Execution as Execution
 from uniserve_worker._uniserve_ipc import GraphBucket as GraphBucket
 
@@ -154,64 +153,3 @@ class Inputs:
                 destination[slices].copy_(value[slices])
             else:
                 destination.copy_(value)
-
-
-@dataclass
-class CUDAGraphRunner:
-    """One executable and the numerical input addresses it retains."""
-
-    executable: CUDAGraph
-    inputs: Inputs
-
-    @classmethod
-    def capture(
-        cls,
-        context,
-        inputs,
-        call,
-        *,
-        pools,
-        restore=None,
-        warm=True,
-        warmup=None,
-    ):
-        """Warm and capture ``call(inputs)`` on ``context``.
-
-        With ``warm``, an eager call first warms the kernel specializations
-        and prepared resources that ``CUDAGraph.capture`` requires; a caller
-        that has already run the same computation at the same shapes passes
-        ``warm=False``. ``warmup`` may complete numerical work outside a
-        partial graph, such as its remaining expert exchanges; by default
-        it runs ``call``. ``restore``, when given, returns mutated state to its
-        pre-call contents after the warm call and again after capture, so
-        preparation leaves live state unchanged. ``inputs`` become the
-        graph's fixed input backing, retained by the runner.
-        """
-        if warm:
-            with context.activate():
-                try:
-                    (call if warmup is None else warmup)(inputs)
-                finally:
-                    if restore is not None:
-                        restore()
-        executable: CUDAGraph[Any] = CUDAGraph(context=context, pools=pools)
-        try:
-            executable.capture(lambda: call(inputs), restore=restore)
-        except BaseException:
-            executable.close()
-            raise
-        return cls(executable, Inputs(inputs))
-
-    def replay(self, live=None):
-        """Copy ``live`` into the fixed inputs, when given, and replay.
-
-        Returns the graph's retained output views, which the next replay
-        overwrites.
-        """
-        with self.executable.context.activate():
-            if live is not None:
-                self.inputs.copy(live)
-            return self.executable.replay()
-
-    def close(self):
-        self.executable.close()

@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyFrozenSet};
+use pyo3::types::PyFrozenSet;
+
+use crate::worker::cuda_graph::CUDAGraph;
 
 use super::{GraphBucket, close_all};
 use crate::worker::host::with_context;
@@ -37,26 +39,20 @@ impl JoinGraphs {
             .collect::<PyResult<BTreeSet<usize>>>()?;
         let graphs = Py::new(py, GraphBucket::new(None))?;
         let result = (|| {
-            let graph_type = py
-                .import("uniserve.runtime.cuda_graph")?
-                .getattr("CUDAGraph")?;
             let partial = py.import("functools")?.getattr("partial")?;
             let join = py.get_type::<Self>().getattr("_join")?;
-            let options = PyDict::new(py);
-            options.set_item("context", context)?;
-            options.set_item("pools", pools)?;
 
             for capacity in capacities.into_iter().rev() {
                 let call = partial.call1((&join, context, exchange, capacity, step))?;
                 if warm {
                     with_context(&context.call_method0("activate")?, || call.call0())?;
                 }
-                let graph = graph_type.call((), Some(&options))?;
+                let graph = Py::new(py, CUDAGraph::new(py, context.clone().unbind(), pools)?)?;
                 graphs
                     .borrow_mut(py)
                     .graphs
-                    .insert(Some(capacity), graph.clone().unbind());
-                graph.call_method1("capture", (call,))?;
+                    .insert(Some(capacity), graph.clone_ref(py).into_any());
+                graph.borrow_mut(py).capture(py, call.unbind(), None)?;
             }
             Ok(())
         })();
@@ -109,7 +105,12 @@ impl JoinGraphs {
                     "no captured expert join serves step capacity {capacity}"
                 ))
             })?;
-        graph.call_method0(py, "replay").map(drop)
+        graph
+            .bind(py)
+            .cast::<CUDAGraph>()?
+            .borrow()
+            .replay(py)
+            .map(drop)
     }
 
     pub(in crate::worker) fn close(&self, py: Python<'_>) -> PyResult<()> {

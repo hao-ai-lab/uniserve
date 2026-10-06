@@ -483,14 +483,3 @@ pub(super) fn on_stream<T>(
     joined?;
     Ok(result)
 }
-
-pub(super) fn graph_error(py: Python<'_>, message: String) -> PyErr {
-    match py
-        .import("uniserve.runtime.cuda_graph")
-        .and_then(|module| module.getattr("CUDAGraphError"))
-        .and_then(|class| class.call1((message,)))
-    {
-        Ok(value) => PyErr::from_value(value),
-        Err(error) => error,
-    }
-}

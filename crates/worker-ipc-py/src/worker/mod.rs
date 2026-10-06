@@ -8,6 +8,7 @@ mod buffer;
 mod capacity;
 mod completion;
 mod config;
+mod cuda_graph;
 mod descriptor_grants;
 pub(crate) mod error;
 mod events;
@@ -88,6 +89,12 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_class::<graph_storage::GraphStorage>()?;
+    module.add_class::<cuda_graph::CUDAGraph>()?;
+    module.add_class::<cuda_graph::CUDAGraphRunner>()?;
+    module.add(
+        "CUDAGraphError",
+        module.py().get_type::<cuda_graph::CUDAGraphError>(),
+    )?;
     module.add_class::<execution::Execution>()?;
     module.add_class::<execution::GraphBucket>()?;
     module.add_class::<execution::JoinGraphs>()?;

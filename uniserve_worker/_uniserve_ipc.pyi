@@ -1145,6 +1145,51 @@ class Microbatches:
 
 def graph_storage_budget_bytes(total_device_bytes: int) -> int: ...
 
+class CUDAGraphError(RuntimeError):
+    """A capture or replay failure, retaining the numerical exception."""
+
+class CUDAGraph(Generic[Source]):
+    """Captured execution and resource lifetime shared by library and worker."""
+    def __init__(
+        self,
+        *,
+        context: ExecutionContext,
+        pools: Mapping[torch.device, torch.cuda.MemPool] | None = None,
+    ) -> None: ...
+    @property
+    def context(self) -> ExecutionContext: ...
+    def capture(
+        self,
+        call: Callable[[], Source],
+        *,
+        restore: Callable[[], None] | None = None,
+    ) -> None: ...
+    def replay(self) -> Source: ...
+    def close(self, *, aborted: bool = False) -> None: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(self, kind, error, traceback) -> None: ...
+
+@final
+class CUDAGraphRunner:
+    """A captured numerical bucket and its fixed tensor inputs."""
+    @property
+    def executable(self) -> CUDAGraph: ...
+    @property
+    def inputs(self) -> Any: ...
+    @staticmethod
+    def capture(
+        context: ExecutionContext,
+        inputs: Any,
+        call: Callable[[Any], Any],
+        *,
+        pools: Mapping[torch.device, torch.cuda.MemPool] | None,
+        restore: Callable[[], None] | None = None,
+        warm: bool = True,
+        warmup: Callable[[Any], Any] | None = None,
+    ) -> CUDAGraphRunner: ...
+    def replay(self, live: Any = None) -> Any: ...
+    def close(self) -> None: ...
+
 @final
 class GraphBucket:
     def __init__(self, graphs: dict[int | None, Any] | None = None) -> None: ...

@@ -7,7 +7,8 @@ use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker_ipc::ForwardStats as NativeStats;
 
 use crate::stats::ForwardStats;
-use crate::worker::execution::{Execution, graph_error, on_stream};
+use crate::worker::cuda_graph::{CUDAGraphError, CUDAGraphRunner};
+use crate::worker::execution::{Execution, on_stream};
 use crate::worker::host::with_context;
 use crate::worker::model_results::ExecutionOutput;
 
@@ -74,9 +75,8 @@ fn capture_batch(
 ) -> PyResult<()> {
     let py = runner.py();
     if execution(runner)?.borrow().sealed {
-        return Err(graph_error(
-            py,
-            "batch capture is outside startup preparation".into(),
+        return Err(CUDAGraphError::new_err(
+            "batch capture is outside startup preparation",
         ));
     }
     let Some(selected) = select(runner, batch, true)? else {
@@ -118,10 +118,9 @@ fn capture_batch(
             .map(Some)
             .collect::<Vec<_>>();
         if values.is_empty() {
-            return Err(graph_error(
-                py,
-                format!("local graph of {tokens} tokens exceeds the expert exchange capacity"),
-            ));
+            return Err(CUDAGraphError::new_err(format!(
+                "local graph of {tokens} tokens exceeds the expert exchange capacity"
+            )));
         }
         values
     } else {
@@ -248,7 +247,11 @@ pub(super) fn run_module(
                     graph
                 }
             };
-            graph.call_method1("replay", (values,))?
+            graph
+                .cast::<CUDAGraphRunner>()?
+                .borrow()
+                .replay(py, Some(values.into_pyobject(py)?.into_any().unbind()))?
+                .into_bound(py)
         } else {
             numerical.call1((&forward, &resources, values))?
         };

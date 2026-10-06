@@ -85,7 +85,7 @@ impl CUDAStream {
     }
 
     #[pyo3(signature = (*, aborted=false))]
-    fn close(&self, py: Python<'_>, aborted: bool) -> PyResult<()> {
+    pub(super) fn close(&self, py: Python<'_>, aborted: bool) -> PyResult<()> {
         let mut stream = self.lock(py)?;
         let stream = &mut *stream;
         py.detach(|| stream.close(aborted)).map_err(error)

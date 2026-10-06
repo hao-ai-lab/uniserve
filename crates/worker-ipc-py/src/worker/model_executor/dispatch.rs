@@ -6,7 +6,8 @@ use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use uniserve_worker_ipc::ForwardStats as NativeStats;
 
 use crate::stats::ForwardStats;
-use crate::worker::execution::{GraphBucket, graph_error};
+use crate::worker::cuda_graph::CUDAGraphError;
+use crate::worker::execution::GraphBucket;
 use crate::worker::expert_exchange::ExpertExchange;
 use crate::worker::host::with_context;
 use crate::worker::microbatches::Microbatches;
@@ -124,13 +125,10 @@ fn forward(
         Some(shape) if buckets.contains(shape.key.bind(py))? => Some(shape),
         Some(shape) if shape.bucketed => {
             if execution(runner)?.borrow().sealed {
-                return Err(graph_error(
-                    py,
-                    format!(
-                        "configured graph bucket is not resident: {}",
-                        shape.key.bind(py).repr()?
-                    ),
-                ));
+                return Err(CUDAGraphError::new_err(format!(
+                    "configured graph bucket is not resident: {}",
+                    shape.key.bind(py).repr()?
+                )));
             }
             graphs::capture(runner, batch, call)?;
             captured = true;
