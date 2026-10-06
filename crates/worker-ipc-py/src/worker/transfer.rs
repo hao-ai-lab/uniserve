@@ -3,24 +3,29 @@
 //! Consumable views and physical retirement are separate completions. Credits
 //! return only after the backend stops accessing source and destination storage.
 
-use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
+mod ticket;
+
+use ticket::BorrowedReads;
+pub(crate) use ticket::{TransferRef, TransferTicket};
+
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
-use pyo3::types::{PyCFunction, PyDict, PyTuple};
-use uniserve_worker::cuda::{DeviceGuard, Event};
+use pyo3::types::{PyDict, PyTuple};
+use uniserve_worker::cuda::DeviceGuard;
 use uniserve_worker::{
-    HostTask as NativeHostTask, Outcome, ReadBackend, ReadReservation as NativeReadReservation,
-    TransferCapacity as NativeTransferCapacity, TransferPool as NativeTransferPool, TransferRead,
+    ReadBackend, ReadReservation as NativeReadReservation,
+    TransferCapacity as NativeTransferCapacity, TransferPool as NativeTransferPool,
     TransferTicket as NativeTransferTicket,
 };
 
-use super::error::{invalid, invariant, native_error, resource};
+use super::error::{invalid, native_error, resource};
 use super::events::{CUDAEvent, EventPool};
 use super::host::with_context;
+use super::registry::BufferRegistry;
 
 /// Python access to the rank's shared native transfer budget.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
@@ -217,443 +222,12 @@ fn notify_capacity(callbacks: Vec<Py<PyAny>>) {
     }
 }
 
-struct TicketState {
-    ticket: NativeTransferTicket<Py<PyAny>, Py<PyAny>, Py<PyAny>>,
-    release: Option<Py<PyAny>>,
-    retained: Vec<Py<PyAny>>,
-    work: Option<Weak<NativeHostTask<TransferRead<PythonRead>>>>,
-}
-
-/// One read's stream readiness and physical retirement. Cancellation revokes
-/// consumption; it cannot prove that a submitted device copy has stopped.
-#[pyclass(frozen, weakref, module = "uniserve_worker._uniserve_ipc")]
-pub(crate) struct TransferTicket {
-    events: Py<EventPool>,
-    state: Mutex<TicketState>,
-}
-
-/// Retain the transport object while native storage owners inspect physical
-/// completion without entering Python or the ticket's numerical state lock.
-pub(crate) struct TransferRef {
-    pub(crate) owner: Py<TransferTicket>,
-    retirement: Arc<uniserve_worker::Completion<Py<PyAny>, Py<PyAny>>>,
-}
-
-impl TransferRef {
-    pub(crate) fn clone_ref(&self, py: Python<'_>) -> Self {
-        Self {
-            owner: self.owner.clone_ref(py),
-            retirement: Arc::clone(&self.retirement),
-        }
-    }
-
-    pub(crate) fn new(py: Python<'_>, owner: Py<TransferTicket>) -> PyResult<Self> {
-        let retirement = Arc::clone(&owner.get().lock(py)?.ticket.retirement);
-        Ok(Self { owner, retirement })
-    }
-}
-
-impl TransferTicket {
-    /// Inspect cancellation while a native transport wait has released the GIL.
-    pub(super) fn check_active(&self) -> uniserve_worker::Result<()> {
-        let state = self.state.lock().map_err(|_| {
-            uniserve_worker::Error::Invariant("transfer ticket lock is poisoned".into())
-        })?;
-        if state.ticket.is_cancelled() {
-            return Err(uniserve_worker::Error::Resource(
-                "transfer read was cancelled",
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl Deref for TransferRef {
-    type Target = uniserve_worker::Completion<Py<PyAny>, Py<PyAny>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.retirement
-    }
-}
-
-#[pymethods]
-impl TransferTicket {
-    #[new]
-    #[pyo3(signature = (event_pool, *, release=None))]
-    fn new(event_pool: Py<EventPool>, release: Option<Py<PyAny>>) -> Self {
-        let ticket = NativeTransferTicket::new(release.is_some());
-        Self {
-            events: event_pool,
-            state: Mutex::new(TicketState {
-                ticket,
-                release,
-                retained: Vec::new(),
-                work: None,
-            }),
-        }
-    }
-
-    pub(crate) fn ready(&self, py: Python<'_>) -> PyResult<bool> {
-        Ok(self.lock(py)?.ticket.ready())
-    }
-
-    pub(crate) fn retired(&self, py: Python<'_>) -> PyResult<bool> {
-        Ok(self.lock(py)?.ticket.retired())
-    }
-
-    pub(crate) fn retirement_ready(&self, py: Python<'_>) -> PyResult<bool> {
-        let state = self.lock(py)?;
-        state.ticket.retirement_ready().map_err(|error| {
-            let error = native_error(py, error);
-            if let Some(cause) = state.ticket.error() {
-                error.set_cause(py, Some(PyErr::from_value(cause.bind(py).clone())));
-            }
-            error
-        })
-    }
-
-    pub(crate) fn add_done_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
-        let immediate = self.lock(py)?.ticket.add_done_callback(callback);
-        if let Some(callback) = immediate {
-            notify(py, vec![callback]);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn add_retirement_callback(
-        &self,
-        py: Python<'_>,
-        callback: Py<PyAny>,
-    ) -> PyResult<()> {
-        let immediate = self.lock(py)?.ticket.retirement.subscribe(callback);
-        if let Some(callback) = immediate {
-            notify(py, vec![callback]);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn cancel(&self, py: Python<'_>) -> PyResult<()> {
-        let error = resource(py, "transfer read was cancelled")
-            .into_value(py)
-            .into_any();
-        let mut state = self.lock(py)?;
-        let callbacks = state.ticket.cancel(error);
-        let work = state.work.as_ref().and_then(Weak::upgrade);
-        drop(state);
-        notify(py, callbacks);
-        if let Some(work) = work {
-            py.detach(|| work.cancel(false))
-                .map_err(|error| PyErr::from_value(error.into_bound(py)))?;
-        }
-        Ok(())
-    }
-
-    #[pyo3(name = "_require_active")]
-    fn require_active(&self, py: Python<'_>) -> PyResult<()> {
-        if let Some(error) = self.lock(py)?.ticket.cancellation_error() {
-            return Err(PyErr::from_value(error.bind(py).clone()));
-        }
-        Ok(())
-    }
-
-    /// Return views without a host wait. CUDA consumption waits on the read
-    /// fence and records every view on the consuming allocator stream.
-    #[pyo3(signature = (stream=None))]
-    pub(crate) fn result(
-        &self,
-        py: Python<'_>,
-        stream: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<Py<PyAny>> {
-        let mut state = self.lock(py)?;
-        let value = match state
-            .ticket
-            .result()
-            .map_err(|error| native_error(py, error))?
-        {
-            Outcome::Success(value) => value.clone_ref(py),
-            Outcome::Failed(error) => return Err(PyErr::from_value(error.bind(py).clone())),
-            Outcome::Cancelled => unreachable!("transfer cancellation retains its error"),
-        };
-        if state.ticket.producer().is_some() {
-            let spans = tensor_spans(value.bind(py))?;
-            let device = spans[0].getattr("device")?;
-            let consumer = match stream {
-                Some(stream) => stream,
-                None => py
-                    .import("torch")?
-                    .getattr("cuda")?
-                    .call_method1("current_stream", (&device,))?,
-            };
-            if !consumer.getattr("device")?.eq(&device)? {
-                return Err(invalid(py, "transfer consumer stream is on another device"));
-            }
-            state
-                .ticket
-                .consume(
-                    device.getattr("index")?.extract()?,
-                    consumer.getattr("cuda_stream")?.extract()?,
-                )
-                .map_err(|error| native_error(py, error))?;
-            for span in spans {
-                span.call_method1("record_stream", (&consumer,))?;
-            }
-        }
-        Ok(value)
-    }
-
-    /// Borrowed storage stays granted until every observed consumer stream
-    /// completes. Copy reads keep their ordinary destination tensor ownership.
-    pub(crate) fn close(slf: Bound<'_, Self>) -> PyResult<()> {
-        let py = slf.py();
-        let owner = slf.get();
-        let pool = owner.events.borrow(py);
-        pool.reap(py)?;
-        let events = {
-            let mut state = owner.lock(py)?;
-            if !state.ticket.close() {
-                return Ok(());
-            }
-
-            pool.with_pool(|pool| state.ticket.record_consumers(pool))?;
-            state.ticket.consumer_events().to_vec()
-        };
-        if events.is_empty() {
-            return owner.events_released(py);
-        }
-
-        for event in &events {
-            pool.wake_event(py, event.device(), event)?;
-        }
-        pool.defer_events(
-            events,
-            slf.clone().into_any().unbind(),
-            Some(slf.getattr("events_released")?.unbind()),
-        )?;
-        pool.reap(py)
-    }
-
-    fn events_released(&self, py: Python<'_>) -> PyResult<()> {
-        let release = {
-            let mut state = self.lock(py)?;
-            state.ticket.release_consumers();
-            state.release.take()
-        };
-        if let Some(release) = release {
-            release.bind(py).call0()?;
-            self.retire(py)?;
-        }
-        Ok(())
-    }
-
-    #[pyo3(name = "_drain_consumers")]
-    fn drain_consumers(slf: Bound<'_, Self>) -> PyResult<()> {
-        Self::close(slf.clone())?;
-        let py = slf.py();
-        let owner = slf.get();
-        let events = owner.lock(py)?.ticket.consumer_events().to_vec();
-        py.detach(|| {
-            for event in events {
-                event.wait().map_err(PyRuntimeError::new_err)?;
-            }
-            Ok::<_, PyErr>(())
-        })?;
-        owner.events.borrow(py).reap(py)
-    }
-
-    #[pyo3(name = "_complete", signature = (value, event=None))]
-    fn complete(
-        &self,
-        py: Python<'_>,
-        value: Py<PyAny>,
-        event: Option<Py<CUDAEvent>>,
-    ) -> PyResult<()> {
-        let event = event.map(|event| Arc::clone(&event.borrow(py).inner));
-        self.complete_native(py, value, event)
-    }
-
-    #[pyo3(name = "_fail")]
-    fn fail(&self, py: Python<'_>, error: Py<PyAny>) -> PyResult<bool> {
-        let mut state = self.lock(py)?;
-        let (late, callbacks) = state.ticket.fail(error);
-        drop(state);
-        notify(py, callbacks);
-        Ok(late)
-    }
-
-    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.events)?;
-        if let Some(state) = gc_lock(&self.state) {
-            state.ticket.visit(|value, error, callbacks| {
-                visit.call(value)?;
-                visit.call(error)?;
-                for callback in callbacks {
-                    visit.call(callback)?;
-                }
-                Ok(())
-            })?;
-            state.ticket.retirement.visit(|_, callbacks| {
-                for callback in callbacks {
-                    visit.call(callback)?;
-                }
-                Ok(())
-            })?;
-            visit.call(&state.release)?;
-            for value in &state.retained {
-                visit.call(value)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl TransferTicket {
-    /// Block a host-copy thread until a value or error is consumable. Physical
-    /// retirement is separate and remains owned by the ticket's readers.
-    pub(crate) fn wait_ready(&self, py: Python<'_>) -> PyResult<()> {
-        if self.ready(py)? {
-            return Ok(());
-        }
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let ready = PyCFunction::new_closure(py, None, None, move |_args, _kwargs| {
-            let _ = sender.send(());
-            Ok::<_, PyErr>(())
-        })?;
-        self.add_done_callback(py, ready.into_any().unbind())?;
-        py.detach(move || receiver.recv())
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
-    }
-}
-
-impl TransferTicket {
-    fn complete_native(
-        &self,
-        py: Python<'_>,
-        value: Py<PyAny>,
-        event: Option<Arc<Event>>,
-    ) -> PyResult<()> {
-        let mut state = self.lock(py)?;
-        if let Some(event) = &event {
-            self.events
-                .borrow(py)
-                .with_pool(|pool| pool.retain(event, event.device(), 1))?;
-        }
-        let callbacks = state.ticket.complete(value, event);
-        drop(state);
-        notify(py, callbacks);
-        Ok(())
-    }
-
-    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, TicketState>> {
-        self.state
-            .lock_py_attached(py)
-            .map_err(|_| invariant(py, "transfer ticket lock is poisoned"))
-    }
-
-    fn retire(&self, py: Python<'_>) -> PyResult<()> {
-        let callbacks = self
-            .lock(py)?
-            .ticket
-            .retire()
-            .map_err(|error| native_error(py, error))?;
-        notify(py, callbacks);
-        Ok(())
-    }
-}
-
-impl Drop for TransferTicket {
-    fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner());
-        Python::try_attach(|py| {
-            let cleanup = (|| -> PyResult<()> {
-                // An unclosed borrowed ticket can lose its last Python owner.
-                // Its completion callback keeps the source grant and views
-                // until every consumer fence finishes, without resurrecting it.
-                let pool = self.events.borrow(py);
-                if !state.ticket.closed()
-                    && let Some(release) = state.release.take()
-                {
-                    state.ticket.close();
-                    pool.with_pool(|pool| state.ticket.record_consumers(pool))?;
-                    let events = state.ticket.consumer_events().to_vec();
-                    for event in &events {
-                        pool.wake_event(py, event.device(), event)?;
-                    }
-                    if events.is_empty() {
-                        release.bind(py).call0()?;
-                        notify(
-                            py,
-                            state
-                                .ticket
-                                .retire()
-                                .map_err(|error| native_error(py, error))?,
-                        );
-                    } else {
-                        let retained = Mutex::new(Some(release));
-                        let retirement = Arc::clone(&state.ticket.retirement);
-                        let complete = PyCFunction::new_closure(
-                            py,
-                            None,
-                            None,
-                            move |args: &Bound<'_, PyTuple>,
-                                  _: Option<&Bound<'_, PyDict>>|
-                                  -> PyResult<()> {
-                                let py = args.py();
-                                let completion = retained
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .take();
-                                if let Some(release) = completion {
-                                    release.bind(py).call0()?;
-                                    let callbacks = retirement
-                                        .complete(Ok(()))
-                                        .map_err(|error| native_error(py, error))?;
-                                    notify(py, callbacks);
-                                }
-                                Ok(())
-                            },
-                        )?;
-                        pool.defer_events(
-                            events,
-                            state
-                                .ticket
-                                .value()
-                                .map(|value| value.clone_ref(py))
-                                .unwrap_or_else(|| py.None()),
-                            Some(complete.into_any().unbind()),
-                        )?;
-                    }
-                }
-
-                let events = state.ticket.take_events();
-                if !events.is_empty() {
-                    pool.defer_events(
-                        events,
-                        state
-                            .ticket
-                            .value()
-                            .map(|value| value.clone_ref(py))
-                            .unwrap_or_else(|| py.None()),
-                        None,
-                    )?;
-                }
-                pool.reap(py)?;
-                Ok(())
-            })();
-            if let Err(error) = cleanup {
-                error.write_unraisable(py, None);
-            }
-        });
-    }
-}
-
 /// Execute a backend's reads against the rank's shared credits. The native host
 /// lane supplies threads; the pool orders copy streams and retires read credits.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct TransferPool {
     pool: Arc<NativeTransferPool<PythonRead>>,
+    borrowed: Arc<BorrowedReads>,
     capacity: Py<TransferCapacity>,
     events: Py<EventPool>,
 }
@@ -673,6 +247,7 @@ impl TransferPool {
             .map_err(|error| native_error(py, error))?;
         Ok(Self {
             pool: Arc::new(pool),
+            borrowed: Arc::new(Mutex::new(Some(Default::default()))),
             capacity,
             events: event_pool,
         })
@@ -693,61 +268,121 @@ impl TransferPool {
         destination: Option<Bound<'_, PyAny>>,
         reservation: Option<Py<ReadReservation>>,
     ) -> PyResult<Py<TransferTicket>> {
+        let ticket = Py::new(
+            slf.py(),
+            TransferTicket::new(slf.get().events.clone_ref(slf.py()), None),
+        )?;
+        let read = PythonRead {
+            ticket,
+            call: ReadCall::Python {
+                call,
+                args: args.clone().unbind(),
+            },
+        };
+        Self::submit_read(&slf, read, nbytes, destination, reservation)
+    }
+
+    /// Grant and submit a local read without a Python ownership callback.
+    #[pyo3(signature = (registry, locator, *, device, destination=None, region=None, reservation=None))]
+    fn fetch_local(
+        slf: Bound<'_, Self>,
+        registry: &Bound<'_, BufferRegistry>,
+        locator: &Bound<'_, PyAny>,
+        device: &Bound<'_, PyAny>,
+        destination: Option<Bound<'_, PyAny>>,
+        region: Option<Bound<'_, PyAny>>,
+        reservation: Option<Py<ReadReservation>>,
+    ) -> PyResult<Py<TransferTicket>> {
         let py = slf.py();
         let owner = slf.get();
         if let Some(error) = owner.pool.error() {
             return Err(PyErr::from_value(error.bind(py).clone()));
         }
-        let nbytes = u64::try_from(nbytes)
-            .map_err(|_| PyValueError::new_err("transfer byte reservation must not be negative"))?;
-        let ticket = Py::new(py, TransferTicket::new(owner.events.clone_ref(py), None))?;
-        let read = PythonRead {
-            ticket: ticket.clone_ref(py),
-            call,
-            args: args.clone().unbind(),
+
+        let (buffer, source) = BufferRegistry::acquire_read(registry, locator)?;
+        let borrowed = destination.is_none();
+        let events = if borrowed {
+            source.events(py)
+        } else {
+            owner.events.clone_ref(py)
         };
-        let reservation = reservation.as_ref().map(|value| &value.get().inner);
-        let task = py
-            .detach(|| owner.pool.reserve(read, nbytes, reservation))
-            .map_err(|error| {
-                TransferCapacity::read_error(
-                    owner.capacity.bind(py),
-                    error,
-                    "asynchronous transfer ticket capacity is exhausted",
-                )
-            })?;
+        let borrower = borrowed.then(|| Arc::downgrade(&owner.borrowed));
+        let ticket = Py::new(py, TransferTicket::new(events, borrower))?;
+        ticket.get().bind_source(py, source)?;
 
         let submitted = (|| -> PyResult<()> {
-            ticket.get().lock(py)?.work = Some(Arc::downgrade(&task));
-            if let Some(destination) = destination {
-                let spans = tensor_spans(&destination)?;
-                if spans[0].getattr("is_cuda")?.extract::<bool>()? {
-                    let device = spans[0].getattr("device")?;
-                    let stream = py
-                        .import("torch.cuda")?
-                        .call_method1("current_stream", (&device,))?
-                        .getattr("cuda_stream")?
-                        .extract()?;
-                    let device = device.getattr("index")?.extract()?;
-                    let pool = owner.events.borrow(py);
-                    pool.reap(py)?;
-                    let mut state = ticket.get().lock(py)?;
-                    pool.with_pool(|pool| state.ticket.prepare_copy(pool, device, stream))?;
-                }
-            }
+            let tensor = buffer.get().tensor(py)?;
+            let producer = buffer.get().event(py);
+            let (tensor, target): (Py<PyAny>, Option<Py<PyAny>>) = py
+                .import("uniserve_worker.transport.local")?
+                .getattr("_read_views")?
+                .call1((
+                    tensor,
+                    locator,
+                    device,
+                    destination.as_ref(),
+                    region.as_ref(),
+                ))?
+                .extract()?;
 
-            if let Some(wake) = owner.pool.completion_wake() {
-                ticket.get().add_done_callback(py, wake.clone_ref(py))?;
-                ticket
+            if let Some(target) = target {
+                let read = PythonRead {
+                    ticket: ticket.clone_ref(py),
+                    call: ReadCall::Copy {
+                        pool: slf.clone().unbind(),
+                        source: tensor,
+                        destination: target.clone_ref(py),
+                        producer,
+                    },
+                };
+                Self::submit_read(
+                    &slf,
+                    read,
+                    locator.getattr("nbytes")?.extract()?,
+                    Some(target.into_bound(py)),
+                    reservation,
+                )?;
+            } else {
+                owner
+                    .capacity
                     .get()
-                    .add_retirement_callback(py, wake.clone_ref(py))?;
+                    .inner
+                    .take_read(reservation.as_ref().map(|value| &value.get().inner))
+                    .map_err(|error| {
+                        TransferCapacity::read_error(
+                            owner.capacity.bind(py),
+                            error,
+                            "local borrowed-view ticket capacity is exhausted",
+                        )
+                    })?;
+                ticket.get().lock(py)?.credit = Some(owner.capacity.clone_ref(py));
+                {
+                    let mut borrowed = owner
+                        .borrowed
+                        .lock_py_attached(py)
+                        .unwrap_or_else(|error| error.into_inner());
+                    let borrowed = borrowed
+                        .as_mut()
+                        .ok_or_else(|| resource(py, "transfer pool is closed"))?;
+                    borrowed.insert(
+                        Arc::as_ptr(&ticket.get().inner) as usize,
+                        Arc::downgrade(&ticket.get().inner),
+                    );
+                }
+
+                if let Some(wake) = owner.pool.completion_wake() {
+                    ticket.get().add_done_callback(py, wake.clone_ref(py))?;
+                    ticket
+                        .get()
+                        .add_retirement_callback(py, wake.clone_ref(py))?;
+                }
+                ticket.get().complete(py, tensor, producer)?;
             }
-            py.detach(|| task.submit())
-                .map_err(|error| native_error(py, error))
+            Ok(())
         })();
         if let Err(error) = submitted {
-            if let Err(cleanup) = py.detach(|| task.cancel(true)) {
-                PyErr::from_value(cleanup.into_bound(py)).write_unraisable(py, None);
+            if let Err(cleanup) = ticket.get().inner.release_source(py) {
+                cleanup.write_unraisable(py, None);
             }
             return Err(error);
         }
@@ -871,10 +506,19 @@ impl TransferPool {
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        if let Some(error) = py.detach(|| self.pool.close()) {
-            return Err(PyErr::from_value(error.bind(py).clone()));
+        let borrowed = self
+            .borrowed
+            .lock_py_attached(py)
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .unwrap_or_default();
+        let mut result = py.detach(|| self.pool.close()).map_or(Ok(()), |error| {
+            Err(PyErr::from_value(error.bind(py).clone()))
+        });
+        for read in borrowed.into_values().filter_map(|read| read.upgrade()) {
+            result = result.and(read.drain(py));
         }
-        Ok(())
+        result
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
@@ -886,8 +530,7 @@ impl TransferPool {
                 visit.call(wake)?;
                 for read in unretired {
                     visit.call(&read.ticket)?;
-                    visit.call(&read.call)?;
-                    visit.call(&read.args)?;
+                    read.call.visit(&visit)?;
                 }
                 Ok(())
             })
@@ -895,10 +538,110 @@ impl TransferPool {
     }
 }
 
+impl TransferPool {
+    fn submit_read(
+        owner: &Bound<'_, Self>,
+        read: PythonRead,
+        nbytes: i64,
+        destination: Option<Bound<'_, PyAny>>,
+        reservation: Option<Py<ReadReservation>>,
+    ) -> PyResult<Py<TransferTicket>> {
+        let py = owner.py();
+        let owner_ref = owner.get();
+        if let Some(error) = owner_ref.pool.error() {
+            return Err(PyErr::from_value(error.bind(py).clone()));
+        }
+        let nbytes = u64::try_from(nbytes)
+            .map_err(|_| PyValueError::new_err("transfer byte reservation must not be negative"))?;
+        let ticket = read.ticket.clone_ref(py);
+        let reservation = reservation.as_ref().map(|value| &value.get().inner);
+        let task = py
+            .detach(|| owner_ref.pool.reserve(read, nbytes, reservation))
+            .map_err(|error| {
+                TransferCapacity::read_error(
+                    owner_ref.capacity.bind(py),
+                    error,
+                    "asynchronous transfer ticket capacity is exhausted",
+                )
+            })?;
+
+        let submitted = (|| -> PyResult<()> {
+            ticket.get().lock(py)?.work = Some(Arc::downgrade(&task));
+            if let Some(destination) = destination {
+                let spans = tensor_spans(&destination)?;
+                if spans[0].getattr("is_cuda")?.extract::<bool>()? {
+                    let device = spans[0].getattr("device")?;
+                    let stream = py
+                        .import("torch.cuda")?
+                        .call_method1("current_stream", (&device,))?
+                        .getattr("cuda_stream")?
+                        .extract()?;
+                    let device = device.getattr("index")?.extract()?;
+                    let pool = owner_ref.events.borrow(py);
+                    pool.reap(py)?;
+                    let mut state = ticket.get().lock(py)?;
+                    pool.with_pool(|pool| state.ticket.prepare_copy(pool, device, stream))?;
+                }
+            }
+
+            if let Some(wake) = owner_ref.pool.completion_wake() {
+                ticket.get().add_done_callback(py, wake.clone_ref(py))?;
+                ticket
+                    .get()
+                    .add_retirement_callback(py, wake.clone_ref(py))?;
+            }
+            py.detach(|| task.submit())
+                .map_err(|error| native_error(py, error))
+        })();
+        if let Err(error) = submitted {
+            if let Err(cleanup) = py.detach(|| task.cancel(true)) {
+                PyErr::from_value(cleanup.into_bound(py)).write_unraisable(py, None);
+            }
+            return Err(error);
+        }
+        Ok(ticket)
+    }
+}
+
 struct PythonRead {
     ticket: Py<TransferTicket>,
-    call: Py<PyAny>,
-    args: Py<PyTuple>,
+    call: ReadCall,
+}
+
+enum ReadCall {
+    Python {
+        call: Py<PyAny>,
+        args: Py<PyTuple>,
+    },
+    Copy {
+        pool: Py<TransferPool>,
+        source: Py<PyAny>,
+        destination: Py<PyAny>,
+        producer: Option<Py<CUDAEvent>>,
+    },
+}
+
+impl ReadCall {
+    fn visit(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
+        match self {
+            Self::Python { call, args } => {
+                visit.call(call)?;
+                visit.call(args)?;
+            }
+            Self::Copy {
+                pool,
+                source,
+                destination,
+                producer,
+            } => {
+                visit.call(pool)?;
+                visit.call(source)?;
+                visit.call(destination)?;
+                visit.call(producer)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ReadBackend for PythonRead {
@@ -916,20 +659,54 @@ impl ReadBackend for PythonRead {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        action(&mut state.ticket)
+        let result = action(&mut state.ticket);
+        let ready = state.ticket.ready();
+        drop(state);
+        if ready {
+            self.ticket.get().inner.ready.notify_all();
+        }
+        result
     }
 
     fn read(&self) -> Result<(), Self::Error> {
         Python::attach(|py| {
             let run = || -> PyResult<()> {
-                with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
-                    let mut arguments = vec![self.ticket.bind(py).as_any().clone()];
-                    arguments.extend(self.args.bind(py).iter());
-                    self.call.bind(py).call1(PyTuple::new(py, arguments)?)?;
-                    Ok(())
-                })
+                with_context(
+                    &py.import("torch")?.call_method0("inference_mode")?,
+                    || match &self.call {
+                        ReadCall::Python { call, args } => {
+                            let mut arguments = vec![self.ticket.bind(py).as_any().clone()];
+                            arguments.extend(args.bind(py).iter());
+                            call.bind(py).call1(PyTuple::new(py, arguments)?)?;
+                            Ok(())
+                        }
+                        ReadCall::Copy {
+                            pool,
+                            source,
+                            destination,
+                            producer,
+                        } => pool.get().copy(
+                            py,
+                            self.ticket.clone_ref(py),
+                            source.bind(py).clone(),
+                            destination.bind(py).clone(),
+                            producer.as_ref().map(|event| event.clone_ref(py)),
+                            None,
+                        ),
+                    },
+                )
             };
             run().map_err(|error| error.into_value(py).into_any())
+        })
+    }
+
+    fn release(&self) -> Result<(), Self::Error> {
+        Python::attach(|py| {
+            self.ticket
+                .get()
+                .inner
+                .release_source(py)
+                .map_err(|error| error.into_value(py).into_any())
         })
     }
 

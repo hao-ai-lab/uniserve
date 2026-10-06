@@ -24,6 +24,11 @@ pub trait ReadBackend: Send + Sync + 'static {
     ) -> T;
 
     fn read(&self) -> std::result::Result<(), Self::Error>;
+
+    /// Release local source ownership after the read's physical accesses end.
+    /// This also runs for a queued read cancelled before numerical execution.
+    fn release(&self) -> std::result::Result<(), Self::Error>;
+
     fn notify(callbacks: Vec<Self::Callback>);
     fn wake(callback: &Self::Callback);
     fn error(error: Error) -> Self::Error;
@@ -150,16 +155,7 @@ impl<B: ReadBackend> TransferPool<B> {
         if self.error().is_some() {
             return Err(Error::Resource("transfer pool has failed"));
         }
-        if let Some(reservation) = reservation {
-            if !Arc::ptr_eq(reservation.capacity(), &self.capacity) {
-                return Err(Error::Invalid(
-                    "read reservation belongs to another transfer capacity".into(),
-                ));
-            }
-            reservation.use_read()?;
-        } else {
-            self.capacity.take_reads(1)?;
-        }
+        self.capacity.take_read(reservation)?;
 
         if let Err(error) = self.capacity.acquire(nbytes) {
             self.capacity.return_reads(1)?;
@@ -211,7 +207,7 @@ impl<B: ReadBackend> TransferPool<B> {
         nbytes: u64,
         task: &HostTask<TransferRead<B>>,
     ) {
-        let error = match task.completion.outcome() {
+        let mut error = match task.completion.outcome() {
             Some(Outcome::Success(_)) => None,
             Some(Outcome::Failed(error)) => Some(error),
             Some(Outcome::Cancelled) => Some(Arc::new(B::error(Error::Resource(
@@ -219,19 +215,34 @@ impl<B: ReadBackend> TransferPool<B> {
             )))),
             None => return,
         };
-        let (undrained, late, callbacks) = backend.with_ticket(|ticket| {
+        let undrained = backend.with_ticket(|ticket| ticket.undrained());
+        let release_error = if undrained {
+            None
+        } else {
+            backend.release().err()
+        };
+        let retained = undrained || release_error.is_some();
+        if let Some(cleanup) = release_error {
+            if error.is_none() {
+                error = Some(Arc::new(cleanup));
+            } else {
+                B::report(cleanup);
+            }
+        }
+
+        let (late, callbacks) = backend.with_ticket(|ticket| {
             let (late, callbacks) = error.as_ref().map_or((false, Vec::new()), |error| {
                 ticket.fail_shared(Arc::clone(error))
             });
-            (ticket.undrained(), late, callbacks)
+            (late, callbacks)
         });
         let wake = {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(error) = error.as_ref().filter(|_| late || undrained) {
+            if let Some(error) = error.as_ref().filter(|_| late || retained) {
                 if state.error.is_none() {
                     state.error = Some(Arc::clone(error));
                 }
-                if undrained {
+                if retained {
                     state.unretired.push(Arc::clone(&backend));
                 }
             }
@@ -242,7 +253,7 @@ impl<B: ReadBackend> TransferPool<B> {
             B::wake(&wake);
         }
 
-        if !undrained {
+        if !retained {
             let retired = capacity
                 .release(nbytes)
                 .and_then(|()| capacity.return_reads(1))

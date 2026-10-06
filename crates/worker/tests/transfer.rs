@@ -16,10 +16,17 @@ fn notify(callbacks: Vec<Callback>) {
     }
 }
 
-/// A numerical backend reporting that its device access could not be drained.
+#[derive(Clone, Copy)]
+enum Failure {
+    Device,
+    Source,
+}
+
+/// A read whose device access or source ownership cannot be retired.
 struct FailedRead {
     ticket: Mutex<TransferTicket<(), String, ()>>,
     _storage: Arc<Vec<u8>>,
+    failure: Failure,
 }
 
 impl ReadBackend for FailedRead {
@@ -36,11 +43,27 @@ impl ReadBackend for FailedRead {
     }
 
     fn read(&self) -> Result<(), String> {
-        self.with_ticket(|ticket| ticket.mark_undrained(None, None));
-        Err("device access could not be drained".into())
+        match self.failure {
+            Failure::Device => {
+                self.with_ticket(|ticket| ticket.mark_undrained(None, None));
+                Err("device access could not be drained".into())
+            }
+            Failure::Source => {
+                self.with_ticket(|ticket| ticket.complete((), None));
+                Ok(())
+            }
+        }
     }
 
     fn notify(_: Vec<()>) {}
+
+    fn release(&self) -> Result<(), String> {
+        match self.failure {
+            Failure::Device => Ok(()),
+            Failure::Source => Err("source storage could not be released".into()),
+        }
+    }
+
     fn wake(_: &()) {}
 
     fn error(error: Error) -> String {
@@ -53,34 +76,40 @@ impl ReadBackend for FailedRead {
 }
 
 #[test]
-fn unknown_completion_keeps_storage_after_the_pool_is_destroyed() -> TestResult {
-    let capacity = Arc::new(TransferCapacity::new(4, 1, FailedRead::notify)?);
-    let pool = Arc::new(TransferPool::new(
-        Arc::clone(&capacity),
-        1,
-        "transfer-failure",
-    )?);
-    let storage = Arc::new(vec![1, 2, 3, 4]);
-    let retained = Arc::downgrade(&storage);
-    let task = pool.reserve(
-        FailedRead {
-            ticket: Mutex::new(TransferTicket::new(false)),
-            _storage: storage,
-        },
-        4,
-        None,
-    )?;
-    task.submit()?;
-    assert_eq!(
-        pool.close().as_deref().map(String::as_str),
-        Some("device access could not be drained")
-    );
-    drop(task);
-    drop(pool);
+fn failed_retirement_keeps_storage_after_the_pool_is_destroyed() -> TestResult {
+    for failure in [Failure::Device, Failure::Source] {
+        let capacity = Arc::new(TransferCapacity::new(4, 1, FailedRead::notify)?);
+        let pool = Arc::new(TransferPool::new(
+            Arc::clone(&capacity),
+            1,
+            "transfer-failure",
+        )?);
+        let storage = Arc::new(vec![1, 2, 3, 4]);
+        let retained = Arc::downgrade(&storage);
+        let task = pool.reserve(
+            FailedRead {
+                ticket: Mutex::new(TransferTicket::new(false)),
+                _storage: storage,
+                failure,
+            },
+            4,
+            None,
+        )?;
+        task.submit()?;
+        assert_eq!(
+            pool.close().as_deref().map(String::as_str),
+            Some(match failure {
+                Failure::Device => "device access could not be drained",
+                Failure::Source => "source storage could not be released",
+            })
+        );
+        drop(task);
+        drop(pool);
 
-    assert_eq!(capacity.used(), 4);
-    assert!(capacity.take_reads(1).is_err());
-    assert!(retained.upgrade().is_some());
+        assert_eq!(capacity.used(), 4);
+        assert!(capacity.take_reads(1).is_err());
+        assert!(retained.upgrade().is_some());
+    }
     Ok(())
 }
 
@@ -117,6 +146,14 @@ fn refused_reservations_leave_byte_and_read_budgets_available() -> TestResult {
     assert!(capacity.return_reads(1).is_err());
     capacity.take_reads(2)?;
     capacity.return_reads(2)?;
+
+    let other = Arc::new(TransferCapacity::new(8, 2, notify)?);
+    let reservation = ReadReservation::new(Arc::clone(&capacity), 1)?;
+    assert!(other.take_read(Some(&reservation)).is_err());
+    capacity.take_read(Some(&reservation))?;
+    capacity.return_reads(1)?;
+    other.take_reads(2)?;
+    other.return_reads(2)?;
     Ok(())
 }
 

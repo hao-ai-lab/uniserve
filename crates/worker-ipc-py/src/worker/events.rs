@@ -323,13 +323,13 @@ impl EventPool {
 
     pub(crate) fn defer_callback(
         &self,
-        event: Arc<Event>,
+        events: Vec<Arc<Event>>,
         callback: impl EventCallback + 'static,
     ) -> PyResult<()> {
         let unused = self
             .lock()
             .pool
-            .defer_release(vec![event], DeferredOwner::Native(Box::new(callback)))
+            .defer_release(events, DeferredOwner::Native(Box::new(callback)))
             .map_err(pool_error)?;
         if let Some(DeferredOwner::Native(callback)) = unused {
             callback.complete()?;

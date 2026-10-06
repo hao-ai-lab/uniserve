@@ -16,6 +16,7 @@ use uniserve_worker::{BufferRegistry as NativeBufferRegistry, HostLane, Register
 use super::completion::{Completion, CompletionRef};
 use super::error::{invalid, invariant, native_error};
 use super::events::EventPool;
+use super::transfer::TransferTicket;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum BufferKey {
@@ -30,6 +31,26 @@ struct Source {
 }
 
 type Registry = NativeBufferRegistry<BufferKey, Source, CompletionRef>;
+
+/// A local reader retains its producer registry until physical access ends.
+pub(super) struct BufferRead {
+    owner: Py<BufferRegistry>,
+    key: BufferKey,
+}
+
+impl BufferRead {
+    pub(super) fn release(&self, py: Python<'_>) -> PyResult<()> {
+        self.owner.get().release_reader(py, &self.key)
+    }
+
+    pub(super) fn events(&self, py: Python<'_>) -> Py<EventPool> {
+        self.owner.get().events.clone_ref(py)
+    }
+
+    pub(super) fn visit(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.owner)
+    }
+}
 
 /// Retain source storage until its producer and all granted readers finish.
 /// Reclamation and retirement observers run outside the registry lock.
@@ -87,26 +108,15 @@ impl BufferRegistry {
             .map_err(|error| native_error(py, error))
     }
 
-    /// Grant a local read. Its caller must release it after physical access
-    /// ends, even if the buffer was revoked while the read was in flight.
-    fn acquire(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<Py<TransportBuffer>> {
-        let key = self.key(locator)?;
-        let mut state = self.lock(py)?;
-        Ok(Self::buffer(&mut state, &key, locator)?
-            .acquire()
-            .map_err(|error| native_error(py, error))?
-            .value
-            .clone_ref(py))
-    }
-
-    fn release_reader(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<()> {
-        let key = self.key(locator)?;
-        let mut state = self.lock(py)?;
-        Self::buffer(&mut state, &key, locator)?
-            .release_reader()
-            .map_err(|error| native_error(py, error))?;
-        drop(state);
-        self.reclaim_buffer(py, &key)
+    /// Attach local source ownership directly to the read's physical lifetime.
+    fn acquire(
+        slf: Bound<'_, Self>,
+        locator: &Bound<'_, PyAny>,
+        ticket: &TransferTicket,
+    ) -> PyResult<Py<TransportBuffer>> {
+        let (source, read) = Self::acquire_read(&slf, locator)?;
+        ticket.bind_source(slf.py(), read)?;
+        Ok(source)
     }
 
     /// Revoke future reads; the returned signal completes after physical
@@ -221,6 +231,40 @@ impl BufferRegistry {
 }
 
 impl BufferRegistry {
+    pub(super) fn acquire_read(
+        owner: &Bound<'_, Self>,
+        locator: &Bound<'_, PyAny>,
+    ) -> PyResult<(Py<TransportBuffer>, BufferRead)> {
+        let py = owner.py();
+        let key = owner.get().key(locator)?;
+        let mut state = owner.get().lock(py)?;
+        let source = Self::buffer(&mut state, &key, locator)?
+            .acquire()
+            .map_err(|error| native_error(py, error))?
+            .value
+            .clone_ref(py);
+
+        Ok((
+            source,
+            BufferRead {
+                owner: owner.clone().unbind(),
+                key,
+            },
+        ))
+    }
+
+    fn release_reader(&self, py: Python<'_>, key: &BufferKey) -> PyResult<()> {
+        let mut state = self.lock(py)?;
+        state
+            .get_mut(key)
+            .ok_or_else(|| invariant(py, "active read lost its source buffer"))?
+            .release_reader()
+            .map_err(|error| native_error(py, error))?;
+        drop(state);
+
+        self.reclaim_buffer(py, key)
+    }
+
     fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, Registry>> {
         self.state
             .lock_py_attached(py)

@@ -96,6 +96,11 @@ impl ReadBackend for Read {
         submitted.and(drained)
     }
 
+    fn release(&self) -> std::result::Result<(), CallbackError> {
+        // The numerical callback owns its inputs; it borrows no registry slot.
+        Ok(())
+    }
+
     fn notify(callbacks: Vec<Function>) {
         for callback in callbacks {
             Self::wake(&callback);
