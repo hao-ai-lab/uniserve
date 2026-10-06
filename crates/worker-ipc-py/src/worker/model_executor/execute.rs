@@ -6,9 +6,11 @@
 
 use std::time::Instant;
 
+use super::ModelExecutor;
 use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
+use std::sync::Arc;
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
 use crate::calls::Call;
@@ -23,7 +25,7 @@ use super::super::stream::CUDAStream;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_batch<'py>(
     py: Python<'py>,
-    owner: &Bound<'py, PyAny>,
+    owner: &Bound<'py, ModelExecutor>,
     runner: &Bound<'py, PyAny>,
     rows: &Bound<'py, PyTuple>,
     calls: &Bound<'py, PyTuple>,
@@ -56,7 +58,7 @@ pub(super) fn run_batch<'py>(
         .inner
         .component
         .clone();
-    let rank: usize = crate::worker::config::native(&owner.getattr("worker_config")?)?.rank;
+    let rank: usize = Arc::clone(&owner.borrow().config).rank;
     let range = py.import("uniserve.profiling")?.call_method1(
         "profile_range",
         (format!(
@@ -149,7 +151,7 @@ pub(super) fn run_batch<'py>(
             output.request_pool_indices = Some(slots.unbind());
             output.output_event = completed.as_ref().map(|event| event.clone_ref(py));
             output.stats = Some(Py::new(py, ForwardStats::from(stats))?);
-            owner.call_method0("_report_new_kernels")?;
+            ModelExecutor::report_new_kernels(owner)?;
             Py::new(py, output).map(|output| output.into_bound(py))
         })();
         match executed {

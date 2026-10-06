@@ -1,6 +1,6 @@
 """Numerical input, capture and replay implementations for model runners.
 
-Native ``ModelRunners`` owns invocation policy: eager execution, startup
+Native ``ModelExecutor`` owns invocation policy: eager execution, startup
 capture, resident graph dispatch and expert microbatches. These backends
 supply numerical shapes, tensor preparation and computation. Configured
 batch buckets must be resident after startup; uncaptured standalone input

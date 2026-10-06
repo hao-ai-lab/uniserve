@@ -23,7 +23,7 @@ use crate::worker::request::{RequestPool, resolve_prefix};
 /// Temporary scheduler allocations for real startup requests. Physical owners
 /// remain on Worker; Finish/Free must complete before these addresses are reused.
 struct Warmup {
-    runner: Py<PyAny>,
+    runner: Py<crate::worker::model_executor::ModelExecutor>,
     tokenizer: Py<PyAny>,
     requests: Py<RequestPool>,
     executor: Py<Executor>,

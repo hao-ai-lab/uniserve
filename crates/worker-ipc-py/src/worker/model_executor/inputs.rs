@@ -5,7 +5,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use super::ModelRunners;
+use super::ModelExecutor;
 use crate::worker::execution::close_all;
 use crate::worker::host::with_context;
 use crate::worker::stream::CUDAStream;
@@ -14,7 +14,7 @@ use crate::worker::stream::CUDAStream;
 /// The scope joins on normal exit, a body error, or a partially submitted copy.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(super) struct InputCopies {
-    pub(super) owner: Py<ModelRunners>,
+    pub(super) owner: Py<ModelExecutor>,
     pub(super) stream: Py<PyAny>,
     pub(super) transfers: Py<PyTuple>,
 }

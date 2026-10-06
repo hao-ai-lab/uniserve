@@ -185,7 +185,11 @@ impl PythonBackend {
     ) -> PyResult<Py<PyAny>> {
         let call = batch.call(py, index)?;
         let model = self.model_runner.bind(py);
-        let device = model.call_method1("call_devices", (&call,))?.get_item(0)?;
+        let device = model
+            .borrow()
+            .call_devices(py, &*call.extract::<PyRef<crate::calls::Call>>()?)?
+            .into_bound(py)
+            .get_item(0)?;
         let read =
             self.tensors
                 .get()

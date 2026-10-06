@@ -43,7 +43,7 @@ use super::inputs::BatchInputs;
 use super::kv_cache::KVCacheManager;
 use super::kv_import::KVImporter;
 use super::latent::LatentPool;
-use super::model_runners::ModelRunners;
+use super::model_executor::ModelExecutor;
 use super::output::OutputPool;
 use super::pending::PendingOutput;
 use super::request::RequestPool;
@@ -87,7 +87,7 @@ struct PythonBackend {
     events: Py<EventPool>,
     exports: Vec<Py<PyDict>>,
     retirement_devices: Vec<Py<PyAny>>,
-    model_runner: Py<PyAny>,
+    model_runner: Py<ModelExecutor>,
     forward_calls: HashSet<CallKind>,
     transports: Vec<Py<PyAny>>,
     info: WorkerInfo,
@@ -451,12 +451,8 @@ impl ServiceBackend for PythonBackend {
     fn join_expert_step(&self, leaving: bool) -> Result<(bool, bool), Py<PyBaseException>> {
         Python::attach(|py| {
             let join = || -> PyResult<_> {
-                let runners = self
-                    .model_runner
-                    .bind(py)
-                    .getattr("batch_runners")?
-                    .cast_into::<ModelRunners>()?;
-                let advanced = ModelRunners::join_expert_step(&runners, leaving)?;
+                let runners = self.model_runner.bind(py);
+                let advanced = ModelExecutor::join_expert_step(runners, leaving)?;
                 let exchange = runners.borrow().experts(py);
                 let released = match exchange {
                     Some(exchange) => exchange
@@ -526,10 +522,9 @@ impl Executor {
             }
         }
 
-        let model_runner = worker.getattr("runner")?;
+        let model_runner = worker.getattr("runner")?.cast_into::<ModelExecutor>()?;
         let mut collective = false;
-        for binding in model_runner
-            .getattr("bindings")?
+        for binding in { model_runner.borrow().bindings.bind(py).clone() }
             .call_method0("values")?
             .try_iter()?
         {
@@ -543,8 +538,8 @@ impl Executor {
         let sampling_group = worker.getattr("sampling_group")?;
         collective |=
             !sampling_group.is_none() && sampling_group.getattr("size")?.extract::<usize>()? > 1;
-        let images = !model_runner.getattr("image_builder")?.is_none();
-        let videos = !model_runner.getattr("video_postprocessor")?.is_none();
+        let images = !{ model_runner.borrow().image_builder.bind(py).clone() }.is_none();
+        let videos = !{ model_runner.borrow().video_postprocessor.bind(py).clone() }.is_none();
         let forward_calls = info
             .supported_calls
             .iter()
@@ -637,12 +632,12 @@ impl Executor {
     pub(super) fn serve(&mut self, py: Python<'_>, server: &PyServer) -> PyResult<()> {
         let executor = self.executor_mut()?;
         let info = executor.backend().info.clone();
-        let experts = !executor
+        let experts = executor
             .backend()
             .model_runner
-            .bind(py)
-            .getattr("experts")?
-            .is_none();
+            .borrow(py)
+            .experts(py)
+            .is_some();
         let gc = py.import("gc")?;
         let gc_enabled: bool = gc.call_method0("isenabled")?.extract()?;
         let mut endpoint = server.take_endpoint()?;

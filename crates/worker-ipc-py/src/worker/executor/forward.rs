@@ -16,8 +16,8 @@ use pyo3::types::{PySlice, PyTuple};
 
 use super::{BatchState, PythonBackend};
 use crate::calls::Call;
+use crate::worker::model_executor::ModelExecutor;
 use crate::worker::model_results::ExecutionOutput;
-use crate::worker::model_runners::ModelRunners;
 use crate::worker::pending::PendingOutput;
 use crate::worker::sampling::{self, SamplingMetadata};
 
@@ -132,16 +132,17 @@ impl PythonBackend {
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
             let call = batch.call(py, row.index)?;
-            let device = model.call_method1("call_devices", (&call,))?.get_item(1)?;
+            let device = model
+                .borrow()
+                .call_devices(py, &*call.extract::<PyRef<crate::calls::Call>>()?)?
+                .into_bound(py)
+                .get_item(1)?;
             buffer.get().register_device(py, &device)?;
             tasks.push((row.task.bind(py), call));
         }
-        let runners = model
-            .getattr("batch_runners")?
-            .extract::<Py<ModelRunners>>()?;
-        let mut groups = runners.borrow(py).forward(
-            py,
-            self.model_runner.clone_ref(py),
+        let runners = model;
+        let mut groups = ModelExecutor::forward(
+            runners,
             PyTuple::new(py, tasks)?.unbind(),
             self.worker.bind(py).getattr("kv_cache")?.unbind(),
             self.worker.bind(py).getattr("block_tables")?.unbind(),

@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
-use super::{ModelRunners, experts};
+use super::{ModelExecutor, experts};
 use crate::worker::error::native_error;
 use crate::worker::execution::close_all;
 use crate::worker::graph_shapes::{TextShapes, configured_prefill, decode_shapes};
@@ -16,8 +16,7 @@ use crate::worker::host::with_context;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn configure(
-    slf: &Bound<'_, ModelRunners>,
-    owner: &Bound<'_, PyAny>,
+    slf: &Bound<'_, ModelExecutor>,
     input_config: &Bound<'_, PyAny>,
     kv_cache: &Bound<'_, PyAny>,
     latent_pool: &Bound<'_, PyAny>,
@@ -34,30 +33,29 @@ pub(super) fn configure(
             "input execution resources are already bound",
         ));
     }
-    super::modules::ensure_open(owner)?;
-    owner.setattr("kv_cache", kv_cache)?;
-    owner.setattr("decode_predicates", predicates)?;
-    let widths = PyTuple::new(py, table_widths)?;
-    owner.setattr("table_widths", &widths)?;
+    super::modules::ensure_open(slf)?;
+    slf.borrow_mut().kv_cache = kv_cache.clone().unbind();
+    slf.borrow_mut().decode_predicates = predicates.clone().unbind();
+    let widths = PyTuple::new(py, &table_widths)?;
+    slf.borrow_mut().table_widths = table_widths;
 
-    let config = owner.getattr("worker_config")?;
-    let config_native = crate::worker::config::native(&config)?;
+    let config = slf.borrow().worker_config.bind(slf.py()).clone().into_any();
+    let config_native = Arc::clone(&slf.borrow().config);
     let streams = Arc::clone(&slf.borrow().streams);
-    streams.initialize(owner, Some(max_inflight + 1))?;
+    streams.initialize(slf, Some(max_inflight + 1))?;
     if config_native.expert_exchange == "dwdp" {
         if streams.lane_count() > 1 {
             return Err(PyValueError::new_err(
                 "DWDP weight buffers require one execution lane",
             ));
         }
-        owner.setattr(
-            "expert_weights",
-            py.import("uniserve.runtime.weight_prefetch")?
-                .call_method1("WeightPrefetch", (owner.getattr("model")?,))?,
-        )?;
+        let weights = py
+            .import("uniserve.runtime.weight_prefetch")?
+            .call_method1("WeightPrefetch", ({ slf.borrow().model.bind(py).clone() },))?;
+        slf.borrow_mut().expert_weights = weights.unbind();
     }
     let max_tokens: usize = input_config.getattr("max_tokens")?.extract()?;
-    experts::configure(slf, owner, max_tokens)?;
+    experts::configure(slf, max_tokens)?;
     let has_experts = !slf.borrow().exchanges.is_empty();
     let microbatches: usize = config_native.expert_microbatches;
 
@@ -81,13 +79,13 @@ pub(super) fn configure(
         .getattr("max_text_tokens")?
         .extract::<usize>()?
         .min(kv_cache.getattr("token_capacity")?.extract()?);
-    let builder = owner.getattr("image_builder")?;
-    let processor = owner.getattr("processor")?;
+    let builder = slf.borrow().image_builder.bind(slf.py()).clone();
+    let processor = slf.borrow().processor.bind(slf.py()).clone();
     let feature_injection =
         !processor.is_none() && !processor.getattr("feature_injection")?.is_none();
     if !builder.is_none() {
         configure_images(
-            owner,
+            slf,
             &builder,
             latent_pool,
             max_rows,
@@ -96,9 +94,9 @@ pub(super) fn configure(
         )?;
     }
 
-    let attention = owner.getattr("attention")?;
+    let attention = slf.borrow().attention.bind(slf.py()).clone();
     let cache = kv_cache.getattr("cache")?;
-    let storage = owner.getattr("graph_storage")?;
+    let storage = slf.borrow().graph_storage(slf.py())?;
     let capture = config_native.graph_policy != "off";
     let runtime = py.import("uniserve.runtime")?;
     let models = py.import("uniserve.model")?;
@@ -302,7 +300,9 @@ pub(super) fn configure(
                             .get(lane.microbatch)
                             .map(|exchange| exchange.bind(py)),
                     )?;
-                    options.set_item("weights", owner.getattr("expert_weights")?)?;
+                    options.set_item("weights", {
+                        slf.borrow().expert_weights.bind(slf.py()).clone()
+                    })?;
                     let context = runtime
                         .getattr("ExecutionContext")?
                         .call((&model,), Some(&options))?;
@@ -317,7 +317,7 @@ pub(super) fn configure(
                     let mut devices = Vec::new();
                     if capture && cuda {
                         devices.push(target.clone());
-                        devices.extend(super::streams::capture_devices(owner, &target)?);
+                        devices.extend(super::streams::capture_devices(slf, &target)?);
                     }
                     options.set_item("devices", PyTuple::new(py, devices)?)?;
                     options.set_item(
@@ -355,7 +355,7 @@ pub(super) fn configure(
                     with_context(&storage.call_method1("allocate", (&execution,))?, || {
                         context.call_method1("prepare", (size,))
                     })?;
-                    storage.call_method0("check")?;
+                    storage.borrow().check(py)?;
                     if token_runner && execution.getattr("pools")?.is_truthy()? {
                         token_pools
                             .entry(pool_key.clone())
@@ -416,7 +416,7 @@ pub(super) fn configure(
 /// Numerical image sizes are queried once, then filtered against physical
 /// token and latent capacity for every configured batch and guidance count.
 fn configure_images(
-    owner: &Bound<'_, PyAny>,
+    owner: &Bound<'_, ModelExecutor>,
     builder: &Bound<'_, PyAny>,
     pool: &Bound<'_, PyAny>,
     max_rows: usize,
@@ -424,8 +424,7 @@ fn configure_images(
     per_image: usize,
 ) -> PyResult<()> {
     let py = owner.py();
-    let config = owner.getattr("worker_config")?;
-    let config_native = crate::worker::config::native(&config)?;
+    let config_native = Arc::clone(&owner.borrow().config);
     let sizes: Vec<(usize, usize)> = config_native.flow_graph_shapes.clone();
     let rows: Vec<usize> = config_native.flow_graph_batch_sizes.clone();
     let capacity: usize = pool.getattr("capacity_units")?.extract()?;
@@ -457,6 +456,7 @@ fn configure_images(
             }
         }
     }
-    owner.setattr("flow_cfg_branches", (1, 2, 3))?;
-    owner.setattr("flow_captures", PyTuple::new(py, shapes)?)
+    owner.borrow_mut().flow_cfg_branches = vec![1, 2, 3];
+    owner.borrow_mut().flow_captures = PyTuple::new(py, shapes)?.unbind();
+    Ok(())
 }

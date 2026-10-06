@@ -65,7 +65,7 @@ impl PythonBackend {
                 .sampling
                 .seed
                 .ok_or_else(|| invalid(py, "a canvas step requires a seeded request"))?;
-            let slots = self.model_runner.bind(py).getattr("canvas_slots")?;
+            let slots = { self.model_runner.borrow(py).canvas_slots.bind(py).clone() };
             if slots.is_none() {
                 return Err(invalid(py, "this worker keeps no generating canvases"));
             }

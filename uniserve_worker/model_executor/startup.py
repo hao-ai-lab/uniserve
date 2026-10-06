@@ -1,6 +1,6 @@
 """Numerical startup inputs built through the same buffers as serving.
 
-The native ModelRunners chooses capture buckets, owns scratch resource scopes
+The native ModelExecutor chooses capture buckets, owns scratch resource scopes
 and submits eager or captured calls. These helpers construct token, canvas and
 image tensors, mathematical conditioning and attention views for those calls.
 """

@@ -27,8 +27,8 @@ mod latent;
 pub(crate) mod locator;
 mod media;
 mod microbatches;
+mod model_executor;
 mod model_results;
-mod model_runners;
 mod output;
 mod pending;
 pub(crate) mod protocol;
@@ -98,7 +98,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(graph_shapes::prefill_captures, module)?)?;
     module.add_function(wrap_pyfunction!(microbatches::yield_microbatch, module)?)?;
     module.add_class::<microbatches::Microbatches>()?;
-    module.add_class::<model_runners::ModelRunners>()?;
+    module.add_class::<model_executor::ModelExecutor>()?;
     module.add_class::<crate::stats::ForwardStats>()?;
     module.add_class::<model_results::ExecutionOutput>()?;
     module.add_class::<weight_prefetch::WeightPrefetch>()?;

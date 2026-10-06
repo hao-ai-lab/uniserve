@@ -3,29 +3,24 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
+use std::sync::Arc;
 use uniserve_worker_ipc::{CallKind, ForwardMode};
 
-use super::{ModelRunners, context, execution};
+use super::{ModelExecutor, context, execution};
 use crate::worker::execution::{Execution, JoinGraphs, close_all};
 use crate::worker::expert_exchange::ExpertExchange;
 use crate::worker::host::with_context;
 use crate::worker::stream::CUDAStream;
 
-pub(super) fn configure(
-    slf: &Bound<'_, ModelRunners>,
-    owner: &Bound<'_, PyAny>,
-    max_tokens: usize,
-) -> PyResult<()> {
+pub(super) fn configure(slf: &Bound<'_, ModelExecutor>, max_tokens: usize) -> PyResult<()> {
     let py = slf.py();
-    let config = owner.getattr("worker_config")?;
-    let config_native = crate::worker::config::native(&config)?;
+    let config_native = Arc::clone(&slf.borrow().config);
     let count: usize = config_native.expert_microbatches;
-    let attention_ranks: usize = owner.getattr("attention_ranks")?.extract()?;
+    let attention_ranks: usize = slf.borrow().attention_ranks;
     let fused = py.import("uniserve.nn.moe")?.getattr("FusedMoE")?;
     let mut layers = Vec::new();
-    if owner.getattr("expert_weights")?.is_none() {
-        for module in owner
-            .getattr("model")?
+    if { slf.borrow().expert_weights.bind(slf.py()).clone() }.is_none() {
+        for module in { slf.borrow().model.bind(slf.py()).clone() }
             .call_method0("modules")?
             .try_iter()?
         {
@@ -51,7 +46,7 @@ pub(super) fn configure(
         return Ok(());
     };
     let group = if attention_ranks != 0 {
-        owner.getattr("expert_group")?
+        slf.borrow().expert_group.bind(slf.py()).clone()
     } else {
         first.getattr("expert_group")?
     };
@@ -133,16 +128,12 @@ pub(super) fn configure(
     Ok(())
 }
 
-pub(super) fn configure_worker(
-    slf: &Bound<'_, ModelRunners>,
-    owner: &Bound<'_, PyAny>,
-) -> PyResult<()> {
+pub(super) fn configure_worker(slf: &Bound<'_, ModelExecutor>) -> PyResult<()> {
     let py = slf.py();
-    let config = owner.getattr("worker_config")?;
-    let config_native = crate::worker::config::native(&config)?;
+    let config_native = Arc::clone(&slf.borrow().config);
     let streams = std::sync::Arc::clone(&slf.borrow().streams);
-    streams.initialize(owner, None)?;
-    configure(slf, owner, config_native.max_batch_tokens)?;
+    streams.initialize(slf, None)?;
+    configure(slf, config_native.max_batch_tokens)?;
     let exchanges = slf
         .borrow()
         .exchanges
@@ -156,8 +147,8 @@ pub(super) fn configure_worker(
     }
 
     let capture = config_native.graph_policy != "off";
-    let storage = owner.getattr("graph_storage")?;
-    let model = owner.getattr("model")?;
+    let storage = slf.borrow().graph_storage(slf.py())?;
+    let model = slf.borrow().model.bind(slf.py()).clone();
     let runtime = py.import("uniserve.runtime")?;
     let size = py.import("uniserve.model")?.getattr("TextSize")?;
     for (stream, exchange) in streams.expert_streams(py)?.iter().zip(exchanges) {
@@ -208,7 +199,7 @@ pub(super) fn configure_worker(
 
 /// Discover one primary runner per numerical call; microbatch peers share its
 /// call order. Rank plans are compared once before warmup enters collectives.
-pub(super) fn bind(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
+pub(super) fn bind(slf: &Bound<'_, ModelExecutor>) -> PyResult<()> {
     let py = slf.py();
     let Some(exchange) = slf
         .borrow()
@@ -260,7 +251,7 @@ pub(super) fn bind(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny>) -> P
 
     let plan = (
         exchange.getattr("capacities")?,
-        crate::worker::config::native(&owner.getattr("worker_config")?)?.expert_microbatches,
+        Arc::clone(&slf.borrow().config).expert_microbatches,
         PyTuple::new(py, calls)?,
     )
         .into_pyobject(py)?;
@@ -290,7 +281,7 @@ pub(super) fn bind(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny>) -> P
     Ok(())
 }
 
-fn first(slf: &Bound<'_, ModelRunners>) -> Option<Py<Execution>> {
+fn first(slf: &Bound<'_, ModelExecutor>) -> Option<Py<Execution>> {
     let owner = slf.borrow();
     owner
         .expert_executions
@@ -299,7 +290,7 @@ fn first(slf: &Bound<'_, ModelRunners>) -> Option<Py<Execution>> {
         .map(|execution| execution.clone_ref(slf.py()))
 }
 
-pub(super) fn capture(slf: &Bound<'_, ModelRunners>) -> PyResult<()> {
+pub(super) fn capture(slf: &Bound<'_, ModelExecutor>) -> PyResult<()> {
     let py = slf.py();
     let Some(first) = first(slf) else {
         return Ok(());
@@ -384,7 +375,7 @@ pub(super) fn join(execution: &Py<Execution>, py: Python<'_>, capacity: usize) -
     }
 }
 
-pub(super) fn idle(slf: &Bound<'_, ModelRunners>, leaving: bool) -> PyResult<bool> {
+pub(super) fn idle(slf: &Bound<'_, ModelExecutor>, leaving: bool) -> PyResult<bool> {
     let py = slf.py();
     let Some(execution) = first(slf) else {
         return Ok(false);

@@ -47,8 +47,9 @@ impl PythonBackend {
             let numerical = pending.call.bind(py);
             let device = self
                 .model_runner
-                .bind(py)
-                .call_method1("call_devices", (numerical,))?
+                .borrow(py)
+                .call_devices(py, &*numerical.extract::<PyRef<crate::calls::Call>>()?)?
+                .into_bound(py)
                 .get_item(0)?;
             let read = batch.numerical.borrow(py).consume_tensor(
                 py,

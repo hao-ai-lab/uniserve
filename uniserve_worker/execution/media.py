@@ -270,7 +270,7 @@ def prepare_denoising(
         )
 
     try:
-        runner.batch_runners.prepare_denoising(runner, storage)
+        runner.prepare_denoising(storage)
     except (CUDAGraphError, torch.OutOfMemoryError) as error:
         raise RuntimeError(
             f"the denoiser's {len(builder.layouts())} capacity layouts "
@@ -349,7 +349,7 @@ def warmup_decoders(runner: ModelExecutor) -> None:
         )
     )
     try:
-        for name, binding, call in runner.batch_runners.calls():
+        for name, binding, call in runner.calls():
             if call.entry_point.method != "decode":
                 continue
             module = call.module
@@ -419,7 +419,7 @@ def warmup_postprocess(
     """
     entries = [
         (name, call)
-        for name, _, call in runner.batch_runners.calls()
+        for name, _, call in runner.calls()
         if isinstance(call.module, VideoPostprocessor)
     ]
     if not entries:

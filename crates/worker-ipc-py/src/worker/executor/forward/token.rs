@@ -173,7 +173,7 @@ impl PythonBackend {
     }
 
     fn visual_advance(&self, py: Python<'_>) -> PyResult<u64> {
-        let builder = self.model_runner.bind(py).getattr("image_builder")?;
+        let builder = { self.model_runner.borrow(py).image_builder.bind(py).clone() };
         if builder.is_none() {
             Ok(1)
         } else {

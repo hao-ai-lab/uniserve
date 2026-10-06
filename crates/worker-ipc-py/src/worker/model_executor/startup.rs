@@ -6,9 +6,77 @@ use std::collections::HashSet;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySlice, PyTuple};
+use std::sync::Arc;
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
-use super::{ModelRunners, context, execution, experts, graphs, resources};
+use super::{ModelExecutor, context, execution, experts, graphs, resources};
+
+/// Seal captured capacities only after budget checks and startup reporting.
+pub(super) fn complete(owner: &Bound<'_, ModelExecutor>) -> PyResult<()> {
+    let py = owner.py();
+    let storage = owner.borrow().graph_storage(py)?;
+    storage.borrow().check(py)?;
+    py.import("uniserve_worker.execution.kernel_table")?
+        .call_method1("log_startup_memory", (storage,))?;
+
+    owner.borrow_mut().kernel_choices = py
+        .import("uniserve.runtime.backends")?
+        .call_method0("kernel_choices")?
+        .extract()?;
+    let kernels = owner.borrow().kernels.bind(py).clone();
+    kernels.call_method1("add", (ModelExecutor::all(owner)?,))?;
+    log_kernels(owner, "startup")?;
+    seal(owner)
+}
+
+impl ModelExecutor {
+    /// Collect diagnostics only when a serving call selected another kernel.
+    pub(super) fn report_new_kernels(owner: &Bound<'_, Self>) -> PyResult<()> {
+        if !owner.borrow().sealed {
+            return Ok(());
+        }
+        let py = owner.py();
+        let choices = py
+            .import("uniserve.runtime.backends")?
+            .call_method0("kernel_choices")?
+            .extract()?;
+        {
+            let mut owner = owner.borrow_mut();
+            if choices == owner.kernel_choices {
+                return Ok(());
+            }
+            owner.kernel_choices = choices;
+        }
+        let kernels = owner.borrow().kernels.bind(py).clone();
+        if kernels
+            .call_method1("add", (Self::all(owner)?,))?
+            .is_truthy()?
+        {
+            log_kernels(owner, "serving")?;
+        }
+        Ok(())
+    }
+}
+
+fn log_kernels(owner: &Bound<'_, ModelExecutor>, stage: &str) -> PyResult<()> {
+    let py = owner.py();
+    let (config, kernels) = {
+        let owner = owner.borrow();
+        (Arc::clone(&owner.config), owner.kernels.bind(py).clone())
+    };
+    let options = PyDict::new(py);
+    options.set_item("stage", stage)?;
+    options.set_item("rank", config.rank)?;
+    options.set_item("device", &config.device)?;
+    let table = kernels.call_method("table", (), Some(&options))?;
+    let text = py
+        .import("uniserve_worker.execution.kernel_table")?
+        .call_method1("format_kernel_table", (table,))?;
+    py.import("logging")?
+        .call_method1("getLogger", ("uniserve_worker.execution.model_executor",))?
+        .call_method1("info", ("%s", text))?;
+    Ok(())
+}
 use crate::worker::block_tables::{GroupShape, GroupTable};
 use crate::worker::execution::{Execution, on_stream};
 use crate::worker::expert_exchange::ExpertExchange;
@@ -16,14 +84,13 @@ use crate::worker::graph_shapes::PrefillShape;
 use crate::worker::host::{with_context, with_entered};
 
 pub(super) fn prepare(
-    slf: &Bound<'_, ModelRunners>,
-    owner: &Bound<'_, PyAny>,
+    slf: &Bound<'_, ModelExecutor>,
     tokenizer: &Bound<'_, PyAny>,
     latents: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     let py = slf.py();
     with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
-        experts::bind(slf, owner)?;
+        experts::bind(slf)?;
         let (exchange, expert) = {
             let runners = slf.borrow();
             (
@@ -93,37 +160,37 @@ pub(super) fn prepare(
                                     .call1((1, 1, 1))?;
                                 shapes = PyTuple::new(py, [shape])?.into_any();
                             }
-                            prepare_prefill(owner, runner, &shapes)?;
+                            prepare_prefill(slf, runner, &shapes)?;
                         }
                         CallKind::Forward(ForwardMode::Decode) => {
-                            prepare_decode(owner, runner)?;
+                            prepare_decode(slf, runner)?;
                         }
                         CallKind::Forward(ForwardMode::TokenDenoising) => {
-                            prepare_canvas(owner, runner)?;
+                            prepare_canvas(slf, runner)?;
                         }
                         CallKind::Media(MediaCall::Denoising) => {
-                            prepare_flow(slf, owner, runner, latents, tokenizer)?;
+                            prepare_flow(slf, runner, latents, tokenizer)?;
                         }
                         _ => unreachable!("fixed startup call kinds"),
                     }
                 }
             }
-            prepare_images(owner, &prepared, latents)?;
+            prepare_images(slf, &prepared, latents)?;
             if let Some(control) = control
-                && owner.getattr("attention_ranks")?.is_truthy()?
+                && (slf.borrow().attention_ranks != 0)
             {
                 control.borrow().warmup(py, 0)?;
             }
         }
         experts::capture(slf)?;
-        resources::synchronize(slf, owner)
+        resources::synchronize(slf)
     })
 }
 
-pub(super) fn seal(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
-    owner.getattr("graph_storage")?.call_method0("seal")?;
+pub(super) fn seal(slf: &Bound<'_, ModelExecutor>) -> PyResult<()> {
+    slf.borrow().graph_storage(slf.py())?.borrow_mut().seal();
     slf.borrow_mut().sealed = true;
-    for runner in ModelRunners::all(slf)? {
+    for runner in ModelExecutor::all(slf)? {
         execution(&runner)?.borrow_mut().sealed = true;
     }
     for expert in &slf.borrow().expert_executions {
@@ -193,19 +260,18 @@ fn capture(runner: &Bound<'_, PyAny>, batch: &Bound<'_, PyAny>) -> PyResult<()> 
 }
 
 fn prepare_prefill(
-    owner: &Bound<'_, PyAny>,
+    owner: &Bound<'_, ModelExecutor>,
     runner: &Bound<'_, PyAny>,
     shapes: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     let py = owner.py();
     let backend = py.import("uniserve_worker.model_executor.startup")?;
-    let config = owner.getattr("worker_config")?;
-    let config_native = crate::worker::config::native(&config)?;
+    let config_native = Arc::clone(&owner.borrow().config);
     let row_tokens = config_native
         .max_sequence_tokens
         .min(config_native.max_batch_tokens)
         .max(1);
-    let cache = owner.getattr("kv_cache")?;
+    let cache = owner.borrow().kv_cache.bind(owner.py()).clone();
     let groups: Vec<Py<GroupShape>> = cache.getattr("shapes")?.extract()?;
     let pages: Vec<_> = groups
         .iter()
@@ -257,11 +323,11 @@ fn prepare_prefill(
     Ok(())
 }
 
-fn prepare_decode(owner: &Bound<'_, PyAny>, runner: &Bound<'_, PyAny>) -> PyResult<()> {
+fn prepare_decode(owner: &Bound<'_, ModelExecutor>, runner: &Bound<'_, PyAny>) -> PyResult<()> {
     let py = owner.py();
     let backend = py.import("uniserve_worker.model_executor.startup")?;
     let buffers = runner.getattr("input_buffers")?;
-    let cache = owner.getattr("kv_cache")?;
+    let cache = owner.borrow().kv_cache.bind(owner.py()).clone();
     let mut rows: Vec<usize> = runner.getattr("shapes")?.getattr("decode")?.extract()?;
     if rows.is_empty() {
         rows.push(1);
@@ -281,7 +347,7 @@ fn prepare_decode(owner: &Bound<'_, PyAny>, runner: &Bound<'_, PyAny>) -> PyResu
                 (&buffers, tokens, tables),
                 Some(&options),
             )?;
-            let predicates = owner.getattr("decode_predicates")?;
+            let predicates = owner.borrow().decode_predicates.bind(owner.py()).clone();
             let saved = if predicates.is_none() {
                 None
             } else {
@@ -303,10 +369,10 @@ fn prepare_decode(owner: &Bound<'_, PyAny>, runner: &Bound<'_, PyAny>) -> PyResu
     Ok(())
 }
 
-fn prepare_canvas(owner: &Bound<'_, PyAny>, runner: &Bound<'_, PyAny>) -> PyResult<()> {
+fn prepare_canvas(owner: &Bound<'_, ModelExecutor>, runner: &Bound<'_, PyAny>) -> PyResult<()> {
     let py = owner.py();
     let backend = py.import("uniserve_worker.model_executor.startup")?;
-    let cache = owner.getattr("kv_cache")?;
+    let cache = owner.borrow().kv_cache.bind(owner.py()).clone();
     let slots = runner.getattr("canvas_slots")?;
     let lengths: Vec<usize> = runner.getattr("readout_lengths")?.extract()?;
     let mut kinds: Vec<_> = lengths
@@ -345,18 +411,16 @@ fn prepare_canvas(owner: &Bound<'_, PyAny>, runner: &Bound<'_, PyAny>) -> PyResu
 }
 
 fn prepare_flow(
-    slf: &Bound<'_, ModelRunners>,
-    owner: &Bound<'_, PyAny>,
+    slf: &Bound<'_, ModelExecutor>,
     runner: &Bound<'_, PyAny>,
     latents: &Bound<'_, PyAny>,
     tokenizer: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
-    let py = owner.py();
+    let py = slf.py();
     let backend = py.import("uniserve_worker.model_executor.startup")?;
-    let config = owner.getattr("worker_config")?;
-    let config_native = crate::worker::config::native(&config)?;
+    let config_native = Arc::clone(&slf.borrow().config);
     let capture_enabled = config_native.graph_policy != "off" && config_native.flow_cuda_graph;
-    let builder = owner.getattr("image_builder")?;
+    let builder = slf.borrow().image_builder.bind(slf.py()).clone();
     let capacity = builder
         .getattr("max_tokens")?
         .extract::<usize>()?
@@ -366,11 +430,12 @@ fn prepare_flow(
             .getattr("denoiser")?
             .getattr("downsample")?
             .extract::<usize>()?;
-    let configured: Vec<Py<PyAny>> = owner.getattr("flow_captures")?.extract()?;
+    let configured: Vec<Py<PyAny>> =
+        { slf.borrow().flow_captures.bind(slf.py()).clone() }.extract()?;
     let mut shapes = if capture_enabled && !configured.is_empty() {
         configured
     } else {
-        let branches: Vec<usize> = owner.getattr("flow_cfg_branches")?.extract()?;
+        let branches: Vec<usize> = slf.borrow().flow_cfg_branches.clone();
         let mut selected = Vec::new();
         for branches in branches {
             let mut matching = None;
@@ -408,13 +473,13 @@ fn prepare_flow(
         .map(|runner| runner.clone_ref(py))
         .ok_or_else(|| PyValueError::new_err("image denoising requires a prefill runner"))?;
     let prefix = prefix.bind(py);
-    let cache = owner.getattr("kv_cache")?;
+    let cache = slf.borrow().kv_cache.bind(slf.py()).clone();
     on_stream(&context(runner)?, &runner.getattr("device")?, || {
         for (_, shape) in ordered {
             let shape = shape.bind(py);
             let rows: usize = shape.getattr("rows")?.extract()?;
             let branches: usize = shape.getattr("cfg_branches")?.extract()?;
-            let prepared = backend.call_method1("flow_prefixes", (owner, shape, tokenizer))?;
+            let prepared = backend.call_method1("flow_prefixes", (slf, shape, tokenizer))?;
             let schedule = prepared.get_item(0)?;
             let prefixes = prepared.get_item(1)?.cast_into::<PyTuple>()?;
             let lengths = prefixes
@@ -474,7 +539,7 @@ fn prepare_flow(
                         }
                         let batch = backend.call_method1(
                             "make_flow_batch",
-                            (owner, runner, shape, schedule, prefixes, tables, values),
+                            (slf, runner, shape, schedule, prefixes, tables, values),
                         )?;
                         if capture_enabled {
                             capture(runner, &batch)
@@ -490,13 +555,13 @@ fn prepare_flow(
 }
 
 fn prepare_images(
-    owner: &Bound<'_, PyAny>,
+    owner: &Bound<'_, ModelExecutor>,
     runners: &[(Py<PyAny>, HashSet<CallKind>)],
     latents: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     let py = owner.py();
     let backend = py.import("uniserve_worker.model_executor.startup")?;
-    let builder = owner.getattr("image_builder")?;
+    let builder = owner.borrow().image_builder.bind(owner.py()).clone();
     let side = if builder.is_none() {
         64
     } else {
@@ -515,7 +580,7 @@ fn prepare_images(
         && runners
             .iter()
             .any(|(_, kinds)| kinds.contains(&CallKind::Media(MediaCall::LatentEncoding)));
-    let processor = owner.getattr("processor")?;
+    let processor = owner.borrow().processor.bind(owner.py()).clone();
     for (runner, kinds) in runners {
         let runner = runner.bind(py);
         on_stream(&context(runner)?, &runner.getattr("device")?, || {
@@ -542,8 +607,7 @@ fn prepare_images(
                     Execution::capture_images(
                         &execution(runner)?,
                         runner,
-                        crate::worker::config::native(&owner.getattr("worker_config")?)?
-                            .max_batch_calls,
+                        Arc::clone(&owner.borrow().config).max_batch_calls,
                         &prepared.get_item(1)?,
                     )?;
                 } else {
@@ -577,18 +641,22 @@ fn prepare_images(
                     .getattr("denoiser")?
                     .call_method1("latent_shape", ("image", &size))?
                     .get_item(0)?;
-                with_tables(&owner.getattr("kv_cache")?, &[query], |tables| {
-                    with_entered(
-                        &latents.call_method1("startup_values", (1, units))?,
-                        |values| {
-                            let batch = backend.call_method1(
-                                "make_latent_feature_batch",
-                                (owner, runner, &size, tables, values.get_item(0)?),
-                            )?;
-                            eager(runner, &batch)
-                        },
-                    )
-                })?;
+                with_tables(
+                    &{ owner.borrow().kv_cache.bind(owner.py()).clone() },
+                    &[query],
+                    |tables| {
+                        with_entered(
+                            &latents.call_method1("startup_values", (1, units))?,
+                            |values| {
+                                let batch = backend.call_method1(
+                                    "make_latent_feature_batch",
+                                    (owner, runner, &size, tables, values.get_item(0)?),
+                                )?;
+                                eager(runner, &batch)
+                            },
+                        )
+                    },
+                )?;
             }
             Ok(())
         })?;

@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use super::ModelExecutor;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -21,7 +22,7 @@ type Group = (Py<PyAny>, Vec<usize>, bool);
 /// requests the next result. A failed consumer therefore starts no later work.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(in crate::worker) struct ModelBatches {
-    owner: Py<PyAny>,
+    owner: Option<Py<ModelExecutor>>,
     tasks: Py<PyTuple>,
     cache: Py<PyAny>,
     tables: Py<PyAny>,
@@ -34,7 +35,7 @@ pub(in crate::worker) struct ModelBatches {
 pub(super) fn prepare(
     py: Python<'_>,
     runners: &ModelRunners<Py<PyAny>>,
-    owner: Py<PyAny>,
+    owner: Py<ModelExecutor>,
     tasks: Py<PyTuple>,
     cache: Py<PyAny>,
     tables: Py<PyAny>,
@@ -82,7 +83,7 @@ pub(super) fn prepare(
     }));
 
     Ok(ModelBatches {
-        owner,
+        owner: Some(owner),
         tasks,
         cache,
         tables,
@@ -117,7 +118,7 @@ impl ModelBatches {
     }
 
     fn __clear__(&mut self, py: Python<'_>) {
-        self.owner = py.None();
+        self.owner = None;
         self.tasks = PyTuple::empty(py).unbind();
         self.cache = py.None();
         self.tables = py.None();
@@ -145,6 +146,9 @@ impl ModelBatches {
         &mut self,
         py: Python<'py>,
     ) -> PyResult<Option<(Vec<usize>, Py<PyAny>)>> {
+        let Some(owner) = &self.owner else {
+            return Ok(None);
+        };
         if let Some(index) = self.missing.pop_front() {
             let task = self.tasks.bind(py).get_item(index)?;
             let call = task.get_item(1)?.extract::<PyRef<'_, Call>>()?;
@@ -176,7 +180,7 @@ impl ModelBatches {
         let result: PyResult<Py<ExecutionOutput>> = (|| {
             let result = execute::run_batch(
                 py,
-                self.owner.bind(py),
+                owner.bind(py),
                 runner,
                 &rows,
                 &calls,

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::worker::model_executor::ModelExecutor;
 use indexmap::IndexMap;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -41,7 +42,13 @@ impl PythonBackend {
             .collect::<PyResult<Vec<_>>>()?;
 
         if let Some(&index) = active.first() {
-            let stream = model.call_method1("call_stream", (calls.get_item(index)?,))?;
+            let stream = ModelExecutor::call_stream(
+                model,
+                &*calls
+                    .get_item(index)?
+                    .extract::<PyRef<crate::calls::Call>>()?,
+            )?
+            .into_bound(py);
             if !stream.is_none() {
                 // Slot resets run on the current stream. Independent model
                 // streams join those resets before borrowing request storage.
@@ -124,8 +131,8 @@ impl PythonBackend {
                         }
                     }
                 }
-                let images = model.getattr("image_builder")?;
-                let media = model.getattr("media_builder")?;
+                let images = { model.borrow().image_builder.bind(py).clone() };
+                let media = { model.borrow().media_builder.bind(py).clone() };
                 NumericalBatch::bind_latents(
                     numerical,
                     self.latents.as_ref().map(|pool| pool.bind(py)),
@@ -330,17 +337,17 @@ impl PythonBackend {
                     if call.code != CallKind::Transfer(TransferMode::Tensor) {
                         // Models describe mathematical layouts; execution binds
                         // each rank's local slice to the declared result buffer.
-                        let layout = self.model_runner.bind(py).call_method1(
-                            "output_layout",
-                            (
-                                &call.component,
-                                output.output_index,
-                                admission.getattr("diffusion")?,
-                                &decode,
-                                admission.getattr("prompt_token_ids")?.len()?,
-                                admission.getattr("video")?,
-                            ),
-                        )?;
+                        let conditions = admission.getattr("video")?;
+                        let layout = ModelExecutor::output_layout(
+                            self.model_runner.bind(py),
+                            &call.component,
+                            output.output_index as usize,
+                            &admission.getattr("diffusion")?,
+                            &decode,
+                            admission.getattr("prompt_token_ids")?.len()?,
+                            (!conditions.is_none()).then_some(&conditions),
+                        )?
+                        .into_bound(py);
                         if layout.is_none() {
                             continue;
                         }

@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker_ipc::CallKind;
 
-use super::{ModelRunners, context};
+use super::{ModelExecutor, context};
 use crate::worker::host::with_context;
 
 /// A declared method and the contexts that borrow its stream and scratch.
@@ -59,7 +59,10 @@ impl Module {
         Ok(())
     }
 
-    pub(super) fn stream<'py>(&self, owner: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    pub(super) fn stream<'py>(
+        &self,
+        owner: &Bound<'py, ModelExecutor>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let py = owner.py();
         let device = self.binding.bind(py).getattr("device")?;
         if device.getattr("type")?.extract::<String>()? != "cuda" {
@@ -83,7 +86,7 @@ impl Module {
 
     pub(super) fn prepare<'py>(
         &self,
-        owner: &Bound<'py, PyAny>,
+        owner: &Bound<'py, ModelExecutor>,
         size: &Bound<'py, PyAny>,
         key: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -99,8 +102,7 @@ impl Module {
             serving.set_item(key, &runner)?;
             return Ok(runner);
         }
-        let capacity: usize =
-            crate::worker::config::native(&owner.getattr("worker_config")?)?.max_request_pool_size;
+        let capacity: usize = Arc::clone(&owner.borrow().config).max_request_pool_size;
         if serving.len() >= capacity
             && let Some((key, runner)) = serving.iter().next()
         {
@@ -108,17 +110,15 @@ impl Module {
             retire(&runner)?;
         }
 
-        let startup = !owner
-            .getattr("batch_runners")?
-            .cast_into::<ModelRunners>()?
-            .borrow()
-            .sealed;
+        let startup = !owner.borrow().sealed;
         let call = self.call.bind(py);
         let device = self.binding.bind(py).getattr("device")?;
         let stream = self.stream(owner)?;
         let runtime = py.import("uniserve.runtime")?;
         let options = PyDict::new(py);
-        options.set_item("attention", owner.getattr("attention")?)?;
+        options.set_item("attention", {
+            owner.borrow().attention.bind(owner.py()).clone()
+        })?;
         options.set_item("stream", &stream)?;
         options.set_item("groups", call.getattr("groups")?)?;
         let scratch = if startup {
@@ -149,13 +149,12 @@ impl Module {
             .getattr("ExecutionContext")?
             .call((call.getattr("module")?,), Some(&options))?;
 
-        let storage = owner.getattr("graph_storage")?;
+        let storage = owner.borrow().graph_storage(owner.py())?;
         let options = PyDict::new(py);
         options.set_item("storage", &storage)?;
         let captures = startup
             && !stream.is_none()
-            && crate::worker::config::native(&owner.getattr("worker_config")?)?.graph_policy
-                != "off"
+            && Arc::clone(&owner.borrow().config).graph_policy != "off"
             && !call
                 .getattr("module")?
                 .is_instance(&py.import("uniserve.model")?.getattr("VideoPostprocessor")?)?;
@@ -189,7 +188,7 @@ impl Module {
                 &storage.call_method1("allocate", (runner.getattr("execution")?,))?,
                 || context.call_method1("prepare", (size,)).map(drop),
             )?;
-            storage.call_method0("check")?;
+            storage.borrow().check(py)?;
             Ok(())
         })();
         if let Err(error) = prepared {
@@ -226,19 +225,14 @@ fn retire(runner: &Bound<'_, PyAny>) -> PyResult<()> {
     runner.call_method0("close").map(drop)
 }
 
-pub(super) fn ensure_open(owner: &Bound<'_, PyAny>) -> PyResult<()> {
-    if owner
-        .getattr("batch_runners")?
-        .cast_into::<ModelRunners>()?
-        .borrow()
-        .closed
-    {
+pub(super) fn ensure_open(owner: &Bound<'_, ModelExecutor>) -> PyResult<()> {
+    if owner.borrow().closed {
         return Err(PyRuntimeError::new_err("model runner is closed"));
     }
     Ok(())
 }
 
-impl ModelRunners {
+impl ModelExecutor {
     pub(super) fn module(
         &self,
         py: Python<'_>,

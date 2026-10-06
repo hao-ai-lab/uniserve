@@ -2,12 +2,13 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::sync::Arc;
 
-use super::ModelRunners;
+use super::ModelExecutor;
 use super::streams::cuda_index;
 use crate::worker::execution::close_all;
 
-pub(super) fn synchronize(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
+pub(super) fn synchronize(slf: &Bound<'_, ModelExecutor>) -> PyResult<()> {
     let py = slf.py();
     let streams = slf.borrow().streams.owned(py);
     let mut results: Vec<_> = streams
@@ -19,10 +20,10 @@ pub(super) fn synchronize(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny
     // a runner. Explicit shutdown drains it before freeing model backing.
     let device = py.import("uniserve.runtime.device")?.call_method1(
         "canonical_device",
-        (&crate::worker::config::native(&owner.getattr("worker_config")?)?.device,),
+        (&Arc::clone(&slf.borrow().config).device,),
     )?;
     let mut devices = vec![device.clone()];
-    devices.extend(super::streams::capture_devices(owner, &device)?);
+    devices.extend(super::streams::capture_devices(slf, &device)?);
     let cuda = py.import("torch.cuda")?;
     for device in devices {
         if cuda_index(&device)?.is_some() {
@@ -36,9 +37,9 @@ pub(super) fn synchronize(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny
     close_all(py, results)
 }
 
-pub(super) fn close_graphs(slf: &Bound<'_, ModelRunners>) -> PyResult<()> {
+pub(super) fn close_graphs(slf: &Bound<'_, ModelExecutor>) -> PyResult<()> {
     let py = slf.py();
-    let mut results: Vec<_> = ModelRunners::all(slf)?
+    let mut results: Vec<_> = ModelExecutor::all(slf)?
         .iter()
         .map(|runner| runner.call_method0("close_graphs").map(drop))
         .collect();
@@ -56,11 +57,7 @@ pub(super) fn close_graphs(slf: &Bound<'_, ModelRunners>) -> PyResult<()> {
     close_all(py, results)
 }
 
-pub(super) fn close(
-    slf: &Bound<'_, ModelRunners>,
-    owner: &Bound<'_, PyAny>,
-    aborted: bool,
-) -> PyResult<()> {
+pub(super) fn close(slf: &Bound<'_, ModelExecutor>, aborted: bool) -> PyResult<()> {
     let py = slf.py();
     {
         let mut runners = slf.borrow_mut();
@@ -72,19 +69,22 @@ pub(super) fn close(
 
     // A host draw writes request storage. Stop admission before draining it;
     // an aborted worker keeps its backing until immediate process exit.
-    if let Ok(draws) = owner.getattr("noise_draws")
-        && !draws.is_none()
-    {
-        draws.call_method0("abort")?;
+    let draws = slf
+        .borrow()
+        .noise_draws
+        .as_ref()
+        .map(|draws| draws.clone_ref(py));
+    if let Some(draws) = draws {
+        draws.get().abort();
         if !aborted {
-            draws.call_method0("close")?;
+            draws.get().close(py)?;
         }
     }
 
     let streams = slf.borrow().streams.owned(py);
     if aborted {
         py.import("uniserve.runtime.resources")?
-            .call_method1("retain_until_exit", (owner,))?;
+            .call_method1("retain_until_exit", (slf,))?;
         let options = PyDict::new(py);
         options.set_item("aborted", true)?;
         return close_all(
@@ -98,11 +98,11 @@ pub(super) fn close(
         );
     }
 
-    let result = (|| {
+    let result = {
         let mut results = vec![
-            synchronize(slf, owner),
+            synchronize(slf),
             close_graphs(slf),
-            ModelRunners::close_modules(slf),
+            ModelExecutor::close_modules(slf),
         ];
         let diffusion = slf
             .borrow()
@@ -123,7 +123,7 @@ pub(super) fn close(
                 .iter()
                 .map(|runner| runner.call_method0(py, "close").map(drop)),
         );
-        let weights = owner.getattr("expert_weights")?;
+        let weights = slf.borrow().expert_weights.bind(slf.py()).clone();
         if !weights.is_none() {
             results.push(weights.call_method0("close").map(drop));
         }
@@ -152,17 +152,10 @@ pub(super) fn close(
                 .map(|stream| stream.bind(py).call_method0("close").map(drop)),
         );
         close_all(py, results)
-    })();
+    };
 
     slf.borrow_mut().clear();
-    close_all(
-        py,
-        [
-            result,
-            owner
-                .getattr("graph_storage")?
-                .call_method0("close")
-                .map(drop),
-        ],
-    )
+    let storage = slf.borrow().graph_storage(py)?;
+    crate::worker::graph_storage::GraphStorage::close(storage.borrow_mut());
+    result
 }
