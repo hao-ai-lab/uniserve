@@ -68,6 +68,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<graph_storage::GraphStorage>()?;
     module.add_class::<execution::Execution>()?;
     module.add_class::<execution::GraphBucket>()?;
+    module.add_class::<execution::JoinGraphs>()?;
     module.add_class::<graph_shapes::PrefillShape>()?;
     module.add_class::<graph_shapes::TextShapes>()?;
     module.add_function(wrap_pyfunction!(graph_shapes::prefill_units, module)?)?;

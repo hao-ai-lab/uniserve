@@ -44,7 +44,7 @@ pub(super) fn select(
 pub(super) fn exchange<'py>(
     runner: &Bound<'py, PyAny>,
 ) -> PyResult<Option<Bound<'py, ExpertExchange>>> {
-    if !runner.getattr("expert_step")?.is_truthy()? {
+    if execution(runner)?.borrow().expert_order.is_none() {
         return Ok(None);
     }
     let exchange = context(runner)?.getattr("experts")?;
@@ -95,7 +95,7 @@ fn agree(
     tokens: usize,
 ) -> PyResult<usize> {
     let py = runner.py();
-    let kind = runner.getattr("expert_order")?.extract()?;
+    let kind = execution(runner)?.borrow().expert_order.unwrap_or(0);
     loop {
         let capacity = with_context(&profile(py, "uniserve.expert.agree")?, || {
             exchange.borrow().agree(py, tokens, kind, false)
@@ -113,12 +113,7 @@ fn agree(
                 &format!("uniserve.expert.step tokens=0 capacity={capacity}"),
             )?,
             || {
-                let joins = runner.getattr("expert_joins")?;
-                if joins.is_none() {
-                    execution(runner)?.borrow().join_expert_step(py, capacity)?;
-                } else {
-                    joins.call_method1("replay", (capacity,))?;
-                }
+                super::experts::join(execution(runner)?.as_unbound(), py, capacity)?;
                 Ok(())
             },
         )?;
@@ -139,7 +134,7 @@ fn forward(
     let selected = match selected {
         Some(shape) if buckets.contains(shape.key.bind(py))? => Some(shape),
         Some(shape) if shape.bucketed => {
-            if runner.getattr("_startup_complete")?.is_truthy()? {
+            if execution(runner)?.borrow().sealed {
                 return Err(graph_error(
                     py,
                     format!(
@@ -302,9 +297,13 @@ fn microbatches(
                         let peer = peer.bind(py);
                         let batch = batch.bind(py);
                         if batch.is_none() {
-                            let joins = peer.getattr("microbatch_joins")?;
-                            if !joins.is_none() {
-                                joins.call_method1("replay", (capacity,))?;
+                            let joins = execution(peer)?
+                                .borrow()
+                                .microbatch_joins
+                                .as_ref()
+                                .map(|joins| joins.clone_ref(py));
+                            if let Some(joins) = joins {
+                                joins.borrow(py).replay(py, capacity)?;
                                 return Ok(py.None());
                             }
                         }

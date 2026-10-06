@@ -124,7 +124,7 @@ class EncoderRunner(ModelRunner):
         """
         if not self.packs_images or self._packed_capacities:
             return
-        if self._startup_complete:
+        if self.execution.sealed:
             raise CUDAGraphError("packed capture is outside startup")
         encoder = self.model
         assert isinstance(encoder, PatchEncoder)

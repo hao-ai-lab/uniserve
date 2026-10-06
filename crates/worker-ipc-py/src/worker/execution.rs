@@ -1,5 +1,8 @@
 //! Prepared numerical resources and graph retirement.
 
+mod joins;
+pub(super) use joins::JoinGraphs;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
@@ -99,6 +102,12 @@ pub(crate) struct Execution {
     #[pyo3(get)]
     pub(super) microbatches: Option<Py<Microbatches>>,
     peer: usize,
+    #[pyo3(get)]
+    pub(super) sealed: bool,
+    #[pyo3(get)]
+    pub(super) expert_order: Option<i64>,
+    pub(super) joins: Option<Py<JoinGraphs>>,
+    pub(super) microbatch_joins: Option<Py<JoinGraphs>>,
     closed: bool,
 }
 
@@ -128,6 +137,10 @@ impl Execution {
                 storage: Some(storage.clone_ref(py)),
                 microbatches: None,
                 peer: 0,
+                sealed: false,
+                expert_order: None,
+                joins: None,
+                microbatch_joins: None,
                 closed: false,
             },
         )?;
@@ -138,6 +151,10 @@ impl Execution {
             .call_method("reserve", (&owner, devices), Some(&kwargs))?;
         owner.borrow_mut(py).pools = pools.extract()?;
         Ok(owner)
+    }
+
+    fn seal(&mut self) {
+        self.sealed = true;
     }
 
     /// Bind independently prepared contexts to one ordered host rotation.
@@ -230,11 +247,21 @@ impl Execution {
             buckets.clear();
             values
         };
+        let (joins, microbatch_joins) = {
+            let mut owner = slf.borrow_mut();
+            (owner.joins.take(), owner.microbatch_joins.take())
+        };
         close_all(
             slf.py(),
             buckets
                 .iter()
-                .map(|bucket| bucket.call_method0("close").map(drop)),
+                .map(|bucket| bucket.call_method0("close").map(drop))
+                .chain(
+                    joins
+                        .into_iter()
+                        .chain(microbatch_joins)
+                        .map(|joins| joins.borrow(slf.py()).close(slf.py())),
+                ),
         )
     }
 
@@ -271,7 +298,9 @@ impl Execution {
         visit.call(&self.buckets)?;
         visit.call(&self.pools)?;
         visit.call(&self.storage)?;
-        visit.call(&self.microbatches)
+        visit.call(&self.microbatches)?;
+        visit.call(&self.joins)?;
+        visit.call(&self.microbatch_joins)
     }
 
     fn __clear__(&mut self, py: Python<'_>) {
@@ -280,6 +309,8 @@ impl Execution {
         self.context = py.None();
         self.storage = None;
         self.microbatches = None;
+        self.joins = None;
+        self.microbatch_joins = None;
     }
 }
 

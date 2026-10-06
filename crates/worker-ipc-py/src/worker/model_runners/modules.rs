@@ -110,7 +110,11 @@ impl Module {
             retire(&runner)?;
         }
 
-        let startup = !owner.getattr("_startup_complete")?.is_truthy()?;
+        let startup = !owner
+            .getattr("batch_runners")?
+            .cast_into::<ModelRunners>()?
+            .borrow()
+            .sealed;
         let call = self.call.bind(py);
         let device = self.binding.bind(py).getattr("device")?;
         let stream = self.stream(owner)?;
@@ -197,7 +201,7 @@ impl Module {
             runner.call_method0("close")?;
             return Err(error);
         }
-        runner.setattr("_startup_complete", !startup)?;
+        super::execution(&runner)?.borrow_mut().sealed = !startup;
         if startup {
             self.resident.bind(py)
         } else {

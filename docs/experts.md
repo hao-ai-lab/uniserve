@@ -20,6 +20,8 @@ Rust owns source readiness, cyclic call selection, step capacity and layer parti
 
 A rank with no input tokens still participates. `ExecutionContext.join_expert_layers()` completes the forward's skipped tail with empty source rows; `JoinGraphs` captures this participation for configured capacities. Graph padding contributes no route weight. Drain all participating invocations before closing graphs, contexts and the exchange, in that order.
 
+Rust owns `JoinGraphs` and its capacity-indexed graph variants. Startup warms and captures capacities largest first, on every rank in the same order. Worker `ModelRunners` owns numerical runner registration, expert exchanges and expert-only contexts. It prepares prefill, decode, canvas and image-denoising calls in order, then captures rank and microbatch joins. `Execution` retains each call's expert order and shared join graphs and seals capture when startup ends. An idle rank selects the next expert step through the same native exchange as an active forward; empty microbatches replay their own join graphs and allocation pools. Normal and exceptional returns join the submitted work through device events without a host wait. Python constructs numerical inputs, tensor buffers and ordinary model calls.
+
 The colocated MegaMoE provider requires directly mapped NVLink peer memory. Its NVSHMEM owner defaults `NVSHMEM_REMOTE_TRANSPORT` to `none`, preserving any explicit operator setting. This avoids initializing unused RDMA endpoints; peer memory remains the kernel's data path. NVIDIA documents the transport setting in its [NVSHMEM environment reference](https://docs.nvidia.com/nvshmem/api/latest/gen/env.html).
 
 ## Independent weight prefetch
