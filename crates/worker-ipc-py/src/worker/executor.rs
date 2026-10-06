@@ -482,7 +482,7 @@ pub(crate) struct Executor {
 #[pymethods]
 impl Executor {
     #[new]
-    fn new(py: Python<'_>, worker: &Bound<'_, PyAny>) -> PyResult<Self> {
+    pub(super) fn new(py: Python<'_>, worker: &Bound<'_, PyAny>) -> PyResult<Self> {
         let capacity = worker.getattr("info")?.getattr("queue_depth")?.extract()?;
         let distributed = worker
             .getattr("worker_config")?
@@ -613,7 +613,7 @@ impl Executor {
     }
 
     #[pyo3(signature = (batch, *, propagate_errors=false))]
-    fn submit(
+    pub(super) fn submit(
         &mut self,
         py: Python<'_>,
         batch: &Bound<'_, crate::batches::Batch>,
@@ -632,7 +632,7 @@ impl Executor {
 
     /// Serve the rank's native channel without Python request/response envelopes.
     /// The resource owner retains both executor and endpoint after this returns.
-    fn serve(&mut self, py: Python<'_>, server: &PyServer) -> PyResult<()> {
+    pub(super) fn serve(&mut self, py: Python<'_>, server: &PyServer) -> PyResult<()> {
         let executor = self.executor_mut()?;
         let info = executor.backend().info.clone();
         let experts = !executor
@@ -660,13 +660,17 @@ impl Executor {
         result
     }
 
-    fn advance(&mut self, py: Python<'_>) -> PyResult<bool> {
+    pub(super) fn advance(&mut self, py: Python<'_>) -> PyResult<bool> {
         self.executor_mut()?
             .advance()
             .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))
     }
 
-    fn poll(&mut self, py: Python<'_>, submission: &Submission) -> PyResult<Option<Py<PyAny>>> {
+    pub(super) fn poll(
+        &mut self,
+        py: Python<'_>,
+        submission: &Submission,
+    ) -> PyResult<Option<Py<PyAny>>> {
         self.executor_mut()?
             .poll(&submission.submission)
             .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))?
@@ -686,24 +690,24 @@ impl Executor {
     }
 
     #[getter]
-    fn started(&self) -> bool {
+    pub(super) fn started(&self) -> bool {
         self.executor.as_ref().is_some_and(NativeExecutor::started)
     }
 
-    fn reset(&mut self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn reset(&mut self, py: Python<'_>) -> PyResult<()> {
         self.executor_mut()?
             .reset()
             .map_err(|error| PyErr::from_value(error.into_bound(py).into_any()))
     }
 
-    fn drop_request(&mut self, py: Python<'_>, request_id: u64) -> PyResult<()> {
+    pub(super) fn drop_request(&mut self, py: Python<'_>, request_id: u64) -> PyResult<()> {
         let backend = self.executor_mut()?.backend();
         backend.release_requests(py, &[request_id], &Default::default())?;
         backend.requests.borrow_mut(py).drop_request(py, request_id);
         Ok(())
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(mut executor) = self.executor.take() {
             executor
                 .close()

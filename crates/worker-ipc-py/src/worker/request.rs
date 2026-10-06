@@ -291,7 +291,7 @@ impl RequestPool {
         self.pool.capacity()
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         for request in self.views.iter().flatten() {
             let mut request = request.borrow_mut(py);
             request.drain_preparation(py);

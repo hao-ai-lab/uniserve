@@ -32,6 +32,7 @@ mod pending;
 pub(crate) mod protocol;
 mod registry;
 mod request;
+mod runtime;
 mod sampling;
 mod shared_buffer;
 mod storage;
@@ -106,6 +107,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<kv_import::KVImport>()?;
     module.add_class::<kv_import::KVImporter>()?;
     module.add_class::<executor::Executor>()?;
+    module.add_class::<runtime::Worker>()?;
     module.add_class::<executor::Submission>()?;
     module.add_class::<buffer::BufferBinding>()?;
     module.add_class::<buffer::BufferPool>()?;

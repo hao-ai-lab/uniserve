@@ -17,6 +17,7 @@ that does not continue its slot's canvas, or of a canvas whose sampling is
 not the one the worker serves, is refused.
 """
 
+import weakref
 from dataclasses import replace
 
 import pytest
@@ -294,6 +295,10 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
     expected = _expected_blocks(tmp_path, prompt)
 
     worker = _worker(tmp_path, canvas_sampling=ADMITTED)
+    slots = worker.canvas_slots
+    state = [
+        weakref.ref(tensor) for tensor in (*slots.banks.values(), slots.live)
+    ]
     with worker:
         _admitted_prompt(worker, prompt)
 
@@ -316,6 +321,9 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
         actual += _block(run, 13 + CANVAS, 1, 11)
         _run(worker, Batch(batch_id=20, commands=(Finish(REQUEST),)))
 
+    # A caller retaining the closed worker or its pool must not retain the
+    # canvas storage after all steps and their readers have retired.
+    assert all(reference() is None for reference in state)
     assert actual == expected
     # Each block ends with the one step that reports all of its tokens.
     assert [len(tokens) for tokens in expected if tokens] == [CANVAS, CANVAS]

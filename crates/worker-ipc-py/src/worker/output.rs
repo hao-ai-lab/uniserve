@@ -489,7 +489,7 @@ impl OutputPool {
         Ok(buffer)
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn close(&self, py: Python<'_>) -> PyResult<()> {
         let buffers: Vec<_> = {
             let mut pool = self.lock(py)?;
             pool.begin_close();
