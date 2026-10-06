@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 
+from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 
@@ -38,11 +39,13 @@ def test_buffer_lookup_preserves_identity_across_reconstruction_and_versions():
         replace(reference, output_index=1),
         replace(
             reference,
-            producer_call_id=replace(reference.producer_call_id, batch_id=12),
+            producer_call_id=CallId(
+                12, reference.producer_call_id.request_index
+            ),
         ),
         replace(
             reference,
-            request_key=replace(reference.request_key, request_epoch=4),
+            request_key=RequestKey(2, 7, 4),
         ),
     )
     for item in versions:
@@ -66,4 +69,26 @@ def test_computation_order_and_lookup_follow_batch_and_request_coordinates():
         "second",
         "third",
     ]
-    assert replace(second, request_index=1) in entries
+    assert CallId(second.batch_id, 1) in entries
+
+
+@pytest.mark.parametrize(
+    ("kind", "mapping"),
+    (
+        (RequestKey, {"engine_id": 1, "request_id": 7, "request_epoch": -1}),
+        (RequestKey, {"engine_id": 1, "request_id": 7, "request_epoch": True}),
+        (CallId, {"batch_id": 0, "request_index": 1}),
+        (
+            BufferId,
+            {
+                "owner": {"engine_id": 1, "request_id": 7, "request_epoch": 2},
+                "producer_call_id": {"batch_id": 3, "request_index": 0},
+                "output_index": 0,
+                "generation": 0,
+            },
+        ),
+    ),
+)
+def test_invalid_coordinates_are_rejected_at_wire_decoding(kind, mapping):
+    with pytest.raises(WorkerError):
+        kind.from_mapping(mapping)

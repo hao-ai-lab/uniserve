@@ -144,7 +144,7 @@ def test_kv_install_waits_without_blocking_independent_work(
                 if owner is worker:
                     # This export is read by an external consumer whose
                     # acknowledgment the test controls.
-                    export = replace(export, consumer_slots=(1,))
+                    export = export.replace(consumer_slots=(1,))
                 published = finalized_report(
                     owner,
                     owner.submit(
@@ -743,8 +743,12 @@ def test_failed_batch_import_releases_earlier_destinations() -> None:
                     else tensor.locations
                 ),
             )
-            missing_base = replace(
-                exports[1].source, producer_call_id=CallId(3, 0)
+            source = exports[1].source
+            missing_base = BufferId(
+                source.owner,
+                CallId(3, 0),
+                source.output_index,
+                source.generation,
             )
             transfers = (pending, replace(exports[1], base=missing_base))
             calls = tuple(

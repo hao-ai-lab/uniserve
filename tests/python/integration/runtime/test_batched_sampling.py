@@ -350,15 +350,14 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     result = finalized_report(
         worker, worker.submit(execution_batch(batch_id=2, calls=(verify,)))
     )
-    successor = replace(
-        token_call(
-            admission.request_key,
-            call_id=CallId(3, 0),
-            predecessor=verify.call_id,
-            mode=ForwardMode.DECODE,
-            tokens=(0,),
-            predicate=verify.token_output,
-        ),
+    successor = token_call(
+        admission.request_key,
+        call_id=CallId(3, 0),
+        predecessor=verify.call_id,
+        mode=ForwardMode.DECODE,
+        tokens=(0,),
+        predicate=verify.token_output,
+    ).replace(
         input_token_ids=(),
     )
     # Reserve the verifier's full possible prefix, as a queued scheduler would.
@@ -536,8 +535,8 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(5, 6),
         logprobs=True,
     )
-    invalid = replace(
-        invalid, bounds=replace(invalid.bounds, max_completion_bytes=1)
+    invalid = invalid.replace(
+        bounds=replace(invalid.bounds, max_completion_bytes=1)
     )
     failed = finalized_report(
         worker,
@@ -635,8 +634,7 @@ def test_worker_samples_with_the_call_branch_state() -> None:
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    call = replace(
-        call,
+    call = call.replace(
         sampling_state=SamplingState(allowed_token_ids=(7,)),
     )
 
@@ -697,8 +695,7 @@ def test_all_masked_branch_state_produces_an_error_completion() -> None:
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    call = replace(
-        call,
+    call = call.replace(
         sampling_state=SamplingState(allowed_token_ids=()),
     )
 

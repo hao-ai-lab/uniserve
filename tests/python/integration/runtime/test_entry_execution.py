@@ -630,7 +630,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
         assert not refused.products
 
         copied = replace(copied, producer_call_id=CallId(3, 0))
-        consumer = replace(consumer, call_id=CallId(3, 0), outputs=(copied,))
+        consumer = consumer.replace(call_id=CallId(3, 0), outputs=(copied,))
         transfer = replace(
             transfer,
             batch_id=3,

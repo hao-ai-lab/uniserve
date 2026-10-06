@@ -20,6 +20,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
 use pythonize::{depythonize, pythonize};
+use serde::de::DeserializeOwned;
 use uniserve_core::{
     AudioClip, Canvas, ConditionMedia, ConditionRole, ImageParams, SamplingParams, TokenLogprob,
     VideoCondition,
@@ -65,6 +66,75 @@ pub(crate) fn batch_from_py(value: &Bound<'_, PyAny>) -> PyResult<Batch> {
     }
 
     Ok(batch)
+}
+
+/// Read a direct submission, retaining its already-native calls. Only Python
+/// allocation and numerical parameter records need decoding here.
+pub(crate) fn batch_from_object(value: &Bound<'_, PyAny>) -> PyResult<Batch> {
+    let calls = value
+        .getattr("calls")?
+        .try_iter()?
+        .map(|call| {
+            Ok(call?
+                .extract::<PyRef<'_, crate::calls::Call>>()?
+                .inner
+                .as_ref()
+                .clone())
+        })
+        .collect::<PyResult<_>>()?;
+    let command_to_mapping = value
+        .py()
+        .import("uniserve_worker.protocol.batch")?
+        .getattr("command_to_mapping")?;
+    let commands = value
+        .getattr("commands")?
+        .try_iter()?
+        .map(|command| depythonize(&command_to_mapping.call1((command?,))?).map_err(Into::into))
+        .collect::<PyResult<_>>()?;
+    let input_products = value
+        .getattr("input_products")?
+        .try_iter()?
+        .map(|product| {
+            tensor_export_from_py(&product?.call_method0("to_mapping")?)
+                .ok_or_else(|| PyValueError::new_err("invalid batch tensor product"))
+        })
+        .collect::<PyResult<_>>()?;
+    let kv_inputs = value
+        .getattr("kv_inputs")?
+        .try_iter()?
+        .map(|input| {
+            kv_transfer_from_py(&input?.call_method0("to_mapping")?)
+                .ok_or_else(|| PyValueError::new_err("invalid batch KV transfer"))
+        })
+        .collect::<PyResult<_>>()?;
+
+    Ok(Batch {
+        batch_id: value.getattr("batch_id")?.extract()?,
+        collective_seq: value.getattr("collective_seq")?.extract()?,
+        calls,
+        block_tables: records_from_py(&value.getattr("block_tables")?)?,
+        new_cache_units: records_from_py(&value.getattr("new_cache_units")?)?,
+        forward: uniserve_worker_ipc::ForwardBatch {
+            call_indices: value.getattr("forward_call_indices")?.extract()?,
+            request_pool_indices: value.getattr("request_pool_indices")?.extract()?,
+            seq_lens: value.getattr("seq_lens")?.extract()?,
+            query_lens: value.getattr("query_lens")?.extract()?,
+            write_kv: value.getattr("write_kv")?.extract()?,
+        },
+        latent_params: records_from_py(&value.getattr("latent_params")?)?,
+        decode_ranges: records_from_py(&value.getattr("decode_ranges")?)?,
+        buffer_allocations: records_from_py(&value.getattr("buffer_allocations")?)?,
+        commands,
+        input_products,
+        kv_inputs,
+    })
+}
+
+fn records_from_py<T: DeserializeOwned>(values: &Bound<'_, PyAny>) -> PyResult<Vec<T>> {
+    values
+        .try_iter()?
+        .map(|value| depythonize(&value?.call_method0("to_mapping")?).map_err(Into::into))
+        .collect()
 }
 
 /// Return the public Python response mapping with its flattened transfer records.
@@ -152,14 +222,10 @@ pub(crate) fn execute_request_to_py<'py>(
 /// `records` holds the classes built through [`construct`] by keyword; the
 /// classes and the function in the other fields are called positionally. The
 /// enum arrays are indexed by `RequestTypes::kind`, `RequestTypes::dtype`,
-/// and the draw-layout match in `RequestConversion::call`.
+/// and the draw-layout match in `RequestConversion::rng`.
 struct RequestTypes {
     records: HashMap<&'static str, Py<PyAny>>,
-    call: Py<PyAny>,
-    computation_id: Py<PyAny>,
-    request_key: Py<PyAny>,
     tensor_ref: Py<PyAny>,
-    buffer_id: Py<PyAny>,
     shape_bound: Py<PyAny>,
     static_dim: Py<PyAny>,
     device_dim: Py<PyAny>,
@@ -214,7 +280,6 @@ impl RequestTypes {
         // imported from the module that defines it.
         let batch = py.import("uniserve_worker.protocol.batch")?;
         let call = py.import("uniserve_worker.protocol.call")?;
-        let identity = py.import("uniserve_worker.protocol.identity")?;
         let tensor = py.import("uniserve_worker.protocol.tensor")?;
         let class = |module: &Bound<'_, PyModule>, name: &str| -> PyResult<Py<PyAny>> {
             Ok(module.getattr(name)?.unbind())
@@ -272,11 +337,7 @@ impl RequestTypes {
         records.insert("KvTransfer", class(&module, "KvTransfer")?);
         Ok(Self {
             records,
-            call: class(&call, "Call")?,
-            computation_id: class(&identity, "CallId")?,
-            request_key: class(&identity, "RequestKey")?,
             tensor_ref: class(&tensor, "TensorRef")?,
-            buffer_id: class(&identity, "BufferId")?,
             shape_bound: class(&tensor, "ShapeBound")?,
             static_dim: class(&tensor, "StaticDim")?,
             device_dim: class(&tensor, "DeviceDim")?,
@@ -298,7 +359,7 @@ impl RequestTypes {
             )?,
 
             // The `dtypes` and `draw_layouts` spellings sit at the indices that
-            // `dtype` and the draw-layout match in `RequestConversion::call`
+            // `dtype` and the draw-layout match in `RequestConversion::rng`
             // hardcode (the Rust discriminant values). `kind` indexes the other
             // three with `as usize`, which relies on each `ALL` array listing
             // variants in declaration order.
@@ -384,11 +445,10 @@ fn construct<'py>(
 
 /// Per-batch construction context: repeated typed leaves are built once.
 ///
-/// Equal request keys, call ids, and shape bounds converted through one
-/// context map to the same Python object. Sharing is safe because those
-/// records are frozen dataclasses. Tensor references and buffer ids are constructed anew on each
-/// use from the cached leaves.
-struct RequestConversion<'py> {
+/// Equal request keys, call ids and shape bounds share immutable Python views
+/// within one batch. Tensor references are built from these leaves; buffer ids
+/// copy their small native values directly.
+pub(crate) struct RequestConversion<'py> {
     py: Python<'py>,
     types: &'static RequestTypes,
     request_keys: HashMap<RequestKey, Py<PyAny>>,
@@ -398,7 +458,7 @@ struct RequestConversion<'py> {
 
 impl<'py> RequestConversion<'py> {
     /// Starts a batch conversion with shared Python types and empty value caches.
-    fn new(py: Python<'py>) -> PyResult<Self> {
+    pub(crate) fn new(py: Python<'py>) -> PyResult<Self> {
         Ok(Self {
             py,
             types: RequestTypes::get(py)?,
@@ -417,11 +477,7 @@ impl<'py> RequestConversion<'py> {
         if let Some(value) = self.computation_ids.get(&id) {
             return Ok(value.bind(self.py).clone());
         }
-        let value = self
-            .types
-            .computation_id
-            .bind(self.py)
-            .call1((id.batch_id, id.request_index))?;
+        let value = Bound::new(self.py, crate::ids::CallId { inner: id })?.into_any();
         self.computation_ids.insert(id, value.clone().unbind());
         Ok(value)
     }
@@ -431,11 +487,7 @@ impl<'py> RequestConversion<'py> {
         if let Some(value) = self.request_keys.get(&key) {
             return Ok(value.bind(self.py).clone());
         }
-        let value = self.types.request_key.bind(self.py).call1((
-            key.engine_id,
-            key.request_id.0,
-            key.request_epoch,
-        ))?;
+        let value = Bound::new(self.py, crate::ids::RequestKey { inner: key })?.into_any();
         self.request_keys.insert(key, value.clone().unbind());
         Ok(value)
     }
@@ -464,7 +516,7 @@ impl<'py> RequestConversion<'py> {
     }
 
     /// Constructs a typed Python product reference from shared leaf objects.
-    fn tensor_ref(&mut self, product: &TensorRef) -> PyResult<Bound<'py, PyAny>> {
+    pub(crate) fn tensor_ref(&mut self, product: &TensorRef) -> PyResult<Bound<'py, PyAny>> {
         let request_key = self.request_key(product.request_key)?;
         let shape_bound = self.shape_bound(&product.shape_bound)?;
         self.types.tensor_ref.bind(self.py).call1((
@@ -479,214 +531,123 @@ impl<'py> RequestConversion<'py> {
 
     /// Constructs a typed Python persistent-buffer identity.
     fn buffer_id(&mut self, buffer: BufferId) -> PyResult<Bound<'py, PyAny>> {
-        let owner = self.request_key(buffer.owner)?;
-        self.types.buffer_id.bind(self.py).call1((
-            owner,
-            self.computation_id(buffer.producer_call_id)?,
-            buffer.output_index,
-            buffer.generation,
+        Bound::new(self.py, crate::ids::BufferId { inner: buffer }).map(Bound::into_any)
+    }
+
+    /// Borrow the native computation without reconstructing its Python fields.
+    fn call(&self, call: &Call) -> PyResult<Bound<'py, PyAny>> {
+        Bound::new(self.py, crate::calls::Call::from(call.clone())).map(Bound::into_any)
+    }
+
+    pub(crate) fn kind(&self, kind: CallKind) -> Bound<'py, PyAny> {
+        self.types.kind(self.py, kind)
+    }
+
+    pub(crate) fn coordinates(
+        &self,
+        value: &uniserve_worker_ipc::CallCoordinates,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.types.call_coordinates.bind(self.py).call1((
+            value.logical_position,
+            value.kv_visible_len,
+            value.kv_computed_len,
+            value.flow_step,
         ))
     }
 
-    /// Constructs a typed Python call from its computation fields.
-    ///
-    /// `Call` is constructed positionally: the argument tuple below follows
-    /// the field order of the `Call` dataclass in
-    /// `uniserve_worker.protocol.call`, and `Call` has no `__post_init__` to
-    /// reject a misordered argument. Reordering fields on either side requires
-    /// updating the other.
-    fn call(&mut self, call: &Call) -> PyResult<Bound<'py, PyAny>> {
-        let request_key = self.request_key(call.request_key)?;
-        let coordinates = self.types.call_coordinates.bind(self.py).call1((
-            call.coordinates.logical_position,
-            call.coordinates.kv_visible_len,
-            call.coordinates.kv_computed_len,
-            call.coordinates.flow_step,
-        ))?;
-        let bounds = self.types.bounds.bind(self.py).call1((
-            call.bounds.max_tokens,
-            call.bounds.max_kv_units,
-            call.bounds.max_latent_bytes,
-            call.bounds.max_completion_bytes,
-            call.bounds.max_transfer_bytes,
-        ))?;
-        let inputs = call
-            .inputs
-            .as_slice()
-            .iter()
-            .map(|product| self.tensor_ref(product))
-            .collect::<PyResult<Vec<_>>>()?;
-        let outputs = call
-            .outputs
-            .as_slice()
-            .iter()
-            .map(|product| self.tensor_ref(product))
-            .collect::<PyResult<Vec<_>>>()?;
-        let predicate = call
-            .predicate
+    pub(crate) fn bounds(
+        &self,
+        value: &uniserve_worker_ipc::Bounds,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.types.bounds.bind(self.py).call1((
+            value.max_tokens,
+            value.max_kv_units,
+            value.max_latent_bytes,
+            value.max_completion_bytes,
+            value.max_transfer_bytes,
+        ))
+    }
+
+    pub(crate) fn rng(&self, value: &uniserve_worker_ipc::Rng) -> PyResult<Bound<'py, PyAny>> {
+        let layout = match value.draw_layout {
+            DrawLayout::TargetSampling => 0,
+            DrawLayout::SpeculativeProposal => 1,
+            DrawLayout::FlowNoise => 2,
+        };
+        self.types.rng.bind(self.py).call1((
+            value.seed,
+            value.semantic_index_base,
+            self.types.draw_layouts[layout].bind(self.py),
+        ))
+    }
+
+    pub(crate) fn sampling_state(
+        &self,
+        value: &uniserve_worker_ipc::SamplingState,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = self.py;
+        let allowed = value
+            .allowed_token_ids
             .as_ref()
-            .as_ref()
-            .map(|predicate| self.tensor_ref(predicate))
-            .transpose()?;
-        let rng = call
-            .rng
-            .as_ref()
-            .map(|rng| {
-                // Indices follow the `draw_layouts` order in `RequestTypes::build`.
-                let layout = match rng.draw_layout {
-                    DrawLayout::TargetSampling => 0,
-                    DrawLayout::SpeculativeProposal => 1,
-                    DrawLayout::FlowNoise => 2,
-                };
-                self.types.rng.bind(self.py).call1((
-                    rng.seed,
-                    rng.semantic_index_base,
-                    self.types.draw_layouts[layout].bind(self.py).clone(),
-                ))
-            })
+            .map(|ids| PyTuple::new(py, ids))
             .transpose()?;
 
-        let py = self.py;
-        let sampling_state = call
-            .sampling_state
-            .as_ref()
-            .map(|state| {
-                let allowed = state
-                    .allowed_token_ids
-                    .as_ref()
-                    .map(|ids| pyo3::types::PyTuple::new(py, ids))
-                    .transpose()?;
-                self.types.sampling_state.bind(py).call1((
-                    allowed,
-                    pyo3::types::PyTuple::new(py, &state.suppressed_token_ids)?,
-                    pyo3::types::PyTuple::new(py, &state.finish_token_ids)?,
-                    pyo3::types::PyTuple::new(py, &state.transition_token_ids)?,
-                    state.force_finish,
-                ))
-            })
-            .transpose()?;
-        let readout = call
-            .readout
-            .as_ref()
-            .map(|readout| {
-                self.types.readout.bind(py).call1((
-                    pyo3::types::PyTuple::new(py, &readout.slot_tokens)?,
-                    pyo3::types::PyTuple::new(py, &readout.candidate_offsets)?,
-                    pyo3::types::PyTuple::new(py, &readout.candidate_ids)?,
-                ))
-            })
-            .transpose()?;
-        let vision_inputs = call
-            .vision_inputs
+        self.types.sampling_state.bind(py).call1((
+            allowed,
+            PyTuple::new(py, &value.suppressed_token_ids)?,
+            PyTuple::new(py, &value.finish_token_ids)?,
+            PyTuple::new(py, &value.transition_token_ids)?,
+            value.force_finish,
+        ))
+    }
+
+    pub(crate) fn readout(
+        &self,
+        value: &uniserve_worker_ipc::Readout,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.types.readout.bind(self.py).call1((
+            PyTuple::new(self.py, &value.slot_tokens)?,
+            PyTuple::new(self.py, &value.candidate_offsets)?,
+            PyTuple::new(self.py, &value.candidate_ids)?,
+        ))
+    }
+
+    pub(crate) fn canvas(
+        &self,
+        value: &uniserve_worker_ipc::CanvasStep,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.types
+            .canvas_step
+            .bind(self.py)
+            .call1((value.block, value.step))
+    }
+
+    pub(crate) fn vision_inputs(
+        &mut self,
+        values: &[uniserve_worker_ipc::VisionInput],
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let inputs = values
             .iter()
-            .map(|input| {
-                let feature = self.tensor_ref(&input.feature)?;
+            .map(|value| {
+                let feature = self.tensor_ref(&value.feature)?;
                 self.types
                     .vision_input
-                    .bind(py)
-                    .call1((input.offset, feature))
+                    .bind(self.py)
+                    .call1((value.offset, feature))
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let canvas = call
-            .canvas
-            .as_ref()
-            .map(|canvas| {
-                self.types
-                    .canvas_step
-                    .bind(py)
-                    .call1((canvas.block, canvas.step))
-            })
-            .transpose()?;
-        let arguments = pyo3::types::PyTuple::new(
-            py,
-            [
-                request_key.into_any(),
-                self.computation_id(call.call_id)?,
-                coordinates.into_any(),
-                self.types.kind(py, call.code),
-                bounds.into_any(),
-                call.component.clone().into_pyobject(py)?.into_any(),
-                pyo3::types::PyTuple::new(py, inputs)?.into_any(),
-                pyo3::types::PyTuple::new(py, outputs)?.into_any(),
-                call.token_input
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                call.token_output
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                pyo3::types::PyTuple::new(py, vision_inputs)?.into_any(),
-                call.latent_feature_input
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                call.encoder_output
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                call.latent_input
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                call.latent_output
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                call.image_input
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                call.image_output
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                call.completion_output
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                call.transition_output
-                    .as_ref()
-                    .map(|tensor| self.tensor_ref(tensor))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                predicate
-                    .map(Bound::into_any)
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                rng.map(Bound::into_any)
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                sampling_state
-                    .map(Bound::into_any)
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                pyo3::types::PyTuple::new(py, &call.input_token_ids)?.into_any(),
-                call.input_image.as_deref().into_pyobject(py)?.into_any(),
-                call.kv_input
-                    .map(|buffer| self.buffer_id(buffer))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                call.kv_output
-                    .map(|buffer| self.buffer_id(buffer))
-                    .transpose()?
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                pyo3::types::PyTuple::new(py, &call.consumer_slots)?.into_any(),
-                readout
-                    .map(Bound::into_any)
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                canvas
-                    .map(Bound::into_any)
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-            ],
-        )?;
-        self.types.call.bind(py).call1(arguments)
+
+        PyTuple::new(self.py, inputs)
+    }
+
+    pub(crate) fn tensor_refs<'a>(
+        &mut self,
+        values: impl Iterator<Item = &'a TensorRef>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let values = values
+            .map(|value| self.tensor_ref(value))
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(self.py, values)
     }
 
     /// Constructs a typed Python KV unit table.
@@ -744,10 +705,9 @@ impl<'py> RequestConversion<'py> {
 
 /// Constructs a fully typed Python batch from the validated wire record.
 ///
-/// One `RequestConversion` spans the whole batch, so identity leaves are
-/// shared between calls, commands, input products, and the per-batch
-/// parameter records. `kv_inputs` are the exception: `kv_transfer_to_py`
-/// builds their buffer ids through `buffer_id_to_py`.
+/// Calls retain their native descriptions. One `RequestConversion` shares
+/// immutable leaf values across the allocation and transfer views; each call
+/// creates its numerical views only when Python consumes them.
 pub(crate) fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>> {
     let mut native = RequestConversion::new(py)?;
 
@@ -1261,20 +1221,16 @@ pub(crate) fn transfer_locator_to_py<'py>(
     crate::worker::locator::Locator::wrap(py, locator.clone()).map(Bound::into_any)
 }
 
-/// Encodes the persistent buffer that identifies a KV export.
-///
-/// Uses a fresh `RequestConversion`, so the owner request key and producer
-/// call id are equal to, but not the same objects as, the batch's cached
-/// leaves for the same identities.
+/// Return the native buffer value used by a KV export.
 pub(crate) fn buffer_id_to_py<'py>(
     py: Python<'py>,
     buffer: &BufferId,
 ) -> PyResult<Bound<'py, PyAny>> {
-    RequestConversion::new(py)?.buffer_id(*buffer)
+    Bound::new(py, crate::ids::BufferId { inner: *buffer }).map(Bound::into_any)
 }
 
 pub(crate) fn request_key_to_py(py: Python<'_>, key: RequestKey) -> PyResult<Bound<'_, PyAny>> {
-    RequestConversion::new(py)?.request_key(key)
+    Bound::new(py, crate::ids::RequestKey { inner: key }).map(Bound::into_any)
 }
 
 /// Converts a product-family transfer handle into its typed Python record.
@@ -1721,14 +1677,12 @@ pub(crate) fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locat
 }
 
 /// Decodes the persistent buffer that identifies a KV export.
-fn buffer_id_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<BufferId> {
-    let py = value.py();
-    let dict = value.cast::<PyDict>().ok()?;
+pub(crate) fn buffer_id_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<BufferId> {
     Some(BufferId {
-        owner: request_key_from_py(&get(dict, intern!(py, "owner"))?)?,
-        producer_call_id: computation_id_from_py(&get(dict, intern!(py, "producer_call_id"))?)?,
-        output_index: u16_of(&get(dict, intern!(py, "output_index"))?)?,
-        generation: u32_of(&get(dict, intern!(py, "generation"))?)?,
+        owner: request_key_from_py(&value.get_item("owner").ok()?)?,
+        producer_call_id: computation_id_from_py(&value.get_item("producer_call_id").ok()?)?,
+        output_index: u16_of(&value.get_item("output_index").ok()?)?,
+        generation: u32_of(&value.get_item("generation").ok()?)?,
     })
 }
 
@@ -1794,23 +1748,23 @@ fn feature_kind_from_py(value: &Bound<'_, PyAny>) -> Option<FeatureKind> {
 }
 
 /// Decodes a call id from its `batch_id` and `request_index` fields.
-fn computation_id_from_py(value: &Bound<'_, PyAny>) -> Option<CallId> {
-    let py = value.py();
-    let dict = value.cast::<PyDict>().ok()?;
+pub(crate) fn computation_id_from_py(value: &Bound<'_, PyAny>) -> Option<CallId> {
+    if let Ok(value) = value.extract::<PyRef<'_, crate::ids::CallId>>() {
+        return Some(value.inner);
+    }
+
     Some(CallId::new(
-        u64_of(&get(dict, intern!(py, "batch_id"))?)?,
-        u32_of(&get(dict, intern!(py, "request_index"))?)?,
+        u64_of(&value.get_item("batch_id").ok()?)?,
+        u32_of(&value.get_item("request_index").ok()?)?,
     ))
 }
 
 /// Decodes a request identity from its Python mapping.
-fn request_key_from_py(value: &Bound<'_, PyAny>) -> Option<RequestKey> {
-    let py = value.py();
-    let dict = value.cast::<PyDict>().ok()?;
+pub(crate) fn request_key_from_py(value: &Bound<'_, PyAny>) -> Option<RequestKey> {
     Some(RequestKey {
-        engine_id: u64_of(&get(dict, intern!(py, "engine_id"))?)?,
-        request_id: uniserve_core::RequestId(u64_of(&get(dict, intern!(py, "request_id"))?)?),
-        request_epoch: u64_of(&get(dict, intern!(py, "request_epoch"))?)?,
+        engine_id: u64_of(&value.get_item("engine_id").ok()?)?,
+        request_id: uniserve_core::RequestId(u64_of(&value.get_item("request_id").ok()?)?),
+        request_epoch: u64_of(&value.get_item("request_epoch").ok()?)?,
     })
 }
 
@@ -1849,7 +1803,7 @@ fn i64_of(value: &Bound<'_, PyAny>) -> Option<i64> {
 }
 
 /// Extracts a `u64` while rejecting Python booleans as integers.
-fn u64_of(value: &Bound<'_, PyAny>) -> Option<u64> {
+pub(crate) fn u64_of(value: &Bound<'_, PyAny>) -> Option<u64> {
     if value.cast::<PyBool>().is_ok() {
         return None;
     }

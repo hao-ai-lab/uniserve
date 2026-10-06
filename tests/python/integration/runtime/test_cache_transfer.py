@@ -166,7 +166,9 @@ def test_shutdown_retires_running_and_queued_import_destinations() -> None:
         for slot in range(1, 6):
             export = KvTransfer(
                 groups=(KvGroupTransfer(0, 256, (field, field)),),
-                source=replace(_buffer(slot), owner=RequestKey(1, slot, 1)),
+                source=BufferId(
+                    RequestKey(1, slot, 1), CallId(slot, 0), 0, slot
+                ),
                 destination="consumer",
                 base=None,
                 base_extent=0,
@@ -339,9 +341,15 @@ def test_kv_exports_isolate_request_epochs() -> None:
     tables.install(((1, 0, 0, (1,), 4),))
     exports = pool
     first = _buffer(1)
-    second = replace(
-        first,
-        owner=replace(first.owner, request_epoch=first.owner.request_epoch + 1),
+    second = BufferId(
+        RequestKey(
+            first.owner.engine_id,
+            first.owner.request_id,
+            first.owner.request_epoch + 1,
+        ),
+        first.producer_call_id,
+        first.output_index,
+        first.generation,
     )
     try:
         for source in (first, second):
@@ -363,7 +371,12 @@ def test_kv_exports_isolate_request_epochs() -> None:
                 initialized_units=(),
                 transports={},
             )
-            installed = replace(source, producer_call_id=CallId(3, 0))
+            installed = BufferId(
+                source.owner,
+                CallId(3, 0),
+                source.output_index,
+                source.generation,
+            )
             result = exports.install(
                 installed_buffer=installed,
                 write=write,

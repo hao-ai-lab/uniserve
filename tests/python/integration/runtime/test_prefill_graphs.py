@@ -26,6 +26,7 @@ import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
+from tests.python.fixtures.model_runner import forward_batch
 from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.math import ceil_div
@@ -192,7 +193,8 @@ def _call(runner, manager, rows):
         )
         for index, row in enumerate(rows)
     )
-    return runner.run_forward_group(
+    return forward_batch(
+        runner,
         rows,
         calls=calls,
         cache=manager,

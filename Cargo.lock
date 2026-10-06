@@ -9558,6 +9558,7 @@ dependencies = [
  "pyo3",
  "pythonize",
  "serde",
+ "serde_json",
  "uniserve-core",
  "uniserve-worker",
  "uniserve-worker-ipc",

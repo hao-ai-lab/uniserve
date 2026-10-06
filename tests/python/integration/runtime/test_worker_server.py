@@ -217,14 +217,13 @@ def test_execution_failure_reports_the_call_kind_as_its_route(caplog) -> None:
     admissions = (ar_params(93, block_ids=(0,)), ar_params(94, block_ids=(1,)))
     # A text extension without input tokens is refused while the batch runs.
     calls = tuple(
-        replace(
-            token_call(
-                admission.request_key,
-                call_id=CallId(index + 1, 0),
-                predecessor=root_parent(admission),
-                mode=ForwardMode.PREFILL,
-                tokens=(3, 4),
-            ),
+        token_call(
+            admission.request_key,
+            call_id=CallId(index + 1, 0),
+            predecessor=root_parent(admission),
+            mode=ForwardMode.PREFILL,
+            tokens=(3, 4),
+        ).replace(
             input_token_ids=(),
         )
         for index, admission in enumerate(admissions)

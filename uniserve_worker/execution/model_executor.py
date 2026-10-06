@@ -72,7 +72,7 @@ from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import canonical_device, process_device_bytes
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout
-from uniserve_worker._uniserve_ipc import TextShapes
+from uniserve_worker._uniserve_ipc import ModelRunners, TextShapes
 from uniserve_worker.bootstrap.components import (
     VIDEO_CODEC_COMPONENT,
     bind_components,
@@ -145,7 +145,6 @@ from uniserve_worker.model_executor.text_runner import TextRunner
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.call import (
     Call,
-    CallKind,
     ForwardMode,
     MediaCall,
 )
@@ -289,7 +288,7 @@ class ModelExecutor:
         )
 
         self.entries: dict[tuple[str, str, str | None, int], ModelRunner] = {}
-        self._forward_calls: dict[tuple[str, CallKind], ModelRunner] = {}
+        self.batch_runners: ModelRunners[ModelRunner] = ModelRunners()
         self._module_calls = {}
         self._call_kinds = {}
         self._runner_types = {}
@@ -608,7 +607,7 @@ class ModelExecutor:
         in its component's batched entry; that runner also integrates the
         call's guided predictions.
         """
-        entry = self._forward_calls.get((call.component, MediaCall.DENOISING))
+        entry = self.batch_runners.get(call.component, MediaCall.DENOISING)
         if not isinstance(entry, DiffusionRunner):
             raise invalid_descriptor(
                 "denoising call has no batched diffusion runner"
@@ -625,11 +624,12 @@ class ModelExecutor:
         component's capabilities for the call do not narrow to exactly one,
         and propagates the errors of ``module_stream``.
         """
-        if (call.component, call.kind) in self._forward_calls:
+        if self.batch_runners.get(call.component, call.kind) is not None:
             return None
         if (
             call.kind is MediaCall.LATENT_PREPARATION
-            and (call.component, MediaCall.DENOISING) in self._forward_calls
+            and self.batch_runners.get(call.component, MediaCall.DENOISING)
+            is not None
         ):
             return None
         calls = self._calls_by_kind.get((call.component, call.kind), ())
@@ -1003,10 +1003,10 @@ class ModelExecutor:
     @property
     def canvas_runner(self) -> CanvasRunner | None:
         """The runner of this rank's token denoising, if it has one."""
-        for (_name, kind), entry in self._forward_calls.items():
-            if kind is ForwardMode.TOKEN_DENOISING:
-                return cast("CanvasRunner", entry)
-        return None
+        return cast(
+            "CanvasRunner | None",
+            self.batch_runners.first(ForwardMode.TOKEN_DENOISING),
+        )
 
     def bind_canvas_slots(self, slots: CanvasSlots) -> None:
         """Lend the resident sampler state to the token-denoising runner.
@@ -1575,15 +1575,8 @@ class ModelExecutor:
                 if isinstance(entry, CanvasRunner):
                     entry.pool_rows = pool_rows
 
-                for kind in kinds:
-                    key = (name, kind)
-                    if microbatch:
-                        continue
-                    if key in self._forward_calls:
-                        raise ValueError(
-                            f"computation {key} has multiple lane bindings"
-                        )
-                    self._forward_calls[key] = entry
+                if not microbatch:
+                    self.batch_runners.bind(name, kinds, entry)
             if token_runner and self.worker_config.expert_microbatches > 1:
                 peers[0].bind_microbatches(peers)
 
@@ -1840,7 +1833,7 @@ class ModelExecutor:
                 or self.worker_config.device
             )
 
-        entry = self._forward_calls.get((call.component, call.kind))
+        entry = self.batch_runners.get(call.component, call.kind)
         return source, source if entry is None else entry.device, source
 
     def warmup(self, storage):
@@ -2200,6 +2193,7 @@ class ModelExecutor:
         try:
             close_resources(*actions)
         finally:
+            self.batch_runners.clear()
             self.entries.clear()
             self._module_entries.clear()
             self._module_scratch.clear()
@@ -2306,55 +2300,39 @@ class ModelExecutor:
         Fatal failures propagate immediately because later device work is
         unsafe.
         """
-        # Rows sharing an entry, forward mode, device, row type, media shape
-        # and attention causality form one homogeneous numerical call: a
-        # canvas readout and a canvas step of one pass are separate calls.
-        # A context call's interdependent text and vision segments stay in
-        # one prefill: attention writes all their K/V before reading it.
-        # Independent uniform calls retain their causal/non-causal graphs.
-        grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
-        bindings: dict[int, ModelRunner] = {}
-        for index, (task, call) in enumerate(tasks):
-            entry = self._forward_calls.get((call.component, task.forward_mode))
-            if entry is None:
-                yield (
-                    (index,),
-                    invalid_descriptor(
-                        f"execution has no {call.kind.value!r} binding "
-                        f"for {call.component!r}"
-                    ),
-                )
-                continue
-
-            target = entry.device
-            bindings[index] = entry
-            shape: tuple[int, ...] = ()
-            if isinstance(task, VisionRow):
-                shape = tuple(int(value) for value in task.encode_pixels.shape)
-            elif isinstance(task, (DiffusionRow, DecodeRow)):
-                shape = (task.image_height, task.image_width)
-            causal = (
-                None
-                if call.vision_inputs and call.completion_output is None
-                else isinstance(task, TokenRow) and task.causal
+        # Numerical input types and shapes remain with their Python backend.
+        # Native routing combines compatible rows and marks outputs that must
+        # survive a later invocation of the same runner.
+        missing, groups = self.batch_runners.group(
+            (
+                call,
+                row.forward_mode,
+                type(row),
+                tuple(row.encode_pixels.shape)
+                if isinstance(row, VisionRow)
+                else (row.image_height, row.image_width)
+                if isinstance(row, (DiffusionRow, DecodeRow))
+                else (),
+                isinstance(row, TokenRow) and row.causal,
             )
-            grouped[
-                (
-                    entry,
-                    task.forward_mode,
-                    str(target),
-                    type(task),
-                    shape,
-                    causal,
-                )
-            ].append(index)
+            for row, call in tasks
+        )
+        for index in missing:
+            call = tasks[index][1]
+            yield (
+                (index,),
+                invalid_descriptor(
+                    f"execution has no {call.kind.value!r} binding "
+                    f"for {call.component!r}"
+                ),
+            )
 
-        groups = list(grouped.values())
-        for group_index, indexes in enumerate(groups):
+        for runner, indexes, preserve_output in groups:
             rows = tuple(tasks[index][0] for index in indexes)
             try:
                 forward_started = time.perf_counter_ns()
-                result = self.run_forward_group(
+                result = self.run_batch(
+                    runner,
                     rows,
                     calls=tuple(tasks[index][1] for index in indexes),
                     cache=cache,
@@ -2370,10 +2348,10 @@ class ModelExecutor:
                 # work observes this group's writes in order.
                 if result.output_event is not None:
                     result.output_event.wait(
-                        torch.cuda.current_stream(bindings[indexes[0]].device)
+                        torch.cuda.current_stream(runner.device)
                     )
 
-                if all(row.forward_mode is ForwardMode.DECODE for row in rows):
+                if rows[0].forward_mode is ForwardMode.DECODE:
                     if result.stats is None:
                         raise RuntimeError("text forward lost its statistics")
                     components = dict(result.stats.component_us)
@@ -2387,20 +2365,18 @@ class ModelExecutor:
 
                 # A later call may replay the same graph or reuse its buffer.
                 # Preserve these numerical values until their consumer runs.
-                if any(
-                    bindings[later[0]] is bindings[indexes[0]]
-                    for later in groups[group_index + 1 :]
-                ):
+                if preserve_output:
                     result = result.clone()
             except BaseException as error:
                 if classify(error).fatal:
                     raise
-                yield tuple(indexes), error
+                yield indexes, error
             else:
-                yield tuple(indexes), result
+                yield indexes, result
 
-    def run_forward_group(
+    def run_batch(
         self,
+        entry: ModelRunner,
         rows: tuple[InputRow, ...],
         *,
         calls: tuple[Call, ...],
@@ -2408,36 +2384,22 @@ class ModelExecutor:
         tables: BlockTables | None,
         states: DecodeState | None,
     ) -> ExecutionOutput:
-        """Prepare one homogeneous group of rows, run it, and validate outputs.
+        """Prepare and execute rows on an explicitly bound numerical runner.
 
-        The batch runner chooses eager or CUDA graph execution. Returns the
-        output with its request slot indices, its lane output fence, and
-        statistics for this one call. Raises ``RuntimeError`` once closed,
-        ``ValueError`` for an empty or mixed-kind group, ``InputError`` when
-        the group has no prepared entry or input preparation fails, and the
-        error ``_execution_failure`` classifies for execution or validation.
+        Rows must be nonempty, use one forward mode, and fit this runner's
+        buffers. They may carry per-row attention causality. The caller owns
+        request selection; this method owns input copies, stream ordering,
+        graph execution, and output validation for the numerical invocation.
         """
         if self._closed:
             raise RuntimeError("model runner is closed")
         tasks = rows
-        if not tasks:
-            raise ValueError("model runner received an empty call")
-
-        # Only token forward modes and denoising are eligible for CUDA graphs;
-        # other buffered kinds run eagerly.
         started = time.perf_counter_ns()
-        graph_eligible = all(
-            isinstance(task.forward_mode, ForwardMode)
-            or task.forward_mode is MediaCall.DENOISING
-            for task in tasks
+        forward_mode = tasks[0].forward_mode
+        graph_eligible = (
+            isinstance(forward_mode, ForwardMode)
+            or forward_mode is MediaCall.DENOISING
         )
-        modes = frozenset(task.forward_mode for task in tasks)
-        if len(modes) != 1:
-            raise ValueError(
-                "one numerical call requires homogeneous call kinds"
-            )
-        forward_mode = next(iter(modes))
-
         call_keys = tuple(
             (
                 call.request_key.engine_id,
@@ -2447,15 +2409,6 @@ class ModelExecutor:
             )
             for call in calls
         )
-        entry = self._forward_calls.get((calls[0].component, forward_mode))
-        if entry is None:
-            raise InputError(
-                f"model runner has no {calls[0].kind.value!r} binding "
-                f"for {calls[0].component!r}",
-                phase="input_preparation",
-                route=forward_mode.value,
-                calls=call_keys,
-            )
 
         target = entry.device
         lane_runtime = entry.cuda_stream

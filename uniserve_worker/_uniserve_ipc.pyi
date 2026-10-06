@@ -34,16 +34,17 @@ from uniserve_worker.protocol.batch import (
     NewRequest,
 )
 from uniserve_worker.protocol.call import (
-    Call,
+    Bounds,
+    CallCoordinates,
     CallKind,
     CallStatus,
+    CanvasStep,
     ErrorCode,
     ImageParams,
-)
-from uniserve_worker.protocol.identity import (
-    BufferId,
-    CallId,
-    RequestKey,
+    Readout,
+    Rng,
+    SamplingState,
+    VisionInput,
 )
 from uniserve_worker.protocol.output import (
     BatchOutput,
@@ -61,6 +62,132 @@ from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
 from uniserve_worker.worker import Worker
+
+@final
+class Call:
+    """An immutable scheduler computation shared with native execution."""
+
+    def __init__(
+        self,
+        request_key: RequestKey,
+        call_id: CallId,
+        coordinates: CallCoordinates,
+        kind: CallKind,
+        bounds: Bounds,
+        component: str = ...,
+        *,
+        inputs: tuple[TensorRef, ...] = ...,
+        outputs: tuple[TensorRef, ...] = ...,
+        token_input: TensorRef | None = ...,
+        token_output: TensorRef | None = ...,
+        vision_inputs: tuple[VisionInput, ...] = ...,
+        latent_feature_input: TensorRef | None = ...,
+        encoder_output: TensorRef | None = ...,
+        latent_input: TensorRef | None = ...,
+        latent_output: TensorRef | None = ...,
+        image_input: TensorRef | None = ...,
+        image_output: TensorRef | None = ...,
+        completion_output: TensorRef | None = ...,
+        transition_output: TensorRef | None = ...,
+        predicate: TensorRef | None = ...,
+        rng: Rng | None = ...,
+        sampling_state: SamplingState | None = ...,
+        input_token_ids: tuple[int, ...] = ...,
+        input_image: str | None = ...,
+        kv_input: BufferId | None = ...,
+        kv_output: BufferId | None = ...,
+        consumer_slots: tuple[int, ...] = ...,
+        readout: Readout | None = ...,
+        canvas: CanvasStep | None = ...,
+    ) -> None: ...
+    def replace(self, **fields: Any) -> Call: ...
+    @staticmethod
+    def from_mapping(value: object, where_: str = "call") -> Call: ...
+    def to_mapping(self) -> dict[str, Any]: ...
+    def validate(self) -> None: ...
+    @property
+    def request_key(self) -> RequestKey: ...
+    @property
+    def call_id(self) -> CallId: ...
+    @property
+    def coordinates(self) -> CallCoordinates: ...
+    @property
+    def kind(self) -> CallKind: ...
+    @property
+    def bounds(self) -> Bounds: ...
+    @property
+    def component(self) -> str: ...
+    @property
+    def inputs(self) -> tuple[TensorRef, ...]: ...
+    @property
+    def outputs(self) -> tuple[TensorRef, ...]: ...
+    @property
+    def token_input(self) -> TensorRef | None: ...
+    @property
+    def token_output(self) -> TensorRef | None: ...
+    @property
+    def vision_inputs(self) -> tuple[VisionInput, ...]: ...
+    @property
+    def latent_feature_input(self) -> TensorRef | None: ...
+    @property
+    def encoder_output(self) -> TensorRef | None: ...
+    @property
+    def latent_input(self) -> TensorRef | None: ...
+    @property
+    def latent_output(self) -> TensorRef | None: ...
+    @property
+    def image_input(self) -> TensorRef | None: ...
+    @property
+    def image_output(self) -> TensorRef | None: ...
+    @property
+    def completion_output(self) -> TensorRef | None: ...
+    @property
+    def transition_output(self) -> TensorRef | None: ...
+    @property
+    def predicate(self) -> TensorRef | None: ...
+    @property
+    def rng(self) -> Rng | None: ...
+    @property
+    def sampling_state(self) -> SamplingState | None: ...
+    @property
+    def input_token_ids(self) -> tuple[int, ...]: ...
+    @property
+    def input_image(self) -> str | None: ...
+    @property
+    def kv_input(self) -> BufferId | None: ...
+    @property
+    def kv_output(self) -> BufferId | None: ...
+    @property
+    def consumer_slots(self) -> tuple[int, ...]: ...
+    @property
+    def readout(self) -> Readout | None: ...
+    @property
+    def canvas(self) -> CanvasStep | None: ...
+    @property
+    def advances_state(self) -> bool: ...
+    def tensor_inputs(self) -> tuple[TensorRef, ...]: ...
+    def tensor_outputs(self) -> tuple[TensorRef, ...]: ...
+    def buffer_inputs(self) -> tuple[TensorRef, ...]: ...
+    def buffer_outputs(self) -> tuple[TensorRef, ...]: ...
+
+RunnerT = TypeVar("RunnerT")
+
+class ModelRunners(Generic[RunnerT]):
+    """Route component operations and assemble homogeneous numerical batches."""
+
+    def __init__(self) -> None: ...
+    def bind(
+        self, component: str, kinds: Iterable[CallKind], runner: RunnerT
+    ) -> None: ...
+    def get(self, component: str, kind: CallKind) -> RunnerT | None: ...
+    def first(self, kind: CallKind) -> RunnerT | None: ...
+    def clear(self) -> None: ...
+    def group(
+        self,
+        rows: Iterable[
+            tuple[Call, CallKind, type, tuple[int, ...], bool | None]
+        ],
+    ) -> tuple[list[int], list[tuple[RunnerT, tuple[int, ...], bool]]]: ...
 
 class DescriptorGrants:
     """Own local allocation grants and their native socket service."""
@@ -83,6 +210,10 @@ def open_shared_memory(name: str) -> int:
     ...
 
 __all__ = [
+    "RequestKey",
+    "CallId",
+    "Call",
+    "BufferId",
     "BatchInputs",
     "BatchState",
     "BlockTables",
@@ -113,6 +244,7 @@ __all__ = [
     "LatentPool",
     "LatentUpdate",
     "Microbatches",
+    "ModelRunners",
     "OutputBuffer",
     "OutputPool",
     "PendingOutput",
@@ -150,6 +282,67 @@ __all__ = [
     "select_prefill_captures",
     "yield_microbatch",
 ]
+
+@final
+class RequestKey:
+    """One request admission epoch, shared with native execution and storage."""
+
+    def __new__(
+        cls, engine_id: int, request_id: int, request_epoch: int
+    ) -> Self: ...
+    @property
+    def engine_id(self) -> int: ...
+    @property
+    def request_id(self) -> int: ...
+    @property
+    def request_epoch(self) -> int: ...
+    @staticmethod
+    def from_mapping(
+        value: object, where_: str = "request_key"
+    ) -> RequestKey: ...
+    def to_mapping(self) -> dict[str, object]: ...
+
+@final
+class CallId:
+    """Scheduler batch and selection ordinal, ordered lexicographically."""
+
+    def __new__(cls, batch_id: int, request_index: int) -> Self: ...
+    @property
+    def batch_id(self) -> int: ...
+    @property
+    def request_index(self) -> int: ...
+    def __lt__(self, other: CallId) -> bool: ...
+    def __le__(self, other: CallId) -> bool: ...
+    def __gt__(self, other: CallId) -> bool: ...
+    def __ge__(self, other: CallId) -> bool: ...
+    @staticmethod
+    def from_mapping(
+        value: object, where_: str = "computation_id"
+    ) -> CallId: ...
+    def to_mapping(self) -> dict[str, object]: ...
+
+@final
+class BufferId:
+    """A call output's allocation generation, independent of its location."""
+
+    def __new__(
+        cls,
+        owner: RequestKey,
+        producer_call_id: CallId,
+        output_index: int,
+        generation: int,
+    ) -> Self: ...
+    @property
+    def owner(self) -> RequestKey: ...
+    @property
+    def producer_call_id(self) -> CallId: ...
+    @property
+    def output_index(self) -> int: ...
+    @property
+    def generation(self) -> int: ...
+    @staticmethod
+    def from_mapping(value: object, where_: str = "buffer_id") -> BufferId: ...
+    def to_mapping(self) -> dict[str, object]: ...
 
 Source = TypeVar("Source")
 Args = ParamSpec("Args")

@@ -555,7 +555,7 @@ impl Executor {
         propagate_errors: bool,
     ) -> PyResult<Submission> {
         let executor = self.executor_mut()?;
-        let plan = convert::batch_from_py(&batch.call_method0("to_mapping")?)?;
+        let plan = convert::batch_from_object(batch)?;
         let state = executor
             .backend()
             .batch_state(py, batch, &plan, propagate_errors)?;
