@@ -8,6 +8,10 @@ use uniserve_worker_ipc::{BlockTable, KvTransfer, RequestKey};
 
 use crate::{Error, Result};
 
+mod attention;
+
+pub use attention::{AttentionRow, TablePages, table_pages};
+
 /// Page dimensions needed to address one KV cache group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GroupShape {

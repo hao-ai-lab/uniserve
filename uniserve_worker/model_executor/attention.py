@@ -9,25 +9,20 @@ shares the call's query and prefix lengths; entries differ in their pages,
 page size, write addresses and, for a history-windowed group, the first page
 each row selects.
 
-This module validates one homogeneous group of ``AttentionRow`` values
-against the installed tables (``row_tables``) and selects the pages each
-numerical table selects (``table_pages``); ``input_buffers.AttentionBuffers.
-gather_rows`` gathers those pages from the resident tables on the device. For
-callers that pass a prepared batch it also builds the host-side attention
-batch (``from_tables``: ``PagedInput`` entries for rows that append to the
-cache, ``SegmentedInput`` entries for read-only prefix/current calls).
+Rust selects visible pages and checks cache writes for one homogeneous batch.
+``AttentionBuffers.gather_rows`` gathers units and addresses from resident
+GPU tables. ``from_tables`` constructs host tensors for warmup and direct
+numerical callers using the same native page selection.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from uniserve.math import ceil_div
 from uniserve.nn.attention import (
     AttentionBatch,
     BlockTable,
@@ -36,170 +31,35 @@ from uniserve.nn.attention import (
     SequenceLengths,
     paged_append,
 )
+from uniserve_worker._uniserve_ipc import TablePages as TablePages
+from uniserve_worker._uniserve_ipc import table_pages as table_pages
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.model_executor.input_batch import AttentionRow
-from uniserve_worker.storage.block_tables import GroupTable
 
 if TYPE_CHECKING:
-    from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.kv_cache import KVCacheManager
 
 
-@dataclass(frozen=True, slots=True)
-class TablePages:
-    """The pages one numerical block table selects for every row of a call.
-
-    Attributes:
-        block_size: Tokens per page of the table's cache group.
-        windowed: Whether the group keeps a history window, so rows carry
-            their first selected page; a full-history table starts every row
-            at page zero.
-        start_pages: Each row's first selected logical page.
-        rows: Each row's units of pages ``start_pages[row]..``.
-    """
-
-    block_size: int
-    windowed: bool
-    start_pages: tuple[int, ...]
-    rows: tuple[tuple[int, ...], ...]
-
-    @property
-    def width(self) -> int:
-        """Return the most pages any row selects, at least one."""
-        return max(1, *map(len, self.rows))
-
-
-def row_tables(
+def prepare_attention(
     tasks: tuple[AttentionRow, ...],
     *,
-    tables: BlockTables | None,
     cache: KVCacheManager | None,
-) -> tuple[tuple[GroupTable, ...], ...]:
-    """Validate scheduler cache extents and resolve each row's group tables.
-
-    Args:
-        tasks: Rows of one attention call.
-        tables: Installed request block tables.
-        cache: Resident KV storage, which authorizes each row's write interval.
-
-    Returns:
-        Each row's installed table of every cache group, in group order.
-
-    Raises:
-        WorkerError: An ``invalid_descriptor`` error when ``tasks`` is empty,
-            storage or tables are absent, a length is out of range, a request
-            slot lacks an installed group table, a row's resulting length
-            exceeds its allocated capacity, or a windowed row would read a
-            retired page. Errors from ``cache.require_writable`` for a
-            writing row propagate: a resource error when the interval
-            overlaps an export or an import destination, or
-            ``invalid_descriptor`` for an interval outside its table.
-    """
-    if not tasks:
-        raise invalid_descriptor("attention metadata requires forward rows")
-    if tables is None or cache is None:
-        raise invalid_descriptor(
-            "paged attention requires resident KV storage and request tables"
-        )
-
-    result = []
-    for task in tasks:
-        query, prefix = int(task.query_tokens), int(task.seq_len)
-        if query < 1 or prefix < 0:
-            raise invalid_descriptor("forward attention lengths are invalid")
-
-        # Only rows that write KV extend the cached sequence; read-only rows
-        # need capacity for their prefix alone.
-        resulting = prefix + (query if task.write_kv else 0)
-        if resulting > tables.allocated_length(task.request_pool_idx):
-            raise invalid_descriptor(
-                "forward row exceeds its scheduler block table"
-            )
-
-        groups = tuple(
-            tables.table(task.request_pool_idx, group)
-            for group in range(len(tables.groups))
-        )
-        for table in groups:
-            window = table.shape.window
-            if (
-                window is not None
-                and first_page(table, prefix) < table.start_page
-            ):
-                raise invalid_descriptor(
-                    "attention row reads retired window pages"
-                )
-            if task.write_kv:
-                cache.require_writable(table, start=prefix, length=query)
-        result.append(groups)
-    return tuple(result)
-
-
-def first_page(table: GroupTable, prefix: int) -> int:
-    """Return the first page a row's queries after ``prefix`` read.
-
-    A query at position ``p`` reads keys at positions ``p - window`` through
-    ``p``, so the first query of the row, at ``prefix``, reaches back
-    farthest. A full-history table reads from page zero.
-    """
-    window = table.shape.window
-    if window is None:
-        return 0
-    return max(0, prefix - window) // table.shape.page_tokens
-
-
-def table_pages(
-    tables: Sequence[Sequence[GroupTable]],
-    *,
-    prefix_lengths: Sequence[int],
-    query_lengths: Sequence[int],
 ) -> tuple[TablePages, ...]:
-    """Select each row's visible pages for every numerical block table.
+    """Borrow selected KV pages after native capacity and write checks.
 
-    ``tables`` holds each row's table of every group, in group order. A
-    full-history table selects every installed page of the row. A windowed
-    table selects the pages from the first one the row's window reaches
-    through the page holding its last query token, or through its last
-    installed page when that comes first; at most ``ceil((window + query) /
-    page_tokens) + 1`` pages.
-
-    Returns:
-        One ``TablePages`` per numerical table in table order: every group's
-        unit positions, group-major.
+    A writing row extends its prefix by the query length. A read-only row
+    consumes only its existing prefix. Windowed reads must remain within
+    installed pages; writes must not overlap a transfer's retained range.
     """
-    if not tables:
-        raise ValueError("attention tables require at least one row")
-    result = []
-    for group, first in enumerate(tables[0]):
-        shape = first.shape
-        for position in range(shape.units_per_page):
-            starts, rows = [], []
-            for row, prefix, query in zip(
-                tables, prefix_lengths, query_lengths, strict=True
-            ):
-                table = row[group]
-                units = table.row(position)
-                start = first_page(table, int(prefix))
-                if shape.window is not None:
-                    end = min(
-                        table.end_page,
-                        ceil_div(int(prefix) + int(query), shape.page_tokens),
-                    )
-                    first_column = start - table.start_page
-                    units = units[
-                        first_column : max(first_column, end - table.start_page)
-                    ]
-                starts.append(start)
-                rows.append(units)
-            result.append(
-                TablePages(
-                    shape.page_tokens,
-                    shape.window is not None,
-                    tuple(starts),
-                    tuple(rows),
-                )
-            )
-    return tuple(result)
+    if cache is None:
+        raise invalid_descriptor("paged attention requires resident KV storage")
+
+    return cache.prepare_attention(
+        tuple(
+            (row.request_pool_idx, row.seq_len, row.query_tokens, row.write_kv)
+            for row in tasks
+        )
+    )
 
 
 def from_tables(
@@ -301,8 +161,9 @@ def _host_table(pages: TablePages) -> BlockTable:
     """
     # Rows fill a NumPy array, one slice assignment per row, rather than one
     # tensor construction per row.
-    host = np.zeros((len(pages.rows), pages.width), dtype=np.int32)
-    for index, row in enumerate(pages.rows):
+    rows = pages.rows
+    host = np.zeros((len(rows), pages.width), dtype=np.int32)
+    for index, row in enumerate(rows):
         host[index, : len(row)] = row
     table = torch.from_numpy(host)
     if not pages.windowed:

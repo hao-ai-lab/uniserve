@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from uniserve.diffusion.canvas import CanvasState
-from uniserve.math import bucketed_length, ceil_div
+from uniserve.math import bucketed_length
 from uniserve.media import image
 from uniserve.model import (
     CanvasInput,
@@ -46,6 +46,7 @@ from uniserve.nn.attention import (
 from uniserve.runtime.device import fill_cpu_bools, fill_cpu_ints
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig, adjacent_view
+from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.model_executor._decode_inputs import (
     gather_request_decode_inputs,
 )
@@ -56,9 +57,7 @@ from uniserve_worker.model_executor._row_inputs import (
     row_columns_stride,
 )
 from uniserve_worker.model_executor.attention import (
-    first_page,
-    row_tables,
-    table_pages,
+    prepare_attention,
 )
 from uniserve_worker.model_executor.diffusion_inputs import (
     DecodeInput,
@@ -301,7 +300,7 @@ class InputBuffers:
                 mix computations, or the input buffer subclass rejects the rows.
             TypeError: A row is not the declared ``row_type``, or token or
                 diffusion input buffers receive unsupported attention.
-            WorkerError: ``row_tables`` rejects the rows while attention
+            WorkerError: ``prepare_attention`` rejects the rows while attention
                 is built from ``cache`` and ``tables``.
         """
         self.validate_rows(rows)
@@ -385,7 +384,7 @@ class AttentionBuffers(InputBuffers):
         """Gather the attention columns of token rows from their slots' tables.
 
         ``rows`` are one call's ``AttentionRow`` values, validated against
-        the installed tables (``attention.row_tables``). Every numerical
+        the installed tables (``attention.prepare_attention``). Every numerical
         table selects the pages ``attention.table_pages`` selects: all of a
         full table's installed pages, and a windowed table's pages from the
         first one the row's first query reaches back to, through the row's
@@ -402,11 +401,14 @@ class AttentionBuffers(InputBuffers):
         exact host mirrors.
 
         Raises:
-            WorkerError: From ``attention.row_tables``.
+            WorkerError: From ``attention.prepare_attention``.
             ValueError: A read-only call has a causal row, or a table or the
                 call exceeds this owner's capacity.
         """
-        groups = row_tables(rows, tables=tables, cache=cache)
+        if tables is None:
+            raise invalid_descriptor("paged attention requires request tables")
+
+        pages = prepare_attention(rows, cache=cache)
         count = len(rows)
         queries = tuple(int(row.query_tokens) for row in rows)
         prefixes = tuple(int(row.seq_len) for row in rows)
@@ -444,34 +446,13 @@ class AttentionBuffers(InputBuffers):
         )
         host[section : section + total] = np.repeat(np.arange(count), queries)
 
-        # Each table's selected pages per row and, for a windowed table, its
-        # first selected page; a group's tables select the same pages.
         widths, firsts, block_sizes = [], [], []
-        for group, shape in enumerate(tables.groups):
-            pages, first_pages = [], []
-            for row_groups, prefix, query in zip(
-                groups, prefixes, queries, strict=True
-            ):
-                table = row_groups[group]
-                if shape.window is None:
-                    first, end = 0, table.end_page
-                else:
-                    first = first_page(table, prefix)
-                    end = min(
-                        table.end_page,
-                        ceil_div(prefix + query, shape.page_tokens),
-                    )
-                pages.append(max(0, end - first))
-                first_pages.append(first)
-            for position in range(shape.units_per_page):
-                table_number = tables.first_table[group] + position
-                start = (ROW_SECTIONS + table_number) * stride
-                host[start : start + count] = pages
-                widths.append(max(1, *pages))
-                block_sizes.append(shape.page_tokens)
-                firsts.append(
-                    None if shape.window is None else tuple(first_pages)
-                )
+        for table_number, table in enumerate(pages):
+            start = (ROW_SECTIONS + table_number) * stride
+            host[start : start + count] = table.lengths
+            widths.append(table.width)
+            block_sizes.append(table.block_size)
+            firsts.append(table.start_pages if table.windowed else None)
         if any(
             width > capacity
             for width, capacity in zip(widths, self.table_widths, strict=True)
@@ -801,9 +782,8 @@ class TokenBuffers(AttentionBuffers):
                 )
 
             # A fully indexed call on one CUDA device with its resident unit
-            # tables gathers every input on device. ``row_tables`` validates
-            # the rows' cache extents; the host selects each table's selected
-            # pages only to bound its width and mirror its start pages.
+            # tables gathers every input on device. Native preparation checks
+            # cache extents and returns page widths and first-page mirrors.
             if (
                 attention is None
                 and cache is not None
@@ -812,11 +792,7 @@ class TokenBuffers(AttentionBuffers):
                 and self.device.type == "cuda"
                 and all(row.request_indexed_decode for row in rows)
             ):
-                pages = table_pages(
-                    row_tables(rows, cache=cache, tables=tables),
-                    prefix_lengths=tuple(row.seq_len for row in rows),
-                    query_lengths=(1,) * len(rows),
-                )
+                pages = prepare_attention(rows, cache=cache)
                 inputs = self._indexed(rows, pages, tables, states)
                 return inputs, tuple(row.selection for row in rows), finish
 

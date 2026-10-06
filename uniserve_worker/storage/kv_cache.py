@@ -23,7 +23,7 @@ import torch
 
 from uniserve.math import ceil_div
 from uniserve.runtime import PrefixCache
-from uniserve_worker._uniserve_ipc import Completion
+from uniserve_worker._uniserve_ipc import Completion, TablePages
 from uniserve_worker._uniserve_ipc import KVCacheManager as NativeKVCacheManager
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
@@ -318,16 +318,17 @@ class KVCacheManager:
         """Return physical completions of every overlapping access."""
         return self._manager.write_dependencies(ranges)
 
-    def require_writable(
-        self, table: GroupTable, *, start: int, length: int
-    ) -> None:
-        """Reject writes overlapping independent imports or immutable exports.
+    def prepare_attention(
+        self, rows: Sequence[tuple[int, int, int, bool]]
+    ) -> tuple[TablePages, ...]:
+        """Select pages for ``(slot, prefix, query, write)`` rows as one batch.
 
-        The runner orders model accesses on its stream. Transfers use other
-        streams or processes, so their ranges must retire before a write.
+        Native tables check allocated capacity and retained window history;
+        the cache checks writes against outstanding imports and exports.
+        The returned views retain their selected assignments independently
+        of subsequent slot updates.
         """
-        if self._manager.has_transfers:
-            self._manager.require_writable(table.spans(start, length))
+        return self._manager.prepare_attention(rows)
 
     def close(self) -> None:
         """Drain imports and exports before releasing the backing cache.
@@ -516,7 +517,7 @@ class KVCacheManager:
                 units = table.row(row)
                 # Planes are [columns, units, page tokens, heads, dim]; each
                 # page view is [tokens, columns, heads, dim]. Unencoded views
-                # alias the live units: ``require_writable`` rejects writes
+                # alias the live units: attention preparation rejects writes
                 # into the reserved interval until it is released and
                 # retired.
                 views = tuple(

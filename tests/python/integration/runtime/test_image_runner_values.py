@@ -30,7 +30,7 @@ from uniserve_worker.execution.diffusion import (
     prefix_row,
 )
 from uniserve_worker.execution.model_executor import ModelExecutor
-from uniserve_worker.model_executor.attention import TablePages, from_tables
+from uniserve_worker.model_executor.attention import from_tables, table_pages
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -41,6 +41,7 @@ from uniserve_worker.protocol.call import (
     MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
+from uniserve_worker.storage.block_tables import GroupShape, GroupTable
 from uniserve_worker.storage.kv_cache import KVCacheManager
 from uniserve_worker.storage.latent_pool import LatentPool
 
@@ -275,16 +276,21 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             # The model's one cache group has one-unit pages, so its single
             # table holds each branch's prefix pages.
             attention = from_tables(
-                (
-                    TablePages(
-                        16,
-                        False,
-                        (0,) * len(branches),
-                        tuple(
-                            (slot * 2 + 1, slot * 2 + 2)
-                            for slot in range(len(branches))
-                        ),
+                table_pages(
+                    tuple(
+                        (
+                            GroupTable(
+                                GroupShape(16, 1),
+                                0,
+                                (slot * 2 + 1, slot * 2 + 2),
+                                32,
+                            ),
+                        )
+                        for slot in range(len(branches))
                     ),
+                    prefix_lengths=(prefix_length,) * len(branches),
+                    query_lengths=(factory.sequence_length(size),)
+                    * len(branches),
                 ),
                 query_lengths=(factory.sequence_length(size),) * len(branches),
                 prefix_lengths=(prefix_length,) * len(branches),

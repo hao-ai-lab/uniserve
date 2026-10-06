@@ -133,6 +133,77 @@ impl GroupTable {
     }
 }
 
+#[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
+pub(crate) struct TablePages {
+    pub(super) inner: uniserve_worker::TablePages,
+}
+
+#[pymethods]
+impl TablePages {
+    #[getter]
+    fn block_size(&self) -> u32 {
+        self.inner.shape.page_tokens
+    }
+
+    #[getter]
+    fn windowed(&self) -> bool {
+        self.inner.shape.window.is_some()
+    }
+
+    #[getter]
+    fn width(&self) -> usize {
+        self.inner.width()
+    }
+
+    #[getter]
+    fn start_pages<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, self.inner.starts.iter().copied())
+    }
+
+    #[getter]
+    fn lengths<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, self.inner.lengths.iter().copied())
+    }
+
+    #[getter]
+    fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let rows = self
+            .inner
+            .rows()
+            .map(|row| PyTuple::new(py, row.collect::<Vec<_>>()))
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(py, rows)
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (tables, *, prefix_lengths, query_lengths))]
+pub(crate) fn table_pages<'py>(
+    py: Python<'py>,
+    tables: Vec<Vec<PyRef<'_, GroupTable>>>,
+    prefix_lengths: Vec<u32>,
+    query_lengths: Vec<u32>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let tables = tables
+        .iter()
+        .map(|row| row.iter().map(|table| Arc::clone(&table.table)).collect())
+        .collect::<Vec<_>>();
+    let pages = uniserve_worker::table_pages(&tables, &prefix_lengths, &query_lengths)
+        .map_err(|error| native_error(py, error))?;
+    pages_to_py(py, pages)
+}
+
+pub(super) fn pages_to_py<'py>(
+    py: Python<'py>,
+    pages: Vec<uniserve_worker::TablePages>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let pages = pages
+        .into_iter()
+        .map(|inner| Py::new(py, TablePages { inner }))
+        .collect::<PyResult<Vec<_>>>()?;
+    PyTuple::new(py, pages)
+}
+
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct BlockTables {
     pub(super) tables: NativeBlockTables,

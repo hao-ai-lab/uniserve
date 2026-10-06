@@ -8,7 +8,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use uniserve_worker::KVCacheManager as NativeKVCacheManager;
 use uniserve_worker_ipc::{BufferId, KvGroupTransfer, KvTransfer, RequestKey};
 
-use super::block_tables::{BlockTables, GroupTable};
+use super::block_tables::{BlockTables, GroupTable, pages_to_py};
 use super::completion::{Completion, CompletionRef};
 use super::error::{invalid, native_error};
 use super::protocol::{buffer_id, call_id, request_key};
@@ -255,11 +255,6 @@ impl KVCacheManager {
         self.inner.has_pending_accesses()
     }
 
-    #[getter]
-    fn has_transfers(&self) -> bool {
-        self.inner.has_transfers()
-    }
-
     fn retain_execution(
         &mut self,
         py: Python<'_>,
@@ -354,10 +349,47 @@ impl KVCacheManager {
         Ok(PyTuple::new(py, completions)?.unbind())
     }
 
-    fn require_writable(&mut self, py: Python<'_>, spans: Vec<(u32, u32, u32)>) -> PyResult<()> {
-        self.inner
-            .require_writable(&spans)
-            .map_err(|error| native_error(py, error))
+    /// Resolve all row ranges before checking transfers once for this batch.
+    fn prepare_attention<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(u32, i64, i64, bool)>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let rows = rows
+            .into_iter()
+            .map(|(slot, prefix, query, write)| {
+                let length = |value| {
+                    u32::try_from(value)
+                        .map_err(|_| invalid(py, "forward attention lengths are invalid"))
+                };
+                Ok(uniserve_worker::AttentionRow {
+                    slot,
+                    prefix: length(prefix)?,
+                    query: length(query)?,
+                    write,
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let mut spans = Vec::new();
+        let transfers = self.inner.has_transfers();
+        let pages = self
+            .tables
+            .borrow(py)
+            .tables
+            .prepare_attention(&rows, |table, prefix, query| {
+                if transfers {
+                    spans.extend(table.spans(u64::from(prefix), u64::from(query))?);
+                }
+                Ok(())
+            })
+            .map_err(|error| native_error(py, error))?;
+
+        if !spans.is_empty() {
+            self.inner
+                .require_writable(&spans)
+                .map_err(|error| native_error(py, error))?;
+        }
+        pages_to_py(py, pages)
     }
 
     fn require_reusable(&mut self, py: Python<'_>, spans: Vec<(u32, u32, u32)>) -> PyResult<()> {

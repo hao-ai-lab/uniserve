@@ -392,9 +392,8 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         # Appending touches the remaining token of the same page and the next
         # page. Neither call changes the retained prefix's logical value.
         suffix = torch.full((5, 1, 4), 7.0)
-        pool.require_writable(
-            _table(pool, pages), start=3, length=suffix.shape[0]
-        )
+        pool.block_tables.install(((1, 0, 0, pages, 8),))
+        pool.prepare_attention(((1, 3, suffix.shape[0], True),))
         pool.cache.state(pool.cache.groups[0].layers[0]).write(
             pages, start=3, key=suffix, value=-suffix
         )
@@ -402,7 +401,7 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         torch.testing.assert_close(readers[1].result(), -prefix, rtol=0, atol=0)
         pool.zero_units((2,))
         with pytest.raises(WorkerError, match="published version"):
-            pool.require_writable(_table(pool, pages), start=2, length=1)
+            pool.prepare_attention(((1, 2, 1, True),))
 
         pool.release_buffers((buffer,))
         for location in locations:
@@ -1398,7 +1397,7 @@ def test_fp8_export_preserves_values_before_a_later_block_scale_growth():
         # The import can begin after another invocation appends to the same
         # physical block. Its BufferId still denotes the earlier exact value.
         suffix = torch.full_like(prefix, 896)
-        pool.require_writable(_table(pool, (1,)), start=1, length=1)
+        pool.prepare_attention(((1, 1, 1, True),))
         state.write((1,), start=1, key=suffix, value=-suffix)
         for index, field in enumerate(export.tensors[:2]):
             reader = transport.fetch(
