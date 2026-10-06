@@ -139,7 +139,7 @@ pub(super) fn prepare(
 pub(super) fn seal(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
     owner.getattr("graph_storage")?.call_method0("seal")?;
     slf.borrow_mut().sealed = true;
-    for runner in ModelRunners::all(slf, owner)? {
+    for runner in ModelRunners::all(slf)? {
         execution(&runner)?.borrow_mut().sealed = true;
     }
     for expert in &slf.borrow().expert_executions {

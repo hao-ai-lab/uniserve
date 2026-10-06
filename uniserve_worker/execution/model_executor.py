@@ -30,8 +30,6 @@ only ``close``).
 from __future__ import annotations
 
 import logging
-import time
-from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
@@ -60,7 +58,6 @@ from uniserve.model import (
 )
 from uniserve.nn.vae import PatchAutoencoder
 from uniserve.processing import ImageProcessor
-from uniserve.profiling import profile_range
 from uniserve.runtime import ExecutionContext
 from uniserve.runtime.backends import kernel_choices
 from uniserve.runtime.backends.attention import resolve as attention_backend
@@ -141,13 +138,11 @@ from uniserve_worker.protocol.call import (
     MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId
-from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.sampling.metadata import TokenSelection
 
 if TYPE_CHECKING:
     from uniserve.runtime.weight_prefetch import WeightPrefetch
     from uniserve_worker.model_executor.canvas_runner import CanvasRunner
-    from uniserve_worker.model_executor.media_inputs import MediaBuilder
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.canvas_slots import CanvasSlots
     from uniserve_worker.storage.decode_state import DecodeState
@@ -155,23 +150,6 @@ if TYPE_CHECKING:
     from uniserve_worker.storage.latent_pool import LatentPool
 
 logger = logging.getLogger(__name__)
-
-
-def _observations(name, started, path):
-    """Build single-call forward statistics for one module, in microseconds.
-
-    A module invocation takes opaque numerical arguments with no query-token
-    notion, so it reports its call and time under ``name`` and no tokens.
-    """
-    elapsed = (time.perf_counter_ns() - started) // 1000
-    return ForwardStats(
-        mode_counts={name: 1},
-        mode_us={name: elapsed},
-        component_us={"forward": elapsed},
-        cuda_graph_runtime_mode_counts={path: 1},
-        cuda_graph_captures=int(path == "graph_capture"),
-        cuda_graph_replays=int(path == "graph_replay"),
-    )
 
 
 class ModelExecutor:
@@ -295,10 +273,6 @@ class ModelExecutor:
         self._denoiser = None
         self.diffusion_bank: Mapping[str, torch.Tensor] = {}
         self.latent_pool: LatentPool | None = None
-        self._diffusion: DiffusionRunner | None = None
-        # Layouts the runner prepared while serving, least recently used
-        # first (``diffusion_layout``).
-        self._serving_layouts: OrderedDict[object, None] = OrderedDict()
         # The resident sampler state of generating canvases, bound when this
         # rank runs token denoising (``bind_canvas_slots``).
         self.canvas_slots: CanvasSlots | None = None
@@ -646,7 +620,7 @@ class ModelExecutor:
         samples. The runner borrows both when it is built, so they are bound
         before the first layout is prepared.
         """
-        if self._diffusion is not None:
+        if self.batch_runners.has_diffusion:
             raise RuntimeError(
                 "bind request storage before preparing diffusion runners"
             )
@@ -683,37 +657,7 @@ class ModelExecutor:
         and ``prepare_layouts`` prepares them. It captures when the graph
         policy and the component's stream allow.
         """
-        if self._denoiser is None or self.latent_pool is None:
-            raise InputError("rank does not own denoising computation")
-        if self._diffusion is None:
-            builder = cast("MediaBuilder", self.media_builder)
-            name, binding, call = self._denoiser
-            stream = self.module_stream(
-                name, method=call.entry_point.method, path=call.path
-            )
-            captures = (
-                self.worker_config.graph_policy != "off" and stream is not None
-            )
-            self._diffusion = DiffusionRunner.for_layouts(
-                name,
-                call,
-                builder.maximum_layout,
-                device=binding.device,
-                stream=stream,
-                storage=self.graph_storage,
-                devices=(
-                    binding.device,
-                    *self._capture_devices(binding.device),
-                )
-                if captures
-                else (),
-                bank=self.diffusion_bank if captures else None,
-                slots=self.worker_config.max_request_pool_size,
-                pool=self.latent_pool,
-                pages=builder.sample_pages.pages,
-                attention=self.attention,
-            )
-        return self._diffusion
+        return self.batch_runners.diffusion(self)
 
     def prepare_layouts(self) -> tuple:
         """Prepare the media builder's capacity layouts, largest first.
@@ -724,13 +668,7 @@ class ModelExecutor:
         same order. Returns ``layouts``, the layouts startup warms and
         captures.
         """
-        builder = cast("MediaBuilder", self.media_builder)
-        runner = self.diffusion
-        layouts = builder.layouts()
-        for layout in (builder.maximum_layout, *layouts):
-            runner.prepare(layout, pages=builder.layout_pages(layout))
-        self.graph_storage.check()
-        return layouts
+        return self.batch_runners.prepare_layouts(self)
 
     def diffusion_layout(self, layout):
         """Return a prepared layout, preparing it on first use.
@@ -746,19 +684,7 @@ class ModelExecutor:
             ValueError: The layout's workspace does not fit
                 ``maximum_layout``'s, or its samples exceed the runner's.
         """
-        builder = cast("MediaBuilder", self.media_builder)
-        runner, serving = self.diffusion, self._serving_layouts
-        if layout in serving:
-            serving.move_to_end(layout)
-            return runner.layout(layout)
-        if layout in runner.layouts:
-            return runner.layout(layout)
-        if len(serving) >= self.worker_config.max_request_pool_size:
-            retired, _ = serving.popitem(last=False)
-            runner.retire(retired)
-        entry = runner.prepare(layout, pages=builder.layout_pages(layout))
-        serving[layout] = None
-        return entry
+        return self.batch_runners.diffusion_layout(self, layout)
 
     def run_denoising(self, ladder, index, bank):
         """Run one denoising step of a bound ladder and time it.
@@ -766,16 +692,7 @@ class ModelExecutor:
         ``bank`` holds the request's committed samples; see
         ``DiffusionRunner.step``.
         """
-        runner = self.diffusion
-        started = time.perf_counter_ns()
-        with profile_range(
-            f"uniserve.model.denoise rank={self.worker_config.rank} "
-            "work=denoiser"
-        ):
-            values, path = runner.step(ladder, index, bank)
-        return ModelRunner.result(values).replace(
-            stats=_observations("denoiser", started, path),
-        )
+        return self.batch_runners.run_denoising(self, ladder, index, bank)
 
     def output_layout(
         self,
@@ -1422,7 +1339,7 @@ class ModelExecutor:
         # Warmup and capture have now prepared the call sites and resolved
         # the selections they exercise.
         self._kernel_choices = kernel_choices()
-        self._kernels.add(self.batch_runners.all(self))
+        self._kernels.add(self.batch_runners.all())
         self._log_kernels("startup")
 
         self.batch_runners.seal(self)
@@ -1454,7 +1371,7 @@ class ModelExecutor:
         if not self.batch_runners.sealed or choices == self._kernel_choices:
             return
         self._kernel_choices = choices
-        if self._kernels.add(self.batch_runners.all(self)):
+        if self._kernels.add(self.batch_runners.all()):
             self._log_kernels("serving")
 
     def synchronize(self):
@@ -1473,7 +1390,7 @@ class ModelExecutor:
         worker close calls this before releasing the KV cache, latent pool and
         product backing the graphs reference.
         """
-        self.batch_runners.close_graphs(self)
+        self.batch_runners.close_graphs()
 
     def close(self, *, aborted: bool = False):
         """Release every owned context, buffer, graph and stream exactly once.

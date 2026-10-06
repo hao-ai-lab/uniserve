@@ -41,12 +41,9 @@ pub(super) fn synchronize(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny
     close_all(py, results)
 }
 
-pub(super) fn close_graphs(
-    slf: &Bound<'_, ModelRunners>,
-    owner: &Bound<'_, PyAny>,
-) -> PyResult<()> {
+pub(super) fn close_graphs(slf: &Bound<'_, ModelRunners>) -> PyResult<()> {
     let py = slf.py();
-    let mut results: Vec<_> = ModelRunners::all(slf, owner)?
+    let mut results: Vec<_> = ModelRunners::all(slf)?
         .iter()
         .map(|runner| runner.call_method0("close_graphs").map(drop))
         .collect();
@@ -109,12 +106,16 @@ pub(super) fn close(
     let result = (|| {
         let mut results = vec![
             synchronize(slf, owner),
-            close_graphs(slf, owner),
+            close_graphs(slf),
             ModelRunners::close_modules(slf),
         ];
-        let diffusion = owner.getattr("_diffusion")?;
-        if !diffusion.is_none() {
-            results.push(diffusion.call_method0("close").map(drop));
+        let diffusion = slf
+            .borrow()
+            .diffusion
+            .as_ref()
+            .map(|value| value.clone_ref(py));
+        if let Some(diffusion) = diffusion {
+            results.push(diffusion.call_method0(py, "close").map(drop));
         }
         let runners = slf
             .borrow()
@@ -159,7 +160,6 @@ pub(super) fn close(
     })();
 
     slf.borrow_mut().clear();
-    owner.setattr("_diffusion", py.None())?;
     close_all(
         py,
         [

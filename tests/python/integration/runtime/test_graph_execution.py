@@ -293,8 +293,8 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
 
 
 @torch.inference_mode()
-def test_prepared_layout_preserves_step_values_when_captured():
-    """Preparing and later capturing a layout preserve its solver values."""
+def test_layout_retirement_preserves_eager_and_captured_step_values():
+    """Transient layouts retire without changing resident solver values."""
     device = torch.device("cuda:0")
     model = LinearDenoiser().to(device)
     steps = 2
@@ -329,6 +329,34 @@ def test_prepared_layout_preserves_step_values_when_captured():
                     atol=1e-6,
                 )
                 bank = 1 - bank
+
+            # Serving can introduce exact layouts after capture. Their
+            # constants must survive queued steps and never alias the
+            # resident graph's intermediates. Reprepare an evicted layout
+            # with its own constants after using a different one.
+            for offset in (5.0, 9.0, 5.0):
+                transient = Size(16, offset)
+                runner.prepare(transient, pages=1)
+                _committed(pool, 1, 1, transient).fill_(7.0)
+                request = _bind(runner, schedules, transient, steps, 1)
+                actual, _ = runner.step(request, 0, 1)
+                value = actual["image"][0].clone()
+                runner.retire(transient)
+                torch.testing.assert_close(
+                    value,
+                    _advanced(transient, 1, device=device),
+                    rtol=1e-6,
+                    atol=1e-6,
+                )
+
+            _committed(pool, 1, 1, size).fill_(7.0)
+            actual, _ = runner.step(bound, 0, 1)
+            torch.testing.assert_close(
+                actual["image"][0],
+                _advanced(size, 1, device=device),
+                rtol=1e-6,
+                atol=1e-6,
+            )
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()
