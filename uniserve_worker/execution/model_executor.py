@@ -126,6 +126,7 @@ from uniserve_worker.model_executor.graph_storage import GraphStorage
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
 from uniserve_worker.model_executor.input_batch import (
     CanvasStepRow,
+    InputBatch,
     InputRow,
     TokenRow,
 )
@@ -142,7 +143,6 @@ from uniserve_worker.model_executor.resources import (
     output_layouts,
 )
 from uniserve_worker.model_executor.text_runner import TextRunner
-from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.call import (
     Call,
     ForwardMode,
@@ -2300,83 +2300,13 @@ class ModelExecutor:
         Fatal failures propagate immediately because later device work is
         unsafe.
         """
-        # Numerical input types and shapes remain with their Python backend.
-        # Native routing combines compatible rows and marks outputs that must
-        # survive a later invocation of the same runner.
-        missing, groups = self.batch_runners.group(
-            (
-                call,
-                row.forward_mode,
-                type(row),
-                tuple(row.encode_pixels.shape)
-                if isinstance(row, VisionRow)
-                else (row.image_height, row.image_width)
-                if isinstance(row, (DiffusionRow, DecodeRow))
-                else (),
-                isinstance(row, TokenRow) and row.causal,
-            )
-            for row, call in tasks
+        return self.batch_runners.forward(
+            self, tasks, cache=cache, tables=tables, states=states
         )
-        for index in missing:
-            call = tasks[index][1]
-            yield (
-                (index,),
-                invalid_descriptor(
-                    f"execution has no {call.kind.value!r} binding "
-                    f"for {call.component!r}"
-                ),
-            )
-
-        for runner, indexes, preserve_output in groups:
-            rows = tuple(tasks[index][0] for index in indexes)
-            try:
-                forward_started = time.perf_counter_ns()
-                result = self.run_batch(
-                    runner,
-                    rows,
-                    calls=tuple(tasks[index][1] for index in indexes),
-                    cache=cache,
-                    tables=tables,
-                    states=states,
-                )
-                if result.request_pool_indices is None:
-                    raise RuntimeError(
-                        "forward output has no request slot views"
-                    )
-
-                # Join the lane stream's output fence so later control-stream
-                # work observes this group's writes in order.
-                if result.output_event is not None:
-                    result.output_event.wait(
-                        torch.cuda.current_stream(runner.device)
-                    )
-
-                if rows[0].forward_mode is ForwardMode.DECODE:
-                    if result.stats is None:
-                        raise RuntimeError("text forward lost its statistics")
-                    components = dict(result.stats.component_us)
-                    record_component(
-                        components, "text_model_forward", forward_started
-                    )
-                    result = replace(
-                        result,
-                        stats=replace(result.stats, component_us=components),
-                    )
-
-                # A later call may replay the same graph or reuse its buffer.
-                # Preserve these numerical values until their consumer runs.
-                if preserve_output:
-                    result = result.clone()
-            except BaseException as error:
-                if classify(error).fatal:
-                    raise
-                yield indexes, error
-            else:
-                yield indexes, result
 
     def run_batch(
         self,
-        entry: ModelRunner,
+        runner: ModelRunner,
         rows: tuple[InputRow, ...],
         *,
         calls: tuple[Call, ...],
@@ -2391,160 +2321,88 @@ class ModelExecutor:
         request selection; this method owns input copies, stream ordering,
         graph execution, and output validation for the numerical invocation.
         """
-        if self._closed:
-            raise RuntimeError("model runner is closed")
-        tasks = rows
-        started = time.perf_counter_ns()
-        forward_mode = tasks[0].forward_mode
-        graph_eligible = (
-            isinstance(forward_mode, ForwardMode)
-            or forward_mode is MediaCall.DENOISING
+        return self.batch_runners.run_batch(
+            self,
+            runner,
+            rows,
+            calls=calls,
+            cache=cache,
+            tables=tables,
+            states=states,
         )
-        call_keys = tuple(
-            (
-                call.request_key.engine_id,
-                call.request_key.request_id,
-                call.request_key.request_epoch,
-                call.call_id,
+
+
+def _prepare_inputs(
+    runner: ModelRunner,
+    rows: tuple[InputRow, ...],
+    partitions: tuple[tuple[InputRow, ...], ...],
+    *,
+    cache: KVCacheManager | None,
+    tables: BlockTables | None,
+    states: DecodeState | None,
+) -> tuple[tuple[InputBatch | None, ...], torch.Tensor, bool]:
+    """Pack native row partitions into each peer's numerical backing.
+
+    All tensor work runs under the invocation's input-copy stream. Empty
+    partitions retain their peer position for collective participation.
+    """
+    if runner.microbatches is not None:
+        runner.input_buffers.validate_rows(rows)
+
+    batches = tuple(
+        None
+        if not part
+        else cast(ModelRunner, peer).prepare_inputs(
+            part,
+            forward_mode=rows[0].forward_mode,
+            cache=cache,
+            tables=tables,
+            states=states,
+        )
+        for peer, part in zip(runner.peers, partitions, strict=True)
+    )
+    populated = tuple(batch for batch in batches if batch is not None)
+    slots = (
+        populated[0].request_pool_indices
+        if len(batches) == 1
+        else torch.cat([batch.request_pool_indices for batch in populated])
+    )
+    # Only single-token last-logits rows can borrow graph output storage.
+    borrow = all(
+        isinstance(row, TokenRow)
+        and row.query_tokens == 1
+        and row.selection is TokenSelection.LAST_LOGITS
+        for row in rows
+    )
+    return batches, slots, borrow
+
+
+def _run_inputs(
+    runner: ModelRunner,
+    rows: tuple[InputRow, ...],
+    batches: tuple[InputBatch | None, ...],
+    eligible: bool,
+    borrow: bool,
+) -> tuple[ExecutionOutput, int | None]:
+    """Evaluate prepared tensors and check the numerical output layout."""
+    with torch.inference_mode():
+        if runner.microbatches is None:
+            output = runner.run_batch(
+                batches[0],
+                runner.batch_forward,
+                eligible=eligible,
+                borrow_output=borrow,
             )
-            for call in calls
-        )
+            output.validate_for(batches[0])
+        else:
+            output = runner.run_microbatches(
+                batches, eligible=eligible, borrow_output=borrow
+            )
 
-        target = entry.device
-        lane_runtime = entry.cuda_stream
-        buffers = entry.input_buffers
-        assert buffers is not None
-
-        # Input copies and the forward itself belong to one stage on the
-        # timeline, so the range opens before input preparation.
-        with profile_range(
-            f"uniserve.model.forward rank={self.worker_config.rank} "
-            f"work={calls[0].component}.{forward_mode.value}"
-        ):
-            try:
-                if lane_runtime is not None:
-                    lane_runtime.wait(torch.cuda.current_stream(target))
-                stream_context = (
-                    nullcontext()
-                    if lane_runtime is None
-                    else torch.cuda.stream(lane_runtime.stream)
-                )
-                with stream_context:
-                    if entry.microbatches is not None:
-                        # Partitioning does not enlarge the worker's public
-                        # batch admission bounds.
-                        buffers.validate_rows(tasks)
-                    batches = []
-                    count = len(entry.peers)
-                    for index, peer in enumerate(entry.peers):
-                        # Whole request rows preserve causal attention and
-                        # give simultaneous microbatches disjoint KV writes.
-                        first = index * len(tasks) // count
-                        last = (index + 1) * len(tasks) // count
-                        batches.append(
-                            None
-                            if first == last
-                            else peer.prepare_inputs(
-                                tasks[first:last],
-                                forward_mode=forward_mode,
-                                cache=cache,
-                                tables=tables,
-                                states=states,
-                            )
-                        )
-                    populated = [
-                        batch for batch in batches if batch is not None
-                    ]
-                    request_pool_indices = (
-                        populated[0].request_pool_indices
-                        if count == 1
-                        else torch.cat(
-                            [batch.request_pool_indices for batch in populated]
-                        )
-                    )
-            except Exception as error:
-                # Join input copies already submitted to the lane before
-                # reporting, as for execution failures below.
-                output_event = (
-                    None if lane_runtime is None else lane_runtime.record()
-                )
-                if output_event is not None:
-                    output_event.wait(torch.cuda.current_stream(target))
-                raise _input_failure(error, forward_mode, call_keys) from error
-
-            output_event = None
-            try:
-                # Only a uniform single-token last-logits decode may borrow the
-                # graph's output storage; mixed rows receive owned values.
-                with torch.inference_mode():
-                    borrow_output = all(
-                        isinstance(task, TokenRow)
-                        and task.query_tokens == 1
-                        and task.selection is TokenSelection.LAST_LOGITS
-                        for task in tasks
-                    )
-                    if entry.microbatches is None:
-                        output = entry.run_batch(
-                            populated[0],
-                            entry.batch_forward,
-                            eligible=graph_eligible,
-                            borrow_output=borrow_output,
-                        )
-                        output.validate_for(populated[0])
-                    else:
-                        output = entry.run_microbatches(
-                            batches,
-                            eligible=graph_eligible,
-                            borrow_output=borrow_output,
-                        )
-
-                _validate_outputs(output.values, tasks, target)
-
-                output_event = (
-                    None if lane_runtime is None else lane_runtime.record()
-                )
-                duration_us = (time.perf_counter_ns() - started) // 1000
-                if output.stats is None:
-                    raise RuntimeError(
-                        "entry forward lost its execution statistics"
-                    )
-                # The mode's token counter counts the query tokens the group
-                # computed; encoder and decoder groups have none and report
-                # only their call and time.
-                tokens = (
-                    None
-                    if any(batch.query_tokens is None for batch in populated)
-                    else sum(batch.query_tokens for batch in populated)
-                )
-                stats = replace(
-                    output.stats,
-                    mode_counts={forward_mode.value: 1},
-                    mode_tokens={}
-                    if tokens is None
-                    else {forward_mode.value: tokens},
-                    mode_us={forward_mode.value: duration_us},
-                    component_us={"forward": duration_us},
-                )
-                self._report_new_kernels()
-                return replace(
-                    output,
-                    request_pool_indices=request_pool_indices,
-                    output_event=output_event,
-                    stats=stats,
-                )
-            except Exception as error:
-                # A failed model can leave kernels on a lane stream. Its caller
-                # retires storage behind the current stream's output fence, so
-                # join every submitted lane access before reporting the failure.
-                if output_event is None:
-                    output_event = (
-                        None if lane_runtime is None else lane_runtime.record()
-                    )
-                if output_event is not None:
-                    output_event.wait(torch.cuda.current_stream(target))
-                raise _execution_failure(
-                    error, forward_mode, call_keys
-                ) from error
+    _validate_outputs(output.values, rows, runner.device)
+    counts = tuple(batch.query_tokens for batch in batches if batch is not None)
+    tokens = None if None in counts else sum(cast(tuple[int, ...], counts))
+    return output, tokens
 
 
 def _validate_outputs(

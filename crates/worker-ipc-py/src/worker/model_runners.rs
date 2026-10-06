@@ -1,24 +1,14 @@
 //! Numerical runner bindings and batched dispatch.
 
-use std::sync::Arc;
+mod execute;
+mod forward;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyTuple, PyType};
+use pyo3::types::PyTuple;
 use uniserve_worker::ModelRunners as NativeModelRunners;
 use uniserve_worker_ipc::CallKind;
 
-use crate::calls::Call;
-
 use super::error::native_error;
-
-type InputRow<'py> = (
-    PyRef<'py, Call>,
-    Bound<'py, PyAny>,
-    Bound<'py, PyType>,
-    Vec<usize>,
-    Option<bool>,
-);
-type ModelBatch<'py> = (Py<PyAny>, Bound<'py, PyTuple>, bool);
 
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 #[derive(Default)]
@@ -31,6 +21,37 @@ impl ModelRunners {
     #[new]
     fn new() -> Self {
         Self::default()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (owner, tasks, *, cache, tables, states))]
+    fn forward(
+        &self,
+        py: Python<'_>,
+        owner: Py<PyAny>,
+        tasks: Py<PyTuple>,
+        cache: Py<PyAny>,
+        tables: Py<PyAny>,
+        states: Py<PyAny>,
+    ) -> PyResult<forward::ModelBatches> {
+        forward::prepare(py, &self.inner, owner, tasks, cache, tables, states)
+    }
+
+    /// Execute prepared numerical rows with native stream and result ordering.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (owner, runner, rows, *, calls, cache, tables, states))]
+    fn run_batch<'py>(
+        &self,
+        py: Python<'py>,
+        owner: &Bound<'py, PyAny>,
+        runner: &Bound<'py, PyAny>,
+        rows: &Bound<'py, PyTuple>,
+        calls: &Bound<'py, PyTuple>,
+        cache: &Bound<'py, PyAny>,
+        tables: &Bound<'py, PyAny>,
+        states: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        execute::run_batch(py, owner, runner, rows, calls, cache, tables, states)
     }
 
     fn clear(&mut self) {
@@ -70,46 +91,5 @@ impl ModelRunners {
             .inner
             .first(pythonize::depythonize(kind)?)
             .map(|runner| runner.clone_ref(py)))
-    }
-
-    /// Input type and dimensions are host metadata; grouping never reads a tensor.
-    fn group<'py>(
-        &self,
-        py: Python<'py>,
-        rows: &Bound<'py, PyAny>,
-    ) -> PyResult<(Vec<usize>, Vec<ModelBatch<'py>>)> {
-        let mut native = Vec::new();
-        for row in rows.try_iter()? {
-            let (call, kind, input_type, shape, causal): InputRow<'_> = row?.extract()?;
-            native.push((
-                Arc::clone(&call.inner),
-                pythonize::depythonize::<CallKind>(&kind)?,
-                (input_type, shape),
-                causal,
-            ));
-        }
-
-        let (missing, batches) = self.inner.group(native.iter().map(
-            |(call, kind, (input_type, shape), causal)| {
-                (
-                    call.as_ref(),
-                    *kind,
-                    (input_type.as_ptr() as usize, shape),
-                    *causal,
-                )
-            },
-        ));
-        let batches = batches
-            .into_iter()
-            .map(|batch| {
-                Ok((
-                    batch.runner.clone_ref(py),
-                    PyTuple::new(py, batch.rows)?,
-                    batch.preserve_output,
-                ))
-            })
-            .collect::<PyResult<_>>()?;
-
-        Ok((missing, batches))
     }
 }
