@@ -39,7 +39,7 @@ pub(crate) struct TransferCapacity {
 #[pymethods]
 impl TransferCapacity {
     #[new]
-    fn new(byte_capacity: i64, ticket_capacity: isize) -> PyResult<Self> {
+    pub(in crate::worker) fn new(byte_capacity: i64, ticket_capacity: isize) -> PyResult<Self> {
         if byte_capacity < 1 || ticket_capacity < 1 {
             return Err(PyValueError::new_err(
                 "transfer byte and read capacities must be positive",
@@ -235,11 +235,8 @@ pub(crate) struct TransferPool {
     events: Py<EventPool>,
 }
 
-#[pymethods]
 impl TransferPool {
-    #[new]
-    #[pyo3(signature = (*, workers, capacity, name, event_pool))]
-    fn new(
+    pub(in crate::worker) fn new(
         py: Python<'_>,
         workers: usize,
         capacity: Py<TransferCapacity>,
@@ -256,13 +253,12 @@ impl TransferPool {
         })
     }
 
-    fn set_completion_wake(&self, wake: Option<Py<PyAny>>) {
+    pub(in crate::worker) fn set_completion_wake(&self, wake: Option<Py<PyAny>>) {
         self.pool.set_completion_wake(wake);
     }
 
     /// Admit a channel payload before allocating its host and device views.
-    #[pyo3(signature = (locator, *, device, destination=None, region=None, reservation=None))]
-    fn fetch_channel(
+    pub(in crate::worker) fn fetch_channel(
         slf: Bound<'_, Self>,
         locator: Bound<'_, PyAny>,
         device: Py<PyAny>,
@@ -308,8 +304,7 @@ impl TransferPool {
     }
 
     /// Grant and submit a local read without a Python ownership callback.
-    #[pyo3(signature = (locator, *, device, destination=None, region=None, reservation=None))]
-    fn fetch_local(
+    pub(in crate::worker) fn fetch_local(
         slf: Bound<'_, Self>,
         locator: &Bound<'_, PyAny>,
         device: &Bound<'_, PyAny>,
@@ -419,8 +414,7 @@ impl TransferPool {
     /// Submit a shared-memory read on the same lane as local copies. A private
     /// host tensor ends the source claim before destination DMA begins.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (locator, *, node, slot, device, destination=None, region=None, reservation=None))]
-    fn fetch_shared(
+    pub(in crate::worker) fn fetch_shared(
         slf: Bound<'_, Self>,
         locator: Bound<'_, PyAny>,
         node: &str,
@@ -481,8 +475,7 @@ impl TransferPool {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (locator, *, source, slot, device, destination=None, region=None, reservation=None))]
-    fn fetch_cuda(
+    pub(in crate::worker) fn fetch_cuda(
         slf: Bound<'_, Self>,
         locator: Bound<'_, PyAny>,
         source: Bound<'_, PyAny>,
@@ -504,7 +497,7 @@ impl TransferPool {
         )
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::worker) fn close(&self, py: Python<'_>) -> PyResult<()> {
         let borrowed = self
             .borrowed
             .lock_py_attached(py)
@@ -519,7 +512,10 @@ impl TransferPool {
         }
         result
     }
+}
 
+#[pymethods]
+impl TransferPool {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.capacity)?;
         visit.call(&self.events)?;

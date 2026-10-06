@@ -35,7 +35,7 @@ def open_shared_storage(name: str, size: int) -> mmap.mmap:
 
     Raises:
         OSError: When `shm_open` or the mapping fails; a missing segment raises
-            `FileNotFoundError`, which `ShmTransport` reports as a retired
+            `FileNotFoundError`, which shared transport reports as a retired
             export.
         ValueError: When `size` exceeds the segment's size.
     """

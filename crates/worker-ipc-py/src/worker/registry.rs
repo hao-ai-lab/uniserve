@@ -79,18 +79,11 @@ impl Deref for BufferRegistry {
     }
 }
 
-#[pymethods]
 impl BufferRegistry {
-    #[new]
-    #[pyo3(signature = (*, capacity, event_pool))]
-    fn new(py: Python<'_>, capacity: usize, event_pool: Py<EventPool>) -> PyResult<Self> {
+    pub(in crate::worker) fn new(capacity: usize, event_pool: Py<EventPool>) -> PyResult<Self> {
         let state =
             BufferTable::new(capacity).map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let suffix: String = py
-            .import("uuid")?
-            .call_method0("uuid4")?
-            .getattr("hex")?
-            .extract()?;
+        let suffix = uuid::Uuid::new_v4().simple();
 
         let inner = Arc::new(Registry {
             name: format!("uniserve-buffers-{suffix}"),
@@ -107,13 +100,12 @@ impl BufferRegistry {
         Ok(Self { inner })
     }
 
-    #[getter]
-    fn name(&self) -> &str {
+    pub(in crate::worker) fn name(&self) -> &str {
         &self.inner.name
     }
 
     /// Register backing storage; the backend observes producer completion.
-    fn register(
+    pub(in crate::worker) fn register(
         &self,
         py: Python<'_>,
         locator: Py<PyAny>,
@@ -136,7 +128,7 @@ impl BufferRegistry {
 
     /// Revoke future reads; the returned signal completes after physical
     /// retirement. A buffer already removed from the registry returns None.
-    fn release(
+    pub(in crate::worker) fn release(
         &self,
         py: Python<'_>,
         locator: &Bound<'_, PyAny>,
@@ -154,7 +146,11 @@ impl BufferRegistry {
         Ok(Some(retirement))
     }
 
-    fn retirement(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<Py<Completion>> {
+    pub(in crate::worker) fn retirement(
+        &self,
+        py: Python<'_>,
+        locator: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<Completion>> {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
         Ok(Registry::buffer(&mut state, &key, locator)?
@@ -163,12 +159,12 @@ impl BufferRegistry {
             .clone_ref(py))
     }
 
-    fn awaiting_acknowledgment(&self, py: Python<'_>) -> PyResult<bool> {
+    pub(in crate::worker) fn awaiting_acknowledgment(&self, py: Python<'_>) -> PyResult<bool> {
         Ok(self.lock(py)?.awaiting_acknowledgment())
     }
 
     /// Sweep backend acknowledgments and discard successfully retired storage.
-    fn reap(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::worker) fn reap(&self, py: Python<'_>) -> PyResult<()> {
         let keys: Vec<_> = self.lock(py)?.revoked().cloned().collect();
         for key in keys {
             self.reclaim_buffer(py, &key)?;
@@ -176,7 +172,7 @@ impl BufferRegistry {
         self.remove_finished(py)
     }
 
-    fn set_completion_wake(&self, py: Python<'_>, wake: Option<Py<PyAny>>) {
+    pub(in crate::worker) fn set_completion_wake(&self, py: Python<'_>, wake: Option<Py<PyAny>>) {
         let previous = std::mem::replace(
             &mut *self.wake.lock().unwrap_or_else(PoisonError::into_inner),
             wake.as_ref().map(|wake| wake.clone_ref(py)),
@@ -193,7 +189,7 @@ impl BufferRegistry {
         }
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::worker) fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.unregister();
         self.lock(py)?.close();
         let mut result = self.reap(py);
@@ -226,7 +222,10 @@ impl BufferRegistry {
                 .map_err(|error| native_error(py, error)),
         )
     }
+}
 
+#[pymethods]
+impl BufferRegistry {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         self.inner.visit(&visit)
     }

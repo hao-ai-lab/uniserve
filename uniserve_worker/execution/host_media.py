@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from uniserve_worker.protocol.batch import TensorExport
     from uniserve_worker.storage.tensor_store import TensorStore
     from uniserve_worker.transport.interface import Transport
-    from uniserve_worker.transport.shm import ShmTransport
 
 __all__ = ["HOST_MEDIA_CALLS", "execute"]
 
@@ -72,12 +71,10 @@ def _input_export(
     raise invalid_descriptor("host media input has no published locations")
 
 
-def _shm(transports: Mapping[str, Transport]) -> ShmTransport:
+def _shm(transports: Mapping[str, Transport]) -> Transport:
     """Return the rank's shared-storage transport, bound under ``"shm"``."""
-    from uniserve_worker.transport.shm import ShmTransport
-
     transport = transports.get("shm")
-    if not isinstance(transport, ShmTransport):
+    if transport is None:
         raise unsupported_setup(
             "host media inputs are borrowed over shared storage, which this "
             "rank does not bind"
@@ -150,8 +147,6 @@ def read_encoded_units(
     """
     import torch
 
-    from uniserve_worker.transport.shm import ShmTransport
-
     if len(tensor.shape) != 2 or tensor.dtype != "uint8":
         raise invalid_descriptor("encoded units require byte rows")
     units: dict[int, bytes] = {}
@@ -193,7 +188,7 @@ def read_encoded_units(
                 ticket.close()
             continue
         if isinstance(handle, PosixShmTransfer):
-            assert isinstance(shm, ShmTransport)
+            assert shm is not None
             borrow = shm.borrow(location)
             try:
                 raw = bytearray(borrow)

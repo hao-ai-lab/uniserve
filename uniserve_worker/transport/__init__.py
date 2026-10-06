@@ -19,7 +19,7 @@ has exported.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Sequence
 
 from uniserve.runtime import EventPool
 from uniserve_worker.errors import (
@@ -27,12 +27,8 @@ from uniserve_worker.errors import (
     unsupported_setup,
 )
 from uniserve_worker.protocol.transfer import WorkerEndpoint
-from uniserve_worker.transport.channel import ChannelTransport
-from uniserve_worker.transport.cuda_vmm import CudaVmmTransport
 from uniserve_worker.transport.interface import TRANSPORTS, Transport
-from uniserve_worker.transport.local import LocalTransport
 from uniserve_worker.transport.pool import TransferCapacity
-from uniserve_worker.transport.shm import ShmTransport
 
 
 def make_transports(
@@ -79,29 +75,18 @@ def make_transports(
     # one backend are unavailable to the others.
     capacity = TransferCapacity(byte_capacity, ticket_capacity)
     endpoint = source or WorkerEndpoint.local()
-    constructors: Mapping[str, Callable[..., Transport]] = {
-        "local": LocalTransport,
-        "shm": ShmTransport,
-        "cuda_vmm": CudaVmmTransport,
-        "channel": ChannelTransport,
-    }
     transports: dict[str, Transport] = {}
     try:
         for name in names:
-            arguments = {
-                "capacity": capacity,
-                "event_pool": event_pool,
-                "source": endpoint,
-            }
-            if name == "cuda_vmm":
-                arguments["acknowledgment_slot"] = acknowledgment_slot
-                arguments["cross_host_consumers"] = cross_host_consumers
-            if name == "shm":
-                arguments["acknowledgment_slot"] = acknowledgment_slot
-                arguments["host_slots"] = host_slots
-            if name == "channel":
-                arguments["host_slots"] = host_slots
-            transports[name] = constructors[name](**arguments)
+            transports[name] = Transport(
+                name,
+                capacity=capacity,
+                event_pool=event_pool,
+                source=endpoint,
+                acknowledgment_slot=acknowledgment_slot,
+                host_slots=host_slots,
+                cross_host_consumers=cross_host_consumers,
+            )
     except BaseException:
         # A partial construction must not leave the threads, sockets or
         # endpoint registrations of the backends already built behind.

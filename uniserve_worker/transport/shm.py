@@ -1,264 +1,44 @@
-"""POSIX segment export, direct host borrowing, and acknowledgment.
-
-`ShmTransport` exports a host product, or a device product copied to the
-host, into a fresh POSIX shared-memory segment per export, laid out as
-`segment` describes. Readers on the producer's host open the segment by name:
-`fetch` copies the payload out on a `TransferPool` thread, and `borrow`
-exposes it in place to a reader such as a media unit encode task. Neither
-needs a connection to the producing rank: the producer sweeps the
-acknowledgment words when it reaps, and unlinks a retired segment once no
-named consumer is still reading it.
-"""
+"""Numerical tensor copies to and from native shared storage."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import (
     SHM_HEADER_BYTES,
-    BufferRegistry,
-    Completion,
     SharedBuffer,
     SharedRead,
-    TransportBuffer,
 )
-from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.protocol.transfer import (
-    Locator,
-    PosixShmTransfer,
-    WorkerEndpoint,
-)
-from uniserve_worker.transport.interface import Transport
-from uniserve_worker.transport.layout import (
-    copy_pairs,
-    dtype_name,
-    export_views,
-    resolve_dtype,
-    row_span,
-    tensor_nbytes,
-)
-from uniserve_worker.transport.pool import (
-    ReadReservation,
-    TransferCapacity,
-    TransferPool,
-)
-from uniserve_worker.transport.ticket import TransferTicket
+from uniserve_worker.protocol.transfer import Locator
+from uniserve_worker.transport.layout import copy_pairs, resolve_dtype
 
 if TYPE_CHECKING:
     import torch
 
 
-class ShmTransport(Transport):
-    """Shared storage export whose segment carries its own readiness.
+def _export_payload(
+    source: torch.Tensor | tuple[torch.Tensor, ...],
+    shape: tuple[int, ...],
+    storage: SharedBuffer,
+    stream: torch.cuda.Stream | None,
+) -> None:
+    """Copy spans into the producer's mapping on its selected stream."""
+    import torch
 
-    A consumer opens the segment by name, waits on readiness and writes its own
-    acknowledgment word once it has copied the payload out. The producer
-    unlinks the segment once every named consumer has acknowledged, so a
-    read needs no connection to the producing rank.
-    """
+    first = source[0] if isinstance(source, tuple) else source
+    packed = torch.frombuffer(
+        memoryview(storage)[SHM_HEADER_BYTES:], dtype=first.dtype
+    ).reshape(shape)
+    if stream is None:
+        for target, value in copy_pairs(source, packed):
+            target.copy_(value)
+        return
 
-    name = "shm"
+    from uniserve_kernels.peer_storage import copy_host_device
 
-    def __init__(
-        self,
-        *,
-        capacity: TransferCapacity,
-        event_pool: EventPool,
-        source: WorkerEndpoint | None = None,
-        acknowledgment_slot: int = 0,
-        host_slots: Sequence[int] = (),
-    ) -> None:
-        self.capacity = capacity
-        # Slots of the ranks on this host: the only ones a segment named in
-        # this host's namespace can reach.
-        self._host_slots = frozenset(int(slot) for slot in host_slots)
-        self._buffers = BufferRegistry(capacity=256, event_pool=event_pool)
-        # This rank's own word in the header of every segment it reads.
-        self._acknowledgment_slot = int(acknowledgment_slot)
-        self.source = source or WorkerEndpoint.local()
-        self._events = event_pool
-        self._reads = TransferPool(
-            workers=2,
-            capacity=capacity,
-            name="uniserve-shm-read",
-            event_pool=event_pool,
-        )
-
-    def endpoint(self) -> str:
-        return self._buffers.name
-
-    def serves(self, consumers: Sequence[int]) -> bool:
-        return not consumers or any(
-            int(slot) in self._host_slots for slot in consumers
-        )
-
-    def retirement(self, locator: Locator) -> Completion:
-        return self._buffers.retirement(locator)
-
-    def set_completion_wake(self, wake: Any) -> None:
-        self._reads.set_completion_wake(wake)
-        self._buffers.set_completion_wake(wake)
-
-    def reap(self) -> None:
-        self._buffers.reap()
-
-    def awaiting_acknowledgment(self) -> bool:
-        return self._buffers.awaiting_acknowledgment()
-
-    def export(
-        self,
-        tensor: torch.Tensor | tuple[torch.Tensor, ...],
-        *,
-        offset: tuple[int, ...] | None = None,
-        consumers: Sequence[int] = (),
-    ) -> Locator:
-        """Copy tensor spans into native shared storage and return its locator.
-
-        CUDA copies land directly in the registered mapping. A native callback
-        marks the bytes readable after DMA, without entering Python. Reaping
-        returns capacity after producer completion and reader acknowledgments.
-        """
-        import torch
-
-        source, shape, offset = export_views(tensor, offset)
-        first = source[0] if isinstance(source, tuple) else source
-        nbytes = tensor_nbytes(source)
-        self._buffers.reap()
-        self.capacity.acquire(nbytes)
-
-        storage = None
-        registered = False
-        try:
-            stream = (
-                torch.cuda.current_stream(first.device)
-                if first.is_cuda
-                else None
-            )
-            device = (
-                None
-                if stream is None
-                else (stream.device.index, int(stream.cuda_stream))
-            )
-            storage = SharedBuffer(nbytes, tuple(consumers), device)
-            locator = Locator(
-                source=self.source,
-                transport=PosixShmTransfer(
-                    endpoint=self.endpoint(), name=storage.name
-                ),
-                nbytes=nbytes,
-                dtype=dtype_name(first.dtype),
-                shape=shape,
-                offset=offset,
-                device=str(first.device),
-            )
-            packed = torch.frombuffer(
-                memoryview(storage)[SHM_HEADER_BYTES:], dtype=first.dtype
-            ).reshape(shape)
-            self._buffers.register(
-                locator, TransportBuffer.shared(storage, self.capacity)
-            )
-            registered = True
-
-            if stream is None:
-                for target, value in copy_pairs(source, packed):
-                    target.copy_(value)
-            else:
-                from uniserve_kernels.peer_storage import copy_host_device
-
-                storage.begin_copy()
-                for target, value in copy_pairs(source, packed):
-                    copy_host_device(target, value, stream)
-                    value.record_stream(stream)
-
-            storage.mark_ready()
-            if stream is not None:
-                self._events.notify_stream(int(stream.cuda_stream))
-            return locator
-        except BaseException as error:
-            # A failed copy can leave earlier spans in flight. Native close
-            # drains those accesses before unregistering and unlinking storage;
-            # a failed drain retains the mapping and its byte reservation.
-            if storage is not None:
-                try:
-                    storage.close()
-                except BaseException as cleanup_error:
-                    error.add_note(
-                        f"shared buffer cleanup failed: {cleanup_error}"
-                    )
-                    raise error from cleanup_error
-            if registered:
-                self._buffers.release(locator)
-            else:
-                self.capacity.release(nbytes)
-            raise
-
-    def fetch(
-        self,
-        locator: Locator,
-        *,
-        device: torch.device,
-        destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
-        region: tuple[slice, ...] | None = None,
-        reservation: ReadReservation | None = None,
-    ) -> TransferTicket:
-        """Submit a read of a segment exported on this node.
-
-        Raises:
-            WorkerError: `invalid_descriptor` when the export lies on
-                another node, uses another backend, or, with a `destination`,
-                when `region` exceeds the exported view or `destination` does
-                not match it. Without a destination, shape errors fail the
-                ticket. Admission errors propagate to the submitting caller.
-        """
-        return self._reads.fetch_shared(
-            locator,
-            node=self.source.node,
-            slot=self._acknowledgment_slot,
-            device=device,
-            destination=destination,
-            region=region,
-            reservation=reservation,
-        )
-
-    def borrow(
-        self, locator: Locator, region: tuple[slice, ...] | None = None
-    ) -> SharedRead:
-        """Borrow a mapped payload range for a host numerical consumer.
-
-        Native readiness and acknowledgment retain the source through the
-        consumer's last read. The returned object exposes only the selected
-        rows through the buffer protocol; release ends its read grant.
-        """
-        handle = locator.transport
-        if not isinstance(handle, PosixShmTransfer):
-            raise invalid_descriptor(
-                "shared storage borrow requires a shared storage locator"
-            )
-        if locator.source.node != self.source.node:
-            raise invalid_descriptor(
-                "shared storage transport requires the source node"
-            )
-        start, nbytes = row_span(locator, region)
-        return SharedRead(
-            handle.name, nbytes, self._acknowledgment_slot, offset=start
-        )
-
-    def release(self, locator: Locator) -> Completion | None:
-        if not isinstance(locator.transport, PosixShmTransfer):
-            raise invalid_descriptor(
-                "shared storage release requires a shared storage locator"
-            )
-        return self._buffers.release(locator)
-
-    def close(self) -> None:
-        # Drain reads first. Registry close finishes producer copies, then
-        # reaps buffers whose granted readers have all acknowledged.
-        try:
-            self._reads.close()
-        finally:
-            self._buffers.close()
+    for target, value in copy_pairs(source, packed):
+        copy_host_device(target, value, stream)
+        value.record_stream(stream)
 
 
 def _copy_payload(

@@ -30,6 +30,7 @@ mod shared_buffer;
 mod storage;
 mod stream;
 mod transfer;
+mod transport;
 mod vmm_pool;
 mod weight_prefetch;
 
@@ -85,8 +86,6 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<output::OutputPool>()?;
     module.add_class::<pending::PendingOutput>()?;
     module.add_class::<pending::TokenUpdate>()?;
-    module.add_class::<registry::BufferRegistry>()?;
-    module.add_class::<registry::TransportBuffer>()?;
     module.add_class::<shared_buffer::SharedBuffer>()?;
     module.add_class::<vmm_pool::VmmPool>()?;
     module.add_class::<vmm_pool::PoolChunk>()?;
@@ -107,6 +106,6 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<transfer::TransferCapacity>()?;
     module.add_class::<transfer::ReadReservation>()?;
     module.add_class::<transfer::TransferTicket>()?;
-    module.add_class::<transfer::TransferPool>()?;
+    module.add_class::<transport::Transport>()?;
     Ok(())
 }

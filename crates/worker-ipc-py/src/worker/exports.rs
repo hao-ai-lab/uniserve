@@ -10,6 +10,7 @@ use uniserve_worker_ipc::{BufferId, RequestKey};
 use super::completion::Completion;
 use super::error::{resource, unsupported};
 use super::protocol::buffer_id;
+use super::transport::Transport;
 use super::vmm_pool::PoolExhaustedError;
 use crate::convert;
 
@@ -62,27 +63,24 @@ pub(super) fn export<'py>(
     } else {
         &["local", "shm", "channel"]
     };
-    let consumers = PyTuple::new(py, consumers)?;
+    let consumers: Vec<_> = consumers.iter().map(|&slot| slot as usize).collect();
     let mut selected = Vec::new();
     for &name in names {
         if transports.contains(name)? {
-            let transport = transports.get_item(name)?;
-            if transport
-                .call_method1("serves", (&consumers,))?
-                .is_truthy()?
-            {
+            let transport = transports.get_item(name)?.cast_into::<Transport>()?;
+            if transport.get().serves(&consumers) {
                 selected.push(transport);
             }
         }
     }
 
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("offset", offset)?;
-    kwargs.set_item("consumers", &consumers)?;
     let mut locations = Vec::new();
     let result = (|| -> PyResult<()> {
         for transport in selected {
-            match transport.call_method("export", (source,), Some(&kwargs)) {
+            match transport
+                .get()
+                .export(py, source, offset, consumers.clone())
+            {
                 Ok(location) => retain_location(&transport, location, &mut retain, &mut locations)?,
                 Err(error) if error.is_instance_of::<PoolExhaustedError>(py) => {
                     // A device payload that cannot fit its VMM allocation
@@ -92,14 +90,14 @@ pub(super) fn export<'py>(
                         if !transports.contains(name)? {
                             continue;
                         }
-                        let fallback = transports.get_item(name)?;
-                        if !fallback
-                            .call_method1("serves", (&consumers,))?
-                            .is_truthy()?
-                        {
+                        let fallback = transports.get_item(name)?.cast_into::<Transport>()?;
+                        if !fallback.get().serves(&consumers) {
                             continue;
                         }
-                        let location = fallback.call_method("export", (source,), Some(&kwargs))?;
+                        let location =
+                            fallback
+                                .get()
+                                .export(py, source, offset, consumers.clone())?;
                         retain_location(&fallback, location, &mut retain, &mut locations)?;
                     }
                     if locations.is_empty() {
@@ -119,7 +117,7 @@ pub(super) fn export<'py>(
 
     if let Err(error) = result {
         for (transport, location) in &locations {
-            transport.call_method1("release", (location,))?;
+            transport.get().release(py, location)?;
         }
         return Err(error);
     }
@@ -127,16 +125,16 @@ pub(super) fn export<'py>(
 }
 
 fn retain_location<'py>(
-    transport: &Bound<'py, PyAny>,
+    transport: &Bound<'py, Transport>,
     location: Bound<'py, PyAny>,
     retain: &mut impl FnMut(Py<Completion>) -> PyResult<()>,
-    locations: &mut Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
+    locations: &mut Vec<(Bound<'py, Transport>, Bound<'py, PyAny>)>,
 ) -> PyResult<()> {
     // Include this location in failure cleanup even when its retirement
     // lookup or the storage owner's retention callback raises an error.
     locations.push((transport.clone(), location.clone()));
-    let retirement = transport.call_method1("retirement", (location,))?;
-    retain(retirement.extract()?)?;
+    let retirement = transport.get().retirement(transport.py(), &location)?;
+    retain(retirement)?;
     Ok(())
 }
 
@@ -184,7 +182,10 @@ pub(super) fn release(exports: &Bound<'_, PyDict>, buffers: &[Py<PyAny>]) -> PyR
             for location in locations.try_iter()? {
                 let (transport, locator): (Bound<'_, PyAny>, Bound<'_, PyAny>) =
                     location?.extract()?;
-                transport.call_method1("release", (locator,))?;
+                transport
+                    .cast::<Transport>()?
+                    .get()
+                    .release(exports.py(), &locator)?;
             }
         }
     }

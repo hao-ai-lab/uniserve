@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
 import torch
 
+from tests.python.fixtures.cuda_stream import blocked_stream
 from tests.python.fixtures.shm_export import serve_pending_export
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
@@ -776,7 +777,10 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
         events.close()
 
 
-def test_cuda_vmm_export_read_from_another_host_carries_no_fence() -> None:
+@pytest.mark.parametrize("device_index", (0, 1))
+def test_cuda_vmm_export_read_from_another_host_carries_no_fence(
+    device_index: int,
+) -> None:
     """A chunk whose readers are elsewhere is readable when it is published.
 
     An interprocess event handle does not reach another host, and imported VMM
@@ -784,7 +788,9 @@ def test_cuda_vmm_export_read_from_another_host_carries_no_fence() -> None:
     synchronizes after copying into the chunk instead and the export
     carries nothing for a consumer to wait on.
     """
-    device = torch.device("cuda:0")
+    if torch.cuda.device_count() <= device_index:
+        pytest.skip("requires a second CUDA device")
+    device = torch.device("cuda", device_index)
     events = EventPool()
     transport = make_transport(
         "cuda_vmm",
@@ -799,16 +805,16 @@ def test_cuda_vmm_export_read_from_another_host_carries_no_fence() -> None:
         # crossing decides the fence, not where the product is materialized.
         from uniserve_kernels.peer_storage import empty
 
-        source = empty((1024,), dtype=torch.float32, device=device)
-        source.fill_(1.0)
-        stream = torch.cuda.Stream(device=device)
-        submitted = torch.cuda.Event()
-        with torch.cuda.stream(stream):
+        with torch.cuda.device(device):
+            source = empty((1024,), dtype=torch.float32, device=device)
+            stream = torch.cuda.current_stream(device)
             torch.cuda._sleep(1_000_000_000)
-            locator = transport.export(source)
-            submitted.record(stream)
+            source.fill_(1.0)
 
-        assert submitted.query(), "export returned before its copy had landed"
+        # Export on the caller's original device. The transport must drain
+        # the source stream even when it belongs to a different device.
+        locator = transport.export(source)
+        assert stream.query(), "export returned before its copy had landed"
         assert not locator.transport.ready_event_handle, (
             "a pool export carries a fence a consumer cannot import"
         )
@@ -1223,25 +1229,30 @@ def test_cuda_vmm_local_copy_retains_its_source_until_device_completion(
     source = allocate((1024,), dtype=torch.float32, device=device)
     source.fill_(7)
     locator = producer.export(source)
-    destination = torch.empty_like(source)
-    initializer = torch.cuda.Stream(device=device)
+    destination = torch.zeros_like(source)
     torch.cuda.synchronize(device)
     try:
-        with torch.cuda.stream(initializer):
-            # Readiness can be exposed while device access still waits for
-            # the destination's previous work. The source must stay held.
-            torch.cuda._sleep(1_000_000_000)
-            destination.zero_()
-            ticket = consumer.fetch(
-                locator, device=device, destination=destination
-            )
-        _await_ticket(ticket)
-        retirement = producer.release(locator)
-        events.reap()
-        assert retirement is not None and not retirement.done()
+        with (
+            ThreadPoolExecutor(max_workers=1) as host,
+            blocked_stream(device) as initializer,
+        ):
+            with torch.cuda.stream(initializer):
+                destination.zero_()
+                ticket = consumer.fetch(
+                    locator, device=device, destination=destination
+                )
+            _await_ticket(ticket)
+            retirement = producer.release(locator)
+            events.reap()
+            assert retirement is not None and not retirement.done()
 
-        retired = threading.Event()
-        ticket.add_retirement_callback(retired.set)
+            # A failed close must leave the source and any pooled allocation
+            # available to the already accepted read.
+            with pytest.raises(WorkerError, match="readers remain unresolved"):
+                host.submit(producer.close).result(timeout=5)
+            retired = threading.Event()
+            ticket.add_retirement_callback(retired.set)
+
         assert retired.wait(10)
         events.reap()
         retirement.result(timeout=5)
