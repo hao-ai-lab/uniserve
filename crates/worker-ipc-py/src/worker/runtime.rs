@@ -28,8 +28,8 @@ use crate::PyServer;
 pub(crate) struct Worker {
     #[pyo3(get)]
     worker_config: Py<PyAny>,
-    #[pyo3(get)]
-    info: Py<PyAny>,
+    pub(super) info: Option<uniserve_worker_ipc::WorkerInfo>,
+    info_view: Option<Py<PyAny>>,
     device_product_bytes: u64,
 
     // Resources are filled during construction and released on normal close.
@@ -127,7 +127,8 @@ impl Worker {
     ) -> PyResult<Self> {
         let mut worker = Self {
             worker_config,
-            info: py.None(),
+            info: None,
+            info_view: None,
             device_product_bytes: 0,
             model: None,
             sampling_group,
@@ -211,6 +212,22 @@ impl Worker {
         config: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         bootstrap::from_config(cls, config)
+    }
+
+    /// Materialize the Python report only for a direct library consumer.
+    #[getter]
+    fn info(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        if let Some(view) = &slf.borrow().info_view {
+            return Ok(view.clone_ref(py));
+        }
+        let view = super::capacity::report::info_to_py(
+            py,
+            slf.borrow().info.as_ref().ok_or_else(closed)?,
+        )?
+        .unbind();
+        slf.borrow_mut().info_view = Some(view.clone_ref(py));
+        Ok(view)
     }
 
     /// The shared executor is initialized on first execution, after all resource
@@ -331,15 +348,16 @@ impl Worker {
         executor.borrow_mut(py).reset(py)?;
         {
             let worker = slf.borrow();
-            py.import("uniserve_worker.bootstrap.capacity")?
-                .call_method1(
-                    "check_startup_storage",
-                    (
-                        &worker.worker_config,
-                        worker.device_product_bytes,
-                        &worker.tensor_store,
-                    ),
-                )?;
+            super::capacity::check_startup_storage(
+                worker.worker_config.bind(py),
+                worker.device_product_bytes,
+                worker
+                    .tensor_store
+                    .as_ref()
+                    .ok_or_else(closed)?
+                    .bind(py)
+                    .as_any(),
+            )?;
         }
         slf.borrow_mut().warmed_up = true;
         Ok(())
@@ -502,7 +520,7 @@ impl Worker {
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.worker_config)?;
-        visit.call(&self.info)?;
+        visit.call(&self.info_view)?;
         visit.call(&self.executor)?;
         visit.call(&self.model)?;
         visit.call(&self.runner)?;

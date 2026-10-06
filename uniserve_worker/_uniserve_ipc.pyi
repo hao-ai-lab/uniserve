@@ -25,7 +25,9 @@ import uniserve_worker.storage.kv_cache as kv_cache
 from uniserve.distributed.mesh import Communicator
 from uniserve.model.logits import VocabShard
 from uniserve.processing import FlowPrompt, ImageProcessor
+from uniserve.runtime.backends.attention import Backend
 from uniserve.runtime.execution import ExecutionContext
+from uniserve.runtime.prefix_cache import Planes
 from uniserve.runtime.process_groups import ProcessGroups
 from uniserve.tensors import BufferConfig, OutputLayout
 from uniserve_worker.config.deployment import ComponentConfig, WorkerProcessArgs
@@ -34,6 +36,7 @@ from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestResult
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.model_executor.input_batch import InputBatch, InputRow
+from uniserve_worker.model_executor.input_buffers import TokenBufferConfig
 from uniserve_worker.profiling import WorkerProfiler
 from uniserve_worker.protocol.batch import (
     BatchCommand,
@@ -53,6 +56,7 @@ from uniserve_worker.protocol.call import (
     CanvasStep,
     ErrorCode,
     ImageParams,
+    MediaCall,
     Readout,
     Rng,
     SamplingState,
@@ -62,7 +66,7 @@ from uniserve_worker.protocol.output import (
     BatchOutput,
     RequestOutput,
 )
-from uniserve_worker.protocol.tensor import TensorRef
+from uniserve_worker.protocol.tensor import OutputInfo, TensorRef
 from uniserve_worker.protocol.transfer import (
     KvTransfer,
     TensorTransfer,
@@ -2927,3 +2931,133 @@ def resolve_prefix(
     negative_token_ids: Sequence[int],
     tokenizer: Any,
 ) -> tuple[tuple[int, ...], bool]: ...
+
+@final
+class KVCapacity:
+    @property
+    def num_units(self) -> int: ...
+    @property
+    def unit_bytes(self) -> int: ...
+
+@final
+class ArenaCapacity:
+    @property
+    def latent_pool_bytes(self) -> int: ...
+    @property
+    def tensor_store(self) -> int: ...
+    @property
+    def device_product_bytes(self) -> int: ...
+    @property
+    def transfer_bytes(self) -> int: ...
+    @property
+    def transfer_tickets(self) -> int: ...
+    @property
+    def host_lane_inflight(self) -> int: ...
+
+@final
+class WorkerLayout:
+    """Physical allocations and their logical engine capacity report."""
+    @property
+    def info(self) -> WorkerInfo: ...
+    @property
+    def arena(self) -> ArenaCapacity: ...
+    @property
+    def input_config(self) -> TokenBufferConfig | None: ...
+    @property
+    def fixed_device_bytes(self) -> list[tuple[str, int]]: ...
+    @property
+    def physical_buffer_pool_bytes(self) -> int: ...
+
+def build_worker_layout(
+    model: torch.nn.Module,
+    worker_config: WorkerConfig,
+    *,
+    image_processor: ImageProcessor | None = None,
+    model_name: str | None = None,
+    queue_depth: int = 1,
+    endpoint: WorkerEndpoint | None = None,
+    capacity_group: Communicator | None = None,
+    allowed_calls: frozenset[CallKind] | None = None,
+    transfer_backends: Sequence[str] = ("local",),
+    components: Sequence[tuple[str, ComponentConfig]] | None = None,
+    attention_backend: str = "",
+    bindings: Mapping[str, ComponentBinding] | None = None,
+    state_buffers: Mapping[str, BufferConfig] | None = None,
+) -> WorkerLayout: ...
+def resolve_page_size(
+    model: torch.nn.Module,
+    config: WorkerConfig,
+    attention: Backend,
+    *,
+    group: Communicator | None = None,
+) -> WorkerConfig: ...
+def input_buffer_config(
+    model: torch.nn.Module,
+    config: WorkerConfig,
+    *,
+    processor: ImageProcessor | None = None,
+) -> TokenBufferConfig: ...
+def table_widths(
+    planes: Planes,
+    *,
+    max_sequence_tokens: int,
+    max_query_tokens: int,
+) -> tuple[int, ...]: ...
+def resident_width(planes: Planes, *, max_sequence_tokens: int) -> int: ...
+def graph_table_widths(
+    model: torch.nn.Module,
+    worker_config: WorkerConfig,
+    pool: kv_cache.KVCacheManager | None,
+) -> tuple[int, ...]: ...
+def resolve_request_capacity(
+    model: torch.nn.Module,
+    worker_config: WorkerConfig,
+    *,
+    queue_depth: int,
+    capacity_group: Communicator | None,
+    bindings: Mapping[str, ComponentBinding] | None = None,
+    state_buffers: Mapping[str, BufferConfig] | None = None,
+) -> WorkerConfig: ...
+def tensor_slot_capacity(
+    requirements: Sequence[int],
+    group: Communicator,
+    *,
+    minimum: int,
+    available_bytes: int,
+) -> int:
+    """Greatest request count fitting every rank's candidate byte budgets.
+
+    Requirements start at ``minimum`` requests, one per successive count.
+    All ranks participate with the same range; budgets need not be monotone.
+    """
+    ...
+
+def derive_runtime_kv_capacity(
+    *,
+    pages: Sequence[tuple[int, int]],
+    kv_token_capacity: int | None,
+    unit_bytes: int,
+    device: str | torch.device | None = None,
+    available_bytes: int | None = None,
+    floor: int = 1,
+    default_units: int | None = None,
+    resident_copies: int = 1,
+    co_resident_units: int = 0,
+) -> KVCapacity: ...
+def device_total_bytes(device: str | torch.device) -> int: ...
+def local_product_storage_bytes(
+    entry_outputs: Mapping[str, Sequence[OutputInfo]],
+    *,
+    bindings: Mapping[str, ComponentBinding],
+    media_components: Mapping[MediaCall, str],
+) -> int: ...
+def check_startup_storage(
+    worker_config: WorkerConfig,
+    product_capacity_bytes: int,
+    tensor_store: TensorStore,
+) -> None: ...
+def loaded_worker_config(
+    model: torch.nn.Module,
+    config: WorkerConfig,
+    queue_depth: int,
+) -> WorkerConfig: ...

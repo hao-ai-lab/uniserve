@@ -483,7 +483,13 @@ pub(crate) struct Executor {
 impl Executor {
     #[new]
     pub(super) fn new(py: Python<'_>, worker: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let capacity = worker.getattr("info")?.getattr("queue_depth")?.extract()?;
+        let info = worker
+            .cast::<super::runtime::Worker>()?
+            .borrow()
+            .info
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("worker capacity is not initialized"))?;
+        let capacity = info.queue_depth as usize;
         let distributed = worker
             .getattr("worker_config")?
             .getattr("world_size")?
@@ -523,7 +529,6 @@ impl Executor {
             }
         }
 
-        let info: WorkerInfo = depythonize(&worker.getattr("info")?.call_method0("to_mapping")?)?;
         let model_runner = worker.getattr("runner")?;
         let mut collective = false;
         for binding in model_runner

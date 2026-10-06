@@ -226,6 +226,24 @@ def test_h3_worker_advertises_bounded_media_products():
     assert info.max_batch_calls == 2
 
 
+def test_media_request_slots_reserve_output_and_retirement_positions():
+    from tests.python.fixtures.h3 import fasth3_config
+    from uniserve_models.minimax_h3 import Model
+    from uniserve_worker.bootstrap.model_loader import loaded_worker_config
+    from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.errors import WorkerError
+
+    with torch.device("meta"):
+        model = Model(fasth3_config())
+    config = WorkerConfig(max_batch_calls=4)
+    for depth, slots in ((6, 2), (9, 3), (15, 4)):
+        fitted = loaded_worker_config(model, config, depth)
+        assert fitted.max_request_pool_size == slots
+        assert fitted.max_batch_calls == fitted.max_batch_tokens == slots
+    with pytest.raises(WorkerError, match="two slots"):
+        loaded_worker_config(model, config, 5)
+
+
 def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 

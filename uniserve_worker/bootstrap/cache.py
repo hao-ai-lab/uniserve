@@ -1,41 +1,23 @@
-"""Describe a rank's paged K/V unit pool to the engine scheduler.
+"""Numerical cache layouts and the rank's layer and head placement.
 
-The worker reports a ``KVCacheInfo`` in its ``WorkerInfo``: the unit pool's
-size and unit bytes, and one group per history window and K/V page shape.
-Each group places this rank's layers by global cache-layer id and its K/V
-heads by interval. The token-worker path of ``build_worker_layout`` in
-``uniserve_worker.bootstrap.report`` calls ``cache_info`` with a minimal
-pool to learn the unit size, sizes the pool, and attaches the granted unit
-count with ``resize_cache``. When the engine assembles a worker group from
-its ranks' startup reports, it requires every logical layer to belong to one
-group and its K/V heads to be covered without a gap.
+Native capacity planning selects the page size and physical unit count.
+These descriptions retain the model's cache grouping and tensor partition.
 """
 
-from dataclasses import replace
-
 import torch
-from torch import nn
 
-from uniserve.distributed.mesh import Communicator
-from uniserve.math import ceil_div
 from uniserve.model import CausalLM
-from uniserve.nn.attention import Attention
 from uniserve.quantization import Quantizer
-from uniserve.runtime.backends.attention import Backend, CachePages
 from uniserve.runtime.prefix_cache import Planes, plan_units
-from uniserve_worker.bootstrap.inputs import capability
+from uniserve_worker._uniserve_ipc import resident_width as resident_width
+from uniserve_worker._uniserve_ipc import resolve_page_size as resolve_page_size
+from uniserve_worker._uniserve_ipc import table_widths as table_widths
 from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.protocol.worker_info import (
     KVCacheInfo,
     KvGroup,
     KvGroupKind,
 )
-
-# The largest base page size, in tokens, a worker chooses when the operator
-# sets none. A smaller one is chosen only when an attention kernel cannot
-# read the pages the larger one gives some cache group.
-DEFAULT_BLOCK_SIZE = 64
 
 
 def storage(config: WorkerConfig) -> tuple[torch.dtype | None, bool]:
@@ -85,132 +67,6 @@ def _plan(model: CausalLM, config: WorkerConfig, block_size: int) -> Planes:
         quantization={name: Quantizer("fp8", axis=0) for name in layers}
         if fp8
         else None,
-    )
-
-
-def resolve_page_size(
-    model: nn.Module,
-    config: WorkerConfig,
-    attention: Backend,
-    *,
-    group: Communicator | None = None,
-) -> WorkerConfig:
-    """Resolve the KV page size of a worker whose operator set none.
-
-    An explicit ``block_size`` is kept: a cache group whose pages its
-    attention cannot read then fails when the layer is prepared, naming the
-    layer and its pages. Unset, the base page size is the largest power of
-    two up to ``DEFAULT_BLOCK_SIZE`` at which ``attention`` serves every
-    resident cache layer on the pages its group then holds; a model without
-    a paged cache takes ``DEFAULT_BLOCK_SIZE``. The ranks of ``group`` take
-    the smallest of their sizes, so the ranks of one worker share one page
-    shape.
-
-    Returns:
-        ``config`` with ``block_size`` set.
-
-    Raises:
-        WorkerError: ``unsupported_setup`` when no page size up to
-            ``DEFAULT_BLOCK_SIZE`` serves every resident cache layer.
-    """
-    if config.block_size is not None:
-        return config
-
-    text = capability(model, CausalLM)
-    size = (
-        DEFAULT_BLOCK_SIZE
-        if text is None
-        else _largest_page_size(text, config, attention)
-    )
-    if group is not None and group.size > 1:
-        agreed = torch.tensor(size, dtype=torch.int64, device=group.device)
-        group.all_reduce(agreed, op="min")
-        size = int(agreed.item())
-    return replace(config, block_size=size)
-
-
-def _largest_page_size(
-    model: CausalLM, config: WorkerConfig, attention: Backend
-) -> int:
-    """Return the largest base page size ``attention`` reads for every layer.
-
-    Candidates halve from ``DEFAULT_BLOCK_SIZE``; each plans the unit pool
-    and asks the backend whether it serves every resident cache layer, with
-    that layer's attention shape, on its group's pages.
-    """
-    readers = {
-        module.cache_name: module
-        for module in model.modules()
-        if isinstance(module, Attention) and module.cache_name is not None
-    }
-    layouts = model.cache_config.layers
-    if not set(layouts) <= set(readers):
-        raise unsupported_setup(
-            "every resident cache layer requires an attention layer reading it"
-        )
-
-    size = DEFAULT_BLOCK_SIZE
-    while size >= 1:
-        planes = _plan(model, config, size)
-        if all(
-            attention.reads_pages(
-                num_heads=readers[name].local_heads,
-                num_kv_heads=readers[name].local_kv_heads,
-                head_dim=readers[name].head_dim,
-                dtype=layouts[name].compute_dtype,
-                window=readers[name].window,
-                pages=CachePages(
-                    group.page_tokens, group.dtype, planes.quantized
-                ),
-            )
-            for group in planes.groups
-            for name in group.layers
-        ):
-            return size
-        size //= 2
-    raise unsupported_setup(
-        f"no KV page size of at most {DEFAULT_BLOCK_SIZE} tokens is read by "
-        "the attention of every resident cache layer"
-    )
-
-
-def table_widths(
-    planes: Planes, *, max_sequence_tokens: int, max_query_tokens: int
-) -> tuple[int, ...]:
-    """Bound the columns one call selects per numerical block table.
-
-    A full-attention table spans the longest sequence. A sliding-window
-    table spans only the pages a reader's window of history and one call's
-    queries intersect, at most ``ceil((window + queries) / page_tokens) +
-    1``. Tables are in table order, one per unit position of every group.
-    """
-    widths = []
-    for group in planes.groups:
-        width = ceil_div(max(1, max_sequence_tokens), group.page_tokens)
-        if group.window is not None:
-            width = min(
-                width,
-                ceil_div(
-                    group.window + max(1, max_query_tokens), group.page_tokens
-                )
-                + 1,
-            )
-        widths.extend((max(1, width),) * group.units_per_page)
-    return tuple(widths)
-
-
-def resident_width(planes: Planes, *, max_sequence_tokens: int) -> int:
-    """Return the most pages one slot's installed group table may hold.
-
-    A table may cover the longest sequence in any group, including a
-    sliding-window group whose worst-case reservation holds every page.
-    """
-    return max(
-        1,
-        *(
-            ceil_div(max(1, max_sequence_tokens), group.page_tokens)
-            for group in planes.groups
-        ),
     )
 
 
@@ -321,8 +177,3 @@ def cache_info(
         dtype=str(stored).removeprefix("torch."),
         groups=tuple(groups),
     )
-
-
-def resize_cache(info: KVCacheInfo, num_units: int) -> KVCacheInfo:
-    """Attach the granted unit count to a cache description."""
-    return replace(info, num_units=num_units)

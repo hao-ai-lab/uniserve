@@ -29,7 +29,6 @@ from uniserve.model import (
     ComponentEntry,
     Denoiser,
     ImageDecoder,
-    VideoDecoder,
 )
 from uniserve.nn.attention import (
     AttentionParallelConfig,
@@ -46,6 +45,7 @@ from uniserve.processing import (
 )
 from uniserve.quantization import QuantizationConfig, Quantizer
 from uniserve_models import loading as models
+from uniserve_worker._uniserve_ipc import loaded_worker_config
 from uniserve_worker.bootstrap.components import (
     is_host_component,
     validate_components,
@@ -566,45 +566,3 @@ def _devices(
             "generation device requires a model with a distinct flow route"
         )
     return paths
-
-
-def loaded_worker_config(
-    model: nn.Module, config: WorkerConfig, queue_depth: int
-) -> WorkerConfig:
-    """Resolve media request slots from the worker's export lifetime.
-
-    A resident media slot occupies three positions of the worker's batch
-    queue, one reserved pipeline position and two unresolved outputs, and a
-    media worker keeps at least two slots resident. The same three-position
-    bound governs ``request_tensor_window`` and ``resolve_request_capacity``
-    in ``uniserve_worker.bootstrap.capacity``.
-
-    Only a model containing a ``VideoDecoder`` is adjusted: its batch bounds
-    and maximum request-pool size become the slot count, its minimum
-    request-pool size becomes two, and it drops the KV token capacity,
-    attention backend and generation device. Any other model's configuration
-    is returned unchanged.
-
-    Raises:
-        WorkerError: With ``UNSUPPORTED_SETUP`` when the queue depth or
-            ``max_batch_calls`` leaves fewer than two slots.
-    """
-    if any(isinstance(module, VideoDecoder) for module in model.modules()):
-        state_slots = min(config.max_batch_calls, queue_depth // 3)
-        if state_slots < 2:
-            raise unsupported_setup(
-                "resident media execution requires two slots of three queue "
-                f"positions each; queue depth {queue_depth} holds "
-                f"{queue_depth // 3}"
-            )
-        config = replace(
-            config,
-            kv_token_capacity=None,
-            attention_backend=None,
-            max_batch_calls=state_slots,
-            max_batch_tokens=state_slots,
-            max_request_pool_size=state_slots,
-            min_request_pool_size=2,
-            generation_device=None,
-        )
-    return config

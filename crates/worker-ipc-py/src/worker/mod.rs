@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 mod batch;
 mod block_tables;
 mod buffer;
+mod capacity;
 mod completion;
 mod descriptor_grants;
 pub(crate) mod error;
@@ -44,6 +45,7 @@ mod weight_prefetch;
 
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    capacity::register(module)?;
     module.add_class::<sampling::SamplingMetadata>()?;
     module.add_function(wrap_pyfunction!(sampling::sample, module)?)?;
     module.add_function(wrap_pyfunction!(sampling::sample_graph, module)?)?;
