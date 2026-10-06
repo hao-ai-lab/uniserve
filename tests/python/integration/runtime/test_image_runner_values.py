@@ -15,6 +15,7 @@ from tests.python.fixtures.checkpoints import (
     load_bagel,
     sensenova_checkpoint,
 )
+from tests.python.fixtures.model_runner import forward_batch
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image
 from uniserve.model import TextSize
@@ -248,7 +249,8 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                     for slot in range(len(branches))
                 )
 
-            result = runner.run_forward_group(
+            result = forward_batch(
+                runner,
                 tuple(
                     prefix_row(tokens, (slot + 1, 0, 32))
                     for slot, tokens in enumerate(prefixes)
@@ -332,7 +334,8 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 conditioning_position=prefix_length,
                 device=torch.device("cuda:0"),
             )
-            result = runner.run_forward_group(
+            result = forward_batch(
+                runner,
                 rows,
                 calls=calls(MediaCall.DENOISING),
                 cache=manager,
@@ -509,7 +512,8 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 ForwardMode.PREFILL,
                 Bounds(),
             )
-            actual = worker.runner.run_forward_group(
+            actual = forward_batch(
+                worker.runner,
                 (row,),
                 calls=(call,),
                 cache=worker.kv_cache,
@@ -546,7 +550,8 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             ForwardMode.PREFILL,
             Bounds(),
         )
-        actual = worker.runner.run_forward_group(
+        actual = forward_batch(
+            worker.runner,
             (row,),
             calls=(call,),
             cache=worker.kv_cache,
@@ -583,7 +588,8 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 expected = model.text.compute_logits(
                     model.text(inputs), token_indices=next_position[0]
                 ).gather()
-                actual = worker.runner.run_forward_group(
+                actual = forward_batch(
+                    worker.runner,
                     (
                         TokenRow(
                             forward_mode=ForwardMode.DECODE,
@@ -670,8 +676,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 image_base64=payload,
                 encoder_handle=11,
             )
-            encode = replace(
-                encode,
+            encode = encode.replace(
                 encoder_output=replace(
                     encode.encoder_output,
                     shape_bound=ShapeBound(

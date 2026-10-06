@@ -35,6 +35,7 @@ import torch
 import torch.multiprocessing as mp
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
+from tests.python.fixtures.model_runner import forward_batch
 from tests.python.integration.runtime.test_prefill_graphs import (
     NATIVE_TEXT,
     NATIVE_VISION,
@@ -263,7 +264,8 @@ def _run(runner, manager, rows, kind):
         )
         for index, row in enumerate(rows)
     )
-    return runner.run_forward_group(
+    return forward_batch(
+        runner,
         rows,
         calls=calls,
         cache=manager,

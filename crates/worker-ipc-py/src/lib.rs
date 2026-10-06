@@ -11,8 +11,10 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod calls;
 mod client;
 mod convert;
+mod ids;
 mod worker;
 
 use std::os::fd::AsRawFd;
@@ -387,6 +389,10 @@ fn atomic_load_u32(buffer: PyBuffer<u8>, offset: usize) -> PyResult<u32> {
 #[pymodule]
 /// Registers the worker IPC Python extension module.
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<ids::RequestKey>()?;
+    m.add_class::<ids::CallId>()?;
+    m.add_class::<ids::BufferId>()?;
+    m.add_class::<calls::Call>()?;
     worker::register(m)?;
     m.add_class::<PyServer>()?;
     m.add_class::<client::PyClient>()?;

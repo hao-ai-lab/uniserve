@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.checkpoints import bagel_checkpoint
+from tests.python.fixtures.model_runner import forward_batch
 from uniserve.media import image
 from uniserve.runtime import PrefixCache
 from uniserve_models import bagel
@@ -130,7 +131,8 @@ def _run(runner, manager, rows):
         for index, row in enumerate(rows)
     )
     return (
-        runner.run_forward_group(
+        forward_batch(
+            runner,
             rows,
             calls=calls,
             cache=manager,

@@ -187,7 +187,7 @@ impl PendingOutput {
         buffer: Py<OutputBuffer>,
         row: usize,
     ) -> PyResult<Self> {
-        let plan = pythonize::depythonize(&call.bind(py).call_method0("to_mapping")?)?;
+        let plan = Arc::clone(&call.extract::<PyRef<'_, crate::calls::Call>>(py)?.inner);
         Self::for_call(py, call, &plan, request, buffer, row)
     }
 

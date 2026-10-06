@@ -430,7 +430,7 @@ def stamp_batch(worker: object, batch: Batch) -> Batch:
         rule = _CALL_PROJECTIONS.get(identity)
         if rule is not None:
             ledger[call.request_key] = _projected(entry, rule)
-        stamped.append(replace(call, coordinates=entry))
+        stamped.append(call.replace(coordinates=entry))
     return replace(batch, calls=tuple(stamped))
 
 

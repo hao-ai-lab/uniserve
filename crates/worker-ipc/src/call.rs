@@ -7,8 +7,8 @@
 //! rows with `ForwardBatch::select` and sets each call's `consumer_slots`),
 //! and [`crate::codec`] encodes it as FlatBuffers. A rank answers with one
 //! [`BatchOutput`] of per-call [`RequestOutput`] completions. The Python
-//! worker mirrors these types in the `identity`, `call`, `batch`, and `output`
-//! modules of `uniserve_worker.protocol`.
+//! worker exposes native request, call and buffer identifiers alongside the
+//! numerical records in `uniserve_worker.protocol`.
 //!
 //! Types with invariants carry a `validate` method. [`Batch::validate`]
 //! reaches each nested one and adds the checks that span calls. The

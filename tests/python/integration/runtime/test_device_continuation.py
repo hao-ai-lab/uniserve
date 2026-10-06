@@ -86,8 +86,7 @@ def test_decode_terminal_policy_suppresses_only_its_own_expected_successor(
         )
         if finish_policy != "admission":
             decodes = (
-                replace(
-                    decodes[0],
+                decodes[0].replace(
                     sampling_state=SamplingState(
                         finish_token_ids=(terminal,)
                         if finish_policy == "call"
@@ -175,7 +174,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
         tokens=(0,),
         predicate=predecessor.token_output,
     )
-    successor = replace(successor_template, input_token_ids=())
+    successor = successor_template.replace(input_token_ids=())
 
     successor_report = worker.submit(
         execution_batch(

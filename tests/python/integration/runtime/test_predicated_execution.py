@@ -44,8 +44,7 @@ def _with_transition_predicate(
         dtype=DType.U8,
         shape_bound=ShapeBound(),
     )
-    return replace(
-        selected,
+    return selected.replace(
         transition_output=transition,
         sampling_state=SamplingState(transition_token_ids=(token_id,)),
     )
@@ -101,8 +100,7 @@ def test_feedback_call_publishes_distinct_completion_relay_outputs() -> None:
         dtype=DType.U8,
         shape_bound=ShapeBound(),
     )
-    call = replace(
-        with_transition,
+    call = with_transition.replace(
         completion_output=completion,
         token_output=token,
         transition_output=transition,
@@ -315,7 +313,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         predecessor=predecessor.call_id,
         conditioning=conditioning,
     )
-    candidate = replace(candidate, predicate=transition_predicate)
+    candidate = candidate.replace(predicate=transition_predicate)
 
     candidate_batch = execution_batch(batch_id=4, calls=(candidate,))
     prepared = worker.submit(candidate_batch)

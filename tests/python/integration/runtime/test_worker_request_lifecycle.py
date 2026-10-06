@@ -768,7 +768,7 @@ def test_a_call_whose_coordinates_contradict_the_request_is_refused() -> None:
         # The prompt left the request at position two; claim the origin.
         contradicted = replace(
             run,
-            calls=(replace(run.calls[0], coordinates=CallCoordinates()),),
+            calls=(run.calls[0].replace(coordinates=CallCoordinates()),),
         )
         refused = finalized_report(worker, worker.submit(contradicted))
 

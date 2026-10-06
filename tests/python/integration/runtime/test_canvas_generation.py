@@ -478,18 +478,21 @@ def _second_tables(tokens):
 
 def _row_step(batch, row, request, context, block, step, predicate=None):
     """Row ``row`` of batch ``batch``: request ``request``'s canvas step."""
-    return replace(
-        _step(batch, context, block, step, predicate).calls[0],
-        request_key=request,
-        call_id=CallId(batch, row),
-        completion_output=TensorRef(
+    return (
+        _step(batch, context, block, step, predicate)
+        .calls[0]
+        .replace(
             request_key=request,
-            producer_call_id=CallId(batch, row),
-            output_index=0,
-            generation=batch,
-            dtype=DType.U8,
-            shape_bound=ShapeBound(),
-        ),
+            call_id=CallId(batch, row),
+            completion_output=TensorRef(
+                request_key=request,
+                producer_call_id=CallId(batch, row),
+                output_index=0,
+                generation=batch,
+                dtype=DType.U8,
+                shape_bound=ShapeBound(),
+            ),
+        )
     )
 
 
@@ -541,7 +544,7 @@ def test_a_batch_of_canvas_steps_reports_each_rows_outcome(tmp_path):
         second = _prefill(2, 0, tokens=second_prompt)
         admitted = replace(
             second,
-            calls=(replace(second.calls[0], request_key=SECOND),),
+            calls=(second.calls[0].replace(request_key=SECOND),),
             commands=(
                 Start(
                     NewRequest(
@@ -595,8 +598,7 @@ def test_a_batch_of_canvas_steps_reports_each_rows_outcome(tmp_path):
             replace(
                 gated_commit,
                 calls=(
-                    replace(
-                        gated_commit.calls[0],
+                    gated_commit.calls[0].replace(
                         predicate=stopping.completion_output,
                     ),
                 ),

@@ -6,6 +6,7 @@ import pytest
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+from tests.python.fixtures.model_runner import forward_batch
 from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import CausalLM
@@ -177,7 +178,8 @@ def _text_runner(model, provider, decode_capacity=2, image_processor=None):
                 )
                 for index in range(len(rows))
             )
-            return runner.run_forward_group(
+            return forward_batch(
+                runner,
                 rows,
                 calls=calls,
                 cache=manager,
@@ -466,7 +468,8 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
                         bounds=Bounds(),
                     )
                 )
-            result = runner.run_forward_group(
+            result = forward_batch(
+                runner,
                 tuple(rows),
                 calls=tuple(calls),
                 cache=manager,

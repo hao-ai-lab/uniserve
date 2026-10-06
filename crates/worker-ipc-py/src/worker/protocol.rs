@@ -2,9 +2,7 @@
 
 use pyo3::prelude::*;
 use serde::de::DeserializeOwned;
-use uniserve_core::{
-    CallId, ConditionMedia, ConditionVision, RequestId, VideoCondition, VisionGrid,
-};
+use uniserve_core::{CallId, ConditionMedia, ConditionVision, VideoCondition, VisionGrid};
 use uniserve_worker_ipc::{BufferId, NewRequest, RequestKey, VideoAdmission};
 
 /// Decode immutable admission parameters once, before the pool mutates state.
@@ -86,25 +84,13 @@ fn video_admission(value: &Bound<'_, PyAny>) -> PyResult<VideoAdmission> {
 }
 
 pub(crate) fn request_key(value: &Bound<'_, PyAny>) -> PyResult<RequestKey> {
-    Ok(RequestKey::new(
-        value.getattr("engine_id")?.extract()?,
-        RequestId(value.getattr("request_id")?.extract()?),
-        value.getattr("request_epoch")?.extract()?,
-    ))
+    Ok(value.extract::<PyRef<'_, crate::ids::RequestKey>>()?.inner)
 }
 
 pub(crate) fn call_id(value: &Bound<'_, PyAny>) -> PyResult<CallId> {
-    Ok(CallId::new(
-        value.getattr("batch_id")?.extract()?,
-        value.getattr("request_index")?.extract()?,
-    ))
+    Ok(value.extract::<PyRef<'_, crate::ids::CallId>>()?.inner)
 }
 
 pub(crate) fn buffer_id(value: &Bound<'_, PyAny>) -> PyResult<BufferId> {
-    Ok(BufferId {
-        owner: request_key(&value.getattr("owner")?)?,
-        producer_call_id: call_id(&value.getattr("producer_call_id")?)?,
-        output_index: value.getattr("output_index")?.extract()?,
-        generation: value.getattr("generation")?.extract()?,
-    })
+    Ok(value.extract::<PyRef<'_, crate::ids::BufferId>>()?.inner)
 }

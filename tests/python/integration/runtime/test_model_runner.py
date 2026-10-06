@@ -310,7 +310,7 @@ def test_text_extension_rejects_missing_input_tokens() -> None:
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    call = replace(call, input_token_ids=())
+    call = call.replace(input_token_ids=())
     report = finalized_report(
         worker,
         worker.submit(
@@ -349,7 +349,7 @@ def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent()
         tokens=(0,),
         predicate=predecessor.token_output,
     )
-    call = replace(template, input_token_ids=())
+    call = template.replace(input_token_ids=())
     invalid_table = BlockTable(
         request_pool_idx=admission.request_pool_idx,
         group_id=0,
@@ -403,7 +403,7 @@ def test_decode_reuses_the_published_request_page_table() -> None:
                 tokens=(0,),
                 predicate=predecessor.token_output,
             )
-            call = replace(template, input_token_ids=())
+            call = template.replace(input_token_ids=())
             report = finalized_report(
                 worker,
                 worker.submit(
@@ -2152,8 +2152,7 @@ def test_local_and_imported_completion_predicates_keep_request_progress(
             dtype=DType.U8,
             shape_bound=ShapeBound(),
         )
-        local_source = replace(
-            local_source,
+        local_source = local_source.replace(
             transition_output=local_predicate,
             sampling_state=SamplingState(
                 transition_token_ids=(expected_successor(4) + 1,),
@@ -2405,8 +2404,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     )
     if reject_output:
         assert diffusion_finalize.image_output is not None
-        diffusion_finalize = replace(
-            diffusion_finalize,
+        diffusion_finalize = diffusion_finalize.replace(
             image_output=replace(
                 diffusion_finalize.image_output,
                 shape_bound=ShapeBound((StaticDim(1),)),
@@ -2770,8 +2768,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         dtype=DType.U8,
         shape_bound=ShapeBound(),
     )
-    state = replace(
-        state,
+    state = state.replace(
         sampling_state=SamplingState(
             finish_token_ids=(next_token + 1,),
             transition_token_ids=(next_token,),
@@ -2913,7 +2910,7 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
     )
     # An external consumer, named on the call, holds the first latent
     # unacknowledged across its semantic Free.
-    first = replace(first, consumer_slots=(1,))
+    first = first.replace(consumer_slots=(1,))
     first_report = finalized_report(
         worker,
         worker.submit(

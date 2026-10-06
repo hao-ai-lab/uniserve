@@ -550,7 +550,8 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     # Conditioning prefixes are prefilled by the same component's prefill
     # entry.
     forward = entry.batch_forward
-    prefix_entry = runner._forward_calls[(entry.name, ForwardMode.PREFILL)]
+    prefix_entry = runner.batch_runners.get(entry.name, ForwardMode.PREFILL)
+    assert prefix_entry is not None
     stream = entry.context.stream
     if stream is not None:
         stream.wait(torch.cuda.current_stream(entry.device))
