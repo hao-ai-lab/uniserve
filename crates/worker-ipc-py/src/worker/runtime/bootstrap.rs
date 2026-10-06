@@ -8,6 +8,7 @@ use pyo3::types::{PyDict, PyTuple, PyType};
 
 use super::{Worker, abort, closed};
 use crate::worker::buffer::BufferPool;
+use crate::worker::capacity::{self, inputs as capacity_inputs, pools, report};
 use crate::worker::error::unsupported;
 use crate::worker::events::EventPool;
 use crate::worker::execution::close_all;
@@ -244,25 +245,21 @@ impl Worker {
 
         // Capacity is measured after model inputs and workspaces are bound.
         // The page size is resolved first so every later pool uses that size.
-        let cache = py.import("uniserve_worker.bootstrap.cache")?;
-        let capacity = py.import("uniserve_worker.bootstrap.capacity")?;
-        let options = PyDict::new(py);
-        options.set_item("group", &group)?;
-        config = cache.call_method(
-            "resolve_page_size",
-            (&model, &config, &self.attention),
-            Some(&options),
+        let capacity_group = (!group.is_none()).then_some(&group);
+        config = capacity_inputs::resolve_page_size(
+            model,
+            &config,
+            self.attention.as_ref().ok_or_else(closed)?.bind(py),
+            capacity_group,
         )?;
         runner.setattr("worker_config", &config)?;
-        let options = PyDict::new(py);
-        options.set_item("state_buffers", runner.getattr("state_buffers")?)?;
-        options.set_item("queue_depth", queue_depth)?;
-        options.set_item("bindings", &bindings)?;
-        options.set_item("capacity_group", &group)?;
-        config = capacity.call_method(
-            "resolve_request_capacity",
-            (&model, &config),
-            Some(&options),
+        config = pools::resolve_request_capacity(
+            model,
+            &config,
+            queue_depth,
+            capacity_group,
+            bindings.as_ref().map(|value| value.bind(py)),
+            Some(&runner.getattr("state_buffers")?),
         )?;
         self.worker_config = config.clone().unbind();
         runner.setattr("worker_config", &config)?;
@@ -274,49 +271,39 @@ impl Worker {
         let components = components
             .map(|value| value.into_bound(py))
             .unwrap_or_else(|| PyTuple::empty(py).into_any());
-        let options = PyDict::new(py);
-        options.set_item("image_processor", image_processor)?;
-        options.set_item("state_buffers", runner.getattr("state_buffers")?)?;
-        options.set_item("endpoint", &endpoint)?;
-        options.set_item("bindings", bindings)?;
-        options.set_item("queue_depth", queue_depth)?;
-        options.set_item("completion_payload_bytes", completion_payload_bytes)?;
-        options.set_item("allowed_calls", allowed_calls)?;
-        options.set_item("transfer_backends", PyTuple::new(py, &transfer_backends)?)?;
-        options.set_item("components", &components)?;
-        options.set_item("model_name", model_name)?;
-        options.set_item(
-            "attention_backend",
-            runner.getattr("attention")?.getattr("name")?,
-        )?;
-        options.set_item(
-            "capacity_group",
-            if group.is_none() {
-                self.sampling_group
-                    .as_ref()
-                    .map(|value| value.bind(py).clone())
-                    .unwrap_or_else(|| py.None().into_bound(py))
-            } else {
-                group
-            },
-        )?;
-        let layout = py.import("uniserve_worker.bootstrap.report")?.call_method(
-            "build_worker_layout",
-            (&model, &config),
-            Some(&options),
+        let layout = report::build_worker_layout(
+            model,
+            &config,
+            image_processor.as_ref().map(|value| value.bind(py)),
+            model_name
+                .as_ref()
+                .map(|value| value.extract(py))
+                .transpose()?,
+            queue_depth,
+            Some(&endpoint),
+            capacity_group.or_else(|| self.sampling_group.as_ref().map(|value| value.bind(py))),
+            allowed_calls.as_ref().map(|value| value.bind(py)),
+            transfer_backends.clone(),
+            Some(&components),
+            &runner
+                .getattr("attention")?
+                .getattr("name")?
+                .extract::<String>()?,
+            bindings.as_ref().map(|value| value.bind(py)),
+            Some(&runner.getattr("state_buffers")?),
         )?;
         self.check_auxiliary_storage(py, &layout)?;
-        let info = layout.getattr("info")?;
-        self.info = info.clone().unbind();
-        let arena = layout.getattr("arena")?;
-        self.device_product_bytes = arena.getattr("device_product_bytes")?.extract()?;
+        let info = &layout.info;
+        self.info = Some(info.clone());
+        let arena = &layout.arena;
+        self.device_product_bytes = arena.device_product_bytes;
         let inputs = py.import("uniserve_worker.bootstrap.inputs")?;
         let text = inputs.call_method1(
             "capability",
             (&model, py.import("uniserve.model")?.getattr("CausalLM")?),
         )?;
         if !text.is_none() {
-            self.allocate_cache(py, &text, &info, queue_depth)?;
+            self.allocate_cache(py, &text, info, queue_depth)?;
         }
 
         let options = PyDict::new(py);
@@ -327,7 +314,7 @@ impl Worker {
         options.set_item("device", config.getattr("device")?)?;
         let requests = py
             .get_type::<RequestPool>()
-            .call((info.getattr("request_slots")?,), Some(&options))?
+            .call((info.request_slots,), Some(&options))?
             .cast_into::<RequestPool>()?;
         self.requests = Some(requests.clone().unbind());
         let dtype_name = config
@@ -347,7 +334,7 @@ impl Worker {
         }
         if let Some(tables) = &self.block_tables {
             let options = PyDict::new(py);
-            options.set_item("request_pool_size", info.getattr("request_slots")?)?;
+            options.set_item("request_pool_size", info.request_slots)?;
             options.set_item(
                 "vocab_size",
                 text.getattr("backbone")?.getattr("vocab_size")?,
@@ -367,7 +354,6 @@ impl Worker {
             );
         }
 
-        let plan = capacity.call_method1("latent_pool_plan", (&model, &config))?;
         let denoises = runner.getattr("denoises")?.is_truthy()?;
         let generation_device = config.getattr("generation_device")?;
         let generation_device = if generation_device.is_none() {
@@ -375,16 +361,16 @@ impl Worker {
         } else {
             generation_device
         };
-        if !plan.is_none()
+        if let Some(plan) = &layout.latent_plan
             && (denoises || !inputs.call_method1("image_builder", (&model,))?.is_none())
         {
             let options = PyDict::new(py);
-            options.set_item("request_pool_size", info.getattr("request_slots")?)?;
-            options.set_item("num_pages", info.getattr("latent_pages")?)?;
-            options.set_item("page_units", info.getattr("latent_page_units")?)?;
-            for name in ["latent_width", "dtype", "with_workspace"] {
-                options.set_item(name, plan.getattr(name)?)?;
-            }
+            options.set_item("request_pool_size", info.request_slots)?;
+            options.set_item("num_pages", info.latent_pages)?;
+            options.set_item("page_units", info.latent_page_units)?;
+            options.set_item("latent_width", plan.latent_width)?;
+            options.set_item("dtype", &plan.dtype)?;
+            options.set_item("with_workspace", plan.with_workspace)?;
             options.set_item("device", generation_device)?;
             self.latent_pool = Some(
                 py.get_type::<LatentPool>()
@@ -406,7 +392,7 @@ impl Worker {
         // numerical runners borrow their storage without owning its retirement.
         self.device_events = Some(Py::new(py, EventPool::new())?);
         let options = PyDict::new(py);
-        let max_calls = info.getattr("max_batch_calls")?.extract::<usize>()?;
+        let max_calls = info.max_batch_calls as usize;
         options.set_item("capacity", queue_depth * max_calls)?;
         // Four completion fields plus payload words, matching native leases.
         options.set_item(
@@ -421,35 +407,22 @@ impl Worker {
         );
         let devices = self.devices(py)?;
         let options = PyDict::new(py);
-        let physical = layout
-            .getattr("physical_buffer_pool_bytes")?
-            .extract::<u64>()?;
+        let physical = layout.physical_buffer_pool_bytes;
         options.set_item("byte_capacity", physical)?;
         options.set_item("devices", &devices)?;
-        options.set_item(
-            "compact",
-            physical < info.getattr("buffer_pool_bytes")?.extract::<u64>()?,
-        )?;
+        options.set_item("compact", physical < info.buffer_pool_bytes)?;
         self.buffer_pool = Some(
             py.get_type::<BufferPool>()
                 .call((), Some(&options))?
                 .extract()?,
         );
         let options = PyDict::new(py);
-        options.set_item("capacity", arena.getattr("tensor_store")?)?;
-        options.set_item("byte_capacity", arena.getattr("device_product_bytes")?)?;
-        options.set_item(
-            "max_feature_bytes",
-            info.getattr("encoder_entry_bytes")?
-                .extract::<usize>()?
-                .max(1),
-        )?;
+        options.set_item("capacity", arena.tensor_store)?;
+        options.set_item("byte_capacity", arena.device_product_bytes)?;
+        options.set_item("max_feature_bytes", info.encoder_entry_bytes.max(1))?;
         options.set_item("devices", &devices)?;
-        options.set_item("request_capacity", info.getattr("request_slots")?)?;
-        options.set_item(
-            "relay_depth",
-            info.getattr("max_unresolved_calls")?.extract::<usize>()? + 1,
-        )?;
+        options.set_item("request_capacity", info.request_slots)?;
+        options.set_item("relay_depth", info.max_unresolved_calls as usize + 1)?;
         options.set_item("buffer_pool", &self.buffer_pool)?;
         options.set_item("event_pool", &self.device_events)?;
         self.tensor_store = Some(
@@ -469,14 +442,14 @@ impl Worker {
         let host_capacity = if self.codec_slot {
             1
         } else {
-            arena.getattr("host_lane_inflight")?.extract()?
+            arena.host_lane_inflight
         };
         self.host_tasks = Some(Py::new(
             py,
             HostLane::new(py, host_capacity, host_capacity.min(4), "worker-host-lane")?,
         )?);
 
-        let mut transfer_bytes = arena.getattr("transfer_bytes")?.extract::<usize>()?;
+        let mut transfer_bytes = arena.transfer_bytes as usize;
         if runner.getattr("state_buffers")?.is_truthy()?
             || !inputs
                 .call_method1(
@@ -499,7 +472,7 @@ impl Worker {
         let options = PyDict::new(py);
         options.set_item("source", endpoint)?;
         options.set_item("byte_capacity", transfer_bytes)?;
-        options.set_item("ticket_capacity", arena.getattr("transfer_tickets")?)?;
+        options.set_item("ticket_capacity", arena.transfer_tickets)?;
         options.set_item("event_pool", &self.device_events)?;
         options.set_item("acknowledgment_slot", acknowledgment_slot)?;
         options.set_item("host_slots", host_slots)?;
@@ -517,7 +490,7 @@ impl Worker {
 
         if let Some(decode_state) = &self.decode_state {
             let options = PyDict::new(py);
-            options.set_item("input_config", layout.getattr("input_config")?)?;
+            options.set_item("input_config", &layout.input_config)?;
             options.set_item("kv_cache", &self.kv_cache)?;
             options.set_item("latent_pool", &self.latent_pool)?;
             options.set_item(
@@ -525,12 +498,18 @@ impl Worker {
                 decode_state.bind(py).getattr("predicates")?,
             )?;
             options.set_item("max_calls", max_calls)?;
-            for name in ["request_slots", "latent_capacity_units"] {
-                options.set_item(name, info.getattr(name)?)?;
-            }
+            options.set_item("request_slots", info.request_slots)?;
+            options.set_item(
+                "latent_capacity_units",
+                info.latent_pages.saturating_sub(1) * info.latent_page_units,
+            )?;
             options.set_item(
                 "table_widths",
-                capacity.call_method1("graph_table_widths", (&model, &config, &self.kv_cache))?,
+                capacity_inputs::graph_table_widths(
+                    model,
+                    &config,
+                    self.kv_cache.as_ref().ok_or_else(closed)?.bind(py),
+                )?,
             )?;
             options.set_item("max_inflight", queue_depth)?;
             runner.call_method("configure_inputs", (), Some(&options))?;
@@ -543,7 +522,7 @@ impl Worker {
                     slots.call_method1("generating_denoiser", (canvas.getattr("model")?,))?;
                 if !denoiser.is_none() {
                     let options = PyDict::new(py);
-                    options.set_item("request_pool_size", info.getattr("request_slots")?)?;
+                    options.set_item("request_pool_size", info.request_slots)?;
                     options.set_item("sampling", sampling)?;
                     options.set_item("device", canvas.getattr("device")?)?;
                     self.canvas_slots = Some(
@@ -565,7 +544,7 @@ impl Worker {
         &mut self,
         py: Python<'_>,
         text: &Bound<'_, PyAny>,
-        info: &Bound<'_, PyAny>,
+        info: &uniserve_worker_ipc::WorkerInfo,
         queue_depth: usize,
     ) -> PyResult<()> {
         let config = self.worker_config.bind(py);
@@ -573,12 +552,22 @@ impl Worker {
         if cache.is_none() {
             return Ok(());
         }
-        let kv_info = info.getattr("kv_cache")?;
+        let cache_info = info
+            .kv_cache
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("causal language model has no KV capacity"))?;
+        let kv_info = py
+            .import("uniserve_worker.protocol.worker_info")?
+            .getattr("KVCacheInfo")?
+            .call_method1(
+                "from_mapping",
+                (pythonize::pythonize(py, cache_info)?, "worker KV cache"),
+            )?;
         let planner = py.import("uniserve_worker.bootstrap.cache")?;
         let planes = planner.call_method1("plan_cache", (text, config))?;
         let storage = planner.call_method1("storage", (config,))?;
         let options = PyDict::new(py);
-        options.set_item("num_units", kv_info.getattr("num_units")?)?;
+        options.set_item("num_units", cache_info.num_units)?;
         for name in ["block_size", "device"] {
             options.set_item(name, config.getattr(name)?)?;
         }
@@ -604,16 +593,14 @@ impl Worker {
             "group_layers",
             planner.call_method1("group_layers", (text, &planes))?,
         )?;
-        options.set_item("import_capacity", info.getattr("max_unresolved_calls")?)?;
-        options.set_item("request_pool_size", info.getattr("request_slots")?)?;
-        let width_options = PyDict::new(py);
-        width_options.set_item(
-            "max_sequence_tokens",
-            config.getattr("max_sequence_tokens")?,
-        )?;
+        options.set_item("import_capacity", info.max_unresolved_calls)?;
+        options.set_item("request_pool_size", info.request_slots)?;
         options.set_item(
             "table_width",
-            planner.call_method("resident_width", (planes,), Some(&width_options))?,
+            capacity_inputs::resident_width(
+                &planes,
+                config.getattr("max_sequence_tokens")?.extract()?,
+            )?,
         )?;
         options.set_item("host_buffer_depth", queue_depth)?;
         let cache = py
@@ -636,20 +623,18 @@ impl Worker {
         Ok(devices)
     }
 
-    fn check_auxiliary_storage(&self, py: Python<'_>, layout: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn check_auxiliary_storage(
+        &self,
+        py: Python<'_>,
+        layout: &report::WorkerLayout,
+    ) -> PyResult<()> {
         let config = self.worker_config.bind(py);
         let device = py.import("uniserve.runtime.device")?;
-        let capacity = py.import("uniserve_worker.bootstrap.capacity")?;
-        let graph_budget = py
-            .import("uniserve_worker.config.execution")?
-            .getattr("graph_storage_budget_bytes")?;
         // KV sizing already charges the primary device's fixed storage. Other
         // CUDA devices need their own grant for fixed backing plus graphs.
-        for item in layout.getattr("fixed_device_bytes")?.try_iter()? {
-            let item = item?;
-            let name = item.get_item(0)?;
-            let target = device.call_method1("canonical_device", (&name,))?;
-            if name.eq(config.getattr("device")?)?
+        for (name, bytes) in &layout.fixed_device_bytes {
+            let target = device.call_method1("canonical_device", (name,))?;
+            if *name == config.getattr("device")?.extract::<String>()?
                 || target.getattr("type")?.extract::<String>()? != "cuda"
             {
                 continue;
@@ -661,10 +646,10 @@ impl Worker {
                 )?
                 .get_item(0)?
                 .extract::<u64>()?;
-            let reserved = item.get_item(1)?.extract::<u64>()?
-                + graph_budget
-                    .call1((capacity.call_method1("device_total_bytes", (&name,))?,))?
-                    .extract::<u64>()?;
+            let reserved = bytes
+                + uniserve_worker::graph_storage_budget_bytes(
+                    capacity::device_total_bytes(&target)? as i64,
+                );
             if reserved > available {
                 return Err(unsupported(
                     py,

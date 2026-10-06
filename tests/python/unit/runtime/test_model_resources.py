@@ -13,9 +13,6 @@ from uniserve.math import ceil_div
 from uniserve.tensors import BufferConfig
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.capacity import (
-    latent_trajectory_bytes,
-    model_arena_capacity,
-    request_tensor_window,
     tensor_slot_capacity,
 )
 from uniserve_worker.bootstrap.report import build_worker_layout
@@ -107,62 +104,81 @@ def test_closed_request_storage_rejects_admission_and_borrowing():
         pool.start(admission)
 
 
-def test_request_capacity_charges_only_device_storage_against_device_budget():
-    schema = {
-        "state": BufferConfig((128,), torch.float32),
-        "initial_values": BufferConfig((1024,), torch.float32, host=True),
-    }
+def test_request_capacity_respects_the_device_budget():
+    requirements = [slots * 1024 for slots in range(2, 9)]
     assert (
         tensor_slot_capacity(
-            schema,
-            Communicator(),
-            maximum=8,
-            minimum=2,
-            available_bytes=2048,
-            auxiliary_bytes=lambda slots: slots * 512,
+            requirements, Communicator(), minimum=2, available_bytes=2048
         )
         == 2
     )
     with pytest.raises(RuntimeError, match="insufficient device storage"):
         tensor_slot_capacity(
-            schema,
-            Communicator(),
-            maximum=8,
-            minimum=2,
-            available_bytes=2047,
-            auxiliary_bytes=lambda slots: slots * 512,
+            requirements, Communicator(), minimum=2, available_bytes=2047
+        )
+
+
+def test_request_capacity_charges_device_state_but_not_host_state(monkeypatch):
+    from tests.python.fixtures.device_storage import (
+        DeviceStorage,
+        install_device_storage,
+    )
+    from tests.python.fixtures.encoding import Model as EncodedModel
+    from uniserve_worker.bootstrap.capacity import resolve_request_capacity
+    from uniserve_worker.config.execution import WorkerConfig
+
+    storage = DeviceStorage(total=40_000, free=40_000)
+    storage.held = 0
+    install_device_storage(monkeypatch, storage)
+    model = EncodedModel()
+    config = WorkerConfig(
+        device="cuda:0",
+        model_dtype="float32",
+        kv_storage_fraction=1.0,
+        min_request_pool_size=1,
+        max_request_pool_size=4,
+        max_sequence_tokens=4,
+        max_batch_calls=4,
+        max_batch_tokens=4,
+    )
+    state = {"values": BufferConfig((1024,), torch.float32)}
+    fitted = resolve_request_capacity(
+        model,
+        config,
+        queue_depth=12,
+        capacity_group=Communicator(),
+        state_buffers=state,
+    )
+    assert fitted.max_request_pool_size > 1
+    host = resolve_request_capacity(
+        model,
+        config,
+        queue_depth=12,
+        capacity_group=Communicator(),
+        state_buffers={
+            **state,
+            "initial": BufferConfig((1_000_000,), torch.float32, host=True),
+        },
+    )
+    assert host.max_request_pool_size == fitted.max_request_pool_size
+    with pytest.raises(RuntimeError, match="insufficient device storage"):
+        resolve_request_capacity(
+            model,
+            config,
+            queue_depth=12,
+            capacity_group=Communicator(),
+            state_buffers={"values": BufferConfig((1_000_000,), torch.float32)},
         )
 
 
 def test_request_capacity_accounts_for_the_candidate_output_horizon():
-    schema = {"state": BufferConfig((128,), torch.float32)}
     # At depth 12, two, three, and four requests retain 10, 9, and 8
     # output batches respectively. Smaller counts need more product storage.
+    requirements = [11_264, 10_752, 10_240]
     count = tensor_slot_capacity(
-        schema,
-        Communicator(),
-        maximum=4,
-        minimum=2,
-        available_bytes=10_240,
-        auxiliary_bytes=lambda slots: (
-            slots * request_tensor_window(12, slots) * 1024
-        ),
+        requirements, Communicator(), minimum=2, available_bytes=10_240
     )
     assert count == 4
-
-
-def test_stateless_ranks_still_budget_request_products_and_arenas():
-    assert (
-        tensor_slot_capacity(
-            {},
-            Communicator(),
-            maximum=8,
-            minimum=2,
-            available_bytes=3072,
-            auxiliary_bytes=lambda slots: slots * 1024,
-        )
-        == 3
-    )
 
 
 def test_worker_info_reports_capabilities_and_cache_limits():
@@ -223,26 +239,14 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
     layout = build_worker_layout(
         TEST_MODEL, worker_config, image_processor=image_processor()
     )
-    assert layout.info.encoder_entry_bytes == latent_trajectory_bytes(
-        1024,
-        3 * 16**2,
-        4,
+    assert layout.info.encoder_entry_bytes == 1024 * (3 * 16**2) * 4
+    # Every transfer ticket can hold a whole latent trajectory or the entire
+    # granted KV pool, whichever is larger.
+    arena = layout.arena
+    expected = max(
+        layout.info.encoder_entry_bytes,
+        layout.info.kv_cache.num_units * layout.info.kv_cache.unit_bytes,
     )
-    arena = model_arena_capacity(
-        TEST_MODEL,
-        worker_config,
-        queue_depth=1,
-        completion_payload_bytes=1024,
-        num_units=2,
-        request_pool_size=4,
-        num_latent_pages=5,
-        latent_page_units=4,
-        latent_width=1024,
-        max_latent_feature_bytes=1,
-        max_vision_feature_bytes=1,
-        unit_bytes=1,
-    )
-    expected = latent_trajectory_bytes(1024, 1024, 4)
     assert arena.transfer_bytes == expected * arena.transfer_tickets
 
 
@@ -312,7 +316,6 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
         model,
         config,
         queue_depth=8,
-        completion_payload_bytes=1024,
         components=(("text_encoder", ComponentConfig((0,))),),
     ).info
     arena = BufferPool(byte_capacity=info.buffer_pool_bytes, devices=("cpu",))

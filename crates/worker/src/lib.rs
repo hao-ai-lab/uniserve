@@ -2,6 +2,7 @@
 
 mod block_tables;
 mod buffer;
+pub mod capacity;
 mod completion;
 pub mod cuda;
 mod descriptor_grants;

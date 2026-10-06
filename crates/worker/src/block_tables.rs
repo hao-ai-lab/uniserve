@@ -21,6 +21,26 @@ pub struct GroupShape {
 }
 
 impl GroupShape {
+    /// Installed tables retain the complete reservation, including history
+    /// that a sliding-window reader no longer selects.
+    pub fn resident_width(&self, max_sequence_tokens: u64) -> u64 {
+        max_sequence_tokens
+            .max(1)
+            .div_ceil(u64::from(self.page_tokens))
+    }
+
+    /// A windowed call selects its history and queries plus the partial page
+    /// at their starting offset. Full attention selects the whole sequence.
+    pub fn table_width(&self, max_sequence_tokens: u64, max_query_tokens: u64) -> u64 {
+        let resident = self.resident_width(max_sequence_tokens);
+        self.window.map_or(resident, |window| {
+            resident.min(
+                (u64::from(window) + max_query_tokens.max(1)).div_ceil(u64::from(self.page_tokens))
+                    + 1,
+            )
+        })
+    }
+
     pub fn new(page_tokens: u32, units_per_page: u32, window: Option<u32>) -> Result<Self> {
         if page_tokens == 0 || units_per_page == 0 {
             return Err(Error::Invalid("KV page dimensions must be positive".into()));

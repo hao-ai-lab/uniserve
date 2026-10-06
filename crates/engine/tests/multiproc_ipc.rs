@@ -1465,12 +1465,9 @@ fn multiprocess_topology_handles_rank_failure_and_capacity_limits() -> anyhow::R
 fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    // The `replacement_worker` fixture ranks report their normal worker info
-    // until `replacement.json` exists, and the info with those fields replaced
-    // afterwards. Killing rank 0 once the file is written makes the group
-    // relaunch every rank, and `validate_replacement_info`, called from the
-    // group's recovery, refuses a replacement whose info differs in anything
-    // but its endpoint; a failed replacement closes the group.
+    // Killing rank zero relaunches the group. Each replacement IPC peer
+    // advertises the fields in replacement.json; the head must refuse a
+    // different numerical policy or capacity and stop using the group.
     for change in [
         serde_json::json!({"model_dtype": "float64"}),
         serde_json::json!({"attention_backend": "flashinfer"}),
@@ -1491,9 +1488,8 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
         let state = serde_json::to_string(&directory.path())?;
         // `WorkerGroup` runs `<python> -m uniserve_worker.main <args>`, so the
         // wrapper drops its first two arguments and runs the fixture with the
-        // rest. The fixture serves a `Worker` whose `info` reads
-        // `replacement.json` from `directory`, where each rank also writes
-        // its pid.
+        // rest. The fixture answers Info through the public IPC channel,
+        // applying replacement.json and recording each rank's pid there.
         std::fs::write(
             &wrapper,
             format!(

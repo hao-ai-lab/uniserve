@@ -1,11 +1,9 @@
-"""Request capacity agreement includes stateless component ranks."""
+"""Request slots fit every rank, including stateless component ranks."""
 
 import pytest
-import torch
 import torch.multiprocessing as mp
 
 from uniserve.runtime.process_groups import initialize_process_groups
-from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.capacity import tensor_slot_capacity
 
 pytestmark = pytest.mark.integration
@@ -20,34 +18,35 @@ def _agree_capacity(rank, rendezvous):
         backend="gloo",
         init_method=rendezvous,
     ) as environment:
-        schema = (
-            {} if rank == 0 else {"state": BufferConfig((4,), torch.float32)}
-        )
         # The stateless owner fits three 100-byte product/arena reservations;
         # the stateful owner fits four complete 112-byte reservations.
         capacity = tensor_slot_capacity(
-            schema,
+            [slots * (100 if rank == 0 else 112) for slots in range(2, 5)],
             environment.process_group,
-            maximum=4,
             minimum=2,
             available_bytes=300 if rank == 0 else 448,
-            auxiliary_bytes=lambda slots: slots * (100 if rank == 0 else 96),
         )
         assert capacity == 3
+
+        # Rank zero fits two or four requests; rank one fits two or three.
+        # The common maximum is two, not the minimum of the local maxima.
+        capacity = tensor_slot_capacity(
+            [100, 400, 300] if rank == 0 else [100, 200, 400],
+            environment.process_group,
+            minimum=2,
+            available_bytes=300,
+        )
+        assert capacity == 2
 
         # Both owners must reject admission when either cannot fit the minimum.
         with pytest.raises(
             RuntimeError, match="common request tensor slot count"
         ):
             tensor_slot_capacity(
-                schema,
+                [slots * (100 if rank == 0 else 112) for slots in range(2, 5)],
                 environment.process_group,
-                maximum=4,
                 minimum=2,
                 available_bytes=199 if rank == 0 else 448,
-                auxiliary_bytes=lambda slots: (
-                    slots * (100 if rank == 0 else 96)
-                ),
             )
 
 

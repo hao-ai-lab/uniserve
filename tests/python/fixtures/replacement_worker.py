@@ -34,20 +34,28 @@ def main() -> None:
     ) as endpoint:
         register_endpoint(config, endpoint.endpoint(name))
 
-        class Rank(Worker):
-            @property
-            def info(self):
-                value = super().info
-                change = directory / "replacement.json"
-                return (
-                    replace(value, **json.loads(change.read_text()))
-                    if change.exists()
-                    else value
-                )
-
-        with Rank.from_config(config) as worker:
-            worker.bind(endpoint)
-            worker.run()
+        with Worker.from_config(config) as worker:
+            while True:
+                request = endpoint.recv()
+                kind = request["kind"]
+                message_id = request["message_id"]
+                if kind == "info":
+                    info = worker.info
+                    change = directory / "replacement.json"
+                    if change.exists():
+                        info = replace(info, **json.loads(change.read_text()))
+                    endpoint.respond(
+                        {
+                            "kind": "info",
+                            "message_id": message_id,
+                            "info": info.to_mapping(),
+                        }
+                    )
+                elif kind == "close":
+                    endpoint.respond({"kind": "ok", "message_id": message_id})
+                    break
+                else:
+                    raise ValueError(f"unsupported worker request {kind}")
 
 
 if __name__ == "__main__":
