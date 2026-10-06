@@ -52,7 +52,7 @@ def _copy_export(
 
 def _export_layout(
     source: torch.Tensor | tuple[torch.Tensor, ...], storage_offset: int
-) -> dict[str, tuple[int, ...]]:
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
     """Describe physical spans relative to the exported allocation."""
     spans = source if isinstance(source, tuple) else (source,)
     first = spans[0]
@@ -60,15 +60,15 @@ def _export_layout(
         (length, sum(1 for _ in values))
         for length, values in groupby(int(span.shape[0]) for span in spans)
     )
-    return {
-        "storage_offsets_bytes": tuple(
+    return (
+        tuple(
             storage_offset + span.data_ptr() - first.data_ptr()
             for span in spans
         ),
-        "span_lengths": tuple(length for length, _ in lengths),
-        "span_counts": tuple(count for _, count in lengths),
-        "tensor_stride": tuple(first.stride()),
-    }
+        tuple(length for length, _ in lengths),
+        tuple(count for _, count in lengths),
+        tuple(first.stride()),
+    )
 
 
 def _import_views(

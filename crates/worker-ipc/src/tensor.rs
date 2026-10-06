@@ -981,7 +981,7 @@ pub const MAX_TRANSFER_HANDLE_BYTES: usize = 64 * 1024;
 
 impl Locator {
     /// Validates common tensor bounds and transport-specific opening metadata.
-    fn validate(&self) -> ValidationResult<()> {
+    pub fn validate(&self) -> ValidationResult<()> {
         self.source.validate()?;
         // Tensor metadata is transport-independent and establishes the minimum
         // shape needed to validate every export mechanism.
@@ -1054,12 +1054,6 @@ impl Locator {
                         && matches!(allocation_handle.len(), 4 | 64)
                         && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA VMM transfer handle is incomplete"
-                );
-                let opaque_bytes = ready_event_handle.len() + allocation_handle.len();
-
-                ensure_valid!(
-                    opaque_bytes <= MAX_TRANSFER_HANDLE_BYTES,
-                    "CUDA VMM transfer handles exceed their byte bound"
                 );
             }
             TransferTransport::Channel { endpoint, payload } => {

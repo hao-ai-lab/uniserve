@@ -87,9 +87,7 @@ def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
     storage = shared_memory.SharedMemory(
         create=True, size=segment.HEADER_BYTES + locator.nbytes
     )
-    gated = replace(
-        locator, transport=replace(locator.transport, name=storage.name)
-    )
+    gated = Locator.from_mapping(locator.to_mapping() | {"name": storage.name})
     segment.initialize(storage.buf)
     storage.buf[segment.HEADER_BYTES : segment.HEADER_BYTES + len(data)] = data
     return gated, storage
@@ -861,11 +859,8 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
         assert isinstance(snapshot, KvTransfer)
         first = snapshot.tensors[0].locations[0]
         assert isinstance(first.transport, PosixShmTransfer)
-        missing = replace(
-            first,
-            transport=replace(
-                first.transport, name="uniserve-missing-transfer-segment"
-            ),
+        missing = Locator.from_mapping(
+            first.to_mapping() | {"name": "uniserve-missing-transfer-segment"}
         )
         broken = _map_locations(
             snapshot,

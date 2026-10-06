@@ -99,9 +99,13 @@ impl PythonBackend {
                 .exported_locators
                 .bind(py)
                 .call_method1("extend", (&locations,))?;
+            let locations = locations
+                .iter()
+                .map(|value| Ok(value.cast_into::<crate::worker::locator::Locator>()?))
+                .collect::<PyResult<Vec<_>>>()?;
             let registrations = locations
                 .iter()
-                .map(|location| Ok((transports.get_item(location.getattr("backend")?)?, location)))
+                .map(|location| Ok((transports.get_item(location.get().backend())?, location)))
                 .collect::<PyResult<Vec<_>>>()?;
             pending.latent_exports.bind(py).set_item(
                 convert::buffer_id_to_py(py, &product.buffer_id())?,
@@ -110,11 +114,8 @@ impl PythonBackend {
 
             let locations = locations
                 .iter()
-                .map(|location| {
-                    convert::transfer_locator_from_py(&location.call_method0("to_mapping")?)
-                        .ok_or_else(|| invalid(py, "transport returned an invalid latent location"))
-                })
-                .collect::<PyResult<Vec<_>>>()?;
+                .map(|location| location.get().inner.as_ref().clone())
+                .collect();
             let export = TensorExport {
                 product: product.clone(),
                 value: TransferHandle::Latent {

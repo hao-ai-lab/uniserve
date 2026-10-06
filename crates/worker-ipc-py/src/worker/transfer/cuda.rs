@@ -8,11 +8,13 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use uniserve_worker::cuda::{DeviceGuard, Event, Stream};
+use uniserve_worker_ipc::{TransferTransport, WorkerEndpoint};
 
 use super::super::descriptor_grants::fetch_descriptor;
 use super::super::error::invalid;
 use super::super::events::CUDAEvent;
 use super::super::host::with_context;
+use super::super::locator::Locator;
 use super::super::registry::Registry;
 use super::{
     PythonRead, ReadCall, ReadReservation, TransferPool, TransferTicket, copy_acknowledgment,
@@ -20,7 +22,7 @@ use super::{
 
 pub(super) struct CudaRead {
     pool: Py<TransferPool>,
-    locator: Py<PyAny>,
+    locator: Py<Locator>,
     device: Py<PyAny>,
     destination: Option<Py<PyAny>>,
     region: Option<Py<PyAny>>,
@@ -33,8 +35,8 @@ impl CudaRead {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn submit(
         pool: &Bound<'_, TransferPool>,
-        locator: Bound<'_, PyAny>,
-        source: Bound<'_, PyAny>,
+        locator: Bound<'_, Locator>,
+        source: &WorkerEndpoint,
         slot: usize,
         device: Py<PyAny>,
         destination: Option<Bound<'_, PyAny>>,
@@ -42,16 +44,16 @@ impl CudaRead {
         reservation: Option<Py<ReadReservation>>,
     ) -> PyResult<Py<TransferTicket>> {
         let py = pool.py();
-        if locator.getattr("backend")?.extract::<String>()? != "cuda_vmm" {
+        let value = &locator.get().inner;
+        let TransferTransport::CudaVmm {
+            allocation_handle, ..
+        } = &value.transport
+        else {
             return Err(invalid(py, "CUDA VMM read requires a CUDA VMM locator"));
-        }
-        let producer = locator.getattr("source")?;
-        let same_node = producer.getattr("node")?.eq(source.getattr("node")?)?;
-        let local = producer
-            .getattr("address_space")?
-            .eq(source.getattr("address_space")?)?;
-        let handle = locator.getattr("transport")?;
-        if !same_node && handle.getattr("allocation_handle")?.len()? != 64 {
+        };
+        let same_node = value.source.node == source.node;
+        let local = value.source.address_space == source.address_space;
+        if !same_node && allocation_handle.len() != 64 {
             return Err(invalid(
                 py,
                 "a device product crosses hosts only as a fabric handle",
@@ -73,7 +75,7 @@ impl CudaRead {
                     .call1((&locator, &device, destination, region.as_ref()))
             })
             .transpose()?;
-        let nbytes = locator.getattr("nbytes")?.extract()?;
+        let nbytes = locator.get().inner.nbytes;
         let ticket = Py::new(
             py,
             TransferTicket::new(pool.get().events.clone_ref(py), None),
@@ -131,7 +133,7 @@ impl CudaRead {
                 let source_device = py
                     .import("torch")?
                     .getattr("device")?
-                    .call1((locator.getattr("device")?,))?;
+                    .call1((&locator.get().inner.device,))?;
                 if self.same_node
                     && source_device.getattr("type")?.extract::<String>()? == "cuda"
                     && !source_device.eq(device)?
@@ -143,22 +145,26 @@ impl CudaRead {
                     import_device = source_device;
                 }
 
-                let handle = locator.getattr("transport")?;
-                let exported = handle.getattr("allocation_handle")?;
-                let descriptor = if exported.len()? == size_of::<i32>() {
-                    let endpoint = handle.getattr("endpoint")?;
-                    let export = handle.getattr("export_id")?;
-                    let fd = fetch_descriptor(py, endpoint.extract()?, export.extract()?)?;
+                let TransferTransport::CudaVmm {
+                    endpoint,
+                    export_id,
+                    allocation_handle,
+                    ready_event_handle,
+                    ..
+                } = &locator.get().inner.transport
+                else {
+                    return Err(invalid(py, "CUDA VMM read requires a CUDA VMM locator"));
+                };
+                let descriptor = if allocation_handle.len() == size_of::<i32>() {
+                    let fd = fetch_descriptor(py, endpoint, export_id)?;
                     // The grant transfers this descriptor to the importing caller.
                     Some(unsafe { OwnedFd::from_raw_fd(fd) })
                 } else {
                     None
                 };
                 let exported = match &descriptor {
-                    Some(descriptor) => {
-                        PyBytes::new(py, &descriptor.as_raw_fd().to_ne_bytes()).into_any()
-                    }
-                    None => exported,
+                    Some(descriptor) => PyBytes::new(py, &descriptor.as_raw_fd().to_ne_bytes()),
+                    None => PyBytes::new(py, allocation_handle),
                 };
                 let (mapped, acknowledgment): (Py<PyAny>, Option<Py<PyAny>>) = numerical
                     .getattr("_import_views")?
@@ -166,7 +172,7 @@ impl CudaRead {
                     .extract()?;
                 drop(descriptor);
 
-                let bytes: Vec<u8> = handle.getattr("ready_event_handle")?.extract()?;
+                let bytes = ready_event_handle.as_slice();
                 let event = if bytes.is_empty() {
                     None
                 } else {

@@ -53,8 +53,8 @@ from uniserve_worker.protocol.output import (
 from uniserve_worker.protocol.tensor import TensorRef
 from uniserve_worker.protocol.transfer import (
     KvTransfer,
-    Locator,
     TensorTransfer,
+    TransferTransport,
     WorkerEndpoint,
 )
 from uniserve_worker.storage.request_slots import RequestSlots
@@ -946,6 +946,42 @@ class Completion:
     def add_done_callback(
         self, callback: Callable[[Completion], object]
     ) -> None: ...
+
+@final
+class Locator:
+    """An immutable native physical tensor view and transport handle."""
+
+    def __new__(
+        cls,
+        source: WorkerEndpoint,
+        transport: TransferTransport,
+        nbytes: int,
+        dtype: str,
+        shape: tuple[int, ...],
+        offset: tuple[int, ...],
+        device: str,
+    ) -> Self: ...
+    @property
+    def source(self) -> WorkerEndpoint: ...
+    @property
+    def transport(self) -> TransferTransport: ...
+    @property
+    def backend(self) -> str: ...
+    @property
+    def nbytes(self) -> int: ...
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+    @property
+    def offset(self) -> tuple[int, ...]: ...
+    @property
+    def device(self) -> str: ...
+    @staticmethod
+    def from_mapping(
+        value: object, where_: str = "transfer locator"
+    ) -> Locator: ...
+    def to_mapping(self) -> dict[str, object]: ...
 
 @final
 class Transport:

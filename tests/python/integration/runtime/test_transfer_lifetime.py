@@ -442,11 +442,13 @@ def test_cuda_vmm_rejects_a_changed_registered_view() -> None:
     )
     locator = transport.export(torch.arange(1024, device="cuda:0"))
     try:
-        changed = replace(
-            locator,
-            shape=(512,),
-            nbytes=locator.nbytes // 2,
-            transport=replace(locator.transport, span_lengths=(512,)),
+        changed = Locator.from_mapping(
+            locator.to_mapping()
+            | {
+                "shape": [512],
+                "nbytes": locator.nbytes // 2,
+                "span_lengths": [512],
+            }
         )
         with pytest.raises(WorkerError) as failure:
             _await_ticket(
@@ -1348,8 +1350,6 @@ def test_cuda_vmm_refuses_a_descriptor_handle_from_another_host() -> None:
     to fail inside the driver. A fabric handle carries no such restriction,
     which is what lets a rank read a product produced on another machine.
     """
-    from dataclasses import replace
-
     device = torch.device("cuda:0")
     events = EventPool()
     transport = make_transport(
@@ -1358,8 +1358,9 @@ def test_cuda_vmm_refuses_a_descriptor_handle_from_another_host() -> None:
     locator = None
     try:
         locator = transport.export(torch.ones(256, device=device))
-        elsewhere = replace(
-            locator, source=replace(locator.source, node="another-host")
+        elsewhere = Locator.from_mapping(
+            locator.to_mapping()
+            | {"source": locator.source.to_mapping() | {"node": "another-host"}}
         )
 
         handle = elsewhere.transport

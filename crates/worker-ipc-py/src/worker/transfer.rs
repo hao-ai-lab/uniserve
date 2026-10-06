@@ -24,9 +24,12 @@ use uniserve_worker::{
     TransferTicket as NativeTransferTicket,
 };
 
+use uniserve_worker_ipc::{TransferTransport, WorkerEndpoint};
+
 use super::error::{invalid, native_error, resource};
 use super::events::{CUDAEvent, EventPool};
 use super::host::with_context;
+use super::locator::Locator;
 use super::registry::Registry;
 use super::shared_buffer::SharedRead;
 
@@ -260,14 +263,14 @@ impl TransferPool {
     /// Admit a channel payload before allocating its host and device views.
     pub(in crate::worker) fn fetch_channel(
         slf: Bound<'_, Self>,
-        locator: Bound<'_, PyAny>,
+        locator: Bound<'_, Locator>,
         device: Py<PyAny>,
         destination: Option<Bound<'_, PyAny>>,
         region: Option<Py<PyAny>>,
         reservation: Option<Py<ReadReservation>>,
     ) -> PyResult<Py<TransferTicket>> {
         let py = slf.py();
-        if locator.getattr("backend")?.extract::<String>()? != "channel" {
+        if locator.get().backend() != "channel" {
             return Err(invalid(py, "channel read requires a channel locator"));
         }
 
@@ -285,7 +288,7 @@ impl TransferPool {
                     .call1((&locator, &device, destination, region.as_ref()))
             })
             .transpose()?;
-        let nbytes = locator.getattr("nbytes")?.extract()?;
+        let nbytes = locator.get().inner.nbytes;
         let ticket = Py::new(
             py,
             TransferTicket::new(slf.get().events.clone_ref(py), None),
@@ -306,7 +309,7 @@ impl TransferPool {
     /// Grant and submit a local read without a Python ownership callback.
     pub(in crate::worker) fn fetch_local(
         slf: Bound<'_, Self>,
-        locator: &Bound<'_, PyAny>,
+        locator: &Bound<'_, Locator>,
         device: &Bound<'_, PyAny>,
         destination: Option<Bound<'_, PyAny>>,
         region: Option<Bound<'_, PyAny>>,
@@ -318,7 +321,7 @@ impl TransferPool {
             return Err(PyErr::from_value(error.bind(py).clone()));
         }
 
-        if locator.getattr("backend")?.extract::<String>()? != "local" {
+        if locator.get().backend() != "local" {
             return Err(invalid(py, "local read requires a local locator"));
         }
         let (buffer, source) = Registry::acquire_read(locator)?;
@@ -360,7 +363,7 @@ impl TransferPool {
                 Self::submit_read(
                     &slf,
                     read,
-                    locator.getattr("nbytes")?.extract()?,
+                    locator.get().inner.nbytes,
                     Some(target.into_bound(py)),
                     reservation,
                 )?;
@@ -416,7 +419,7 @@ impl TransferPool {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::worker) fn fetch_shared(
         slf: Bound<'_, Self>,
-        locator: Bound<'_, PyAny>,
+        locator: Bound<'_, Locator>,
         node: &str,
         slot: usize,
         device: Py<PyAny>,
@@ -425,18 +428,13 @@ impl TransferPool {
         reservation: Option<Py<ReadReservation>>,
     ) -> PyResult<Py<TransferTicket>> {
         let py = slf.py();
-        if locator
-            .getattr("source")?
-            .getattr("node")?
-            .extract::<String>()?
-            != node
-        {
+        if locator.get().inner.source.node != node {
             return Err(invalid(
                 py,
                 "shared storage transport requires the source node",
             ));
         }
-        if locator.getattr("backend")?.extract::<String>()? != "shm" {
+        if locator.get().backend() != "shm" {
             return Err(invalid(py, "shared storage read requires a SHM locator"));
         }
 
@@ -455,7 +453,7 @@ impl TransferPool {
                     .call1((&locator, &device, destination, region.as_ref()))
             })
             .transpose()?;
-        let nbytes = locator.getattr("nbytes")?.extract()?;
+        let nbytes = locator.get().inner.nbytes;
         let ticket = Py::new(
             py,
             TransferTicket::new(slf.get().events.clone_ref(py), None),
@@ -477,8 +475,8 @@ impl TransferPool {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::worker) fn fetch_cuda(
         slf: Bound<'_, Self>,
-        locator: Bound<'_, PyAny>,
-        source: Bound<'_, PyAny>,
+        locator: Bound<'_, Locator>,
+        source: &WorkerEndpoint,
         slot: usize,
         device: Py<PyAny>,
         destination: Option<Bound<'_, PyAny>>,
@@ -652,7 +650,7 @@ impl TransferPool {
     fn submit_read(
         owner: &Bound<'_, Self>,
         read: PythonRead,
-        nbytes: i64,
+        nbytes: u64,
         destination: Option<Bound<'_, PyAny>>,
         reservation: Option<Py<ReadReservation>>,
     ) -> PyResult<Py<TransferTicket>> {
@@ -661,8 +659,6 @@ impl TransferPool {
         if let Some(error) = owner_ref.pool.error() {
             return Err(PyErr::from_value(error.bind(py).clone()));
         }
-        let nbytes = u64::try_from(nbytes)
-            .map_err(|_| PyValueError::new_err("transfer byte reservation must not be negative"))?;
         let ticket = read.ticket.clone_ref(py);
         let reservation = reservation.as_ref().map(|value| &value.get().inner);
         let task = py
@@ -722,7 +718,7 @@ enum ReadCall {
     Cuda(cuda::CudaRead),
     Channel {
         pool: Py<TransferPool>,
-        locator: Py<PyAny>,
+        locator: Py<Locator>,
         device: Py<PyAny>,
         destination: Option<Py<PyAny>>,
         region: Option<Py<PyAny>>,
@@ -735,7 +731,7 @@ enum ReadCall {
     },
     Shared {
         pool: Py<TransferPool>,
-        locator: Py<PyAny>,
+        locator: Py<Locator>,
         slot: usize,
         device: Py<PyAny>,
         destination: Option<Py<PyAny>>,
@@ -845,13 +841,20 @@ impl ReadBackend for PythonRead {
                         } => {
                             let locator = locator.bind(py);
                             let source = if let ReadCall::Shared { slot, .. } = &self.call {
-                                let name = locator.getattr("transport")?.getattr("name")?;
+                                let TransferTransport::PosixShm { name, .. } =
+                                    &locator.get().inner.transport
+                                else {
+                                    return Err(invalid(
+                                        py,
+                                        "shared read requires a shared storage locator",
+                                    ));
+                                };
                                 let read = Py::new(
                                     py,
                                     SharedRead::open(
                                         py,
-                                        name.extract()?,
-                                        locator.getattr("nbytes")?.extract()?,
+                                        name,
+                                        locator.get().inner.nbytes as usize,
                                         *slot,
                                         0,
                                         Duration::from_secs(120),
@@ -869,9 +872,24 @@ impl ReadBackend for PythonRead {
                                 read.get().release(py)?;
                                 source?.into_bound(py)
                             } else {
-                                py.import("uniserve_worker.transport.channel")?
-                                    .getattr("_copy_payload")?
-                                    .call1((locator, device))?
+                                let value = &locator.get().inner;
+                                let TransferTransport::Channel { payload, .. } = &value.transport
+                                else {
+                                    return Err(invalid(
+                                        py,
+                                        "channel read requires a channel locator",
+                                    ));
+                                };
+                                let (source, bytes): (
+                                    Bound<'_, PyAny>,
+                                    pyo3::buffer::PyBuffer<u8>,
+                                ) = py
+                                    .import("uniserve_worker.transport.channel")?
+                                    .getattr("_allocate_payload")?
+                                    .call1((&value.shape, &value.dtype, device))?
+                                    .extract()?;
+                                bytes.copy_from_slice(py, payload)?;
+                                source
                             };
                             let target = match destination {
                                 Some(destination) => destination.bind(py).clone(),

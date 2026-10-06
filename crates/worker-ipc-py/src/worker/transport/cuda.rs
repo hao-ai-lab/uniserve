@@ -8,10 +8,10 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyBaseException, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
-use pyo3::types::{PyBytes, PyDict};
 use uniserve_worker::cuda::{DeviceGuard, Stream};
+use uniserve_worker_ipc::TransferTransport;
 
-use super::{ExportView, Transport, numerical, transfer_types};
+use super::{ExportView, Locator, Transport, numerical};
 use crate::worker::descriptor_grants::DescriptorGrants;
 use crate::worker::events::{CUDAEvent, current_stream};
 use crate::worker::host::with_context;
@@ -68,7 +68,7 @@ impl CudaExports {
         owner: &Transport,
         view: &ExportView<'py>,
         consumers: Vec<usize>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Bound<'py, Locator>> {
         let py = view.tensor.py();
         let device = view.first.getattr("device")?;
         let mut source = view.tensor.clone();
@@ -155,13 +155,14 @@ impl CudaExports {
 
             // Shape and stride are numerical view metadata. Rust supplies the
             // allocation coordinates, readiness and acknowledgment lifetime.
-            let args = numerical(py, "cuda_vmm")?
+            let (storage_offsets_bytes, span_lengths, span_counts, tensor_stride): (
+                Vec<u64>,
+                Vec<u64>,
+                Vec<u32>,
+                Vec<i64>,
+            ) = numerical(py, "cuda_vmm")?
                 .call_method1("_export_layout", (&source, offset))?
-                .cast_into::<PyDict>()?;
-            args.set_item("endpoint", owner.endpoint())?;
-            args.set_item("export_id", &export_id)?;
-            args.set_item("storage_size_bytes", size)?;
-            args.set_item("allocation_handle", PyBytes::new(py, &handle))?;
+                .extract()?;
             let ready_handle = if self.cross_host {
                 Vec::new()
             } else {
@@ -172,16 +173,20 @@ impl CudaExports {
                     .map_err(PyRuntimeError::new_err)?
                     .to_vec()
             };
-            args.set_item("ready_event_handle", PyBytes::new(py, &ready_handle))?;
-            args.set_item(
-                "acknowledgment_offset",
-                allocation
+            let handle = TransferTransport::CudaVmm {
+                endpoint: owner.endpoint().to_owned(),
+                export_id: export_id.clone(),
+                storage_size_bytes: size,
+                storage_offsets_bytes,
+                span_lengths,
+                span_counts,
+                tensor_stride,
+                allocation_handle: handle,
+                ready_event_handle: ready_handle,
+                acknowledgment_offset: allocation
                     .as_ref()
                     .map_or(-1, |(_, chunk)| chunk.get().offset() as i64),
-            )?;
-            let handle = transfer_types(py)?
-                .getattr("CudaVmmTransfer")?
-                .call((), Some(&args))?;
+            };
             let locator = view.locator(owner, handle)?;
             self.buffers
                 .get()

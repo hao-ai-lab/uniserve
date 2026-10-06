@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from uniserve.profiling import profile_range
-from uniserve_worker.protocol.transfer import ChannelTransfer, Locator
 from uniserve_worker.transport.layout import copy_pairs, resolve_dtype
 
 if TYPE_CHECKING:
@@ -15,7 +14,7 @@ if TYPE_CHECKING:
 def _export_payload(
     source: torch.Tensor | tuple[torch.Tensor, ...],
     shape: tuple[int, ...],
-) -> bytes:
+) -> memoryview:
     """Copy physical tensor values into a contiguous host payload."""
     import torch
 
@@ -31,23 +30,21 @@ def _export_payload(
             torch.cuda.current_stream(first.device).synchronize()
 
     with profile_range("channel_export_payload"):
-        return bytes(packed.flatten().view(torch.uint8).numpy())
+        return memoryview(packed.flatten().view(torch.uint8).numpy())
 
 
-def _copy_payload(locator: Locator, device: torch.device) -> torch.Tensor:
-    """Make a private tensor from channel bytes, pinned for device DMA."""
+def _allocate_payload(
+    shape: tuple[int, ...], dtype: str, device: torch.device
+) -> tuple[torch.Tensor, memoryview]:
+    """Allocate a private host tensor and expose its writable bytes to Rust."""
     import torch
 
-    handle = cast(ChannelTransfer, locator.transport)
     with profile_range("channel_fetch_payload"):
-        payload = torch.frombuffer(
-            bytearray(handle.payload),
-            dtype=resolve_dtype(locator.dtype),
-        ).reshape(locator.shape)
-        if device.type != "cuda":
-            return payload
-
-        # The copy stream needs pinned storage until its DMA completes.
-        carried = torch.empty_like(payload, pin_memory=True)
-        carried.copy_(payload)
-        return carried
+        # The copy stream retains pinned storage until its DMA completes.
+        payload = torch.empty(
+            shape,
+            dtype=resolve_dtype(dtype),
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        )
+        return payload, memoryview(payload.flatten().view(torch.uint8).numpy())
