@@ -25,7 +25,7 @@ use super::host::with_context;
 /// Python access to the rank's shared native transfer budget.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct TransferCapacity {
-    inner: Arc<NativeTransferCapacity<Py<PyAny>>>,
+    pub(super) inner: Arc<NativeTransferCapacity<Py<PyAny>>>,
 }
 
 #[pymethods]

@@ -7,6 +7,7 @@ import weakref
 from typing import TYPE_CHECKING
 
 from uniserve_worker._uniserve_ipc import BufferRegistry as BufferRegistry
+from uniserve_worker._uniserve_ipc import TransportBuffer as TransportBuffer
 
 if TYPE_CHECKING:
     from uniserve_worker.transport.interface import Transport

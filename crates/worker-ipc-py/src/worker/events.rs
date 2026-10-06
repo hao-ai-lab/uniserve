@@ -71,9 +71,19 @@ impl CUDAEvent {
     }
 }
 
-pub(crate) struct DeferredOwner {
-    value: Py<PyAny>,
-    completed: Option<Py<PyAny>>,
+/// Native completion work retained through device access. The callback exposes
+/// its Python references to GC just like numerical owners retained by the pool.
+pub(crate) trait EventCallback: Send {
+    fn complete(self: Box<Self>) -> PyResult<()>;
+    fn visit(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError>;
+}
+
+pub(crate) enum DeferredOwner {
+    Numerical {
+        value: Py<PyAny>,
+        completed: Option<Py<PyAny>>,
+    },
+    Native(Box<dyn EventCallback>),
 }
 
 #[derive(Default)]
@@ -226,9 +236,12 @@ impl EventPool {
             visit.call(wake)?;
         }
         for owner in state.pool.deferred_owners() {
-            visit.call(&owner.value)?;
-            if let Some(completed) = &owner.completed {
-                visit.call(completed)?;
+            match owner {
+                DeferredOwner::Numerical { value, completed } => {
+                    visit.call(value)?;
+                    visit.call(completed)?;
+                }
+                DeferredOwner::Native(callback) => callback.visit(&visit)?,
             }
         }
         Ok(())
@@ -298,13 +311,29 @@ impl EventPool {
             .pool
             .defer_release(
                 events,
-                DeferredOwner {
+                DeferredOwner::Numerical {
                     value: owner,
                     completed,
                 },
             )
             .map_err(pool_error)?;
         drop(unused);
+        Ok(())
+    }
+
+    pub(crate) fn defer_callback(
+        &self,
+        event: Arc<Event>,
+        callback: impl EventCallback + 'static,
+    ) -> PyResult<()> {
+        let unused = self
+            .lock()
+            .pool
+            .defer_release(vec![event], DeferredOwner::Native(Box::new(callback)))
+            .map_err(pool_error)?;
+        if let Some(DeferredOwner::Native(callback)) = unused {
+            callback.complete()?;
+        }
         Ok(())
     }
 
@@ -316,13 +345,18 @@ impl EventPool {
 fn notify(py: Python<'_>, owners: Vec<DeferredOwner>) -> PyResult<()> {
     let mut failure = Ok(());
     for owner in owners {
-        if let Some(callback) = &owner.completed
-            && let Err(error) = callback.bind(py).call0()
-        {
+        let result = match owner {
+            DeferredOwner::Numerical {
+                value: _value,
+                completed,
+            } => completed.map_or(Ok(()), |callback| callback.bind(py).call0().map(drop)),
+            DeferredOwner::Native(callback) => callback.complete(),
+        };
+        if let Err(error) = result {
             if failure.is_ok() {
                 failure = Err(error);
             } else {
-                error.write_unraisable(py, Some(callback.bind(py)));
+                error.write_unraisable(py, None);
             }
         }
     }

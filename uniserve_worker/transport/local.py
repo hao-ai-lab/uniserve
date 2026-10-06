@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Sequence
-from dataclasses import dataclass
 from itertools import count
 from typing import TYPE_CHECKING, Any
 
 from uniserve import _slices
-from uniserve.runtime import CUDAEvent, EventPool
+from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import Completion
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import (
@@ -26,6 +25,7 @@ from uniserve_worker.protocol.transfer import (
 )
 from uniserve_worker.transport.endpoint import (
     BufferRegistry,
+    TransportBuffer,
     _endpoint_lock,
     _endpoints,
 )
@@ -46,14 +46,6 @@ from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
     import torch
-
-
-@dataclass(slots=True)
-class _LocalSource:
-    """Detached tensor views and their producer fence, if on a device."""
-
-    tensor: torch.Tensor | tuple[torch.Tensor, ...]
-    event: CUDAEvent | None
 
 
 class LocalTransport(Transport):
@@ -82,9 +74,7 @@ class LocalTransport(Transport):
             # Each buffer carries at least one byte, so the byte budget also
             # bounds how many registrations can be retained.
             capacity=capacity.capacity,
-            reclaim=self._reclaim,
-            drain=self._drain,
-            settled=lambda source: True,
+            event_pool=event_pool,
         )
         with _endpoint_lock:
             _endpoints[self.endpoint()] = self
@@ -134,7 +124,7 @@ class LocalTransport(Transport):
             self._events.record(event, first.device)
             self._events.retain(event, first.device)
 
-        source = _LocalSource(t, event)
+        source = TransportBuffer.local(t, event, nbytes, self.capacity)
         try:
             locator = Locator(
                 source=self.source,
@@ -149,7 +139,7 @@ class LocalTransport(Transport):
             )
             self._buffers.register(locator, source)
         except BaseException:
-            self._reclaim(source, Completion())
+            source.retire(self._events)
             raise
         return locator
 
@@ -260,42 +250,12 @@ class LocalTransport(Transport):
         finally:
             self.capacity.return_reads()
 
-    def _reclaim(self, source: _LocalSource, retirement: Completion) -> None:
-        def completed() -> None:
-            self.capacity.release(tensor_nbytes(source.tensor))
-            retirement.set_result(None)
-
-        if source.event is None:
-            completed()
-        else:
-            self._events.defer_release(
-                (source.event,), source, completed=completed
-            )
-
-    def _drain(self, source: _LocalSource) -> None:
-        if source.event is not None:
-            source.event.synchronize()
-            self._events.reap()
-
     def release(self, locator: Locator) -> Completion | None:
         """Revoke new local reads.
 
         Existing copies and borrowed views are retained.
         """
-        retirement = self._buffers.release(locator)
-        if retirement is not None and not retirement.done():
-            source = self._buffers.source(locator)
-            # Wake the controller when a pending producer fence can be reaped.
-            if source.event is not None:
-                self._events.schedule_completion_wake(
-                    (
-                        source.tensor[0]
-                        if isinstance(source.tensor, tuple)
-                        else source.tensor
-                    ).device,
-                    source.event,
-                )
-        return retirement
+        return self._buffers.release(locator)
 
     def close(self) -> None:
         """Release every tensor registered under this local endpoint."""
