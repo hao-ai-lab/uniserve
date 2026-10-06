@@ -275,6 +275,13 @@ impl TransferPool {
             return Err(invalid(py, "channel read requires a channel locator"));
         }
 
+        // Resolve an unindexed CUDA device before crossing to the read thread.
+        let device = py
+            .import("uniserve.runtime.device")?
+            .getattr("canonical_device")?
+            .call1((&device,))?
+            .unbind();
+
         let destination = destination
             .map(|destination| {
                 py.import("uniserve_worker.transport.layout")?
@@ -438,6 +445,12 @@ impl TransferPool {
         if locator.getattr("backend")?.extract::<String>()? != "shm" {
             return Err(invalid(py, "shared storage read requires a SHM locator"));
         }
+
+        let device = py
+            .import("uniserve.runtime.device")?
+            .getattr("canonical_device")?
+            .call1((&device,))?
+            .unbind();
 
         // Supplied destinations must be valid before recording their handoff.
         // Otherwise allocation stays on the read thread, after admission.

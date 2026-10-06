@@ -263,3 +263,28 @@ def test_failed_channel_preparation_returns_read_capacity(
         assert transport.capacity.used == 0
     finally:
         transport.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ("channel", "shm"))
+def test_host_payload_allocation_uses_the_submitting_threads_cuda_device(
+    events: EventPool, backend: str
+) -> None:
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+
+    transport = make_transport(
+        backend, byte_capacity=128, ticket_capacity=1, event_pool=events
+    )
+    source = torch.arange(8, dtype=torch.float32)
+    locator = transport.export(source, consumers=(0,))
+
+    try:
+        with torch.cuda.device(1):
+            ticket = transport.fetch(locator, device=torch.device("cuda"))
+        result = _await_ticket(ticket)
+        assert result.device == torch.device("cuda:1")
+        torch.testing.assert_close(result.cpu(), source, rtol=0, atol=0)
+    finally:
+        transport.release(locator)
+        transport.close()
