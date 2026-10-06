@@ -10,13 +10,12 @@ and retains input tensors through completion.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
 
 from uniserve.model import (
-    AudioEncoder,
     Condition,
     VideoEncoder,
     VisionInput,
@@ -34,7 +33,6 @@ if TYPE_CHECKING:
     )
     from uniserve_worker.model_executor.output import ExecutionOutput
     from uniserve_worker.protocol.batch import DecodeRange
-    from uniserve_worker.protocol.call import Call
     from uniserve_worker.protocol.tensor import OutputInfo
 
 #: RGB24 pixels of every visual condition, ``[pixels, 3]`` uint8.
@@ -111,29 +109,6 @@ def _round_units(video: VideoAdmission, decode: DecodeRange) -> range:
             "a latent encoding round exceeds the request's condition units"
         )
     return range(cursor, cursor + count)
-
-
-def condition_encoder(
-    call: Call, outputs: Mapping[str, tuple[OutputInfo, ...]]
-) -> type[VideoEncoder] | type[AudioEncoder] | None:
-    """Return the condition encoder a latent encoding call runs.
-
-    A visual round publishes ``condition_video_latents`` and runs the video
-    encoder; the audio call publishes ``condition_audio_latents`` and runs
-    the audio encoder. None for a latent encoding call of another product,
-    such as an image's.
-    """
-    declared = outputs.get(call.component, ())
-    names = {
-        declared[output.output_index].name
-        for output in call.outputs
-        if output.output_index < len(declared)
-    }
-    if CONDITION_VIDEO_LATENTS in names:
-        return VideoEncoder
-    if CONDITION_AUDIO_LATENTS in names:
-        return AudioEncoder
-    return None
 
 
 def condition_layout(
@@ -437,7 +412,6 @@ __all__ = [
     "CONDITION_VIDEO_LATENTS",
     "VISION_FEATURES",
     "VISION_PIXELS",
-    "condition_encoder",
     "condition_latents",
     "condition_layout",
     "condition_units",

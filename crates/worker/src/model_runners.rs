@@ -33,6 +33,10 @@ impl<R> Default for ModelRunners<R> {
 }
 
 impl<R> ModelRunners<R> {
+    pub fn iter(&self) -> impl Iterator<Item = &R> {
+        self.runners.iter()
+    }
+
     pub fn clear(&mut self) {
         self.routes.clear();
         self.runners.clear();

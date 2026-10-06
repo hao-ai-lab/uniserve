@@ -403,8 +403,8 @@ def warmup_decoders(runner: ModelExecutor) -> None:
         )
     )
     try:
-        for (name, _, method), (binding, call) in runner._module_calls.items():
-            if method != "decode":
+        for name, binding, call in runner.batch_runners.calls():
+            if call.entry_point.method != "decode":
                 continue
             module = call.module
             if isinstance(module, VideoDecoder):
@@ -473,7 +473,7 @@ def warmup_postprocess(
     """
     entries = [
         (name, call)
-        for (name, _, _), (_, call) in runner._module_calls.items()
+        for name, _, call in runner.batch_runners.calls()
         if isinstance(call.module, VideoPostprocessor)
     ]
     if not entries:

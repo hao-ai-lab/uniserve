@@ -4,16 +4,18 @@
 their capabilities, and owns everything that executes them: CUDA streams
 (execution lanes and their forks), input buffers, and prepared execution
 contexts and captured graphs, whose allocations its ``GraphStorage``
-accounts against per-device budgets. It keeps three kinds of runner:
+accounts against per-device budgets. Native ``ModelRunners`` owns bound
+methods, their prepared contexts and shared stream and scratch lifetime.
+The executor uses three kinds of runner:
 
 - batch runners, created once by ``configure_inputs`` per (component, path,
   lane) with fixed input buffers, which ``forward`` drives with homogeneous
   batches of token rows and image-path rows (vision and latent encoding,
   image denoising and decoding);
-- module entries, prepared by ``prepare_module`` per exact numerical size
+- module runners, prepared by ``prepare_module`` per exact numerical size
   and invoked through ``run_module`` for standalone calls such as encoders,
   decoders and the video post-processor;
-- diffusion runners, one per layout of a standalone video denoiser, which
+- a standalone diffusion runner with prepared layouts, which
   ``run_denoising`` steps (see ``uniserve_worker.execution.media``).
 
 The worker constructs one executor per rank and drives it through startup
@@ -28,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -59,12 +61,7 @@ from uniserve.model import (
 from uniserve.nn.vae import PatchAutoencoder
 from uniserve.processing import ImageProcessor
 from uniserve.profiling import profile_range
-from uniserve.runtime import (
-    CUDAStream,
-    ExecutionContext,
-    Scratch,
-    partition_streams,
-)
+from uniserve.runtime import CUDAStream, ExecutionContext, partition_streams
 from uniserve.runtime.backends import kernel_choices
 from uniserve.runtime.backends.attention import resolve as attention_backend
 from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
@@ -98,7 +95,6 @@ from uniserve_worker.errors import (
 )
 from uniserve_worker.execution.conditions import (
     CONDITION_PRODUCTS,
-    condition_encoder,
     condition_layout,
     library_conditions,
 )
@@ -109,9 +105,6 @@ from uniserve_worker.execution.kernel_table import (
 )
 from uniserve_worker.model_executor.component_binding import (
     ComponentBinding,
-)
-from uniserve_worker.model_executor.cuda_graph import (
-    input_signature,
 )
 from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow
 from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
@@ -289,18 +282,6 @@ class ModelExecutor:
 
         self.entries: dict[tuple[str, str, str | None, int], ModelRunner] = {}
         self.batch_runners: ModelRunners[ModelRunner] = ModelRunners()
-        self._module_calls = {}
-        self._call_kinds = {}
-        self._runner_types = {}
-        self._calls_by_kind = defaultdict(list)
-        self._module_entries: OrderedDict[tuple, ModelRunner] = OrderedDict()
-        # Keys of the module entries prepared during startup, which stay
-        # resident.
-        self._startup_modules: set[tuple] = set()
-        self._module_streams: dict[tuple[str, str, str], CUDAStream] = {}
-        # Transient work areas the startup contexts of one (entry, path,
-        # method) borrow on that entry's stream; see ``prepare_module``.
-        self._module_scratch: dict[tuple[str, str, str], Scratch] = {}
 
         self._lane_streams: list[tuple[LaneConfig | None, CUDAStream]] = []
         self._preparation_stream: torch.cuda.Stream | None = None
@@ -352,12 +333,16 @@ class ModelExecutor:
                 for call in binding.calls:
                     if not call_kinds((call,)):
                         continue
-                    key = (name, call.path, call.entry_point.method)
-                    self._module_calls[key] = (binding, call)
-                    self._call_kinds[id(call)] = call_kinds((call,))
-                    self._runner_types[id(call)] = runner_type(call.module)
-                    for kind in call_kinds((call,)):
-                        self._calls_by_kind[name, kind].append(call)
+                    self.batch_runners.register(
+                        name,
+                        binding,
+                        call,
+                        call_kinds((call,)),
+                        self.outputs.get(name, ()),
+                        encoder=self._encoder_kind(call.module)
+                        if call.entry_point.method == "encode"
+                        else None,
+                    )
 
                     if self.media_builder is not None and isinstance(
                         call.module, Denoiser
@@ -405,46 +390,9 @@ class ModelExecutor:
         ``capability_type`` further restricts the candidates to instances of
         that class. Raises ``InputError`` unless exactly one module matches.
         """
-        calls = [
-            call
-            for _, call in self._module_calls.values()
-            if kind in self._call_kinds[id(call)]
-            and (
-                capability_type is None
-                or isinstance(call.module, capability_type)
-            )
-        ]
-        if len(calls) != 1:
-            raise InputError(
-                f"computation {kind.value} requires one local capability"
-            )
-        return calls[0].module
-
-    def _module_call(self, name, method=None, path=None):
-        """Return the unique ``(binding, call)`` pair of component ``name``.
-
-        ``method`` and ``path`` select among the component's numerical
-        methods, ``path`` naming the module of a component that exposes one
-        method name on several modules. Raises ``RuntimeError`` once the
-        executor is closed and ``InputError`` unless exactly one call matches.
-        """
-        if self._closed:
-            raise RuntimeError("model runner is closed")
-        entries = [
-            (binding, call)
-            for (entry, entry_path, entry_method), (
-                binding,
-                call,
-            ) in self._module_calls.items()
-            if entry == name
-            and (method is None or entry_method == method)
-            and (path is None or entry_path == path)
-        ]
-        if len(entries) != 1:
-            raise InputError(
-                f"component {name!r} requires an unambiguous numerical method"
-            )
-        return entries[0]
+        return self.batch_runners.component(
+            kind, capability_type=capability_type
+        )
 
     def prepare_module(self, name, size, *, method=None, path=None):
         """Prepare one exact numerical size before dependent media calls.
@@ -462,143 +410,20 @@ class ModelExecutor:
         in an LRU whose bound is the request pool size; reaching it retires
         the least recently used one. Returns the prepared runner.
         """
-        binding, call = self._module_call(name, method, path)
-        key = (name, call.path, call.entry_point.method, input_signature(size))
-        if key not in self._module_entries:
-            resident = tuple(
-                value
-                for value in self._module_entries
-                if value[:3] == key[:3] and value not in self._startup_modules
-            )
-            if len(resident) >= self.worker_config.max_request_pool_size:
-                self._retire_module(resident[0])
-
-            stream = self.module_stream(
-                name, method=call.entry_point.method, path=call.path
-            )
-            # The worker holds a module's preparation size as an opaque value.
-            context: ExecutionContext[object] = ExecutionContext(
-                call.module,
-                attention=self.attention,
-                stream=stream,
-                # A method declared for one pipeline stage runs on that stage
-                # alone, so its preparation opens no binding over a group the
-                # other stages never reach.
-                groups=call.groups,
-                # Every context of one entry runs on its one stream, so its
-                # startup contexts borrow one set of transient work areas. A
-                # shared set keeps each backing it grows, so a context
-                # prepared while serving owns its own and retires it with
-                # the context.
-                scratch=None
-                if self._startup_complete
-                else self._module_scratch.setdefault(key[:3], Scratch()),
-                # Serving inputs carry their host sequence lengths; a call
-                # that lacks one fails rather than copying it from the device.
-                derive_host_lengths=False,
-            )
-            # An entry given graph devices captures a graph the first time it
-            # executes each input signature during startup
-            # (``ModelRunners.run_module``); a video post-processor, and
-            # any entry prepared while serving, is given none and always runs
-            # eagerly. Startup entries of one call share its graph pool.
-            share = next(
-                (
-                    self._module_entries[value]
-                    for value in self._startup_modules
-                    if value[:3] == key[:3]
-                ),
-                None,
-            )
-            entry = self._runner_types[id(call)](
-                name,
-                call,
-                binding.device,
-                (),
-                None,
-                context,
-                storage=self.graph_storage,
-                devices=(binding.device,)
-                if stream is not None
-                and self.worker_config.graph_policy != "off"
-                and not isinstance(call.module, VideoPostprocessor)
-                and not self._startup_complete
-                else (),
-                share=share,
-            )
-            try:
-                if stream is not None:
-                    stream.wait(torch.cuda.current_stream(binding.device))
-                with self.graph_storage.allocate(entry.execution):
-                    context.prepare(size)
-                self.graph_storage.check()
-            except BaseException:
-                entry.close()
-                raise
-
-            # An entry prepared while serving never captures.
-            entry._startup_complete = self._startup_complete
-            if not self._startup_complete:
-                self._startup_modules.add(key)
-            self._module_entries[key] = entry
-
-        self._module_entries.move_to_end(key)
-        return self._module_entries[key]
+        return self.batch_runners.prepare_module(
+            self, name, size, method=method, path=path
+        )
 
     def module_stream(self, name, *, method=None, path=None):
-        """Bind one numerical entry to a stream in its existing resource grant.
+        """Return the native registry's stream for a local numerical method.
 
-        ``method`` and ``path`` select the entry as ``_module_call`` does.
-        Returns ``None`` for an entry on a non-CUDA device. Each (entry, path,
-        method) gets one stream on first use, kept until ``close``. Raises
-        ``InputError`` when more than one lane stream on the entry's device
-        covers its call kinds, or when lanes are configured and none does;
-        errors of ``_module_call`` and ``_initialize_streams`` propagate.
+        CPU methods return ``None``. CUDA methods borrow their execution
+        lane and share one stream across prepared sizes. Ambiguous method
+        selection or lane placement raises ``InputError``.
         """
-        binding, call = self._module_call(name, method, path)
-        if binding.device.type != "cuda":
-            return None
-
-        self._initialize_streams(event_slots=self._event_slots)
-        key = (name, call.path, call.entry_point.method)
-        if key not in self._module_streams:
-            # A standalone entry forks the stream on its device that covers
-            # its call kinds: a lane stream, or without lanes the device's
-            # full-device stream, which covers every kind. Without lanes, an
-            # entry on a device that has no full-device stream gets a stream
-            # of its own.
-            entry_kinds = self._call_kinds[id(call)]
-            parents = tuple(
-                stream
-                for lane, stream in self._lane_streams
-                if stream.device == binding.device
-                and (lane is None or entry_kinds.intersection(lane.call_kinds))
-            )
-            if len(parents) > 1:
-                raise InputError(
-                    "one numerical entry requires an unambiguous execution "
-                    "partition"
-                )
-            if parents:
-                owner = parents[0].fork()
-            elif self.worker_config.lanes:
-                raise InputError(
-                    "numerical entry has no initialized execution partition"
-                )
-            else:
-                owner = CUDAStream.external(
-                    torch.cuda.Stream(device=binding.device)
-                )
-            # Weights and runtime backing are initialized before their first
-            # borrowed use. Later calls depend on tensor fences, not other
-            # entries.
-            try:
-                owner.wait(torch.cuda.current_stream(binding.device))
-            except BaseException:
-                owner.close()
-                raise
-            self._module_streams[key] = owner
-        return self._module_streams[key]
+        return self.batch_runners.module_stream(
+            self, name, method=method, path=path
+        )
 
     def diffusion_entry(self, call) -> DiffusionRunner:
         """Return the batched runner that predicts a KV-conditioned call.
@@ -624,54 +449,7 @@ class ModelExecutor:
         component's capabilities for the call do not narrow to exactly one,
         and propagates the errors of ``module_stream``.
         """
-        if self.batch_runners.get(call.component, call.kind) is not None:
-            return None
-        if (
-            call.kind is MediaCall.LATENT_PREPARATION
-            and self.batch_runners.get(call.component, MediaCall.DENOISING)
-            is not None
-        ):
-            return None
-        calls = self._calls_by_kind.get((call.component, call.kind), ())
-        if not calls:
-            return None
-
-        if call.kind is MediaCall.LATENT_PREPARATION:
-            # Preparation composes the denoiser's initialization with optional
-            # conditioning encoders. The denoiser owns this call's stream;
-            # its encoder calls retain their ordinary input/output dependencies.
-            denoisers = tuple(
-                candidate
-                for candidate in calls
-                if isinstance(candidate.module, Denoiser)
-            )
-            calls = denoisers or calls
-        elif call.kind is MediaCall.VIDEO_DECODING:
-            calls = tuple(
-                candidate
-                for candidate in calls
-                if isinstance(candidate.module, VideoDecoder)
-            )
-        elif call.kind is MediaCall.LATENT_ENCODING:
-            # A condition encoding round runs the encoder of the latents it
-            # publishes: visual rounds the video encoder, the audio round
-            # the audio encoder.
-            encoder = condition_encoder(call, self.outputs)
-            if encoder is not None:
-                calls = tuple(
-                    candidate
-                    for candidate in calls
-                    if isinstance(candidate.module, encoder)
-                )
-
-        if len(calls) != 1:
-            raise InputError("call requires one bound numerical capability")
-        owner = self.module_stream(
-            call.component,
-            method=calls[0].entry_point.method,
-            path=calls[0].path,
-        )
-        return None if owner is None else owner.stream
+        return self.batch_runners.call_stream(self, call)
 
     def _initialize_streams(self, *, event_slots):
         """Realize execution grants for both batched and standalone calls.
@@ -721,26 +499,10 @@ class ModelExecutor:
                         )
                     )
 
-    def _retire_module(self, key):
-        """Retire the module entry under ``key`` and its captured graphs.
-
-        The entry's stream is drained first, so no queued work still uses
-        what the entry releases.
-        """
-        self._startup_modules.discard(key)
-        entry = self._module_entries.pop(key)
-        if entry.execution.context.stream is not None:
-            entry.execution.context.stream.synchronize()
-        entry.close()
-
     @property
     def encoder_kinds(self):
-        """Encoder kinds, as ``run_encoder`` names them, bound on this rank."""
-        return frozenset(
-            self._encoder_kind(call.module)
-            for _, call in self._module_calls.values()
-            if call.entry_point.method == "encode"
-        )
+        """Encoder kinds bound on this rank."""
+        return self.batch_runners.encoder_kinds
 
     @staticmethod
     def _encoder_kind(module):
@@ -765,15 +527,7 @@ class ModelExecutor:
         ``lengths``. Raises ``InputError`` unless exactly one bound encoder
         has that kind.
         """
-        found = [
-            (name, call)
-            for (name, _, _), (_, call) in self._module_calls.items()
-            if call.entry_point.method == "encode"
-            and self._encoder_kind(call.module) == kind
-        ]
-        if len(found) != 1:
-            raise InputError(f"rank does not participate in {kind} encoding")
-        name, call = found[0]
+        name, call = self.batch_runners.encoder(kind)
 
         # Text encoders take flat token sequences; other encoders keep their
         # batched input shapes, which also serve as the preparation size.
@@ -799,14 +553,7 @@ class ModelExecutor:
         context serves every call. Raises ``InputError`` unless exactly one
         bound vision encoder exists.
         """
-        found = [
-            (name, call)
-            for (name, _, method), (_, call) in self._module_calls.items()
-            if method == "encode" and isinstance(call.module, PatchEncoder)
-        ]
-        if len(found) != 1:
-            raise InputError("rank does not participate in vision encoding")
-        name, call = found[0]
+        name, call = self.batch_runners.encoder("vision")
         return self.run_module(
             name, inputs, method="encode", path=call.path, size=None
         )
@@ -872,15 +619,10 @@ class ModelExecutor:
         with the padding rows masked out, and returns the prompt's rows; any
         other conditioning encoder refines the exact rows.
         """
-        found = [
-            call.module
-            for (_, _, method), (_, call) in self._module_calls.items()
-            if method == "encode"
-            and self._encoder_kind(call.module) == "conditioning"
-        ]
+        _, call = self.batch_runners.encoder("conditioning")
         count = features.shape[0]
         capacity = self._text_capacity(count)
-        if not isinstance(found[0] if found else None, TextConditioner):
+        if not isinstance(call.module, TextConditioner):
             return self.run_encoder("conditioning", features)
         padded = features.new_zeros((capacity, *features.shape[1:]))
         padded[:count].copy_(features)
@@ -914,8 +656,8 @@ class ModelExecutor:
         # tower.
         encoders = {
             self._encoder_kind(call.module): (name, call.path)
-            for (name, _, method), (_, call) in self._module_calls.items()
-            if method == "encode"
+            for name, _, call in self.batch_runners.calls()
+            if call.entry_point.method == "encode"
         }
         capacities = tuple(reversed(builder.text_capacities))
         dtype = getattr(torch, self.worker_config.model_dtype)
@@ -950,34 +692,13 @@ class ModelExecutor:
             if "conditioning" in kinds and text is not None:
                 self.encode_conditioning(features(capacity))
 
-    @torch.inference_mode()
     def run_module(
         self, name, *args, method=None, path=None, size=None, **kwargs
     ):
         """Resolve a bound capability and invoke its numerical runner."""
-        binding, call = self._module_call(name, method, path)
-        runner = self.prepare_module(
-            name, size, method=call.entry_point.method, path=call.path
+        return self.batch_runners.run_module(
+            self, name, args, kwargs, method=method, path=path, size=size
         )
-        with profile_range(
-            f"uniserve.model.module rank={self.worker_config.rank} work={name}"
-        ):
-            try:
-                result = self.batch_runners.run_module(runner, args, kwargs)
-            except CUDAGraphError:
-                # Retire the failed context and its graphs; the next call at
-                # this size prepares a fresh one.
-                self._retire_module(
-                    (
-                        name,
-                        call.path,
-                        call.entry_point.method,
-                        input_signature(size),
-                    )
-                )
-                raise
-        self._report_new_kernels()
-        return result
 
     @property
     def denoises(self) -> bool:
@@ -1348,11 +1069,9 @@ class ModelExecutor:
         # largest call's intermediates rather than one copy per runner.
         token_pools: dict[tuple[str, int], ModelRunner] = {}
 
-        for (name, path, method), (
-            placement,
-            call,
-        ) in self._module_calls.items():
-            entry_kinds = self._call_kinds[id(call)] & buffered
+        for name, placement, call in self.batch_runners.calls():
+            path = call.path
+            entry_kinds = call_kinds((call,)) & buffered
             if not entry_kinds:
                 continue
 
@@ -1365,7 +1084,7 @@ class ModelExecutor:
                 & {MediaCall.LATENT_ENCODING, MediaCall.IMAGE_DECODING}
                 else placement.device
             )
-            runner_class = self._runner_types[id(call)]
+            runner_class = runner_type(call.module)
             token_runner = issubclass(runner_class, (TextRunner, CanvasRunner))
             streams = [
                 (lane, stream, 0)
@@ -2029,7 +1748,7 @@ class ModelExecutor:
         """Return every runner this executor currently holds."""
         return (
             *self.entries.values(),
-            *self._module_entries.values(),
+            *self.batch_runners.prepared,
             *(() if self._diffusion is None else (self._diffusion,)),
         )
 
@@ -2074,7 +1793,7 @@ class ModelExecutor:
         streams.extend(stream.stream for _, stream in self._lane_streams)
         streams.extend(stream.stream for stream in self._microbatch_streams)
         streams.extend(
-            stream.stream for stream in self._module_streams.values()
+            stream.stream for stream in self.batch_runners.module_streams
         )
 
         devices = {
@@ -2107,7 +1826,7 @@ class ModelExecutor:
             entry.close_graphs
             for entry in (
                 *self.entries.values(),
-                *self._module_entries.values(),
+                *self.batch_runners.prepared,
                 *(() if self._diffusion is None else (self._diffusion,)),
             )
         ]
@@ -2149,7 +1868,7 @@ class ModelExecutor:
                 *(
                     partial(owner.close, aborted=True)
                     for owner in (
-                        *self._module_streams.values(),
+                        *self.batch_runners.module_streams,
                         *self._microbatch_streams,
                         *(owner for _, owner in self._lane_streams),
                     )
@@ -2159,10 +1878,7 @@ class ModelExecutor:
 
         actions = [self.synchronize]
         actions.append(self.close_graphs)
-        actions.extend(entry.close for entry in self._module_entries.values())
-        actions.extend(
-            scratch.close for scratch in self._module_scratch.values()
-        )
+        actions.append(self.batch_runners.close_modules)
         if self._diffusion is not None:
             actions.append(self._diffusion.close)
         for entry in self.entries.values():
@@ -2178,7 +1894,7 @@ class ModelExecutor:
         # rank in the same order.
         actions.extend(
             stream.close
-            for stream in reversed(tuple(self._module_streams.values()))
+            for stream in reversed(self.batch_runners.module_streams)
         )
         actions.extend(
             stream.close for stream in reversed(self._microbatch_streams)
@@ -2192,11 +1908,8 @@ class ModelExecutor:
         finally:
             self.batch_runners.clear()
             self.entries.clear()
-            self._module_entries.clear()
-            self._module_scratch.clear()
             self._diffusion = None
             self.graph_storage.close()
-            self._module_streams.clear()
             self._lane_streams.clear()
             self._microbatch_streams.clear()
             self._expert_exchanges = ()
@@ -2204,14 +1917,7 @@ class ModelExecutor:
 
     def prepare_text_tokens(self, tokens: tuple[int, ...]) -> torch.Tensor:
         """Prepare the text encoder's input using its own reusable backing."""
-        found = [
-            (name, call)
-            for (name, _, method), (_, call) in self._module_calls.items()
-            if method == "encode" and isinstance(call.module, TextEncoder)
-        ]
-        if len(found) != 1:
-            raise InputError("rank has no unambiguous text encoder")
-        name, call = found[0]
+        name, call = self.batch_runners.encoder("text")
         runner = self.prepare_module(
             name, TextSize(len(tokens), 1), method="encode", path=call.path
         )
