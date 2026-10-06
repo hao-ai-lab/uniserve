@@ -4,7 +4,10 @@ mod dispatch;
 mod execute;
 mod forward;
 mod graphs;
+mod inputs;
 mod modules;
+mod resources;
+mod streams;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,7 +34,8 @@ pub(crate) struct ModelRunners {
     modules: IndexMap<(String, String, String), Arc<modules::Module>>,
     outputs: HashMap<String, Vec<String>>,
     // Creation order matters when closing communicators shared by ranks.
-    streams: Arc<Mutex<Vec<Py<PyAny>>>>,
+    streams: Arc<streams::Streams>,
+    closed: bool,
 }
 
 #[pymethods]
@@ -340,53 +344,83 @@ impl ModelRunners {
     }
 
     #[getter]
-    fn module_streams<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let streams: Vec<_> = self
-            .streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .map(|stream| stream.clone_ref(py))
-            .collect();
-        // Python allocation can run GC, whose visitor takes the same lock.
-        PyTuple::new(py, streams)
+    fn lane_count(&self) -> usize {
+        self.streams.lane_count()
     }
 
-    /// The caller drains streams and output readers before releasing contexts.
-    /// Every close is attempted; shared scratch outlives the contexts using it.
-    fn close_modules(slf: &Bound<'_, Self>) -> PyResult<()> {
+    #[pyo3(signature = (owner, *, event_slots=None))]
+    fn initialize_streams(
+        slf: &Bound<'_, Self>,
+        owner: &Bound<'_, PyAny>,
+        event_slots: Option<usize>,
+    ) -> PyResult<()> {
+        ensure_open(owner)?;
+        let streams = Arc::clone(&slf.borrow().streams);
+        streams.initialize(owner, event_slots)
+    }
+
+    #[pyo3(signature = (device, *, microbatches=false))]
+    fn batch_streams<'py>(
+        &self,
+        device: &Bound<'py, PyAny>,
+        microbatches: bool,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        self.streams.batch_streams(device, microbatches)
+    }
+
+    fn fork_microbatch(&self, py: Python<'_>) -> PyResult<()> {
+        self.streams.fork_microbatch(py)
+    }
+
+    #[getter]
+    fn expert_streams<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        self.streams.expert_streams(py)
+    }
+
+    fn preparing_inputs(
+        slf: &Bound<'_, Self>,
+        owner: &Bound<'_, PyAny>,
+        transfers: Py<PyTuple>,
+    ) -> PyResult<inputs::InputCopies> {
         let py = slf.py();
-        let modules: Vec<_> = slf.borrow().modules.values().cloned().collect();
-        let mut actions = Vec::new();
-        for module in &modules {
-            for cache in [&module.resident, &module.serving] {
-                let cache = cache.bind(py);
-                for (_, runner) in cache.iter() {
-                    actions.push(runner.getattr("close")?);
-                }
-                cache.clear();
-            }
+        ensure_open(owner)?;
+        let device = py.import("uniserve.runtime.device")?.call_method1(
+            "canonical_device",
+            (owner.getattr("worker_config")?.getattr("device")?,),
+        )?;
+        if streams::cuda_index(&device)?.is_none() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "input preparation requires a live CUDA execution owner",
+            ));
         }
-        for module in &modules {
-            let scratch = module
-                .scratch
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .map(|scratch| scratch.clone_ref(py));
-            if let Some(scratch) = scratch {
-                actions.push(scratch.bind(py).getattr("close")?);
-            }
-        }
-        py.import("uniserve.runtime.resources")?
-            .getattr("close_resources")?
-            .call1(PyTuple::new(py, actions)?)?;
-        Ok(())
+        let streams = Arc::clone(&slf.borrow().streams);
+        Ok(inputs::InputCopies {
+            owner: slf.clone().unbind(),
+            stream: streams.preparation(&device)?.unbind(),
+            transfers,
+        })
+    }
+
+    fn synchronize(slf: &Bound<'_, Self>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
+        resources::synchronize(slf, owner)
+    }
+
+    fn close_graphs(slf: &Bound<'_, Self>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
+        resources::close_graphs(slf, owner)
+    }
+
+    #[pyo3(signature = (owner, *, aborted=false))]
+    fn close(slf: &Bound<'_, Self>, owner: &Bound<'_, PyAny>, aborted: bool) -> PyResult<()> {
+        resources::close(slf, owner, aborted)
     }
 
     #[new]
-    fn new() -> Self {
-        Self::default()
+    #[pyo3(signature = (*, event_slots=2))]
+    fn new(event_slots: usize) -> Self {
+        Self {
+            streams: Arc::new(streams::Streams::new(event_slots)),
+            ..Self::default()
+        }
     }
 
     /// Evaluate a prepared numerical batch in its context, including experts.
@@ -454,13 +488,7 @@ impl ModelRunners {
         self.inner.clear();
         self.modules.clear();
         self.outputs.clear();
-        let streams = std::mem::take(
-            &mut *self
-                .streams
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        drop(streams);
+        self.streams.clear();
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
@@ -474,14 +502,7 @@ impl ModelRunners {
                 module.traverse(&visit)?;
             }
         }
-        for stream in self
-            .streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-        {
-            visit.call(stream)?;
-        }
+        self.streams.traverse(&visit)?;
         Ok(())
     }
 
@@ -548,4 +569,38 @@ pub(super) fn context<'py>(runner: &Bound<'py, PyAny>) -> PyResult<Bound<'py, Py
         .context
         .bind(runner.py())
         .clone())
+}
+
+impl ModelRunners {
+    /// The caller drains streams and output readers before releasing contexts.
+    /// Every close is attempted; shared scratch outlives the contexts using it.
+    fn close_modules(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        let modules: Vec<_> = slf.borrow().modules.values().cloned().collect();
+        let mut actions = Vec::new();
+        for module in &modules {
+            for cache in [&module.resident, &module.serving] {
+                let cache = cache.bind(py);
+                for (_, runner) in cache.iter() {
+                    actions.push(runner.getattr("close")?);
+                }
+                cache.clear();
+            }
+        }
+        for module in &modules {
+            let scratch = module
+                .scratch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|scratch| scratch.clone_ref(py));
+            if let Some(scratch) = scratch {
+                actions.push(scratch.bind(py).getattr("close")?);
+            }
+        }
+        py.import("uniserve.runtime.resources")?
+            .getattr("close_resources")?
+            .call1(PyTuple::new(py, actions)?)?;
+        Ok(())
+    }
 }

@@ -23,9 +23,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("compute_fails", [False, True])
+@pytest.mark.parametrize("failure", [None, "compute", "copy"])
 def test_initial_inputs_are_ready_for_consumption_after_preparation(
-    compute_fails,
+    failure,
 ):
     device = torch.device("cuda", 0)
     model = Model().to(device)
@@ -37,14 +37,23 @@ def test_initial_inputs_are_ready_for_consumption_after_preparation(
     try:
         for value in (7, 13):
             source.fill_(value)
+            copies = ((destination, source),)
+            if failure == "copy":
+                # Reject a later pair after the valid copy was submitted.
+                copies += ((destination[:1], source),)
             error = (
-                pytest.raises(ValueError, match="compute rejected")
-                if compute_fails
+                pytest.raises(
+                    ValueError,
+                    match="compute rejected"
+                    if failure == "compute"
+                    else "match destination shape and dtype",
+                )
+                if failure is not None
                 else nullcontext()
             )
             with error:
-                with runner.preparing_inputs(((destination, source),)):
-                    if compute_fails:
+                with runner.preparing_inputs(copies):
+                    if failure == "compute":
                         raise ValueError("compute rejected")
             # This GPU consumer uses the calling stream. Copy completion must
             # precede it even when independent preparation computation failed.

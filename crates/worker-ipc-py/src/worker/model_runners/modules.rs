@@ -29,7 +29,7 @@ pub(super) struct Module {
     pub(super) resident: Py<PyDict>,
     pub(super) serving: Py<PyDict>,
     pub(super) stream: Mutex<Option<Py<PyAny>>>,
-    pub(super) streams: Arc<Mutex<Vec<Py<PyAny>>>>,
+    pub(super) streams: Arc<super::streams::Streams>,
     pub(super) scratch: Mutex<Option<Py<PyAny>>>,
 }
 
@@ -73,67 +73,7 @@ impl Module {
         {
             return Ok(stream.bind(py).clone());
         }
-        let options = PyDict::new(py);
-        options.set_item("event_slots", owner.getattr("_event_slots")?)?;
-        owner.call_method("_initialize_streams", (), Some(&options))?;
-
-        let mut parents = Vec::new();
-        for pair in owner.getattr("_lane_streams")?.try_iter()? {
-            let pair = pair?;
-            let lane = pair.get_item(0)?;
-            let stream = pair.get_item(1)?;
-            if !stream.getattr("device")?.eq(&device)? {
-                continue;
-            }
-            let covers = lane.is_none()
-                || lane.getattr("call_kinds")?.try_iter()?.try_fold(
-                    false,
-                    |matched, kind| -> PyResult<bool> {
-                        Ok(matched || self.kinds.contains(&pythonize::depythonize(&kind?)?))
-                    },
-                )?;
-            if covers {
-                parents.push(stream);
-            }
-        }
-        if parents.len() > 1 {
-            return Err(input_error(
-                py,
-                "one numerical module requires an unambiguous execution partition",
-            ));
-        }
-        let cuda = py.import("torch.cuda")?;
-        let stream = if let Some(parent) = parents.first() {
-            parent.call_method0("fork")?
-        } else if owner
-            .getattr("worker_config")?
-            .getattr("lanes")?
-            .is_truthy()?
-        {
-            return Err(input_error(
-                py,
-                "numerical module has no initialized execution partition",
-            ));
-        } else {
-            let options = PyDict::new(py);
-            options.set_item("device", &device)?;
-            let stream = cuda.getattr("Stream")?.call((), Some(&options))?;
-            py.import("uniserve.runtime")?
-                .getattr("CUDAStream")?
-                .call_method1("external", (stream,))?
-        };
-        // The first use follows weight and backing initialization. Later
-        // calls order only their actual input and output dependencies.
-        if let Err(error) =
-            stream.call_method1("wait", (cuda.call_method1("current_stream", (&device,))?,))
-        {
-            stream.call_method0("close")?;
-            return Err(error);
-        }
-        self.streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(stream.clone().unbind());
+        let stream = self.streams.module(owner, &device, &self.kinds)?;
         *self
             .stream
             .lock()
@@ -288,7 +228,12 @@ fn retire(runner: &Bound<'_, PyAny>) -> PyResult<()> {
 }
 
 pub(super) fn ensure_open(owner: &Bound<'_, PyAny>) -> PyResult<()> {
-    if owner.getattr("_closed")?.is_truthy()? {
+    if owner
+        .getattr("batch_runners")?
+        .cast_into::<ModelRunners>()?
+        .borrow()
+        .closed
+    {
         return Err(PyRuntimeError::new_err("model runner is closed"));
     }
     Ok(())
