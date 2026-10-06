@@ -32,7 +32,6 @@ from uniserve_worker.protocol.batch import (
     BufferAllocation,
     LatentParams,
     NewRequest,
-    TensorExport,
 )
 from uniserve_worker.protocol.call import (
     Call,
@@ -305,6 +304,24 @@ class BatchState:
         """Return numerical forward rows in scheduler order."""
     def pending_outputs(self) -> tuple[PendingOutput, ...]: ...
     def complete_latent(self, request_id: int) -> None: ...
+    def consume_tensor(
+        self,
+        request_id: int,
+        tensor_store: TensorStore,
+        device: torch.device,
+    ) -> TensorRead:
+        """Borrow the call's resident source through completion."""
+    def export_tensors(
+        self,
+        request_id: int,
+        values: Sequence[torch.Tensor],
+        tensor_store: TensorStore,
+        transports: Mapping[str, Transport],
+        *,
+        host: bool = False,
+        regions: Sequence[Sequence[tuple[slice, ...]]] | None = None,
+    ) -> None:
+        """Export this rank's numerical outputs and retain native results."""
     def pending_output(self, request_id: int) -> PendingOutput: ...
 
 @final
@@ -369,7 +386,6 @@ class PendingOutput:
     def latent_params(self) -> LatentParams | None: ...
     @property
     def latent_buffer(self) -> LatentBuffer | None: ...
-    tensor_exports: dict[BufferId, ExportLocations]
     cache_exports: dict[BufferId, ExportLocations]
     exported_locators: list[Locator]
     device_reads: list[TensorRead]
@@ -381,9 +397,6 @@ class PendingOutput:
     transition_write: Buffer | None
     completion_write: Buffer | None
     producer_write: Buffer | None
-
-    def set_products(self, products: Sequence[TensorExport]) -> None:
-        """Retain declared tensor results for native batch delivery."""
 
     def set_sampling(
         self,

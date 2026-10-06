@@ -14,7 +14,6 @@ from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.call import (
     Call,
     MediaCall,
-    TransferMode,
 )
 
 if TYPE_CHECKING:
@@ -50,23 +49,14 @@ def execute_calls(
         image,
         media,
         media_reader,
-        transfer,
     )
     from uniserve_worker.execution.host_media import HOST_MEDIA_CALLS
 
     for call in scheduled:
         with state.scope():
-            if isinstance(call.kind, TransferMode):
-                transfer.execute(
-                    call,
-                    tensor_store=tensor_store,
-                    export_transports=export_transports,
-                    model_runner=model_runner,
-                    state=state,
-                )
             # Latent preparation belongs to diffusion only on image workers;
             # a video worker's latent preparation falls through to media.
-            elif (
+            if (
                 call.kind is MediaCall.LATENT_PREPARATION
                 and model_runner.image_builder is not None
             ):

@@ -9,6 +9,7 @@ mod predicates;
 mod prepare;
 mod reserve;
 mod retirement;
+mod tensors;
 
 use std::collections::HashSet;
 use std::sync::Arc;

@@ -104,6 +104,41 @@ _MATERIALIZED_PREFIXES: set[RequestKey] = set()
 _BUFFER_ALLOCATIONS: dict[BufferId, BufferAllocation] = {}
 
 
+def reset_scheduler() -> None:
+    """Start an independent test scenario with no admitted requests."""
+    for state in (
+        _BLOCK_TABLES,
+        _REQUEST_POOL_INDICES,
+        _PAGES_TO_ZERO,
+        _UNBOUND_PAGES,
+        _IMAGE_PARAMS,
+        _CALL_KV_LENGTHS,
+        _CALL_KV_RESULTS,
+        _LEDGERS,
+        _CALL_PROJECTIONS,
+        _FIXTURE_BATCHES,
+        _LATENT_STEPS,
+        _LATENT_PAGES,
+        _NEGATIVE_PROMPTS,
+        _ALTERNATIVE_SLOTS,
+        _ALTERNATIVE_PAGES,
+        _PREFIX_CALLS,
+        _MATERIALIZED_PREFIXES,
+        _BUFFER_ALLOCATIONS,
+    ):
+        state.clear()
+
+    configure_physical_pool(
+        cache_pages=1,
+        request_pool_size=1,
+        block_size=1,
+        commit_marker_tokens=1,
+        max_cfg_branches=1,
+        latent_page_units=1,
+        latent_downsample=1,
+    )
+
+
 def configure_physical_pool(
     *,
     cache_pages: int,

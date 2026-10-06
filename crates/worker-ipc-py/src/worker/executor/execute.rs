@@ -121,38 +121,22 @@ impl PythonBackend {
         } else if self.forward_calls.contains(&batch.plan.calls[0].code) {
             self.execute_forward(py, batch, &active)?;
         } else if batch.plan.calls[0].code == CallKind::Transfer(TransferMode::Tensor) {
-            for &index in &active {
-                let call = &batch.plan.calls[index];
-                if call.latent_input.is_some() && call.latent_output.is_none() {
-                    return Err(invalid(
-                        py,
-                        "product transfer changes the physical product kind",
-                    ));
-                }
-            }
-            // Resident latent transfers need only a pool export. Other
-            // tensor transfers still borrow numerical values from their store.
-            let tensors: Vec<_> = active
-                .iter()
-                .copied()
-                .filter(|&index| batch.plan.calls[index].latent_input.is_none())
-                .collect();
-            if !tensors.is_empty() {
-                self.runner
-                    .bind(py)
-                    .call_method1("execute", (&batch.numerical, tensors))?;
-            }
+            let scope = super::super::batch::BatchState::scope(batch.numerical.bind(py))?;
+            with_context(scope.bind(py), || self.execute_tensors(py, batch, &active))?;
         } else {
             self.runner
                 .bind(py)
                 .call_method1("execute", (&batch.numerical, &active))?;
         }
-        if active
-            .iter()
-            .any(|&index| batch.plan.calls[index].latent_output.is_some())
-        {
+        if active.iter().any(|&index| {
+            batch.plan.calls[index].latent_output.is_some()
+                || batch.plan.calls[index].encoder_output.is_some()
+        }) {
             let scope = super::super::batch::BatchState::scope(batch.numerical.bind(py))?;
-            with_context(scope.bind(py), || self.export_latents(py, batch, &active))?;
+            with_context(scope.bind(py), || {
+                self.export_latents(py, batch, &active)?;
+                self.export_features(py, batch, &active)
+            })?;
         }
         Ok(())
     }

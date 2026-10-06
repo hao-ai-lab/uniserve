@@ -1,5 +1,7 @@
 //! PyTorch views and transport submission for native tensor storage.
 
+mod exports;
+
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
@@ -104,6 +106,11 @@ impl Buffer {
     pub(super) fn id(&self, py: Python<'_>) -> BufferId {
         lock(py, &self.inner).id
     }
+
+    pub(super) fn deferred(&self, py: Python<'_>) -> bool {
+        let buffer = lock(py, &self.inner);
+        buffer.state == WriteState::Deferred && !buffer.released
+    }
 }
 
 #[pymethods]
@@ -135,7 +142,7 @@ impl Buffer {
     }
 
     #[getter]
-    fn feature(&self, py: Python<'_>) -> bool {
+    pub(super) fn feature(&self, py: Python<'_>) -> bool {
         lock(py, &self.inner).feature
     }
 
@@ -231,7 +238,7 @@ pub(crate) struct TensorRead {
     #[pyo3(get)]
     region: Option<Py<PyAny>>,
     #[pyo3(get)]
-    metadata: Option<Py<PyAny>>,
+    pub(super) metadata: Option<Py<PyAny>>,
     inner: NativeRead,
 }
 
@@ -355,7 +362,7 @@ pub(crate) struct TensorStore {
     #[pyo3(get)]
     event_pool: Py<EventPool>,
     #[pyo3(get)]
-    exports: Py<PyDict>,
+    pub(super) exports: Py<PyDict>,
     state: Mutex<StoreState>,
 }
 
@@ -896,7 +903,7 @@ impl TensorStore {
     /// Copy a numerical value, then attach its producer fence. A supplied
     /// event is recorded by the caller after all writes in that invocation.
     #[pyo3(signature = (write, value, *, producer_event=None, metadata=None))]
-    fn write<'py>(
+    pub(super) fn write<'py>(
         &self,
         py: Python<'py>,
         write: Bound<'py, Buffer>,
@@ -993,7 +1000,7 @@ impl TensorStore {
     }
 
     #[pyo3(signature = (reference, *, consumer_call_id, device=None))]
-    fn consume<'py>(
+    pub(super) fn consume<'py>(
         &self,
         py: Python<'py>,
         reference: Bound<'py, PyAny>,

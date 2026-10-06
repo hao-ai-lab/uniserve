@@ -37,7 +37,6 @@ from uniserve.model import (
 )
 from uniserve.tensors import OutputLayout
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import transfer
 from uniserve_worker.protocol.call import MediaCall
 from uniserve_worker.protocol.video import VideoAdmission
 from uniserve_worker.storage.tensor_store import device_product_storage
@@ -50,10 +49,7 @@ if TYPE_CHECKING:
         ComponentBinding,
     )
     from uniserve_worker.model_executor.output import ExecutionOutput
-    from uniserve_worker.protocol.batch import (
-        DecodeRange,
-        TensorExport,
-    )
+    from uniserve_worker.protocol.batch import DecodeRange
     from uniserve_worker.protocol.call import Call
     from uniserve_worker.protocol.tensor import OutputInfo
     from uniserve_worker.storage.tensor_store import TensorStore
@@ -281,17 +277,14 @@ def _consume_whole(
 
 
 def _outcome(
-    call: Call,
     request: PendingOutput,
-    products: tuple[TensorExport, ...],
     result: ExecutionOutput,
     state: BatchState,
 ) -> PendingOutput:
-    """Record a condition call's statistics and stage its outcome."""
+    """Record a condition call's numerical execution statistics."""
     if result.stats is None:
         raise RuntimeError("module output has no execution statistics")
     state.forward_stats.append(result.stats)
-    request.set_products(products)
     return request
 
 
@@ -327,14 +320,13 @@ def encode_vision(
         model_runner=model_runner,
     )
     features, result = vision_features(video, patches, model_runner)
-    products = transfer.export_tensors(
-        call,
+    state.export_tensors(
+        call.request_key.request_id,
         (features,),
-        tensor_store=tensor_store,
-        export_transports=export_transports,
-        state=state,
+        tensor_store,
+        export_transports,
     )
-    return _outcome(call, request, products, result, state)
+    return _outcome(request, result, state)
 
 
 def vision_features(
@@ -595,14 +587,13 @@ def encode_latents(
         rows, result = encode_units(video, run, source, model_runner)
     else:
         rows, result = encode_tracks(video, source, model_runner)
-    products = transfer.export_tensors(
-        call,
+    state.export_tensors(
+        call.request_key.request_id,
         (rows,),
-        tensor_store=tensor_store,
-        export_transports=export_transports,
-        state=state,
+        tensor_store,
+        export_transports,
     )
-    return _outcome(call, request, products, result, state)
+    return _outcome(request, result, state)
 
 
 def condition_latents(

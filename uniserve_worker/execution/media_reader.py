@@ -31,7 +31,6 @@ import torch
 from uniserve.model import AudioEncoder, PatchEncoder
 from uniserve_worker.bootstrap.inputs import capability
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution import transfer
 from uniserve_worker.execution.conditions import (
     CONDITION_PIXELS,
     CONDITION_SAMPLES,
@@ -190,10 +189,10 @@ def execute(
             raise invalid_descriptor(f"media reading does not produce {name}")
         write = bound_device_write(output, state=state)
         tensor_store.defer_write(write)
-        products[name] = (output, write)
+        products[name] = write
 
     def target(name: str) -> torch.Tensor | None:
-        return products[name][1].tensor if name in products else None
+        return products[name].tensor if name in products else None
 
     task = reservations[0].configure(
         partial(
@@ -213,19 +212,14 @@ def execute(
         ),
     )
 
-    def publish(results: tuple[object, ...]) -> None:
-        published = tuple(
-            transfer.export_deferred_product(
-                output,
-                write,
-                write.tensor,
-                tensor_store=tensor_store,
-                export_transports=export_transports,
-                consumers=call.consumer_slots,
-            )
-            for output, write in products.values()
+    def finish(results: tuple[object, ...]) -> None:
+        state.export_tensors(
+            call.request_key.request_id,
+            tuple(write.tensor for write in products.values()),
+            tensor_store,
+            export_transports,
+            host=True,
         )
-        request.set_products(published)
 
-    request.set_host_tasks((task,), finish=publish)
+    request.set_host_tasks((task,), finish=finish)
     return request

@@ -375,12 +375,7 @@ impl PythonBackend {
 
             let transports = self.worker.bind(py).getattr("transports")?;
             for output in outputs {
-                let locators = output.borrow().exported_locators.clone_ref(py);
-                for locator in locators.bind(py) {
-                    transports
-                        .get_item(locator.getattr("backend")?)?
-                        .call_method1("release", (locator,))?;
-                }
+                output.borrow().revoke_exports(&transports)?;
                 output.borrow_mut().release_execution_references(py)?;
             }
             Ok(())

@@ -14,7 +14,7 @@ use uniserve_worker_ipc::{BufferId, Call, CallStatus, ErrorCode, KvTransfer, Req
 use crate::convert;
 
 use super::block_tables::BlockTables;
-use super::error::{invalid, native_error, unsupported};
+use super::error::{native_error, unsupported};
 use super::host::HostTask;
 use super::latent::LatentBuffer;
 use super::output::OutputBuffer;
@@ -91,7 +91,7 @@ pub(crate) struct PendingOutput {
     state: Arc<Mutex<NativeOutput>>,
     buffer: Option<Py<OutputBuffer>>,
     #[pyo3(get)]
-    call: Py<PyAny>,
+    pub(super) call: Py<PyAny>,
     #[pyo3(get)]
     pub(super) request: Py<Request>,
     #[pyo3(get)]
@@ -105,7 +105,6 @@ pub(crate) struct PendingOutput {
     // Video unit positions within this decode round, assigned to this rank.
     pub(super) media_units: Vec<usize>,
     host_finish: Option<Py<PyAny>>,
-    #[pyo3(get)]
     pub(super) tensor_exports: Py<PyDict>,
     #[pyo3(get)]
     pub(super) cache_exports: Py<PyDict>,
@@ -249,20 +248,6 @@ impl PendingOutput {
         self.token_update.borrow_mut(py).prompt_logits = Some(logits);
         self.lock(py)?.progress.prompt_logits_ready = true;
         Ok(())
-    }
-
-    /// Convert each export once, including results produced by host callbacks.
-    fn set_products(&self, py: Python<'_>, products: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
-        let products = products
-            .into_iter()
-            .map(|product| {
-                convert::tensor_export_from_py(&product.call_method0("to_mapping")?)
-                    .ok_or_else(|| invalid(py, "invalid tensor output"))
-            })
-            .collect::<PyResult<_>>()?;
-        self.lock(py)?
-            .set_products(products)
-            .map_err(|error| native_error(py, error))
     }
 
     fn cache_coordinates(&self, tables: &Bound<'_, PyAny>) -> PyResult<(u32, u64, u32)> {
@@ -465,7 +450,19 @@ impl PendingOutput {
 
 impl PendingOutput {
     pub(super) fn release_execution_references(&mut self, py: Python<'_>) -> PyResult<()> {
-        self.writes.bind(py).call_method0("clear")?;
+        // A host task may still be filling its reserved buffers after batch
+        // commit. Keep only those writes until its completion callback runs.
+        let writes = self
+            .writes
+            .bind(py)
+            .iter()
+            .map(|write| write.cast_into::<super::storage::Buffer>())
+            .collect::<Result<Vec<_>, _>>()?;
+        self.writes = PyList::new(
+            py,
+            writes.into_iter().filter(|write| write.get().deferred(py)),
+        )?
+        .unbind();
         self.tensor_exports.bind(py).clear();
         self.cache_exports.bind(py).clear();
         self.exported_locators.bind(py).call_method0("clear")?;
@@ -482,6 +479,15 @@ impl PendingOutput {
         self.completion_write = None;
         self.producer_write = None;
         self.token_update.borrow_mut(py).__clear__(py);
+        Ok(())
+    }
+
+    pub(super) fn revoke_exports(&self, transports: &Bound<'_, PyAny>) -> PyResult<()> {
+        for locator in self.exported_locators.bind(transports.py()) {
+            transports
+                .get_item(locator.getattr("backend")?)?
+                .call_method1("release", (locator,))?;
+        }
         Ok(())
     }
 
@@ -603,6 +609,7 @@ impl PendingOutput {
 
         let retired = {
             let mut this = slf.borrow_mut();
+            this.writes.bind(py).call_method0("clear")?;
             (
                 this.buffer.take(),
                 std::mem::take(&mut this.host_tasks),

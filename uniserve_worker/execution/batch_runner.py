@@ -103,15 +103,12 @@ class BatchRunner:
             state=state,
             kv_cache=self.worker.kv_cache,
             tensor_store=self.worker.tensor_store,
-            worker_info=self.worker.info,
             latent_pool=self.worker.latent_pool,
-            export_transports=self.worker.export_transports,
             request_tables=self.worker.block_tables,
             model_runner=self.worker.runner,
             decode_state=self.worker.decode_state,
             sampling_group=self.worker.sampling_group,
             tokenizer=self.worker.tokenizer,
-            config=self.worker.worker_config,
         )
 
     def finish_diffusion(
