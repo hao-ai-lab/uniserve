@@ -199,3 +199,18 @@ impl PythonBackend {
         Ok(())
     }
 }
+
+impl super::BatchState {
+    pub(super) fn latent_params(
+        &self,
+        py: Python<'_>,
+        index: usize,
+    ) -> PyResult<&uniserve_worker_ipc::LatentParams> {
+        let call = &self.plan.calls[index];
+        self.plan
+            .latent_params
+            .iter()
+            .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
+            .ok_or_else(|| invalid(py, "trajectory call has no bound latent parameters"))
+    }
+}

@@ -53,9 +53,7 @@ impl PythonBackend {
                             .requests
                             .borrow(py)
                             .get(py, request.request_key.request_id.0)?;
-                        py.import("uniserve_worker.execution.media")?
-                            .getattr("begin_noise")?
-                            .call1((&self.model_runner, view, &self.requests))?;
+                        self.prepare_video_noise(py, &view)?;
                     }
                 }
             }

@@ -25,7 +25,6 @@ import uniserve_worker.storage.kv_cache as kv_cache
 from uniserve.model.logits import VocabShard
 from uniserve.runtime.execution import ExecutionContext
 from uniserve.tensors import BufferConfig, OutputLayout
-from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestResult
 from uniserve_worker.model_executor.input_batch import InputBatch, InputRow
@@ -984,6 +983,7 @@ class BatchState:
     def forward_rows(self, request_id: int) -> tuple[int, ...]:
         """Return numerical forward rows in scheduler order."""
     def pending_outputs(self) -> tuple[PendingOutput, ...]: ...
+    def decode_range(self, request_id: int) -> DecodeRange: ...
     def complete_latent(self, request_id: int) -> None: ...
     def record_forward(self, stats: ForwardStats) -> None: ...
     def execution_stats(self) -> ForwardStats: ...
@@ -2433,7 +2433,6 @@ class Request:
     def closed(self) -> bool: ...
     @property
     def retired(self) -> bool: ...
-    diffusion: DiffusionState | None
 
 @final
 class RequestProgress:

@@ -1,17 +1,12 @@
 """Explicit request results preserve progress and request-epoch ownership."""
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import replace
-from threading import Event
 
 import pytest
-import torch
 
 from uniserve.media import image
 from uniserve.model import ConditionRole
 from uniserve_worker.errors import WorkerError
-from uniserve_worker.execution.diffusion_state import DiffusionState, SlotLadder
-from uniserve_worker.execution.host import HostLane
 from uniserve_worker.execution.request import (
     RequestPool,
     RequestProgress,
@@ -228,51 +223,3 @@ def test_video_admission_retains_all_condition_tracks():
             pool.start(replace(admission, video=replacement))
     finally:
         pool.close()
-
-
-def test_diffusion_close_drains_a_failed_host_write():
-    release = Event()
-    destination = torch.zeros(1)
-
-    def stage():
-        if not release.wait(5):
-            raise TimeoutError("host preparation was not released")
-        destination.fill_(7)
-        raise RuntimeError("host preparation failed after writing")
-
-    lane = HostLane(max_inflight=1, workers=1)
-    try:
-        preparation = lane.reserve().submit(stage)
-        state = DiffusionState(
-            size=(), schedules={}, slot=SlotLadder(preparation=preparation)
-        )
-        with ThreadPoolExecutor(max_workers=1) as tasks:
-            closing = tasks.submit(state.close)
-            try:
-                with pytest.raises(TimeoutError):
-                    closing.result(timeout=0.05)
-            finally:
-                release.set()
-
-            closing.result(timeout=5)
-        assert destination.item() == 7
-        with pytest.raises(RuntimeError, match="host preparation failed"):
-            preparation.result()
-    finally:
-        release.set()
-        lane.close()
-
-
-def test_diffusion_close_retires_cancelled_host_preparation():
-    destination = torch.zeros(1)
-    lane = HostLane(max_inflight=1, workers=1)
-    try:
-        preparation = lane.reserve().configure(lambda: destination.fill_(7))
-        preparation.cancel()
-        state = DiffusionState(
-            size=(), schedules={}, slot=SlotLadder(preparation=preparation)
-        )
-        state.close()
-        assert destination.item() == 0
-    finally:
-        lane.close()

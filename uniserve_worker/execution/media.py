@@ -1,30 +1,14 @@
-"""Device execution of a standalone video denoiser's request calls.
+"""Numerical video denoising, reconstruction and startup preparation.
 
-``uniserve_worker.execution.schedule`` dispatches here the video calls of a
-worker whose model has a ``VideoPostprocessor``: latent preparation, one
-denoising step per call, and video and audio decode rounds. A video decode
-round also converts its media unit to RGB and publishes it as a host product;
-``uniserve_worker.execution.host_media`` encodes and muxes those products.
-
-Each request keeps a ``DiffusionState`` whose ``SlotLadder`` holds views of
-its request slot (the denoising state: tables, noise draws and retained
-conditioning; or the video overlap state on a video decoding rank) and its
-bound ladder. The solver samples live in the worker's ``LatentPool``:
-preparation writes them to bank one of the request's pages, each step gathers
-the committed bank and writes its successor to the other bank, and the batch
-commit publishes each result through the ``LatentUpdate`` the call leaves on
-its output.
-
-The module also holds the startup passes ``ModelExecutor.warmup`` runs for
-these capabilities, and ``begin_noise``, which the batch ``Executor`` calls
-when it applies a diffusion request's start command.
+Rust owns request views, host preparation, latent-bank access and result
+export. These helpers assemble numerical inputs and evaluate the same
+model operations during serving and startup.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -34,32 +18,17 @@ from uniserve.media import video
 from uniserve.model import AudioDecoder, VideoDecoder, VideoPostprocessor
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.tensors import TensorOutput, concatenate_views
-from uniserve_worker._uniserve_ipc import BatchState
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
-from uniserve_worker.execution.diffusion_state import (
-    DiffusionState,
-    SlotLadder,
-)
-from uniserve_worker.execution.output import PendingOutput
+from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.media.mux import AvMuxConfig
-from uniserve_worker.protocol.batch import (
-    DecodeRange,
-    MediaTrack,
-    NewRequest,
-)
-from uniserve_worker.protocol.call import Call, MediaCall
+from uniserve_worker.protocol.batch import NewRequest
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from uniserve.runtime.tensor_buffers import TensorBuffers
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.execution.request import Request, RequestPool
     from uniserve_worker.model_executor.output import ExecutionOutput
-    from uniserve_worker.storage.tensor_store import TensorStore
-    from uniserve_worker.transport.interface import Transport
 
 
 def video_shape(runner: ModelExecutor, admission: NewRequest):
@@ -216,78 +185,6 @@ def decode_audio(
     return result.replace(
         values=(torch.cat(result.values),), vocabularies=(), layouts=()
     )
-
-
-def slot_ladder(trajectory: DiffusionState) -> SlotLadder:
-    """Return the slot state of a standalone denoiser's request."""
-    if trajectory.slot is None:
-        raise invalid_descriptor("video diffusion requires request slot state")
-    return trajectory.slot
-
-
-def prepare_call(
-    runner: ModelExecutor, trajectory: DiffusionState, call, storage
-):
-    """Bind request state and prepare the exact call's runtime-owned resources.
-
-    Only request state survives in the trajectory. Runners own their
-    constants and workspace and may be retired after their dependent graphs
-    drain.
-
-    Returns the request's slot views for the call and the prepared
-    resources whose constants and workspace it uses: the ``"denoising"``
-    views and the request layout's ``DenoisingBuffers`` for preparation and
-    denoising, the ``"video_overlap"`` views and the post-processor's context
-    for a video decode round, whose decoder context the round's segment
-    selects when it decodes (``decode_video_unit``), and no views for an
-    audio decode round. Other kinds return ``({}, None)``. Slot views
-    are taken from ``storage`` on first use and kept in the trajectory.
-    Raises ``invalid_descriptor`` when the trajectory has no slot state, and
-    ``RuntimeError`` when a preparation or denoising call reaches a rank that
-    does not denoise, or when views must be taken and ``storage`` is ``None``;
-    errors of ``prepare_module`` and ``component`` propagate.
-    """
-    kind, size, slot = call.kind, trajectory.size, slot_ladder(trajectory)
-
-    if kind in {MediaCall.LATENT_PREPARATION, MediaCall.DENOISING}:
-        if not runner.denoises:
-            raise RuntimeError("rank does not own denoising execution")
-        if "denoising" not in slot.tensors:
-            if storage is None:
-                raise RuntimeError(
-                    "denoising requires reserved request storage"
-                )
-            slot.tensors["denoising"] = storage.view(
-                runner.media_builder.buffers(size)
-            )
-        layout = runner.media_builder.layout(size)
-        return slot.tensors["denoising"], runner.diffusion_layout(layout)
-
-    if kind is MediaCall.VIDEO_DECODING:
-        # A decode round also converts its media unit to RGB, cross-faded with
-        # the neighbouring unit's tail held in the request's overlap state.
-        postprocessor = runner.video_postprocessor
-        output = video.Config(size.num_frames, size.canvas)
-        if "video_overlap" not in slot.tensors:
-            if storage is None:
-                raise RuntimeError(
-                    "video reconstruction requires reserved overlap storage"
-                )
-            slot.tensors["video_overlap"] = storage.view(
-                postprocessor.state_buffers(output)
-            )
-        return slot.tensors["video_overlap"], runner.prepare_module(
-            call.component, output, method="forward"
-        ).execution.context
-
-    if kind is MediaCall.AUDIO_DECODING:
-        decoder = runner.component(kind)
-        frames = decoder.latent_frames(audio_samples(runner, size.num_frames))
-        return {}, runner.prepare_module(
-            call.component, frames, method="decode"
-        ).execution.context
-
-    return {}, None
 
 
 def _prepare_placeholder(builder, size, views, samples, diffusion, layout):
@@ -651,19 +548,6 @@ def mux_config(runner: ModelExecutor, media) -> AvMuxConfig:
     )
 
 
-def decode_range(call: Call, *, state: BatchState) -> DecodeRange:
-    """Return the unique reconstruction params assigned to a call."""
-    selected = tuple(
-        params
-        for params in state.batch.decode_ranges
-        if params.request_key == call.request_key
-        and params.call_id == call.call_id
-    )
-    if len(selected) != 1:
-        raise invalid_descriptor("video decode call has no exact decode params")
-    return selected[0]
-
-
 def open_state(runner: ModelExecutor, size) -> DiffusionState:
     """Open a video request's diffusion state on the fixed schedule."""
     builder = runner.media_builder
@@ -676,375 +560,92 @@ def open_state(runner: ModelExecutor, size) -> DiffusionState:
     )
 
 
-def video_state(runner: ModelExecutor, request: Request) -> DiffusionState:
-    """Return the admitted video request's state, creating it on first use."""
-    size = video_shape(runner, request.admission)
-    trajectory = request.diffusion
-    if trajectory is None:
-        trajectory = open_state(runner, size)
-        request.diffusion = trajectory
-    if (
-        not isinstance(trajectory, DiffusionState)
-        or trajectory.slot is None
-        or trajectory.size != size
-    ):
+def initialize_video(
+    runner, size, views, context, samples, encoded, conditions
+):
+    """Initialize borrowed samples and retain text/condition features on stream.
+
+    ``conditions`` follows the numerical denoiser's request order. The
+    caller has joined any host noise preparation before entering this call.
+    """
+    builder = runner.media_builder
+    copies = builder.initialize(
+        size,
+        views,
+        builder.sample_views(size, samples),
+        constants=context.constants,
+        workspace=context.workspace,
+    )
+    result = None
+    with runner.preparing_inputs(copies):
+        if "conditioning" in runner.encoder_kinds:
+            result = runner.encode_conditioning(encoded)
+            if len(result.values) != 1:
+                raise invalid_descriptor(
+                    "conditioning computation must return one Tensor"
+                )
+            builder.store_conditioning(size, views, result.values[0])
+
+        if conditions:
+            builder.encode_conditions(size, views, conditions)
+
+    return result
+
+
+def bind_video(runner, trajectory, views, slot: int, pages: tuple[int, ...]):
+    """Bind numerical step inputs over a request's borrowed slot views."""
+    builder = runner.media_builder
+    size = trajectory.size
+    diffusion = runner.diffusion
+    samples = builder.sample_views(size, diffusion.samples)
+    return diffusion.bind(
+        builder.layout(size),
+        tuple(
+            builder.bind(size, views, samples, trajectory.schedules, index)
+            for index in range(builder.num_steps)
+        ),
+        trajectory.schedules,
+        state=views,
+        slot=slot,
+        pages=pages,
+    )
+
+
+def reconstruct_video(runner, component, latent, frames, size, views, count):
+    """Decode and cross-fade one unit into its padded RGB output row.
+
+    A short final unit occupies the leading frames of the same row shape
+    as the longest unit. The padding remains zero for its host consumer.
+    """
+    decoded = decode_video_unit(runner, component, latent, frames, size)
+    if len(decoded.values) != 1 or decoded.values[0].shape[0] != 1:
         raise invalid_descriptor(
-            "video request changed its admitted numerical dimensions"
+            "video decoding reconstructs exactly one media unit"
         )
-    return trajectory
 
-
-def begin_noise(
-    runner: ModelExecutor, request: Request, request_pool: RequestPool
-) -> None:
-    """Prepare an admitted video request's host inputs off the service thread.
-
-    The seeded draw and the request's state tables depend only on the seed
-    and the admitted size, so they are prepared on the rank's noise thread
-    while the service thread launches other device work, this request's text
-    encoding or another request's denoising steps, and latent preparation
-    waits for them. A rank that does not denoise prepares no host inputs.
-    """
-    media = request.admission.diffusion
-    if media is None or runner.noise_draws is None or not runner.state_buffers:
-        return
-    trajectory = video_state(runner, request)
-    slot = slot_ladder(trajectory)
-    if "denoising" not in slot.tensors:
-        slot.tensors["denoising"] = request_pool.storage.tensors(
-            request.request_pool_idx
-        ).view(runner.media_builder.buffers(trajectory.size))
-    slot.preparation = runner.noise_draws.reserve().submit(
-        runner.media_builder.prepare_request,
-        trajectory.size,
-        slot.tensors["denoising"],
-        seed=media.seed,
+    decoder = runner.video_decoder
+    processed = runner.run_module(
+        component,
+        (decoder.place(decoded.values[0], frames, size),),
+        method="forward",
+        size=size,
+        frames=(frames,),
+        sizes=(size,),
+        state=views,
+        unit_count=count,
     )
-
-
-def execute(
-    call: Call,
-    *,
-    state: BatchState,
-    tensor_store: TensorStore,
-    export_transports: Mapping[str, Transport],
-    request_pool: RequestPool,
-    model_runner: ModelExecutor,
-) -> PendingOutput:
-    """Land one ready video call without constructing a model input row.
-
-    Latent preparation, denoising steps and decode rounds run here on the
-    device; a video decode round also converts its media unit to RGB and
-    publishes it as a host product for the host ranks that encode it.
-
-    Preparation and each denoising step leave a ``LatentUpdate`` on the
-    returned output, which the batch commit applies to the latent pool; a
-    denoising step also advances the output's ``flow_step``. Nothing here
-    commits request progress. Returns the call's ``PendingOutput`` with an
-    ``OK`` status and its exports. Raises ``invalid_descriptor`` when
-    the call, its inputs, parameters or progress disagree with the admitted
-    request or this rank's model, and ``RuntimeError`` when the rank lacks
-    the call's storage or capability or a module returns no statistics;
-    errors of the executor, tensor store and latent pool calls propagate.
-    """
-    if model_runner.video_postprocessor is None:
-        raise invalid_descriptor("video execution requires a video model")
-    request = state.pending_output(call.request_key.request_id)
-    media = request.request.admission.diffusion
-    if media is None:
-        raise invalid_descriptor("video call has no admitted media dimensions")
-    numerical_shape = video_shape(model_runner, request.request.admission)
-
-    trajectory = video_state(model_runner, request.request)
-
-    slot, context = prepare_call(
-        model_runner,
-        trajectory,
-        call,
-        request_pool.storage.tensors(request.request.request_pool_idx)
-        if model_runner.state_buffers
-        else None,
+    length = frames.stop - frames.start
+    value = concatenate_views(processed.values).view(
+        1, length, size.frame.height, size.frame.width, 3
     )
+    longest = max(
+        span.stop - span.start for span in decoder.frame_slices(size.num_frames)
+    )
+    if length < longest:
+        row = value.new_zeros((1, longest, *value.shape[2:]))
+        row[:, :length].copy_(value)
+        value = row
 
-    builder = model_runner.media_builder
-    pool = model_runner.latent_pool
-    slot_index = request.request.request_pool_idx
-    if call.kind is MediaCall.LATENT_PREPARATION:
-        # Batch preparation validated the call's pages and interval.
-        params = request.latent_params
-        if params is None:
-            raise invalid_descriptor(
-                "video call has no bound latent parameters"
-            )
-        assert pool is not None
-        # The text features, then a conditioned request's condition latents:
-        # every visual round's rows, then every audio track's
-        # (``conditions.condition_latents``).
-        reads = []
-        for product in call.inputs:
-            read = tensor_store.consume(
-                product,
-                consumer_call_id=call.call_id,
-                device=model_runner.call_devices(call)[0],
-            )
-            request.device_reads.append(read)
-            if read.region is not None:
-                raise invalid_descriptor(
-                    "video preparation requires complete input coverage"
-                )
-            reads.append(read)
-        video_inputs = request.request.admission.video
-        conditioned = video_inputs is not None and bool(video_inputs.conditions)
-        if not reads or (len(reads) > 1) != conditioned:
-            raise invalid_descriptor(
-                "video preparation reads its conditioning and its conditions"
-            )
-        conditioning = reads[0]
-
-        # Without a preparation task from ``begin_noise``, the seeded draw and
-        # the request's tables are prepared here on the service thread.
-        encoded = conditioning.tensor
-        preparation = slot_ladder(trajectory).preparation
-        if preparation is None:
-            builder.prepare_request(numerical_shape, slot, seed=media.seed)
-        else:
-            preparation.result()
-
-        # The initial samples are copied straight into the request's pages
-        # of the bank a fresh trajectory starts in, overlapping the
-        # conditioning encoder; the batch commit publishes them at step zero.
-        bank = pool.initial_bank(
-            slot_index, params.page_table, latent_units=params.latent_units
-        )
-        initial = builder.initialize(
-            numerical_shape,
-            slot,
-            builder.sample_views(
-                numerical_shape, pool.bank_view(bank, params.page_table)
-            ),
-            constants=context.constants,
-            workspace=context.workspace,
-        )
-        with model_runner.preparing_inputs(initial):
-            if "conditioning" in model_runner.encoder_kinds:
-                if encoded is None:
-                    raise invalid_descriptor(
-                        "conditioning module has no input Tensor"
-                    )
-                result = model_runner.encode_conditioning(encoded)
-                if result.stats is None:
-                    raise RuntimeError(
-                        "module output has no execution statistics"
-                    )
-                state.record_forward(result.stats)
-                if len(result.values) != 1:
-                    raise invalid_descriptor(
-                        "conditioning computation must return one Tensor"
-                    )
-                builder.store_conditioning(
-                    numerical_shape, slot, result.values[0]
-                )
-            if conditioned:
-                from uniserve_worker.execution.conditions import (
-                    condition_latents,
-                )
-
-                assert video_inputs is not None
-                if any(read.tensor is None for read in reads[1:]):
-                    raise invalid_descriptor(
-                        "condition latents have no input Tensor"
-                    )
-                # The condition rows follow the stored prompt in the
-                # retained conditioning, written on the same stream.
-                builder.encode_conditions(
-                    numerical_shape,
-                    slot,
-                    condition_latents(
-                        video_inputs, tuple(read.tensor for read in reads[1:])
-                    ),
-                )
-        state.complete_latent(call.request_key.request_id)
-
-    elif call.kind is MediaCall.DENOISING:
-        params = request.latent_params
-        if params is None:
-            raise invalid_descriptor(
-                "video call has no bound latent parameters"
-            )
-        start_step, step_count = int(params.start_step), int(params.step_count)
-        assert pool is not None
-        source, _ = pool.step_banks(
-            slot_index,
-            params.page_table,
-            step=start_step,
-            generation=start_step + 1,
-            latent_units=params.latent_units,
-            height=params.height,
-            width=params.width,
-        )
-
-        # The ladder is bound over the request's slot views and the
-        # runner's samples once, in the request's capacity layout, and
-        # replayed by every later step.
-        slot_state = slot_ladder(trajectory)
-        layout = builder.layout(numerical_shape)
-        diffusion = model_runner.diffusion
-        if slot_state.ladder is None or not diffusion.binds(slot_state.ladder):
-            samples = builder.sample_views(numerical_shape, diffusion.samples)
-            slot_state.ladder = diffusion.bind(
-                layout,
-                tuple(
-                    builder.bind(
-                        numerical_shape,
-                        slot,
-                        samples,
-                        trajectory.schedules,
-                        index,
-                    )
-                    for index in range(builder.num_steps)
-                ),
-                trajectory.schedules,
-                state=slot,
-                slot=slot_index,
-                pages=params.page_table,
-            )
-        result = model_runner.run_denoising(
-            slot_state.ladder, start_step, source
-        )
-        if result.stats is None:
-            raise RuntimeError("module output has no execution statistics")
-        state.record_forward(result.stats)
-        state.complete_latent(call.request_key.request_id)
-
-        # Only the call that completes denoising may declare products, and
-        # it publishes the step's result, the final samples.
-        if call.outputs:
-            if start_step + step_count != media.num_inference_steps:
-                raise invalid_descriptor(
-                    "final latent products require completed denoising"
-                )
-            state.export_tensors(
-                call.request_key.request_id,
-                result.values,
-                tensor_store,
-                export_transports,
-            )
-
-    elif call.kind in {MediaCall.VIDEO_DECODING, MediaCall.AUDIO_DECODING}:
-        params = decode_range(call, state=state)
-        inputs = call.inputs
-        if len(inputs) != 1:
-            raise invalid_descriptor(
-                "media reconstruction requires one Tensor input"
-            )
-        read = tensor_store.consume(
-            inputs[0],
-            consumer_call_id=call.call_id,
-            device=model_runner.call_devices(call)[0],
-        )
-        request.device_reads.append(read)
-        if read.region is not None or read.tensor is None:
-            raise invalid_descriptor(
-                "media reconstruction requires complete input coverage"
-            )
-
-        cursor, count = params.cursor, params.max_units
-        track = (
-            MediaTrack.AUDIO
-            if call.kind is MediaCall.AUDIO_DECODING
-            else MediaTrack.VIDEO
-        )
-        # Each rank of a distributed decoder binding reconstructs its
-        # contiguous run of the declared range's media units, on either
-        # track (``ComponentBinding.media_units``).
-        if track is MediaTrack.VIDEO:
-            windows = model_runner.video_decoder.frame_slices(media.num_frames)
-            # A video decoder places one native unit per rank
-            # (``validate_components``), so its run is a single unit.
-            unit = assigned_units(
-                model_runner, call.component, cursor, count, len(windows)
-            ).start
-            window = windows[unit]
-            output = video.Config(media.num_frames, media.canvas)
-            decoded = decode_video_unit(
-                model_runner, call.component, read.tensor, window, output
-            )
-            if decoded.stats is None:
-                raise RuntimeError("module output has no execution statistics")
-            state.record_forward(decoded.stats)
-            if len(decoded.values) != 1 or decoded.values[0].shape[0] != 1:
-                raise invalid_descriptor(
-                    "video decoding reconstructs exactly one media unit"
-                )
-
-            # The decoded window becomes an RGB media unit on this rank,
-            # cross-faded with the neighbouring unit's tail, and that unit
-            # is the product a host rank encodes.
-            decoder = model_runner.video_decoder
-            unit_outputs = (decoder.place(decoded.values[0], window, output),)
-            processed = model_runner.run_module(
-                call.component,
-                unit_outputs,
-                method="forward",
-                size=output,
-                frames=(window,),
-                sizes=(output,),
-                state=slot,
-                unit_count=count,
-            )
-            state.record_forward(processed.stats)
-            # Concatenation borrows one flat byte span; the product row is
-            # the unit's frames at the output raster, and a unit shorter than
-            # the longest fills its row's leading frames.
-            frames = window.stop - window.start
-            value = concatenate_views(processed.values).view(
-                1, frames, media.height, media.width, 3
-            )
-            longest = max(
-                span.stop - span.start
-                for span in decoder.frame_slices(media.num_frames)
-            )
-            if frames < longest:
-                row = value.new_zeros((1, longest, *value.shape[2:]))
-                row[:, :frames].copy_(value)
-                value = row
-            values: tuple[torch.Tensor, ...] = (value,)
-        else:
-            result = decode_audio(
-                model_runner,
-                call.component,
-                read.tensor,
-                audio_samples(model_runner, media.num_frames),
-                cursor=cursor,
-                count=count,
-            )
-            if result.stats is None:
-                raise RuntimeError("module output has no execution statistics")
-            state.record_forward(result.stats)
-            values = result.values
-        # Decoded media units are host products: a host rank's encoder reads
-        # them in place from the segment this rank publishes, over the host
-        # mechanism of its edges.
-        state.export_tensors(
-            call.request_key.request_id,
-            values,
-            tensor_store,
-            export_transports,
-            host=True,
-        )
-    else:
-        raise invalid_descriptor(f"unsupported video call {call.kind!r}")
-
-    return request
-
-
-def _request_label(call: Call) -> str:
-    """Format a stable request and call label for media work."""
-    key = call.request_key
-    return f"{key.engine_id}:{key.request_id}:{key.request_epoch}"
-
-
-__all__ = [
-    "decode_range",
-    "execute",
-]
+    return decoded, processed.replace(
+        values=(value,), vocabularies=(), layouts=()
+    )

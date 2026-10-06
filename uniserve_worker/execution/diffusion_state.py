@@ -3,33 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
 from uniserve.diffusion import Guidance, Schedule
-from uniserve.model import ImageDenoiser
-from uniserve_worker.execution.host import HostTask
-from uniserve_worker.model_executor.diffusion_runner import Ladder
-
-
-@dataclass(slots=True)
-class SlotLadder:
-    """A standalone request's views of its slot and its bound ladder.
-
-    The views borrow request storage whose execution owners retain the
-    backing. The ladder views the samples of its layout's runner and is bound
-    again when that runner is replaced. ``preparation`` is the host task
-    started at admission (the seeded draw and the request's own state
-    tables); latent preparation reads what it filled, and retirement waits
-    for it.
-    """
-
-    tensors: dict[str, Mapping[str, torch.Tensor]] = field(default_factory=dict)
-    ladder: Ladder | None = None
-    preparation: HostTask[None] | None = None
 
 
 @dataclass(slots=True)
@@ -39,9 +18,9 @@ class DiffusionState:
     ``size`` is the admitted numerical size and ``schedules`` the fixed
     schedule of every sample modality. ``guidance`` selects and combines the
     branch predictions of a denoiser evaluated once per branch, and is
-    ``None`` for a denoiser with one prediction per step. Standalone denoisers
-    borrow their request slot through ``slot``; image denoisers retain only
-    numerical position tensors here and borrow KV coordinates from Rust.
+    ``None`` for a denoiser with one prediction per step. Request slots,
+    bound execution and host preparation belong to the native request.
+    Image denoisers cache numerical position tensors here.
     Accepted progress and product generations belong to the request, not
     this state.
     """
@@ -50,18 +29,6 @@ class DiffusionState:
     schedules: Mapping[str, Schedule]
     guidance: Guidance | None = None
     positions: dict[int, torch.Tensor] = field(default_factory=dict)
-    slot: SlotLadder | None = None
-
-    def close(self) -> None:
-        """Drain host writes before the request's tensor slot can be reused."""
-        if self.slot is not None and self.slot.preparation is not None:
-            # A failed task may have written part of the destination; wait for
-            # its actual exit without rethrowing its already reported error.
-            try:
-                self.slot.preparation.exception()
-            except CancelledError:
-                pass
-            self.slot.preparation = None
 
     @classmethod
     def open(
@@ -74,15 +41,9 @@ class DiffusionState:
         device: torch.device | str,
         guidance: Guidance | None = None,
     ) -> DiffusionState:
-        """Build a request's state from its admitted sampling parameters.
-
-        An ``ImageDenoiser`` attends to the request's KV prefixes; any other
-        denoiser advances a ladder over its request slot.
-        """
-        attends = isinstance(denoiser, ImageDenoiser)
+        """Build schedules from admitted numerical sampling parameters."""
         return cls(
             size,
             dict(denoiser.make_schedules(steps, shift=shift, device=device)),
             guidance,
-            slot=None if attends else SlotLadder(),
         )

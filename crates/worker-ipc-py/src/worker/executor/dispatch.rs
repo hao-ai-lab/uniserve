@@ -40,6 +40,20 @@ impl PythonBackend {
                     return Ok(());
                 }
 
+                if videos
+                    && matches!(
+                        kind,
+                        CallKind::Media(
+                            MediaCall::LatentPreparation
+                                | MediaCall::Denoising
+                                | MediaCall::VideoDecoding
+                                | MediaCall::AudioDecoding
+                        )
+                    )
+                {
+                    return self.execute_video(py, batch, index);
+                }
+
                 let call = batch.call(py, index)?;
                 let options = PyDict::new(py);
                 options.set_item("model_runner", model)?;
@@ -70,10 +84,6 @@ impl PythonBackend {
                         options
                             .set_item("transports", self.worker.bind(py).getattr("transports")?)?;
                         ("uniserve_worker.execution.host_media", "execute")
-                    }
-                    _ if videos => {
-                        options.set_item("request_pool", &self.requests)?;
-                        ("uniserve_worker.execution.media", "execute")
                     }
                     _ => return Err(invalid(py, format!("unsupported call {}", kind.as_str()))),
                 };

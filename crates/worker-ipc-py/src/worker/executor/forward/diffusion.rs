@@ -106,7 +106,7 @@ impl PythonBackend {
         index: usize,
     ) -> PyResult<()> {
         let call = &batch.plan.calls[index];
-        let params = latent_params(py, batch, index)?;
+        let params = batch.latent_params(py, index)?;
         let cache = self.conditioning(py, batch, index)?;
         let pending = batch.pending(py, index);
         let request = pending.borrow(py).request.clone_ref(py);
@@ -190,7 +190,7 @@ impl PythonBackend {
         let mut trajectories = HashMap::new();
         for &index in indices {
             let call = &batch.plan.calls[index];
-            let params = latent_params(py, batch, index)?;
+            let params = batch.latent_params(py, index)?;
             let cache = self.conditioning(py, batch, index)?;
             let (Some(input), Some(output)) = (&call.latent_input, &call.latent_output) else {
                 return Err(invalid(
@@ -244,7 +244,7 @@ impl PythonBackend {
     ) -> PyResult<()> {
         for &index in indices {
             let call = &batch.plan.calls[index];
-            let params = latent_params(py, batch, index)?;
+            let params = batch.latent_params(py, index)?;
             let input = call
                 .latent_input
                 .as_ref()
@@ -469,7 +469,7 @@ impl PythonBackend {
         batch: &BatchState,
         index: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let params = latent_params(py, batch, index)?;
+        let params = batch.latent_params(py, index)?;
         let buffer = latent_buffer(py, batch, index)?;
         buffer
             .get()
@@ -477,20 +477,6 @@ impl PythonBackend {
             .bind(py)
             .get_item(PySlice::new(py, 0, params.latent_units as isize, 1))
     }
-}
-
-fn latent_params<'a>(
-    py: Python<'_>,
-    batch: &'a BatchState,
-    index: usize,
-) -> PyResult<&'a LatentParams> {
-    let call = &batch.plan.calls[index];
-    batch
-        .plan
-        .latent_params
-        .iter()
-        .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
-        .ok_or_else(|| invalid(py, "trajectory call has no bound latent parameters"))
 }
 
 fn latent_buffer<'py>(

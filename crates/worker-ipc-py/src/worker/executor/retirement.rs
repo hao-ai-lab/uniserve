@@ -307,15 +307,6 @@ impl PythonBackend {
         // themselves would delay this result behind later queued batches.
         self.release_requests(py, &live, retained)?;
         for request_id in live {
-            let request = self.requests.borrow(py).get(py, request_id)?;
-            let diffusion = request
-                .borrow(py)
-                .diffusion
-                .as_ref()
-                .map(|value| value.clone_ref(py));
-            if let Some(diffusion) = diffusion {
-                diffusion.bind(py).call_method0("close")?;
-            }
             self.requests.borrow_mut(py).retire(py, request_id)?;
         }
         Ok(())

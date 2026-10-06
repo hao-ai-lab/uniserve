@@ -294,7 +294,7 @@ impl HostTask {
     }
 
     #[pyo3(signature = (function, *args, **kwargs))]
-    fn submit<'py>(
+    pub(crate) fn submit<'py>(
         slf: &Bound<'py, Self>,
         function: Py<PyAny>,
         args: &Bound<'py, PyTuple>,
@@ -425,6 +425,14 @@ impl HostTask {
 }
 
 impl HostTask {
+    /// Wait for the host writer to exit before its destination can be reused.
+    /// Its consumer reports failure; retirement only needs physical completion.
+    pub(super) fn drain(&self, py: Python<'_>) {
+        if !self.task.completion.done() {
+            py.detach(|| self.task.completion.wait(None));
+        }
+    }
+
     fn outcome(
         &self,
         py: Python<'_>,

@@ -283,9 +283,7 @@ def execute(
     finish: Callable[[tuple[object, ...]], None] | None = None
     if call.kind is MediaCall.VIDEO_ENCODING:
         positions = request.media_units
-        from uniserve_worker.execution.media import decode_range
-
-        cursor = int(decode_range(call, state=state).cursor)
+        cursor = state.decode_range(call.request_key.request_id).cursor
         config = mux_config(model_runner, media)
         export = _input_export(call, state)
         # Batch preparation borrows the round only when it is published over

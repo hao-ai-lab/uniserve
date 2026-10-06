@@ -93,21 +93,37 @@ pub(super) struct KVConditioning {
     pub(super) branches: HashMap<String, (u32, u64, u32)>,
 }
 
+/// Borrowed video tensors and the host writer that fills their request slot.
+#[derive(Default)]
+pub(super) struct VideoState {
+    pub(super) denoising: Option<Py<PyAny>>,
+    pub(super) overlap: Option<Py<PyAny>>,
+    pub(super) ladder: Option<Py<PyAny>>,
+    pub(super) preparation: Option<Py<super::host::HostTask>>,
+}
+
 /// Retain numerical parameters and tensors alongside a native request epoch.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct Request {
     pub(super) request: Arc<NativeRequest>,
     #[pyo3(get)]
     pub(super) admission: Py<PyAny>,
-    #[pyo3(get, set)]
     pub(super) diffusion: Option<Py<PyAny>>,
     pub(super) kv: Option<KVConditioning>,
+    pub(super) video: VideoState,
 }
 
 impl Request {
+    fn drain_preparation(&mut self, py: Python<'_>) {
+        if let Some(task) = self.video.preparation.take() {
+            task.borrow(py).drain(py);
+        }
+    }
+
     fn clear_diffusion(&mut self) {
         self.diffusion = None;
         self.kv = None;
+        self.video = VideoState::default();
     }
 }
 
@@ -208,7 +224,12 @@ impl Request {
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.admission)?;
-        visit.call(&self.diffusion)
+        visit.call(&self.diffusion)?;
+        visit.call(&self.video.denoising)?;
+        visit.call(&self.video.overlap)?;
+        visit.call(&self.video.ladder)?;
+        visit.call(&self.video.preparation)?;
+        Ok(())
     }
 
     fn __clear__(&mut self) {
@@ -223,7 +244,7 @@ pub(crate) struct RequestPool {
     // Cached language views carry numerical state, never a second lifecycle.
     views: Vec<Option<Py<Request>>>,
     #[pyo3(get)]
-    storage: Py<PyAny>,
+    pub(super) storage: Py<PyAny>,
 }
 
 #[pymethods]
@@ -270,7 +291,9 @@ impl RequestPool {
 
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         for request in self.views.iter().flatten() {
-            request.borrow_mut(py).clear_diffusion();
+            let mut request = request.borrow_mut(py);
+            request.drain_preparation(py);
+            request.clear_diffusion();
         }
         self.views.iter_mut().for_each(|view| *view = None);
         self.pool.close();
@@ -393,19 +416,24 @@ impl RequestPool {
     }
 
     #[pyo3(name = "drop")]
-    pub(super) fn drop_request(&mut self, request_id: u64) {
+    pub(super) fn drop_request(&mut self, py: Python<'_>, request_id: u64) {
         if let Some(request) = self.pool.peek(request_id) {
+            if let Some(view) = &self.views[request.slot()] {
+                view.borrow_mut(py).drain_preparation(py);
+            }
             self.views[request.slot()] = None;
         }
         self.pool.remove(request_id);
     }
 
-    /// The execution owner drains numerical work before retiring this slot.
+    /// Device work is already drained; wait for host writes before slot reuse.
     pub(super) fn retire(&mut self, py: Python<'_>, request_id: u64) -> PyResult<()> {
+        let request = self.get(py, request_id)?;
+        request.borrow_mut(py).drain_preparation(py);
         self.pool
             .retire(request_id)
             .map_err(|error| native_error(py, error))?;
-        self.get(py, request_id)?.borrow_mut(py).clear_diffusion();
+        request.borrow_mut(py).clear_diffusion();
         Ok(())
     }
 
@@ -453,6 +481,7 @@ impl RequestPool {
                     admission: admission.clone().unbind(),
                     diffusion: None,
                     kv: None,
+                    video: VideoState::default(),
                 },
             )?);
         }
