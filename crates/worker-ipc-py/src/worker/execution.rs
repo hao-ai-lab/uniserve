@@ -1,6 +1,8 @@
 //! Prepared numerical resources and graph retirement.
 
+mod denoising;
 mod joins;
+pub(super) use denoising::DenoisingBuffers;
 pub(super) use joins::JoinGraphs;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -108,6 +110,7 @@ pub(crate) struct Execution {
     pub(super) expert_order: Option<i64>,
     pub(super) joins: Option<Py<JoinGraphs>>,
     pub(super) microbatch_joins: Option<Py<JoinGraphs>>,
+    denoising: Option<denoising::Denoising>,
     closed: bool,
 }
 
@@ -141,6 +144,7 @@ impl Execution {
                 expert_order: None,
                 joins: None,
                 microbatch_joins: None,
+                denoising: None,
                 closed: false,
             },
         )?;
@@ -151,6 +155,67 @@ impl Execution {
             .call_method("reserve", (&owner, devices), Some(&kwargs))?;
         owner.borrow_mut(py).pools = pools.extract()?;
         Ok(owner)
+    }
+
+    fn configure_denoising(&mut self, py: Python<'_>, maximum: Py<PyAny>) {
+        self.denoising = Some(denoising::Denoising::new(py, maximum));
+    }
+
+    pub(super) fn prepare_denoising<'py>(
+        slf: &Bound<'py, Self>,
+        runner: &Bound<'py, PyAny>,
+        layout: &Bound<'py, PyAny>,
+        pages: usize,
+    ) -> PyResult<Bound<'py, DenoisingBuffers>> {
+        denoising::prepare(slf, runner, layout, pages)
+    }
+
+    pub(super) fn denoising_layout<'py>(
+        slf: &Bound<'py, Self>,
+        layout: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, DenoisingBuffers>> {
+        denoising::layout(slf, layout)
+    }
+
+    pub(super) fn retire_denoising(
+        slf: &Bound<'_, Self>,
+        layout: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        denoising::retire(slf, layout)
+    }
+
+    pub(super) fn binds_denoising(
+        slf: &Bound<'_, Self>,
+        runner: &Bound<'_, PyAny>,
+        ladder: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        denoising::binds(slf, runner, ladder)
+    }
+
+    pub(super) fn warm_denoising(
+        slf: &Bound<'_, Self>,
+        runner: &Bound<'_, PyAny>,
+        ladder: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        denoising::warm(slf, runner, ladder)
+    }
+
+    pub(super) fn capture_denoising(
+        slf: &Bound<'_, Self>,
+        runner: &Bound<'_, PyAny>,
+        ladder: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        denoising::capture(slf, runner, ladder)
+    }
+
+    pub(super) fn step_denoising(
+        slf: &Bound<'_, Self>,
+        runner: &Bound<'_, PyAny>,
+        ladder: &Bound<'_, PyAny>,
+        index: usize,
+        bank: i64,
+    ) -> PyResult<(Py<PyAny>, &'static str)> {
+        denoising::step(slf, runner, ladder, index, bank)
     }
 
     fn seal(&mut self) {
@@ -286,11 +351,13 @@ impl Execution {
             None => Ok(()),
         };
         let context = context.call_method0(py, "close").map(drop);
+        let denoising = slf.borrow_mut().denoising.take();
+        let buffers = denoising.map_or(Ok(()), |value| value.close(py));
         let storage = storage.map_or(Ok(()), |storage| {
             storage.bind(py).call_method1("release", (slf,)).map(drop)
         });
         slf.borrow().pools.bind(py).clear();
-        close_all(py, [graphs, rotated, context, storage])
+        close_all(py, [graphs, rotated, context, buffers, storage])
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
@@ -300,7 +367,11 @@ impl Execution {
         visit.call(&self.storage)?;
         visit.call(&self.microbatches)?;
         visit.call(&self.joins)?;
-        visit.call(&self.microbatch_joins)
+        visit.call(&self.microbatch_joins)?;
+        if let Some(denoising) = &self.denoising {
+            denoising.traverse(&visit)?;
+        }
+        Ok(())
     }
 
     fn __clear__(&mut self, py: Python<'_>) {
@@ -311,10 +382,21 @@ impl Execution {
         self.microbatches = None;
         self.joins = None;
         self.microbatch_joins = None;
+        self.denoising = None;
     }
 }
 
 impl Execution {
+    pub(super) fn has_denoising_layout(
+        &self,
+        py: Python<'_>,
+        layout: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.denoising
+            .as_ref()
+            .map_or(Ok(false), |value| value.contains(py, layout))
+    }
+
     fn contexts<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyAny>> {
         match &self.microbatches {
             Some(rotation) => rotation.borrow(py).contexts.bind(py).iter().collect(),
@@ -349,4 +431,31 @@ pub(super) fn close_all(
         }
     }
     failure.map_or(Ok(()), Err)
+}
+
+/// Order a numerical context between the caller's stream accesses, including
+/// exceptional exits. Activation restores PyTorch's current stream.
+pub(super) fn on_stream<T>(
+    context: &Bound<'_, PyAny>,
+    device: &Bound<'_, PyAny>,
+    call: impl FnOnce() -> PyResult<T>,
+) -> PyResult<T> {
+    let py = context.py();
+    let stream = context.getattr("stream")?;
+    let cuda = py.import("torch.cuda")?;
+    let current = || cuda.call_method1("current_stream", (device,));
+    if !stream.is_none() {
+        stream.call_method1("wait", (current()?,))?;
+    }
+    let result = with_context(&context.call_method0("activate")?, call);
+    let joined = if stream.is_none() {
+        Ok(())
+    } else {
+        current()?
+            .call_method1("wait_stream", (stream.getattr("stream")?,))
+            .map(drop)
+    };
+    let result = result?;
+    joined?;
+    Ok(result)
 }

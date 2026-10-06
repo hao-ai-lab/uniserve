@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable, Mapping, Sequence
-from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -12,11 +11,10 @@ import torch
 from uniserve.diffusion import Branch, DenoisingStep, Schedule, advance_
 from uniserve.model import DenoiserInput, LatentInput
 from uniserve.runtime import ExecutionContext, TensorBuffers
-from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.tensors import BufferConfig
+from uniserve_worker._uniserve_ipc import DenoisingBuffers
 from uniserve_worker.model_executor.cuda_graph import (
     CUDAGraphRunner,
-    GraphBucket,
     Inputs,
     clone_inputs,
     input_signature,
@@ -83,30 +81,6 @@ class Ladder:
     samples: torch.Tensor
 
 
-@dataclass
-class DenoisingBuffers:
-    """Constants, workspace and request-state views for a denoising layout.
-
-    ``constants`` views the owned ``backing`` filled once during preparation;
-    ``workspace`` borrows the runner's shared workspace. ``rows`` is the
-    [2, pages] int64 device table of pool rows one step reads and writes.
-    """
-
-    backing: TensorBuffers
-    constants: Mapping[str, torch.Tensor]
-    workspace: Mapping[str, torch.Tensor]
-    pages: int
-    rows: torch.Tensor
-    # Whether an eager step has prepared this layout's kernels, plans and
-    # scratch, which capture requires.
-    warmed: bool = False
-    # Captured steps gather request state into fixed views. Each gather pairs
-    # a bank's [slots, span] columns with its [1, span] input buffer.
-    signature: Hashable = None
-    state: Mapping[str, torch.Tensor] = field(default_factory=dict)
-    gathers: tuple = ()
-
-
 class DiffusionRunner(ModelRunner):
     """Run one denoiser binding's diffusion computation.
 
@@ -159,13 +133,12 @@ class DiffusionRunner(ModelRunner):
                 raise ValueError(f"bank {name!r} requires contiguous rows")
         self.bank, self.slots = bank, slots
         # [1] int64 device bank row a captured step gathers, set before each
-        # capture and replay from the pinned sources in ``_slot_values``.
+        # capture and replay from pinned sources retained by Execution.
         self._slot_index = (
             torch.zeros(1, dtype=torch.int64, device=self.device)
             if self.captures
             else None
         )
-        self._slot_values: dict[int, torch.Tensor] = {}
 
         # A standalone denoiser's prepared layouts and the storage they
         # share: the samples, [pages * page_units, latent_width] in the
@@ -173,12 +146,9 @@ class DiffusionRunner(ModelRunner):
         # captured steps' copies of banked state. ``for_layouts`` allocates
         # them with the context.
         self.pool = pool
-        self._maximum: Hashable = None
-        self.layouts: dict[Hashable, DenoisingBuffers] = {}
         self.samples: torch.Tensor | None = None
         self._workspace: TensorBuffers | None = None
         self._state_buffers: TensorBuffers | None = None
-        self._row_values: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
 
     @classmethod
     def for_layouts(
@@ -269,7 +239,7 @@ class DiffusionRunner(ModelRunner):
                         },
                         device=device,
                     )
-            runner._maximum = maximum
+            runner.execution.configure_denoising(maximum)
             storage.check()
         except BaseException:
             runner.close()
@@ -295,12 +265,12 @@ class DiffusionRunner(ModelRunner):
                 workspace does not fit the maximum's, or its pages exceed
                 the runner's samples.
         """
-        entry = self.layouts.get(layout)
-        if entry is not None:
-            return entry
+        return self.execution.prepare_denoising(self, layout, pages)
+
+    def _prepare_layout(self, layout, pages, first) -> DenoisingBuffers:
+        """Allocate constants and borrow shared numerical buffers."""
         samples, pool = self.samples, self.pool
-        # A rank whose token shard holds no audio or video rows, such as
-        # the first rank under a long text region, has no sample pages.
+        # Empty sequence shards need no sample pages.
         if (
             samples is None
             or pool is None
@@ -308,8 +278,6 @@ class DiffusionRunner(ModelRunner):
             or not 0 <= pages * pool.page_units <= samples.shape[0]
         ):
             raise ValueError("a layout's samples exceed the runner's pages")
-        if not self.layouts and layout != self._maximum:
-            raise ValueError("a denoiser runner prepares its maximum first")
 
         module, context, device = (
             self.model,
@@ -319,37 +287,26 @@ class DiffusionRunner(ModelRunner):
         constants = getattr(module, "constant_buffers", None)
         workspace = getattr(module, "workspace_buffers", None)
         requirements = {} if constants is None else constants(layout)
-        # Once a step is captured, the pool's free blocks are that graph's
-        # intermediates, so a layout prepared afterwards, while serving,
-        # takes its storage from the device allocator instead.
-        with (
-            self.execution.storage.allocate(self.execution)
-            if not self.execution.buckets
-            else nullcontext()
-        ):
-            backing = TensorBuffers.allocate(requirements, device=device)
-            rows = torch.empty((2, pages), dtype=torch.int64, device=device)
+        backing = TensorBuffers.allocate(requirements, device=device)
+        rows = torch.empty((2, pages), dtype=torch.int64, device=device)
         try:
             constants = backing.view(requirements)
             workspace = self._workspace.view(
                 {} if workspace is None else workspace(layout)
             )
-            if not self.layouts:
+            if first:
                 # The maximum prepares the context's bindings; its constants
                 # and workspace are this layout's own views.
-                with self.execution.storage.allocate(self.execution):
-                    context.prepare(
-                        layout, constants=backing, workspace=self._workspace
-                    )
+                context.prepare(
+                    layout, constants=backing, workspace=self._workspace
+                )
             elif requirements:
                 with context.activate():
                     module.prepare_constants(layout, out=constants)
         except BaseException:
             backing.close()
             raise
-        entry = DenoisingBuffers(backing, constants, workspace, pages, rows)
-        self.layouts[layout] = entry
-        return entry
+        return DenoisingBuffers(backing, constants, workspace, pages, rows)
 
     def retire(self, layout) -> None:
         """Release a prepared layout that has no captured step.
@@ -361,17 +318,7 @@ class DiffusionRunner(ModelRunner):
         Raises:
             ValueError: ``layout`` is the maximum or has a captured step.
         """
-        bucket = self.execution.buckets.get(layout)
-        if layout == self._maximum or (
-            bucket is not None and bucket.get(None) is not None
-        ):
-            raise ValueError("a captured or maximum layout stays prepared")
-        entry = self.layouts.pop(layout, None)
-        if entry is None:
-            return
-        if self.execution.context.stream is not None:
-            self.execution.context.stream.synchronize()
-        entry.backing.close()
+        self.execution.retire_denoising(layout)
 
     def layout(self, layout) -> DenoisingBuffers:
         """Return a prepared layout.
@@ -379,7 +326,7 @@ class DiffusionRunner(ModelRunner):
         Raises:
             KeyError: The runner has not prepared ``layout``.
         """
-        return self.layouts[layout]
+        return self.execution.denoising_layout(layout)
 
     def batch_forward(self, batch, *, padded=False):
         module, inputs = self.model, batch.inputs
@@ -463,7 +410,6 @@ class DiffusionRunner(ModelRunner):
             entry.workspace,
         )
 
-    @torch.inference_mode()
     def warmup(self, ladder: Ladder):
         """Prepare a layout's kernels, plans and scratch for its steps.
 
@@ -482,35 +428,16 @@ class DiffusionRunner(ModelRunner):
             RuntimeError: A graph is already resident and this layout is not
                 warm.
         """
-        if not self.binds(ladder):
-            raise ValueError("the ladder was bound by another runner")
-        context, entry = self.execution.context, self.layout(ladder.layout)
-        if entry.warmed:
-            return
-        if self.execution.buckets:
-            raise RuntimeError(
-                "warm every denoiser layout before capturing any"
-            )
+        self.execution.warm_denoising(self, ladder)
+
+    def _warm_step(self, entry, ladder):
+        """Warm numerical plans without changing the request's samples."""
         live = ladder.inputs[0]
-        if context.stream is not None:
-            context.stream.wait(torch.cuda.current_stream(self.device))
-        # The warm step allocates the context's shared scratch and the
-        # step's intermediates from the runner's pool, which accounts for
-        # them and which the captured steps then reuse.
-        with (
-            context.activate(),
-            self.execution.storage.allocate(self.execution),
-        ):
-            restore = restore_samples(live)
-            try:
-                self._call(entry, live, ladder.schedules, ladder.state)()
-            finally:
-                restore()
-        if self.device.type == "cuda":
-            (
-                context.stream or torch.cuda.current_stream(self.device)
-            ).synchronize()
-        entry.warmed = True
+        restore = restore_samples(live)
+        try:
+            self._call(entry, live, ladder.schedules, ladder.state)()
+        finally:
+            restore()
 
     def bind(
         self, layout, inputs, schedules, *, state, slot, pages: Sequence[int]
@@ -624,66 +551,48 @@ class DiffusionRunner(ModelRunner):
 
     def binds(self, ladder: Ladder) -> bool:
         """Whether ``ladder`` was bound over this runner's samples."""
-        return ladder.samples is self.samples and ladder.layout in self.layouts
+        return self.execution.binds_denoising(self, ladder)
 
-    def _bucket(self, ladder: Ladder) -> GraphBucket:
-        """Return the ladder's layout bucket, binding its state buffers once.
-
-        The layout borrows the runner's shared state buffers. Its graph gathers
-        the slot's banked state into those buffers before any read.
-        """
-        entry = self.layout(ladder.layout)
-        bucket = self.execution.buckets.get(ladder.layout)
-        if bucket is None:
-            state_buffers = cast(TensorBuffers, self._state_buffers)
-            state_views = state_buffers.view(
-                {
-                    name: BufferConfig(shape, self.bank[name].dtype)
-                    for name, (_, shape) in ladder.spans.items()
-                }
-            )
-            gathers = []
-            for name, (start, _) in ladder.spans.items():
-                buffer = state_views[name]
-                if buffer.numel():
-                    rows = self.bank[name].view(self.slots, -1)
-                    gathers.append(
-                        (
-                            rows[:, start : start + buffer.numel()],
-                            buffer.view(1, -1),
-                        )
+    def _state_views(self, ladder):
+        """Bind compact input views for the fields gathered by a step graph."""
+        state_buffers = cast(TensorBuffers, self._state_buffers)
+        state_views = state_buffers.view(
+            {
+                name: BufferConfig(shape, self.bank[name].dtype)
+                for name, (_, shape) in ladder.spans.items()
+            }
+        )
+        gathers = []
+        for name, (start, _) in ladder.spans.items():
+            buffer = state_views[name]
+            if buffer.numel():
+                rows = self.bank[name].view(self.slots, -1)
+                gathers.append(
+                    (
+                        rows[:, start : start + buffer.numel()],
+                        buffer.view(1, -1),
                     )
-            entry.signature = ladder.signature
-            entry.state = state_views
-            entry.gathers = tuple(gathers)
-            bucket = GraphBucket()
-            self.execution.buckets[ladder.layout] = bucket
-        elif entry.signature != ladder.signature:
-            raise ValueError(
-                "a ladder's structure differs from its layout's captured steps"
-            )
-        return bucket
+                )
+        return state_views, tuple(gathers)
 
-    def _row_value(self, bank: int, pages: tuple[int, ...]) -> torch.Tensor:
-        """Return the pool rows one step reads and writes, [2, pages] int64.
+    def _row_source(self, bank: int, pages: tuple[int, ...]) -> torch.Tensor:
+        """Build [2, pages] indices for committed and successor rows."""
+        pool = cast("LatentPool", self.pool)
+        ids = torch.tensor(pages, dtype=torch.int64)
+        value = torch.stack(
+            (bank * pool.num_pages + ids, (1 - bank) * pool.num_pages + ids)
+        )
+        return value.pin_memory() if self.device.type == "cuda" else value
 
-        Row ``b * num_pages + page`` is ``page`` of bank ``b``: the first row
-        of the pair reads the committed ``bank`` and the second writes the
-        other one. Values are immutable and retained, so an asynchronous copy
-        never outlives its source.
-        """
-        key = int(bank), pages
-        value = self._row_values.get(key)
-        if value is None:
-            pool = cast("LatentPool", self.pool)
-            ids = torch.tensor(pages, dtype=torch.int64)
-            value = torch.stack(
-                (bank * pool.num_pages + ids, (1 - bank) * pool.num_pages + ids)
-            )
-            if self.device.type == "cuda":
-                value = value.pin_memory()
-            self._row_values[key] = value
-        return value
+    def _copy_indices(self, entry, rows, slot):
+        """Enqueue retained host indices on the active numerical stream."""
+        entry.rows.copy_(rows, non_blocking=True)
+        if slot is not None:
+            cast(torch.Tensor, self._slot_index).copy_(slot, non_blocking=True)
+
+    def _slot_source(self, slot):
+        """Build the pinned [1] int64 source holding the zero-based bank row."""
+        return torch.tensor([slot - 1], dtype=torch.int64).pin_memory()
 
     def _advance(
         self, entry: DenoisingBuffers, call, gathers=(), slot_index=None
@@ -709,19 +618,6 @@ class DiffusionRunner(ModelRunner):
             rows.index_copy_(0, indices[1], workspace)
         return samples
 
-    def _slot_value(self, slot):
-        """Return the pinned [1] int64 host source holding ``slot - 1``.
-
-        Retained per slot, like ``_row_value``, so an asynchronous copy never
-        outlives its source.
-        """
-        if slot not in self._slot_values:
-            self._slot_values[slot] = torch.tensor(
-                [slot - 1], dtype=torch.int64
-            ).pin_memory()
-        return self._slot_values[slot]
-
-    @torch.inference_mode()
     def capture(self, ladder: Ladder) -> None:
         """Make the layout's step graph resident without advancing samples.
 
@@ -736,83 +632,58 @@ class DiffusionRunner(ModelRunner):
         capturing runner for the worker's lifetime and checks the graph
         storage budget once its captures end.
         """
-        if not self.captures:
-            raise RuntimeError("denoising graph capture requires a stream")
-        if self.execution.sealed:
-            raise CUDAGraphError(
-                "denoising capture is outside startup preparation"
-            )
-        entry = self.layout(ladder.layout)
-        if not entry.warmed:
-            raise RuntimeError("warm a layout before capturing its steps")
-        bucket = self._bucket(ladder)
-        if None in bucket:
-            return
-        # The first step stands for every step: all of a ladder's steps share
-        # one structure, and a replay copies its own step's inputs in.
+        self.execution.capture_denoising(self, ladder)
+
+    def _capture_step(self, entry, ladder):
+        """Construct fixed numerical inputs and capture their solver step."""
         live = ladder.inputs[0]
         slot_index = cast(torch.Tensor, self._slot_index)
         context = self.execution.context
-        if context.stream is not None:
-            context.stream.wait(torch.cuda.current_stream(self.device))
-        with context.activate():
-            # Bank tensors are gathered in the graph. Other numerical
-            # tensors, including the step index and timesteps, have
-            # graph-owned copies.
-            sources = ladder.temporal[0]
-            with self.execution.storage.allocate(self.execution):
-                temporal = clone_inputs((ladder.schedules, sources))
-            replacements = {
-                id(value): buffer
-                for value, buffer in zip(sources, temporal[1], strict=True)
-            }
-            # Banked fields read the bucket's state buffers and the samples stay
-            # the runner's own.
-            samples = {
-                id(value.tensor)
-                for values in live.latents.values()
-                for value in values
-            }
-            stepped = map_tensors(
-                live,
-                lambda value: (
-                    entry.state[ladder.fields[id(value)]]
-                    if id(value) in ladder.fields
-                    else value
-                    if id(value) in samples
-                    else replacements[id(value)]
-                ),
-            )
-            call = DenoisingStep(
-                self.model,
-                stepped,
-                temporal[0],
-                entry.state,
-                entry.constants,
-                entry.workspace,
-            )
-            # Capture addresses the ladder's pages as a fresh trajectory's,
-            # committed in bank one; replay sets the request's own rows.
-            entry.rows.copy_(
-                self._row_value(1, ladder.pages), non_blocking=True
-            )
-            slot_index.copy_(self._slot_value(ladder.slot), non_blocking=True)
+        sources = ladder.temporal[0]
+        with self.execution.storage.allocate(self.execution):
+            temporal = clone_inputs((ladder.schedules, sources))
+        replacements = {
+            id(value): buffer
+            for value, buffer in zip(sources, temporal[1], strict=True)
+        }
+        # Banked fields read the bucket's state buffers and the samples stay
+        # the runner's own.
+        samples = {
+            id(value.tensor)
+            for values in live.latents.values()
+            for value in values
+        }
+        stepped = map_tensors(
+            live,
+            lambda value: (
+                entry.state[ladder.fields[id(value)]]
+                if id(value) in ladder.fields
+                else value
+                if id(value) in samples
+                else replacements[id(value)]
+            ),
+        )
+        call = DenoisingStep(
+            self.model,
+            stepped,
+            temporal[0],
+            entry.state,
+            entry.constants,
+            entry.workspace,
+        )
 
-            def compute(_):
-                return self._advance(entry, call, entry.gathers, slot_index)
+        def compute(_):
+            return self._advance(entry, call, entry.gathers, slot_index)
 
-            # ``warmup`` ran this layout's computation at the same shapes,
-            # so capture needs no eager pass of its own.
-            bucket[None] = CUDAGraphRunner.capture(
-                context,
-                temporal,
-                compute,
-                pools=self.execution.pools,
-                restore=restore_samples(live),
-                warm=False,
-            )
+        return CUDAGraphRunner.capture(
+            context,
+            temporal,
+            compute,
+            pools=self.execution.pools,
+            restore=restore_samples(live),
+            warm=False,
+        )
 
-    @torch.inference_mode()
     def step(self, ladder: Ladder, index: int, bank: int):
         """Advance a bound step; the worker commits request progress.
 
@@ -823,51 +694,22 @@ class DiffusionRunner(ModelRunner):
         ``capture`` made resident, and ``"eager"`` for any other layout,
         such as one prepared while serving, or for a runner without graphs.
         """
-        if not self.binds(ladder):
-            raise ValueError("the ladder was bound by another runner")
-        entry = self.layout(ladder.layout)
-        live = ladder.inputs[index]
-        bucket = self.execution.buckets.get(ladder.layout)
-        graph = None if bucket is None else bucket.get(None)
-        if bucket is not None and entry.signature != ladder.signature:
-            raise ValueError(
-                "a ladder's structure differs from its layout's captured steps"
-            )
-        context = self.execution.context
-        stream = context.stream
-        if stream is not None:
-            stream.wait(torch.cuda.current_stream(self.device))
-        try:
-            with context.activate():
-                entry.rows.copy_(
-                    self._row_value(bank, ladder.pages), non_blocking=True
-                )
-                if graph is None:
-                    return self._advance(
-                        entry,
-                        self._call(entry, live, ladder.schedules, ladder.state),
-                    ), "eager"
+        return self.execution.step_denoising(self, ladder, index, bank)
 
-                # The graph's inputs are the step's schedules and its tensors
-                # other than samples and banked fields (``ladder.temporal``),
-                # the step index among them. Replay copies them by PyTree
-                # path, so every step of any ladder of this layout, with its
-                # own schedule objects, maps onto the same captured inputs.
-                temporal = ladder.schedules, ladder.temporal[index]
-                cast(torch.Tensor, self._slot_index).copy_(
-                    self._slot_value(ladder.slot), non_blocking=True
-                )
-                graph.replay(temporal)
-            return {
-                name: tuple(value.tensor for value in values)
-                for name, values in live.latents.items()
-            }, "graph_replay"
-        finally:
-            # Activation has restored the caller's stream on this device.
-            if stream is not None:
-                torch.cuda.current_stream(self.device).wait_stream(
-                    stream.stream
-                )
+    def _eager_step(self, entry, ladder, index):
+        return self._advance(
+            entry,
+            self._call(
+                entry, ladder.inputs[index], ladder.schedules, ladder.state
+            ),
+        )
+
+    def _step_values(self, ladder, index):
+        """Borrow the successor samples held until the runner's next call."""
+        return {
+            name: tuple(value.tensor for value in values)
+            for name, values in ladder.inputs[index].latents.items()
+        }
 
     def close(self):
         # Pinned copy sources retain their destination stream; release them
@@ -877,14 +719,9 @@ class DiffusionRunner(ModelRunner):
         try:
             super().close()
         finally:
-            for entry in self.layouts.values():
-                entry.backing.close()
             for backing in (self._workspace, self._state_buffers):
                 if backing is not None:
                     backing.close()
-            self.layouts.clear()
-            self._slot_values.clear()
-            self._row_values.clear()
             self._slot_index = None
             self.samples = self.pool = None
             self._workspace = self._state_buffers = None

@@ -9,8 +9,10 @@ use uniserve_worker_ipc::{CallKind, MediaCall};
 
 use super::{BatchState, PythonBackend};
 use crate::worker::error::invalid;
+use crate::worker::execution::Execution;
 use crate::worker::host::{HostLane, HostTask};
 use crate::worker::model_results::ExecutionOutput;
+use crate::worker::model_runners::ModelRunners;
 use crate::worker::request::Request;
 
 impl PythonBackend {
@@ -228,31 +230,45 @@ impl PythonBackend {
                         i64::from(params.height),
                         i64::from(params.width),
                     )?;
-                    let mut ladder = request
+                    let ladder = request
                         .borrow(py)
                         .video
                         .ladder
                         .as_ref()
                         .map(|value| value.clone_ref(py));
-                    let diffusion = model.getattr("diffusion")?;
+                    let runners = model
+                        .getattr("batch_runners")?
+                        .cast_into::<ModelRunners>()?;
+                    let diffusion = ModelRunners::diffusion(&runners, model)?;
                     let reusable = match &ladder {
-                        Some(ladder) => diffusion.call_method1("binds", (ladder,))?.is_truthy()?,
+                        Some(ladder) => Execution::binds_denoising(
+                            &diffusion.getattr("execution")?.cast_into::<Execution>()?,
+                            &diffusion,
+                            ladder.bind(py),
+                        )?,
                         None => false,
                     };
-                    if !reusable {
-                        let bound = numerical
-                            .call_method1(
-                                "bind_video",
-                                (model, &state, views, slot, PyTuple::new(py, pages)?),
-                            )?
-                            .unbind();
-                        request.borrow_mut(py).video.ladder = Some(bound.clone_ref(py));
-                        ladder = Some(bound);
-                    }
-                    let result = model
-                        .call_method1("run_denoising", (ladder, params.start_step, source))?
-                        .cast_into::<ExecutionOutput>()?;
-                    batch.record_result(py, &result)?;
+                    let ladder = match ladder {
+                        Some(ladder) if reusable => ladder,
+                        _ => {
+                            let bound = numerical
+                                .call_method1(
+                                    "bind_video",
+                                    (model, &state, views, slot, PyTuple::new(py, pages)?),
+                                )?
+                                .unbind();
+                            request.borrow_mut(py).video.ladder = Some(bound.clone_ref(py));
+                            bound
+                        }
+                    };
+                    let result = ModelRunners::run_denoising(
+                        &runners,
+                        model,
+                        ladder.bind(py),
+                        params.start_step as usize,
+                        i64::from(source),
+                    )?;
+                    batch.record_result(py, result.bind(py))?;
                     batch
                         .numerical
                         .borrow(py)
@@ -265,7 +281,7 @@ impl PythonBackend {
                                 "final latent products require completed denoising",
                             ));
                         }
-                        self.export_video_result(py, batch, index, &result, false)?;
+                        self.export_video_result(py, batch, index, result.bind(py), false)?;
                     }
                 }
             }

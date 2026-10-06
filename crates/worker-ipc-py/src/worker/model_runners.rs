@@ -1,5 +1,6 @@
 //! Numerical runner bindings and batched dispatch.
 
+mod diffusion;
 mod dispatch;
 mod execute;
 mod experts;
@@ -40,6 +41,8 @@ pub(crate) struct ModelRunners {
     closed: bool,
     #[pyo3(get)]
     sealed: bool,
+    diffusion: Option<Py<PyAny>>,
+    diffusion_layouts: Option<Py<PyDict>>,
     exchanges: Vec<Py<PyAny>>,
     expert_executions: Vec<Py<Execution>>,
     // Buffered numerical calls in collective order, each with its microbatch
@@ -432,10 +435,52 @@ impl ModelRunners {
         startup::seal(slf, owner)
     }
 
-    fn all<'py>(
+    #[getter]
+    fn has_diffusion(&self) -> bool {
+        self.diffusion.is_some()
+    }
+
+    pub(super) fn diffusion<'py>(
+        slf: &Bound<'py, Self>,
+        owner: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        diffusion::runner(slf, owner)
+    }
+
+    fn prepare_layouts<'py>(
         slf: &Bound<'py, Self>,
         owner: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyTuple>> {
+        diffusion::prepare_layouts(slf, owner)
+    }
+
+    fn diffusion_layout(
+        slf: &Bound<'_, Self>,
+        owner: &Bound<'_, PyAny>,
+        layout: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        diffusion::layout(slf, owner, layout)
+    }
+
+    pub(super) fn run_denoising(
+        slf: &Bound<'_, Self>,
+        owner: &Bound<'_, PyAny>,
+        ladder: &Bound<'_, PyAny>,
+        index: usize,
+        bank: i64,
+    ) -> PyResult<Py<ExecutionOutput>> {
+        diffusion::run(slf, owner, ladder, index, bank)
+    }
+
+    fn prepare_denoising(
+        slf: &Bound<'_, Self>,
+        owner: &Bound<'_, PyAny>,
+        storage: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        diffusion::prepare(slf, owner, storage)
+    }
+
+    fn all<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
         let py = slf.py();
         let mut runners: Vec<_> = slf
             .borrow()
@@ -444,9 +489,8 @@ impl ModelRunners {
             .map(|runner| runner.bind(py).clone())
             .collect();
         runners.extend(slf.borrow().prepared(py)?.iter());
-        let diffusion = owner.getattr("_diffusion")?;
-        if !diffusion.is_none() {
-            runners.push(diffusion);
+        if let Some(diffusion) = &slf.borrow().diffusion {
+            runners.push(diffusion.bind(py).clone());
         }
         PyTuple::new(py, runners)
     }
@@ -479,8 +523,8 @@ impl ModelRunners {
         resources::synchronize(slf, owner)
     }
 
-    fn close_graphs(slf: &Bound<'_, Self>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
-        resources::close_graphs(slf, owner)
+    fn close_graphs(slf: &Bound<'_, Self>) -> PyResult<()> {
+        resources::close_graphs(slf)
     }
 
     #[pyo3(signature = (owner, *, aborted=false))]
@@ -562,6 +606,8 @@ impl ModelRunners {
         self.inner.clear();
         self.modules.clear();
         self.outputs.clear();
+        self.diffusion = None;
+        self.diffusion_layouts = None;
         self.exchanges.clear();
         self.expert_executions.clear();
         self.expert_runners.clear();
@@ -579,6 +625,8 @@ impl ModelRunners {
                 module.traverse(&visit)?;
             }
         }
+        visit.call(&self.diffusion)?;
+        visit.call(&self.diffusion_layouts)?;
         for exchange in &self.exchanges {
             visit.call(exchange)?;
         }

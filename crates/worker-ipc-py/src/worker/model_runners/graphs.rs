@@ -7,6 +7,7 @@ use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker_ipc::ForwardStats as NativeStats;
 
 use crate::stats::ForwardStats;
+use crate::worker::execution::on_stream;
 use crate::worker::host::with_context;
 use crate::worker::model_results::ExecutionOutput;
 
@@ -52,36 +53,14 @@ pub(super) fn run_eager(
     Ok(result)
 }
 
-/// Order a numerical context between the caller's stream accesses, including
-/// exceptional exits. The context itself restores PyTorch's current stream.
-fn on_stream<T>(runner: &Bound<'_, PyAny>, call: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
-    let py = runner.py();
-    let numerical = context(runner)?;
-    let stream = numerical.getattr("stream")?;
-    let cuda = py.import("torch.cuda")?;
-    let current = || cuda.call_method1("current_stream", (runner.getattr("device")?,));
-    if !stream.is_none() {
-        stream.call_method1("wait", (current()?,))?;
-    }
-    let result = with_context(&numerical.call_method0("activate")?, call);
-    let joined = if stream.is_none() {
-        Ok(())
-    } else {
-        current()?
-            .call_method1("wait_stream", (stream.getattr("stream")?,))
-            .map(drop)
-    };
-    let result = result?;
-    joined?;
-    Ok(result)
-}
-
 pub(super) fn capture(
     runner: &Bound<'_, PyAny>,
     batch: &Bound<'_, PyAny>,
     forward: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
-    on_stream(runner, || capture_batch(runner, batch, forward))
+    on_stream(&context(runner)?, &runner.getattr("device")?, || {
+        capture_batch(runner, batch, forward)
+    })
 }
 
 fn capture_batch(
@@ -213,7 +192,7 @@ pub(super) fn run_module(
     let py = runner.py();
     let started = Instant::now();
     let mut path = "eager";
-    let output = on_stream(runner, || {
+    let output = on_stream(&context(runner)?, &runner.getattr("device")?, || {
         let backend = py.import("uniserve_worker.model_executor.cuda_graph")?;
         let values = (args, kwargs);
         let key = backend.call_method1("input_signature", (values,))?;
@@ -274,8 +253,20 @@ pub(super) fn run_module(
             .cast_into::<ExecutionOutput>()?;
         ExecutionOutput::copy(&output)
     })?;
-    let elapsed = started.elapsed().as_micros() as u64;
     let name: String = runner.getattr("name")?.extract()?;
+    record_stats(py, &output, &name, path, started)?;
+    Ok(output)
+}
+
+pub(super) fn record_stats(
+    py: Python<'_>,
+    output: &Py<ExecutionOutput>,
+    name: &str,
+    path: &str,
+    started: Instant,
+) -> PyResult<()> {
+    let elapsed = started.elapsed().as_micros() as u64;
+    let name = name.to_owned();
     output.borrow_mut(py).stats = Some(Py::new(
         py,
         ForwardStats::from(NativeStats {
@@ -288,5 +279,5 @@ pub(super) fn run_module(
             ..NativeStats::default()
         }),
     )?);
-    Ok(output)
+    Ok(())
 }

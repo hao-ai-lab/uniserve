@@ -7,8 +7,6 @@ model operations during serving and startup.
 
 from __future__ import annotations
 
-import logging
-import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -22,8 +20,6 @@ from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.media.mux import AvMuxConfig
 from uniserve_worker.protocol.batch import NewRequest
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from uniserve.runtime.tensor_buffers import TensorBuffers
@@ -211,7 +207,35 @@ def _prepare_placeholder(builder, size, views, samples, diffusion, layout):
         views["text_condition"].zero_()
 
 
-@torch.inference_mode()
+def denoising_inputs(runner, storage, schedules, layout, initialize):
+    """Bind scratch request tensors for one layout's warmup or capture.
+
+    Slot one is unowned during startup. Only warmup evaluates the numerical
+    call, so capture needs the same views without filling placeholder values.
+    """
+    builder, diffusion = runner.media_builder, runner.diffusion
+    size = builder.size(
+        layout.num_frames,
+        min(layout.num_text_tokens, builder.max_text_tokens),
+        layout.canvas,
+    )
+    views = storage.view(builder.layout_buffers(layout))
+    samples = builder.sample_views(size, diffusion.samples, layout=layout)
+    if initialize:
+        _prepare_placeholder(builder, size, views, samples, diffusion, layout)
+    return diffusion.bind(
+        layout,
+        tuple(
+            builder.bind(size, views, samples, schedules, index, layout=layout)
+            for index in range(builder.num_steps)
+        ),
+        schedules,
+        state=views,
+        slot=1,
+        pages=builder.slot_pages(1),
+    )
+
+
 def prepare_denoising(
     runner: ModelExecutor, storage: tuple[TensorBuffers, ...]
 ) -> None:
@@ -228,7 +252,8 @@ def prepare_denoising(
     prompt length the layout holds, since the lengths differ only in the
     state a graph gathers from the slot.
     Collective across the component's ranks, which hold each other in
-    lockstep here; serving never prepares a layout or captures.
+    lockstep here. Serving can prepare additional eager layouts and never
+    captures.
 
     Raises:
         RuntimeError: The request storage or input builder is missing, or
@@ -244,87 +269,8 @@ def prepare_denoising(
             "storage"
         )
 
-    started = time.perf_counter()
     try:
-        layouts = runner.prepare_layouts()
-        prepared = time.perf_counter()
-        diffusion = runner.diffusion
-        schedules = open_state(runner, builder.maximum).schedules
-
-        def ladder(layout, *, initialize):
-            # A placeholder request filling the layout's text capacity on
-            # slot one. ``storage[0]`` is slot one's tensors; no request
-            # owns a slot while this pass runs. Capture records the step
-            # without evaluating it, so only the warm step needs the
-            # placeholder's inputs initialized.
-            size = builder.size(
-                layout.num_frames,
-                min(layout.num_text_tokens, builder.max_text_tokens),
-                layout.canvas,
-            )
-            views = storage[0].view(builder.layout_buffers(layout))
-            samples = builder.sample_views(
-                size, diffusion.samples, layout=layout
-            )
-            if initialize:
-                _prepare_placeholder(
-                    builder, size, views, samples, diffusion, layout
-                )
-            return diffusion.bind(
-                layout,
-                tuple(
-                    builder.bind(
-                        size, views, samples, schedules, index, layout=layout
-                    )
-                    for index in range(builder.num_steps)
-                ),
-                schedules,
-                state=views,
-                slot=1,
-                pages=builder.slot_pages(1),
-            )
-
-        # Every layout warms before any captures. A warm step allocates the
-        # layout's persistent plans and scratch from the runner's pool, and
-        # the captured steps of every layout share that pool's free blocks
-        # as their intermediates; a persistent allocation made after a
-        # capture could land in a block an earlier graph rewrites. Each
-        # layout's warm step and captures also leave storage outside the
-        # pool (loaded modules, graph executables), so the budget is checked
-        # per layout: an overrun is refused at the layout that causes it,
-        # before the device itself runs out. The layout bounding the
-        # condition capacity warms first, so the scratch every layout
-        # borrows already holds the largest step, that of a request with
-        # conditions evaluating eagerly in a layout of its own; it is never
-        # captured.
-        maximum = builder.maximum_layout
-        warm = layouts if maximum in layouts else (maximum, *layouts)
-        for layout in warm:
-            diffusion.warmup(ladder(layout, initialize=True))
-            runner.graph_storage.check()
-        warmed = time.perf_counter()
-        if diffusion.captures:
-            # One graph per layout evaluates every solver step.
-            for layout in layouts:
-                diffusion.capture(ladder(layout, initialize=False))
-                runner.graph_storage.check()
-        resident = sum(runner.graph_storage.pool_bytes().values())
-        finished = time.perf_counter()
-        logger.info(
-            "prepared %d denoiser layouts (%d canvases x %d frame counts x "
-            "%d text capacities, %d step graphs) in %.1f s (contexts %.1f s, "
-            "warm steps %.1f s, capture %.1f s); graph storage %.2f GiB",
-            len(layouts),
-            len(builder.canvases),
-            len(builder.frame_counts),
-            len(builder.text_capacities),
-            len(layouts) if diffusion.captures else 0,
-            finished - started,
-            prepared - started,
-            warmed - prepared,
-            finished - warmed,
-            resident / 2**30,
-        )
+        runner.batch_runners.prepare_denoising(runner, storage)
     except (CUDAGraphError, torch.OutOfMemoryError) as error:
         raise RuntimeError(
             f"the denoiser's {len(builder.layouts())} capacity layouts "
