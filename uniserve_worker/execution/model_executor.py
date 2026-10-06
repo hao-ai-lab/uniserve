@@ -499,7 +499,7 @@ class ModelExecutor:
             )
             # An entry given graph devices captures a graph the first time it
             # executes each input signature during startup
-            # (``ModelRunner.execute_model``); a video post-processor, and
+            # (``ModelRunners.run_module``); a video post-processor, and
             # any entry prepared while serving, is given none and always runs
             # eagerly. Startup entries of one call share its graph pool.
             share = next(
@@ -963,7 +963,7 @@ class ModelExecutor:
             f"uniserve.model.module rank={self.worker_config.rank} work={name}"
         ):
             try:
-                result = runner.execute_model(*args, **kwargs)
+                result = self.batch_runners.run_module(runner, args, kwargs)
             except CUDAGraphError:
                 # Retire the failed context and its graphs; the next call at
                 # this size prepares a fresh one.
@@ -2374,34 +2374,6 @@ def _prepare_inputs(
         for row in rows
     )
     return batches, slots, borrow
-
-
-def _run_inputs(
-    runner: ModelRunner,
-    rows: tuple[InputRow, ...],
-    batches: tuple[InputBatch | None, ...],
-    eligible: bool,
-    borrow: bool,
-) -> tuple[ExecutionOutput, int | None]:
-    """Evaluate prepared tensors and check the numerical output layout."""
-    with torch.inference_mode():
-        if runner.microbatches is None:
-            output = runner.run_batch(
-                batches[0],
-                runner.batch_forward,
-                eligible=eligible,
-                borrow_output=borrow,
-            )
-            output.validate_for(batches[0])
-        else:
-            output = runner.run_microbatches(
-                batches, eligible=eligible, borrow_output=borrow
-            )
-
-    _validate_outputs(output.values, rows, runner.device)
-    counts = tuple(batch.query_tokens for batch in batches if batch is not None)
-    tokens = None if None in counts else sum(cast(tuple[int, ...], counts))
-    return output, tokens
 
 
 def _validate_outputs(

@@ -84,7 +84,13 @@ impl ExpertExchange {
     }
 
     #[pyo3(signature = (tokens, *, kind = 0, leaving = false))]
-    fn agree(&self, py: Python<'_>, tokens: usize, kind: i64, leaving: bool) -> PyResult<usize> {
+    pub(super) fn agree(
+        &self,
+        py: Python<'_>,
+        tokens: usize,
+        kind: i64,
+        leaving: bool,
+    ) -> PyResult<usize> {
         let tokens = count(tokens)?;
         self.collective(|buffers| {
             let local = buffers.local.as_mut_slice(py).expect("fixed host row");
@@ -104,7 +110,7 @@ impl ExpertExchange {
         })
     }
 
-    fn warmup(&self, py: Python<'_>, capacity: usize) -> PyResult<usize> {
+    pub(super) fn warmup(&self, py: Python<'_>, capacity: usize) -> PyResult<usize> {
         self.collective(|buffers| {
             let Some(broadcast) = &buffers.broadcast else {
                 return Ok(capacity);
@@ -116,11 +122,11 @@ impl ExpertExchange {
         })
     }
 
-    fn begin(&self, capacity: usize) -> PyResult<()> {
+    pub(super) fn begin(&self, capacity: usize) -> PyResult<()> {
         self.state().begin(capacity).map_err(error)
     }
 
-    fn end(&self) {
+    pub(super) fn end(&self) {
         self.state().end();
     }
 
@@ -146,7 +152,7 @@ impl ExpertExchange {
         self.state().reset_layers();
     }
 
-    fn record_layers(&self, modules: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub(super) fn record_layers(&self, modules: &Bound<'_, PyAny>) -> PyResult<()> {
         let modules = modules
             .try_iter()?
             .map(|module| module?.extract::<usize>())
@@ -168,7 +174,7 @@ impl ExpertExchange {
     }
 
     #[getter]
-    fn capacity(&self) -> usize {
+    pub(super) fn capacity(&self) -> usize {
         self.state().capacity()
     }
 
@@ -178,7 +184,7 @@ impl ExpertExchange {
     }
 
     #[getter]
-    fn active(&self) -> bool {
+    pub(super) fn active(&self) -> bool {
         self.state().active()
     }
 

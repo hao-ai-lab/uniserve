@@ -432,6 +432,21 @@ class ModelRunners(Generic[RunnerT]):
     def get(self, component: str, kind: CallKind) -> RunnerT | None: ...
     def first(self, kind: CallKind) -> RunnerT | None: ...
     def clear(self) -> None: ...
+    def run_eager(
+        self,
+        runner: RunnerT,
+        batch: InputBatch,
+        forward: Callable[[InputBatch], ExecutionOutput],
+    ) -> ExecutionOutput: ...
+    def capture(
+        self,
+        runner: RunnerT,
+        batch: InputBatch,
+        forward: Callable[[InputBatch], ExecutionOutput],
+    ) -> None: ...
+    def run_module(
+        self, runner: RunnerT, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> ExecutionOutput: ...
     def run_batch(
         self,
         owner: ModelExecutor,

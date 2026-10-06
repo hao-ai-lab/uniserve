@@ -98,6 +98,8 @@ class EncoderRunner(ModelRunner):
     def batch_forward(self, batch, *, padded=False):
         """Encode a homogeneous image batch through its declared capability."""
         if isinstance(self.model, PatchEncoder):
+            if self.packs_images:
+                return self._forward_packed(batch.inputs)
             return ExecutionOutput(self.model.encode(batch.inputs))
         if isinstance(self.model, PatchAutoencoder):
             return ExecutionOutput(
@@ -165,38 +167,25 @@ class EncoderRunner(ModelRunner):
                 raise
             self._packed[slots] = graph
 
-    @torch.inference_mode()
-    def run_batch(self, batch, forward, *, eligible, borrow_output=False):
-        """Replay packed vision graphs, or run the batch as ``ModelRunner``.
+    def _forward_packed(self, inputs: VisionInput) -> ExecutionOutput:
+        """Replay packed vision slots, preserving each image's feature rows.
 
-        With packed graphs every vision call replays them: its images are
-        copied into the static slots of the smallest capacity that holds
-        them, one full group of the largest capacity at a time, and each
-        image's features are sliced from a copy of the graph's output.
-
-        Raises:
-            CUDAGraphError: When packed graphs are enabled but a capacity
-                was not captured before serving.
+        Each full group uses the largest capacity, with the final group in
+        the smallest captured capacity that holds it. A copy retains the
+        group's outputs before another replay reuses the captured backing.
         """
-        if not self.packs_images or not isinstance(batch.inputs, VisionInput):
-            return super().run_batch(
-                batch, forward, eligible=eligible, borrow_output=borrow_output
-            )
-
         if not self._packed:
             raise CUDAGraphError("packed vision graphs are not resident")
-        inputs = batch.inputs
         largest = max(self._packed)
         values: list[torch.Tensor] = []
-        with self.context.activate():
-            for start in range(0, inputs.batch_size, largest):
-                stop = min(start + largest, inputs.batch_size)
-                values.extend(
-                    self._replay_packed(
-                        inputs.images[start:stop],
-                        inputs.grid_shapes[start:stop],
-                    )
+        for start in range(0, inputs.batch_size, largest):
+            stop = min(start + largest, inputs.batch_size)
+            values.extend(
+                self._replay_packed(
+                    inputs.images[start:stop],
+                    inputs.grid_shapes[start:stop],
                 )
+            )
         replays = -(-inputs.batch_size // largest)
         return ExecutionOutput(
             tuple(values),

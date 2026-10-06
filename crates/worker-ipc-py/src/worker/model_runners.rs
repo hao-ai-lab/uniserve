@@ -1,10 +1,12 @@
 //! Numerical runner bindings and batched dispatch.
 
+mod dispatch;
 mod execute;
 mod forward;
+mod graphs;
 
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker::ModelRunners as NativeModelRunners;
 use uniserve_worker_ipc::CallKind;
 
@@ -22,6 +24,50 @@ impl ModelRunners {
     #[new]
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Evaluate a prepared numerical batch in its context, including experts.
+    /// The caller orders input and output accesses with the runner's stream.
+    fn run_eager(
+        &self,
+        py: Python<'_>,
+        runner: &Bound<'_, PyAny>,
+        batch: &Bound<'_, PyAny>,
+        forward: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<ExecutionOutput>> {
+        super::host::with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
+            super::host::with_context(
+                &runner.getattr("context")?.call_method0("activate")?,
+                || graphs::run_eager(runner, batch, forward),
+            )
+        })
+    }
+
+    /// Capture every expert-capacity variant of a selected startup bucket.
+    /// Fails after startup is sealed; joins the caller's stream on every exit.
+    fn capture(
+        &self,
+        py: Python<'_>,
+        runner: &Bound<'_, PyAny>,
+        batch: &Bound<'_, PyAny>,
+        forward: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        super::host::with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
+            graphs::capture(runner, batch, forward)
+        })
+    }
+
+    /// Evaluate a standalone numerical signature and return owned tensors.
+    fn run_module(
+        &self,
+        py: Python<'_>,
+        runner: &Bound<'_, PyAny>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: &Bound<'_, PyDict>,
+    ) -> PyResult<Py<ExecutionOutput>> {
+        super::host::with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
+            graphs::run_module(runner, args, kwargs)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
