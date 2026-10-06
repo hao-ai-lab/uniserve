@@ -3,7 +3,7 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
-use uniserve_worker_ipc::{CallKind, CallStatus, MediaCall};
+use uniserve_worker_ipc::CallStatus;
 
 use super::{BatchState, PythonBackend};
 use crate::worker::error::native_error;
@@ -343,14 +343,6 @@ impl PythonBackend {
                 PendingOutput::abandon(output)?;
             }
 
-            let media_mux = self.worker.bind(py).getattr("media_mux")?;
-            if !media_mux.is_none() {
-                for call in &batch.plan.calls {
-                    if call.code == CallKind::Media(MediaCall::LatentPreparation) {
-                        media_mux.call_method1("drop", (call.request_key.request_id.0,))?;
-                    }
-                }
-            }
             OutputBuffer::abandon(buffer)?;
             self.tensors
                 .get()

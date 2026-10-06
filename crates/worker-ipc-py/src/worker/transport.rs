@@ -42,7 +42,7 @@ enum Backend {
 /// Python supplies borrowed tensor views and numerical copies.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct Transport {
-    source: WorkerEndpoint,
+    pub(super) source: WorkerEndpoint,
     #[pyo3(get)]
     pub(super) capacity: Py<TransferCapacity>,
     events: Py<EventPool>,
@@ -234,7 +234,7 @@ impl Transport {
 
     /// Borrow shared host rows in place; release ends the reader's claim.
     #[pyo3(signature = (locator, region=None))]
-    fn borrow(
+    pub(super) fn borrow(
         &self,
         py: Python<'_>,
         locator: &Bound<'_, Locator>,

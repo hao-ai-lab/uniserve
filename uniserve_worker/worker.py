@@ -4,8 +4,7 @@
 model runner (`ModelExecutor`), the paged KV cache and block tables of a
 worker with a ``CausalLM``, the latent pool of a denoising worker, the
 request slots (`RequestPool`), the product, buffer and output stores, the
-transports, the host lane, the muxer rank's `MediaMux`, and the process
-groups created by `from_config`.
+transports, the host lane, and the process groups created by `from_config`.
 
 Both entry paths drive the worker's one `Executor`. The worker process
 (``uniserve_worker.bootstrap.launch``) builds a worker with `from_config`,
@@ -58,10 +57,7 @@ from uniserve_worker.bootstrap.capacity import (
     latent_pool_plan,
     resolve_request_capacity,
 )
-from uniserve_worker.bootstrap.components import (
-    MUXER_COMPONENT,
-    holds_host_components,
-)
+from uniserve_worker.bootstrap.components import holds_host_components
 from uniserve_worker.bootstrap.distributed import initialize_components
 from uniserve_worker.bootstrap.inputs import capability, image_builder
 from uniserve_worker.bootstrap.model_loader import (
@@ -85,7 +81,6 @@ from uniserve_worker.media.container import (
     VIDEO_CODEC,
     require_media_codecs,
 )
-from uniserve_worker.media.mux import MediaMux
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.profiling import (
     WorkerProfiler,
@@ -759,20 +754,6 @@ class Worker:
                 startup.callback(self.canvas_slots.close)
                 runner.bind_canvas_slots(self.canvas_slots)
 
-            # Only the muxer member that publishes the component's host
-            # products (`WorkerInfo.output_rank`) holds a `MediaMux`; it
-            # assembles each request's container on its host lane.
-            muxer = self.runner.bindings.get(MUXER_COMPONENT)
-            self.media_mux = (
-                MediaMux(rank=worker_config.rank)
-                if muxer is not None
-                and muxer.owns
-                and worker_config.rank == info.output_rank(MUXER_COMPONENT)
-                else None
-            )
-            if self.media_mux is not None:
-                startup.callback(self.media_mux.close)
-
         except BaseException as error:
             # Releasing partially started owners could wait on device work
             # or peers and replace this error with a stall, so keep them
@@ -951,11 +932,6 @@ class Worker:
             actions.append(self.profiler.close)
         actions.append(self.executor.close)
 
-        # Discarding mux sessions before the host lane drains is safe: a
-        # session held by a running lane task is closed when that task
-        # releases it (`MuxSession.discard`).
-        if self.media_mux is not None:
-            actions.append(self.media_mux.close)
         actions.append(self.host_tasks.close)
 
         # Stop imports and transports before releasing the storage they borrow.
@@ -1009,7 +985,6 @@ class Worker:
                 self.block_tables,
                 self.kv_cache,
                 self.latent_pool,
-                self.media_mux,
                 self.output_pool,
                 self.tensor_store,
                 self.buffer_pool,

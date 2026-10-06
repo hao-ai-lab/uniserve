@@ -6,6 +6,7 @@ mod execute;
 mod forward;
 mod inputs;
 mod latents;
+mod media;
 mod output;
 mod predicates;
 mod prepare;

@@ -1,4 +1,4 @@
-//! Python numerical actions and observers for the native host lane.
+//! Numerical callbacks, native codec actions and host-lane observers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,17 +14,23 @@ use uniserve_worker::{
 
 use super::completion::{Completion, CompletionRef, cancelled};
 use super::error::native_error;
+use super::media::MediaTask;
+
+enum Action {
+    Python(Py<PyAny>),
+    Media(MediaTask),
+}
 
 enum Dependency {
     Task {
         owner: Py<HostTask>,
-        task: Arc<NativeHostTask<PythonAction>>,
+        task: Arc<NativeHostTask<HostOperation>>,
     },
     Completion(CompletionRef),
 }
 
-pub(super) struct PythonAction {
-    action: Py<PyAny>,
+pub(super) struct HostOperation {
+    action: Action,
     dependencies: Vec<Dependency>,
     input_ready: Option<Py<PyAny>>,
     input_completion: Option<CompletionRef>,
@@ -32,11 +38,11 @@ pub(super) struct PythonAction {
     profile_name: String,
 }
 
-impl PythonAction {
+impl HostOperation {
     /// A numerical call whose input lifetime belongs to its enclosing owner.
     pub(super) fn numerical(action: Py<PyAny>, profile_name: &str) -> Self {
         Self {
-            action,
+            action: Action::Python(action),
             dependencies: Vec::new(),
             input_ready: None,
             input_completion: None,
@@ -46,7 +52,7 @@ impl PythonAction {
     }
 }
 
-impl HostAction for PythonAction {
+impl HostAction for HostOperation {
     type Output = Py<PyAny>;
     type Error = Py<PyBaseException>;
     type Callback = (Py<PyAny>, Py<HostTask>);
@@ -75,7 +81,10 @@ impl HostAction for PythonAction {
                     .import("uniserve.profiling")?
                     .getattr("profile_range")?
                     .call1((&self.profile_name,))?;
-                with_context(&scope, || self.action.bind(py).call0().map(Bound::unbind))
+                with_context(&scope, || match &self.action {
+                    Action::Python(action) => action.bind(py).call0().map(Bound::unbind),
+                    Action::Media(action) => action.run(py),
+                })
             };
             run().map_err(|error| error.into_value(py))
         })
@@ -83,6 +92,9 @@ impl HostAction for PythonAction {
 
     fn release(&self) -> Result<(), Self::Error> {
         Python::attach(|py| {
+            if let Action::Media(action) = &self.action {
+                return action.release(py).map_err(|error| error.into_value(py));
+            }
             self.release
                 .as_ref()
                 .map_or(Ok(()), |release| release.bind(py).call0().map(drop))
@@ -178,7 +190,7 @@ fn wait_for<C, T: Clone>(
 
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct HostLane {
-    lane: NativeHostLane<PythonAction>,
+    lane: NativeHostLane<HostOperation>,
     #[pyo3(get)]
     max_inflight: usize,
 }
@@ -233,7 +245,7 @@ impl HostLane {
         let mut errors = py.detach(|| self.lane.close()).into_iter();
         if let Some(mut error) = errors.next() {
             for cleanup in errors {
-                PythonAction::note_cleanup(&mut error, cleanup);
+                HostOperation::note_cleanup(&mut error, cleanup);
             }
             return Err(PyErr::from_value(error.bind(py).clone().into_any()));
         }
@@ -243,7 +255,7 @@ impl HostLane {
 
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct HostTask {
-    task: Arc<NativeHostTask<PythonAction>>,
+    task: Arc<NativeHostTask<HostOperation>>,
 }
 
 #[pymethods]
@@ -281,8 +293,8 @@ impl HostTask {
             .transpose()?;
         slf.borrow()
             .task
-            .configure(PythonAction {
-                action,
+            .configure(HostOperation {
+                action: Action::Python(action),
                 dependencies,
                 input_ready,
                 input_completion,
@@ -363,7 +375,7 @@ impl HostTask {
             .completion
             .subscribe((callback, slf.clone().unbind()));
         if let Some(callback) = immediate {
-            PythonAction::notify(vec![callback]);
+            HostOperation::notify(vec![callback]);
         }
     }
 
@@ -387,7 +399,10 @@ impl HostTask {
             return Ok(());
         }
         if let Some(result) = self.task.visit_action(|action| {
-            visit.call(&action.action)?;
+            match &action.action {
+                Action::Python(function) => visit.call(function)?,
+                Action::Media(task) => task.traverse(&visit)?,
+            }
             visit.call(&action.input_ready)?;
             visit.call(&action.release)?;
             if let Some(completion) = &action.input_completion {
@@ -425,6 +440,27 @@ impl HostTask {
 }
 
 impl HostTask {
+    /// Bind native codec work to an already-reserved slot. Input release and
+    /// cancellation use the same task lifecycle as numerical callbacks.
+    pub(super) fn configure_media(
+        &self,
+        py: Python<'_>,
+        action: MediaTask,
+        profile_name: String,
+    ) -> PyResult<()> {
+        let operation = HostOperation {
+            action: Action::Media(action),
+            dependencies: Vec::new(),
+            input_ready: None,
+            input_completion: None,
+            release: None,
+            profile_name,
+        };
+        self.task
+            .configure(operation)
+            .map_err(|error| native_error(py, error))
+    }
+
     /// Wait for the host writer to exit before its destination can be reused.
     /// Its consumer reports failure; retirement only needs physical completion.
     pub(super) fn drain(&self, py: Python<'_>) {

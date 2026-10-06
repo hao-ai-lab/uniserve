@@ -163,7 +163,7 @@ impl SharedRead {
         Ok(self.lock(py)?.nbytes())
     }
 
-    fn truncate(&self, py: Python<'_>, nbytes: usize) -> PyResult<()> {
+    pub(super) fn truncate(&self, py: Python<'_>, nbytes: usize) -> PyResult<()> {
         self.lock(py)?
             .truncate(nbytes)
             .map_err(|error| native_error(py, error))

@@ -14,30 +14,17 @@ condition products (``uniserve_worker.execution.conditions``):
   condition the conditioner reads (``PatchEncoder.pack_pixels``) from its
   decoded frames: an image's one frame, or a video's sampled frames.
 
-Conditions follow each other in request order in every product. Decoding
-runs as one task on the rank's host lane; ``execute`` reserves the products
-and configures that task, whose completion publishes them as host products
-for the vision and latent encoders, which read them on their own hosts.
+Conditions follow each other in request order. Native host tasks retain the
+borrowed output tensors until reading completes, then export them together.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.model import AudioEncoder, PatchEncoder
-from uniserve_worker.bootstrap.inputs import capability
-from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.execution.conditions import (
-    CONDITION_PIXELS,
-    CONDITION_SAMPLES,
-    VISION_PIXELS,
-    video_admission,
-)
-from uniserve_worker.execution.image import bound_device_write
+from uniserve.model import PatchEncoder
 from uniserve_worker.media.reader import (
     open_media,
     read_audio,
@@ -47,15 +34,7 @@ from uniserve_worker.media.reader import (
 )
 
 if TYPE_CHECKING:
-    from uniserve_worker._uniserve_ipc import BatchState
-    from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.execution.output import PendingOutput
-    from uniserve_worker.protocol.call import Call
     from uniserve_worker.protocol.video import VideoCondition
-    from uniserve_worker.storage.tensor_store import TensorStore
-    from uniserve_worker.transport.interface import Transport
-
-__all__ = ["execute", "read_conditions"]
 
 
 def read_conditions(
@@ -143,83 +122,3 @@ def read_conditions(
     ):
         if target is not None and rows[name] != target.shape[0]:
             raise ValueError(f"the request's conditions leave {name} unfilled")
-
-
-def execute(
-    call: Call,
-    *,
-    state: BatchState,
-    tensor_store: TensorStore,
-    export_transports: Mapping[str, Transport],
-    model_runner: ModelExecutor,
-) -> PendingOutput:
-    """Schedule one request's media reading on the rank's host lane.
-
-    Reserves the call's products, configures its one reserved host task to
-    decode the request's conditions into them, and schedules ``host.finish``,
-    which publishes the products once the task completes. The returned
-    output carries no products at commit.
-
-    Raises:
-        WorkerError: ``invalid_descriptor`` when the request has no
-            conditions, or the call declares a product other than the
-            media reader's.
-        RuntimeError: The call has no reserved lane slot, or the model
-            lacks the vision or audio encoder whose inputs it reads.
-    """
-    request = state.pending_output(call.request_key.request_id)
-    video = video_admission(request)
-    reservations = request.host_tasks
-    if len(reservations) != 1:
-        raise RuntimeError("media reading has no reserved lane slot")
-    vision = capability(model_runner.model, PatchEncoder)
-    audio = capability(model_runner.model, AudioEncoder)
-    if vision is None or audio is None:
-        raise RuntimeError("media reading requires the condition encoders")
-
-    # Each product's storage is reserved now and filled by the host task;
-    # the products are published only once it completes.
-    declared = model_runner.outputs.get(call.component, ())
-    products = {}
-    for output in call.outputs:
-        if output.output_index >= len(declared):
-            raise invalid_descriptor("media reading declares no such product")
-        name = declared[output.output_index].name
-        if name not in (CONDITION_PIXELS, CONDITION_SAMPLES, VISION_PIXELS):
-            raise invalid_descriptor(f"media reading does not produce {name}")
-        write = bound_device_write(output, state=state)
-        tensor_store.defer_write(write)
-        products[name] = write
-
-    def target(name: str) -> torch.Tensor | None:
-        return products[name].tensor if name in products else None
-
-    task = reservations[0].configure(
-        partial(
-            read_conditions,
-            video.conditions,
-            pixels=target(CONDITION_PIXELS),
-            samples=target(CONDITION_SAMPLES),
-            patches=target(VISION_PIXELS),
-            vision=vision,
-            sample_rate=audio.sample_rate,
-            ffmpeg=model_runner.worker_config.ffmpeg,
-        ),
-        profile_name=(
-            "uniserve.host.read "
-            f"request={call.request_key.request_id} "
-            f"conditions={len(video.conditions)}"
-        ),
-    )
-
-    def finish(results: tuple[object, ...]) -> None:
-        state.export_tensors(
-            call.request_key.request_id,
-            tuple(write.tensor for write in products.values()),
-            tensor_store,
-            export_transports,
-            host=True,
-        )
-
-    request.set_host_tasks((task,), finish=finish)
-    return request

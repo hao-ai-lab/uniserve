@@ -14,11 +14,13 @@ use uniserve_worker_ipc::{BufferId, Call, CallStatus, ErrorCode, KvTransfer, Req
 use crate::convert;
 
 use super::block_tables::BlockTables;
-use super::error::{native_error, unsupported};
+use super::error::{invalid, native_error, unsupported};
 use super::host::HostTask;
 use super::latent::LatentBuffer;
+use super::media::HostTensors;
 use super::output::OutputBuffer;
 use super::request::{Request, RequestPool, RequestProgress};
+use super::storage::{Buffer, TensorStore};
 
 /// Borrowed sampling views and device coordinates awaiting batch commit.
 pub(crate) struct TokenUpdate {
@@ -92,7 +94,7 @@ pub(crate) struct PendingOutput {
     pub(super) host_tasks: Vec<Py<HostTask>>,
     // Video unit positions within this decode round, assigned to this rank.
     pub(super) media_units: Vec<usize>,
-    host_finish: Option<Py<PyAny>>,
+    pub(super) host_tensors: Option<HostTensors>,
     pub(super) tensor_exports: Py<PyDict>,
     #[pyo3(get)]
     pub(super) cache_exports: Py<PyDict>,
@@ -159,7 +161,7 @@ impl PendingOutput {
             latent_exports: PyDict::new(py).unbind(),
             host_tasks: Vec::new(),
             media_units: Vec::new(),
-            host_finish: None,
+            host_tensors: None,
             tensor_exports: PyDict::new(py).unbind(),
             cache_exports: PyDict::new(py).unbind(),
             exported_locators: PyList::empty(py).unbind(),
@@ -255,24 +257,12 @@ impl PendingOutput {
     }
 
     #[getter]
-    fn media_units<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, &self.media_units)
-    }
-
-    #[getter]
     fn host_tasks(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         PyTuple::new(py, self.host_tasks.iter().map(|task| task.bind(py))).map(Bound::unbind)
     }
 
-    #[pyo3(signature = (tasks, finish=None))]
-    fn set_host_tasks(slf: &Bound<'_, Self>, tasks: Vec<Py<HostTask>>, finish: Option<Py<PyAny>>) {
-        let retired = {
-            let mut this = slf.borrow_mut();
-            (
-                std::mem::replace(&mut this.host_tasks, tasks),
-                std::mem::replace(&mut this.host_finish, finish),
-            )
-        };
+    fn set_host_tasks(slf: &Bound<'_, Self>, tasks: Vec<Py<HostTask>>) {
+        let retired = std::mem::replace(&mut slf.borrow_mut().host_tasks, tasks);
         drop(retired);
     }
 
@@ -315,7 +305,7 @@ impl PendingOutput {
             };
             (
                 std::mem::take(&mut this.host_tasks),
-                this.host_finish.take(),
+                this.host_tensors.take(),
                 this.buffer.take(),
                 row,
             )
@@ -354,7 +344,9 @@ impl PendingOutput {
         for task in &self.host_tasks {
             visit.call(task)?;
         }
-        visit.call(&self.host_finish)?;
+        if let Some(tensors) = &self.host_tensors {
+            tensors.traverse(&visit)?;
+        }
         visit.call(&self.tensor_exports)?;
         visit.call(&self.cache_exports)?;
         visit.call(&self.exported_locators)?;
@@ -374,14 +366,14 @@ impl PendingOutput {
         self.latent_buffer = None;
         self.latent_exports.bind(py).clear();
         self.host_tasks.clear();
-        self.host_finish = None;
+        self.host_tensors = None;
     }
 }
 
 impl PendingOutput {
     pub(super) fn release_execution_references(&mut self, py: Python<'_>) -> PyResult<()> {
         // A host task may still be filling its reserved buffers after batch
-        // commit. Keep only those writes until its completion callback runs.
+        // commit. Keep only those writes until its host result is resolved.
         let writes = self
             .writes
             .bind(py)
@@ -501,7 +493,7 @@ impl PendingOutput {
             (state.output.status, state.reports_output)
         };
 
-        // A host callback may update this result. Drop every native lock and
+        // Host result resolution may update this output. Drop every native lock and
         // Python borrow before invoking it or dispatching completion observers.
         let completed = if status == CallStatus::Ok {
             resolve_host(slf, reports)
@@ -543,7 +535,7 @@ impl PendingOutput {
             (
                 this.buffer.take(),
                 std::mem::take(&mut this.host_tasks),
-                this.host_finish.take(),
+                this.host_tensors.take(),
             )
         };
         drop(retired);
@@ -578,10 +570,9 @@ fn resolve_host(output: &Bound<'_, PendingOutput>, reports: bool) -> PyResult<()
         .iter()
         .map(|task| task.borrow(py).result(py, None))
         .collect::<PyResult<Vec<_>>>()?;
-    let finish = output.borrow_mut().host_finish.take();
-    if let Some(finish) = finish {
-        finish.call1(py, (PyTuple::new(py, results)?,))?;
-        return Ok(());
+    let finish = output.borrow_mut().host_tensors.take();
+    if let Some(tensors) = finish {
+        return tensors.finish(output, results);
     }
 
     if reports {
@@ -648,4 +639,90 @@ fn log_failure(output: &Bound<'_, PendingOutput>, error: &PyErr) -> PyResult<()>
             Some(&kwargs),
         )?;
     Ok(())
+}
+
+impl PendingOutput {
+    /// Commit numerical results and their initialized regions through one storage path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn export_tensors(
+        slf: &Bound<'_, Self>,
+        call: &Call,
+        values: Vec<Bound<'_, PyAny>>,
+        tensor_store: &TensorStore,
+        transports: &Bound<'_, PyAny>,
+        host: bool,
+        regions: Option<Vec<Vec<Bound<'_, PyTuple>>>>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        if values.len() != call.outputs.len()
+            || regions
+                .as_ref()
+                .is_some_and(|regions| regions.len() != values.len())
+        {
+            return Err(invalid(
+                py,
+                "numerical results disagree with declared tensor outputs",
+            ));
+        }
+
+        let output = slf.borrow();
+        let writes = output
+            .writes
+            .bind(py)
+            .iter()
+            .map(|write| write.cast_into::<Buffer>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let deferred: Vec<_> = writes
+            .iter()
+            .filter(|write| write.get().deferred(py))
+            .cloned()
+            .collect();
+        let exported = (|| {
+            let mut products = Vec::new();
+            for (index, (product, value)) in call.outputs.iter().zip(&values).enumerate() {
+                let write = writes.iter().find(|write| {
+                    write.get().id(py) == product.buffer_id() && !write.get().feature(py)
+                });
+                let Some(write) = write else {
+                    continue;
+                };
+                tensor_store.write(py, write.clone(), value.clone(), None, None)?;
+                products.push(tensor_store.export_buffer(
+                    py,
+                    call,
+                    product,
+                    write,
+                    transports,
+                    host,
+                    regions.as_ref().map(|regions| regions[index].as_slice()),
+                    &output,
+                )?);
+            }
+            output
+                .lock(py)?
+                .set_products(products)
+                .map_err(|error| native_error(py, error))?;
+
+            if !deferred.is_empty() {
+                let resident = tensor_store.exports.bind(py);
+                let exports = output.tensor_exports.bind(py);
+                super::exports::validate_exports(resident, exports)?;
+                tensor_store.commit_writes(py, deferred.clone())?;
+                resident.update(exports.as_mapping())?;
+            }
+            Ok(())
+        })();
+
+        if !deferred.is_empty() {
+            // These writes finish after batch commit, so failure cleanup
+            // belongs here rather than the executor's pre-commit discard.
+            if exported.is_err() {
+                output.revoke_exports(transports)?;
+                tensor_store.abandon_writes(py, deferred)?;
+            }
+            drop(output);
+            slf.borrow_mut().release_execution_references(py)?;
+        }
+        exported
+    }
 }
