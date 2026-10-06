@@ -126,7 +126,7 @@ def autotune_knobs(
 
     ``frontend`` is a NVFP4/MXFP8 mega frontend (must have ``apply_knobs``);
     ``launch`` is a zero-arg closure that runs one synchronized forward with
-    the caller's real staged inputs (e.g. a ``nvfp4_mega_moe(...)`` call).
+    the caller's input buffers (e.g. a ``nvfp4_mega_moe(...)`` call).
 
     ``on_winner`` (optional) is called once with ``(winner, p50_seconds)``
     after the winner is applied — used to persist the result in the knob
@@ -216,7 +216,7 @@ def autotune_nvfp4_mega_moe(
     warmup_iters: int = 3,
     timed_iters: int = 10,
 ) -> Dict[str, Any]:
-    """Autotune the NVFP4 mega session on the caller's staged inputs.
+    """Autotune the NVFP4 mega session on the caller's input buffers.
 
     Arguments mirror :func:`.nvfp4.nvfp4_mega_moe`; ``y`` is clobbered by the
     candidate launches.  Apply the winner and return its knob dict; subsequent

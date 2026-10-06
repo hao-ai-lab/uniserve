@@ -252,7 +252,7 @@ def _install(manager, count, tokens=SEQUENCE):
 
 
 def _run(runner, manager, rows, kind):
-    """Run one staged group of rows as calls of ``kind``."""
+    """Run one batch of rows as calls of ``kind``."""
     calls = tuple(
         Call(
             request_key=RequestKey(1, row.request_pool_idx, 0),

@@ -57,7 +57,7 @@ def test_initial_inputs_are_ready_for_consumption_after_preparation(
 
 
 def _pool(slots, *, device):
-    """A consumer-staged latent pool in which slot ``s`` owns page ``s``."""
+    """A consumer-owned latent pool in which slot ``s`` owns page ``s``."""
     return LatentPool(
         request_pool_size=slots,
         num_pages=slots + 1,

@@ -444,12 +444,16 @@ def test_conditioned_request_computes_the_model_first_step(
     ):
         model_runner = DenoisingRunner(denoiser, context=context)
         model_runner.warmup(model_layout)
-        request, staged = backing.view(requirements), host.view(requirements)
+        request, host_views = (
+            backing.view(requirements),
+            host.view(requirements),
+        )
         model_runner.prepare_latents(
             (model_layout,),
             noise=noise,
             state={
-                name: staged[name].unsqueeze(0) for name in denoiser.modalities
+                name: host_views[name].unsqueeze(0)
+                for name in denoiser.modalities
             },
         )
         model_runner.prepare_state(
@@ -457,12 +461,12 @@ def test_conditioned_request_computes_the_model_first_step(
             layouts=(model_layout,),
             out={
                 name: value
-                for name, value in staged.items()
+                for name, value in host_views.items()
                 if name not in denoiser.modalities
             },
         )
         for name, value in request.items():
-            value.copy_(staged[name])
+            value.copy_(host_views[name])
         for name in builder.tables(size):
             assert _equal(views[name], request[name]), name
         for name in denoiser.modalities:

@@ -72,7 +72,7 @@ def test_decode_export_and_inputs_follow_live_request_coordinates(
         )
 
     # Exercise a singleton, a partial batch and the non-power-of-two capacity,
-    # then shrink again while changing the staged width.
+    # then shrink again while changing the input width.
     for count, width in ((1, 1), (3, 3), (capacity, 5), (1, 3)):
         live = slots[::-1][:count]
         indices = torch.tensor(live, dtype=torch.int64, device=device)
@@ -104,7 +104,7 @@ def test_decode_export_and_inputs_follow_live_request_coordinates(
         assert state.predicates.tolist() == expected_predicates
 
         # The windowed group has retired every page before the one its
-        # readers' windows reach, so its first staged page is its first
+        # readers' windows reach, so its first gathered page is its first
         # installed page.
         first = [max(length - 2, 0) // 2 for length in expected_lengths]
         starts[1].copy_(torch.tensor(first, dtype=torch.int32))

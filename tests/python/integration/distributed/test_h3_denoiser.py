@@ -196,7 +196,7 @@ def _run(rank, rendezvous, directory, source):
                 TensorBuffers.allocate(requirements, device=device) as resident,
             ):
                 request = resident.view(requirements)
-                staged = host.view(requirements)
+                host_views = host.view(requirements)
                 state = {name: request[name] for name in model.modalities}
                 noise = {
                     name: torch.empty(
@@ -211,7 +211,7 @@ def _run(rank, rendezvous, directory, source):
                     (layout,),
                     noise=noise,
                     state={
-                        name: staged[name].unsqueeze(0)
+                        name: host_views[name].unsqueeze(0)
                         for name in model.modalities
                     },
                     constants=execution.constants,
@@ -222,12 +222,12 @@ def _run(rank, rendezvous, directory, source):
                     layouts=(layout,),
                     out={
                         name: value
-                        for name, value in staged.items()
+                        for name, value in host_views.items()
                         if name not in model.modalities
                     },
                 )
                 for name, value in request.items():
-                    value.copy_(staged[name])
+                    value.copy_(host_views[name])
                 features = torch.zeros(
                     model.text_condition_rows(layout),
                     model.text_condition_width,
@@ -438,8 +438,10 @@ def _committed(factory, latents, size, slot, bank):
     )
 
 
-def _stage(factory, latents, size, slot, views, context, *, seed, features):
-    """Stage one admitted request as the worker does.
+def _prepare_request(
+    factory, latents, size, slot, views, context, *, seed, features
+):
+    """Prepare one admitted request as the worker does.
 
     The request's tables and conditioning go to its slot views and its
     initial samples to the bank of its pages a fresh trajectory starts in.
@@ -544,7 +546,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                     schedules = model.make_schedules(
                         factory.num_steps, shift=None, device=device
                     )
-                    _stage(
+                    _prepare_request(
                         factory,
                         latents,
                         size,
@@ -668,7 +670,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
             samples, paths = {}, []
             for slot, size in requests.items():
                 views = pool.storage.tensors(slot).view(factory.buffers(size))
-                _stage(
+                _prepare_request(
                     factory,
                     latents,
                     size,
@@ -721,7 +723,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                 views = pool.storage.tensors(1).view(
                     factory.buffers(placeholder)
                 )
-                _stage(
+                _prepare_request(
                     factory,
                     latents,
                     placeholder,
@@ -824,7 +826,7 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
             samples, paths = {}, []
             for slot, size in requests.items():
                 views = pool.storage.tensors(slot).view(factory.buffers(size))
-                _stage(
+                _prepare_request(
                     factory,
                     latents,
                     size,
@@ -878,7 +880,7 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                 views = pool.storage.tensors(1).view(
                     padded.buffers(placeholder)
                 )
-                _stage(
+                _prepare_request(
                     padded,
                     latents,
                     placeholder,
@@ -985,7 +987,7 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
                 TensorBuffers.allocate(requirements, device=device) as backing,
             ):
                 context.prepare(layout)
-                request, staged = (
+                request, host_views = (
                     backing.view(requirements),
                     host.view(requirements),
                 )
@@ -1001,7 +1003,7 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
                     (layout,),
                     noise=noise,
                     state={
-                        modality: staged[modality].unsqueeze(0)
+                        modality: host_views[modality].unsqueeze(0)
                         for modality in model.modalities
                     },
                     constants=context.constants,
@@ -1012,12 +1014,12 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
                     layouts=(layout,),
                     out={
                         field: value
-                        for field, value in staged.items()
+                        for field, value in host_views.items()
                         if field not in model.modalities
                     },
                 )
                 for field, value in request.items():
-                    value.copy_(staged[field])
+                    value.copy_(host_views[field])
                 # The prompt's features lead a text region of the layout's
                 # capacity; the rows past it are padding.
                 conditioning = torch.zeros(

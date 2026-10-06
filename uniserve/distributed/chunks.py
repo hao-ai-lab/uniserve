@@ -36,7 +36,7 @@ def gather_chunks(
         raise ValueError("row gathering scratch cannot hold all input rows")
 
     # Scratch layout per segment: [group.size, count, width] with one member
-    # slot per rank in backend order. Segments stay near 64 MiB of staged
+    # slot per rank in backend order. Segments stay near 64 MiB of
     # source rows, rounded down to whole 128-row units.
     storage = (
         workspace.view(torch.uint8).view(-1)[:byte_count].view(input.dtype)

@@ -835,7 +835,7 @@ class MegaMoENvfp4Frontend:
             # Opaque byte workspaces are passed as raw uint8 gmem base pointers
             # (not cute tensors): the kernel addresses them by base + Int64 byte
             # offset, and a tensor shape would overflow cute's 32-bit memref
-            # field once internalized combine staging pushes shared_workspace
+            # field once internal combine storage pushes shared_workspace
             # past 2 GiB (mirrors the drop's mega_runner).
             local_workspace=self._to_cute_ptr(mega.local_workspace),
             shared_workspace=self._to_cute_ptr(mega.shared_workspace),
@@ -942,7 +942,7 @@ def init_dist() -> Tuple[int, int]:
 
 @dataclass
 class MegaMoESymmBuffer:
-    """Symmetric-heap staging buffers for one MegaMoE session.
+    """Symmetric-heap input and combine buffers for one MegaMoE session.
 
     Mirrors DeepGEMM's symm-buffer object: exposes ``x``, ``x_sf``,
     ``topk_idx``, and ``topk_weights`` views sized for ``num_max_tokens``.
@@ -1009,7 +1009,7 @@ def get_symm_buffer_for_mega_moe(
     knobs: Optional[dict] = None,
     activation: Literal["silu", "gelu_tanh"] = "silu",
 ) -> MegaMoESymmBuffer:
-    """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
+    """Allocate symmetric-heap input and combine buffers for one MegaMoE session.
 
     Argument order follows ``deep_gemm.get_symm_buffer_for_mega_moe`` (problem
     sizes first).  Pass ``rank`` / ``world_size`` from :func:`init_dist` instead
@@ -1022,10 +1022,10 @@ def get_symm_buffer_for_mega_moe(
     ``ref_compute_graph == "deepgemm"`` behaviour when ``True`` (default).
 
     ``in_kernel_fc2_reduce`` collapses the top-k combine in flight via
-    cross-rank REDG atomic-add instead of staging the per-topk ``(T, K, H)``
-    tensor + explicit tail reduce: ~1-2% faster end to end and the multi-GB
-    internal combine staging disappears from ``shared_workspace``.  Requires
-    ``apply_topk_in_fc1=True`` and a bf16 combine wire; the accumulation order
+    cross-rank REDG atomic-add instead of storing the per-topk ``(T, K, H)``
+    tensor for a separate reduction. The per-route combine storage is removed
+    from ``shared_workspace``. Requires ``apply_topk_in_fc1=True`` and a bf16
+    combine wire; the accumulation order
     is nondeterministic (compare with a tolerance, not bit-exact).
 
     ``combine_dtype`` selects the cross-rank combine wire format: ``"bf16"``
@@ -1123,8 +1123,8 @@ def get_symm_buffer_for_mega_moe(
     sym_roots.append(x_sf_root)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
-    # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
-    # tail, but start from the masked state so a partial first staging is safe.
+    # as live tokens routed to expert 0. Callers copy active rows into [:n]
+    # and mask the tail. Initialize all routes to -1 for partial first batches.
     topk_idx.fill_(-1)
     sym_roots.append(topk_idx)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
@@ -1136,7 +1136,7 @@ def get_symm_buffer_for_mega_moe(
     # plain CUDA memory locally.  Always-sym keeps the session ikr-capable so
     # the knob can flip per-compile (autotune / apply_knobs) without
     # reallocating; the cost ((T, hidden) bf16) is negligible next to the
-    # internal combine staging.
+    # internal combine storage.
     output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     sym_roots.append(output_activation)
     fc1_alpha = _resolve_per_expert_epilogue(
@@ -1534,7 +1534,7 @@ def create_dummy_inputs(
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     symm_buffer.x_sf[:num_tokens, :hidden_sf_cols].copy_(activation_sf)
     symm_buffer.topk_idx[:num_tokens].copy_(topk_idx.to(torch.int64))
-    # Mask pad rows (and stale routes from a previous larger staging): the
+    # Mask pad rows (and stale routes from a previous larger batch): the
     # launch covers the full buffer and relies on topk_idx[n:] == -1.
     symm_buffer.topk_idx[num_tokens:].fill_(-1)
     symm_buffer.topk_weights[:num_tokens].copy_(topk_weights.to(torch.float32))

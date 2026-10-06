@@ -127,7 +127,7 @@ def async_tensor_h2d(
 ) -> torch.Tensor:
     """Copy host integers into a new tensor on ``device`` without a host wait.
 
-    On CUDA the values are staged in pinned memory from PyTorch's caching
+    On CUDA the values are written to pinned memory from PyTorch's caching
     host allocator and copied non-blocking on the current stream. The
     allocator reuses that pinned block only after the copy completes, so the
     calling thread never waits for device work queued ahead of the copy, and

@@ -145,12 +145,15 @@ def generate(
     ):
         runner = DenoisingRunner(denoiser, context=context)
         runner.warmup(layout)
-        request, staged = backing.view(requirements), host.view(requirements)
+        request = backing.view(requirements)
+        host_views = host.view(requirements)
+
         runner.prepare_latents(
             (layout,),
             noise=noise,
             state={
-                name: staged[name].unsqueeze(0) for name in denoiser.modalities
+                name: host_views[name].unsqueeze(0)
+                for name in denoiser.modalities
             },
         )
         runner.prepare_state(
@@ -158,12 +161,13 @@ def generate(
             layouts=(layout,),
             out={
                 name: value
-                for name, value in staged.items()
+                for name, value in host_views.items()
                 if name not in denoiser.modalities
             },
         )
         for name, value in request.items():
-            value.copy_(staged[name])
+            value.copy_(host_views[name])
+
         schedules = denoiser.make_schedules(
             denoiser.num_steps, shift=None, device=device
         )

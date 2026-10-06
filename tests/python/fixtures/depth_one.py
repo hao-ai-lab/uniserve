@@ -4,7 +4,7 @@ These are builders for worker forward-behavior tests.
 
 Each builder produces the records the scheduler supplies at depth one: an
 :class:`NewRequest`, an :class:`Call` whose ``predecessor``
-names accepted execution progress, and the host-staged token payload
+names accepted execution progress, and the host token payload
 consumed by token work.
 """
 

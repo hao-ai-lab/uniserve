@@ -2650,7 +2650,7 @@ mod tests {
 
                 let call = native_batch.getattr("calls").unwrap().get_item(0).unwrap();
                 match index {
-                    // The token call carries host-staged inputs and the
+                    // The token call carries host inputs and the
                     // sampling state the worker reads per call; its
                     // admission carries the request's input image count.
                     0 => {

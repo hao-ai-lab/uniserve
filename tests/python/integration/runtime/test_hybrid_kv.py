@@ -298,7 +298,7 @@ def test_indexed_decode_gathers_every_table_in_one_batch():
             states=states,
         )
         # The host path builds the same attention from the installed tables.
-        staged = reference.prepare_inputs(
+        host_batch = reference.prepare_inputs(
             rows(False),
             forward_mode=ForwardMode.DECODE,
             cache=pool,
@@ -306,9 +306,9 @@ def test_indexed_decode_gathers_every_table_in_one_batch():
         )
         assert gathered.inputs.input_ids.tolist() == [11, 7]
         entries = gathered.inputs.attention.entries
-        assert sorted(entries) == sorted(staged.inputs.attention.entries)
+        assert sorted(entries) == sorted(host_batch.inputs.attention.entries)
         for number, entry in entries.items():
-            other = staged.inputs.attention.entries[number]
+            other = host_batch.inputs.attention.entries[number]
             width = other.block_table.indices.shape[1]
             assert (
                 entry.block_table.indices[:, :width].tolist()

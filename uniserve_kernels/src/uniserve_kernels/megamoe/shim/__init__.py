@@ -130,27 +130,12 @@ from .autotune import (
     nvfp4_candidates,
 )
 
-# Fused bf16 -> quant + routing staging (single-launch DataPreprocess).
-from .quant_stage import (
-    forget_staged_tokens,
-    fused_quant_stage,
-    fused_quant_stage_supported,
-    note_staged_tokens,
-    staged_tokens,
-)
-
 # Persistent offline-tuning knob cache (pure-lookup hot path).
 from .knob_cache import knob_cache_path, lookup_knobs, record_knobs, resolve_knobs
 
 __all__ = [
     # paths
     "bootstrap_paths",
-    # quant_stage
-    "forget_staged_tokens",
-    "fused_quant_stage",
-    "fused_quant_stage_supported",
-    "note_staged_tokens",
-    "staged_tokens",
     # knob_cache
     "knob_cache_path",
     "lookup_knobs",

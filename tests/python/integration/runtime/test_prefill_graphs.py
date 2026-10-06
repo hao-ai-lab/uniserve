@@ -90,7 +90,7 @@ UNITS = 1024
 def _diffusion_gemma_worker(
     root, *, graphs, units=UNITS, slots=4, outputs=True
 ):
-    """Bind a DiffusionGemma worker's staged calls over a fresh unit pool.
+    """Bind a DiffusionGemma worker's calls over a fresh unit pool.
 
     Startup captures prefill graphs when ``graphs`` is set and runs prefill
     eagerly otherwise; without ``outputs`` the worker's prefills select no
@@ -181,7 +181,7 @@ def _install(manager, slots, *, retired):
 
 
 def _call(runner, manager, rows):
-    """Run one staged group of token rows and return its gathered outputs."""
+    """Run one batch of token rows and return its gathered outputs."""
     calls = tuple(
         Call(
             request_key=RequestKey(1, row.request_pool_idx, 0),
@@ -538,7 +538,7 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
 def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
     """Decode capacity follows the unit pool; wider decode calls fail.
 
-    Decode graphs of up to 16 rows are configured, and capturing one stages
+    Decode graphs of up to 16 rows are configured, and capturing one allocates
     a page of the model's one cache group per row on the unit pool, whose
     96 tokens hold fewer. The worker reports the largest configured size its
     allocatable units hold, replays a graph for a decode call of that many
@@ -570,7 +570,7 @@ def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
         completion_payload_bytes=1 << 16,
     ) as worker:
         worker.warmup()
-        # Unit zero is the pool's sentinel; each row stages one unit.
+        # Unit zero is the pool's sentinel; each row uses one unit.
         allocatable = worker.info.kv_cache.num_units - 1
         capacity = worker.info.max_decode_calls
         assert capacity == max(size for size in sizes if size <= allocatable)
