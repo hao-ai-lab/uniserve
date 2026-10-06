@@ -8,7 +8,7 @@ packs a context prefill, whose prompt tokens run between input-image vision
 blocks, into one row per segment, and ``finish_context`` reads its rows'
 outputs. ``prepare_sampling`` turns the model's logits into
 ``SamplingMetadata`` for the sampler, or into a direct outcome when the call
-samples nothing. ``publish_sample`` stages the sampled result and the
+samples nothing. ``publish_sample`` records the sampled result and the
 request progress it implies on the call's ``PendingOutput``.
 
 Device state is only bound here: the views in ``PendingOutput.token_update``
@@ -232,7 +232,7 @@ def prepare_sampling(
 ) -> SamplingMetadata | PendingOutput:
     """Turn a call's forward output into sampling work or a direct outcome.
 
-    A prefill commits every query token and, with a ``DecodeState``, stages
+    A prefill commits every query token and, with a ``DecodeState``, retains
     the resulting runtime cache length; a decode commits one token without
     preparing it; a verify commits nothing here.
     Returns a finished ``PendingOutput`` when a prefill declares no token
@@ -332,11 +332,11 @@ def publish_sample(
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> PendingOutput:
-    """Stage a sampled selection and the request progress it implies.
+    """Record a sampled selection and the request progress it implies.
 
     A prefill or decode advances the logical position by its computed tokens
     and the RNG counter by one; a prefill's prompt scoring adds to the ranges
-    already staged. A context prefill's last text row publishes as a prompt
+    already recorded. A context prefill's last text row publishes as a prompt
     chunk; a last vision row advances past its temporal positions without
     scoring image placeholders. A verify binds device tensors offset from
     its base coordinates and records those coordinates
@@ -432,7 +432,7 @@ def publish_sample(
         # resolves it later against these base coordinates. The accepted
         # token count is the accepted drafts plus a correction or bonus token,
         # which is omitted when acceptance reaches the terminal draft prefix.
-        # It stays a device tensor, so the staged cache length and positions
+        # It stays a device tensor, so the pending cache length and positions
         # below are device values as well.
         device_selected = sampled.accepted_token_count
         if device_selected is None:
@@ -618,7 +618,7 @@ def _finish_visual(
     image_builder: ImageBuilder | None,
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Advance the logical position past a visual row and stage its outcome.
+    """Advance the logical position past a visual row and record its outcome.
 
     A call that closes the image advances by the image builder's RoPE advance
     (at least one); an input image's latent row keeps its position.
@@ -777,7 +777,7 @@ def finish_context(
     requested (``prompt_logprob_details``). Vision blocks score nothing;
     their final logits predict the following text token.
 
-    A call that samples nothing stages its outcome at the position after its
+    A call that samples nothing records its outcome at the position after its
     last row. A sampling call reads the final row's last logits, whether
     that row is text or vision. A final prompt run publishes as a prompt
     chunk from its starting position; a final vision block contributes no
@@ -980,8 +980,8 @@ def prompt_logprob_details(
 
     The first chunk (``start == 0``) scores every token after the first. A
     continued chunk also scores its first token, using the last logits of the
-    previous chunk from the request's staged runtime logits or
-    ``DecodeState.prompt_logits``. This chunk's last logits are staged for
+    previous chunk from the request's retained runtime logits or
+    ``DecodeState.prompt_logits``. This chunk's last logits are retained for
     the next chunk and ``prompt_logits_ready`` is set.
 
     Returns:
@@ -1189,7 +1189,7 @@ def commit_kv(
 
     The count must lie within the row's query span and the resulting extent
     within the request's allocated page table. With ``publish_runtime`` and a
-    ``DecodeState``, the extent is staged as
+    ``DecodeState``, the extent is recorded as
     ``request.token_update.cache_length`` for the commit. A zero count
     leaves the update unchanged and skips the page-table check.
 

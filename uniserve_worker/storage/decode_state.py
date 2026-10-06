@@ -232,7 +232,7 @@ class DecodeState:
                 asynchronously on the device.
         """
         # Host fast path: with host indices and host columns on a device
-        # where Triton launches, the rows and their columns stage in one
+        # where Triton launches, the rows and their columns copy in one
         # non-blocking copy and every row resets in one fused launch. A
         # device column makes ``_host_reset_column`` return None and falls
         # through to the indexed path.

@@ -156,7 +156,7 @@ def execute(
     """Schedule one request's media reading on the rank's host lane.
 
     Reserves the call's products, configures its one reserved host task to
-    decode the request's conditions into them, and stages ``host.finish``,
+    decode the request's conditions into them, and schedules ``host.finish``,
     which publishes the products once the task completes. The returned
     output carries no products at commit.
 

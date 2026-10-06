@@ -7,12 +7,12 @@ block tables (see ``uniserve.runtime.prefix_cache``), so one call's attention
 is an ``AttentionBatch`` with one entry per numerical table. Every entry
 shares the call's query and prefix lengths; entries differ in their pages,
 page size, write addresses and, for a history-windowed group, the first page
-each row stages.
+each row selects.
 
 This module validates one homogeneous group of ``AttentionRow`` values
 against the installed tables (``row_tables``) and selects the pages each
-numerical table stages (``table_pages``); ``input_buffers.AttentionBuffers.
-stage_rows`` stages those pages from the resident tables on the device. For
+numerical table selects (``table_pages``); ``input_buffers.AttentionBuffers.
+gather_rows`` gathers those pages from the resident tables on the device. For
 callers that pass a prepared batch it also builds the host-side attention
 batch (``from_tables``: ``PagedInput`` entries for rows that append to the
 cache, ``SegmentedInput`` entries for read-only prefix/current calls).
@@ -47,14 +47,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class TablePages:
-    """The pages one numerical block table stages for every row of a call.
+    """The pages one numerical block table selects for every row of a call.
 
     Attributes:
         block_size: Tokens per page of the table's cache group.
         windowed: Whether the group keeps a history window, so rows carry
-            their first staged page; a full-history table starts every row
+            their first selected page; a full-history table starts every row
             at page zero.
-        start_pages: Each row's first staged logical page.
+        start_pages: Each row's first selected logical page.
         rows: Each row's units of pages ``start_pages[row]..``.
     """
 
@@ -65,7 +65,7 @@ class TablePages:
 
     @property
     def width(self) -> int:
-        """Return the most pages any row stages, at least one."""
+        """Return the most pages any row selects, at least one."""
         return max(1, *map(len, self.rows))
 
 
@@ -154,11 +154,11 @@ def table_pages(
     prefix_lengths: Sequence[int],
     query_lengths: Sequence[int],
 ) -> tuple[TablePages, ...]:
-    """Select the pages every numerical table stages for each row.
+    """Select each row's visible pages for every numerical block table.
 
     ``tables`` holds each row's table of every group, in group order. A
-    full-history table stages every installed page of the row. A windowed
-    table stages the pages from the first one the row's window reaches
+    full-history table selects every installed page of the row. A windowed
+    table selects the pages from the first one the row's window reaches
     through the page holding its last query token, or through its last
     installed page when that comes first; at most ``ceil((window + query) /
     page_tokens) + 1`` pages.

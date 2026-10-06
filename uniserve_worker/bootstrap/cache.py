@@ -177,7 +177,7 @@ def _largest_page_size(
 def table_widths(
     planes: Planes, *, max_sequence_tokens: int, max_query_tokens: int
 ) -> tuple[int, ...]:
-    """Bound the columns one call stages per numerical block table.
+    """Bound the columns one call selects per numerical block table.
 
     A full-attention table spans the longest sequence. A sliding-window
     table spans only the pages a reader's window of history and one call's

@@ -2358,11 +2358,11 @@ impl Scheduler {
     /// Holds one validated completion until earlier calls for the request are applied.
     ///
     /// A completion that names no in-flight call of the request, or repeats
-    /// one already staged, is dropped and fails its request: a media request
+    /// one already queued, is dropped and fails its request: a media request
     /// records a failure intent, a running token request finishes with an
-    /// error. `apply_result` releases staged completions in dependency order
+    /// error. `apply_result` releases queued completions in dependency order
     /// through `Inflight::take_ready_completions`.
-    pub(super) fn stage_completion(
+    pub(super) fn queue_completion(
         &mut self,
         mut record: uniserve_worker_ipc::RequestOutput,
         media: Result<Option<Arc<SharedMedia>>, String>,
@@ -2794,7 +2794,7 @@ impl Scheduler {
     ///    applied.
     /// 2. Account: fold domain and batch timing; on the batch's final result,
     ///    settle its lifecycle command receipts.
-    /// 3. Stage and apply: hold each completion until
+    /// 3. Queue and apply: hold each completion until
     ///    `Inflight::take_ready_completions` releases it in request-local
     ///    dependency order, then reclaim resources and resolve the public
     ///    effects in lifecycle priority and arrival order.
@@ -2976,7 +2976,7 @@ impl Scheduler {
         // whose input producers have resolved; applying one can make others
         // ready, so the loop repeats until none are.
         for result in report.results {
-            self.stage_completion(result.output, result.media);
+            self.queue_completion(result.output, result.media);
         }
 
         loop {
@@ -3578,7 +3578,7 @@ impl Scheduler {
                     },
                 );
             }
-            // A later completion may already be staged behind a call the
+            // A later completion may already be queued behind a call the
             // failure retired. With that call gone it reaches the front of the
             // queue, so it drains here: its call is removed and its products
             // are freed without applying the result.

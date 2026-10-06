@@ -198,7 +198,7 @@ class BlockTables:
             # of changed unit rows, rows 2 and 3 the groups and slots of
             # changed start pages, and row 4 the slots whose allocated length
             # changed; ``_value_buffer`` holds those start pages (row 0) and
-            # lengths (row 1). `release` stages its slots in row 1.
+            # lengths (row 1). `release` copies its slot indices in row 1.
             "_row_buffer": BufferConfig((row_capacity, width), torch.int32),
             "_index_buffer": BufferConfig(
                 (5, max(row_capacity, entry_capacity)), torch.int64
@@ -243,7 +243,7 @@ class BlockTables:
         length_slots: Sequence[int],
         length_values: Sequence[int],
     ) -> None:
-        """Stage the changed native rows on the caller's current stream."""
+        """Copy the changed native rows on the caller's current stream."""
         non_blocking = self.unit_tables.device.type == "cuda"
         if rows or start_values or length_slots:
             # Every index set of one installation shares one pinned
@@ -266,21 +266,21 @@ class BlockTables:
 
         if rows:
             row_slot, row_host = self._row_host.acquire()
-            staged = row_host[: len(rows)]
+            host_rows = row_host[: len(rows)]
             # Rows are written through a NumPy view of the pinned host buffer.
             # A large torch fill would run in torch's intra-op OpenMP pool,
             # whose barrier stalls this thread when the host is contended;
             # NumPy fills stay on the calling thread.
-            view = staged.numpy()
+            view = host_rows.numpy()
             view.fill(0)
             for index, units in enumerate(rows):
                 view[index, : len(units)] = units
             self._row_buffer[: len(rows)].copy_(
-                staged, non_blocking=non_blocking
+                host_rows, non_blocking=non_blocking
             )
             self._row_host.record_copy(row_slot)
-            # Scatter the staged rows into unit_tables[table, slot, :]. A
-            # staged row is zero past its units, which clears a longer
+            # Scatter the copied rows into unit_tables[table, slot, :]. A
+            # copied row is zero past its units, which clears a longer
             # previous row.
             self.unit_tables[
                 self._index_buffer[0, : len(rows)],

@@ -6,7 +6,7 @@ their capabilities, and owns everything that executes them: CUDA streams
 contexts and captured graphs, whose allocations its ``GraphStorage``
 accounts against per-device budgets. It keeps three kinds of runner:
 
-- staged entries, created once by ``configure_inputs`` per (component, path,
+- batch runners, created once by ``configure_inputs`` per (component, path,
   lane) with fixed input buffers, which ``forward`` drives with homogeneous
   batches of token rows and image-path rows (vision and latent encoding,
   image denoising and decoding);
@@ -618,9 +618,9 @@ class ModelExecutor:
     def call_stream(self, call):
         """Select the stream a standalone capability's batch runs on.
 
-        Returns ``None`` for a call a staged entry serves, since staged
-        batches bind their own lanes; for latent preparation of a component
-        whose denoising is staged; for a call with no bound capability; and
+        Returns ``None`` for a call served by a batch runner, which binds
+        its own lane; for latent preparation of a component whose denoising
+        uses input buffers; for a call with no bound capability; and
         for a capability on a non-CUDA device. Raises ``InputError`` when the
         component's capabilities for the call do not narrow to exactly one,
         and propagates the errors of ``module_stream``.
@@ -674,7 +674,7 @@ class ModelExecutor:
         return None if owner is None else owner.stream
 
     def _initialize_streams(self, *, event_slots):
-        """Realize execution grants for both staged and standalone capabilities.
+        """Realize execution grants for both batched and standalone calls.
 
         Once streams exist, later calls keep them, whatever their
         ``event_slots``. With lanes configured it partitions the worker
@@ -1263,16 +1263,16 @@ class ModelExecutor:
         table_widths,
         max_inflight,
     ):
-        """Bind staged input resources and graph budgets for every capability.
+        """Bind input buffers and graph budgets for every capability.
 
         Creates one capability runner per (entry, path, lane) covering a
         computation kind, with its input buffers, execution context, decode /
         prefill capture shapes, and CUDA graph storage pools: private ones,
         except that the text and canvas runners of one lane stream share
-        theirs. Prefill buckets reach the text tokens ``input_config`` stages
+        theirs. Prefill buckets reach the text tokens ``input_config`` holds
         per call, and ``max_calls`` and ``request_slots`` bound their live
         rows. Callable once: a second call raises ``RuntimeError`` when the
-        first bound any entry. Raises ``ValueError`` when two staged entries
+        first bound any entry. Raises ``ValueError`` when two batch runners
         of one component cover the same computation kind, and as
         ``_initialize_streams`` does.
         """
@@ -1341,7 +1341,7 @@ class ModelExecutor:
                 ),
             )
 
-        staged = buffered_kinds(diffusion=self.image_builder is not None)
+        buffered = buffered_kinds(diffusion=self.image_builder is not None)
         # The first text or canvas runner with graph pools on each (device,
         # lane stream). A lane stream runs one call at a time and every such
         # runner allocates its persistent graph storage before the first
@@ -1354,11 +1354,11 @@ class ModelExecutor:
             placement,
             call,
         ) in self._module_calls.items():
-            entry_kinds = self._call_kinds[id(call)] & staged
+            entry_kinds = self._call_kinds[id(call)] & buffered
             if not entry_kinds:
                 continue
 
-            # An entry covering latent encoding or image decoding is staged on
+            # An entry covering latent encoding or image decoding runs on
             # the generation device, or the worker device when none is
             # configured; any other entry on its component's placement device.
             target = (
@@ -1645,7 +1645,7 @@ class ModelExecutor:
 
         Every expert-parallel ``FusedMoE`` of the model shares the exchange
         of its group, sized for ``max_tokens`` tokens per rank, the most one
-        staged call holds, over the transport ``WorkerConfig.expert_exchange``
+        buffered call holds, over the transport ``WorkerConfig.expert_exchange``
         names; ``None`` when no layer is expert-parallel.
         Construction maps peer memory collectively, so every rank of the
         group builds it at this same point of its startup. The exchange
@@ -1821,14 +1821,14 @@ class ModelExecutor:
         return True
 
     def call_devices(self, call):
-        """Return ``(compute, staged, output)`` devices for one call.
+        """Return ``(compute, input, output)`` devices for one call.
 
         The compute and output device is the component's placement device, or
         the worker device for an unbound component. With an image builder,
         latent preparation, denoising and image decoding compute and output on
         the generation device, or the worker device when none is configured. The
-        staged device is the bound execution entry's device, or the compute
-        device when the call has no staged binding.
+        input device is the bound execution entry's device, or the compute
+        device when the call has no batch runner.
         """
         binding = self.bindings.get(call.component)
         source = (
@@ -1866,12 +1866,12 @@ class ModelExecutor:
 
     @torch.inference_mode()
     def capture(self, *, tokenizer, latents):
-        """Prepare every staged entry before serving.
+        """Prepare every batch runner before serving.
 
         Captures each entry's configured prefill, decode, canvas and flow
         graphs, running one eager call of each kind that captures none, then
         runs one synthetic image through every image encoding and decoding
-        entry (see ``startup.prepare_images``), so every staged call kind has
+        entry (see ``startup.prepare_images``), so every buffered call kind has
         prepared its call sites and chosen its kernels.
         """
         from uniserve_worker.model_executor.startup import (
@@ -2297,7 +2297,7 @@ class ModelExecutor:
 
         Yields ``(indexes, outcome)`` pairs, where ``indexes`` are positions in
         ``tasks`` and ``outcome`` is the group's ``ExecutionOutput`` or the
-        error that failed it. A row with no staged entry yields its own
+        error that failed it. A row with no batch runner yields its own
         ``invalid_descriptor`` error before any group runs; groups then run in
         the order their first row appears.
 
@@ -2408,9 +2408,9 @@ class ModelExecutor:
         tables: BlockTables | None,
         states: DecodeState | None,
     ) -> ExecutionOutput:
-        """Stage one homogeneous group of rows, run it, and validate outputs.
+        """Prepare one homogeneous group of rows, run it, and validate outputs.
 
-        The staged entry chooses eager or CUDA graph execution. Returns the
+        The batch runner chooses eager or CUDA graph execution. Returns the
         output with its request slot indices, its lane output fence, and
         statistics for this one call. Raises ``RuntimeError`` once closed,
         ``ValueError`` for an empty or mixed-kind group, ``InputError`` when
@@ -2424,7 +2424,7 @@ class ModelExecutor:
             raise ValueError("model runner received an empty call")
 
         # Only token forward modes and denoising are eligible for CUDA graphs;
-        # other staged kinds run eagerly.
+        # other buffered kinds run eagerly.
         started = time.perf_counter_ns()
         graph_eligible = all(
             isinstance(task.forward_mode, ForwardMode)

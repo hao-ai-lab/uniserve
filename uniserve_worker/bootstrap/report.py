@@ -483,7 +483,7 @@ def _token_worker_layout(
         max_rows = min(
             worker_config.max_batch_calls, worker_config.max_request_pool_size
         )
-        staged = buffered_kinds(diffusion=flow is not None)
+        buffered = buffered_kinds(diffusion=flow is not None)
         for name, calls in describe_components(model).items():
             placement = None if bindings is None else bindings.get(name)
             if bindings is not None and (
@@ -491,7 +491,7 @@ def _token_worker_layout(
             ):
                 continue
             for call in calls:
-                kinds = call_kinds((call,)) & staged
+                kinds = call_kinds((call,)) & buffered
                 target = (
                     worker_config.generation_device or worker_config.device
                     if kinds
@@ -547,7 +547,7 @@ def _token_worker_layout(
                         and torch.device(target).type == "cuda"
                         and worker_config.graph_policy != "off"
                     ):
-                        # Canvas readout graphs stage padding sequences
+                        # Canvas readout graphs include padding sequences
                         # beyond their canvases.
                         fields = replace(
                             fields,

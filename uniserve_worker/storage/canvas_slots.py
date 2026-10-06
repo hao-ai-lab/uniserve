@@ -5,7 +5,7 @@ canvases its stopping rule compares, and the self-conditioning embedding of
 its latest sampling distribution (``uniserve.diffusion.canvas.CanvasState``,
 one row per canvas). ``CanvasSlots`` keeps these rows for every request-pool
 slot in one device bank per field, with a leading slot axis. A pass gathers
-the rows of its slots into its own contiguous input buffers (``stage``),
+the rows of its slots into its own contiguous input buffers (``gather``),
 the sampler steps them in place, and ``commit`` writes them back.
 Concurrent executions own separate input buffers and sampler workspaces while
 sharing these banks for disjoint request slots. Slot ``0`` is the padding
@@ -304,7 +304,7 @@ class CanvasSlots:
         for slot in slots:
             self._last.pop(int(slot), None)
 
-    def stage(
+    def gather(
         self, slots: torch.Tensor, views: dict[str, torch.Tensor]
     ) -> None:
         """Gather the state of ``slots`` into caller-owned contiguous views.

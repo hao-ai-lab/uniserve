@@ -22,17 +22,17 @@ if TYPE_CHECKING:
 class ExecutionOutput:
     """Row-aligned numerical results with execution observations and fences.
 
-    For a staged batch ``values`` holds one tensor per row, which
+    For a prepared batch ``values`` holds one tensor per row, which
     ``validate_for`` checks; for a standalone call it holds the module
     call's tensors. A value with a ``VocabShard`` in ``vocabularies`` holds
     logits over this rank's vocabulary columns; ``materialize`` gathers them
     into the full vocabulary. ``layouts`` optionally describes each value as
-    an ``OutputLayout``. For a staged batch, ``ModelExecutor`` sets
+    an ``OutputLayout``. For a prepared batch, ``ModelExecutor`` sets
     ``request_pool_indices`` and ``output_event``, which is recorded on the
     lane stream after the forward and is None without a lane stream.
     ``greedy`` is the greedy decode a replayed text graph computed. It is
     None whenever ``graph_inputs.greedy_decode`` declines the batch, after
-    eager execution, and for a batch staged without a force-finish column.
+    eager execution, and for a batch prepared without a force-finish column.
     """
 
     values: tuple[torch.Tensor, ...]

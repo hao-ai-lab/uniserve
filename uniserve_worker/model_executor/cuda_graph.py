@@ -143,7 +143,7 @@ class Inputs:
             ):
                 raise ValueError("graph tensor shape or representation changed")
 
-            # Inputs already staged in the graph's own backing need no copy.
+            # Inputs already stored in the graph's own backing need no copy.
             if destination.data_ptr() == value.data_ptr():
                 continue
 

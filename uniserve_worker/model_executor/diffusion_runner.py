@@ -111,8 +111,8 @@ class LadderBucket(GraphBucket):
     that a replay copies from the ladder's step. ``signature`` is the
     structure every ladder replaying it must share.
     ``state`` holds one buffer view per banked field, and each ``gathers``
-    entry pairs a bank's [slots, span] column view with its stage viewed as
-    [1, numel], so a graph copies the selected slot's span into the stage.
+    entry pairs a bank's [slots, span] column view with its input buffer viewed
+    as [1, numel], so a graph copies the selected slot's span into that buffer.
     """
 
     signature: Hashable = None
@@ -271,7 +271,7 @@ class DiffusionRunner(ModelRunner):
                     device=runner.device,
                 )
                 if runner.captures:
-                    # One stage per banked field at the bank's slot row
+                    # One input buffer per banked field at the bank's slot row
                     # shape, the capacity every layout's field fits.
                     runner._state_buffers = TensorBuffers.allocate(
                         {
@@ -641,7 +641,7 @@ class DiffusionRunner(ModelRunner):
         bucket = self.buckets.get(ladder.layout)
         if bucket is None:
             state_buffers = cast(TensorBuffers, self._state_buffers)
-            stages = state_buffers.view(
+            state_views = state_buffers.view(
                 {
                     name: BufferConfig(shape, self.bank[name].dtype)
                     for name, (_, shape) in ladder.spans.items()
@@ -649,18 +649,18 @@ class DiffusionRunner(ModelRunner):
             )
             gathers = []
             for name, (start, _) in ladder.spans.items():
-                stage = stages[name]
-                if stage.numel():
+                buffer = state_views[name]
+                if buffer.numel():
                     rows = self.bank[name].view(self.slots, -1)
                     gathers.append(
                         (
-                            rows[:, start : start + stage.numel()],
-                            stage.view(1, -1),
+                            rows[:, start : start + buffer.numel()],
+                            buffer.view(1, -1),
                         )
                     )
             bucket = LadderBucket(
                 signature=ladder.signature,
-                state=stages,
+                state=state_views,
                 gathers=tuple(gathers),
             )
             self.buckets[ladder.layout] = bucket
@@ -701,16 +701,16 @@ class DiffusionRunner(ModelRunner):
         """
         pool = cast("LatentPool", self.pool)
         rows, indices = pool.page_rows, entry.rows
-        staged = cast(torch.Tensor, self.samples)[
+        workspace = cast(torch.Tensor, self.samples)[
             : entry.pages * pool.page_units
         ].view(entry.pages, pool.page_units * pool.latent_width)
         if entry.pages:
-            torch.index_select(rows, 0, indices[0], out=staged)
-        for bank_rows, stage in gathers:
-            torch.index_select(bank_rows, 0, slot_index, out=stage)
+            torch.index_select(rows, 0, indices[0], out=workspace)
+        for bank_rows, buffer in gathers:
+            torch.index_select(bank_rows, 0, slot_index, out=buffer)
         samples = call()
         if entry.pages:
-            rows.index_copy_(0, indices[1], staged)
+            rows.index_copy_(0, indices[1], workspace)
         return samples
 
     def _slot_value(self, slot):
@@ -767,8 +767,8 @@ class DiffusionRunner(ModelRunner):
             with self.graph_storage.allocate(self):
                 temporal = clone_inputs((ladder.schedules, sources))
             replacements = {
-                id(value): staged
-                for value, staged in zip(sources, temporal[1], strict=True)
+                id(value): buffer
+                for value, buffer in zip(sources, temporal[1], strict=True)
             }
             # Banked fields read the bucket's state buffers and the samples stay
             # the runner's own.

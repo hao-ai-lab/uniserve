@@ -1,7 +1,7 @@
 """Worker graph shapes, stable numerical inputs and captured call ownership.
 
 Text calls replay graphs captured at configured bucket shapes. Selection
-(``text_shape``) picks a bucket for a staged batch, ``pad_text`` widens the
+(``text_shape``) picks a bucket for a prepared batch, ``pad_text`` widens the
 batch's views of the runner's fixed buffers to that bucket and makes the
 padding inert. Decode buckets capture the call together with
 graph-capturable greedy decoding (``capture_batch``/``replay_batch``);
@@ -134,7 +134,7 @@ def prefill_units(pages, rows, tokens):
     group, so a call of ``rows`` rows and ``tokens`` query tokens holds at
     least ``max(rows, ceil(tokens / page_tokens))`` pages of each group,
     whatever its row lengths and prefixes. ``capture_lengths`` in
-    ``startup`` stages rows that hold exactly this many.
+    ``startup`` prepares rows that hold exactly this many.
     """
     return sum(
         units * max(rows, ceil_div(tokens, page)) for page, units in pages
@@ -154,7 +154,7 @@ def select_prefill_captures(
     """Build prefill capture buckets from configured token and row sizes.
 
     Token buckets are the configured sizes up to ``max_tokens`` and
-    ``max_tokens`` itself, the most tokens one staged call holds, so every
+    ``max_tokens`` itself, the most tokens one buffered call holds, so every
     call the buffers hold fits a bucket. ``text_shape`` routes a batch
     only to a row bucket strictly larger than its row count, leaving room
     for the padding sequence, so row sizes of one are dropped and each
@@ -210,7 +210,7 @@ def decode_captures(config, *, max_rows, row_units, num_units):
 
     ``config`` is the ``WorkerConfig``. A configured size is kept when it is
     positive, at most ``max_rows``, and its rows fit the KV pool's
-    allocatable units: capturing ``rows`` decode rows stages one page of
+    allocatable units: capturing ``rows`` decode rows requires one page of
     every cache group per row (``row_units`` units) on the ``num_units``
     pool, whose unit zero is the sentinel. The sizes keep their configured
     order. Empty when the graph policy is off, which leaves decode calls
@@ -239,7 +239,7 @@ def prefill_captures(
 
     ``config`` is the ``WorkerConfig``: its ``prefill_graph_token_sizes``
     and the fixed ``DEFAULT_PREFILL_GRAPH_ROW_BUCKETS`` size the buckets up to
-    ``max_rows`` rows and ``max_tokens`` tokens, the most one staged call
+    ``max_rows`` rows and ``max_tokens`` tokens, the most one buffered call
     holds, keeping those whose batches fit the unit ``pool`` (see
     ``select_prefill_captures``). Causal text is always captured, with
     embedding replacement when the lane has an ``image_builder`` (every
@@ -325,8 +325,8 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
 
     Returns:
         ``(rows, tokens, widths, decode)`` for ``pad_text``, where
-        ``widths[t]`` is the width to stage for numerical table ``t``: at
-        least its staged width and its ``table_widths`` floor. A decode
+        ``widths[t]`` is the width to expose for numerical table ``t``: at
+        least its input width and its ``table_widths`` floor. A decode
         batch (``ForwardMode.DECODE`` with one query token per row) uses the
         first configured decode size at least its row count, with ``tokens ==
         rows``, when its rows are causal and all select last logits. Any other
@@ -434,7 +434,7 @@ def _fixed_view(tensor, shape):
     )
 
 
-def _stage_offsets(offsets: torch.Tensor, lengths: tuple[int, ...]) -> None:
+def _copy_offsets(offsets: torch.Tensor, lengths: tuple[int, ...]) -> None:
     """Copy the running offsets of host ``lengths``, from zero, into place."""
     offsets.copy_(
         torch.tensor(
@@ -450,7 +450,7 @@ def pad_text(batch, rows, tokens, widths, decode, *, buffers):
     Physical unit zero is valid storage. Padding queries read disposable
     values but never write a unit: their write indices are -1, their start
     pages zero, and their results are discarded. Prefill padding belongs to
-    one additional numerical sequence. ``widths[t]`` is the staged width of
+    one additional numerical sequence. ``widths[t]`` is the input width of
     numerical table ``t``.
 
     The batch's tensors must be views of ``buffers``, the runner's fixed
@@ -458,7 +458,7 @@ def pad_text(batch, rows, tokens, widths, decode, *, buffers):
     live extents, and the returned batch views the same storage at the
     bucket shape. Padding rows use request slot zero, which the block tables
     reserve for padding. Lengths and offsets derive from the host lengths
-    and stage with one copy each; every table's padding clears with one
+    and use one copy each; every table's padding clears with one
     launch per column.
     """
     inputs, live_rows = batch.inputs, batch.row_count
@@ -472,7 +472,7 @@ def pad_text(batch, rows, tokens, widths, decode, *, buffers):
     if padding and not extra:
         raise ValueError("token padding requires an additional sequence")
     if not padding and not extra:
-        # The staged lengths and offsets already describe the whole bucket.
+        # The input lengths and offsets already describe the whole bucket.
         # Only page-table capacity can differ from the captured view.
         return widen_prefix(batch, widths)
 
@@ -502,12 +502,12 @@ def pad_text(batch, rows, tokens, widths, decode, *, buffers):
             torch.tensor(dummy, dtype=queries.dtype), non_blocking=True
         )
     query_offsets = _fixed_view(attention.queries.offsets, (rows + 1,))
-    _stage_offsets(query_offsets, host_queries)
+    _copy_offsets(query_offsets, host_queries)
     shared = SequenceLengths(
         host=host_queries, values=queries, offsets=query_offsets
     )
 
-    # Tables staged together share one prefix column, padded once; every
+    # Tables in one batch share one prefix column, padded once; every
     # table's page columns and write addresses pad with one launch each.
     buffers.clear_padding(
         live_rows=live_rows, rows=rows, live_tokens=live_tokens, tokens=tokens
@@ -534,7 +534,7 @@ def pad_text(batch, rows, tokens, widths, decode, *, buffers):
             prefix[live_rows:].zero_()
             prefix_offsets = _fixed_view(entry.prefixes.offsets, (rows + 1,))
             host_prefixes = entry.prefixes.host + (0,) * extra
-            _stage_offsets(prefix_offsets, host_prefixes)
+            _copy_offsets(prefix_offsets, host_prefixes)
             prefixes = SequenceLengths(
                 host=host_prefixes, values=prefix, offsets=prefix_offsets
             )
@@ -738,7 +738,7 @@ def _replay(graph, batch):
 
 
 def replay_batch(graph: CUDAGraphRunner, batch, *, rows=None, borrow=False):
-    """Replay staged inputs and retain the live output rows.
+    """Replay prepared inputs and retain the live output rows.
 
     ``rows`` is the live row count (default: ``batch.row_count``); outputs of
     padding rows are dropped. With ``borrow``, the result views the graph's

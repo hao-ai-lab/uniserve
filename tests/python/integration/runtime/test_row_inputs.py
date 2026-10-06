@@ -1,6 +1,6 @@
 """Token rows prepare the attention columns their host page layout describes.
 
-``AttentionBuffers.stage_rows`` gathers every numerical table's units, first
+``AttentionBuffers.gather_rows`` gathers every numerical table's units, first
 staged pages and write addresses from the request slots' resident tables.
 Over random calls of a model whose windowed and full-attention groups share
 one unit pool (six numerical tables, as DiffusionGemma has), its attention

@@ -27,7 +27,7 @@ except Exception:
     tl = None
 
 if triton is not None:
-    # Request counts and staged widths change during serving. Keeping them as
+    # Request counts and input widths change during serving. Keeping them as
     # unspecialized runtime values means an arrival does not load another
     # kernel variant.
     @triton.jit(do_not_specialize=["rows", "columns"])
@@ -100,7 +100,7 @@ if triton is not None:
                 other=0,
             )
 
-            # A windowed table stages pages from the first one the decode
+            # A windowed table selects pages from the first one the decode
             # query's window reaches; a full table from page zero.
             first = tl.where(
                 window >= 0, tl.maximum(cache - window, 0) // page_tokens, 0
@@ -179,7 +179,7 @@ if triton is not None:
             table_offsets = (tl.program_id(0) - 1) * block + tl.arange(0, block)
 
             # Map active output rows through the request pool into the
-            # table's installed units, from the row's first staged page.
+            # table's installed units, from the row's first selected page.
             # Stores span the full row capacity, zeroing inactive rows.
             table_elements = max_rows * columns
             table_mask = table_offsets < table_elements
@@ -248,15 +248,15 @@ def gather_request_decode_inputs(
     ``request_pool_indices[:rows]`` identifies scheduler-owned request slots.
     The function materializes, for every numerical table ``t`` described by
     ``table_shapes[t] = (group, page_tokens, window or -1)``, the slots'
-    units from their first staged page into ``block_tables[t]``, that page
+    units from their first selected page into ``block_tables[t]``, that page
     into ``start_pages[t]`` and the append address into
     ``write_indices[t]``; and, shared by all tables, next-token ids and
-    position axes, cache/query lengths and offsets. A row's first staged
+    position axes, cache/query lengths and offsets. A row's first selected
     page of a windowed table is the first page its window reaches,
     ``max(0, cache - window) // page_tokens``; of a full table, page zero.
     ``request_unit_tables[t, slot]`` holds the slot's units from its
     installed start page ``request_start_pages[group, slot]`` on. Each table
-    stages ``columns`` cells per row. Output rows beyond ``rows`` are
+    writes ``columns`` cells per row. Output rows beyond ``rows`` are
     initialized for safe fixed-shape graph replay: token id 1, zero
     positions, cache length and start page, one query token, a zeroed table
     row, and the write-index sentinel -1. The function also overwrites
@@ -282,7 +282,7 @@ def gather_request_decode_inputs(
     """
     # The fused kernel dereferences every tensor directly, so all must share
     # one CUDA device. All validation precedes the launch, so a rejected call
-    # stages nothing.
+    # writes nothing.
     tensors = (
         request_pool_indices,
         request_unit_tables,
@@ -326,7 +326,7 @@ def gather_request_decode_inputs(
     ):
         raise ValueError("request-indexed decode tables have the wrong rank")
 
-    # Every staged table must hold every output row and ``columns`` cells.
+    # Every input table must hold every output row and ``columns`` cells.
     tables = int(request_unit_tables.shape[0])
     if (
         table_shapes.shape != (tables, 3)

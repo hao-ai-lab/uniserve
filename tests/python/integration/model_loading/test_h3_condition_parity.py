@@ -338,7 +338,7 @@ def test_conditioned_request_computes_the_model_first_step(
     entry = runner.diffusion_layout(layout)
 
     views = worker.slots.tensors(1).view(builder.buffers(size))
-    builder.stage_request(size, views, seed=SEED)
+    builder.prepare_request(size, views, seed=SEED)
     initial = builder.sample_views(
         size, worker.pool.bank_view(1, builder.slot_pages(1))
     )

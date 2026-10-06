@@ -445,7 +445,7 @@ def _stage(factory, latents, size, slot, views, context, *, seed, features):
     initial samples to the bank of its pages a fresh trajectory starts in.
     ``context`` supplies the request layout's constants and workspace.
     """
-    factory.stage_request(size, views, seed=seed)
+    factory.prepare_request(size, views, seed=seed)
     for target, value in factory.initialize(
         size,
         views,

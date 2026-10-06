@@ -10,7 +10,7 @@ batch's output buffer, and encoded on the rank's ``HostLane`` once that copy
 completes.
 
 ``forward``, ``token``, ``schedule`` and ``transfer`` call into this module;
-the ``*_outcome`` helpers stage a call's successful ``PendingOutput``.
+the ``*_outcome`` helpers record a call's successful ``PendingOutput``.
 """
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow
 from uniserve_worker.model_executor.image_inputs import (
     PreparedImage,
     VisionRow,
+    copy_image,
     patch_grid_shape,
     prepare_host_image,
     prepare_tensor_image,
-    stage_image,
 )
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.call import (
@@ -145,7 +145,7 @@ def reserve_images(
     decodes, resizes, normalizes and packs the image into page-locked
     memory (``prepare_host_image``) while the worker thread launches other
     batches. ``BatchInputs`` retains the tasks and waits for their results;
-    ``prepare_features`` stages those results, and closing the inputs
+    ``prepare_features`` copies those results, and closing the inputs
     withdraws any task still queued.
 
     The engine charges every such call one task on the host lane of each
@@ -194,12 +194,12 @@ def prepare_features(
     tensor_store: TensorStore,
     model_runner: ModelExecutor,
 ) -> PreparedImage:
-    """Stage the source image of one vision or latent encoder call.
+    """Prepare the source image of one vision or latent encoder call.
 
     The source is either the request's encoded image, which the call's
     host-lane task (``reserve_images``) has already resized and normalized
     by the model's image processor, or a resident image product (see
-    ``encode_source``), transformed here. Either is staged on the device of
+    ``encode_source``), transformed here. Both use the device of
     the call's execution entry without synchronizing with it.
 
     Raises:
@@ -246,7 +246,7 @@ def prepare_features(
         task = state.inputs.image(call.call_id)
         if task is None:
             raise RuntimeError("inline image encode has no host preparation")
-        prepared = stage_image(task.result(), target_device)
+        prepared = copy_image(task.result(), target_device)
     return prepared
 
 
@@ -532,7 +532,7 @@ def vision_state_row(
     injection = model_runner.image_processor().feature_injection
     if injection is None:
         raise invalid_descriptor(
-            "vision state stage requires declared feature injection"
+            "vision state preparation requires declared feature injection"
         )
 
     # Accept a leading singleton batch axis; the row layout is [tokens, hidden].
@@ -854,7 +854,7 @@ def defer_image_encoding(
 
 
 def bound_device_write(reference: TensorRef, *, state: BatchState) -> Buffer:
-    """Return the staged device-product write matching a declared output.
+    """Return the pending device-product write matching a declared output.
 
     Raises:
         WorkerError: When the request has no such write or more than one.
@@ -874,7 +874,7 @@ def bound_device_write(reference: TensorRef, *, state: BatchState) -> Buffer:
 
 
 def bound_encoder_write(reference: TensorRef, *, state: BatchState) -> Buffer:
-    """Return the staged encoder-cache write matching a declared output.
+    """Return the pending encoder-cache write matching a declared output.
 
     Raises:
         WorkerError: When the request has no such write or more than one.

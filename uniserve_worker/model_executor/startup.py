@@ -1,7 +1,7 @@
 """Prepare bounded text inputs and CUDA graphs during worker startup.
 
 ``ModelExecutor.capture`` calls these functions before serving begins, and
-before ``ModelExecutor.complete_startup`` seals graph capture. They stage
+before ``ModelExecutor.complete_startup`` seals graph capture. They prepare
 startup rows (token ID zero for text; for image denoising, guidance-branch
 prefixes resolved through the model's ``FlowPrompt``) through the same
 ``TokenBuffers``, ``CanvasBuffers`` and ``DiffusionBuffers`` serving uses, on
@@ -9,7 +9,7 @@ scratch KV units and latent values leased from the idle pools, and capture
 each configured bucket; when graphs are disabled, representative calls run
 eagerly as warmup instead.
 Image encoders and decoders, which run eagerly, evaluate one synthetic image
-each (``prepare_images``), so every staged call kind has prepared its call
+each (``prepare_images``), so every buffered call kind has prepared its call
 sites and chosen its kernels before serving.
 """
 
@@ -87,7 +87,7 @@ def scratch_tables(
     return tuple(result)
 
 
-def stage_text(
+def make_text_batch(
     buffers: TokenBuffers,
     tokens: tuple[tuple[int, ...], ...],
     tables: Sequence[Sequence[GroupTable]],
@@ -99,14 +99,14 @@ def stage_text(
     slots: tuple[int, ...] | None = None,
     embeddings: bool = False,
 ) -> InputBatch:
-    """Stage synthetic token rows through serving's input preparation.
+    """Prepare synthetic token rows through serving's input preparation.
 
     ``tokens`` holds each row's token IDs and ``tables`` its scratch tables
     of every cache group. Rows default to empty prefixes and to request
     slots ``1..rows``; slot 0 is the inactive sentinel. Every row writes KV.
     With ``embeddings``, every token replaces its embedding with zeros, as an
     image feature row replaces its placeholders. A decode batch also carries
-    the buffer's cleared force-finish column. ``causal=None`` stages device
+    the buffer's cleared force-finish column. ``causal=None`` supplies device
     flags for a mixed-context graph family, even for a one-row warmup.
     """
     rows = len(tokens)
@@ -162,7 +162,7 @@ def stage_text(
     if causal is None:
         # Even a one-row warmup must compile the device-flag specialization;
         # later replays can carry any mixture of text and image rows.
-        values = buffers.stage_causality(flags, dynamic=True)
+        values = buffers.prepare_causality(flags, dynamic=True)
         current = batch.inputs.attention
         batch = replace(
             batch,
@@ -277,7 +277,7 @@ def prepare_prefill(
 
     Buckets are ordered by token-times-row footprint, so the first capture
     of hidden states sizes the runner's shared prefill output. Each capture
-    stages the ``capture_lengths`` rows of its bucket on zeroed scratch KV
+    prepares the ``capture_lengths`` rows of its bucket on zeroed scratch KV
     units, which the pool's allocatable units hold, with the bucket's
     causality, embedding replacement and outputs (rows of a cache-only
     bucket select ``TokenSelection.CACHE``), through serving's input buffers
@@ -310,7 +310,7 @@ def prepare_prefill(
         lengths = capture_lengths(shape, row_tokens, pages, units)
         count = sum(map(cache.page_units, lengths))
         with cache.startup_units(count) as scratch:
-            batch = stage_text(
+            batch = make_text_batch(
                 buffers,
                 tuple((0,) * length for length in lengths),
                 scratch_tables(cache, scratch, lengths),
@@ -349,10 +349,10 @@ def prepare_decode(
 
             # Prefill the one-token prompt eagerly so the decode capture below
             # attends over K/V the model wrote rather than zeroed scratch.
-            prompt = stage_text(buffers, ((0,),) * rows, tables)
+            prompt = make_text_batch(buffers, ((0,),) * rows, tables)
             entry.eager_batch(prompt, forward)
 
-            batch = stage_text(
+            batch = make_text_batch(
                 buffers,
                 ((0,),) * rows,
                 tables,
@@ -360,7 +360,7 @@ def prepare_decode(
                 decode=True,
             )
 
-            # Capture with every row live (slots 1..rows, as staged above),
+            # Capture with every row live (slots 1..rows, as prepared above),
             # then restore the caller's predicates.
             predicates = runner.decode_predicates
             saved = None if predicates is None else predicates.clone()
@@ -373,7 +373,7 @@ def prepare_decode(
                     predicates.copy_(saved)
 
 
-def stage_canvas(
+def make_canvas_batch(
     buffers: CanvasBuffers,
     tables: Sequence[Sequence[GroupTable]],
     *,
@@ -381,7 +381,7 @@ def stage_canvas(
     sampling: CanvasSampling | None = None,
     step: int = 0,
 ) -> InputBatch:
-    """Stage synthetic canvas rows through serving's input preparation.
+    """Prepare synthetic canvas rows through serving's input preparation.
 
     Row ``i`` is a canvas of ``length`` tokens in request slot ``i + 1``
     over a one-token prefix on its scratch ``tables``, read-only and
@@ -411,7 +411,7 @@ def stage_canvas(
         "write_kv": False,
         "causal": False,
     }
-    staged = tuple(
+    inputs = tuple(
         CanvasRow(
             request_pool_idx=slot,
             token_ids=torch.zeros(length, dtype=torch.int64),
@@ -432,7 +432,7 @@ def stage_canvas(
         for slot in range(1, rows + 1)
     )
     return buffers.prepare_inputs(
-        staged, forward_mode=ForwardMode.TOKEN_DENOISING, attention=attention
+        inputs, forward_mode=ForwardMode.TOKEN_DENOISING, attention=attention
     )
 
 
@@ -473,7 +473,7 @@ def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
     for rows in reversed(entry.canvas_rows if entry.pools else (1,)):
         for sampling, step, length in kinds:
             with cache.startup_units(rows * cache.page_units(1)) as scratch:
-                batch = stage_canvas(
+                batch = make_canvas_batch(
                     entry.input_buffers,
                     scratch_tables(cache, scratch, (1,) * rows),
                     length=length,
@@ -507,7 +507,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
 
     For each shape, the prefix entry first prefills every nonempty branch
     prompt prefix eagerly into scratch KV units, then the denoising entry
-    stages rows that read those prefixes and captures them, or runs them
+    prepares rows that read those prefixes and captures them, or runs them
     eagerly when graph capture or flow graphs are disabled. Rows are
     ordered by request with guidance branches varying fastest, and the
     branches of one request share its slot and latent.
@@ -628,7 +628,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     index for index, prefix in enumerate(prefixes) if prefix
                 )
                 if selected:
-                    batch = stage_text(
+                    batch = make_text_batch(
                         prefix_entry.input_buffers,
                         tuple(prefixes[index] for index in selected),
                         tuple(tables[index] for index in selected),
@@ -701,8 +701,8 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
 def prepare_images(runner: ModelExecutor, latents) -> None:
     """Evaluate one synthetic image in every image input and output call.
 
-    Vision and latent encoding stage a black square through the model's
-    image processor, as a request image is staged; image decoding decodes a
+    Vision and latent encoding prepare a black square through the model's
+    image processor, as a request image is prepared; image decoding decodes a
     zero latent of an image that square's size; and a model that writes an
     input image's latent into its prompt (framed latent features, as
     ``execution.image.latent_state_row`` builds them) writes one on scratch

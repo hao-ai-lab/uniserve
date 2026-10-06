@@ -114,7 +114,7 @@ class EncoderRunner(ModelRunner):
         """Capture every packed vision slot count at startup, largest first.
 
         ``max_images`` is the most vision calls one batch carries and
-        ``dtype`` the dtype images are staged in. Each graph's static input
+        ``dtype`` the input dtype of images. Each graph's static input
         holds ``dtype`` patch rows of empty slots; the graphs share the
         runner's pools and are charged to its graph storage.
 

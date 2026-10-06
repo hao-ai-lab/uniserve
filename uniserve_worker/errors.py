@@ -184,7 +184,7 @@ class WorkerError(Exception):
 
 
 class InputError(WorkerError):
-    """A staged execution input is invalid for its declared route."""
+    """An execution input is invalid for its declared route."""
 
     def __init__(self, message: str, **kw: Any) -> None:
         """Create a request-scoped input failure.
