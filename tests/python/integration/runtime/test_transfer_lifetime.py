@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import threading
+from concurrent.futures import Future
 from dataclasses import replace
 
 import pytest
@@ -785,18 +786,35 @@ def test_cuda_vmm_export_on_this_host_does_not_stall_its_producer() -> None:
         events.close()
 
 
-def test_cuda_vmm_retirement_retains_capacity_until_it_completes() -> None:
-    """Byte capacity is held from export to retirement.
-
-    Capacity bounds what a rank can have published at once, so it is returned
-    when the export retires rather than when its copy completes.
-    """
-    device = torch.device("cuda:0")
+@pytest.mark.parametrize(
+    ("backend", "source_device"),
+    (
+        ("local", "cpu"),
+        ("local", "cuda:0"),
+        ("shm", "cpu"),
+        ("shm", "cuda:0"),
+        ("cuda_vmm", "cuda:0"),
+    ),
+)
+def test_transport_retirement_returns_capacity_before_notifying_observers(
+    backend: str, source_device: str
+) -> None:
+    """Completion observers can export again using the returned byte budget."""
+    device = torch.device(source_device)
     events = EventPool()
     transport = make_transport(
-        "cuda_vmm", byte_capacity=4096, ticket_capacity=1, event_pool=events
+        backend, byte_capacity=4096, ticket_capacity=1, event_pool=events
     )
     source = torch.ones(1024, device=device)
+    replaced: Future[Locator] = Future()
+
+    def export_next(retirement) -> None:
+        try:
+            retirement.result()
+            replaced.set_result(transport.export(source))
+        except BaseException as error:
+            replaced.set_exception(error)
+
     locator = None
     replacement = None
     try:
@@ -804,11 +822,15 @@ def test_cuda_vmm_retirement_retains_capacity_until_it_completes() -> None:
         with pytest.raises(WorkerError, match="capacity"):
             transport.export(source)
 
+        transport.retirement(locator).add_done_callback(export_next)
+        if source.is_cuda:
+            torch.cuda.current_stream(device).synchronize()
         retirement = transport.release(locator)
         assert retirement is not None
         events.reap()
+        transport.reap()
         retirement.result(timeout=5)
-        replacement = transport.export(source)
+        replacement = replaced.result(timeout=5)
     finally:
         if locator is not None:
             transport.release(locator)

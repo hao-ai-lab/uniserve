@@ -91,6 +91,7 @@ __all__ = [
     "BufferBinding",
     "BufferPool",
     "BufferRegistry",
+    "TransportBuffer",
     "Completion",
     "CUDAEvent",
     "CUDAStream",
@@ -951,32 +952,62 @@ class Completion:
     ) -> None: ...
 
 @final
-class BufferRegistry(Generic[Source]):
-    """Retain registered storage until its producer and readers finish.
+class TransportBuffer:
+    """An export's backing, producer event and reserved byte capacity."""
 
-    Reclaim hands the source back and completes its retirement signal. Drain
-    waits for producer writes and in-flight reclamation at shutdown. Settled
-    inspects completion and backend acknowledgments; it must not mutate the
-    registry or invoke observers.
+    @staticmethod
+    def local(
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        event: CUDAEvent | None,
+        nbytes: int,
+        capacity: TransferCapacity,
+    ) -> TransportBuffer: ...
+    @staticmethod
+    def shared(
+        storage: SharedBuffer, capacity: TransferCapacity
+    ) -> TransportBuffer: ...
+    @staticmethod
+    def cuda(
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        event: CUDAEvent,
+        nbytes: int,
+        capacity: TransferCapacity,
+        handle: bytes,
+        copied_source: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        *,
+        pool: tuple[VmmPool, PoolChunk] | None = None,
+        consumers: Sequence[int] = (),
+        grants: DescriptorGrants | None = None,
+        export_id: str = "",
+    ) -> TransportBuffer: ...
+    @property
+    def tensor(self) -> torch.Tensor | tuple[torch.Tensor, ...]: ...
+    @property
+    def event(self) -> CUDAEvent | None: ...
+    def retire(self, events: EventPool) -> None:
+        """Retire a failed export that was never registered."""
+
+@final
+class BufferRegistry:
+    """Retain storage through producer completion and granted readers.
+
+    Reclamation returns byte capacity and completes the retirement signal.
+    CUDA host unregistration runs on the native host executor. Close drains
+    producer writes and reclamation before requiring all readers to retire.
     """
 
-    def __new__(
-        cls,
-        *,
-        capacity: int,
-        reclaim: Callable[[Source, Completion], None],
-        drain: Callable[[Source], None],
-        settled: Callable[[Source], bool],
-    ) -> Self: ...
+    def __new__(cls, *, capacity: int, event_pool: EventPool) -> Self: ...
     @property
     def name(self) -> str: ...
-    def register(self, locator: Locator, source: Source) -> None: ...
-    def source(self, locator: Locator) -> Source: ...
-    def acquire(self, locator: Locator) -> Source: ...
+    def register(self, locator: Locator, source: TransportBuffer) -> None: ...
+    def acquire(self, locator: Locator) -> TransportBuffer: ...
     def release_reader(self, locator: Locator) -> None: ...
     def release(self, locator: Locator) -> Completion | None: ...
     def retirement(self, locator: Locator) -> Completion: ...
     def awaiting_acknowledgment(self) -> bool: ...
+    def set_completion_wake(
+        self, wake: Callable[[], object] | None
+    ) -> None: ...
     def reap(self) -> None: ...
     def close(self) -> None: ...
 

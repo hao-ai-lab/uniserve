@@ -13,15 +13,12 @@ named consumer is still reading it.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import (
     SHM_HEADER_BYTES,
     Completion,
-    HostLane,
-    HostTask,
     SharedBuffer,
     SharedRead,
 )
@@ -31,7 +28,7 @@ from uniserve_worker.protocol.transfer import (
     PosixShmTransfer,
     WorkerEndpoint,
 )
-from uniserve_worker.transport.endpoint import BufferRegistry
+from uniserve_worker.transport.endpoint import BufferRegistry, TransportBuffer
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.layout import (
     copy_pairs,
@@ -51,12 +48,6 @@ from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
     import torch
-
-
-@dataclass(slots=True)
-class _ShmSource:
-    storage: SharedBuffer
-    retirement: HostTask[None] | None = None
 
 
 class ShmTransport(Transport):
@@ -83,17 +74,7 @@ class ShmTransport(Transport):
         # Slots of the ranks on this host: the only ones a segment named in
         # this host's namespace can reach.
         self._host_slots = frozenset(int(slot) for slot in host_slots)
-        # CUDA host unregistration may wait on unrelated device work. Keep it
-        # off the execution loop, using the shared native host executor.
-        self._retirements = HostLane(
-            max_inflight=256, workers=1, name="uniserve-shm-retire"
-        )
-        self._buffers = BufferRegistry(
-            capacity=256,
-            reclaim=self._reclaim,
-            drain=self._drain,
-            settled=lambda source: source.storage.settled(),
-        )
+        self._buffers = BufferRegistry(capacity=256, event_pool=event_pool)
         # This rank's own word in the header of every segment it reads.
         self._acknowledgment_slot = int(acknowledgment_slot)
         self.source = source or WorkerEndpoint.local()
@@ -118,30 +99,7 @@ class ShmTransport(Transport):
 
     def set_completion_wake(self, wake: Any) -> None:
         self._reads.set_completion_wake(wake)
-        self._retirements.set_completion_wake(wake)
-
-    def _reclaim(self, source: _ShmSource, retirement: Completion) -> None:
-        if source.storage.is_cuda:
-            source.retirement = self._retirements.reserve()
-            source.retirement.submit(self._retire, source.storage, retirement)
-        else:
-            self._retire(source.storage, retirement)
-
-    def _retire(self, storage: SharedBuffer, retirement: Completion) -> None:
-        try:
-            storage.close()
-            self.capacity.release(storage.nbytes)
-        except BaseException as error:
-            retirement.set_exception(error)
-            raise
-        else:
-            retirement.set_result(None)
-
-    def _drain(self, source: _ShmSource) -> None:
-        source.storage.synchronize()
-        self._buffers.reap()
-        if source.retirement is not None:
-            source.retirement.result()
+        self._buffers.set_completion_wake(wake)
 
     def reap(self) -> None:
         self._buffers.reap()
@@ -198,7 +156,9 @@ class ShmTransport(Transport):
             packed = torch.frombuffer(
                 memoryview(storage)[SHM_HEADER_BYTES:], dtype=first.dtype
             ).reshape(shape)
-            self._buffers.register(locator, _ShmSource(storage))
+            self._buffers.register(
+                locator, TransportBuffer.shared(storage, self.capacity)
+            )
             registered = True
 
             if stream is None:
@@ -358,7 +318,4 @@ class ShmTransport(Transport):
         try:
             self._reads.close()
         finally:
-            try:
-                self._buffers.close()
-            finally:
-                self._retirements.close()
+            self._buffers.close()

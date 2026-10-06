@@ -21,7 +21,7 @@ pub(super) fn open_shared_memory(py: Python<'_>, name: &str) -> PyResult<i32> {
 
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct SharedBuffer {
-    inner: Mutex<NativeBuffer>,
+    pub(super) inner: Mutex<NativeBuffer>,
 }
 
 #[pymethods]

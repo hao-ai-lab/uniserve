@@ -24,7 +24,6 @@ import sys
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
 from functools import cache
 from itertools import groupby, repeat
 from typing import TYPE_CHECKING, Any
@@ -44,6 +43,7 @@ from uniserve_worker.transport import descriptor_grants, vmm_pool
 from uniserve_worker.transport.descriptor_grants import DescriptorGrants
 from uniserve_worker.transport.endpoint import (
     BufferRegistry,
+    TransportBuffer,
     _endpoint_lock,
     _endpoints,
 )
@@ -65,7 +65,6 @@ from uniserve_worker.transport.pool import (
 from uniserve_worker.transport.ticket import TransferTicket
 from uniserve_worker.transport.vmm_pool import (
     ACK_WORD_BYTES,
-    PoolChunk,
     VmmPool,
 )
 
@@ -83,49 +82,6 @@ def _can_access_peer(device: str, peer: str) -> bool:
     return torch.cuda.can_device_access_peer(
         torch.device(device), torch.device(peer)
     )
-
-
-@dataclass(slots=True)
-class _CudaSource:
-    """Retain export bytes through the producer's final device access.
-
-    `tensor` is what readers in this address space borrow: the exported
-    source itself, or its pool chunk view. `event` is the producer fence, and
-    `handle` the allocation handle bytes the locator carries. When the product
-    was copied into a chunk, `copied_source` keeps the original views alive
-    until `event` drains, because the asynchronous copy reads them.
-    """
-
-    tensor: torch.Tensor | tuple[torch.Tensor, ...]
-    event: CUDAEvent
-    nbytes: int
-    capacity: TransferCapacity
-    handle: bytes
-    copied_source: torch.Tensor | tuple[torch.Tensor, ...] | None = None
-    retirement: Completion | None = None
-    #: Pool and chunk this export occupies, when it came from a pool.
-    pool: VmmPool | None = None
-    chunk: PoolChunk | None = None
-    #: Acknowledgment slots of the ranks that read this export.
-    consumers: tuple[int, ...] = ()
-    #: Grant table this export's descriptor is lent from, on a device
-    #: that exports descriptors rather than fabric handles.
-    grants: DescriptorGrants | None = None
-    export_id: str = ""
-
-    def events_released(self) -> None:
-        # Direct exports own their descriptor and end its grant here. A pool
-        # chunk keeps its grant until remote readers finish with the chunk.
-        if self.grants is not None and self.export_id and self.pool is None:
-            self.grants.release(self.export_id)
-            os.close(int.from_bytes(self.handle, sys.byteorder))
-
-        # The copy fence ends access to the original views. Remote readers
-        # retain only the exported chunk, whose acknowledgments are swept later.
-        self.copied_source = None
-        self.capacity.release(self.nbytes)
-        if self.retirement is not None:
-            self.retirement.set_result(None)
 
 
 class CudaVmmTransport(Transport):
@@ -199,14 +155,7 @@ class CudaVmmTransport(Transport):
         self._longest_synchronize = 0.0
         # The source retires after its copy. The native pool separately holds
         # the exported chunk until remote readers acknowledge completion.
-        self._buffers = BufferRegistry(
-            capacity=256,
-            reclaim=self._reclaim,
-            drain=self._drain,
-            # Remote readers retain the native pool's chunk independently
-            # of this registry's original source.
-            settled=lambda source: True,
-        )
+        self._buffers = BufferRegistry(capacity=256, event_pool=event_pool)
         self._reads = TransferPool(
             workers=2,
             capacity=capacity,
@@ -232,24 +181,6 @@ class CudaVmmTransport(Transport):
     def set_completion_wake(self, wake: Any) -> None:
         self._reads.set_completion_wake(wake)
 
-    def _reclaim(
-        self,
-        source: _CudaSource,
-        retirement: Completion | None = None,
-    ) -> None:
-        source.retirement = retirement
-        if source.chunk is not None and source.pool is not None:
-            source.pool.retire(
-                source.chunk,
-                source.consumers,
-                source.event,
-                source.grants,
-                source.export_id,
-            )
-        self._events.defer_release(
-            (source.event,), source, completed=source.events_released
-        )
-
     def reap(self) -> None:
         """Return chunks whose consumers have finished acknowledging.
 
@@ -265,15 +196,6 @@ class CudaVmmTransport(Transport):
         return any(
             pool.awaiting_acknowledgment() for pool in self._pools.values()
         )
-
-    def _drain(self, source: _CudaSource) -> None:
-        """Block until the producer fence completes, then release the source.
-
-        `BufferRegistry.close` calls this for a reclamation still in flight;
-        `EventPool.reap` runs `_CudaSource.events_released`.
-        """
-        source.event.synchronize()
-        self._events.reap()
 
     def _pool(self, device: torch.device) -> VmmPool:
         """Return this device's pool, reserving it on first export."""
@@ -414,15 +336,16 @@ class CudaVmmTransport(Transport):
                 grants.register(
                     export_id, int.from_bytes(descriptor, sys.byteorder)
                 )
-            export = _CudaSource(
+            export = TransportBuffer.cuda(
                 source,
                 event,
                 nbytes,
                 self.capacity,
                 descriptor,
                 copied_source,
-                pool=pool if chunk is not None else None,
-                chunk=chunk,
+                pool=(pool, chunk)
+                if pool is not None and chunk is not None
+                else None,
                 consumers=readers if chunk is not None else (),
                 grants=grants,
                 export_id=export_id,
@@ -473,7 +396,7 @@ class CudaVmmTransport(Transport):
             return locator
         except BaseException:
             if export is not None:
-                self._reclaim(export)
+                export.retire(self._events)
             else:
                 try:
                     # No usable producer fence exists on this failure path.
@@ -731,20 +654,7 @@ class CudaVmmTransport(Transport):
             raise invalid_descriptor(
                 "CUDA VMM release requires a CUDA VMM locator"
             )
-        retirement = self._buffers.release(locator)
-        # Retirement completes when the producer fence drains, which only an
-        # `EventPool.reap` observes, so the controller is woken for it.
-        if retirement is not None and not retirement.done():
-            source = self._buffers.source(locator)
-            self._events.schedule_completion_wake(
-                (
-                    source.tensor[0]
-                    if isinstance(source.tensor, tuple)
-                    else source.tensor
-                ).device,
-                source.event,
-            )
-        return retirement
+        return self._buffers.release(locator)
 
     def close(self) -> None:
         if self._exported:

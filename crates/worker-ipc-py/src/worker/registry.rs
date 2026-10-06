@@ -1,15 +1,21 @@
-//! Numerical sources and callbacks for the native buffer registry.
+//! Registered transport buffers and native physical reclamation.
 
-use std::sync::{Mutex, MutexGuard, TryLockError};
+mod buffer;
+
+use buffer::Retirement;
+pub(crate) use buffer::TransportBuffer;
+
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::MutexExt;
-use uniserve_worker::{BufferRegistry as NativeBufferRegistry, RegisteredBuffer};
+use uniserve_worker::{BufferRegistry as NativeBufferRegistry, HostLane, RegisteredBuffer};
 
 use super::completion::{Completion, CompletionRef};
 use super::error::{invalid, invariant, native_error};
+use super::events::EventPool;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum BufferKey {
@@ -20,34 +26,28 @@ enum BufferKey {
 
 struct Source {
     locator: Py<PyAny>,
-    value: Py<PyAny>,
+    value: Py<TransportBuffer>,
 }
 
 type Registry = NativeBufferRegistry<BufferKey, Source, CompletionRef>;
 
 /// Retain source storage until its producer and all granted readers finish.
-/// Reclaim callbacks and retirement observers run outside the registry lock.
+/// Reclamation and retirement observers run outside the registry lock.
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct BufferRegistry {
     #[pyo3(get)]
     name: String,
-    reclaim: Py<PyAny>,
-    drain: Py<PyAny>,
-    settled: Py<PyAny>,
+    events: Py<EventPool>,
+    retirements: Mutex<Option<Arc<HostLane<Retirement>>>>,
+    wake: Mutex<Option<Py<PyAny>>>,
     state: Mutex<Registry>,
 }
 
 #[pymethods]
 impl BufferRegistry {
     #[new]
-    #[pyo3(signature = (*, capacity, reclaim, drain, settled))]
-    fn new(
-        py: Python<'_>,
-        capacity: usize,
-        reclaim: Py<PyAny>,
-        drain: Py<PyAny>,
-        settled: Py<PyAny>,
-    ) -> PyResult<Self> {
+    #[pyo3(signature = (*, capacity, event_pool))]
+    fn new(py: Python<'_>, capacity: usize, event_pool: Py<EventPool>) -> PyResult<Self> {
         let state =
             Registry::new(capacity).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let suffix: String = py
@@ -58,15 +58,20 @@ impl BufferRegistry {
 
         Ok(Self {
             name: format!("uniserve-buffers-{suffix}"),
-            reclaim,
-            drain,
-            settled,
+            events: event_pool,
+            retirements: Mutex::new(None),
+            wake: Mutex::new(None),
             state: Mutex::new(state),
         })
     }
 
     /// Register backing storage; the backend observes producer completion.
-    fn register(&self, py: Python<'_>, locator: Py<PyAny>, source: Py<PyAny>) -> PyResult<()> {
+    fn register(
+        &self,
+        py: Python<'_>,
+        locator: Py<PyAny>,
+        source: Py<TransportBuffer>,
+    ) -> PyResult<()> {
         let key = self.key(locator.bind(py))?;
         self.remove_finished(py)?;
         let retirement = Py::new(py, Completion::new())?;
@@ -82,19 +87,9 @@ impl BufferRegistry {
             .map_err(|error| native_error(py, error))
     }
 
-    /// Inspect owner-held storage, including after reads have been revoked.
-    fn source(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let key = self.key(locator)?;
-        let mut state = self.lock(py)?;
-        Ok(Self::buffer(&mut state, &key, locator)?
-            .source()
-            .value
-            .clone_ref(py))
-    }
-
     /// Grant a local read. Its caller must release it after physical access
     /// ends, even if the buffer was revoked while the read was in flight.
-    fn acquire(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    fn acquire(&self, py: Python<'_>, locator: &Bound<'_, PyAny>) -> PyResult<Py<TransportBuffer>> {
         let key = self.key(locator)?;
         let mut state = self.lock(py)?;
         Ok(Self::buffer(&mut state, &key, locator)?
@@ -156,30 +151,61 @@ impl BufferRegistry {
         self.remove_finished(py)
     }
 
+    fn set_completion_wake(&self, py: Python<'_>, wake: Option<Py<PyAny>>) {
+        let previous = std::mem::replace(
+            &mut *self.wake.lock().unwrap_or_else(PoisonError::into_inner),
+            wake.as_ref().map(|wake| wake.clone_ref(py)),
+        );
+        drop(previous);
+
+        let lane = self
+            .retirements
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(lane) = lane {
+            lane.set_wake(wake);
+        }
+    }
+
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.lock(py)?.close();
-        self.reap(py)?;
-
-        // A producer can still be writing before backend reclamation begins.
-        // Drain those writes as well as already scheduled reader retirement.
+        let mut result = self.reap(py);
         let sources: Vec<_> = self
             .lock(py)?
             .buffers()
             .map(|buffer| buffer.source().value.clone_ref(py))
             .collect();
         for source in sources {
-            self.drain.bind(py).call1((source,))?;
+            result = result.and(source.get().drain(py, &self.events.borrow(py)));
         }
-        self.reap(py)?;
-        self.lock(py)?
-            .require_retired()
-            .map_err(|error| native_error(py, error))
+        result = result.and(self.reap(py));
+
+        // Joining unregistration must not hold a registry or lane lock: its
+        // completion observers may inspect returned storage or close peers.
+        let lane = self
+            .retirements
+            .lock_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(lane) = lane {
+            for error in py.detach(|| lane.close()) {
+                result = result.and(Err(PyRuntimeError::new_err(error)));
+            }
+        }
+        result = result.and(self.reap(py));
+        result.and(
+            self.lock(py)?
+                .require_retired()
+                .map_err(|error| native_error(py, error)),
+        )
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.reclaim)?;
-        visit.call(&self.drain)?;
-        visit.call(&self.settled)?;
+        visit.call(&self.events)?;
+        if let Ok(wake) = self.wake.try_lock() {
+            visit.call(&*wake)?;
+        }
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
@@ -239,8 +265,8 @@ impl BufferRegistry {
         let Some(buffer) = state.get_mut(key) else {
             return Ok(());
         };
-        let Some((source, retirement)) = buffer
-            .begin_reclaim(|source| self.settled.bind(py).call1((&source.value,))?.is_truthy())?
+        let Some((source, retirement)) =
+            buffer.begin_reclaim(|source| Ok::<_, PyErr>(source.value.get().settled(py)))?
         else {
             return Ok(());
         };
@@ -248,11 +274,59 @@ impl BufferRegistry {
         let retirement = retirement.owner.clone_ref(py);
         drop(state);
 
-        if let Err(error) = self.reclaim.bind(py).call1((source, &retirement)) {
+        let action = Retirement {
+            buffer: source.clone_ref(py),
+            completion: Some(CompletionRef::new(py, retirement.clone_ref(py))),
+        };
+        let result = if source.get().asynchronous(py) {
+            self.retire_shared(py, action)
+        } else {
+            TransportBuffer::reclaim(
+                py,
+                action.buffer,
+                &self.events.borrow(py),
+                action.completion,
+            )
+        };
+        if let Err(error) = result {
             if !retirement.borrow(py).done() {
                 Completion::set_exception(retirement.bind(py), error.value(py).clone().unbind())?;
             }
             return Err(error);
+        }
+        Ok(())
+    }
+
+    fn retire_shared(&self, py: Python<'_>, action: Retirement) -> PyResult<()> {
+        let lane = {
+            let mut installed = self
+                .retirements
+                .lock_py_attached(py)
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(lane) = &*installed {
+                Arc::clone(lane)
+            } else {
+                let lane = HostLane::new(256, 1, "uniserve-shm-retire")
+                    .map_err(|error| native_error(py, error))?;
+                lane.set_wake(
+                    self.wake
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .as_ref()
+                        .map(|wake| wake.clone_ref(py)),
+                );
+                let lane = Arc::new(lane);
+                *installed = Some(Arc::clone(&lane));
+                lane
+            }
+        };
+        let task = lane.reserve().map_err(|error| native_error(py, error))?;
+        let submitted = task.configure(action).and_then(|()| task.submit());
+        if let Err(error) = submitted {
+            if let Err(cleanup) = task.cancel(true) {
+                PyRuntimeError::new_err(cleanup).write_unraisable(py, None);
+            }
+            return Err(native_error(py, error));
         }
         Ok(())
     }

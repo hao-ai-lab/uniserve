@@ -175,7 +175,7 @@ impl VmmPool {
     }
 
     #[pyo3(signature = (chunk, consumers, producer, grants=None, export_id=""))]
-    fn retire(
+    pub(super) fn retire(
         &self,
         py: Python<'_>,
         chunk: &PoolChunk,

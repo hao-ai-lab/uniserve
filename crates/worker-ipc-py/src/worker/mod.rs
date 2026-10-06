@@ -86,6 +86,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<pending::PendingOutput>()?;
     module.add_class::<pending::TokenUpdate>()?;
     module.add_class::<registry::BufferRegistry>()?;
+    module.add_class::<registry::TransportBuffer>()?;
     module.add_class::<shared_buffer::SharedBuffer>()?;
     module.add_class::<vmm_pool::VmmPool>()?;
     module.add_class::<vmm_pool::PoolChunk>()?;
