@@ -9,6 +9,7 @@ use uniserve_worker::ModelRunners as NativeModelRunners;
 use uniserve_worker_ipc::CallKind;
 
 use super::error::native_error;
+use super::model_results::ExecutionOutput;
 
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 #[derive(Default)]
@@ -50,8 +51,8 @@ impl ModelRunners {
         cache: &Bound<'py, PyAny>,
         tables: &Bound<'py, PyAny>,
         states: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        execute::run_batch(py, owner, runner, rows, calls, cache, tables, states)
+    ) -> PyResult<Bound<'py, ExecutionOutput>> {
+        execute::run_batch(py, owner, runner, rows, calls, cache, tables, states, false)
     }
 
     fn clear(&mut self) {

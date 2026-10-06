@@ -23,6 +23,7 @@ mod kv_import;
 mod latent;
 pub(crate) mod locator;
 mod microbatches;
+mod model_results;
 mod model_runners;
 mod output;
 mod pending;
@@ -64,6 +65,8 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(microbatches::yield_microbatch, module)?)?;
     module.add_class::<microbatches::Microbatches>()?;
     module.add_class::<model_runners::ModelRunners>()?;
+    module.add_class::<crate::stats::ForwardStats>()?;
+    module.add_class::<model_results::ExecutionOutput>()?;
     module.add_class::<weight_prefetch::WeightPrefetch>()?;
     module.add_class::<expert_exchange::ExpertExchange>()?;
     module.add_class::<batch::BatchState>()?;

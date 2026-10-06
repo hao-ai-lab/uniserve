@@ -113,19 +113,22 @@ impl BatchState {
 
     fn record_execution(&mut self, py: Python<'_>, stats: &Bound<'_, PyAny>) -> PyResult<()> {
         self.execution_us = Some(stats.get_item(0)?.extract()?);
-        self.stats = Some(depythonize(
-            &stats.get_item(1)?.call_method0("to_mapping")?,
-        )?);
-        let (buffer, forwards, components) = {
+        self.stats = Some(
+            stats
+                .get_item(1)?
+                .extract::<PyRef<'_, crate::stats::ForwardStats>>()?
+                .inner
+                .clone(),
+        );
+        let (buffer, components) = {
             let mut numerical = self.numerical.borrow_mut(py);
+            numerical.forward_stats = ForwardStats::default();
             (
                 numerical.buffer.take(),
-                numerical.forward_stats.clone_ref(py),
                 numerical.component_us.clone_ref(py),
             )
         };
         drop(buffer);
-        forwards.bind(py).call_method0("clear")?;
         components.bind(py).clear();
         Ok(())
     }

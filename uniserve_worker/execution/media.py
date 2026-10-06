@@ -213,8 +213,8 @@ def decode_audio(
 
     # Consecutive units' samples abut, so their concatenation is the rank's
     # contiguous span of the track.
-    return replace(
-        result, values=(torch.cat(result.values),), vocabularies=(), layouts=()
+    return result.replace(
+        values=(torch.cat(result.values),), vocabularies=(), layouts=()
     )
 
 
@@ -836,7 +836,7 @@ def execute(
                     raise RuntimeError(
                         "module output has no execution statistics"
                     )
-                state.forward_stats.append(result.stats)
+                state.record_forward(result.stats)
                 if len(result.values) != 1:
                     raise invalid_descriptor(
                         "conditioning computation must return one Tensor"
@@ -913,7 +913,7 @@ def execute(
         )
         if result.stats is None:
             raise RuntimeError("module output has no execution statistics")
-        state.forward_stats.append(result.stats)
+        state.record_forward(result.stats)
         state.complete_latent(call.request_key.request_id)
 
         # Only the call that completes denoising may declare products, and
@@ -971,7 +971,7 @@ def execute(
             )
             if decoded.stats is None:
                 raise RuntimeError("module output has no execution statistics")
-            state.forward_stats.append(decoded.stats)
+            state.record_forward(decoded.stats)
             if len(decoded.values) != 1 or decoded.values[0].shape[0] != 1:
                 raise invalid_descriptor(
                     "video decoding reconstructs exactly one media unit"
@@ -992,7 +992,7 @@ def execute(
                 state=slot,
                 unit_count=count,
             )
-            state.forward_stats.append(processed.stats)
+            state.record_forward(processed.stats)
             # Concatenation borrows one flat byte span; the product row is
             # the unit's frames at the output raster, and a unit shorter than
             # the longest fills its row's leading frames.
@@ -1020,7 +1020,7 @@ def execute(
             )
             if result.stats is None:
                 raise RuntimeError("module output has no execution statistics")
-            state.forward_stats.append(result.stats)
+            state.record_forward(result.stats)
             values = result.values
         # Decoded media units are host products: a host rank's encoder reads
         # them in place from the segment this rank publishes, over the host

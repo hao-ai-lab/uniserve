@@ -10,7 +10,7 @@
 //! Cached record constructors follow Python dataclass field order. IPC batches
 //! have already been validated before their numerical views are requested.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use pyo3::exceptions::PyValueError;
@@ -28,9 +28,9 @@ use uniserve_worker_ipc::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
     BufferAllocation, BufferId, CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType,
     DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCode, FeatureKind,
-    FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaOutput,
-    NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, ShapeBound, TensorExport,
-    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    FinishFlags, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest,
+    RequestKey, RequestKind, RequestOutput, ResponseKind, ShapeBound, TensorExport, TensorRef,
+    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
     WorkerEndpoint, WorkerRequest, WorkerResponse,
 };
 
@@ -1240,7 +1240,7 @@ pub(crate) fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput
     let forward_stats = match dict.get_item(intern!(py, "forward_stats")).ok()? {
         None => None,
         Some(value) if value.is_none() => None,
-        Some(value) => Some(forward_stats_from_py(&value)?),
+        Some(value) => Some(mapping_from_py(&value).ok()?),
     };
     Some(BatchOutput {
         batch_id: u64_of(&get(dict, intern!(py, "batch_id"))?)?,
@@ -1248,97 +1248,6 @@ pub(crate) fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput
         products: payloads,
         worker_exec_us: opt_u64(dict, intern!(py, "worker_exec_us"))?,
         forward_stats,
-    })
-}
-
-/// Decodes the complete set of worker forward-path counters.
-fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<ForwardStats> {
-    let py = value.py();
-    let dict = value.cast::<PyDict>().ok()?;
-    Some(ForwardStats {
-        // Aggregate execution-mode counters.
-        mode_counts: u64_map(dict, intern!(py, "mode_counts"))?,
-        mode_tokens: u64_map(dict, intern!(py, "mode_tokens"))?,
-        mode_us: u64_map(dict, intern!(py, "mode_us"))?,
-        component_us: u64_map(dict, intern!(py, "component_us"))?,
-
-        // Attention backend activity.
-        attention_launches: u64_of(&get(dict, intern!(py, "attention_launches"))?)?,
-        attention_us: u64_of(&get(dict, intern!(py, "attention_us"))?)?,
-        attention_backend_counts: u64_map(dict, intern!(py, "attention_backend_counts"))?,
-
-        // CUDA graph lifecycle and padding behavior.
-        cuda_graph_captures: u64_of(&get(dict, intern!(py, "cuda_graph_captures"))?)?,
-        cuda_graph_replays: u64_of(&get(dict, intern!(py, "cuda_graph_replays"))?)?,
-        cuda_graph_misses: u64_of(&get(dict, intern!(py, "cuda_graph_misses"))?)?,
-        cuda_graph_fallbacks: u64_of(&get(dict, intern!(py, "cuda_graph_fallbacks"))?)?,
-        cuda_graph_unpadded_tokens: u64_of(&get(dict, intern!(py, "cuda_graph_unpadded_tokens"))?)?,
-        cuda_graph_padded_tokens: u64_of(&get(dict, intern!(py, "cuda_graph_padded_tokens"))?)?,
-        cuda_graph_runtime_mode_counts: u64_map(
-            dict,
-            intern!(py, "cuda_graph_runtime_mode_counts"),
-        )?,
-
-        // Decode relay cache effectiveness.
-        text_decode_token_relay_hits: u64_of(&get(
-            dict,
-            intern!(py, "text_decode_token_relay_hits"),
-        )?)?,
-        text_decode_token_relay_misses: u64_of(&get(
-            dict,
-            intern!(py, "text_decode_token_relay_misses"),
-        )?)?,
-        text_decode_position_relay_hits: u64_of(&get(
-            dict,
-            intern!(py, "text_decode_position_relay_hits"),
-        )?)?,
-        text_decode_position_relay_misses: u64_of(&get(
-            dict,
-            intern!(py, "text_decode_position_relay_misses"),
-        )?)?,
-
-        // FlashInfer planning activity.
-        flashinfer_decode_plan_calls: u64_of(&get(
-            dict,
-            intern!(py, "flashinfer_decode_plan_calls"),
-        )?)?,
-        flashinfer_decode_plan_reuses: u64_of(&get(
-            dict,
-            intern!(py, "flashinfer_decode_plan_reuses"),
-        )?)?,
-        flashinfer_decode_plan_rows: u64_of(&get(
-            dict,
-            intern!(py, "flashinfer_decode_plan_rows"),
-        )?)?,
-        flashinfer_decode_plan_indices: u64_of(&get(
-            dict,
-            intern!(py, "flashinfer_decode_plan_indices"),
-        )?)?,
-        flashinfer_decode_graph_plan_calls: u64_of(&get(
-            dict,
-            intern!(py, "flashinfer_decode_graph_plan_calls"),
-        )?)?,
-        flashinfer_decode_graph_plan_reuses: u64_of(&get(
-            dict,
-            intern!(py, "flashinfer_decode_graph_plan_reuses"),
-        )?)?,
-
-        // Speculative-verification outcomes.
-        spec_verify_rows: u64_of(&get(dict, intern!(py, "spec_verify_rows"))?)?,
-        spec_verify_draft_tokens: u64_of(&get(dict, intern!(py, "spec_verify_draft_tokens"))?)?,
-        spec_verify_accepted_tokens: u64_of(&get(
-            dict,
-            intern!(py, "spec_verify_accepted_tokens"),
-        )?)?,
-        spec_verify_rejected_tokens: u64_of(&get(
-            dict,
-            intern!(py, "spec_verify_rejected_tokens"),
-        )?)?,
-        spec_verify_committed_tokens: u64_of(&get(
-            dict,
-            intern!(py, "spec_verify_committed_tokens"),
-        )?)?,
-        spec_verify_path_counts: u64_map(dict, intern!(py, "spec_verify_path_counts"))?,
     })
 }
 
@@ -1731,17 +1640,6 @@ fn bool_of(value: &Bound<'_, PyAny>) -> Option<bool> {
 /// Copies a strict Python string into owned Rust storage.
 fn string_of(value: &Bound<'_, PyAny>) -> Option<String> {
     Some(value.cast::<PyString>().ok()?.to_str().ok()?.to_owned())
-}
-
-/// Decodes a required string-to-`u64` mapping with deterministic key order.
-fn u64_map(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<BTreeMap<String, u64>> {
-    let values = get(dict, key)?;
-    let values = values.cast::<PyDict>().ok()?;
-    let mut result = BTreeMap::new();
-    for (key, value) in values.iter() {
-        result.insert(string_of(&key)?, u64_of(&value)?);
-    }
-    Some(result)
 }
 
 /// Copies a Python list into a strictly typed `u32` vector.

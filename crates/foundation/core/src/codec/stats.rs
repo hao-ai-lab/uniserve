@@ -71,10 +71,10 @@ pub struct PrefillStats {
 ///
 /// The same counters are mirrored elsewhere, including the `ForwardStats`
 /// table of the worker flatbuffers schema, the worker-ipc codec, the Python
-/// extension's `forward_stats_from_py`, the Python worker's `ForwardStats`,
+/// extension's native `ForwardStats` view,
 /// the engine's `WorkerStats` and `SchedulerStatsReporter`, and the server's
 /// `record_scheduler_stats`. A field added here also needs an entry in
-/// [`ForwardStats::is_empty`].
+/// [`ForwardStats::merge`] and [`ForwardStats::is_empty`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForwardStats {
     /// Forward executions grouped by runtime mode.
@@ -172,6 +172,110 @@ pub struct ForwardStats {
 }
 
 impl ForwardStats {
+    /// Add another invocation's counters, retaining every keyed breakdown.
+    /// Counters saturate at the wire representation's unsigned 64-bit limit.
+    pub fn merge(&mut self, other: &Self) {
+        for (target, values) in [
+            (&mut self.mode_counts, &other.mode_counts),
+            (&mut self.mode_tokens, &other.mode_tokens),
+            (&mut self.mode_us, &other.mode_us),
+            (&mut self.component_us, &other.component_us),
+            (
+                &mut self.attention_backend_counts,
+                &other.attention_backend_counts,
+            ),
+            (
+                &mut self.cuda_graph_runtime_mode_counts,
+                &other.cuda_graph_runtime_mode_counts,
+            ),
+            (
+                &mut self.spec_verify_path_counts,
+                &other.spec_verify_path_counts,
+            ),
+        ] {
+            for (name, &value) in values {
+                let count = target.entry(name.clone()).or_default();
+                *count = count.saturating_add(value);
+            }
+        }
+
+        for (target, value) in [
+            (&mut self.attention_launches, other.attention_launches),
+            (&mut self.attention_us, other.attention_us),
+            (&mut self.cuda_graph_captures, other.cuda_graph_captures),
+            (&mut self.cuda_graph_replays, other.cuda_graph_replays),
+            (&mut self.cuda_graph_misses, other.cuda_graph_misses),
+            (&mut self.cuda_graph_fallbacks, other.cuda_graph_fallbacks),
+            (
+                &mut self.cuda_graph_unpadded_tokens,
+                other.cuda_graph_unpadded_tokens,
+            ),
+            (
+                &mut self.cuda_graph_padded_tokens,
+                other.cuda_graph_padded_tokens,
+            ),
+            (
+                &mut self.text_decode_token_relay_hits,
+                other.text_decode_token_relay_hits,
+            ),
+            (
+                &mut self.text_decode_token_relay_misses,
+                other.text_decode_token_relay_misses,
+            ),
+            (
+                &mut self.text_decode_position_relay_hits,
+                other.text_decode_position_relay_hits,
+            ),
+            (
+                &mut self.text_decode_position_relay_misses,
+                other.text_decode_position_relay_misses,
+            ),
+            (
+                &mut self.flashinfer_decode_plan_calls,
+                other.flashinfer_decode_plan_calls,
+            ),
+            (
+                &mut self.flashinfer_decode_plan_reuses,
+                other.flashinfer_decode_plan_reuses,
+            ),
+            (
+                &mut self.flashinfer_decode_plan_rows,
+                other.flashinfer_decode_plan_rows,
+            ),
+            (
+                &mut self.flashinfer_decode_plan_indices,
+                other.flashinfer_decode_plan_indices,
+            ),
+            (
+                &mut self.flashinfer_decode_graph_plan_calls,
+                other.flashinfer_decode_graph_plan_calls,
+            ),
+            (
+                &mut self.flashinfer_decode_graph_plan_reuses,
+                other.flashinfer_decode_graph_plan_reuses,
+            ),
+            (&mut self.spec_verify_rows, other.spec_verify_rows),
+            (
+                &mut self.spec_verify_draft_tokens,
+                other.spec_verify_draft_tokens,
+            ),
+            (
+                &mut self.spec_verify_accepted_tokens,
+                other.spec_verify_accepted_tokens,
+            ),
+            (
+                &mut self.spec_verify_rejected_tokens,
+                other.spec_verify_rejected_tokens,
+            ),
+            (
+                &mut self.spec_verify_committed_tokens,
+                other.spec_verify_committed_tokens,
+            ),
+        ] {
+            *target = target.saturating_add(value);
+        }
+    }
+
     /// Returns whether every worker counter and breakdown is empty or zero.
     ///
     /// The engine reports an interval's worker counters as `None` when their

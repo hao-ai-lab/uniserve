@@ -16,6 +16,7 @@ mod calls;
 mod client;
 mod convert;
 mod ids;
+mod stats;
 mod worker;
 
 use std::os::fd::AsRawFd;

@@ -10,7 +10,7 @@ which records a torch-profiler range only while a profiler is active and an
 NVTX range when ``UNISERVE_NVTX`` enables it on a CUDA host.
 
 The module also holds the per-batch component timers merged into
-`ForwardStats` (`record_component`, `_forward_stats`), the gate for CUDA
+`ForwardStats` (native `BatchState.execution_stats`), the gate for CUDA
 timing events in `OutputBuffer` (`timing_events_enabled`), request failure
 logging for `Service` (`record_failure`), and rank-qualified range names
 (`worker_range_name`).
@@ -18,20 +18,13 @@ logging for `Service` (`record_failure`), and rank-qualified range names
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from uniserve_worker.protocol.output import ForwardStats
-
-
 import inspect
 import logging
 import os
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -449,33 +442,12 @@ def record_component(
     Args:
         component_us: Per-batch totals in microseconds, normally
             ``BatchState.component_us``; merged into the batch's
-            `ForwardStats` by `_forward_stats`.
+            `ForwardStats` by native `BatchState.execution_stats`.
         name: Component key, such as ``open_lane`` or ``commit_lane``.
         started_ns: Start time from ``time.perf_counter_ns``.
     """
     elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
     component_us[name] = component_us.get(name, 0) + elapsed_us
-
-
-def _forward_stats(
-    values: Sequence[ForwardStats],
-    component_us: Mapping[str, int] | None = None,
-) -> ForwardStats:
-    """Combine per-forward stats and add the batch's component timers.
-
-    ``values`` are the stats each model forward reported; they are summed
-    with `ForwardStats.combine`. Each ``component_us`` entry is clamped at
-    zero and added to the combined ``component_us`` under the same key.
-    """
-    from uniserve_worker.protocol.output import ForwardStats
-
-    stats = ForwardStats.combine(values)
-    components = dict(stats.component_us)
-    for name, value in (component_us or {}).items():
-        components[str(name)] = components.get(str(name), 0) + max(
-            0, int(value)
-        )
-    return replace(stats, component_us=components)
 
 
 def record_failure(

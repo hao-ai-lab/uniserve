@@ -861,8 +861,8 @@ class ModelExecutor:
                 "visual": (visual,),
             }
         result = self.run_encoder("text", tokens, **options)
-        return replace(
-            result, values=tuple(value[:count] for value in result.values)
+        return result.replace(
+            values=tuple(value[:count] for value in result.values)
         )
 
     def encode_conditioning(self, features: torch.Tensor) -> ExecutionOutput:
@@ -888,8 +888,8 @@ class ModelExecutor:
             (1,), count, dtype=torch.int32, device=features.device
         )
         result = self.run_encoder("conditioning", padded, lengths=lengths)
-        return replace(
-            result, values=tuple(value[:count] for value in result.values)
+        return result.replace(
+            values=tuple(value[:count] for value in result.values)
         )
 
     @torch.inference_mode()
@@ -1120,8 +1120,7 @@ class ModelExecutor:
             "work=denoiser"
         ):
             values, path = runner.step(ladder, index, bank)
-        return replace(
-            ModelRunner.result(values),
+        return ModelRunner.result(values).replace(
             stats=_observations("denoiser", started, path),
         )
 

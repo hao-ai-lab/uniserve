@@ -121,7 +121,7 @@ def text(
     )
     if result.stats is None:
         raise RuntimeError("module output has no execution statistics")
-    state.forward_stats.append(result.stats)
+    state.record_forward(result.stats)
 
     return request
 

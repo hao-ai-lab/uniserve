@@ -9,10 +9,9 @@ rank service sends native results without constructing Python records.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, cast
+from dataclasses import dataclass
 
+from uniserve_worker._uniserve_ipc import ForwardStats as ForwardStats
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol import identity, transfer
 from uniserve_worker.protocol.batch import TensorExport
@@ -450,224 +449,6 @@ class RequestOutput:
 
 
 @dataclass(frozen=True, slots=True)
-class ForwardStats:
-    """Aggregate model-forward counters reported with a batch result.
-
-    Covers forward modes, component time, attention, CUDA graphs, decode
-    relays, FlashInfer decode planning, and speculative verification. Every
-    field is either an ``int`` or a ``str -> int`` mapping; `combine` and
-    `to_mapping` iterate the dataclass fields generically and depend on that.
-    `to_mapping` emits every field by name, and the PyO3 decoder
-    (`forward_stats_from_py` in `crates/worker-ipc-py`) requires each counter
-    of the Rust `ForwardStats`, so a field renamed or removed here fails the
-    whole batch result.
-
-    ``mode_counts`` and ``mode_us`` count calls and their time by forward
-    mode. ``mode_tokens`` counts the query tokens those calls computed, so a
-    mode without a token notion (encoder and decoder calls, standalone module
-    invocations) has no entry there.
-    """
-
-    mode_counts: Mapping[str, int] = field(default_factory=dict)
-    mode_tokens: Mapping[str, int] = field(default_factory=dict)
-    mode_us: Mapping[str, int] = field(default_factory=dict)
-    component_us: Mapping[str, int] = field(default_factory=dict)
-    attention_launches: int = 0
-    attention_us: int = 0
-    attention_backend_counts: Mapping[str, int] = field(default_factory=dict)
-    cuda_graph_captures: int = 0
-    cuda_graph_replays: int = 0
-    cuda_graph_misses: int = 0
-    cuda_graph_fallbacks: int = 0
-    cuda_graph_unpadded_tokens: int = 0
-    cuda_graph_padded_tokens: int = 0
-    cuda_graph_runtime_mode_counts: Mapping[str, int] = field(
-        default_factory=dict
-    )
-    text_decode_token_relay_hits: int = 0
-    text_decode_token_relay_misses: int = 0
-    text_decode_position_relay_hits: int = 0
-    text_decode_position_relay_misses: int = 0
-    flashinfer_decode_plan_calls: int = 0
-    flashinfer_decode_plan_reuses: int = 0
-    flashinfer_decode_plan_rows: int = 0
-    flashinfer_decode_plan_indices: int = 0
-    flashinfer_decode_graph_plan_calls: int = 0
-    flashinfer_decode_graph_plan_reuses: int = 0
-    spec_verify_rows: int = 0
-    spec_verify_draft_tokens: int = 0
-    spec_verify_accepted_tokens: int = 0
-    spec_verify_rejected_tokens: int = 0
-    spec_verify_committed_tokens: int = 0
-    spec_verify_path_counts: Mapping[str, int] = field(default_factory=dict)
-
-    @classmethod
-    def combine(cls, values: Sequence[ForwardStats]) -> ForwardStats:
-        """Sum scalar counters and per-key mapping counters across values.
-
-        An empty sequence yields zeroed stats, and a single value is returned
-        as-is. The first value's field type decides how each field is merged.
-        """
-        if not values:
-            return cls()
-        if len(values) == 1:
-            return values[0]
-
-        merged: dict[str, object] = {}
-        for name in cls.__dataclass_fields__:
-            fields = tuple(getattr(value, name) for value in values)
-            if isinstance(fields[0], Mapping):
-                totals: dict[str, int] = {}
-                for field_value in fields:
-                    for key, count in cast(
-                        Mapping[str, int], field_value
-                    ).items():
-                        totals[key] = totals.get(key, 0) + count
-                merged[name] = totals
-            else:
-                merged[name] = sum(cast(tuple[int, ...], fields))
-
-        return cls(**cast(Any, merged))
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "worker forward stats"
-    ) -> ForwardStats:
-        """Parse forward counters; absent fields default to zero or empty.
-
-        Raises:
-            WorkerError: `value` or a keyed field is not a mapping, a
-                mapping key is not a string, or a counter is not a
-                non-negative integer.
-        """
-        data = _map(value, where)
-
-        def counter_map(name: str) -> dict[str, int]:
-            """Parse one string-keyed map of nonnegative execution counters."""
-            values = _map(data.get(name, {}), f"{where}.{name}")
-            return {
-                _str(key, f"{where}.{name}.key"): _uint(
-                    raw, f"{where}.{name}.{key}"
-                )
-                for key, raw in values.items()
-            }
-
-        map_fields = {
-            name: counter_map(name)
-            for name in (
-                "mode_counts",
-                "mode_tokens",
-                "mode_us",
-                "component_us",
-                "attention_backend_counts",
-                "cuda_graph_runtime_mode_counts",
-                "spec_verify_path_counts",
-            )
-        }
-        scalar_fields = {
-            name: _uint(data.get(name, 0), f"{where}.{name}")
-            for name in (
-                "attention_launches",
-                "attention_us",
-                "cuda_graph_captures",
-                "cuda_graph_replays",
-                "cuda_graph_misses",
-                "cuda_graph_fallbacks",
-                "cuda_graph_unpadded_tokens",
-                "cuda_graph_padded_tokens",
-                "text_decode_token_relay_hits",
-                "text_decode_token_relay_misses",
-                "text_decode_position_relay_hits",
-                "text_decode_position_relay_misses",
-                "flashinfer_decode_plan_calls",
-                "flashinfer_decode_plan_reuses",
-                "flashinfer_decode_plan_rows",
-                "flashinfer_decode_plan_indices",
-                "flashinfer_decode_graph_plan_calls",
-                "flashinfer_decode_graph_plan_reuses",
-                "spec_verify_rows",
-                "spec_verify_draft_tokens",
-                "spec_verify_accepted_tokens",
-                "spec_verify_rejected_tokens",
-                "spec_verify_committed_tokens",
-            )
-        }
-
-        return cls(
-            mode_counts=map_fields["mode_counts"],
-            mode_tokens=map_fields["mode_tokens"],
-            mode_us=map_fields["mode_us"],
-            component_us=map_fields["component_us"],
-            attention_launches=scalar_fields["attention_launches"],
-            attention_us=scalar_fields["attention_us"],
-            attention_backend_counts=map_fields["attention_backend_counts"],
-            cuda_graph_captures=scalar_fields["cuda_graph_captures"],
-            cuda_graph_replays=scalar_fields["cuda_graph_replays"],
-            cuda_graph_misses=scalar_fields["cuda_graph_misses"],
-            cuda_graph_fallbacks=scalar_fields["cuda_graph_fallbacks"],
-            cuda_graph_unpadded_tokens=scalar_fields[
-                "cuda_graph_unpadded_tokens"
-            ],
-            cuda_graph_padded_tokens=scalar_fields["cuda_graph_padded_tokens"],
-            cuda_graph_runtime_mode_counts=map_fields[
-                "cuda_graph_runtime_mode_counts"
-            ],
-            text_decode_token_relay_hits=scalar_fields[
-                "text_decode_token_relay_hits"
-            ],
-            text_decode_token_relay_misses=scalar_fields[
-                "text_decode_token_relay_misses"
-            ],
-            text_decode_position_relay_hits=scalar_fields[
-                "text_decode_position_relay_hits"
-            ],
-            text_decode_position_relay_misses=scalar_fields[
-                "text_decode_position_relay_misses"
-            ],
-            flashinfer_decode_plan_calls=scalar_fields[
-                "flashinfer_decode_plan_calls"
-            ],
-            flashinfer_decode_plan_reuses=scalar_fields[
-                "flashinfer_decode_plan_reuses"
-            ],
-            flashinfer_decode_plan_rows=scalar_fields[
-                "flashinfer_decode_plan_rows"
-            ],
-            flashinfer_decode_plan_indices=scalar_fields[
-                "flashinfer_decode_plan_indices"
-            ],
-            flashinfer_decode_graph_plan_calls=scalar_fields[
-                "flashinfer_decode_graph_plan_calls"
-            ],
-            flashinfer_decode_graph_plan_reuses=scalar_fields[
-                "flashinfer_decode_graph_plan_reuses"
-            ],
-            spec_verify_rows=scalar_fields["spec_verify_rows"],
-            spec_verify_draft_tokens=scalar_fields["spec_verify_draft_tokens"],
-            spec_verify_accepted_tokens=scalar_fields[
-                "spec_verify_accepted_tokens"
-            ],
-            spec_verify_rejected_tokens=scalar_fields[
-                "spec_verify_rejected_tokens"
-            ],
-            spec_verify_committed_tokens=scalar_fields[
-                "spec_verify_committed_tokens"
-            ],
-            spec_verify_path_counts=map_fields["spec_verify_path_counts"],
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize every counter field, copying mappings into plain dicts."""
-        return {
-            name: dict(value) if isinstance(value, Mapping) else value
-            for name, value in (
-                (name, getattr(self, name))
-                for name in self.__dataclass_fields__
-            )
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class BatchOutput:
     """One batch's complete result, carrying only materialized host values.
 
@@ -710,9 +491,7 @@ class BatchOutput:
             forward_stats=(
                 None
                 if data.get("forward_stats") is None
-                else ForwardStats.from_mapping(
-                    data["forward_stats"], f"{where}.forward_stats"
-                )
+                else ForwardStats.from_mapping(data["forward_stats"])
             ),
         )
 

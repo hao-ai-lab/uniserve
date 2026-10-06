@@ -7,7 +7,7 @@ use std::time::Instant;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker_ipc::{Batch, CallKind, CallStatus, DType, MediaCall, TransferHandle};
 
 use super::block_tables::BlockTables;
@@ -46,8 +46,7 @@ pub(crate) struct BatchState {
     #[pyo3(get)]
     pub(super) started_ns: u64,
 
-    #[pyo3(get)]
-    pub(super) forward_stats: Py<PyList>,
+    pub(super) forward_stats: uniserve_worker_ipc::ForwardStats,
     #[pyo3(get)]
     pub(super) component_us: Py<PyDict>,
     forward_indices: Vec<Vec<usize>>,
@@ -77,7 +76,7 @@ impl BatchState {
             predicate_captures: Vec::new(),
             stream: None,
             started_ns: 0,
-            forward_stats: PyList::empty(py).unbind(),
+            forward_stats: uniserve_worker_ipc::ForwardStats::default(),
             component_us: PyDict::new(py).unbind(),
             forward_indices,
         })
@@ -901,6 +900,28 @@ impl BatchState {
         Ok(())
     }
 
+    /// Add one completed numerical invocation without retaining Python results.
+    fn record_forward(&mut self, stats: PyRef<'_, crate::stats::ForwardStats>) {
+        self.forward_stats.merge(&stats.inner);
+    }
+
+    fn execution_stats(&self, py: Python<'_>) -> PyResult<crate::stats::ForwardStats> {
+        if self.started_ns == 0 {
+            return Ok(crate::stats::ForwardStats::from(
+                uniserve_worker_ipc::ForwardStats::default(),
+            ));
+        }
+
+        let mut stats = self.forward_stats.clone();
+        for (name, elapsed) in self.component_us.bind(py) {
+            let elapsed = elapsed.extract::<i64>()?.max(0) as u64;
+            let count = stats.component_us.entry(name.extract()?).or_default();
+            *count = count.saturating_add(elapsed);
+        }
+
+        Ok(crate::stats::ForwardStats::from(stats))
+    }
+
     #[getter]
     fn batch_id(&self) -> u64 {
         self.plan.batch_id
@@ -972,7 +993,6 @@ impl BatchState {
             visit.call(output)?;
         }
         visit.call(&self.stream)?;
-        visit.call(&self.forward_stats)?;
         visit.call(&self.component_us)
     }
 
@@ -982,7 +1002,7 @@ impl BatchState {
         self.buffer = None;
         self.stream = None;
         self.predicate_captures.clear();
-        self.forward_stats = PyList::empty(py).unbind();
+        self.forward_stats = uniserve_worker_ipc::ForwardStats::default();
         self.component_us = PyDict::new(py).unbind();
     }
 }
