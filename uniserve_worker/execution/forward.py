@@ -220,7 +220,7 @@ def forward_values(
 
         # One forward output group maps back to its input rows; bind each
         # row's value, request slot view, graph sample, and output layout.
-        state.forward_stats.append(stats)
+        state.record_forward(stats)
         for local, (index, value) in enumerate(
             zip(indexes, output.values, strict=True)
         ):

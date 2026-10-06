@@ -22,14 +22,14 @@ from typing_extensions import Buffer as BufferProtocol
 import uniserve_worker.sampling.result as sampling_result
 import uniserve_worker.storage.block_tables as block_tables
 import uniserve_worker.storage.kv_cache as kv_cache
+from uniserve.model.logits import VocabShard
 from uniserve.runtime.execution import ExecutionContext
 from uniserve.sampling import SamplingParams
-from uniserve.tensors import BufferConfig
+from uniserve.tensors import BufferConfig, OutputLayout
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestResult
-from uniserve_worker.model_executor.input_batch import InputRow
-from uniserve_worker.model_executor.output import ExecutionOutput
+from uniserve_worker.model_executor.input_batch import InputBatch, InputRow
 from uniserve_worker.protocol.batch import (
     BatchCommand,
     BlockTable,
@@ -55,7 +55,6 @@ from uniserve_worker.protocol.call import (
 )
 from uniserve_worker.protocol.output import (
     BatchOutput,
-    ForwardStats,
     RequestOutput,
 )
 from uniserve_worker.protocol.tensor import TensorRef
@@ -70,6 +69,153 @@ from uniserve_worker.storage.request_slots import RequestSlots
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
 from uniserve_worker.worker import Worker
+
+@final
+class ForwardStats:
+    """Immutable native counters shared by model execution and IPC.
+
+    Counts and microsecond timings add across invocations. Modes without
+    query tokens report calls and time without a mode_tokens entry.
+    """
+
+    def __init__(
+        self,
+        *,
+        mode_counts: Mapping[str, int] = ...,
+        mode_tokens: Mapping[str, int] = ...,
+        mode_us: Mapping[str, int] = ...,
+        component_us: Mapping[str, int] = ...,
+        attention_launches: int = ...,
+        attention_us: int = ...,
+        attention_backend_counts: Mapping[str, int] = ...,
+        cuda_graph_captures: int = ...,
+        cuda_graph_replays: int = ...,
+        cuda_graph_misses: int = ...,
+        cuda_graph_fallbacks: int = ...,
+        cuda_graph_unpadded_tokens: int = ...,
+        cuda_graph_padded_tokens: int = ...,
+        cuda_graph_runtime_mode_counts: Mapping[str, int] = ...,
+        text_decode_token_relay_hits: int = ...,
+        text_decode_token_relay_misses: int = ...,
+        text_decode_position_relay_hits: int = ...,
+        text_decode_position_relay_misses: int = ...,
+        flashinfer_decode_plan_calls: int = ...,
+        flashinfer_decode_plan_reuses: int = ...,
+        flashinfer_decode_plan_rows: int = ...,
+        flashinfer_decode_plan_indices: int = ...,
+        flashinfer_decode_graph_plan_calls: int = ...,
+        flashinfer_decode_graph_plan_reuses: int = ...,
+        spec_verify_rows: int = ...,
+        spec_verify_draft_tokens: int = ...,
+        spec_verify_accepted_tokens: int = ...,
+        spec_verify_rejected_tokens: int = ...,
+        spec_verify_committed_tokens: int = ...,
+        spec_verify_path_counts: Mapping[str, int] = ...,
+    ) -> None: ...
+    @staticmethod
+    def from_mapping(value: object) -> ForwardStats: ...
+    def to_mapping(self) -> dict[str, Any]: ...
+    @property
+    def mode_counts(self) -> Mapping[str, int]: ...
+    @property
+    def mode_tokens(self) -> Mapping[str, int]: ...
+    @property
+    def mode_us(self) -> Mapping[str, int]: ...
+    @property
+    def component_us(self) -> Mapping[str, int]: ...
+    @property
+    def attention_launches(self) -> int: ...
+    @property
+    def attention_us(self) -> int: ...
+    @property
+    def attention_backend_counts(self) -> Mapping[str, int]: ...
+    @property
+    def cuda_graph_captures(self) -> int: ...
+    @property
+    def cuda_graph_replays(self) -> int: ...
+    @property
+    def cuda_graph_misses(self) -> int: ...
+    @property
+    def cuda_graph_fallbacks(self) -> int: ...
+    @property
+    def cuda_graph_unpadded_tokens(self) -> int: ...
+    @property
+    def cuda_graph_padded_tokens(self) -> int: ...
+    @property
+    def cuda_graph_runtime_mode_counts(self) -> Mapping[str, int]: ...
+    @property
+    def text_decode_token_relay_hits(self) -> int: ...
+    @property
+    def text_decode_token_relay_misses(self) -> int: ...
+    @property
+    def text_decode_position_relay_hits(self) -> int: ...
+    @property
+    def text_decode_position_relay_misses(self) -> int: ...
+    @property
+    def flashinfer_decode_plan_calls(self) -> int: ...
+    @property
+    def flashinfer_decode_plan_reuses(self) -> int: ...
+    @property
+    def flashinfer_decode_plan_rows(self) -> int: ...
+    @property
+    def flashinfer_decode_plan_indices(self) -> int: ...
+    @property
+    def flashinfer_decode_graph_plan_calls(self) -> int: ...
+    @property
+    def flashinfer_decode_graph_plan_reuses(self) -> int: ...
+    @property
+    def spec_verify_rows(self) -> int: ...
+    @property
+    def spec_verify_draft_tokens(self) -> int: ...
+    @property
+    def spec_verify_accepted_tokens(self) -> int: ...
+    @property
+    def spec_verify_rejected_tokens(self) -> int: ...
+    @property
+    def spec_verify_committed_tokens(self) -> int: ...
+    @property
+    def spec_verify_path_counts(self) -> Mapping[str, int]: ...
+
+@final
+class ExecutionOutput:
+    """Row-aligned numerical views, native statistics and a producer fence.
+
+    values, vocabularies and layouts align by row. Empty metadata defaults
+    to unsharded tensors without declared layouts. clone joins the producer
+    and owns copies that survive graph-buffer reuse. materialize joins and
+    gathers vocabulary shards; every tensor rank participates in the gather.
+    """
+
+    def __init__(
+        self,
+        values: tuple[torch.Tensor, ...],
+        vocabularies: tuple[VocabShard | None, ...] = (),
+        request_pool_indices: torch.Tensor | None = None,
+        output_event: CUDAEvent | None = None,
+        stats: ForwardStats | None = None,
+        greedy: sampling_result.SamplerOutput | None = None,
+        layouts: tuple[OutputLayout | None, ...] = (),
+    ) -> None: ...
+    @property
+    def values(self) -> tuple[torch.Tensor, ...]: ...
+    @property
+    def vocabularies(self) -> tuple[VocabShard | None, ...]: ...
+    @property
+    def request_pool_indices(self) -> torch.Tensor | None: ...
+    @property
+    def output_event(self) -> CUDAEvent | None: ...
+    @property
+    def stats(self) -> ForwardStats | None: ...
+    @property
+    def greedy(self) -> sampling_result.SamplerOutput | None: ...
+    @property
+    def layouts(self) -> tuple[OutputLayout | None, ...]: ...
+    def replace(self, **fields: Any) -> ExecutionOutput: ...
+    @staticmethod
+    def combine(outputs: Iterable[ExecutionOutput]) -> ExecutionOutput: ...
+    def clone(self) -> ExecutionOutput: ...
+    def materialize(self) -> ExecutionOutput: ...
+    def validate_for(self, batch: InputBatch) -> None: ...
 
 @final
 class CanvasSampling:
@@ -348,7 +494,9 @@ __all__ = [
     "EventPool",
     "EventPoolError",
     "Executor",
+    "ExecutionOutput",
     "ExpertExchange",
+    "ForwardStats",
     "GraphStorage",
     "PrefillShape",
     "TextShapes",
@@ -607,7 +755,6 @@ class BatchState:
     inputs: BatchInputs
     stream: torch.cuda.Stream | None
     started_ns: int
-    forward_stats: list[ForwardStats]
     component_us: dict[str, int]
 
     @property
@@ -621,6 +768,8 @@ class BatchState:
         """Return numerical forward rows in scheduler order."""
     def pending_outputs(self) -> tuple[PendingOutput, ...]: ...
     def complete_latent(self, request_id: int) -> None: ...
+    def record_forward(self, stats: ForwardStats) -> None: ...
+    def execution_stats(self) -> ForwardStats: ...
     def consume_tensor(
         self,
         request_id: int,

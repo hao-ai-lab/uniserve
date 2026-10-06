@@ -286,8 +286,7 @@ class ModelRunner(Execution, ABC):
         if stream is not None:
             torch.cuda.current_stream(self.device).wait_stream(stream.stream)
         elapsed = (time.perf_counter_ns() - started) // 1000
-        return replace(
-            output,
+        return output.replace(
             stats=ForwardStats(
                 mode_counts={self.name: 1},
                 mode_us={self.name: elapsed},
@@ -474,7 +473,7 @@ class ModelRunner(Execution, ABC):
         # graph can return greedy continuations that such a batch did not
         # request.
         if batch.decode_force_finish is None:
-            result = replace(result, greedy=None)
+            result = result.replace(greedy=None)
         return result
 
     @torch.inference_mode()
@@ -620,8 +619,7 @@ class ModelRunner(Execution, ABC):
 
     def _run_forward(self, batch, forward, *, selected, borrow_output=False):
         if selected is None:
-            return replace(
-                self.eager_batch(batch, forward),
+            return self.eager_batch(batch, forward).replace(
                 stats=ForwardStats(cuda_graph_runtime_mode_counts={"eager": 1}),
             )
 
@@ -631,8 +629,7 @@ class ModelRunner(Execution, ABC):
             # Only configured buckets may capture at run time; an exact
             # signature without a resident graph simply runs eager.
             if not bucketed:
-                return replace(
-                    self.eager_batch(batch, forward),
+                return self.eager_batch(batch, forward).replace(
                     stats=ForwardStats(
                         cuda_graph_runtime_mode_counts={"eager": 1}
                     ),
@@ -659,8 +656,7 @@ class ModelRunner(Execution, ABC):
             # Replayed exchanges run no host code; the bucket names them.
             exchange.record_layers(self.buckets[key].expert_layers)
         result = self.replay_graph(key, execution, batch, borrow=borrow_output)
-        return replace(
-            result,
+        return result.replace(
             stats=ForwardStats(
                 cuda_graph_runtime_mode_counts={
                     "graph_capture" if captured else "graph_replay": 1

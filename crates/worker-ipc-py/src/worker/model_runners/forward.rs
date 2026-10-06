@@ -2,17 +2,16 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::PyTuple;
 use uniserve_worker::ModelRunners;
-use uniserve_worker_ipc::{CallKind, ForwardMode};
+use uniserve_worker_ipc::CallKind;
 
 use crate::calls::Call;
 use crate::worker::error::invalid;
-use crate::worker::events::CUDAEvent;
+use crate::worker::model_results::ExecutionOutput;
 
 use super::execute;
 
@@ -144,9 +143,8 @@ impl ModelBatches {
         }
         let rows = PyTuple::new(py, rows)?;
         let calls = PyTuple::new(py, calls)?;
-        let started = Instant::now();
-        let result: PyResult<Py<PyAny>> = (|| {
-            let mut result = execute::run_batch(
+        let result: PyResult<Py<ExecutionOutput>> = (|| {
+            let result = execute::run_batch(
                 py,
                 self.owner.bind(py),
                 runner,
@@ -155,52 +153,17 @@ impl ModelBatches {
                 self.cache.bind(py),
                 self.tables.bind(py),
                 self.states.bind(py),
+                true,
             )?;
-            let event = result.getattr("output_event")?;
-            if !event.is_none() {
-                let current = py
-                    .import("torch.cuda")?
-                    .call_method1("current_stream", (runner.getattr("device")?,))?;
-                event
-                    .extract::<PyRef<'_, CUDAEvent>>()?
-                    .wait(py, Some(&current))?;
-            }
-
-            let mode: CallKind =
-                pythonize::depythonize(&rows.get_item(0)?.getattr("forward_mode")?)?;
-            if mode == CallKind::Forward(ForwardMode::Decode) {
-                let stats = result.getattr("stats")?;
-                let components = py
-                    .import("builtins")?
-                    .getattr("dict")?
-                    .call1((stats.getattr("component_us")?,))?
-                    .cast_into::<PyDict>()?;
-                // The numerical call's elapsed time includes input preparation
-                // and the join that exposes its output on the control stream.
-                let previous: u64 = components
-                    .get_item("text_model_forward")?
-                    .map(|value| value.extract())
-                    .transpose()?
-                    .unwrap_or(0);
-                components.set_item(
-                    "text_model_forward",
-                    previous + started.elapsed().as_micros() as u64,
-                )?;
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("component_us", components)?;
-                let replace = py.import("dataclasses")?.getattr("replace")?;
-                let stats = replace.call((stats,), Some(&kwargs))?;
-                kwargs.clear();
-                kwargs.set_item("stats", stats)?;
-                result = replace.call((result,), Some(&kwargs))?;
-            }
             if preserve {
-                result = result.call_method0("clone")?;
+                // run_batch already joined the producer on this stream.
+                // Copy the views without inserting a second event wait.
+                return ExecutionOutput::copy(&result);
             }
             Ok(result.unbind())
         })();
         match result {
-            Ok(result) => Ok(Some((result_indices, result))),
+            Ok(result) => Ok(Some((result_indices, result.into_any()))),
             Err(error) => {
                 let fatal: bool = py
                     .import("uniserve_worker.errors")?

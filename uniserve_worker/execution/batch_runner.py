@@ -15,7 +15,7 @@ from uniserve_worker.execution.forward import (
     initialize_trajectories,
 )
 from uniserve_worker.execution.image import reserve_images
-from uniserve_worker.profiling import _forward_stats, record_component
+from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.output import ForwardStats
 
 if TYPE_CHECKING:
@@ -137,7 +137,5 @@ class BatchRunner:
             record_component(state.component_us, "commit_lane", commit_started)
         return (
             (time.perf_counter_ns() - started) // 1000,
-            _forward_stats(state.forward_stats, state.component_us)
-            if state.started_ns
-            else ForwardStats(),
+            state.execution_stats(),
         )

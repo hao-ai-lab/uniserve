@@ -616,8 +616,7 @@ def replay_batch(graph: CUDAGraphRunner, batch, *, rows=None, borrow=False):
     """
     output, greedy = _replay(graph, batch)
     count = batch.row_count if rows is None else rows
-    result = replace(
-        output,
+    result = output.replace(
         values=output.values[:count],
         vocabularies=output.vocabularies[:count],
         layouts=output.layouts[:count],

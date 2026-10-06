@@ -9,13 +9,15 @@ use std::time::Instant;
 use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
-use uniserve_worker_ipc::{CallKind, MediaCall};
+use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
 use crate::calls::Call;
 use crate::ids::CallId;
+use crate::stats::ForwardStats;
 
 use super::super::events::CUDAEvent;
 use super::super::host::with_context;
+use super::super::model_results::ExecutionOutput;
 use super::super::stream::CUDAStream;
 
 #[allow(clippy::too_many_arguments)]
@@ -28,7 +30,8 @@ pub(super) fn run_batch<'py>(
     cache: &Bound<'py, PyAny>,
     tables: &Bound<'py, PyAny>,
     states: &Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
+    join: bool,
+) -> PyResult<Bound<'py, ExecutionOutput>> {
     if owner.getattr("_closed")?.extract::<bool>()? {
         return Err(PyRuntimeError::new_err("model runner is closed"));
     }
@@ -107,41 +110,47 @@ pub(super) fn run_batch<'py>(
 
         let mut completed = None;
         let executed = (|| {
-            let (output, tokens): (Bound<'_, PyAny>, Option<u64>) = backend
+            let (output, tokens): (Bound<'_, ExecutionOutput>, Option<u64>) = backend
                 .call_method1("_run_inputs", (runner, rows, batches, eligible, borrow))?
                 .extract()?;
 
             completed = record(py, stream.as_ref(), &cuda, &device)?;
             let elapsed = started.elapsed().as_micros() as u64;
-            let stats = output.getattr("stats")?;
-            if stats.is_none() {
-                return Err(PyRuntimeError::new_err(
-                    "model forward lost its execution statistics",
-                ));
-            }
-            let stats_fields = PyDict::new(py);
-            for (field, value) in [("mode_counts", 1), ("mode_us", elapsed)] {
-                let values = PyDict::new(py);
-                values.set_item(kind.as_str(), value)?;
-                stats_fields.set_item(field, values)?;
-            }
-            let mode_tokens = PyDict::new(py);
-            if let Some(tokens) = tokens {
-                mode_tokens.set_item(kind.as_str(), tokens)?;
-            }
-            stats_fields.set_item("mode_tokens", mode_tokens)?;
-            let components = PyDict::new(py);
-            components.set_item("forward", elapsed)?;
-            stats_fields.set_item("component_us", components)?;
+            let mut output = output.borrow().clone_ref(py);
+            let mut stats = output
+                .stats
+                .as_ref()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("model forward lost its execution statistics")
+                })?
+                .borrow(py)
+                .inner
+                .clone();
+            stats.mode_counts = [(kind.as_str().into(), 1)].into();
+            stats.mode_us = [(kind.as_str().into(), elapsed)].into();
+            stats.mode_tokens = tokens
+                .map(|value| (kind.as_str().into(), value))
+                .into_iter()
+                .collect();
+            stats.component_us = [("forward".into(), elapsed)].into();
 
-            let replace = py.import("dataclasses")?.getattr("replace")?;
-            let stats = replace.call((stats,), Some(&stats_fields))?;
-            let fields = PyDict::new(py);
-            fields.set_item("request_pool_indices", slots)?;
-            fields.set_item("output_event", &completed)?;
-            fields.set_item("stats", stats)?;
+            if join {
+                if let Some(event) = &completed {
+                    let current = cuda.call_method1("current_stream", (&device,))?;
+                    event.borrow(py).wait(py, Some(&current))?;
+                }
+                if kind == CallKind::Forward(ForwardMode::Decode) {
+                    stats.component_us.insert(
+                        "text_model_forward".into(),
+                        started.elapsed().as_micros() as u64,
+                    );
+                }
+            }
+            output.request_pool_indices = Some(slots.unbind());
+            output.output_event = completed.as_ref().map(|event| event.clone_ref(py));
+            output.stats = Some(Py::new(py, ForwardStats::from(stats))?);
             owner.call_method0("_report_new_kernels")?;
-            replace.call((output,), Some(&fields))
+            Py::new(py, output).map(|output| output.into_bound(py))
         })();
         match executed {
             Ok(output) => Ok(output),
