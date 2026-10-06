@@ -18,7 +18,8 @@ pub(super) fn configure(
 ) -> PyResult<()> {
     let py = slf.py();
     let config = owner.getattr("worker_config")?;
-    let count: usize = config.getattr("expert_microbatches")?.extract()?;
+    let config_native = crate::worker::config::native(&config)?;
+    let count: usize = config_native.expert_microbatches;
     let attention_ranks: usize = owner.getattr("attention_ranks")?.extract()?;
     let fused = py.import("uniserve.nn.moe")?.getattr("FusedMoE")?;
     let mut layers = Vec::new();
@@ -92,10 +93,9 @@ pub(super) fn configure(
         max_tokens = capacity.call_method0("item")?.extract()?;
     }
     let options = PyDict::new(py);
-    if attention_ranks != 0 && config.getattr("role")?.extract::<String>()? != "experts" {
-        let first_rank = group.getattr("rank")?.extract::<usize>()?
-            - config.getattr("rank")?.extract::<usize>()?;
-        let width: usize = config.getattr("world_size")?.extract()?;
+    if attention_ranks != 0 && config_native.role != "experts" {
+        let first_rank = group.getattr("rank")?.extract::<usize>()? - config_native.rank;
+        let width: usize = config_native.world_size;
         let ranks: Vec<usize> = group.getattr("ranks")?.extract()?;
         options.set_item(
             "source_group",
@@ -115,10 +115,10 @@ pub(super) fn configure(
     options.set_item(
         "device",
         py.import("uniserve.runtime.device")?
-            .call_method1("canonical_device", (config.getattr("device")?,))?,
+            .call_method1("canonical_device", (&config_native.device,))?,
     )?;
     options.set_item("attention_ranks", attention_ranks)?;
-    options.set_item("transport", config.getattr("expert_exchange")?)?;
+    options.set_item("transport", &config_native.expert_exchange)?;
     let exchange_type = py
         .import("uniserve.runtime.expert_exchange")?
         .getattr("ExpertExchange")?;
@@ -139,9 +139,10 @@ pub(super) fn configure_worker(
 ) -> PyResult<()> {
     let py = slf.py();
     let config = owner.getattr("worker_config")?;
+    let config_native = crate::worker::config::native(&config)?;
     let streams = std::sync::Arc::clone(&slf.borrow().streams);
     streams.initialize(owner, None)?;
-    configure(slf, owner, config.getattr("max_batch_tokens")?.extract()?)?;
+    configure(slf, owner, config_native.max_batch_tokens)?;
     let exchanges = slf
         .borrow()
         .exchanges
@@ -154,7 +155,7 @@ pub(super) fn configure_worker(
         ));
     }
 
-    let capture = config.getattr("graph_policy")?.extract::<String>()? != "off";
+    let capture = config_native.graph_policy != "off";
     let storage = owner.getattr("graph_storage")?;
     let model = owner.getattr("model")?;
     let runtime = py.import("uniserve.runtime")?;
@@ -259,9 +260,7 @@ pub(super) fn bind(slf: &Bound<'_, ModelRunners>, owner: &Bound<'_, PyAny>) -> P
 
     let plan = (
         exchange.getattr("capacities")?,
-        owner
-            .getattr("worker_config")?
-            .getattr("expert_microbatches")?,
+        crate::worker::config::native(&owner.getattr("worker_config")?)?.expert_microbatches,
         PyTuple::new(py, calls)?,
     )
         .into_pyobject(py)?;

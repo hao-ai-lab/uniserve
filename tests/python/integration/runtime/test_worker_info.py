@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 from torch import nn
 
@@ -113,8 +111,7 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
 def test_worker_info_reports_limits_safe_for_all_bound_lanes(
     with_lane_limits,
 ) -> None:
-    config = replace(
-        stub_worker_config(16, max_batch_tokens=256),
+    config = stub_worker_config(16, max_batch_tokens=256).replace(
         max_batch_calls=4,
         lanes=(
             LaneConfig(
@@ -151,8 +148,7 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(
 
 @pytest.mark.parametrize("attention_backend", ("torch", "auto"))
 def test_worker_capabilities_reflect_enabled_calls(attention_backend) -> None:
-    config = replace(
-        stub_worker_config(16, max_batch_tokens=256),
+    config = stub_worker_config(16, max_batch_tokens=256).replace(
         graph_policy="off",
         attention_backend=attention_backend,
     )

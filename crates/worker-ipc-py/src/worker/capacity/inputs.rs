@@ -54,13 +54,14 @@ pub(in crate::worker) fn graph_table_widths<'py>(
     worker_config: &Bound<'py, PyAny>,
     pool: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyTuple>> {
+    let worker_config_native = crate::worker::config::native(worker_config)?;
     let py = model.py();
-    let sequence: u64 = worker_config.getattr("max_sequence_tokens")?.extract()?;
+    let sequence = worker_config_native.max_sequence_tokens as u64;
     if pool.is_none() || sequence == 0 || capability(model, "CausalLM")?.is_none() {
         return Ok(PyTuple::empty(py));
     }
 
-    let query = worker_config.getattr("max_batch_tokens")?.extract()?;
+    let query = worker_config_native.max_batch_tokens as u64;
     let units = pool
         .getattr("info")?
         .getattr("num_units")?
@@ -85,6 +86,7 @@ pub(super) fn input_buffer_config<'py>(
     config: &Bound<'py, PyAny>,
     processor: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let config_native = crate::worker::config::native(config)?;
     let py = model.py();
     let text = capability(model, "CausalLM")?;
     if text.is_none() {
@@ -93,22 +95,13 @@ pub(super) fn input_buffer_config<'py>(
         ));
     }
 
-    let calls: usize = config.getattr("max_batch_calls")?.extract()?;
-    let tokens: usize = config.getattr("max_batch_tokens")?.extract()?;
-    let mut max_rows = calls.min(config.getattr("max_request_pool_size")?.extract()?);
+    let calls: usize = config_native.max_batch_calls;
+    let tokens: usize = config_native.max_batch_tokens;
+    let mut max_rows = calls.min(config_native.max_request_pool_size);
     let mut max_tokens = tokens;
-    for lane in config.getattr("lanes")?.try_iter()? {
-        let lane = lane?;
-        max_rows = max_rows.min(
-            lane.getattr("max_batch_calls")?
-                .extract::<Option<usize>>()?
-                .unwrap_or(calls),
-        );
-        max_tokens = max_tokens.min(
-            lane.getattr("max_batch_tokens")?
-                .extract::<Option<usize>>()?
-                .unwrap_or(tokens),
-        );
+    for lane in &config_native.lanes {
+        max_rows = max_rows.min(lane.max_batch_calls.unwrap_or(calls));
+        max_tokens = max_tokens.min(lane.max_batch_tokens.unwrap_or(tokens));
     }
 
     let flow = py
@@ -148,8 +141,7 @@ pub(super) fn input_buffer_config<'py>(
     if !flow.is_none() {
         flow_tokens = image_tokens + flow.getattr("framing")?.extract::<usize>()?;
         let image = py.import("uniserve.media.image")?.getattr("Config")?;
-        for shape in config.getattr("flow_graph_shapes")?.try_iter()? {
-            let (height, width): (usize, usize) = shape?.extract()?;
+        for &(height, width) in &config_native.flow_graph_shapes {
             let size = image.call1((height, width))?;
             flow_tokens =
                 flow_tokens.max(flow.call_method1("sequence_length", (size,))?.extract()?);
@@ -172,7 +164,7 @@ pub(super) fn input_buffer_config<'py>(
         "table_widths",
         table_widths(
             &planes,
-            config.getattr("max_sequence_tokens")?.extract()?,
+            config_native.max_sequence_tokens as u64,
             call_tokens as u64,
         )?,
     )?;
@@ -180,7 +172,7 @@ pub(super) fn input_buffer_config<'py>(
         "hidden_size",
         text.getattr("backbone")?.getattr("hidden_size")?,
     )?;
-    let dtype: String = config.getattr("model_dtype")?.extract()?;
+    let dtype: String = config_native.model_dtype.clone();
     options.set_item(
         "embedding_dtype",
         py.import("torch")?
@@ -200,8 +192,9 @@ pub(in crate::worker) fn resolve_page_size<'py>(
     attention: &Bound<'py, PyAny>,
     group: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let config_native = crate::worker::config::native(config)?;
     let py = model.py();
-    if !config.getattr("block_size")?.is_none() {
+    if !config_native.block_size.is_none() {
         return Ok(config.clone());
     }
     let text = capability(model, "CausalLM")?;
@@ -273,8 +266,7 @@ pub(in crate::worker) fn resolve_page_size<'py>(
         }
     }
     size = minimum_capacity(group, size)?;
-    let options = PyDict::new(py);
-    options.set_item("block_size", size)?;
-    py.import("dataclasses")?
-        .call_method("replace", (config,), Some(&options))
+    let mut resolved = (*config_native).clone();
+    resolved.block_size = Some(size as usize);
+    crate::worker::config::updated(config, resolved)
 }

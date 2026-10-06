@@ -11,7 +11,6 @@ candidate log-probabilities as a request admitted into a fresh slot.
 
 import math
 import time
-from dataclasses import replace
 
 import pytest
 import torch
@@ -62,8 +61,7 @@ LATER_WORK_CYCLES = 2_000_000_000
 def _worker(root):
     """A worker on ``cuda:0`` that holds up to three batches at once."""
     loaded = models.read_config(root)
-    config = replace(
-        stub_worker_config(PAGE, max_batch_tokens=256),
+    config = stub_worker_config(PAGE, max_batch_tokens=256).replace(
         device="cuda:0",
         model_dtype="bfloat16",
         max_sequence_tokens=128,

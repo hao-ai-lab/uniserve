@@ -99,10 +99,8 @@ impl Module {
             serving.set_item(key, &runner)?;
             return Ok(runner);
         }
-        let capacity: usize = owner
-            .getattr("worker_config")?
-            .getattr("max_request_pool_size")?
-            .extract()?;
+        let capacity: usize =
+            crate::worker::config::native(&owner.getattr("worker_config")?)?.max_request_pool_size;
         if serving.len() >= capacity
             && let Some((key, runner)) = serving.iter().next()
         {
@@ -156,10 +154,7 @@ impl Module {
         options.set_item("storage", &storage)?;
         let captures = startup
             && !stream.is_none()
-            && owner
-                .getattr("worker_config")?
-                .getattr("graph_policy")?
-                .extract::<String>()?
+            && crate::worker::config::native(&owner.getattr("worker_config")?)?.graph_policy
                 != "off"
             && !call
                 .getattr("module")?

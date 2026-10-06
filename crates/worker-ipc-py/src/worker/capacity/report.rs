@@ -72,6 +72,7 @@ pub(in crate::worker) fn build_worker_layout(
 ) -> PyResult<WorkerLayout> {
     let py = model.py();
     let config = worker_config;
+    let config_native = crate::worker::config::native(config)?;
     if queue_depth == 0 {
         return Err(unsupported(py, "worker pipeline depth must be positive"));
     }
@@ -86,7 +87,7 @@ pub(in crate::worker) fn build_worker_layout(
         .map(|item| item?.get_item(0)?.extract())
         .collect::<PyResult<_>>()?;
     let declarations = py.import("uniserve_worker.bootstrap.components")?;
-    let dedicated = config.getattr("role")?.extract::<String>()? == "experts";
+    let dedicated = config_native.role == "experts";
     let supported: Vec<CallKind> = if dedicated {
         Vec::new()
     } else {
@@ -120,7 +121,7 @@ pub(in crate::worker) fn build_worker_layout(
         Some(endpoint) => record_from_py(endpoint)?,
         None => {
             let options = PyDict::new(py);
-            options.set_item("rank", config.getattr("rank")?)?;
+            options.set_item("rank", config_native.rank)?;
             record_from_py(
                 &py.import("uniserve_worker.protocol.transfer")?
                     .getattr("WorkerEndpoint")?
@@ -194,7 +195,7 @@ pub(in crate::worker) fn build_worker_layout(
             });
         }
     }
-    let device = config.getattr("device")?;
+    let device = config_native.device.as_str().into_pyobject(py)?.into_any();
     let fabric_handles = if is_cuda(&device)? {
         let index = py
             .import("torch")?
@@ -210,9 +211,9 @@ pub(in crate::worker) fn build_worker_layout(
         false
     };
     let backend = if attention_backend.is_empty() {
-        config
-            .getattr("attention_backend")?
-            .extract::<Option<String>>()?
+        config_native
+            .attention_backend
+            .clone()
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "auto".into())
     } else {
@@ -222,8 +223,9 @@ pub(in crate::worker) fn build_worker_layout(
         model_name,
         endpoint,
         device: device.str()?.extract()?,
-        world_size: config.getattr("world_size")?.extract()?,
-        model_dtype: config.getattr("model_dtype")?.extract()?,
+        world_size: u32::try_from(config_native.world_size)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?,
+        model_dtype: config_native.model_dtype.clone(),
         attention_backend: backend,
         weight_formats: weight_formats.into_iter().collect(),
         activation_formats: activation_formats.into_iter().collect(),
@@ -233,9 +235,12 @@ pub(in crate::worker) fn build_worker_layout(
         transfer_backends,
         fabric_handles,
         queue_depth: queue_depth as u32,
-        max_batch_calls: config.getattr("max_batch_calls")?.extract()?,
-        max_batch_tokens: config.getattr("max_batch_tokens")?.extract()?,
-        request_slots: config.getattr("max_request_pool_size")?.extract()?,
+        max_batch_calls: u32::try_from(config_native.max_batch_calls)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?,
+        max_batch_tokens: u32::try_from(config_native.max_batch_tokens)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?,
+        request_slots: u32::try_from(config_native.max_request_pool_size)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?,
         max_prefill_calls: 0,
         max_decode_calls: 0,
         kv_cache: None,
@@ -279,18 +284,17 @@ pub(in crate::worker) fn build_worker_layout(
     info = layout.info;
     // Every eligible lane must be able to execute an admitted batch. Storage
     // still covers warmup and graph capture at their configured dimensions.
-    for lane in config.getattr("lanes")?.try_iter()? {
-        let lane = lane?;
-        info.max_batch_calls = info.max_batch_calls.min(
-            lane.getattr("max_batch_calls")?
-                .extract::<Option<u32>>()?
-                .unwrap_or(info.max_batch_calls),
-        );
-        info.max_batch_tokens = info.max_batch_tokens.min(
-            lane.getattr("max_batch_tokens")?
-                .extract::<Option<u32>>()?
-                .unwrap_or(info.max_batch_tokens),
-        );
+    for lane in &config_native.lanes {
+        if let Some(calls) = lane.max_batch_calls {
+            info.max_batch_calls = info.max_batch_calls.min(
+                u32::try_from(calls).map_err(|error| PyValueError::new_err(error.to_string()))?,
+            );
+        }
+        if let Some(tokens) = lane.max_batch_tokens {
+            info.max_batch_tokens = info.max_batch_tokens.min(
+                u32::try_from(tokens).map_err(|error| PyValueError::new_err(error.to_string()))?,
+            );
+        }
     }
     info.max_prefill_calls = info.max_prefill_calls.min(info.max_batch_calls);
     info.max_decode_calls = info.max_decode_calls.min(info.max_batch_calls);

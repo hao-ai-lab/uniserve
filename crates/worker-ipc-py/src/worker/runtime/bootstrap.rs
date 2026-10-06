@@ -32,11 +32,12 @@ pub(super) fn from_config<'py>(
     let description = prepared.get_item(1)?;
     let declarations = prepared.get_item(2)?;
     let execution = config.getattr("execution")?;
+    let execution_native = crate::worker::config::native(&execution)?;
     let experts = config.getattr("expert_parallel")?;
     let options = PyDict::new(py);
-    for name in ["rank", "world_size", "device"] {
-        options.set_item(name, execution.getattr(name)?)?;
-    }
+    options.set_item("rank", execution_native.rank)?;
+    options.set_item("world_size", execution_native.world_size)?;
+    options.set_item("device", &execution_native.device)?;
     options.set_item("local_rank", config.getattr("local_rank")?)?;
     options.set_item("backend", config.getattr("distributed_backend")?)?;
     options.set_item("rendezvous", config.getattr("rendezvous")?)?;
@@ -57,7 +58,7 @@ pub(super) fn from_config<'py>(
 
     let result = (|| {
         let components = config.getattr("components")?;
-        let bindings = if execution.getattr("role")?.extract::<String>()? == "experts" {
+        let bindings = if execution_native.role == "experts" {
             PyDict::new(py).into_any()
         } else {
             let options = PyDict::new(py);
@@ -181,18 +182,13 @@ impl Worker {
         entry_points: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         let mut config = self.worker_config.clone_ref(py).into_bound(py);
+        let config_native = crate::worker::config::native(&config)?;
         let torch = py.import("torch")?;
         if !model.is_instance(&py.import("torch.nn")?.getattr("Module")?)? {
             return Err(unsupported(
                 py,
                 "worker model has no supported execution surface",
             ));
-        }
-        if !config.is_instance(
-            &py.import("uniserve_worker.config.execution")?
-                .getattr("WorkerConfig")?,
-        )? {
-            return Err(unsupported(py, "model worker requires a WorkerConfig"));
         }
         if queue_depth == 0 {
             return Err(unsupported(py, "worker pipeline depth must be positive"));
@@ -211,7 +207,7 @@ impl Worker {
         if transfer_backends.iter().any(|name| name == "cuda_vmm")
             && torch
                 .getattr("device")?
-                .call1((config.getattr("device")?,))?
+                .call1((&config_native.device,))?
                 .getattr("type")?
                 .extract::<String>()?
                 != "cuda"
@@ -262,13 +258,14 @@ impl Worker {
             bindings.as_ref().map(|value| value.bind(py)),
             Some(&runner.getattr("state_buffers")?),
         )?;
+        let config_native = crate::worker::config::native(&config)?;
         self.worker_config = config.clone().unbind();
         runner.setattr("worker_config", &config)?;
 
         let endpoint = py
             .import("uniserve_worker.protocol.transfer")?
             .getattr("WorkerEndpoint")?
-            .call_method1("local", (worker_id, config.getattr("rank")?))?;
+            .call_method1("local", (worker_id, config_native.rank))?;
         let components = components
             .map(|value| value.into_bound(py))
             .unwrap_or_else(|| PyTuple::empty(py).into_any());
@@ -312,20 +309,15 @@ impl Worker {
         if state_buffers.is_truthy()? {
             options.set_item("state_buffers", state_buffers)?;
         }
-        options.set_item("device", config.getattr("device")?)?;
+        options.set_item("device", &config_native.device)?;
         let requests = py
             .get_type::<RequestPool>()
             .call((info.request_slots,), Some(&options))?
             .cast_into::<RequestPool>()?;
         self.requests = Some(requests.clone().unbind());
-        let dtype_name = config
-            .getattr("model_dtype")?
-            .str()?
-            .to_str()?
-            .trim_start_matches("torch.")
-            .to_owned();
+        let dtype_name = config_native.model_dtype.trim_start_matches("torch.");
         let dtype = torch
-            .getattr(dtype_name.as_str())
+            .getattr(dtype_name)
             .map_err(|_| unsupported(py, format!("unsupported model dtype {dtype_name:?}")))?;
         if !dtype.is_instance(&torch.getattr("dtype")?)? {
             return Err(unsupported(
@@ -341,7 +333,7 @@ impl Worker {
                 text.getattr("backbone")?.getattr("vocab_size")?,
             )?;
             options.set_item("continuation_width", 1)?;
-            options.set_item("device", config.getattr("device")?)?;
+            options.set_item("device", &config_native.device)?;
             options.set_item("logits_dtype", dtype)?;
             options.set_item(
                 "valid_cache_lengths",
@@ -356,12 +348,10 @@ impl Worker {
         }
 
         let denoises = runner.getattr("denoises")?.is_truthy()?;
-        let generation_device = config.getattr("generation_device")?;
-        let generation_device = if generation_device.is_none() {
-            config.getattr("device")?
-        } else {
-            generation_device
-        };
+        let generation_device = config_native
+            .generation_device
+            .as_deref()
+            .unwrap_or(&config_native.device);
         if let Some(plan) = &layout.latent_plan
             && (denoises || !inputs.call_method1("image_builder", (&model,))?.is_none())
         {
@@ -464,11 +454,7 @@ impl Worker {
         {
             // One export credit per representation plus one read credit per
             // remote rank keeps request tensor lifetimes within the pool.
-            transfer_bytes *= export_backends.len()
-                + config
-                    .getattr("world_size")?
-                    .extract::<usize>()?
-                    .saturating_sub(1);
+            transfer_bytes *= export_backends.len() + config_native.world_size.saturating_sub(1);
         }
         let options = PyDict::new(py);
         options.set_item("source", endpoint)?;
@@ -533,7 +519,7 @@ impl Worker {
                     runner.call_method1("bind_canvas_slots", (&self.canvas_slots,))?;
                 }
             }
-        } else if config.getattr("role")?.extract::<String>()? == "experts" {
+        } else if config_native.role == "experts" {
             ModelRunners::configure_experts(
                 &runner
                     .getattr("batch_runners")?
@@ -552,6 +538,7 @@ impl Worker {
         queue_depth: usize,
     ) -> PyResult<()> {
         let config = self.worker_config.bind(py);
+        let config_native = crate::worker::config::native(config)?;
         let cache = text.getattr("cache_config")?;
         if cache.is_none() {
             return Ok(());
@@ -572,9 +559,8 @@ impl Worker {
         let storage = planner.call_method1("storage", (config,))?;
         let options = PyDict::new(py);
         options.set_item("num_units", cache_info.num_units)?;
-        for name in ["block_size", "device"] {
-            options.set_item(name, config.getattr(name)?)?;
-        }
+        options.set_item("block_size", config_native.block_size)?;
+        options.set_item("device", &config_native.device)?;
         options.set_item("dtype", storage.get_item(0)?)?;
         if storage.get_item(1)?.is_truthy()? {
             let quantization = PyDict::new(py);
@@ -601,10 +587,7 @@ impl Worker {
         options.set_item("request_pool_size", info.request_slots)?;
         options.set_item(
             "table_width",
-            capacity_inputs::resident_width(
-                &planes,
-                config.getattr("max_sequence_tokens")?.extract()?,
-            )?,
+            capacity_inputs::resident_width(&planes, config_native.max_sequence_tokens as u64)?,
         )?;
         options.set_item("host_buffer_depth", queue_depth)?;
         let cache = py
@@ -618,12 +601,11 @@ impl Worker {
 
     fn devices<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
         let config = self.worker_config.bind(py);
-        let device = config.getattr("device")?;
-        let generation = config.getattr("generation_device")?;
-        let mut devices = vec![device.clone()];
-        if !generation.is_none() && !generation.eq(device)? {
-            devices.push(generation);
-        }
+        let native = crate::worker::config::native(config)?;
+        let devices = native
+            .devices()
+            .map(|device| Ok(device.into_pyobject(config.py())?.into_any()))
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(devices)
     }
 
@@ -633,12 +615,13 @@ impl Worker {
         layout: &report::WorkerLayout,
     ) -> PyResult<()> {
         let config = self.worker_config.bind(py);
+        let config_native = crate::worker::config::native(config)?;
         let device = py.import("uniserve.runtime.device")?;
         // KV sizing already charges the primary device's fixed storage. Other
         // CUDA devices need their own grant for fixed backing plus graphs.
         for (name, bytes) in &layout.fixed_device_bytes {
             let target = device.call_method1("canonical_device", (name,))?;
-            if *name == config.getattr("device")?.extract::<String>()?
+            if *name == config_native.device
                 || target.getattr("type")?.extract::<String>()? != "cuda"
             {
                 continue;
@@ -646,7 +629,7 @@ impl Worker {
             let available = device
                 .call_method1(
                     "device_storage_budget",
-                    (&name, config.getattr("kv_storage_fraction")?),
+                    (&name, config_native.kv_storage_fraction),
                 )?
                 .get_item(0)?
                 .extract::<u64>()?;
@@ -667,7 +650,7 @@ impl Worker {
     }
 
     pub(super) fn bind_graph_budgets(&self, py: Python<'_>) -> PyResult<()> {
-        let config = self.worker_config.bind(py);
+        let config = crate::worker::config::native(self.worker_config.bind(py))?;
         let devices = self.devices(py)?;
         let storage = self
             .runner
@@ -687,7 +670,7 @@ impl Worker {
             let available = device
                 .call_method1(
                     "device_storage_budget",
-                    (&target, config.getattr("kv_storage_fraction")?),
+                    (&target, config.kv_storage_fraction),
                 )?
                 .get_item(0)?
                 .extract::<u64>()?;

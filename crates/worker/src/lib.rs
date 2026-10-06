@@ -4,6 +4,7 @@ mod block_tables;
 mod buffer;
 pub mod capacity;
 mod completion;
+pub mod config;
 pub mod cuda;
 mod descriptor_grants;
 mod error;
@@ -39,6 +40,7 @@ pub use block_tables::{
 };
 pub use buffer::{BufferBinding, BufferPool};
 pub use completion::{Completion, Outcome};
+pub use config::WorkerConfig;
 pub use descriptor_grants::{DescriptorGrants, fetch_descriptor};
 pub use error::{Error, Result};
 pub use events::EventPool;

@@ -26,12 +26,14 @@ from uniserve.distributed.mesh import Communicator
 from uniserve.model.logits import VocabShard
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.runtime.backends.attention import Backend
+from uniserve.runtime.backends.attention.flashinfer import (
+    Config as FlashInferConfig,
+)
 from uniserve.runtime.execution import ExecutionContext
 from uniserve.runtime.prefix_cache import Planes
 from uniserve.runtime.process_groups import ProcessGroups
 from uniserve.tensors import BufferConfig, OutputLayout
 from uniserve_worker.config.deployment import ComponentConfig, WorkerProcessArgs
-from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestResult
 from uniserve_worker.model_executor.component_binding import ComponentBinding
@@ -82,6 +84,164 @@ from uniserve_worker.transport.exports import ExportLocations
 
 TOKEN_CONTINUATION_BIT: int
 TOKEN_VALUE_MASK: int
+
+DEFAULT_DECODE_GRAPH_BATCH_SIZES: tuple[int, ...]
+DEFAULT_PREFILL_GRAPH_ROW_BUCKETS: tuple[int, ...]
+DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS: tuple[int, ...]
+
+def graph_padding_block_count(block_size: int) -> int: ...
+
+@final
+class LaneConfig:
+    def __init__(
+        self,
+        lane_id: str,
+        sm_budget: int,
+        call_kinds: tuple[CallKind, ...],
+        max_batch_calls: int | None = ...,
+        max_batch_tokens: int | None = ...,
+        max_inflight: int | None = ...,
+    ) -> None: ...
+    @property
+    def lane_id(self) -> str: ...
+    @property
+    def sm_budget(self) -> int: ...
+    @property
+    def call_kinds(self) -> tuple[CallKind, ...]: ...
+    @property
+    def max_batch_calls(self) -> int | None: ...
+    @property
+    def max_batch_tokens(self) -> int | None: ...
+    @property
+    def max_inflight(self) -> int | None: ...
+
+@final
+class WorkerConfig:
+    """Immutable rank settings; replace returns a separately resolved value."""
+
+    def __init__(
+        self,
+        *,
+        device: str | torch.device = ...,
+        rank: int = ...,
+        world_size: int = ...,
+        role: str = ...,
+        expert_exchange: str = ...,
+        expert_microbatches: int = ...,
+        block_size: int | None = ...,
+        kv_token_capacity: int | None = ...,
+        attention_backend: str | None = ...,
+        max_batch_calls: int = ...,
+        max_batch_tokens: int = ...,
+        max_sequence_tokens: int = ...,
+        max_video_seconds: float = ...,
+        max_condition_rows: int = ...,
+        ffmpeg: str = ...,
+        min_video_seconds: float | None = ...,
+        video_text_capacities: tuple[int, ...] = ...,
+        deployment_components: tuple[str, ...] = ...,
+        canvas_sampling: CanvasSampling | None = ...,
+        max_request_pool_size: int = ...,
+        encoder_cache_entries: int = ...,
+        generation_device: str | torch.device | None = ...,
+        min_request_pool_size: int = ...,
+        pool_storage_bytes: int | None = ...,
+        model_dtype: str = ...,
+        kv_cache_dtype: str | None = ...,
+        kv_storage_fraction: float = ...,
+        lanes: tuple[LaneConfig, ...] = ...,
+        graph_policy: str = ...,
+        decode_graph_batch_sizes: tuple[int, ...] = ...,
+        prefill_cuda_graph: bool = ...,
+        prefill_outputs: bool = ...,
+        prefill_graph_token_sizes: tuple[int, ...] = ...,
+        flow_cuda_graph: bool = ...,
+        flow_graph_batch_sizes: tuple[int, ...] = ...,
+        flow_graph_shapes: tuple[tuple[int, int], ...] = ...,
+        flashinfer: FlashInferConfig = ...,
+    ) -> None: ...
+    @property
+    def device(self) -> str: ...
+    @property
+    def rank(self) -> int: ...
+    @property
+    def world_size(self) -> int: ...
+    @property
+    def role(self) -> str: ...
+    @property
+    def expert_exchange(self) -> str: ...
+    @property
+    def expert_microbatches(self) -> int: ...
+    @property
+    def block_size(self) -> int | None: ...
+    @property
+    def kv_token_capacity(self) -> int | None: ...
+    @property
+    def attention_backend(self) -> str | None: ...
+    @property
+    def max_batch_calls(self) -> int: ...
+    @property
+    def max_batch_tokens(self) -> int: ...
+    @property
+    def max_sequence_tokens(self) -> int: ...
+    @property
+    def max_video_seconds(self) -> float: ...
+    @property
+    def max_condition_rows(self) -> int: ...
+    @property
+    def ffmpeg(self) -> str: ...
+    @property
+    def min_video_seconds(self) -> float | None: ...
+    @property
+    def video_text_capacities(self) -> tuple[int, ...]: ...
+    @property
+    def deployment_components(self) -> tuple[str, ...]: ...
+    @property
+    def canvas_sampling(self) -> CanvasSampling | None: ...
+    @property
+    def max_request_pool_size(self) -> int: ...
+    @property
+    def encoder_cache_entries(self) -> int: ...
+    @property
+    def generation_device(self) -> str | None: ...
+    @property
+    def min_request_pool_size(self) -> int: ...
+    @property
+    def pool_storage_bytes(self) -> int | None: ...
+    @property
+    def model_dtype(self) -> str: ...
+    @property
+    def kv_cache_dtype(self) -> str | None: ...
+    @property
+    def kv_storage_fraction(self) -> float: ...
+    @property
+    def lanes(self) -> tuple[LaneConfig, ...]: ...
+    @property
+    def graph_policy(self) -> str: ...
+    @property
+    def decode_graph_batch_sizes(self) -> tuple[int, ...]: ...
+    @property
+    def prefill_cuda_graph(self) -> bool: ...
+    @property
+    def prefill_outputs(self) -> bool: ...
+    @property
+    def prefill_graph_token_sizes(self) -> tuple[int, ...]: ...
+    @property
+    def flow_cuda_graph(self) -> bool: ...
+    @property
+    def flow_graph_batch_sizes(self) -> tuple[int, ...]: ...
+    @property
+    def flow_graph_shapes(self) -> tuple[tuple[int, int], ...]: ...
+    @property
+    def flashinfer(self) -> FlashInferConfig: ...
+    def replace(self, **fields: Any) -> WorkerConfig: ...
+    @staticmethod
+    def from_launch(
+        fields: dict[str, Any],
+        *,
+        device: str,
+        generation_device: str | None = ...,
+    ) -> WorkerConfig: ...
 
 @final
 class SamplingParams:

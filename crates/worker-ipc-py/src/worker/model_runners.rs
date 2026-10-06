@@ -320,7 +320,7 @@ impl ModelRunners {
             .call_method1("input_signature", (size,))?;
         with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
             let runner = module.prepare(owner, size, &key)?;
-            let rank: usize = owner.getattr("worker_config")?.getattr("rank")?.extract()?;
+            let rank: usize = crate::worker::config::native(&owner.getattr("worker_config")?)?.rank;
             let result = with_context(
                 &dispatch::profile(
                     py,
@@ -498,7 +498,7 @@ impl ModelRunners {
         ensure_open(owner)?;
         let device = py.import("uniserve.runtime.device")?.call_method1(
             "canonical_device",
-            (owner.getattr("worker_config")?.getattr("device")?,),
+            (&crate::worker::config::native(&owner.getattr("worker_config")?)?.device,),
         )?;
         if streams::cuda_index(&device)?.is_none() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(

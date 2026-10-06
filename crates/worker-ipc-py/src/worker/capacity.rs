@@ -138,12 +138,11 @@ fn schema_bytes(schema: &Bound<'_, PyAny>, device_only: bool) -> PyResult<u64> {
 }
 
 fn devices<'py>(config: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let primary = config.getattr("device")?;
-    let generation = config.getattr("generation_device")?;
-    let mut devices = vec![primary.clone()];
-    if !generation.is_none() && !generation.eq(&primary)? {
-        devices.push(generation);
-    }
+    let native = crate::worker::config::native(config)?;
+    let devices = native
+        .devices()
+        .map(|device| Ok(device.into_pyobject(config.py())?.into_any()))
+        .collect::<PyResult<Vec<_>>>()?;
     Ok(devices)
 }
 
@@ -258,9 +257,10 @@ pub(in crate::worker) fn check_startup_storage(
     product_capacity_bytes: u64,
     tensor_store: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
+    let worker_config_native = crate::worker::config::native(worker_config)?;
     let py = worker_config.py();
     let device = py.import("uniserve.runtime.device")?;
-    let fraction: f64 = worker_config.getattr("kv_storage_fraction")?.extract()?;
+    let fraction: f64 = worker_config_native.kv_storage_fraction;
     let devices = devices(worker_config)?;
     let product_bytes = product_capacity_bytes / devices.len() as u64;
 

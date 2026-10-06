@@ -4,7 +4,6 @@ import argparse
 import os
 import socket
 from contextlib import contextmanager
-from dataclasses import replace
 
 import pytest
 import torch
@@ -226,8 +225,7 @@ def _run(rank, local_rank, rendezvous, root, graphs, attention_tp, replicas):
                 for module in model.modules()
                 if isinstance(module, FusedMoE)
             )
-        config = replace(
-            config,
+        config = config.replace(
             role="model" if source else "experts",
             expert_exchange="deepep",
             expert_microbatches=2,

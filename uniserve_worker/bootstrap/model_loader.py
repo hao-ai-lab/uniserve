@@ -360,8 +360,7 @@ def load_worker_model(
             model.get_submodule(path).to(device)
         return WorkerModel(
             model,
-            replace(
-                config.execution,
+            config.execution.replace(
                 attention_backend="torch",
                 encoder_cache_entries=1024,
             ),
@@ -470,7 +469,7 @@ def load_worker_model(
     if override is not None:
         if not isinstance(override, str):
             raise invalid_descriptor("worker KV dtype is unsupported")
-        worker_config = replace(worker_config, kv_cache_dtype=override)
+        worker_config = worker_config.replace(kv_cache_dtype=override)
 
     logger.info("loaded numerical model %s", type(model).__qualname__)
     return WorkerModel(

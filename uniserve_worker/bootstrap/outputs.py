@@ -12,7 +12,6 @@ video codec publishes. ``uniserve_worker.bootstrap.capacity`` and
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
 from types import MappingProxyType
 
 import torch
@@ -132,8 +131,7 @@ def resolve_outputs(
     # Condition products are sized by the condition rows the deployment's
     # denoiser provisions (``condition_capacity``).
     denoiser = video_denoiser(model, config)
-    config = replace(
-        config,
+    config = config.replace(
         max_condition_rows=0
         if denoiser is None
         else condition_capacity(denoiser, config),

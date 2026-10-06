@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -30,8 +28,7 @@ def _startup(monkeypatch: pytest.MonkeyPatch, *, held: int, reserved: int):
     install_device_storage(monkeypatch, storage)
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: reserved)
 
-    config = replace(
-        stub_worker_config(max_batch_tokens=8),
+    config = stub_worker_config(max_batch_tokens=8).replace(
         device="cuda:0",
         kv_storage_fraction=FRACTION,
     )

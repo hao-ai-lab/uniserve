@@ -26,7 +26,7 @@ def test_a_non_positive_flashinfer_workspace_is_a_usage_error(
         worker_args(tmp_path, flashinfer_workspace_size=size)
 
     assert exit_info.value.code == 2
-    assert "--flashinfer-workspace-size" in capsys.readouterr().err
+    assert "FlashInfer workspace size" in capsys.readouterr().err
 
 
 # Representations no native CUDA attention kernel computes, with the option

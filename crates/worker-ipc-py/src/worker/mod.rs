@@ -7,6 +7,7 @@ mod block_tables;
 mod buffer;
 mod capacity;
 mod completion;
+mod config;
 mod descriptor_grants;
 pub(crate) mod error;
 mod events;
@@ -46,6 +47,24 @@ mod weight_prefetch;
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     capacity::register(module)?;
+    module.add_class::<config::WorkerConfig>()?;
+    module.add_class::<config::LaneConfig>()?;
+    module.add_function(wrap_pyfunction!(config::graph_padding_block_count, module)?)?;
+    module.add(
+        "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
+        pyo3::types::PyTuple::new(module.py(), uniserve_worker::config::default_decode_sizes())?,
+    )?;
+    module.add(
+        "DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS",
+        pyo3::types::PyTuple::new(
+            module.py(),
+            uniserve_worker::config::default_prefill_sizes(),
+        )?,
+    )?;
+    module.add(
+        "DEFAULT_PREFILL_GRAPH_ROW_BUCKETS",
+        pyo3::types::PyTuple::new(module.py(), uniserve_worker::config::PREFILL_ROW_BUCKETS)?,
+    )?;
     module.add_class::<sampling::SamplingMetadata>()?;
     module.add_function(wrap_pyfunction!(sampling::sample, module)?)?;
     module.add_function(wrap_pyfunction!(sampling::sample_graph, module)?)?;

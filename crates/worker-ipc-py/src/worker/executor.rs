@@ -490,11 +490,8 @@ impl Executor {
             .clone()
             .ok_or_else(|| PyRuntimeError::new_err("worker capacity is not initialized"))?;
         let capacity = info.queue_depth as usize;
-        let distributed = worker
-            .getattr("worker_config")?
-            .getattr("world_size")?
-            .extract::<usize>()?
-            > 1;
+        let distributed =
+            crate::worker::config::native(&worker.getattr("worker_config")?)?.world_size > 1;
         let cache = worker.getattr("kv_cache")?;
         let (cache_manager, cache_imports) = if cache.is_none() {
             (None, None)
