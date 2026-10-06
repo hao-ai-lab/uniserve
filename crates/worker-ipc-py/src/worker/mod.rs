@@ -76,10 +76,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<graph_shapes::PrefillShape>()?;
     module.add_class::<graph_shapes::TextShapes>()?;
     module.add_function(wrap_pyfunction!(graph_shapes::prefill_units, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        graph_shapes::select_prefill_captures,
-        module
-    )?)?;
+    module.add_function(wrap_pyfunction!(graph_shapes::prefill_captures, module)?)?;
     module.add_function(wrap_pyfunction!(microbatches::yield_microbatch, module)?)?;
     module.add_class::<microbatches::Microbatches>()?;
     module.add_class::<model_runners::ModelRunners>()?;

@@ -91,7 +91,7 @@ impl PrefillShape {
 
 #[pyclass(frozen, module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct TextShapes {
-    inner: NativeTextShapes,
+    pub(super) inner: NativeTextShapes,
 }
 
 #[pymethods]
@@ -159,35 +159,6 @@ pub(crate) fn prefill_units(
     Ok(uniserve_worker::prefill_units(&pages, rows, tokens))
 }
 
-#[pyfunction]
-#[pyo3(signature = (token_sizes, row_sizes, *, max_rows, max_tokens, variants, outputs=true, pool=None))]
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn select_prefill_captures<'py>(
-    py: Python<'py>,
-    token_sizes: Vec<usize>,
-    row_sizes: Vec<usize>,
-    max_rows: usize,
-    max_tokens: usize,
-    variants: Vec<(Option<bool>, bool)>,
-    outputs: bool,
-    pool: Option<(Vec<(usize, usize)>, usize)>,
-) -> PyResult<Bound<'py, PyTuple>> {
-    if let Some((pages, _)) = &pool {
-        validate_pages(pages)?;
-    }
-    let shapes = uniserve_worker::prefill_shapes(
-        &token_sizes,
-        &row_sizes,
-        max_rows,
-        max_tokens,
-        &variants,
-        outputs,
-        pool.as_ref()
-            .map(|(pages, units)| (pages.as_slice(), *units)),
-    );
-    shapes_to_py(py, shapes)
-}
-
 fn validate_pages(pages: &[(usize, usize)]) -> PyResult<()> {
     if pages.iter().any(|&(tokens, _)| tokens == 0) {
         return Err(PyValueError::new_err(
@@ -197,7 +168,7 @@ fn validate_pages(pages: &[(usize, usize)]) -> PyResult<()> {
     Ok(())
 }
 
-fn shapes_to_py<'py>(
+pub(super) fn shapes_to_py<'py>(
     py: Python<'py>,
     shapes: impl IntoIterator<Item = NativePrefillShape>,
 ) -> PyResult<Bound<'py, PyTuple>> {
@@ -206,4 +177,95 @@ fn shapes_to_py<'py>(
         .map(|inner| Py::new(py, PrefillShape { inner }))
         .collect::<PyResult<Vec<_>>>()?;
     PyTuple::new(py, shapes)
+}
+
+/// Decode rows each hold one page of every KV group. Unit zero is padding.
+pub(super) fn decode_shapes(
+    config: &Bound<'_, PyAny>,
+    max_rows: usize,
+    row_units: usize,
+    num_units: usize,
+) -> PyResult<Vec<usize>> {
+    if config.getattr("graph_policy")?.extract::<String>()? == "off" {
+        return Ok(Vec::new());
+    }
+    Ok(config
+        .getattr("decode_graph_batch_sizes")?
+        .extract::<Vec<usize>>()?
+        .into_iter()
+        .filter(|&rows| rows > 0 && rows <= max_rows && rows * row_units < num_units)
+        .collect())
+}
+
+/// Startup and capacity planning use the same causal and multimodal buckets.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn configured_prefill(
+    config: &Bound<'_, PyAny>,
+    max_rows: usize,
+    max_tokens: usize,
+    image_builder: bool,
+    feature_injection: bool,
+    device_causality: bool,
+    pool: Option<(&[(usize, usize)], usize)>,
+) -> PyResult<Vec<NativePrefillShape>> {
+    if config.getattr("graph_policy")?.extract::<String>()? == "off"
+        || !config.getattr("prefill_cuda_graph")?.extract::<bool>()?
+    {
+        return Ok(Vec::new());
+    }
+    let mut variants = vec![(Some(true), image_builder)];
+    if feature_injection {
+        variants.push((Some(false), true));
+        if device_causality {
+            variants.push((None, true));
+        }
+    }
+    let tokens = config
+        .getattr("prefill_graph_token_sizes")?
+        .extract::<Vec<usize>>()?;
+    let rows = config
+        .py()
+        .import("uniserve_worker.config.execution")?
+        .getattr("DEFAULT_PREFILL_GRAPH_ROW_BUCKETS")?
+        .extract::<Vec<usize>>()?;
+    Ok(uniserve_worker::prefill_shapes(
+        &tokens,
+        &rows,
+        max_rows,
+        max_tokens,
+        &variants,
+        config.getattr("prefill_outputs")?.extract()?,
+        pool,
+    ))
+}
+
+/// Configured prefill buckets, including the inert padding sequence.
+#[pyfunction]
+#[pyo3(signature = (config, *, max_rows, max_tokens, image_builder, feature_injection, device_causality, pool=None))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn prefill_captures<'py>(
+    config: &Bound<'py, PyAny>,
+    max_rows: usize,
+    max_tokens: usize,
+    image_builder: bool,
+    feature_injection: bool,
+    device_causality: bool,
+    pool: Option<(Vec<(usize, usize)>, usize)>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    if let Some((pages, _)) = &pool {
+        validate_pages(pages)?;
+    }
+    shapes_to_py(
+        config.py(),
+        configured_prefill(
+            config,
+            max_rows,
+            max_tokens,
+            image_builder,
+            feature_injection,
+            device_causality,
+            pool.as_ref()
+                .map(|(pages, units)| (pages.as_slice(), *units)),
+        )?,
+    )
 }

@@ -1,5 +1,6 @@
 //! Numerical runner bindings and batched dispatch.
 
+mod binding;
 mod diffusion;
 mod dispatch;
 mod execute;
@@ -24,7 +25,6 @@ use uniserve_worker_ipc::{CallKind, MediaCall};
 
 use crate::calls::Call;
 
-use super::error::native_error;
 use super::execution::Execution;
 use super::host::with_context;
 use super::model_results::ExecutionOutput;
@@ -355,29 +355,35 @@ impl ModelRunners {
         PyTuple::new(py, values.collect::<Vec<_>>())
     }
 
-    #[getter]
-    fn lane_count(&self) -> usize {
-        self.streams.lane_count()
-    }
-
-    #[pyo3(signature = (owner, *, event_slots=None))]
-    fn initialize_streams(
+    /// Bind numerical backing and graph buckets once for every local lane.
+    #[pyo3(signature = (owner, *, input_config, kv_cache, latent_pool, decode_predicates, max_calls, request_slots, latent_capacity_units, table_widths, max_inflight))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn configure_inputs(
         slf: &Bound<'_, Self>,
         owner: &Bound<'_, PyAny>,
-        event_slots: Option<usize>,
+        input_config: &Bound<'_, PyAny>,
+        kv_cache: &Bound<'_, PyAny>,
+        latent_pool: &Bound<'_, PyAny>,
+        decode_predicates: &Bound<'_, PyAny>,
+        max_calls: usize,
+        request_slots: usize,
+        latent_capacity_units: usize,
+        table_widths: Vec<usize>,
+        max_inflight: usize,
     ) -> PyResult<()> {
-        ensure_open(owner)?;
-        let streams = Arc::clone(&slf.borrow().streams);
-        streams.initialize(owner, event_slots)
-    }
-
-    #[pyo3(signature = (device, *, microbatches=false))]
-    fn batch_streams<'py>(
-        &self,
-        device: &Bound<'py, PyAny>,
-        microbatches: bool,
-    ) -> PyResult<Bound<'py, PyTuple>> {
-        self.streams.batch_streams(device, microbatches)
+        binding::configure(
+            slf,
+            owner,
+            input_config,
+            kv_cache,
+            latent_pool,
+            decode_predicates,
+            max_calls,
+            request_slots,
+            latent_capacity_units,
+            table_widths,
+            max_inflight,
+        )
     }
 
     #[getter]
@@ -398,22 +404,10 @@ impl ModelRunners {
             .map(|exchange| exchange.clone_ref(py))
     }
 
-    fn exchange(&self, py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
-        self.exchanges
-            .get(index)
-            .map(|exchange| exchange.clone_ref(py))
-            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err(index))
-    }
-
-    fn configure_exchanges(
+    pub(super) fn configure_experts(
         slf: &Bound<'_, Self>,
         owner: &Bound<'_, PyAny>,
-        max_tokens: usize,
     ) -> PyResult<()> {
-        experts::configure(slf, owner, max_tokens)
-    }
-
-    fn configure_experts(slf: &Bound<'_, Self>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
         experts::configure_worker(slf, owner)
     }
 
@@ -644,35 +638,6 @@ impl ModelRunners {
         self.clear();
     }
 
-    /// Bind whole-row numerical peers to their shared native execution group.
-    fn bind_microbatches(&self, py: Python<'_>, peers: &Bound<'_, PyTuple>) -> PyResult<()> {
-        let executions = peers
-            .iter()
-            .map(|peer| execution(&peer).map(Bound::unbind))
-            .collect::<PyResult<Vec<_>>>()?;
-        Execution::bind_microbatches(py, executions)?;
-        for peer in peers {
-            peer.setattr("peers", peers)?;
-        }
-        Ok(())
-    }
-
-    fn bind(
-        &mut self,
-        py: Python<'_>,
-        component: &str,
-        kinds: &Bound<'_, PyAny>,
-        runner: Py<PyAny>,
-    ) -> PyResult<()> {
-        let kinds = kinds
-            .try_iter()?
-            .map(|kind| pythonize::depythonize(&kind?).map_err(Into::into))
-            .collect::<PyResult<Vec<CallKind>>>()?;
-        self.inner
-            .bind(component, &kinds, runner)
-            .map_err(|error| native_error(py, error))
-    }
-
     fn get(
         &self,
         py: Python<'_>,
@@ -706,6 +671,19 @@ pub(super) fn context<'py>(runner: &Bound<'py, PyAny>) -> PyResult<Bound<'py, Py
 }
 
 impl ModelRunners {
+    /// Bind whole-row numerical peers to their shared native execution group.
+    fn bind_microbatches(&self, py: Python<'_>, peers: &Bound<'_, PyTuple>) -> PyResult<()> {
+        let executions = peers
+            .iter()
+            .map(|peer| execution(&peer).map(Bound::unbind))
+            .collect::<PyResult<Vec<_>>>()?;
+        Execution::bind_microbatches(py, executions)?;
+        for peer in peers {
+            peer.setattr("peers", peers)?;
+        }
+        Ok(())
+    }
+
     /// The caller drains streams and output readers before releasing contexts.
     /// Every close is attempted; shared scratch outlives the contexts using it.
     fn close_modules(slf: &Bound<'_, Self>) -> PyResult<()> {
