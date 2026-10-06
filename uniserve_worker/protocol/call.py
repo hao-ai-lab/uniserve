@@ -408,7 +408,7 @@ class Bounds:
 
     Zero means the call may use none of that resource. `Call.validate` checks
     `max_tokens` against the input token ids and `max_latent_bytes` against
-    encoder, latent, and image outputs; `Batch.validate` checks
+    encoder, latent, and image outputs; native batch validation checks
     `max_transfer_bytes` against installed KV transfers.
     """
 

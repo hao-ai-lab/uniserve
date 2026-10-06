@@ -731,8 +731,6 @@ def test_a_call_whose_coordinates_contradict_the_request_is_refused() -> None:
     it was scheduled for, so a claim that disagrees with the request's own
     progress ends the call rather than producing a token at the wrong place.
     """
-    from dataclasses import replace
-
     worker = execution_worker()
     admission = ar_params(91, block_ids=(0,))
     prefill = token_call(
@@ -766,8 +764,7 @@ def test_a_call_whose_coordinates_contradict_the_request_is_refused() -> None:
         )
         run = stamp_batch(worker, execution_batch(batch_id=2, calls=(decode,)))
         # The prompt left the request at position two; claim the origin.
-        contradicted = replace(
-            run,
+        contradicted = run.replace(
             calls=(run.calls[0].replace(coordinates=CallCoordinates()),),
         )
         refused = finalized_report(worker, worker.submit(contradicted))

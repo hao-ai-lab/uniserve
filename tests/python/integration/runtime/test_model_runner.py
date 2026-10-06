@@ -914,8 +914,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact( 
         admissions=(),
         calls=(flow,),
     )
-    batch = replace(
-        valid_batch,
+    batch = valid_batch.replace(
         seq_lens=tuple(
             query + 1 if slot != admission.request_pool_idx else length
             for length, query, slot in zip(
@@ -1219,8 +1218,7 @@ def test_rejected_interval_preserves_unequal_denoising_trajectories() -> None:
                     for index, admission in enumerate(admissions)
                 )
                 batch = execution_batch(batch_id=batch_id, calls=calls)
-                batch = replace(
-                    batch,
+                batch = batch.replace(
                     latent_params=(
                         batch.latent_params[0],
                         replace(batch.latent_params[1], start_step=1),
@@ -1936,8 +1934,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
             for item in initial.buffer_allocations
             if item.buffer == source.buffer_id
         )
-        reuse = replace(
-            reuse,
+        reuse = reuse.replace(
             buffer_allocations=tuple(
                 replace(item, offset=source_allocation.offset)
                 if item.buffer == replacement.encoder_output.buffer_id
@@ -2193,8 +2190,8 @@ def test_local_and_imported_completion_predicates_keep_request_progress(
             coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),
-            token_input=source,
-            token_output=transferred,
+            inputs=(source,),
+            outputs=(transferred,),
         )
         transfer_report = finalized_report(
             producer,
@@ -2419,8 +2416,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             input_products=transferred,
         )
         # Destination page order is independent of the source's page order.
-        return replace(
-            batch,
+        return batch.replace(
             latent_params=tuple(
                 replace(
                     allocation,
@@ -2583,7 +2579,10 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
                 call_id=moved.producer_call_id,
                 coordinates=CallCoordinates(),
                 kind=TransferMode.TENSOR,
-                bounds=Bounds(max_transfer_bytes=image.max_bytes),
+                bounds=Bounds(
+                    max_transfer_bytes=image.max_bytes,
+                    max_latent_bytes=image.max_bytes,
+                ),
                 image_input=image,
                 image_output=moved,
             )

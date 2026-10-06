@@ -1135,8 +1135,7 @@ impl BatchCommand {
     /// Returns a discriminant that distinguishes command variants.
     ///
     /// [`Batch::validate`] uses it in the identity that detects repeated
-    /// commands. `_command_variant_index` in `uniserve_worker.protocol.batch`
-    /// returns the same values.
+    /// commands.
     pub const fn variant_index(&self) -> u8 {
         match self {
             Self::Start { .. } => 0,
@@ -1300,6 +1299,12 @@ impl NewRequest {
         );
         if let Some(ar) = &self.ar {
             ar.sampling.validate()?;
+            if let Some(canvas) = &ar.canvas
+                && let Some(parameter) = canvas.invalid_parameter()
+            {
+                bail_invalid!("invalid canvas sampling {parameter}");
+            }
+
             ensure_valid!(
                 ar.finish_token_ids.windows(2).all(|pair| pair[0] < pair[1]),
                 "autoregressive finish token ids are not canonical"

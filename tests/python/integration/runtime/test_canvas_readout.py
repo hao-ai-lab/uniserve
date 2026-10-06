@@ -377,8 +377,7 @@ def test_canvas_rows_read_candidates_over_the_cached_prompt(tmp_path):
     worker = _worker(tmp_path)
     with worker:
         prefill = _prefill(1, 0, tokens=prompt.tolist())
-        prefill = replace(
-            prefill,
+        prefill = prefill.replace(
             commands=(_admission(),),
             new_cache_units=tuple(
                 CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)
@@ -619,8 +618,7 @@ def _encode(batch, image, soft):
 def _admitted_prefill(batch, tokens, input_images):
     """``REQUEST``'s admission with the prefill of its first ``tokens``."""
     tables = _tables(len(tokens))
-    return replace(
-        _prefill(batch, 0, tokens=tokens),
+    return _prefill(batch, 0, tokens=tokens).replace(
         commands=(_admission(input_images=input_images),),
         new_cache_units=tuple(
             CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)

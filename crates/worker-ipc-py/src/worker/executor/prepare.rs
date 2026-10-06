@@ -11,6 +11,7 @@ use uniserve_worker_ipc::{BatchCommand, CallKind, MediaCall, TransferMode};
 use super::super::error::{invalid, native_error};
 use super::super::inputs::BatchInputs;
 use super::{BatchState, PythonBackend};
+use crate::convert::{RequestConversion, admission_to_py};
 
 impl PythonBackend {
     pub(super) fn prepare_batch(&self, py: Python<'_>, batch: &mut BatchState) -> PyResult<()> {
@@ -33,15 +34,14 @@ impl PythonBackend {
 
         // Install Starts before resolving predecessors. Even if a later Start
         // or its numerical noise preparation fails, reset all admitted slots.
-        let numerical_batch = batch.numerical.borrow(py).batch.clone_ref(py);
-        let commands = numerical_batch.bind(py).getattr("commands")?;
+        let mut views = RequestConversion::new(py)?;
         let mut admitted = Vec::new();
         let started = (|| -> PyResult<()> {
-            for (index, command) in batch.plan.commands.iter().enumerate() {
+            for command in &batch.plan.commands {
                 let BatchCommand::Start { request } = command else {
                     continue;
                 };
-                let admission = commands.get_item(index)?.getattr("request")?;
+                let admission = admission_to_py(py, request, &mut views)?;
                 let slot =
                     self.requests
                         .borrow_mut(py)

@@ -588,11 +588,7 @@ def _none_if_empty(value: object | None) -> str | None:
 
 def _canvas_sampling(value: object | None) -> CanvasSampling | None:
     """Parse the served block-diffusion sampling, keeping ``None`` as none."""
-    return (
-        None
-        if value is None
-        else CanvasSampling.from_mapping(value, "canvas_sampling")
-    )
+    return None if value is None else CanvasSampling.from_mapping(value)
 
 
 def _optional_float(value: object | None) -> float | None:

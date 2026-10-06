@@ -139,7 +139,7 @@ impl CanvasSampling {
     /// Returns the first parameter the scheduler cannot plan with, if any:
     /// an empty canvas or step limit, or a non-finite sampling value. The
     /// worker's sampler checks the sampling values' domain itself.
-    fn invalid_parameter(&self) -> Option<&'static str> {
+    pub fn invalid_parameter(&self) -> Option<&'static str> {
         if self.canvas_length == 0 {
             Some("canvas_length")
         } else if self.max_steps == 0 {

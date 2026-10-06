@@ -6,7 +6,7 @@ use uniserve_core::{CallId, ConditionMedia, ConditionVision, VideoCondition, Vis
 use uniserve_worker_ipc::{BufferId, NewRequest, RequestKey, VideoAdmission};
 
 /// Decode immutable admission parameters once, before the pool mutates state.
-pub(super) fn new_request(value: &Bound<'_, PyAny>) -> PyResult<NewRequest> {
+pub(crate) fn new_request(value: &Bound<'_, PyAny>) -> PyResult<NewRequest> {
     let video = value.getattr("video")?;
     Ok(NewRequest {
         request_key: request_key(&value.getattr("request_key")?)?,

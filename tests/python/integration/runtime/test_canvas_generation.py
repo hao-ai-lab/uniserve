@@ -98,7 +98,7 @@ SAMPLING = sampler.CanvasSampling(
 )
 # Sampling whose blocks stop at their first step: every argmax canvas is
 # stable without history, and every mean entropy is below the threshold.
-EARLY = replace(ADMITTED, confidence_threshold=100.0, stability_threshold=0)
+EARLY = ADMITTED.replace(confidence_threshold=100.0, stability_threshold=0)
 EARLY_SAMPLING = replace(SAMPLING, confidence=100.0, stability=0)
 
 
@@ -120,22 +120,7 @@ def _step(batch, context, block, step, predicate=None):
     The step's completion output reports whether its block continues; a
     queued step is predicated on the ``predicate`` of the step before it.
     """
-    call = _call(
-        batch,
-        ForwardMode.TOKEN_DENOISING,
-        context,
-        bounds=Bounds(max_tokens=CANVAS, max_completion_bytes=4 * CANVAS),
-        canvas=CanvasStep(block, step),
-        completion_output=TensorRef(
-            request_key=REQUEST,
-            producer_call_id=CallId(batch, 0),
-            output_index=0,
-            generation=batch,
-            dtype=DType.U8,
-            shape_bound=ShapeBound(),
-        ),
-        predicate=predicate,
-    )
+    call = _row_step(batch, 0, REQUEST, context, block, step, predicate)
     return Batch(
         batch_id=batch,
         collective_seq=batch,
@@ -286,8 +271,7 @@ def _expected_blocks(root, prompt, sampling=SAMPLING):
 
 def _admitted_prompt(worker, prompt, canvas=ADMITTED):
     """Admit the request with ``canvas`` sampling and prefill ``prompt``."""
-    prefill = replace(
-        _prefill(1, 0, tokens=prompt),
+    prefill = _prefill(1, 0, tokens=prompt).replace(
         commands=(_admission(canvas),),
         block_tables=_tables(13 + 2 * CANVAS),
         new_cache_units=tuple(
@@ -325,8 +309,7 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
             return tuple(record.committed_tokens)
 
         actual = _block(run, 13, 0, 2)
-        commit = replace(
-            _prefill(10, 13, tokens=list(actual[-1])),
+        commit = _prefill(10, 13, tokens=list(actual[-1])).replace(
             block_tables=_tables(13 + 2 * CANVAS),
         )
         assert _run(worker, commit).completions[0].kv_visible_len == 13 + CANVAS
@@ -402,8 +385,7 @@ def test_queued_steps_give_the_blocks_of_steps_that_wait(tmp_path):
                 actual.append(tuple(record.committed_tokens))
             queued.extend(records[finishing + 1 :])
             if block == 0:
-                commit = replace(
-                    _prefill(batch, 13, tokens=list(actual[-1])),
+                commit = _prefill(batch, 13, tokens=list(actual[-1])).replace(
                     block_tables=_tables(13 + 2 * CANVAS),
                 )
                 assert (
@@ -427,8 +409,7 @@ def _first_step_status(root, admitted, step):
     """
     worker = _worker(root, canvas_sampling=ADMITTED)
     with worker:
-        prefill = replace(
-            _prefill(1, 0, tokens=list(range(7, 20))),
+        prefill = _prefill(1, 0, tokens=list(range(7, 20))).replace(
             commands=(_admission(admitted),),
             new_cache_units=tuple(
                 CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)
@@ -450,7 +431,7 @@ def test_a_step_that_skips_its_canvas_is_refused(tmp_path):
 def test_a_canvas_with_other_sampling_is_refused(tmp_path):
     """A worker steps only canvases of the sampling it serves."""
     diffusion_gemma_checkpoint(tmp_path)
-    other = replace(ADMITTED, max_steps=ADMITTED.max_steps + 1)
+    other = ADMITTED.replace(max_steps=ADMITTED.max_steps + 1)
     assert _first_step_status(tmp_path, other, 0) is CallStatus.ERROR
     assert _first_step_status(tmp_path, ADMITTED, 0) is CallStatus.OK
 
@@ -478,22 +459,22 @@ def _second_tables(tokens):
 
 def _row_step(batch, row, request, context, block, step, predicate=None):
     """Row ``row`` of batch ``batch``: request ``request``'s canvas step."""
-    return (
-        _step(batch, context, block, step, predicate)
-        .calls[0]
-        .replace(
+    return _call(
+        batch,
+        ForwardMode.TOKEN_DENOISING,
+        context,
+        bounds=Bounds(max_tokens=CANVAS, max_completion_bytes=4 * CANVAS),
+        canvas=CanvasStep(block, step),
+        completion_output=TensorRef(
             request_key=request,
-            call_id=CallId(batch, row),
-            completion_output=TensorRef(
-                request_key=request,
-                producer_call_id=CallId(batch, row),
-                output_index=0,
-                generation=batch,
-                dtype=DType.U8,
-                shape_bound=ShapeBound(),
-            ),
-        )
-    )
+            producer_call_id=CallId(batch, row),
+            output_index=0,
+            generation=batch,
+            dtype=DType.U8,
+            shape_bound=ShapeBound(),
+        ),
+        predicate=predicate,
+    ).replace(request_key=request, call_id=CallId(batch, row))
 
 
 def _steps_batch(batch, rows):
@@ -542,8 +523,7 @@ def test_a_batch_of_canvas_steps_reports_each_rows_outcome(tmp_path):
     with worker:
         _admitted_prompt(worker, first_prompt)
         second = _prefill(2, 0, tokens=second_prompt)
-        admitted = replace(
-            second,
+        admitted = second.replace(
             calls=(second.calls[0].replace(request_key=SECOND),),
             commands=(
                 Start(
@@ -595,8 +575,7 @@ def test_a_batch_of_canvas_steps_reports_each_rows_outcome(tmp_path):
         gated_commit = _prefill(batch + 1, 13, tokens=list(expected[stop]))
         (record,) = _run(
             worker,
-            replace(
-                gated_commit,
+            gated_commit.replace(
                 calls=(
                     gated_commit.calls[0].replace(
                         predicate=stopping.completion_output,
