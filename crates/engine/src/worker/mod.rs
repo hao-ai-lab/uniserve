@@ -125,7 +125,7 @@ pub struct WorkerProcessArgs {
     /// process's static allocations; `WorkerConfig::validate_storage_fraction`
     /// states its range.
     pub kv_storage_fraction: f64,
-    /// Optional device mesh specification for staged model components.
+    /// Optional device mesh specification for model components.
     pub mesh: Option<String>,
     /// Optional process-world communication backend.
     pub distributed_backend: Option<String>,

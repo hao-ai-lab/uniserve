@@ -339,7 +339,7 @@ def test_gemma4_preprocessing_matches_the_transformers_processor(
     torch.testing.assert_close(
         result.pixels, expected["pixel_values"][0, :count], rtol=0, atol=0
     )
-    # Rows follow the staged grid in raster order, which is where the
+    # Rows follow the image grid in raster order, which is where the
     # reference places its (column, row) patch positions.
     rows, columns = result.grid_shape
     assert result.grid.tolist() == [[rows, columns]]
@@ -359,7 +359,7 @@ def test_gemma4_preprocessing_matches_the_transformers_processor(
     _DIFFUSION_GEMMA_TOKEN_CASES,
     ids=lambda case: f"{case['width']}x{case['height']}",
 )
-def test_gemma4_staged_soft_tokens_match_the_server_planner(tmp_path, case):
+def test_gemma4_image_soft_tokens_match_the_server_planner(tmp_path, case):
     image = Image.new("RGB", (case["width"], case["height"]), (90, 120, 150))
 
     result = prepare_image(

@@ -2,7 +2,7 @@
 
 ``uniserve serve`` logs one ``uniserve-kernel-table`` line when startup
 completes (see ``uniserve_worker.execution.kernel_table``). Startup runs
-every staged call kind, image encoders and decoders included, so for an
+every call kind, image encoders and decoders included, so for an
 image-understanding model the table already names the kernels that serve
 image inputs: here BAGEL's SigLIP vision tower, its autoencoder's encoder
 and decoder, the non-causal image-feature rows its prefill appends, and the

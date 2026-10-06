@@ -260,7 +260,7 @@ def test_text_graph_replay_uses_live_lengths_tokens_and_cache_blocks(
                 output.clone().values,
                 tuple(v.clone() for v in output.values),
             )
-        # Different graph shapes share the entry's staged columns. An
+        # Different graph shapes share the input buffers. An
         # earlier prefill must still execute correctly after decode has
         # changed the same storage's lengths, IDs, positions and writes.
         sequences = ((3, 5, 7, 9), (11, 13))

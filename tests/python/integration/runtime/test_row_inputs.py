@@ -1,7 +1,7 @@
 """Token rows prepare the attention columns their host page layout describes.
 
 ``AttentionBuffers.gather_rows`` gathers every numerical table's units, first
-staged pages and write addresses from the request slots' resident tables.
+gathered pages and write addresses from the request slots' resident tables.
 Over random calls of a model whose windowed and full-attention groups share
 one unit pool (six numerical tables, as DiffusionGemma has), its attention
 inputs, padded to a graph bucket, equal those of the same call's host layout
@@ -129,11 +129,11 @@ def _host_layout(rows, manager):
 
 
 def _columns(batch, padding_from=None):
-    """Every staged attention column of a batch, on the host.
+    """Every attention input column of a batch, on the host.
 
     With ``padding_from``, the batch is padded to a bucket: its tables are
     compared from that row on, since the columns of live rows past their
-    staged pages are never read and hold whatever earlier calls left.
+    gathered pages are never read and hold whatever earlier calls left.
     """
     attention = batch.inputs.attention
     values = {
@@ -181,7 +181,7 @@ def _compare(columns, expected):
     ids=("appending", "mixed", "read_only"),
 )
 @torch.inference_mode()
-def test_rows_stage_the_columns_their_host_layout_describes(
+def test_rows_gather_the_columns_their_host_layout_describes(
     device, write, causal
 ):
     model = hybrid_model()
@@ -197,7 +197,7 @@ def test_rows_stage_the_columns_their_host_layout_describes(
         table_widths=(WIDTH,) * 6,
         hidden_size=0,
     )
-    staged = TokenBuffers(config=buffer_config, device=device)
+    buffers = TokenBuffers(config=buffer_config, device=device)
     reference = TokenBuffers(config=buffer_config, device=device)
     generator = random.Random(1 + (write is None) + 2 * (not causal))
     try:
@@ -208,7 +208,7 @@ def test_rows_stage_the_columns_their_host_layout_describes(
             )
             if not rows:
                 continue
-            actual = staged.prepare_inputs(
+            actual = buffers.prepare_inputs(
                 rows,
                 forward_mode=ForwardMode.PREFILL,
                 cache=manager,
@@ -228,9 +228,9 @@ def test_rows_stage_the_columns_their_host_layout_describes(
             tokens = actual.inputs.input_ids.numel()
             bucket = (len(rows) + 1, tokens + 1, (WIDTH,) * 6, False)
             padded, padded_expected = (
-                pad_text(batch, *bucket, buffers=buffers)
-                for batch, buffers in (
-                    (actual, staged),
+                pad_text(batch, *bucket, buffers=inputs)
+                for batch, inputs in (
+                    (actual, buffers),
                     (expected, reference),
                 )
             )
@@ -241,6 +241,6 @@ def test_rows_stage_the_columns_their_host_layout_describes(
     finally:
         if device != "cpu":
             torch.cuda.synchronize()
-        staged.close()
+        buffers.close()
         reference.close()
         manager.close()

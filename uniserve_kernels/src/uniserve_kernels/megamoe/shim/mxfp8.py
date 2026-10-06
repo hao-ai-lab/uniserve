@@ -711,7 +711,7 @@ class MegaMoEMxfp8Frontend:
             shared_workspace=self._to_cute(mega.shared_workspace),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
             # fc1_c is the optional in-kernel fc1-out C buffer (generate_c path);
-            # None uses the kernel's internal staging (matches the drop default).
+            # None uses the kernel's internal buffers (matches the drop default).
             fc1_c=None,
             stream=stream,
         )
@@ -753,7 +753,7 @@ def init_dist() -> Tuple[int, int]:
 
 @dataclass
 class MegaMoEMxfp8SymmBuffer:
-    """Symmetric-heap staging buffers for one MXFP8 MegaMoE session.
+    """Symmetric-heap input and combine buffers for one MXFP8 MegaMoE session.
 
     Mirrors the NVFP4 :class:`MegaMoESymmBuffer`: exposes ``x``, ``x_sf``,
     ``topk_idx``, and ``topk_weights`` views sized for ``num_max_tokens``.
@@ -812,7 +812,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     token_back_by_dispatch: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEMxfp8SymmBuffer:
-    """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
+    """Allocate symmetric-heap input and combine buffers for one MXFP8 session.
 
     Argument order follows the NVFP4 frontend (problem sizes first).  Pass
     ``rank`` / ``world_size`` from :func:`init_dist`.
@@ -897,8 +897,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     sym_roots.append(x_sf_root)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
-    # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
-    # tail, but start from the masked state so a partial first staging is safe.
+    # as live tokens routed to expert 0. Callers copy active rows into [:n]
+    # and mask the tail. Initialize all routes to -1 for partial first batches.
     topk_idx.fill_(-1)
     sym_roots.append(topk_idx)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
@@ -1219,7 +1219,7 @@ def create_dummy_inputs(
         activation_sf.view(torch.uint8),
     )
     symm_buffer.topk_idx[:num_tokens].copy_(topk_idx.to(torch.int64))
-    # Mask pad rows (and stale routes from a previous larger staging): the
+    # Mask pad rows (and stale routes from a previous larger batch): the
     # launch covers the full buffer and relies on topk_idx[n:] == -1.
     symm_buffer.topk_idx[num_tokens:].fill_(-1)
     symm_buffer.topk_weights[:num_tokens].copy_(topk_weights.to(torch.float32))

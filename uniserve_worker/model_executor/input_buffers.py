@@ -362,7 +362,7 @@ class AttentionBuffers(InputBuffers):
         self.max_tokens = config.max_tokens
         self.table_widths = config.table_widths
         # -1 is the attention write-index sentinel for a token that writes no
-        # cache slot; unstaged capacity starts inert.
+        # cache slot; unused capacity starts inert.
         self.write_indices.fill_(-1)
         # Pinned sources of the host columns ``gather_rows`` copies.
         self._row_host = HostBuffers(
@@ -743,7 +743,7 @@ class TokenBuffers(AttentionBuffers):
         self.max_text_tokens = config.max_text_tokens
         self.hidden_size = config.hidden_size
         self.image_builder = image_builder
-        # Unstaged token capacity holds ID 1, the same value request-indexed
+        # Unused token capacity holds ID 1, the same value request-indexed
         # decode gathers into inactive rows.
         self.input_ids.fill_(1)
         self.input_embeddings = getattr(self, "input_embeddings", None)

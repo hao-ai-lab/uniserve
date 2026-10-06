@@ -275,12 +275,13 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
         chunk_rows = _projection_chunk_rows(width, dtype)
         backend_rank = group.backend_order.index(group.rank)
         pending = []
-        staged = cursor = 0
+        chunk_start = 0
+        cursor = 0
         from itertools import chain
 
-        def publish(start, count):
+        def start_gather(start, count):
             # Storage lays each payload out as [group.size, count, width] so
-            # every member contributes its staged rows at its own backend rank.
+            # every member contributes its input rows at its own backend rank.
             target = storage[
                 start * group.size * width : (start + count)
                 * group.size
@@ -291,6 +292,7 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
                 target.flatten(0, 1), target[backend_rank]
             )
             pending.append((start, count, target, work))
+
             stop = min(start + count, rows)
             if start < stop:
                 return slice(
@@ -300,7 +302,7 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
 
         consumed = 0
         try:
-            # Stage produced rows into this member's payload slot and publish
+            # Copy produced rows into this member's payload slot and gather
             # each full payload as soon as its rows are complete.
             for interval, value in chain(
                 () if first is None else (first,), chunks
@@ -314,40 +316,45 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
                 )
                 offset = 0
                 while offset < value.shape[0]:
-                    count = min(chunk_rows, capacity - staged)
+                    count = min(chunk_rows, capacity - chunk_start)
                     target = storage[
-                        staged * group.size * width : (staged + count)
+                        chunk_start * group.size * width : (chunk_start + count)
                         * group.size
                         * width
                     ].view(group.size, count, width)[backend_rank]
-                    take = min(value.shape[0] - offset, staged + count - cursor)
-                    target[cursor - staged : cursor - staged + take].copy_(
-                        value[offset : offset + take]
+
+                    take = min(
+                        value.shape[0] - offset, chunk_start + count - cursor
                     )
+                    target[
+                        cursor - chunk_start : cursor - chunk_start + take
+                    ].copy_(value[offset : offset + take])
                     cursor += take
                     offset += take
-                    if cursor == staged + count:
-                        ready = publish(staged, count)
-                        staged += count
+
+                    if cursor == chunk_start + count:
+                        ready = start_gather(chunk_start, count)
+                        chunk_start += count
                         if ready is not None:
                             yield ready
+
             if cursor != rows:
                 raise ValueError(
                     "projection chunks must cover their complete token shard"
                 )
 
-            # Pad and publish any remaining payload slots up to the shard
+            # Pad and gather any remaining payload slots up to the shard
             # capacity so every peer's collective sees the same payload sizes.
-            while staged < capacity:
-                count = min(chunk_rows, capacity - staged)
+            while chunk_start < capacity:
+                count = min(chunk_rows, capacity - chunk_start)
                 target = storage[
-                    staged * group.size * width : (staged + count)
+                    chunk_start * group.size * width : (chunk_start + count)
                     * group.size
                     * width
                 ].view(group.size, count, width)[backend_rank]
-                target[max(0, cursor - staged) :].zero_()
-                ready = publish(staged, count)
-                staged += count
+                target[max(0, cursor - chunk_start) :].zero_()
+                ready = start_gather(chunk_start, count)
+                chunk_start += count
                 if ready is not None:
                     yield ready
 

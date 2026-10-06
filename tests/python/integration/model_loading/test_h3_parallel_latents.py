@@ -224,7 +224,7 @@ def _generate(
             ):
                 context.prepare(layout)
                 request = backing.view(requirements)
-                staged = host.view(requirements)
+                host_views = host.view(requirements)
                 state = {name: request[name] for name in denoiser.modalities}
                 noise = {
                     name: torch.empty(
@@ -238,7 +238,7 @@ def _generate(
                     (layout,),
                     noise=noise,
                     state={
-                        name: staged[name].unsqueeze(0)
+                        name: host_views[name].unsqueeze(0)
                         for name in denoiser.modalities
                     },
                     constants=context.constants,
@@ -249,12 +249,12 @@ def _generate(
                     layouts=(layout,),
                     out={
                         name: value
-                        for name, value in staged.items()
+                        for name, value in host_views.items()
                         if name not in denoiser.modalities
                     },
                 )
                 for name, value in request.items():
-                    value.copy_(staged[name])
+                    value.copy_(host_views[name])
                 # The checkpoint is distilled for eight evaluations.
                 schedules = denoiser.make_schedules(
                     8, shift=None, device=device

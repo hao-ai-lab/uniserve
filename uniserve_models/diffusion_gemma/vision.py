@@ -54,7 +54,7 @@ class PatchEmbedder(nn.Module):
     def forward(
         self, patches: torch.Tensor, x: torch.Tensor, y: torch.Tensor
     ) -> torch.Tensor:
-        # Pixels in [0, 1] map to [-1, 1] in their staged dtype, then round to
+        # Pixels in [0, 1] map to [-1, 1] in their input dtype, then round to
         # the weight dtype for the projection.
         pixels = 2 * (patches - 0.5)
         features = self.projection(pixels.to(self.projection.weight.dtype))

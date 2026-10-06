@@ -594,7 +594,7 @@ impl SimEngine {
                 } else {
                     0.0
                 };
-                // Penalty counts are device-resident, not carried in the staged
+                // Penalty counts are device-resident, not carried in the host
                 // state: the successor reads the committed base folded from
                 // ancestral tokens before any of them is host-observed.
                 let recent_counts = request.recent_counts();

@@ -15,7 +15,7 @@ The numerical contract is the W4A4 ModelOpt one the CuTeDSL provider keeps:
 hidden states encode to NVFP4 with the static calibrated scale ``s13`` of
 ``up_gate.input_quantizer`` (global scale ``1 / s13``) into the bytes the
 other NVFP4 providers read (stored encodings as they are, BF16 rows with
-FlashInfer's ``fp4_quantize``) and stage into the symmetric buffer, FC1 products
+FlashInfer's ``fp4_quantize``) and copy into the symmetric buffer, FC1 products
 dequantize with ``tensor_scale13[e] * s13`` before the activation, the gated
 product encodes with ``1 / s2`` of ``down.input_quantizer``, FC2 products
 dequantize with ``tensor_scale2[e] * s2``, and each route's FP32 weight
@@ -91,7 +91,7 @@ class MegaMoEBuffer:
 
     Construction is collective over ``group``: NVSHMEM initialization and
     the symmetric allocation run on every rank at the same point of its
-    startup. ``max_tokens`` bounds the tokens one rank stages per call;
+    startup. ``max_tokens`` bounds the tokens one rank supplies per call;
     ``intermediate`` is each expert's gated width ``I`` and ``activation``
     the experts' gate nonlinearity. The kernel compiles at the first call,
     which must precede any capture on every rank.
@@ -138,7 +138,7 @@ class MegaMoEBuffer:
 
         ``weights`` names the layer; ``fc1`` and ``fc2`` are its kernel-ready
         ``(weight, block scale)`` pairs. ``tokens`` is the positive local
-        extent staged for this invocation, bounded by ``max_tokens``.
+        extent supplied for this invocation, bounded by ``max_tokens``.
         """
         from uniserve_kernels.megamoe import nvfp4_mega_launch_thunk
 
@@ -206,32 +206,28 @@ class _MegaMoE(NVFP4Operator):
         self._validate(hidden, topk_ids, topk_weights)
         if hidden.shape[0] > self.buffer.max_tokens:
             raise ValueError("routed tokens exceed the MegaMoE buffer")
-        from uniserve_kernels.megamoe import note_staged_tokens
 
-        # Stage this rank's rows in the experts' input encoding, as FlashInfer's
-        # MegaMoE backend stages pre-quantized inputs (moe_ep/backends/mega/
-        # kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/backend.py:181-210): values and
-        # linear block scales and their routes. The launch reads only the
-        # staged extent. Rows stored in that encoding stage as they are; BF16
-        # rows encode with the operator's fp4_quantize, so both give the bytes
-        # the other NVFP4 providers read.
+        # Copy values, linear block scales, and routes into symmetric memory.
+        # Already-encoded rows retain their bytes; BF16 rows use the shared
+        # NVFP4 encoder. The launch reads only this call's token extent.
         symmetric = self.buffer.symmetric
         tokens = hidden.shape[0]
         fields = self.encode(hidden).buffers()
-        staged_scales = symmetric.x_sf.view(torch.uint8)
-        if staged_scales.shape[1] != fields["block_scale"].shape[1]:
-            raise ValueError("the staged block scales pad the hidden width")
+        input_scales = symmetric.x_sf.view(torch.uint8)
+        if input_scales.shape[1] != fields["block_scale"].shape[1]:
+            raise ValueError("the symmetric scale buffer pads the hidden width")
         symmetric.x.view(torch.uint8)[:tokens].copy_(fields["values"])
-        staged_scales[:tokens].copy_(fields["block_scale"])
+        input_scales[:tokens].copy_(fields["block_scale"])
         symmetric.topk_idx[:tokens].copy_(topk_ids)
         symmetric.topk_weights[:tokens].copy_(topk_weights)
+
         # The frontend's zero-token call is a no-op, but an idle EP rank
         # must still serve its peers. One invalid row keeps the collective
         # active without contributing a route or a caller-visible output.
         active_tokens = max(1, tokens)
         if not tokens:
             symmetric.topk_idx[:1].fill_(-1)
-        note_staged_tokens(symmetric.topk_idx, tokens)
+
         # The buffer's per-expert scales are shared by every layer.
         symmetric.fc1_alpha.copy_(self._fc1_alpha)
         symmetric.fc2_alpha.copy_(self._fc2_alpha)
