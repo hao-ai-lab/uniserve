@@ -24,6 +24,7 @@ from collections.abc import Sequence
 import torch
 from uniserve_kernels.triton import launchable
 
+from uniserve.runtime.device import async_tensor_h2d
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
 from uniserve_worker.storage import _decode_state as kernels
@@ -133,15 +134,24 @@ class DecodeState:
         self._ones_int32 = tensors["_ones_int32"]
         self._ones_int64 = tensors["_ones_int64"]
 
-        # Prepare the same capacity-bounded kernel used by live publications.
-        # A zero count leaves all request rows unchanged, and the row reset
-        # rewrites the sentinel with its initial values.
-        if (
+        # Whether row resets run as one fused Triton launch; decided once, so
+        # a reset does not re-query device availability.
+        self._fused_reset = (
             kernels.triton is not None
             and self.device.type == "cuda"
             and launchable(self.device)
-        ):
-            self._reset_device_row(0, 0, 0, 0)
+        )
+
+        # Prepare the same capacity-bounded kernel used by live publications.
+        # A zero count leaves all request rows unchanged, and the row reset
+        # rewrites the sentinel with its initial values.
+        if self._fused_reset:
+            self._reset_rows(
+                async_tensor_h2d(
+                    (0, 0, 0, 0), dtype=torch.int64, device=self.device
+                ),
+                1,
+            )
             kernels._publish_decode_kernel[(1,)](
                 self._ones_int64,
                 self.future_input_tokens[:, 0],
@@ -221,17 +231,19 @@ class DecodeState:
                 on a CUDA state ``torch._assert_async`` checks them and fails
                 asynchronously on the device.
         """
-        # Host fast path: with host indices and host columns on a CUDA device,
-        # each row is reset directly (one fused launch per row when Triton is
-        # launchable) without building device index tensors. A device column
-        # makes ``_host_reset_column`` return None and falls through to the
-        # indexed path.
+        # Host fast path: with host indices and host columns on a device
+        # where Triton launches, the rows and their columns stage in one
+        # non-blocking copy and every row resets in one fused launch. A
+        # device column makes ``_host_reset_column`` return None and falls
+        # through to the indexed path.
         if (
             not isinstance(request_pool_indices, torch.Tensor)
-            and self.device.type == "cuda"
+            and self._fused_reset
         ):
             host = tuple(int(value) for value in request_pool_indices)
             self._validate_host_indices(host)
+            if not host:
+                return
             valid = self._host_reset_column(valid_cache_lengths, len(host))
             logical = self._host_reset_column(logical_lengths, len(host))
             sampling = self._host_reset_column(sampling_positions, len(host))
@@ -240,13 +252,12 @@ class DecodeState:
                 and logical is not None
                 and sampling is not None
             ):
-                for position, row in enumerate(host):
-                    self._reset_device_row(
-                        row,
-                        valid[position],
-                        logical[position],
-                        sampling[position],
-                    )
+                columns = async_tensor_h2d(
+                    host + valid + logical + sampling,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self._reset_rows(columns, len(host))
                 return
 
         indices = self._indices(request_pool_indices)
@@ -499,7 +510,7 @@ class DecodeState:
             return indices
         host = tuple(int(value) for value in values)
         self._validate_host_indices(host)
-        return torch.tensor(host, dtype=torch.long, device=self.device)
+        return async_tensor_h2d(host, dtype=torch.long, device=self.device)
 
     def _validate_host_indices(self, values: tuple[int, ...]) -> None:
         """Require unique host indices within ``1..request_pool_size``."""
@@ -539,41 +550,31 @@ class DecodeState:
             raise ValueError("runtime-state reset columns are not aligned")
         return result
 
-    def _reset_device_row(
-        self,
-        row: int,
-        valid_cache_length: int,
-        logical_length: int,
-        sampling_position: int,
-    ) -> None:
-        """Reset one device row through the fused kernel or tensor fallback."""
-        if kernels.triton is not None and launchable(self.device):
-            # One program per block of the wider of the two row-wide spans.
-            block_size = 256
-            span = max(self.continuation_width, self.vocab_size)
-            kernels._reset_row_kernel[(kernels.triton.cdiv(span, block_size),)](
-                self.future_input_tokens,
-                self.penalty_counts,
-                self.predicates,
-                self.logical_lengths,
-                self.sampling_positions,
-                self.valid_cache_lengths,
-                row,
-                valid_cache_length,
-                logical_length,
-                sampling_position,
-                continuation_width=self.continuation_width,
-                vocab_size=self.vocab_size,
-                block_size=block_size,
-            )
-            return
+    def _reset_rows(self, columns: torch.Tensor, count: int) -> None:
+        """Reset ``count`` rows from a device ``[4, count]`` int64 table.
 
-        self.future_input_tokens[row].fill_(1)
-        self.penalty_counts[row].zero_()
-        self.predicates[row].fill_(False)
-        self.logical_lengths[row].fill_(logical_length)
-        self.sampling_positions[row].fill_(sampling_position)
-        self.valid_cache_lengths[row].fill_(valid_cache_length)
+        The table holds the rows, then their verified cache lengths, logical
+        lengths and sampling positions (`_decode_state._reset_rows_kernel`).
+        """
+        # One program per row and block of the wider of the two row-wide
+        # spans.
+        block_size = 256
+        span = max(self.continuation_width, self.vocab_size)
+        kernels._reset_rows_kernel[
+            (count, kernels.triton.cdiv(span, block_size))
+        ](
+            columns,
+            self.future_input_tokens,
+            self.penalty_counts,
+            self.predicates,
+            self.logical_lengths,
+            self.sampling_positions,
+            self.valid_cache_lengths,
+            count,
+            continuation_width=self.continuation_width,
+            vocab_size=self.vocab_size,
+            block_size=block_size,
+        )
 
     def _copy_or_zero(
         self,

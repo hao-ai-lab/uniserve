@@ -295,6 +295,16 @@ class HostTask:
 
     def _run(self) -> None:
         """Execute on the lane thread that dequeued this task."""
+        # A task ``cancel`` withdrew while it was queued does not run; its
+        # capacity and input lease return here, on the dequeuing thread.
+        if not self.promise.set_running_or_notify_cancel():
+            self._action = None
+            self._dependencies = ()
+            try:
+                self._release_input()
+            finally:
+                self._pool._remove(self)
+            return
         try:
             for dependency in self._dependencies:
                 dependency.result()
@@ -368,6 +378,23 @@ class HostTask:
                 return
             self._pool._tasks.remove(self)
         self._cancel()
+
+    def cancel(self) -> None:
+        """Withdraw this task unless its action has started.
+
+        An unsubmitted task is abandoned. A submitted task still queued
+        resolves ``promise`` as cancelled now and returns its capacity and
+        input lease when a lane thread dequeues it, without running. A
+        running or finished task is left to complete.
+        """
+        with self._pool._lock:
+            submitted = self._submitted
+        if not submitted:
+            self.abandon()
+        else:
+            # Succeeds only while the promise is pending; ``_run`` marks it
+            # running first, so exactly one of the two takes effect.
+            self.promise.cancel()
 
     def _cancel(self) -> None:
         self.promise.cancel()

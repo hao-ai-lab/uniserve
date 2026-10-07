@@ -30,7 +30,7 @@ from uniserve_worker.protocol.call import (
     ForwardMode,
     TransferMode,
 )
-from uniserve_worker.protocol.identity import CallId, RequestKey
+from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 
 pytestmark = pytest.mark.integration
 
@@ -227,6 +227,68 @@ def test_retained_encoder_product_outlives_its_producer_request(
         if consumer is not producer:
             consumer.close()
         producer.close()
+
+
+def test_distinct_images_beyond_the_encoder_cache_budget_encode() -> None:
+    """Encoding continues after the encoder cache fills with retained images.
+
+    The engine's encoder cache retains up to ``encoder_cache_entries``
+    features past their requests. A new distinct image's feature is placed
+    and encoded while the cache is full; once it is inserted, the cache
+    evicts its least recently used entry and frees that buffer. Every image
+    in a stream longer than the budget must therefore encode.
+    """
+    budget = 2
+    worker = execution_worker(encoder_cache_entries=budget)
+    cached: list[BufferId] = []
+    batch_id = 0
+    with worker:
+        for index in range(budget + 2):
+            admission = ar_params(index + 1, block_ids=(0,), input_images=1)
+            image = io.BytesIO()
+            Image.new("RGB", (16, 16), (40 * index, 96, 128)).save(
+                image, format="PNG"
+            )
+            batch_id += 1
+            encode = encode_call(
+                admission.request_key,
+                call_id=CallId(batch_id, 0),
+                predecessor=root_parent(admission),
+                image_base64=base64.b64encode(image.getvalue()).decode(),
+                encoder_handle=100 + index,
+                component="vision_encoder",
+            )
+            produced = finalized_report(
+                worker,
+                worker.submit(
+                    execution_batch(
+                        batch_id=batch_id,
+                        admissions=(admission,),
+                        calls=(encode,),
+                    )
+                ),
+            )
+            assert produced.completions[0].status is CallStatus.OK, (
+                f"image {index} with {len(cached)} cached features: "
+                f"{produced.completions[0]}"
+            )
+
+            # The request finishes with its feature retained by the cache,
+            # which frees its least recently used entry once over budget.
+            feature = encode.encoder_output.buffer_id
+            cached.append(feature)
+            commands: list[Finish | Free] = [
+                Finish(admission.request_key, retained_buffers=(feature,))
+            ]
+            if len(cached) > budget:
+                commands.append(Free(cached.pop(0)))
+            batch_id += 1
+            finalized_report(
+                worker,
+                worker.submit(
+                    execution_batch(batch_id=batch_id, commands=tuple(commands))
+                ),
+            )
 
 
 @pytest.mark.parametrize("retirement", ("free", "finish"))

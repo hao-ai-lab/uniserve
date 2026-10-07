@@ -10,19 +10,21 @@ page size, write addresses and, for a history-windowed group, the first page
 each row stages.
 
 This module validates one homogeneous group of ``AttentionRow`` values
-against the installed tables, selects the pages each numerical table stages,
-and builds the host-side attention batch (``PagedInput`` entries for rows
-that append to the cache, ``SegmentedInput`` entries for read-only
-prefix/current calls) that ``uniserve_worker.model_executor.input_buffers``
-then stages into its fixed device backing.
+against the installed tables (``row_tables``) and selects the pages each
+numerical table stages (``table_pages``); ``input_buffers.AttentionBuffers.
+stage_rows`` stages those pages from the resident tables on the device. For
+callers that pass a prepared batch it also builds the host-side attention
+batch (``from_tables``: ``PagedInput`` entries for rows that append to the
+cache, ``SegmentedInput`` entries for read-only prefix/current calls).
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from uniserve.math import ceil_div
@@ -32,6 +34,7 @@ from uniserve.nn.attention import (
     PagedInput,
     SegmentedInput,
     SequenceLengths,
+    paged_append,
 )
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.model_executor.input_batch import AttentionRow
@@ -121,7 +124,7 @@ def row_tables(
             window = table.shape.window
             if (
                 window is not None
-                and _first_page(table, prefix) < table.start_page
+                and first_page(table, prefix) < table.start_page
             ):
                 raise invalid_descriptor(
                     "attention row reads retired window pages"
@@ -132,7 +135,7 @@ def row_tables(
     return tuple(result)
 
 
-def _first_page(table: GroupTable, prefix: int) -> int:
+def first_page(table: GroupTable, prefix: int) -> int:
     """Return the first page a row's queries after ``prefix`` read.
 
     A query at position ``p`` reads keys at positions ``p - window`` through
@@ -176,7 +179,7 @@ def table_pages(
             ):
                 table = row[group]
                 units = table.row(position)
-                start = _first_page(table, int(prefix))
+                start = first_page(table, int(prefix))
                 if shape.window is not None:
                     end = min(
                         table.end_page,
@@ -229,27 +232,38 @@ def from_tables(
     prefixes = SequenceLengths.from_lengths(prefix_lengths, device="cpu")
 
     if any(write):
+        # Rows that do not write keep their query positions but address no
+        # cache token.
+        skipped = np.repeat(
+            np.logical_not(np.asarray(write, dtype=bool)),
+            np.asarray(query_lengths, dtype=np.int64),
+        )
         entries: dict[int, PagedInput | SegmentedInput] = {}
         for number, table in enumerate(pages):
-            entry = PagedInput.from_blocks(
-                blocks=table.rows,
+            start_pages = table.start_pages if table.windowed else None
+            blocks, writes = paged_append(
+                table.rows,
                 query_lengths=query_lengths,
                 prefix_lengths=prefix_lengths,
                 block_size=table.block_size,
-                causal=tuple(causal),
-                device="cpu",
-                start_pages=table.start_pages if table.windowed else None,
+                start_pages=start_pages,
             )
-            writes = entry.write_indices
-            if writes is None:
-                raise ValueError("paged appends require cache write addresses")
-            offset = 0
-            for length, enabled in zip(query_lengths, write, strict=True):
-                if not enabled:
-                    writes[offset : offset + length].fill_(-1)
-                offset += length
+            writes[skipped] = -1
             # Every table reads the same query domain and prefixes.
-            entries[number] = replace(entry, queries=queries, prefixes=prefixes)
+            entries[number] = PagedInput(
+                queries,
+                prefixes,
+                BlockTable(
+                    torch.from_numpy(blocks),
+                    table.block_size,
+                    None
+                    if start_pages is None
+                    else torch.tensor(start_pages, dtype=torch.int32),
+                    start_pages,
+                ),
+                torch.from_numpy(writes),
+                tuple(causal),
+            )
         return AttentionBatch(entries, queries)
 
     if any(causal):
@@ -285,9 +299,12 @@ def _host_table(pages: TablePages) -> BlockTable:
     The table is ``[rows, width]`` int32; short rows are zero-padded and
     their prefix lengths bound the valid span.
     """
-    table = torch.zeros((len(pages.rows), pages.width), dtype=torch.int32)
+    # Rows fill a NumPy array, one slice assignment per row, rather than one
+    # tensor construction per row.
+    host = np.zeros((len(pages.rows), pages.width), dtype=np.int32)
     for index, row in enumerate(pages.rows):
-        table[index, : len(row)] = torch.tensor(row, dtype=torch.int32)
+        host[index, : len(row)] = row
+    table = torch.from_numpy(host)
     if not pages.windowed:
         return BlockTable(table, pages.block_size)
     return BlockTable(
@@ -295,21 +312,4 @@ def _host_table(pages: TablePages) -> BlockTable:
         pages.block_size,
         torch.tensor(pages.start_pages, dtype=torch.int32),
         pages.start_pages,
-    )
-
-
-def columns(tasks, *, tables, cache):
-    """Build the attention batch for one homogeneous group of forward rows."""
-    query_lengths = tuple(task.query_tokens for task in tasks)
-    prefix_lengths = tuple(task.seq_len for task in tasks)
-    return from_tables(
-        table_pages(
-            row_tables(tasks, tables=tables, cache=cache),
-            prefix_lengths=prefix_lengths,
-            query_lengths=query_lengths,
-        ),
-        query_lengths=query_lengths,
-        prefix_lengths=prefix_lengths,
-        causal=tuple(task.causal for task in tasks),
-        write=tuple(task.write_kv for task in tasks),
     )

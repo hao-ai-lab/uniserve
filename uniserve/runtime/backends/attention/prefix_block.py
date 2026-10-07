@@ -269,6 +269,8 @@ class _PrefixBlock(_Operator):
 
 
 class Backend(_Backend):
+    device_causality = True
+
     name = "prefix_block"
 
     operator_class = _PrefixBlock

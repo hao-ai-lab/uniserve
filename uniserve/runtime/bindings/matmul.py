@@ -8,6 +8,7 @@ from uniserve.nn.linear import MergedColumnParallelLinear
 from uniserve.quantization import QuantizedTensor
 
 from ..backends import matmul as matmul_backend
+from ..backends import record_kernel_choice
 from . import capturing
 
 
@@ -21,6 +22,9 @@ class MatmulBinding:
         self.module, self.backend, self.max_rows = module, backend, max_rows
         self.allocate = allocate
         self.operators = {}
+        # Provider name of each prepared (input dtype, output dtype,
+        # activation quantizer) key.
+        self.providers = {}
 
     def _prepare(self, dtype, output_dtype, quantizer, rows):
         if self.max_rows is not None and rows > self.max_rows:
@@ -62,7 +66,35 @@ class MatmulBinding:
             operator = provider.prepare(weight, **options, workspace=workspace)
 
         self.operators[key] = (rows, operator)
+        self.providers[key] = provider.name
+        record_kernel_choice()
         return operator
+
+    def kernels(self):
+        """Describe the GEMM provider of each prepared representation.
+
+        One record per prepared (input dtype, output dtype, activation
+        quantizer): the provider name, the weight's representation (its
+        quantization format, or its dtype when unquantized) and the input.
+        """
+        weight = self._weight()
+        representation = (
+            weight.quantizer.format
+            if isinstance(weight, QuantizedTensor)
+            else str(weight.dtype).removeprefix("torch.")
+        )
+        return [
+            {
+                "op": "matmul",
+                "provider": name,
+                "weight": representation,
+                # An encoded activation is named by its quantization format.
+                "input": str(input_dtype).removeprefix("torch.")
+                if quantizer is None
+                else quantizer.format,
+            }
+            for (input_dtype, _, quantizer), name in self.providers.items()
+        ]
 
     def _weight(self):
         if isinstance(self.module, MergedColumnParallelLinear):

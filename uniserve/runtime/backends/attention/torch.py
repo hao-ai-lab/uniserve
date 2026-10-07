@@ -489,6 +489,8 @@ class _TorchOperator(_Operator):
 
 
 class Backend(_Backend):
+    device_causality = True
+
     name = "torch"
 
     operator_class = _TorchOperator

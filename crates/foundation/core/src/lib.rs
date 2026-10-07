@@ -43,10 +43,11 @@ pub use events::{
     RuntimeFamily, StopReason, TokenLogprob, VideoTask,
 };
 pub use generation::{
-    CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,
+    CachePolicy, CanvasSampling, FeedbackNextToken, FeedbackSource, GenerationConstraint,
     GenerationConstraintParseError, GenerationFeatures, GenerationLimits, GenerationRequest,
     GenerationRequestError, GenerationResourceError, ImageEncoderInput, ImageGenerationConfig,
-    ImageIngestStep, ImageInput, ImageTrigger, MultimodalInputs, encoder_cache_key,
+    ImageIngestStep, ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot,
+    encoder_cache_key,
 };
 pub use sampling::{SampleOutput, score_token_logprobs, try_apply_sampling_counts};
 

@@ -13,6 +13,7 @@ from .inputs import (
     SequenceLengths,
     VarlenInput,
     VisibleInput,
+    paged_append,
 )
 from .layer import Attention
 from .projection import AxialQKVProjection, QKVProjection, RotaryQKVProjection
@@ -27,6 +28,7 @@ __all__ = [
     "SequenceLengths",
     "VarlenInput",
     "VisibleInput",
+    "paged_append",
     "AttentionParallelConfig",
     "ContextParallelConfig",
     "Ulysses",

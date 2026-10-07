@@ -17,6 +17,9 @@ use tracing::{info, warn};
 
 use crate::cli::{Cli, Command};
 
+// mimalloc is built with `no_thp` (workspace `Cargo.toml`): its arenas carry
+// no transparent-huge-page advice, so khugepaged never collapses the engine's
+// heap while the scheduler thread runs.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -128,5 +131,48 @@ async fn async_main(cli: Cli) -> Result<()> {
                 python = %args.runtime.worker_python.display(), "resolved deployment");
             uniserve_server::serve(args.to_uniserve_config(), shutdown_signal()).await
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// Returns the `VmFlags` of the mapping in `/proc/self/smaps` that holds
+    /// `address`.
+    fn mapping_flags(address: usize) -> Option<String> {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+        let mut inside = false;
+        for line in smaps.lines() {
+            let range = line
+                .split_whitespace()
+                .next()
+                .and_then(|field| field.split_once('-'))
+                .and_then(|(start, end)| {
+                    Some((
+                        usize::from_str_radix(start, 16).ok()?,
+                        usize::from_str_radix(end, 16).ok()?,
+                    ))
+                });
+            if let Some((start, end)) = range {
+                inside = (start..end).contains(&address);
+            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return Some(flags.trim().to_owned());
+            }
+        }
+        None
+    }
+
+    /// The process heap is never advised for transparent huge pages
+    /// (`MADV_HUGEPAGE`, flag `hg`), so khugepaged has nothing of it to
+    /// collapse while the engine runs.
+    #[test]
+    fn the_heap_carries_no_huge_page_advice() {
+        // Large enough to be served from an allocator arena rather than a
+        // small-object page.
+        let block = vec![1_u8; 64 << 20];
+        let flags = mapping_flags(block.as_ptr() as usize).expect("the heap block is mapped");
+        assert!(
+            !flags.split_whitespace().any(|flag| flag == "hg"),
+            "the heap mapping is advised for huge pages: {flags}"
+        );
     }
 }

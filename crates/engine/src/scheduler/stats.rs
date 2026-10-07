@@ -142,10 +142,15 @@ pub struct ExecutionDomainStats {
     /// Counters for every other media call: latent preparation, denoising,
     /// decoding, media encoding, and muxing.
     pub flow: DomainStats,
+    /// Counters for token-canvas denoising passes.
+    pub canvas: DomainStats,
 }
 
 impl ExecutionDomainStats {
-    /// Public metrics aggregate concrete call kinds into three stable labels.
+    /// Number of public metric domains, the length of `groups`.
+    pub(crate) const COUNT: usize = 4;
+
+    /// Public metrics aggregate concrete call kinds into four stable labels.
     /// This index is used only for counters, never for execution or lane routing.
     ///
     /// The returned index addresses the array from `groups`, so the two must
@@ -154,6 +159,7 @@ impl ExecutionDomainStats {
         use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
         match computation {
             CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify) => 1,
+            CallKind::Forward(ForwardMode::TokenDenoising) => 3,
             CallKind::Forward(_)
             | CallKind::Transfer(_)
             | CallKind::Media(
@@ -164,11 +170,12 @@ impl ExecutionDomainStats {
     }
 
     /// Stable public metric labels and their accumulated counters.
-    pub(super) fn groups(&self) -> [(&'static str, &DomainStats); 3] {
+    pub(crate) fn groups(&self) -> [(&'static str, &DomainStats); Self::COUNT] {
         [
             ("prefill", &self.prefill),
             ("decode", &self.decode),
             ("flow", &self.flow),
+            ("canvas", &self.canvas),
         ]
     }
 

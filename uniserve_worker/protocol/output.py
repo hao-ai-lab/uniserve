@@ -21,6 +21,7 @@ from uniserve_worker.protocol.call import (
     CallKind,
     CallStatus,
     ErrorCode,
+    ForwardMode,
     TransferMode,
     computation,
 )
@@ -229,6 +230,9 @@ class RequestOutput:
     top_logprobs: tuple[tuple[int, float, int], ...] = ()
     # Ranked candidates for each scored prompt position, in input order.
     prompt_logprobs: tuple[tuple[tuple[int, float, int], ...], ...] = ()
+    # Natural-log probability of every candidate of a token-denoising
+    # readout, in the call's `Readout.candidate_ids` order.
+    candidate_logprobs: tuple[float, ...] = ()
 
     def validate(self) -> None:
         """Check that identity, status, coordinates, and outputs agree.
@@ -242,11 +246,22 @@ class RequestOutput:
                 attached to anything but a successful KV_PUBLISH of this
                 call; the visible KV extent exceeds the computed one; a
                 coordinate is negative; the error code does not match the
-                status; or a predicated completion carries tokens,
-                logprobs, products, or finish flags.
+                status; a completion other than a successful token
+                denoising carries candidate log-probabilities; or a
+                predicated completion carries tokens, logprobs, products, or
+                finish flags.
         """
         if self.call_id.batch_id < 1:
             raise invalid_descriptor("completion call id must be positive")
+
+        if self.candidate_logprobs and (
+            self.status is not CallStatus.OK
+            or self.kind is not ForwardMode.TOKEN_DENOISING
+        ):
+            raise invalid_descriptor(
+                "candidate log-probabilities belong to a successful "
+                "token-denoising completion"
+            )
 
         if self.kv_output is not None and (
             self.status is not CallStatus.OK
@@ -347,6 +362,13 @@ class RequestOutput:
                     data.get("prompt_logprobs", ()), "prompt_logprobs"
                 )
             ),
+            candidate_logprobs=tuple(
+                _logprob_value(value)
+                for value in _seq(
+                    data.get("candidate_logprobs", ()),
+                    f"{where}.candidate_logprobs",
+                )
+            ),
             committed_tokens=_uints(
                 data.get("committed_tokens", ()), f"{where}.committed_tokens"
             ),
@@ -405,6 +427,7 @@ class RequestOutput:
                 ]
                 for entries in self.prompt_logprobs
             ],
+            "candidate_logprobs": list(self.candidate_logprobs),
             "finish_flags": {
                 "eos": flags.eos,
                 "length": flags.length,

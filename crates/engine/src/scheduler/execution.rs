@@ -290,6 +290,15 @@ impl Scheduler {
     }
 }
 
+/// Describes a rejected worker result for the request's terminal error and
+/// its error finish's log line: the rejection, then the call it answered.
+fn rejection_cause(call: &Call, error: &generation::GenerationResultError) -> String {
+    format!(
+        "{error} (call {}.{}, {:?})",
+        call.call_id.batch_id, call.call_id.request_index, call.code
+    )
+}
+
 /// The calls that read the products of an image generation call, or `None`
 /// for a call whose readers are the destinations of its transfer edges.
 ///
@@ -306,12 +315,23 @@ pub(crate) fn generation_consuming_calls(media_call: MediaCall) -> Option<&'stat
     })
 }
 
+/// A request's context projected through its in-flight calls
+/// (`Scheduler::scheduled_context`).
+pub(super) struct ScheduledContext {
+    /// Model position after the in-flight calls.
+    pub(super) logical: u32,
+    /// KV length after the in-flight calls, at their submitted maxima.
+    pub(super) physical: u32,
+    /// The next input-image block no accepted or in-flight call writes.
+    pub(super) blocks: BlockCursor,
+}
+
 /// The lanes one media call occupies while it is in flight.
 ///
 /// A component lane measured in media units carries `units`; a demand with
 /// zero `units` holds its component lane exclusively, one request at a time.
 /// `host_ranks` names the host lanes the call places tasks on.
-struct LaneDemand {
+pub(super) struct LaneDemand {
     /// The worker and component whose device lane the call occupies, taken
     /// from the request's placement (`Placement::affinity`). Admission places
     /// a media request on a worker for every media component, so a request's
@@ -328,9 +348,10 @@ struct LaneDemand {
 /// Lane occupancy across the media calls in flight.
 ///
 /// `lane_occupancy` rebuilds it from the in-flight calls at the start of each
-/// media pass, and the pass charges each call it selects.
+/// media pass, and at the first inline-image encoder call of a generation
+/// pass; the pass charges each call it selects.
 #[derive(Default)]
-struct LaneLedger {
+pub(super) struct LaneLedger {
     /// The request holding each exclusive component lane.
     exclusive: HashMap<(crate::WorkerId, String), RequestId>,
     /// Media units in flight on each unit-measured component lane.
@@ -345,7 +366,12 @@ impl LaneLedger {
     ///
     /// Every host rank must have room for the call's tasks. An exclusive
     /// component lane admits further calls of the request already holding it.
-    fn admits(&self, demand: &LaneDemand, request: RequestId, scheduler: &Scheduler) -> bool {
+    pub(super) fn admits(
+        &self,
+        demand: &LaneDemand,
+        request: RequestId,
+        scheduler: &Scheduler,
+    ) -> bool {
         if demand.host_ranks.iter().any(|(worker, rank, tasks)| {
             let capacity = scheduler.host_lane_capacity(worker);
             let key = (worker.clone(), *rank);
@@ -372,7 +398,7 @@ impl LaneLedger {
     }
 
     /// Marks the lanes one request's call occupies until it completes.
-    fn occupy(&mut self, demand: &LaneDemand, request: RequestId) {
+    pub(super) fn occupy(&mut self, demand: &LaneDemand, request: RequestId) {
         for (worker, rank, tasks) in &demand.host_ranks {
             *self.host.entry((worker.clone(), *rank)).or_default() += tasks;
         }
@@ -730,14 +756,45 @@ impl Scheduler {
             .map_or(1, |(_, info)| info.host_lane_capacity.max(1))
     }
 
-    /// Accumulates the lanes the media calls in flight occupy.
-    fn lane_occupancy(&self) -> LaneLedger {
+    /// Returns the host lanes one encoder call carrying inline image bytes
+    /// occupies.
+    ///
+    /// The worker prepares an inline input image (decoding, resizing,
+    /// normalization) as one host task on each rank of the component that
+    /// encodes it, and the call holds those tasks until its result returns.
+    /// The component is the one the worker routes `media_call` to, or the
+    /// default component, as `Placement::worker_target` resolves it.
+    pub(super) fn image_lane_demand(
+        &self,
+        request: RequestKey,
+        media_call: MediaCall,
+    ) -> LaneDemand {
+        let component = self
+            .media_component(media_call)
+            .unwrap_or_else(|| DEFAULT_COMPONENT.to_owned());
+        LaneDemand {
+            component: None,
+            units: 0,
+            host_ranks: self.host_lane_ranks(request, Some(&component), 1),
+        }
+    }
+
+    /// Accumulates the lanes the media calls in flight occupy, including the
+    /// host tasks preparing the inline images of generation encoder calls.
+    pub(super) fn lane_occupancy(&self) -> LaneLedger {
         let mut ledger = LaneLedger::default();
         for (id, queue) in &self.inflight.pending_calls {
             for inflight in queue {
                 let CallKind::Media(media_call) = inflight.call.code else {
                     continue;
                 };
+                if inflight.call.input_image.is_some() {
+                    ledger.occupy(
+                        &self.image_lane_demand(inflight.call.request_key, media_call),
+                        *id,
+                    );
+                    continue;
+                }
                 let units = match &inflight.input {
                     InflightInput::Media {
                         decode: Some(range),
@@ -1081,7 +1138,7 @@ impl Scheduler {
             },
 
             token_output: None,
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -1094,6 +1151,8 @@ impl Scheduler {
             kv_input: None,
             kv_output: None,
             input_token_ids: Vec::new(),
+            readout: None,
+            canvas: None,
             sampling_state: None,
             request_key,
             call_id,
@@ -1534,18 +1593,34 @@ impl Scheduler {
     /// Pending work contributes its submitted maximum; accepted lengths remain
     /// request state and are never advanced by this scheduling calculation.
     pub(super) fn scheduled_token_lengths(&self, id: RequestId) -> Option<(u32, u32)> {
+        self.scheduled_context(id)
+            .map(|context| (context.logical, context.physical))
+    }
+
+    /// Returns the input images whose every block the request's accepted and
+    /// in-flight calls write.
+    pub(super) fn num_scheduled_images(&self, id: RequestId) -> Option<usize> {
+        self.scheduled_context(id)
+            .map(|context| context.blocks.image)
+    }
+
+    /// Projects the request's accepted context through its in-flight calls:
+    /// logical and KV extents, and the input-image block cursor.
+    pub(super) fn scheduled_context(&self, id: RequestId) -> Option<ScheduledContext> {
         let state = self.running.get(&id)?;
         let (mut logical, mut physical) = (state.logical_position, state.kv_visible_len);
-        let mut image_index = state.num_ingested_images;
-        let mut encoder_index = state.image_encoder_index;
+        let mut blocks = state.block_cursor();
         let mut feedback_index = state.feedback_encoder_index;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
             match call.code {
+                // A context prefill adds its prompt tokens and vision blocks.
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
                     let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
-                    logical = logical.saturating_add(count);
-                    physical = physical.saturating_add(count);
+                    let advance = state.context_advance(count, call.vision_inputs.len(), blocks)?;
+                    logical = logical.saturating_add(advance.logical);
+                    physical = physical.saturating_add(advance.kv);
+                    blocks = advance.cursor;
                 }
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     physical = physical.saturating_add(call.bounds.max_tokens);
@@ -1557,13 +1632,13 @@ impl Scheduler {
                             feedback_index = 0;
                         }
                     } else {
-                        let image = state.req.multimodal_inputs.images.get(image_index)?;
-                        encoder_index += 1;
-                        if encoder_index == image.encoders.len() {
+                        // A latent input-image block.
+                        let image = state.req.multimodal_inputs.images.get(blocks.image)?;
+                        let next = state.next_block(blocks)?;
+                        if next.image != blocks.image {
                             logical = logical.saturating_add(image.num_positions);
-                            encoder_index = 0;
-                            image_index += 1;
                         }
+                        blocks = next;
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => physical = physical.saturating_add(1),
@@ -1575,7 +1650,11 @@ impl Scheduler {
                 _ => {}
             }
         }
-        Some((logical, physical))
+        Some(ScheduledContext {
+            logical,
+            physical,
+            blocks,
+        })
     }
 
     /// The coordinates the next call of this request executes at.
@@ -1606,6 +1685,27 @@ impl Scheduler {
             },
             flow_step: self.num_scheduled_denoise_steps(id)?,
         })
+    }
+
+    /// Readout rows accepted or covered by submitted canvas passes.
+    ///
+    /// Canvas passes cover consecutive rows from the accepted cursor in
+    /// submission order, so each in-flight pass continues where the previous
+    /// one ends. Returns `None` for a request that is not running or whose
+    /// in-flight passes do not cover whole rows.
+    pub(super) fn scheduled_readout_rows(&self, id: RequestId) -> Option<usize> {
+        let state = self.running.get(&id)?;
+        self.inflight
+            .pending_calls
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter(|pending| pending.call.readout.is_some())
+            .try_fold(state.readout_rows, |rows, pending| {
+                let covered =
+                    state.readout_rows_covering(rows, pending.call.input_token_ids.len())?;
+                Some(rows + covered)
+            })
     }
 
     /// Last denoising step covered by submitted intervals, without accepting them.
@@ -1683,6 +1783,22 @@ impl Scheduler {
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     Phase::Prefill
                 }
+                // Steps queued behind the accepted one that stopped the block
+                // are no-ops; the block's commit follows them. A step queued
+                // behind the commit itself starts the next block.
+                CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
+                    let behind_commit = self.inflight.pending_calls.get(&id).is_some_and(|calls| {
+                        calls
+                            .iter()
+                            .any(|inflight| is_prompt_extend(&inflight.call))
+                    });
+                    if state.phase == Phase::CommitCanvas && !behind_commit {
+                        Phase::CommitCanvas
+                    } else {
+                        Phase::Canvas
+                    }
+                }
+                CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Readout,
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     if is_feedback_computation(call) {
                         if self.scheduled_feedback(id)?.0 == 0 {
@@ -1691,16 +1807,9 @@ impl Scheduler {
                             Phase::FeedbackEncode
                         }
                     } else {
-                        let image = state
-                            .req
-                            .multimodal_inputs
-                            .images
-                            .get(state.num_ingested_images)?;
-                        if state.image_encoder_index + 1 == image.encoders.len() {
-                            Phase::Prefill
-                        } else {
-                            Phase::Encode
-                        }
+                        // A latent input-image block: context ingestion
+                        // continues after it.
+                        Phase::Prefill
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => Phase::PublishKv,
@@ -1719,12 +1828,23 @@ impl Scheduler {
             None => state.phase,
         };
         Some(match phase {
+            // A complete prompt conditions a readout's canvases or a
+            // canvas-generating request's blocks; any other request decodes
+            // from it. A block commit also projects here, since it extends
+            // the context the same way, and the next block follows it.
             Phase::Prefill
                 if self.num_scheduled_prompt_tokens(id)?
                     >= state.req.prompt_token_ids.len() as u32
-                    && state.num_ingested_images >= state.req.multimodal_inputs.images.len() =>
+                    && self.num_scheduled_images(id)?
+                        >= state.req.multimodal_inputs.images.len() =>
             {
-                Phase::DecodeUnd
+                if state.req.is_readout() {
+                    Phase::Readout
+                } else if state.req.is_canvas_generation() {
+                    Phase::Canvas
+                } else {
+                    Phase::DecodeUnd
+                }
             }
             Phase::DenoiseGen
                 if self.num_scheduled_denoise_steps(id)? >= state.denoising.steps() =>
@@ -1904,33 +2024,79 @@ impl Scheduler {
             {
                 return false;
             }
-            // Ordinary pipelining needs the whole prompt submitted and every
-            // context image ingested, and counts each in-flight call as one
+            // Ordinary pipelining needs the whole prompt and every context
+            // image block submitted, and counts each in-flight call as one
             // token toward `max_und_tokens`.
             return self
                 .num_scheduled_prompt_tokens(id)
                 .is_some_and(|count| count as usize >= state.req.prompt_token_ids.len())
-                && state.num_ingested_images >= state.req.multimodal_inputs.images.len()
+                && self
+                    .num_scheduled_images(id)
+                    .is_some_and(|count| count >= state.req.multimodal_inputs.images.len())
                 && state.num_generated_tokens.saturating_add(queue.len())
                     < state.req.max_und_tokens;
         }
 
-        // Other successor kinds require a completion predicate and an exact
-        // projected physical variant match.
-        predecessor.call.completion_output.is_some()
+        // Other successor kinds require an exact projected physical variant
+        // match and, unless they follow unconditionally, a completion
+        // predicate.
+        (predecessor.call.completion_output.is_some() || self.follows_unconditionally(id, target))
             && self
                 .pending_successor_code(id)
                 .is_some_and(|variant| variant == target)
     }
 
+    /// Returns whether a successor of kind `target`, queued behind the
+    /// request's last in-flight call, runs whatever that call's device result
+    /// is, and so carries no predicate.
+    ///
+    /// Two successors follow unconditionally:
+    /// - The canvas pass that follows the prefill completing a context (a
+    ///   readout's pass or a block's first step), since the prefill cannot
+    ///   stop the request. The pass reads the KV the prefill writes, and only
+    ///   the worker's device order puts the write first: forwards run in
+    ///   submission order on one stream, and a forward on an execution lane
+    ///   forks from and joins back into the device's control stream
+    ///   (`ModelExecutor.forward` in uniserve_worker).
+    /// - A stopped block's commit queued behind the block's steps still in
+    ///   flight. The host has accepted the step that stopped the block, so
+    ///   every step behind it is a no-op whose completion is false, and the
+    ///   commit runs regardless. The commit writes the block's tokens to KV
+    ///   positions `[P, P + canvas)`, where `P` is the context length each
+    ///   step of the block reads; a canvas step reads KV below `P` and writes
+    ///   none, so the commit's writes never overlap what those steps read.
+    ///   Each rank also runs the commit after them in submission order on
+    ///   its device stream, under data and expert parallelism alike.
+    pub(super) fn follows_unconditionally(&self, id: RequestId, target: CallKind) -> bool {
+        let Some(predecessor) = self
+            .inflight
+            .pending_calls
+            .get(&id)
+            .and_then(|queue| queue.back())
+        else {
+            return false;
+        };
+        match target {
+            CallKind::Forward(ForwardMode::TokenDenoising) => is_prompt_extend(&predecessor.call),
+            CallKind::Forward(ForwardMode::Prefill) => self.running.get(&id).is_some_and(|state| {
+                state.phase == Phase::CommitCanvas
+                    && predecessor
+                        .call
+                        .canvas
+                        .is_some_and(|step| step.block == state.canvas_block)
+            }),
+            _ => false,
+        }
+    }
+
     /// Determines the next pipelined computation from its submitted predecessor.
     ///
     /// Returns `None`, among other cases, when the request is not running or
-    /// has no call in flight, has not yet submitted its whole prompt or
-    /// ingested every context image, cannot chain from its last in-flight
+    /// has no call in flight, has not yet submitted its whole prompt or every
+    /// block of its context images, cannot chain from its last in-flight
     /// call (an image decode whose request does not feed the device image
     /// product back, or a completed feedback round whose request does not
-    /// sample a feedback continuation), or projects to an encode or ingest
+    /// sample a feedback continuation), or projects to a latent ingest
     /// phase.
     pub(super) fn pending_successor_code(&self, id: RequestId) -> Option<CallKind> {
         if !self.inflight.has_pending_calls(id) {
@@ -1938,7 +2104,7 @@ impl Scheduler {
         }
         let state = self.running.get(&id)?;
         if self.num_scheduled_prompt_tokens(id)? < state.req.prompt_token_ids.len() as u32
-            || state.num_ingested_images < state.req.multimodal_inputs.images.len()
+            || self.num_scheduled_images(id)? < state.req.multimodal_inputs.images.len()
         {
             return None;
         }
@@ -1965,6 +2131,8 @@ impl Scheduler {
             Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
             Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
             Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
+            Phase::Readout | Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;
                 feedback.feedback_source.as_ref()?;
@@ -1977,7 +2145,7 @@ impl Scheduler {
                     ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
                 }
             }
-            Phase::Encode | Phase::IngestState => return None,
+            Phase::IngestState => return None,
         })
     }
 
@@ -2621,7 +2789,9 @@ impl Scheduler {
         // Aggregate timings by the stable public metric groups, one slot per
         // `ExecutionDomainStats::groups` entry. Multiple concrete calls in one
         // group count as one returned batch, as do multiple requests.
-        let mut returned_groups: [Option<TimingCounters>; 3] = [None; 3];
+        let mut returned_groups: [Option<TimingCounters>;
+            super::stats::ExecutionDomainStats::COUNT] =
+            [None; super::stats::ExecutionDomainStats::COUNT];
         let mut invalid_result = false;
 
         // A completion can mutate state only while its logical batch remains owned
@@ -2877,19 +3047,15 @@ impl Scheduler {
                     // outputs still being produced when cancellation arrived.
                     continue;
                 };
-                if generation::validate_generation_result(
+                if let Err(error) = generation::validate_generation_result(
                     &call,
                     image_kv,
                     latent.as_ref(),
                     state,
                     &record,
                     media.as_deref(),
-                )
-                .is_err()
-                {
-                    if self.running.contains_key(&id) {
-                        self.finish_after_inflight(id, FinishReason::Error, None);
-                    }
+                ) {
+                    self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
                 }
 
@@ -2947,10 +3113,8 @@ impl Scheduler {
                 } else {
                     None
                 };
-                if let Some(Err(_)) = progress_result {
-                    if self.running.contains_key(&id) {
-                        self.finish_after_inflight(id, FinishReason::Error, None);
-                    }
+                if let Some(Err(error)) = progress_result {
+                    self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
                 }
                 // An accepted forward extends the request's KV: publish the
@@ -3029,13 +3193,24 @@ impl Scheduler {
                 // A predicated call was skipped because its device predicate
                 // was false, so it is rolled back like an invalidated
                 // descendant and marks any later descendants invalidated.
+                // A step queued behind the step that stopped its block is the
+                // exception: the host knew it for a no-op once it accepted the
+                // stopping step, and every call queued since, the block's
+                // commit and the next block's steps, was planned from that
+                // host-observed stop (`follows_unconditionally`).
                 if record.status == CallStatus::Predicated {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_kv_units_sent = state
                             .num_kv_units_sent
                             .saturating_sub(u64::from(call.bounds.max_kv_units));
-                        state.speculative_chain_invalidated = has_unresolved_descendants;
+                        let stop_observed = state.phase == Phase::CommitCanvas
+                            && call
+                                .canvas
+                                .is_some_and(|step| step.block == state.canvas_block);
+                        if !stop_observed {
+                            state.speculative_chain_invalidated = has_unresolved_descendants;
+                        }
                     }
                     self.free_buffers(call.output_buffers());
                     self.finish_pending_if_idle(id);
@@ -3062,7 +3237,7 @@ impl Scheduler {
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
-                );
+                ) || call.canvas.is_some();
                 // With stop strings, push a placeholder decoder boundary before
                 // resolving, so a non-error finish reached while resolving
                 // waits for the frontend decoder's stop-string decision on this
@@ -3375,11 +3550,17 @@ impl Scheduler {
                         },
                     );
                 }
+                let terminal_published = self
+                    .inflight
+                    .pending_finishes
+                    .get(&id)
+                    .is_some_and(|finish| finish.terminal_published);
                 self.inflight.pending_finishes.insert(
                     id,
                     PendingFinish {
                         reason: FinishReason::Error,
                         stop_reason: None,
+                        terminal_published,
                     },
                 );
             }

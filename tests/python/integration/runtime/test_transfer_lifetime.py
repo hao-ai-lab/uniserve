@@ -899,7 +899,6 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
     buffers = BufferPool(byte_capacity=4096, devices=("cpu",))
     if owner == "encoder":
         store = TensorStore(
-            entry_capacity=1,
             max_entry_bytes=4096,
             devices=("cpu",),
             buffer_pool=buffers,

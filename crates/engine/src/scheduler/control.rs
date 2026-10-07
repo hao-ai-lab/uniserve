@@ -101,9 +101,9 @@ impl Scheduler {
                     });
                 } else {
                     match *request {
-                        Request::Ar(request) | Request::Umm(request) => {
-                            self.enqueue(request, event_tx)
-                        }
+                        Request::Ar(request)
+                        | Request::Umm(request)
+                        | Request::BlockDiffusion(request) => self.enqueue(request, event_tx),
                         Request::Diffusion(request) => self.enqueue_media(request, event_tx, now()),
                     }
                 }

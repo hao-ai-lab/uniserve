@@ -129,7 +129,9 @@ def execute_batch(
     required_predicates = {
         calls.call_identity(call)
         for call in batch.calls
-        if call.predicate is not None and call.predicate.dtype is DType.U8
+        if call.predicate is not None
+        and call.predicate.dtype is DType.U8
+        and not calls.device_gated(call)
     }
     if required_predicates != set(predicate_values):
         raise invalid_descriptor(

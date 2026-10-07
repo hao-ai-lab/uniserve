@@ -863,6 +863,36 @@ pub(super) async fn assemble_event_stream(
                     }
                 }
             }
+            // Tokens committed together carry no logprobs and are consumed
+            // as consecutive text tokens.
+            EngineCoreOutput::TextTokens { ids } => {
+                if !state.accepted {
+                    return Err(malformed_output(
+                        request_id.clone(),
+                        "engine began generation before prompt logprobs were complete",
+                    ));
+                }
+                if state.pending_token.is_some() || generated_logprobs_requested {
+                    return Err(malformed_output(
+                        request_id.clone(),
+                        "engine emitted committed tokens without their requested logprobs",
+                    ));
+                }
+                let mut context = RawTokenEmitContext {
+                    emit: &emit_context,
+                    prompt_token_ids: &prompt_token_ids,
+                    emit_token_ids,
+                    decode_options: &mut decode_options,
+                    decoder: &mut decoder,
+                    stream: &mut stream,
+                    y: &mut y,
+                };
+                for id in ids {
+                    if state.consume_token(id, None, &mut context).await? {
+                        return Ok(());
+                    }
+                }
+            }
             EngineCoreOutput::TokenLogprobs { id, candidates } => {
                 let pending = state.pending_token.take().ok_or_else(|| {
                     malformed_output(
@@ -1050,11 +1080,18 @@ pub(super) async fn assemble_event_stream(
                 return Ok(());
             }
             // Artifacts and media progress belong to diffusion media requests,
-            // which `assemble_media_event_stream` serves.
+            // which `assemble_media_event_stream` serves, and readout answers
+            // to readout requests, which the System One route collects.
             EngineCoreOutput::Artifact(_) | EngineCoreOutput::MediaProgress { .. } => {
                 return Err(malformed_output(
                     request_id,
                     "generation request received a media lifecycle event",
+                ));
+            }
+            EngineCoreOutput::Readout { .. } => {
+                return Err(malformed_output(
+                    request_id,
+                    "generation request received a readout answer",
                 ));
             }
         }

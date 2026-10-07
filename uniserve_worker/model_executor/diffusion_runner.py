@@ -225,9 +225,16 @@ class DiffusionRunner(ModelRunner):
         Preparation, the shared storage included, is charged to ``storage``,
         whose budget it must fit; ``prepare`` adds each layout.
         """
-        # The worker holds the denoiser's layout as an opaque size value.
+        # The worker holds the denoiser's layout as an opaque size value. As
+        # in every serving context, attention planning uses only the host
+        # sequence lengths a layout's inputs carry and never copies them from
+        # the device.
         context: ExecutionContext[object] = ExecutionContext(
-            call.module, attention=attention, stream=stream, groups=call.groups
+            call.module,
+            attention=attention,
+            stream=stream,
+            groups=call.groups,
+            derive_host_lengths=False,
         )
         runner = cls(
             name,

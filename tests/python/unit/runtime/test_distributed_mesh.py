@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch.distributed.tensor import Partial, Replicate, Shard
 
-from uniserve.distributed import DeviceMesh, Distribution
+from uniserve.distributed import Communicator, DeviceMesh, Distribution
 from uniserve.runtime.process_groups import initialize_process_groups
 
 pytestmark = pytest.mark.unit
@@ -101,3 +101,16 @@ def test_distribution_uses_upstream_tensor_placements():
     )
     with pytest.raises(ValueError, match="one entry per mesh axis"):
         Distribution(mesh, (Replicate(),))
+
+
+def test_one_member_all_gather_returns_its_input_or_fills_out():
+    group = Communicator()
+    value = torch.arange(6, dtype=torch.float32).view(2, 3)
+
+    for dim in (0, 1):
+        # The one-member concatenation is the input itself: same storage.
+        assert group.all_gather(value, dim=dim) is value
+
+        out = torch.empty_like(value)
+        assert group.all_gather(value, dim=dim, out=out) is out
+        torch.testing.assert_close(out, value, rtol=0, atol=0)

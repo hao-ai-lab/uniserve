@@ -148,7 +148,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: Some(feature.clone()),
         latent_input: None,
@@ -161,6 +161,8 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         kv_output: None,
         input_image: Some(String::from_utf8(image_bytes).unwrap().into()),
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: second_key,
         call_id: CallId::new(3, 0),
@@ -618,7 +620,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             coordinates: CallCoordinates::default(),
             token_input: Some(value.clone()),
             token_output: Some(publication.clone()),
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -631,6 +633,8 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             kv_input: None,
             kv_output: None,
             input_token_ids: Vec::new(),
+            readout: None,
+            canvas: None,
             sampling_state: None,
             request_key: admission.request_key,
             call_id: CallId::new(2, 0),
@@ -656,7 +660,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             coordinates: CallCoordinates::default(),
             token_input: Some(publication.clone()),
             token_output: Some(copy.clone()),
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -669,6 +673,8 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             kv_input: None,
             kv_output: None,
             input_token_ids: Vec::new(),
+            readout: None,
+            canvas: None,
             sampling_state: None,
             request_key: admission.request_key,
             call_id: CallId::new(3, 0),
@@ -969,7 +975,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -982,6 +988,8 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         kv_input: None,
         kv_output: None,
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: key,
         call_id: CallId::new(1, 0),
@@ -1010,7 +1018,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -1023,6 +1031,8 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         kv_input: None,
         kv_output: None,
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: key,
         call_id: CallId::new(2, 0),
@@ -1234,7 +1244,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -1247,6 +1257,8 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         kv_input: None,
         kv_output: None,
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: key,
         call_id: CallId::new(2, 0),
@@ -1342,7 +1354,8 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let fixture = serde_json::to_string(&root.join("tests/python/fixtures/rank_media.py"))?;
         // The fixture is run by path, so its own directory leads the import
-        // path; the package it shares with the rest of the suite is named here.
+        // path; name the shared fixture package without dropping configured
+        // source paths for separately packaged dependencies such as kernels.
         let import_root = serde_json::to_string(&root.canonicalize()?)?;
         let name = serde_json::to_string(&name_path)?;
         // `WorkerGroup` runs `<python> -m uniserve_worker.main <args>`, so the
@@ -1352,7 +1365,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         std::fs::write(
             &wrapper,
             format!(
-                "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, PYTHONPATH={import_root}, UNISERVE_TEST_MEDIA_RESPONSE={case:?}, UNISERVE_TEST_MEDIA_NAME={name})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
+                "#!/usr/bin/env python3\nimport os, sys\npaths = [{import_root}, os.environ.get('PYTHONPATH', '')]\nenv = dict(os.environ, PYTHONPATH=os.pathsep.join(path for path in paths if path), UNISERVE_TEST_MEDIA_RESPONSE={case:?}, UNISERVE_TEST_MEDIA_NAME={name})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
@@ -1509,6 +1522,78 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
         );
         worker.close()?;
     }
+    Ok(())
+}
+
+/// Workers launched by the engine hold a request row for every running
+/// request the engine is configured to keep resident, beyond the worker's
+/// own default pool.
+/// Launched ranks keep their host heap out of transparent huge pages: no
+/// mapping of a rank process is advised for them (`MADV_HUGEPAGE`, VmFlags
+/// `hg`), so khugepaged never collapses a serving rank's memory.
+#[test]
+fn launched_ranks_hold_no_huge_page_advised_memory() -> anyhow::Result<()> {
+    let worker = spawn_rank_group()?;
+    // The ranks are this thread's children, each launched with `--rank`.
+    let ranks: Vec<String> = std::fs::read_to_string("/proc/thread-self/children")?
+        .split_whitespace()
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|args| args.split(|byte| *byte == 0).any(|arg| arg == b"--rank"))
+        })
+        .map(str::to_owned)
+        .collect();
+    anyhow::ensure!(ranks.len() == WORLD_SIZE, "found rank processes {ranks:?}");
+    for pid in &ranks {
+        let smaps = std::fs::read_to_string(format!("/proc/{pid}/smaps"))?;
+        let advised = smaps
+            .lines()
+            .filter_map(|line| line.strip_prefix("VmFlags:"))
+            .filter(|flags| flags.split_whitespace().any(|flag| flag == "hg"))
+            .count();
+        assert_eq!(
+            advised, 0,
+            "rank process {pid} holds {advised} mappings advised for huge pages"
+        );
+    }
+    drop(worker);
+    Ok(())
+}
+
+#[test]
+fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<()> {
+    const RUNNING: usize = 200;
+
+    let mut config = EngineConfig::sim("stub");
+    config.runtime_family = RuntimeFamily::Ar;
+    config.generation_limits = uniserve_core::GenerationLimits {
+        features: uniserve_core::GenerationFeatures::UNDERSTANDING,
+        latent_downsample: 1,
+        max_cfg_branches: 1,
+        ..Default::default()
+    };
+    config.max_num_seqs = RUNNING;
+    config.workers = vec![WorkerConfig::placed(
+        &["localhost".to_owned()],
+        "cpu",
+        WORLD_SIZE,
+        2,
+        WorkerConfig::single_component("model", WORLD_SIZE),
+    )];
+    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    let engine = {
+        let _launch_guard = CHILD_LAUNCH_ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child-launch environment lock is poisoned"))?;
+        EngineCore::new(config)?
+    };
+    let request_rows = engine.info().request_slots as usize;
+    engine.shutdown();
+
+    assert!(
+        request_rows >= RUNNING,
+        "{request_rows} request rows cannot hold {RUNNING} running requests"
+    );
     Ok(())
 }
 
@@ -1855,7 +1940,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         coordinates: coordinates_after(&first.results[0].output),
         token_input: None,
         token_output: None,
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -1868,6 +1953,8 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         kv_input: None,
         kv_output: Some(buffer),
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key,
         call_id: CallId::new(10, 0),
@@ -2211,7 +2298,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -2224,6 +2311,8 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         kv_input: None,
         kv_output: None,
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(3, 0),
@@ -2436,7 +2525,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         coordinates: coordinates_after(&produced.results[0].output),
         token_input: Some(source.clone()),
         token_output: Some(publication.clone()),
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -2449,6 +2538,8 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         kv_input: None,
         kv_output: None,
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(6, 0),
@@ -2479,7 +2570,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         coordinates: CallCoordinates::default(),
         token_input: Some(publication.clone()),
         token_output: Some(copy.clone()),
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -2492,6 +2583,8 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         kv_input: None,
         kv_output: None,
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(7, 0),
@@ -2530,7 +2623,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: Some(feature.clone()),
         latent_input: None,
@@ -2543,6 +2636,8 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         kv_output: None,
         input_image: Some(String::from_utf8(image_bytes).unwrap().into()),
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(8, 0),
@@ -2651,7 +2746,10 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
-        vision_input: Some(feature.clone()),
+        vision_inputs: vec![uniserve_worker_ipc::VisionInput {
+            offset: 0,
+            feature: feature.clone(),
+        }],
         latent_feature_input: None,
         encoder_output: Some(TensorRef {
             request_key: next.request_key,
@@ -2668,6 +2766,8 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         kv_input: None,
         kv_output: None,
         input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: next.request_key,
         call_id: CallId::new(15, 0),
@@ -3042,6 +3142,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "block_size": 16,
     "max_batch_calls": 8,
     "max_batch_tokens": 256,
+    "max_request_pool_size": 129,
     "max_model_len": 8192,
     "max_video_seconds": 15.0,
     "max_condition_rows": 0,
@@ -3121,6 +3222,7 @@ fn text_admission(
             negative_token_ids: Vec::new(),
             finish_token_ids: Vec::new(),
             initial_position: 0,
+            canvas: None,
         }),
         None,
         0,
@@ -3183,7 +3285,7 @@ fn token_batch(
         },
         token_input: None,
         token_output: Some(token_output),
-        vision_input: None,
+        vision_inputs: Vec::new(),
         latent_feature_input: None,
         encoder_output: None,
         latent_input: None,
@@ -3196,6 +3298,8 @@ fn token_batch(
         kv_input: None,
         kv_output: None,
         input_token_ids: tokens.to_vec(),
+        readout: None,
+        canvas: None,
         sampling_state: None,
         request_key,
         call_id,

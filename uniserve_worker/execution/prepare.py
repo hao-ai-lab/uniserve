@@ -414,10 +414,10 @@ def prepare_inputs(
                     )
                 if not any(
                     entry.product
-                    == (
-                        call.vision_input
+                    in (
+                        tuple(block.feature for block in call.vision_inputs)
                         if value.payload_kind == "vision_feature"
-                        else call.latent_feature_input
+                        else (call.latent_feature_input,)
                     )
                     for call in batch.calls
                 ):
@@ -766,14 +766,17 @@ def _prepare_predicates(
     for `capture_predicates`. The buffer is sealed once every row is
     captured, and `BatchState.predicate_values` reads it after the copies
     complete. I64 relay predicates are not captured here; `_consume_predicates`
-    hands them to execution as device tensors.
+    hands them to execution as device tensors. Nor are the predicates of
+    calls gated on the device (`calls.device_gated`).
     """
     # Predicate rows occupy one compact completion buffer regardless of whether
     # their source is already local or will arrive through a prepared transfer.
     scheduled = tuple(
         call
         for call in state.batch.calls
-        if call.predicate is not None and call.predicate.dtype is DType.U8
+        if call.predicate is not None
+        and call.predicate.dtype is DType.U8
+        and not calls.device_gated(call)
     )
     if not scheduled:
         return
@@ -1741,6 +1744,7 @@ def _bind_cache_tables(
         )
     page_tables.install(tuple(tables))
 
+    recycled: list[int] = []
     for allocation in inputs.new_cache_units:
         if allocation.request_pool_idx not in slots:
             continue
@@ -1754,19 +1758,20 @@ def _bind_cache_tables(
                 "new cache units are outside the installed block table"
             )
 
-        # A KV import zeroes the new units it covers before copying into them
-        # (`CacheImport.initialized_units`); every other new unit resets the
-        # metadata its next writer reads;
-        # retained payload values remain outside the visible token intervals.
+        # A KV import resets the new units it covers before copying into
+        # them (`CacheImport.initialized_units`); every other new unit is
+        # recycled for its new owner below.
         initialized = {
             unit
             for write in state.cache_imports.values()
             if write.request_pool_idx == allocation.request_pool_idx
             for unit in write.initialized_units
         }
-        cache.recycle_units(
-            tuple(unit for unit in units if unit not in initialized)
-        )
+        recycled.extend(unit for unit in units if unit not in initialized)
+
+    # One recycle covers every allocation of the batch, so any device reset
+    # it needs is one launch per field rather than one per allocation.
+    cache.recycle_units(tuple(recycled))
 
     # Forward rows index `inputs.calls`, the full batch including predicated
     # calls, so rows are mapped by call identity rather than by position in

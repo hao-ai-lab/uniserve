@@ -258,6 +258,7 @@ def _fused_weight(weights, scale):
 class Backend:
     """A provider factory; each prepare call creates an independent operator."""
 
+    name: str
     operator_class: type[Operator]
 
     def workspace_buffers(

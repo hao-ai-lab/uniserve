@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -43,8 +43,9 @@ from uniserve_worker.model_executor.image_inputs import (
     PreparedImage,
     VisionRow,
     patch_grid_shape,
-    prepare_image,
+    prepare_host_image,
     prepare_tensor_image,
+    stage_image,
 )
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.batch import TensorPublication
@@ -72,7 +73,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.execution.host import HostLane
     from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.protocol.worker_info import WorkerInfo
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.latent_pool import LatentPool
@@ -143,6 +146,68 @@ def text(
     return request
 
 
+_ENCODER_CALLS = frozenset(
+    {MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING}
+)
+
+
+def reserve_images(
+    state: BatchState,
+    *,
+    host_tasks: HostLane,
+    request_pool: RequestPool,
+    model_runner: ModelExecutor,
+) -> None:
+    """Start preparing the batch's inline input images on the rank's host lane.
+
+    Runs when the batch is accepted. Each vision or latent encoder call
+    carrying an inline image payload takes one host-lane task, which
+    decodes, resizes, normalizes and packs the image into page-locked
+    memory (``prepare_host_image``) while the worker thread launches other
+    batches. The tasks are recorded in ``state.image_tasks``: execution
+    waits for them (``BatchState.inputs_ready``), ``prepare_features``
+    stages their results, and ``BatchState.close_inputs`` withdraws them.
+
+    The engine charges every such call one task on the host lane of each
+    rank of its component and holds the charge until the call's result
+    returns, so the lane admits the reservation, and the page-locked results
+    alive at once are bounded by the lane's capacity.
+
+    Raises:
+        WorkerError: ``invalid_descriptor`` when a call's request admitted no
+            input images; a ``ResourceError`` when the lane has no capacity
+            left. Tasks reserved before the failure stay in
+            ``state.image_tasks`` for ``close_inputs`` to withdraw.
+    """
+    # Each encoder call with the inline image payload it carries.
+    calls = tuple(
+        (call, call.input_image)
+        for call in state.batch.calls
+        if call.kind in _ENCODER_CALLS and call.input_image is not None
+    )
+    if not calls:
+        return
+
+    processor = model_runner.image_processor()
+    for call, encoded in calls:
+        admission = request_pool.get(call.request_key.request_id).admission
+        device = model_runner.call_devices(call)[1]
+        task = host_tasks.reserve()
+        state.image_tasks[call.call_id] = task
+        task.configure(
+            partial(
+                prepare_host_image,
+                processor,
+                cast(MediaCall, call.kind),
+                encoded,
+                input_images=_input_images(admission.input_images),
+                pin=device.type == "cuda",
+            ),
+            profile_name="uniserve.host.prepare_image",
+        )
+        task.submit_if_ready()
+
+
 def prepare_features(
     call: Call,
     *,
@@ -152,9 +217,15 @@ def prepare_features(
 ) -> PreparedImage:
     """Stage the source image of one vision or latent encoder call.
 
-    The source is either the request's encoded image or a resident image
-    product (see ``encode_source``); it is resized and normalized by the
-    model's image processor onto the device of the call's execution entry.
+    The source is either the request's encoded image, which the call's
+    host-lane task (``reserve_images``) has already resized and normalized
+    by the model's image processor, or a resident image product (see
+    ``encode_source``), transformed here. Either is staged on the device of
+    the call's execution entry without synchronizing with it.
+
+    Raises:
+        WorkerError: The preparation's own error, such as an undecodable
+            payload, which fails the batch.
     """
     image_processor = model_runner.image_processor()
     mode = call.kind
@@ -193,29 +264,23 @@ def prepare_features(
             signed_unit=source_metadata.value_range == (-1.0, 1.0),
         )
     else:
-        prepared = prepare_image(
-            image_processor,
-            mode,
-            source,
-            device=target_device,
-            input_images=_input_images(
-                state.pending_output(call.request_key.request_id)
-            ),
-        )
+        task = state.image_tasks.get(call.call_id)
+        if task is None:
+            raise RuntimeError("inline image encode has no host preparation")
+        prepared = stage_image(task.result(), target_device)
     return prepared
 
 
-def _input_images(request: PendingOutput) -> int:
-    """Return the input image count admitted with a request that has one.
+def _input_images(count: int) -> int:
+    """Return a request's admitted input image count, which must be positive.
 
     Raises:
         WorkerError: ``invalid_descriptor`` when the admission declares no
             input images.
     """
-    count = int(request.request.admission.input_images)
-    if count < 1:
+    if int(count) < 1:
         raise invalid_descriptor("request admission declares no input images")
-    return count
+    return int(count)
 
 
 def publish_features(
@@ -514,6 +579,7 @@ def vision_state_row(
     width: int,
     conditioning_position: int,
     *,
+    seq_len: int,
     state: BatchState,
     close_image: bool,
     logits: bool,
@@ -523,13 +589,25 @@ def vision_state_row(
     """Build the prefill row that writes one image's vision features into KV.
 
     ``features`` are ``[tokens, hidden]`` (or with a leading singleton batch
-    axis). The row is non-causal, writes KV at the request's cache
-    coordinates, and selects last logits when ``logits`` is set (hidden
-    states otherwise). A framed layout adds start and end marker tokens;
+    axis). The row is non-causal: its features attend to each other in both
+    directions and to the ``seq_len`` KV tokens before it in the request's
+    slot, which are the request's visible KV and, in a context prefill, the
+    rows of its call before this one. It writes its KV after them and
+    selects last logits when ``logits`` is set (only the K/V cache
+    otherwise). A framed layout adds start and end marker tokens;
     ``close_image`` adds the end marker in any layout.
+
+    Raises:
+        WorkerError: When the model declares no feature injection, the
+            features are not ``[tokens, hidden]``, or ``seq_len`` exceeds
+            the request's allocated KV (``calls.cache_coordinates``).
     """
     request = state.pending_output(call.request_key.request_id)
     cache = calls.cache_coordinates(request, tables=request_tables)
+    if seq_len < cache[1] or seq_len > cache[2]:
+        raise invalid_descriptor(
+            "vision row prefix lies outside the request's KV extent"
+        )
     injection = model_runner.image_processor().feature_injection
     if injection is None:
         raise invalid_descriptor(
@@ -577,7 +655,9 @@ def vision_state_row(
         leading=leading,
         trailing=trailing,
         close_image=close_image,
-        input_images=None if close_image else _input_images(request),
+        input_images=None
+        if close_image
+        else _input_images(request.request.admission.input_images),
         model_runner=model_runner,
     )
     return TokenRow(
@@ -586,11 +666,13 @@ def vision_state_row(
         token_embeddings=token_embeddings,
         token_embedding_mask=embedding_mask,
         positions=positions,
+        # A row that samples no token only writes the K/V cache; its
+        # outcome reads no output.
         selection=TokenSelection.LAST_LOGITS
         if logits
-        else TokenSelection.HIDDEN,
+        else TokenSelection.CACHE,
         request_pool_idx=cache[0],
-        seq_len=cache[1],
+        seq_len=seq_len,
         write_kv=True,
         causal=False,
     )
@@ -622,7 +704,9 @@ def _vision_positions(
     """Build position ids for a vision row's marker and feature slots.
 
     Returns ``[query]`` positions for ``PositionLayout.TEMPORAL``, all at
-    ``conditioning_position``. Otherwise returns ``[3, query]`` rows of
+    ``conditioning_position``, and for ``PositionLayout.SEQUENTIAL``,
+    consecutive from ``conditioning_position``. Otherwise returns
+    ``[3, query]`` rows of
     temporal, height and width coordinates: feature slots take their raster
     grid coordinates and marker slots zero spatial coordinates. The raster
     grid is the patch grid of a ``height`` x ``width`` canvas under the
@@ -633,6 +717,9 @@ def _vision_positions(
         return torch.full(
             (query,), int(conditioning_position), dtype=torch.long
         )
+    if layout is PositionLayout.SEQUENTIAL:
+        start = int(conditioning_position)
+        return torch.arange(start, start + query, dtype=torch.long)
 
     transform = model_runner.image_processor().vit
     if not isinstance(transform, PatchTransform):

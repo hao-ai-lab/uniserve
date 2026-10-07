@@ -9,15 +9,19 @@ readable descriptor for selector loops. ``atomic_store_u32`` and
 """
 
 from types import TracebackType
-from typing import Any, Self, final
+from typing import Any, Final, Self, final
 
 __all__ = [
+    "DEBUG_BUILD",
     "Server",
     "StreamSignal",
     "atomic_load_u32",
     "atomic_store_u32",
     "service_name",
 ]
+
+DEBUG_BUILD: Final[bool]
+"""Whether the extension was compiled with debug assertions."""
 
 @final
 class Server:

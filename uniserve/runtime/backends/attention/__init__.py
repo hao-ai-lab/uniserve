@@ -304,6 +304,11 @@ class Backend:
 
     operator_class: type[Operator]
 
+    # Whether paged calls can change each row's causal mask through device
+    # flags between graph replays. Fixed-mask providers retain their causal
+    # and non-causal graphs without capturing an unsupported mixed variant.
+    device_causality = False
+
     def reads_pages(
         self,
         *,

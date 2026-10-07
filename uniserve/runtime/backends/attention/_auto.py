@@ -417,6 +417,8 @@ class Backend(_Backend):
     attention kernels are not candidates.
     """
 
+    device_causality = True
+
     def __init__(self, device, *, flashinfer=None):
         self.device = device
         self._architecture = (

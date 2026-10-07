@@ -49,8 +49,8 @@ pub struct SchedulerStatsReporter {
     last_worker_exec_us_total: u64,
     last_batch_roundtrip_us_total: u64,
     last_batch_timing_count: u64,
-    // Indexed in the prefill, decode, flow order used by `domain_stats`.
-    last_domains: [DomainCumulative; 3],
+    // Indexed in the `ExecutionDomainStats::groups` order `domain_stats` reads.
+    last_domains: [DomainCumulative; super::stats::ExecutionDomainStats::COUNT],
 }
 
 impl SchedulerStatsReporter {
@@ -137,11 +137,7 @@ impl SchedulerStatsReporter {
     /// Credit counts are reported as current values: `active_credits` is the
     /// present count and `peak_credits` the lifetime maximum.
     fn domain_stats(&mut self, stats: &SchedulerStats) -> Vec<DomainSchedulerStats> {
-        let domains = [
-            ("prefill", &stats.domains.prefill),
-            ("decode", &stats.domains.decode),
-            ("flow", &stats.domains.flow),
-        ];
+        let domains = stats.domains.groups();
         domains
             .into_iter()
             .enumerate()

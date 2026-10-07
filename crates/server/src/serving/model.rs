@@ -792,6 +792,8 @@ impl InputProcessor {
         let constraint = crate::serving::omni::generation_constraint(modalities);
 
         let mut generation = GenerationRequest {
+            canvas: None,
+            readout: Vec::new(),
             request_id: RequestId(stable_hash(request_id.as_ref())),
             prompt_token_ids: Vec::new(),
             negative_prompt_token_ids: Vec::new(),

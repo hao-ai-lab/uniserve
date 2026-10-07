@@ -381,6 +381,8 @@ class _FlashAttentionOperator(_Operator):
 
 
 class Backend(_Backend):
+    device_causality = True
+
     name = "flash_attn_4"
 
     operator_class = _FlashAttentionOperator

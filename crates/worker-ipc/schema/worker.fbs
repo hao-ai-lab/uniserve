@@ -32,7 +32,7 @@ namespace uniserve.ipc;
 
 // ForwardMode, MediaCall, and TransferMode mirror the Rust enums of the same
 // names. Their leading `None` exists only to mark an unset CallKind tag.
-enum ForwardMode : ubyte { None, Prefill, Decode, Verify }
+enum ForwardMode : ubyte { None, Prefill, Decode, Verify, TokenDenoising }
 enum MediaCall : ubyte { None, MediaReading, VisionEncoding, LatentEncoding, TextEncoding, LatentPreparation, Denoising, ImageDecoding, VideoDecoding, AudioDecoding, VideoEncoding, AudioEncoding, Muxing }
 enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
 
@@ -265,6 +265,13 @@ table WorkerInfo {
   /// values.
   checkpoint_identity:string;
   video_denoiser:VideoDenoiserInfo;
+  /// Maximum calls in one prefill run, the rows the rank's captured prefill
+  /// graphs hold; zero leaves prefill runs bounded by `max_batch_calls`.
+  max_prefill_calls:uint;
+  /// Maximum calls in one decode run, the rows the rank's largest captured
+  /// decode graph holds; zero leaves decode runs bounded by
+  /// `max_batch_calls`.
+  max_decode_calls:uint;
 }
 
 // Request identities and call records.
@@ -322,6 +329,22 @@ table SamplingState {
   force_finish:bool;
 }
 
+/// One denoising step of a block-diffusion request's resident canvas,
+/// decoded into `CanvasStep`.
+table CanvasStep {
+  block:uint;
+  step:uint;
+}
+
+/// Candidate slots of a token-denoising readout, decoded into `Readout`.
+/// Slot `i` is canvas token `slot_tokens[i]` of the call's `input_token_ids`
+/// and reads `candidate_ids[candidate_offsets[i]..candidate_offsets[i + 1]]`.
+table Readout {
+  slot_tokens:[uint];
+  candidate_offsets:[uint];
+  candidate_ids:[uint];
+}
+
 /// The coordinates a call carries so a rank does not derive them from the
 /// calls that preceded it. The engine holds the request state they come
 /// from; the rank asserts its own ledger agrees.
@@ -330,6 +353,14 @@ table CallCoordinates {
   kv_visible_len:uint;
   kv_computed_len:uint;
   flow_step:uint;
+}
+
+/// One image block of a context prefill, decoded into `VisionInput`: the
+/// vision-encoder `feature` the block injects, written before the call's
+/// input token `offset`.
+table VisionInput {
+  offset:uint;
+  feature:TensorRef (required);
 }
 
 /// One planned computation, decoded into `Call` and checked by
@@ -354,7 +385,7 @@ table Call {
   outputs:[TensorRef];
   token_input:TensorRef;
   token_output:TensorRef;
-  vision_input:TensorRef;
+  vision_inputs:[VisionInput];
   latent_feature_input:TensorRef;
   encoder_output:TensorRef;
   latent_input:TensorRef;
@@ -380,6 +411,10 @@ table Call {
   /// excluding the executing rank. A published product retires once each
   /// has acknowledged it.
   consumer_slots:[uint];
+  /// Present exactly on a token-denoising call, whose `input_token_ids` hold
+  /// its canvas rows back to back.
+  readout:Readout;
+  canvas:CanvasStep;
 }
 
 /// Units of logical pages `start_page..` of one request slot and cache group,
@@ -484,6 +519,9 @@ table RequestOutput {
   finish_flags:FinishFlags;
   media_output:MediaOutput;
   kv_output:KvTransfer;
+  /// Natural-log probability of every readout candidate of a successful
+  /// token-denoising call, in the call's `Readout.candidate_ids` order.
+  candidate_logprobs:[float];
 }
 
 table StartCommand { request:NewRequest; }
@@ -550,11 +588,24 @@ table VideoAdmission {
   conditions:[VideoCondition];
 }
 
+/// Block-diffusion sampling of a canvas-generating request, decoded into
+/// `CanvasSampling`.
+table CanvasSampling {
+  canvas_length:uint;
+  max_steps:uint;
+  entropy_bound:float;
+  t_min:float;
+  t_max:float;
+  confidence_threshold:float;
+  stability_threshold:uint;
+}
+
 table ArRequestParams {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   finish_token_ids:[uint];
   initial_position:uint;
+  canvas:CanvasSampling;
 }
 
 table DiffusionSamplingParams {

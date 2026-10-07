@@ -81,6 +81,13 @@ pub enum EngineCoreOutput {
         /// Token log probability when requested.
         logprob: Option<f32>,
     },
+    /// Publishes generated text tokens committed together, in order, such as
+    /// a stopped block-diffusion canvas; they carry no log probabilities.
+    /// Consumers treat them as consecutive `TextToken`s.
+    TextTokens {
+        /// Vocabulary token identities.
+        ids: Vec<u32>,
+    },
     /// Publishes ranked candidates associated with a text token.
     TokenLogprobs {
         /// Generated token identity this payload scores.
@@ -92,6 +99,13 @@ pub enum EngineCoreOutput {
     PromptLogprobs {
         /// Scored prompt positions in prompt order.
         positions: Vec<PositionLogprobs>,
+    },
+    /// Publishes a readout request's answer, once, before its `Finished`.
+    Readout {
+        /// Natural-log probability of every candidate of every slot, in
+        /// row, slot, and candidate order
+        /// (`GenerationRequest::readout_candidates` values).
+        candidate_logprobs: Vec<f32>,
     },
     /// Opens the lifecycle of one generated image.
     ///
@@ -226,6 +240,9 @@ pub enum RuntimeFamily {
     Diffusion,
     /// Unified multimodal understanding and generation runtime.
     Umm,
+    /// Block-diffusion token runtime: prompt prefill and denoising passes
+    /// over token canvases that read the prompt's KV cache.
+    BlockDiffusion,
 }
 
 /// One caller-visible artifact retaining its immutable shared-storage mapping.
@@ -410,6 +427,8 @@ pub enum Request {
     Diffusion(DiffusionRequest),
     /// Unified multimodal request.
     Umm(crate::GenerationRequest),
+    /// Block-diffusion token request, such as a canvas readout.
+    BlockDiffusion(crate::GenerationRequest),
 }
 
 impl From<crate::GenerationRequest> for Request {
@@ -423,7 +442,9 @@ impl Request {
     /// Returns the request identifier shared by every runtime family.
     pub const fn request_id(&self) -> RequestId {
         match self {
-            Self::Ar(request) | Self::Umm(request) => request.request_id,
+            Self::Ar(request) | Self::Umm(request) | Self::BlockDiffusion(request) => {
+                request.request_id
+            }
             Self::Diffusion(request) => request.request_id,
         }
     }
@@ -431,7 +452,9 @@ impl Request {
     /// Returns the scheduling priority shared by every runtime family.
     pub const fn priority(&self) -> i32 {
         match self {
-            Self::Ar(request) | Self::Umm(request) => request.priority,
+            Self::Ar(request) | Self::Umm(request) | Self::BlockDiffusion(request) => {
+                request.priority
+            }
             Self::Diffusion(request) => request.priority,
         }
     }
@@ -442,6 +465,7 @@ impl Request {
             Self::Ar(_) => RuntimeFamily::Ar,
             Self::Diffusion(_) => RuntimeFamily::Diffusion,
             Self::Umm(_) => RuntimeFamily::Umm,
+            Self::BlockDiffusion(_) => RuntimeFamily::BlockDiffusion,
         }
     }
 }

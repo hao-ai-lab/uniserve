@@ -4,37 +4,111 @@
 //! reserves an engine `RequestId` for an external identifier before
 //! preprocessing, so duplicates are refused early and control commands can
 //! reach a request that is still being prepared. `submit_generation` or
-//! `submit_media` then claims that registration and hands the request to the
-//! engine; the returned `EventRx` releases the claim when its stream ends or
-//! it is dropped.
+//! `submit_media` then claims that registration and hands the request to one
+//! engine core; the returned `EventRx` releases the claim when its stream ends
+//! or it is dropped.
+//!
+//! A data-parallel deployment runs one engine core per replica
+//! (`EngineCore::replicas`), each with its own scheduler, KV cache and
+//! workers. The client routes each submitted request to the live core with
+//! the fewest requests in flight, scanning from a start that advances after
+//! every pick so ties rotate across the replicas. This is SGLang's
+//! `total_requests` data-parallel balancing (the argmin of running plus
+//! waiting requests, `data_parallel_controller.py:778-782`) and vLLM's
+//! data-parallel client score with equal waiting and running weights and a
+//! rotating start (`v1/engine/core_client.py:1398-1426`). Both read load
+//! snapshots published by the replicas; the cores here share the client's
+//! process, so the counts are exact at every pick.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::error::{Error, Result};
 use uniserve_core::{GenerationLimits, ModelDtype, Request, RequestId, RuntimeFamily};
-use uniserve_engine::{EngineCore, EngineHandle, EventRx, Executor};
+use uniserve_engine::{EngineCore, EventRx, Executor, SubmitError};
 
 /// In-process engine client owned by the server layer.
 ///
-/// Construction spawns a Tokio task, so every constructor must be called
-/// within a Tokio runtime.
+/// Construction spawns one Tokio task per engine core, so every constructor
+/// must be called within a Tokio runtime.
 pub struct EngineClient {
-    core: Arc<EngineCore>,
+    /// One core per data-parallel replica; the replicas serve the same model
+    /// with the same limits.
+    cores: Box<[Arc<EngineCore>]>,
+    /// Routing state shared with every submitted request's completion hook.
+    routing: Arc<Routing>,
     pub(crate) requests: Arc<super::requests::RequestRegistry>,
 }
 
-impl EngineClient {
-    /// Returns the shared engine handle.
-    fn handle(&self) -> EngineHandle {
-        self.core.handle()
+/// Which core holds each submitted request, and how many each holds.
+#[derive(Default)]
+struct Routing {
+    /// Requests submitted to each core whose event stream has not ended.
+    in_flight: Box<[AtomicUsize]>,
+    /// The core a routing scan starts from.
+    start: AtomicUsize,
+    /// The core of every submitted request whose event stream has not ended,
+    /// so control commands reach the core that holds the request.
+    cores: Mutex<HashMap<RequestId, usize>>,
+}
+
+impl Routing {
+    fn new(cores: usize) -> Self {
+        Self {
+            in_flight: (0..cores).map(|_| AtomicUsize::new(0)).collect(),
+            ..Self::default()
+        }
     }
 
-    /// Starts an engine from its worker-backed core configuration.
+    /// Picks the live core with the fewest requests in flight.
+    ///
+    /// The scan starts one core later after every pick, so equal loads rotate
+    /// across the replicas. Returns `None` when every core is dead.
+    fn pick(&self, cores: &[Arc<EngineCore>]) -> Option<usize> {
+        let count = cores.len();
+        let start = self.start.fetch_add(1, Ordering::Relaxed) % count;
+        (0..count)
+            .map(|offset| (start + offset) % count)
+            .filter(|&index| !cores[index].is_dead())
+            .min_by_key(|&index| self.in_flight[index].load(Ordering::Relaxed))
+    }
+
+    /// Records `request` on `core` until `release` runs for it.
+    fn hold(&self, request: RequestId, core: usize) {
+        self.in_flight[core].fetch_add(1, Ordering::Relaxed);
+        self.lock().insert(request, core);
+    }
+
+    /// Forgets `request`, once its event stream has ended or its submission
+    /// failed.
+    fn release(&self, request: RequestId) {
+        if let Some(core) = self.lock().remove(&request) {
+            self.in_flight[core].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The core that holds `request`, while its event stream lasts.
+    fn core(&self, request: RequestId) -> Option<usize> {
+        self.lock().get(&request).copied()
+    }
+
+    /// Locks the request map and recovers it after poisoning.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, usize>> {
+        self.cores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl EngineClient {
+    /// Starts the engine cores of a worker-backed configuration: one core, or
+    /// one per data-parallel replica (`EngineConfig::data_parallel_size`).
     pub fn connect(config: uniserve_engine::EngineConfig) -> Result<Self> {
-        let core = EngineCore::new(config).map_err(|e| Error::ClientClosed {
+        let cores = EngineCore::replicas(config).map_err(|e| Error::ClientClosed {
             message: format!("failed to start the UniServe engine: {e:?}"),
         })?;
-        Self::from_core(core)
+        Self::from_cores(cores)
     }
 
     /// Starts an engine over an explicitly supplied executor.
@@ -42,11 +116,26 @@ impl EngineClient {
         config: uniserve_engine::EngineConfig,
         executor: Box<dyn Executor>,
     ) -> Result<Self> {
-        let core =
-            EngineCore::with_executor(config, executor).map_err(|e| Error::ClientClosed {
-                message: format!("failed to start the UniServe engine: {e:?}"),
-            })?;
-        Self::from_core(core)
+        Self::connect_with_executors(config, vec![executor])
+    }
+
+    /// Starts one engine core per supplied executor, each serving one
+    /// data-parallel replica.
+    pub fn connect_with_executors(
+        config: uniserve_engine::EngineConfig,
+        executors: Vec<Box<dyn Executor>>,
+    ) -> Result<Self> {
+        let cores = executors
+            .into_iter()
+            .map(|executor| {
+                EngineCore::with_executor(config.clone(), executor).map_err(|e| {
+                    Error::ClientClosed {
+                        message: format!("failed to start the UniServe engine: {e:?}"),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_cores(cores)
     }
 
     /// Starts an engine over an executor and explicit command waker.
@@ -61,26 +150,47 @@ impl EngineClient {
                     message: format!("failed to start the UniServe engine: {e:?}"),
                 }
             })?;
-        Self::from_core(core)
+        Self::from_cores(vec![core])
     }
 
-    /// Wraps an initialized engine core with request tracking and periodic statistics export.
+    /// Wraps initialized engine cores with request tracking and periodic
+    /// statistics export.
     ///
-    /// The export task publishes one scheduler-stats snapshot per second as
-    /// engine `0`, matching `engine_count`. It holds only a weak reference to
-    /// the core, so it does not keep the engine alive and exits on the first
-    /// tick after the client is dropped. The request registry records
-    /// completed requests under the same model name and engine.
-    fn from_core(core: EngineCore) -> Result<Self> {
-        let core = Arc::new(core);
+    /// The replicas must serve the same model under the same limits, since a
+    /// request is validated once against the client's limits and may land on
+    /// any replica; a mismatch fails. One export task per core publishes a
+    /// scheduler-stats snapshot every second under that core's engine index,
+    /// matching `engine_count`. Each task holds only a weak reference to its
+    /// core, so it does not keep the engine alive and exits on the first tick
+    /// after the client is dropped. The request registry records completed
+    /// requests under the same model name as engine 0.
+    fn from_cores(cores: Vec<EngineCore>) -> Result<Self> {
+        let cores: Box<[Arc<EngineCore>]> = cores.into_iter().map(Arc::new).collect();
+        let first = cores.first().ok_or_else(|| Error::ClientClosed {
+            message: "an engine client needs at least one engine core".to_string(),
+        })?;
+        for core in &cores[1..] {
+            if core.model_name() != first.model_name()
+                || core.max_model_len() != first.max_model_len()
+                || core.generation_limits() != first.generation_limits()
+                || core.model_dtype() != first.model_dtype()
+                || core.runtime_family() != first.runtime_family()
+                || core.info().denoise_steps() != first.info().denoise_steps()
+                || core.supports_token_sampling() != first.supports_token_sampling()
+            {
+                return Err(Error::ClientClosed {
+                    message: "data-parallel replicas serve different models or limits".to_string(),
+                });
+            }
+        }
 
         let requests = Arc::new(super::requests::RequestRegistry::new(
-            core.model_name().to_string(),
+            first.model_name().to_string(),
         ));
-        {
+        for (engine, core) in (0u32..).zip(cores.iter()) {
             let stats = Arc::clone(core.stats());
             let model_name = core.model_name().to_string();
-            let guard = Arc::downgrade(&core);
+            let guard = Arc::downgrade(core);
             tokio::spawn(async move {
                 // The reporter turns cumulative scheduler counters into
                 // per-snapshot increments, so one instance lives across ticks.
@@ -96,62 +206,76 @@ impl EngineClient {
                     crate::engine_client::metrics::record_scheduler_stats(
                         &uniserve_observability::METRICS.scheduler,
                         &model_name,
-                        0,
+                        engine,
                         &snapshot,
                     );
                 }
             });
         }
 
-        Ok(Self { core, requests })
+        Ok(Self {
+            routing: Arc::new(Routing::new(cores.len())),
+            cores,
+            requests,
+        })
+    }
+
+    /// The first core, whose model identity and limits every replica shares.
+    fn first(&self) -> &EngineCore {
+        &self.cores[0]
     }
 }
 
 impl EngineClient {
     /// Returns the configured model name.
     pub fn model_name(&self) -> &str {
-        self.core.model_name()
+        self.first().model_name()
     }
 
-    /// Returns the number of logical engine instances.
+    /// Returns the number of engine cores, one per data-parallel replica.
     pub fn engine_count(&self) -> usize {
-        1
+        self.cores.len()
     }
 
     /// Returns the maximum supported model context length.
     pub fn max_model_len(&self) -> u32 {
-        self.core.max_model_len()
+        self.first().max_model_len()
     }
 
     /// Returns worker-advertised generation limits.
     pub fn generation_limits(&self) -> GenerationLimits {
-        self.core.generation_limits()
+        self.first().generation_limits()
     }
 
     /// Returns what the deployment's video denoiser serves, as its worker
     /// reported at startup; `None` for a model without one.
     pub fn video_denoiser(&self) -> Option<uniserve_engine::VideoDenoiserInfo> {
-        self.core.info().video_denoiser.clone()
+        self.first().info().video_denoiser.clone()
     }
 
     /// Returns whether the worker supports token sampling calls.
     pub fn supports_token_sampling(&self) -> bool {
-        self.core.supports_token_sampling()
+        self.first().supports_token_sampling()
     }
 
     /// Returns the worker's effective model dtype.
     pub fn model_dtype(&self) -> ModelDtype {
-        self.core.model_dtype()
+        self.first().model_dtype()
     }
 
-    /// Returns the allocatable paged-KV units the scheduler plans against.
+    /// Returns the allocatable paged-KV units the schedulers plan against,
+    /// summed over the replicas.
     pub fn total_kv_units(&self) -> u64 {
-        u64::from(self.core.info().kv_usable_units())
+        self.cores
+            .iter()
+            .map(|core| u64::from(core.info().kv_usable_units()))
+            .sum()
     }
 
-    /// Returns whether the engine can accept requests.
+    /// Returns whether the engine can accept requests: whether any replica's
+    /// core is alive. Requests route only to live replicas.
     pub fn is_healthy(&self) -> bool {
-        !self.core.is_dead()
+        self.cores.iter().any(|core| !core.is_dead())
     }
 
     /// Reserves a unique request ID before preprocessing. The caller must submit
@@ -159,13 +283,14 @@ impl EngineClient {
     ///
     /// Returns `Error::DuplicateRequestId` when a live request already holds
     /// `external_request_id`. With `output_identity`, the registration also
-    /// carries per-request lifecycle statistics.
+    /// carries per-request lifecycle statistics. Identifiers come from the
+    /// first core's allocator alone, so they are unique across the replicas.
     pub fn register_request(
         &self,
         external_request_id: String,
         output_identity: Option<crate::serving::ModelEventIdentity>,
     ) -> Result<RequestId> {
-        let rid = self.core.next_request_id();
+        let rid = self.first().next_request_id();
         if !self
             .requests
             .register(external_request_id.clone().into(), rid, output_identity)
@@ -196,29 +321,19 @@ impl EngineClient {
         request: uniserve_core::GenerationRequest,
     ) -> Result<EventRx> {
         let rid = request.request_id;
-        self.requests.claim_submission(&external_request_id, rid)?;
-        let request = match self.core.runtime_family() {
+        let request = match self.first().runtime_family() {
             RuntimeFamily::Ar => Request::Ar(request),
             RuntimeFamily::Umm => Request::Umm(request),
+            RuntimeFamily::BlockDiffusion => Request::BlockDiffusion(request),
             RuntimeFamily::Diffusion => {
+                self.requests.claim_submission(&external_request_id, rid)?;
                 self.requests.release_engine(&external_request_id, rid);
                 return Err(Error::ClientClosed {
                     message: "text generation is unavailable for a diffusion runtime".to_string(),
                 });
             }
         };
-        let mut scheduler_rx = self.core.submit(request).map_err(|error| {
-            self.requests.release_engine(&external_request_id, rid);
-            Error::from(error)
-        })?;
-        // Once the event stream ends or the receiver is dropped, the registry
-        // forgets the engine side of the record, so a later control command no
-        // longer reaches the engine.
-        let requests = Arc::clone(&self.requests);
-        scheduler_rx.set_on_finish(move || {
-            requests.release_engine(&external_request_id, rid);
-        });
-        Ok(scheduler_rx)
+        self.submit(external_request_id, rid, request)
     }
 
     /// Submits one terminal media request and returns its event receiver.
@@ -231,23 +346,48 @@ impl EngineClient {
         request: uniserve_core::DiffusionRequest,
     ) -> Result<EventRx> {
         let rid = request.request_id;
-        self.requests.claim_submission(&external_request_id, rid)?;
-        if self.core.runtime_family() != RuntimeFamily::Diffusion {
+        if self.first().runtime_family() != RuntimeFamily::Diffusion {
+            self.requests.claim_submission(&external_request_id, rid)?;
             self.requests.release_engine(&external_request_id, rid);
             return Err(Error::ClientClosed {
                 message: "diffusion generation is unavailable for this runtime".to_string(),
             });
         }
-        let mut scheduler_rx = self
-            .core
-            .submit(Request::Diffusion(request))
-            .map_err(|error| {
-                self.requests.release_engine(&external_request_id, rid);
-                Error::from(error)
-            })?;
+        self.submit(external_request_id, rid, Request::Diffusion(request))
+    }
+
+    /// Routes one claimed request to a replica and attaches its release.
+    ///
+    /// The request is recorded on its core before the claim, so a control
+    /// command accepted once the claim holds finds the core. Once the event
+    /// stream ends or the receiver is dropped, the registry forgets the engine
+    /// side of the record, so a later control command no longer reaches the
+    /// engine, and the routing forgets the request.
+    fn submit(
+        &self,
+        external_request_id: String,
+        rid: RequestId,
+        request: Request,
+    ) -> Result<EventRx> {
+        let core = self
+            .routing
+            .pick(&self.cores)
+            .ok_or(Error::Submit(SubmitError::Dead))?;
+        self.routing.hold(rid, core);
+        if let Err(error) = self.requests.claim_submission(&external_request_id, rid) {
+            self.routing.release(rid);
+            return Err(error);
+        }
+        let mut scheduler_rx = self.cores[core].submit(request).map_err(|error| {
+            self.requests.release_engine(&external_request_id, rid);
+            self.routing.release(rid);
+            Error::from(error)
+        })?;
         let requests = Arc::clone(&self.requests);
+        let routing = Arc::clone(&self.routing);
         scheduler_rx.set_on_finish(move || {
             requests.release_engine(&external_request_id, rid);
+            routing.release(rid);
         });
         Ok(scheduler_rx)
     }
@@ -259,22 +399,22 @@ impl EngineClient {
     /// pending cancellation; one without statistics whose registration is not
     /// claimed is removed, so its later submission fails with
     /// `Error::UnknownRequestId`.
-    /// The abort reaches the engine (`EngineHandle::abort`) only while a
-    /// submission holds the registration's claim, from `claim_submission`
-    /// until `release_engine`. Unknown identifiers are ignored, and the call
-    /// always returns `Ok`.
+    /// The abort reaches the engine core holding the request
+    /// (`EngineHandle::abort`) only while a submission holds the
+    /// registration's claim, from `claim_submission` until `release_engine`.
+    /// Unknown identifiers are ignored, and the call always returns `Ok`.
     pub async fn abort<I, S>(&self, ids: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let handle = self.handle();
         for id in ids {
             if let Some(rid) = self
                 .requests
                 .mark_control(id.as_ref(), crate::serving::RequestLifecycleState::Aborting)
+                && let Some(core) = self.routing.core(rid)
             {
-                handle.abort(rid);
+                self.cores[core].handle().abort(rid);
             }
         }
         Ok(())
@@ -284,47 +424,55 @@ impl EngineClient {
     ///
     /// Registry handling matches `abort`, except that a request with lifecycle
     /// statistics moves to `Cancelling` and keeps a pending `Aborting`. The
-    /// cancellation reaches the engine (`EngineHandle::cancel`) under the same
-    /// claim condition. Unknown identifiers are ignored, and the call always
-    /// returns `Ok`.
+    /// cancellation reaches the engine core holding the request
+    /// (`EngineHandle::cancel`) under the same claim condition. Unknown
+    /// identifiers are ignored, and the call always returns `Ok`.
     pub async fn cancel<I, S>(&self, ids: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let handle = self.handle();
         for id in ids {
             if let Some(rid) = self.requests.mark_control(
                 id.as_ref(),
                 crate::serving::RequestLifecycleState::Cancelling,
-            ) {
-                handle.cancel(rid);
+            ) && let Some(core) = self.routing.core(rid)
+            {
+                self.cores[core].handle().cancel(rid);
             }
         }
         Ok(())
     }
 
-    /// Requests graceful shutdown and waits until the engine's scheduler
-    /// thread has exited.
+    /// Requests graceful shutdown of every engine core and waits until their
+    /// scheduler threads have exited.
     ///
-    /// The scheduler finishes outstanding requests and closes its executor,
+    /// Each scheduler finishes outstanding requests and closes its executor,
     /// which on a multi-rank deployment waits for every rank to drain and
-    /// exit. The join therefore runs on Tokio's blocking pool, leaving the
-    /// calling runtime thread free for other tasks. Repeated calls are
-    /// harmless.
+    /// exit. The cores shut down concurrently on Tokio's blocking pool,
+    /// leaving the calling runtime thread free for other tasks. Repeated
+    /// calls are harmless.
     ///
     /// # Errors
     ///
-    /// Returns `Error::ClientClosed` when the blocking shutdown task does not
+    /// Returns `Error::ClientClosed` when a blocking shutdown task does not
     /// complete, which happens only if it panics or its runtime is shutting
     /// down.
     pub async fn shutdown(&self) -> Result<()> {
-        let core = Arc::clone(&self.core);
-        tokio::task::spawn_blocking(move || core.shutdown())
-            .await
-            .map_err(|error| Error::ClientClosed {
-                message: format!("engine shutdown did not complete: {error}"),
+        let tasks = self
+            .cores
+            .iter()
+            .map(|core| {
+                let core = Arc::clone(core);
+                tokio::task::spawn_blocking(move || core.shutdown())
             })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            task.await.map_err(|error| Error::ClientClosed {
+                message: format!("engine shutdown did not complete: {error}"),
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -371,6 +519,8 @@ mod tests {
             priority: 0,
             cache: Default::default(),
             image_generation: policy,
+            readout: Vec::new(),
+            canvas: None,
         };
         let mut stream = client
             .submit_generation("req-text".to_string(), generation)
@@ -406,6 +556,92 @@ mod tests {
         );
 
         client.shutdown().await.expect("shutdown engine");
+    }
+
+    /// A text request of `rid` that generates until the simulator's EOS.
+    fn text_request(rid: uniserve_core::RequestId) -> GenerationRequest {
+        GenerationRequest {
+            request_id: rid,
+            prompt_token_ids: vec![1, 2, 3, 4],
+            multimodal_inputs: Default::default(),
+            negative_prompt_token_ids: Vec::new(),
+            constraint: GenerationConstraint::UndOnly,
+            sampling: SamplingParams::default(),
+            image: ImageParams::default(),
+            max_und_tokens: 64,
+            include_stop_token: false,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            cache: Default::default(),
+            image_generation: ImageGenerationConfig::default(),
+            readout: Vec::new(),
+            canvas: None,
+        }
+    }
+
+    /// Two requests in flight together land on different data-parallel
+    /// replicas, each served entirely by its own replica.
+    #[tokio::test]
+    async fn concurrent_requests_spread_over_data_parallel_replicas() {
+        let mut executors: Vec<Box<dyn Executor>> = Vec::new();
+        let mut observers = Vec::new();
+        for _ in 0..2 {
+            let mut executor = uniserve_engine::SimExecutor::new(uniserve_engine::SimEngine::new());
+            observers.push(executor.observe());
+            executors.push(Box::new(executor));
+        }
+        let client =
+            EngineClient::connect_with_executors(EngineConfig::sim("sim-model"), executors)
+                .expect("connect two sim replicas");
+        assert_eq!(client.engine_count(), 2);
+
+        // Both requests are submitted before either stream is read, so the
+        // first is still in flight when the second is routed.
+        let mut streams = Vec::new();
+        let mut ids = Vec::new();
+        for name in ["first", "second"] {
+            let rid = client
+                .register_request(name.to_string(), None)
+                .expect("reserve request");
+            ids.push(rid);
+            streams.push(
+                client
+                    .submit_generation(name.to_string(), text_request(rid))
+                    .await
+                    .expect("submit request"),
+            );
+        }
+        for stream in &mut streams {
+            while let Some(event) = stream.next().await {
+                if let EngineCoreOutput::Finished { reason, .. } = event {
+                    assert_eq!(reason, uniserve_core::FinishReason::Eos);
+                    break;
+                }
+            }
+        }
+        client.shutdown().await.expect("shutdown engines");
+
+        let served = observers
+            .iter()
+            .map(|observer| {
+                observer
+                    .try_iter()
+                    .filter_map(|event| match event {
+                        uniserve_engine::BatchEvent::Submitted(batch) => Some(batch),
+                        uniserve_engine::BatchEvent::Resolved { .. } => None,
+                    })
+                    .flat_map(|batch| batch.requests)
+                    .map(|(call, _)| call.request_key.request_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(served.iter().map(|ids| ids.len()).sum::<usize>(), 2);
+        assert!(served.iter().all(|ids| ids.len() == 1));
+        assert!(
+            ids.iter()
+                .all(|id| served.iter().any(|ids| ids.contains(id)))
+        );
     }
 
     #[tokio::test]
@@ -452,6 +688,8 @@ mod tests {
             priority: 0,
             cache: Default::default(),
             image_generation: policy,
+            readout: Vec::new(),
+            canvas: None,
         };
         request
             .validate_resources(&client.generation_limits())

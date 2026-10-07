@@ -643,7 +643,7 @@ impl KvTransfer {
 /// Encoding represented by a reusable image-feature publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FeatureKind {
-    /// Vision-encoder features, consumed through a call's `vision_input`.
+    /// Vision-encoder features, consumed through a call's `vision_inputs`.
     #[serde(rename = "vision_feature")]
     Vision,
     /// Latent image features, consumed through a call's

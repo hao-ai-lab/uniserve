@@ -89,7 +89,7 @@ def test_quantization_config_defaults_to_model_policy(tmp_path) -> None:
     assert config.model.quantization_config == {}
 
 
-def test_engine_batch_capacity_reaches_worker_resources(tmp_path) -> None:
+def test_engine_capacities_reach_worker_resources(tmp_path) -> None:
     config = worker_args(
         tmp_path,
         ipc_payload_cap=65536,
@@ -97,10 +97,12 @@ def test_engine_batch_capacity_reaches_worker_resources(tmp_path) -> None:
         device="cpu",
         max_batch_calls=128,
         max_batch_tokens=16384,
+        max_request_pool_size=257,
     )
 
     assert config.execution.max_batch_calls == 128
     assert config.execution.max_batch_tokens == 16384
+    assert config.execution.max_request_pool_size == 257
 
 
 def test_quantization_config_reaches_model_launch_config(tmp_path) -> None:
@@ -161,9 +163,12 @@ def test_execution_lanes_are_typed_and_domain_disjoint(tmp_path) -> None:
         ("decode", 64),
         ("compute", 88),
     )
+    # The decode domain holds the calls that advance admitted requests
+    # without growing their prompt.
     assert config.execution.lanes[0].call_kinds == (
         ForwardMode.DECODE,
         ForwardMode.VERIFY,
+        ForwardMode.TOKEN_DENOISING,
     )
 
 

@@ -149,17 +149,17 @@ class ExecutionContext(Generic[SizeT]):
     borrowers run on the same stream; the caller closes it after every
     borrower retires. Without it the context owns a private one.
 
-    ``experts`` is a borrowed ``ExpertExchange`` the expert-parallel
-    ``FusedMoE`` layers exchange tokens through; its owner opens a step
-    around every forward and retires it after this context. ``weights`` is
-    borrowed expert storage whose owner outlives its contexts and graphs.
-
     ``derive_host_lengths`` lets attention planning read host sequence
     lengths and table start pages a batch lacks from its device columns, a
     synchronizing device-to-host copy for direct library callers. A caller
     whose inputs always carry those host mirrors, such as the serving
     worker, passes False, and a call missing one then raises instead of
     copying. Planning never reads device values during graph capture.
+
+    ``experts`` is a borrowed ``ExpertExchange`` the expert-parallel
+    ``FusedMoE`` layers of ``module`` exchange tokens through; its owner
+    opens a step around every forward that reaches them (see
+    ``uniserve.runtime.expert_exchange``) and retires it after this context.
     """
 
     def __init__(
@@ -174,9 +174,9 @@ class ExecutionContext(Generic[SizeT]):
         moe="auto",
         groups=None,
         scratch: Scratch | None = None,
+        derive_host_lengths: bool = True,
         experts=None,
         weights=None,
-        derive_host_lengths: bool = True,
     ):
         # Close releases the module; a closed context never executes again.
         self.module: nn.Module | None = module
@@ -190,9 +190,11 @@ class ExecutionContext(Generic[SizeT]):
             matmul,
         )
         self._moe_backend = moe
-        self.experts = experts
-        self.weights = weights
         self._derive_host_lengths = derive_host_lengths
+        self.experts = experts
+        # Borrowed immutable expert storage and local prefetch scheduling.
+        # Its owner outlives every context and graph using these views.
+        self.weights = weights
 
         reference: torch.Tensor | None = next(
             (value for value in module.parameters() if not value.is_meta), None
@@ -232,10 +234,13 @@ class ExecutionContext(Generic[SizeT]):
         self._merged: dict[int | _binding.MergedKey, MatmulBinding] = {}
         self._attention: dict[int, AttentionBinding] = {}
         self._vsa: dict[int, VsaBinding] = {}
-        self._moe: dict[int, MoEBinding] = {}
         # VSA plans depend on numerical shapes, not on layer weights. Keep
-        # one operator per signature across this context's serialized layers.
-        self._vsa_operators: dict[tuple[object, ...], VsaOperator] = {}
+        # one operator per signature across this context's serialized layers,
+        # with the name of the provider that prepared it.
+        self._vsa_operators: dict[
+            tuple[object, ...], tuple[str, VsaOperator]
+        ] = {}
+        self._moe: dict[int, MoEBinding] = {}
         self._vsa_output: dict[ParallelAttention, OutputBuffers] = {}
         self._vsa_context: dict[ParallelAttention, AttentionBuffers] = {}
         self._context_backing: dict[tuple[object, ...], AttentionBuffers] = {}
@@ -718,7 +723,7 @@ class ExecutionContext(Generic[SizeT]):
         for binding in pending:
             binding.join(binding.module.hidden_size, self._dtype)
 
-    def bind_attention(self, batch):
+    def bind_attention(self, batch, *, replay=False):
         """Plan one call's attention metadata on the layers that read it.
 
         ``batch`` is the call's ``AttentionBatch``. A layer with a cache
@@ -732,6 +737,14 @@ class ExecutionContext(Generic[SizeT]):
         layers and tables, and only when the batch lacks them and the context
         derives host lengths; otherwise a plan that needs a missing mirror
         raises ``ValueError``.
+
+        With ``replay``, the batch feeds a captured graph's replay. When no
+        reading layer builds a launch plan (``AttentionBinding.
+        builds_launch_plan``), the captured launches read every length and
+        table on the device, so only the checks of the batch remain; the
+        layers reading one table share its entry, so one layer per table
+        checks it. Otherwise every reading layer binds as without
+        ``replay``.
         """
         from .backends.attention._sequences import batch_host_lengths
 
@@ -746,6 +759,14 @@ class ExecutionContext(Generic[SizeT]):
                     else binding.table in batch.entries
                 )
             )
+            if replay and not any(
+                binding.builds_launch_plan for binding in readers
+            ):
+                # The first layer reading each table checks its entry.
+                first: dict[int | None, AttentionBinding] = {}
+                for binding in readers:
+                    first.setdefault(binding.table, binding)
+                readers = tuple(first.values())
             mirrored = batch
             if any(
                 binding.reads_host_lengths(batch.entry(binding.table))
@@ -756,6 +777,43 @@ class ExecutionContext(Generic[SizeT]):
                 )
             for binding in readers:
                 binding.bind(mirrored, source=batch)
+
+    def kernels(self) -> list[dict[str, object]]:
+        """Describe the kernel prepared at every call site of this context.
+
+        Returns one record per call site and prepared representation, in
+        module order. Each record holds ``path``, the call site's module path
+        within the prepared module, and ``op``: ``attention``, ``vsa``,
+        ``moe`` or ``matmul``. The rest describes the call site's
+        representation and the ``provider`` its binding resolved; automatic
+        attention selection also reports, under ``inputs``, the provider
+        that served each input class the call site met. Call sites prepare
+        and select lazily, so read this after the calls to report have run,
+        for example after warmup and graph capture; an attention call site
+        that prepares at its first call and has not been called reports one
+        record whose ``dtype`` and ``provider`` are None. A closed context
+        reports nothing.
+        """
+        module = self.module
+        if module is None:
+            return []
+
+        records: list[dict[str, object]] = []
+        for path, child in module.named_modules():
+            bindings = (
+                self._merged.get(id(child))
+                if isinstance(child, MergedColumnParallelLinear)
+                else self._operators.get(id(child)),
+                self._moe.get(id(child)),
+                self._vsa.get(id(child)),
+                self._attention.get(id(child)),
+            )
+            for binding in bindings:
+                if binding is not None:
+                    records.extend(
+                        {"path": path, **record} for record in binding.kernels()
+                    )
+        return records
 
     @contextmanager
     def activate(self):
@@ -804,8 +862,11 @@ class ExecutionContext(Generic[SizeT]):
             close_resources(
                 *(binding.close for binding in self._attention.values()),
                 *(binding.close for binding in self._vsa.values()),
+                *(
+                    operator.close
+                    for _, operator in self._vsa_operators.values()
+                ),
                 *(binding.close for binding in self._moe.values()),
-                *(operator.close for operator in self._vsa_operators.values()),
                 *(
                     allocation.close
                     for allocation in reversed(self._allocations)
@@ -823,8 +884,8 @@ class ExecutionContext(Generic[SizeT]):
                 self._merged,
                 self._attention,
                 self._vsa,
-                self._moe,
                 self._vsa_operators,
+                self._moe,
                 self._vsa_output,
                 self._vsa_context,
                 self._context_backing,

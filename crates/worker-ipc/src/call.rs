@@ -42,7 +42,11 @@ impl RequestKey {
     }
 }
 
-/// The numerical mode of an autoregressive model forward.
+/// The numerical mode of a token model forward.
+///
+/// `Prefill`, `Decode` and `Verify` extend a request's KV cache causally.
+/// `TokenDenoising` runs one denoising pass over rows of a token canvas that
+/// read the request's cached prefix without writing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -50,6 +54,7 @@ pub enum ForwardMode {
     Prefill,
     Decode,
     Verify,
+    TokenDenoising,
 }
 
 impl ForwardMode {
@@ -58,13 +63,19 @@ impl ForwardMode {
     /// `worker-ipc-py` builds its Python enum table from this array and
     /// indexes it with `mode as usize`, so the order must match the
     /// declaration order.
-    pub const ALL: [Self; 3] = [Self::Prefill, Self::Decode, Self::Verify];
+    pub const ALL: [Self; 4] = [
+        Self::Prefill,
+        Self::Decode,
+        Self::Verify,
+        Self::TokenDenoising,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Prefill => "prefill",
             Self::Decode => "decode",
             Self::Verify => "verify",
+            Self::TokenDenoising => "token_denoising",
         }
     }
 }
@@ -286,11 +297,12 @@ impl CallKind {
     /// Mirrored, in the same order, by `CALL_KINDS` in
     /// `uniserve_worker.protocol.call`; the worker's reports list supported
     /// calls in this order.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Forward(ForwardMode::Prefill),
         Self::Forward(ForwardMode::Decode),
         Self::Forward(ForwardMode::Verify),
         Self::Media(MediaCall::MediaReading),
+        Self::Forward(ForwardMode::TokenDenoising),
         Self::Media(MediaCall::VisionEncoding),
         Self::Media(MediaCall::LatentEncoding),
         Self::Media(MediaCall::TextEncoding),
@@ -441,8 +453,100 @@ impl CallCoordinates {
     }
 }
 
+/// One denoising step of a block-diffusion request's resident canvas.
+///
+/// The request's admitted `ArRequestParams::canvas` fixes the sampling; the
+/// worker holds the canvas, its self-conditioning input and its stopping
+/// history in the request's slot. `block` counts the blocks already
+/// committed to the request's context and `step` the steps already run on
+/// this canvas; step zero starts the canvas from random tokens. The step
+/// that stops the canvas, by convergence or by reaching the admitted step
+/// limit, reports the canvas's argmax tokens as its committed tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CanvasStep {
+    /// Blocks committed to the request's context before this canvas.
+    pub block: u32,
+    /// Denoising steps already run on this canvas.
+    pub step: u32,
+}
+
+/// Candidate log-probabilities a token-denoising call reads at canvas slots.
+///
+/// The call's `input_token_ids` hold its canvas rows back to back. Slot `i`
+/// is canvas token `slot_tokens[i]` of that sequence and reads the candidate
+/// token ids `candidate_ids[candidate_offsets[i]..candidate_offsets[i + 1]]`.
+/// The worker reports, in `candidate_ids` order, each candidate's natural-log
+/// probability under the log-softmax over the full vocabulary of the model's
+/// logits at its slot (`RequestOutput::candidate_logprobs`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Readout {
+    /// Index of each slot's token in the call's concatenated canvas rows.
+    pub slot_tokens: Vec<u32>,
+    /// Offsets of each slot's candidates in `candidate_ids`: one more entry
+    /// than there are slots, starting at zero and ending at the id count.
+    pub candidate_offsets: Vec<u32>,
+    /// Candidate token ids of every slot, slot after slot.
+    pub candidate_ids: Vec<u32>,
+}
+
+impl Readout {
+    /// Number of candidate log-probabilities the readout reports.
+    pub fn candidate_count(&self) -> usize {
+        self.candidate_ids.len()
+    }
+
+    /// Validates the slot layout against a call of `canvas_tokens` canvas
+    /// tokens.
+    ///
+    /// Slots address canvas tokens in increasing order, each reads at least
+    /// one candidate, and the offsets partition `candidate_ids` in slot
+    /// order.
+    pub fn validate(&self, canvas_tokens: usize) -> ValidationResult<()> {
+        ensure_valid!(!self.slot_tokens.is_empty(), "readout reads no slot");
+        ensure_valid!(
+            self.candidate_offsets.len() == self.slot_tokens.len() + 1,
+            "readout candidate offsets do not bound every slot"
+        );
+        ensure_valid!(
+            self.candidate_offsets.first() == Some(&0)
+                && self.candidate_offsets.last().map(|&end| end as usize)
+                    == Some(self.candidate_ids.len())
+                && self
+                    .candidate_offsets
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+            "readout candidate offsets do not partition the candidates"
+        );
+        ensure_valid!(
+            self.slot_tokens
+                .iter()
+                .all(|&token| (token as usize) < canvas_tokens),
+            "readout slot lies outside the call's canvas rows"
+        );
+        ensure_valid!(
+            self.slot_tokens.windows(2).all(|pair| pair[0] < pair[1]),
+            "readout slots are not in canvas order"
+        );
+        Ok(())
+    }
+}
+
 /// Component used when a deployment does not partition a model by capability.
 pub const DEFAULT_COMPONENT: &str = "model";
+
+/// One image block of a context prefill.
+///
+/// The block writes the vision-encoder product `feature` into KV as one
+/// attention block, before the call's input token `offset`: the call's
+/// context is its input tokens `[0, offset)`, then the block, then the
+/// tokens from `offset` on. Blocks sharing an offset follow in list order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisionInput {
+    /// Input tokens of the call that precede the block.
+    pub offset: u32,
+    /// Vision-encoder features the block injects.
+    pub feature: TensorRef,
+}
 
 /// One immutable computation with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,8 +581,9 @@ pub struct Call {
     /// Sampled token and continuation bit in one I64 scalar. The worker packs
     /// it with `tagged_token_values` in `uniserve_worker.sampling.sampler`.
     pub token_output: Option<TensorRef>,
-    /// Vision features consumed by multimodal forward.
-    pub vision_input: Option<TensorRef>,
+    /// Image blocks a prefill injects, in context order: each block's
+    /// vision-encoder feature and the input token it precedes.
+    pub vision_inputs: Vec<VisionInput>,
     /// VAE features consumed by multimodal forward.
     pub latent_feature_input: Option<TensorRef>,
     /// Features produced by the selected image encoder.
@@ -502,9 +607,16 @@ pub struct Call {
     pub rng: Option<Rng>,
     /// Host-side sampler constraints for this computation; absent uses admission defaults.
     pub sampling_state: Option<SamplingState>,
-    /// Host-known prompt, draft, or decode input tokens in model input order.
-    /// Empty when continuation reads its predecessor's device token.
+    /// Host-known prompt, draft, or decode input tokens in model input order,
+    /// or a token-denoising call's canvas rows back to back. Empty when
+    /// continuation reads its predecessor's device token.
     pub input_token_ids: Vec<u32>,
+    /// Candidate slots a token-denoising readout reports; absent for every
+    /// other call.
+    pub readout: Option<Readout>,
+    /// The step a token-denoising call runs on its request's generation
+    /// canvas; absent for every other call.
+    pub canvas: Option<CanvasStep>,
     /// Encoded source image in base64, consumed by a vision or latent encoder.
     /// Dispatch and in-flight matching share these immutable bytes.
     pub input_image: Option<std::sync::Arc<str>>,
@@ -523,7 +635,7 @@ impl Call {
         self.inputs
             .iter()
             .chain(self.token_input.iter())
-            .chain(self.vision_input.iter())
+            .chain(self.vision_inputs.iter().map(|input| &input.feature))
             .chain(self.latent_feature_input.iter())
             .chain(self.latent_input.iter())
             .chain(self.image_input.iter())
@@ -560,7 +672,7 @@ impl Call {
     pub fn buffer_inputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.inputs
             .iter()
-            .chain(self.vision_input.iter())
+            .chain(self.vision_inputs.iter().map(|input| &input.feature))
             .chain(self.latent_feature_input.iter())
             .chain(self.image_input.iter())
     }
@@ -644,6 +756,34 @@ impl Call {
                     )
                     && self.image_input.is_none(),
                 "encoded image requires an image encoder without another image source"
+            );
+        }
+
+        // A token-denoising call either reads candidate log-probabilities at
+        // slots of the canvas rows it carries, or runs one step of its
+        // request's resident generation canvas of `max_tokens` tokens. Either
+        // way it produces no sampled token output.
+        let denoises = self.code == CallKind::Forward(ForwardMode::TokenDenoising);
+        ensure_valid!(
+            u8::from(self.readout.is_some()) + u8::from(self.canvas.is_some())
+                == u8::from(denoises),
+            "a token-denoising call carries exactly one readout or canvas step"
+        );
+        ensure_valid!(
+            !denoises || (self.token_output.is_none() && self.transition_output.is_none()),
+            "token denoising samples no token output"
+        );
+        if let Some(readout) = &self.readout {
+            ensure_valid!(
+                !self.input_token_ids.is_empty(),
+                "a readout requires canvas tokens"
+            );
+            readout.validate(self.input_token_ids.len())?;
+        }
+        if self.canvas.is_some() {
+            ensure_valid!(
+                self.input_token_ids.is_empty() && self.bounds.max_tokens > 0,
+                "a canvas step denoises its resident canvas of max_tokens tokens"
             );
         }
 
@@ -744,7 +884,10 @@ impl Call {
             input.validate()?;
             ensure_valid!(
                 input.request_key == self.request_key
-                    || Some(input) == self.vision_input.as_ref()
+                    || self
+                        .vision_inputs
+                        .iter()
+                        .any(|vision| &vision.feature == input)
                     || Some(input) == self.latent_feature_input.as_ref(),
                 "request-local tensor belongs to another request"
             );
@@ -886,6 +1029,9 @@ pub struct RequestOutput {
     pub top_logprobs: Vec<TokenLogprob>,
     /// Ranked candidates for each scored prompt position, in input order.
     pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
+    /// Natural-log probability of every candidate of a token-denoising
+    /// readout, in the call's `Readout::candidate_ids` order.
+    pub candidate_logprobs: Vec<f32>,
     /// Device-observed terminal conditions.
     pub finish_flags: FinishFlags,
     /// Completed artifact and its external storage lifetime, when produced.
@@ -926,6 +1072,12 @@ impl RequestOutput {
                 "a non-error completion must not carry an error code"
             ),
         }
+        ensure_valid!(
+            self.candidate_logprobs.is_empty()
+                || (self.status == CallStatus::Ok
+                    && self.code == CallKind::Forward(ForwardMode::TokenDenoising)),
+            "candidate log-probabilities belong to a successful token-denoising completion"
+        );
         if self.status == CallStatus::Predicated {
             ensure_valid!(
                 self.committed_tokens.as_slice().is_empty() && self.product_generations.is_empty(),
@@ -1034,9 +1186,12 @@ pub struct ArRequestParams {
     pub finish_token_ids: Vec<u32>,
     /// Logical position assigned to the first request token.
     pub initial_position: u32,
+    /// Block-diffusion sampling of a request that generates its text in
+    /// canvases; its seed is `sampling.seed`.
+    pub canvas: Option<CanvasSampling>,
 }
 
-pub use uniserve_core::DiffusionSamplingParams;
+pub use uniserve_core::{CanvasSampling, DiffusionSamplingParams};
 
 /// What a video request admits besides its sampling controls.
 ///

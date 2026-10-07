@@ -14,7 +14,7 @@ from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.request import RequestProgress
-from uniserve_worker.protocol.call import Call, CallStatus
+from uniserve_worker.protocol.call import Call, CallStatus, ForwardMode
 from uniserve_worker.protocol.identity import CallIdentity
 from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.storage.block_tables import BlockTables
@@ -118,6 +118,18 @@ def call_identity(call: Call) -> CallIdentity:
     of one request id never share an identity.
     """
     return call.request_key, call.call_id
+
+
+def device_gated(call: Call) -> bool:
+    """Whether a call's completion predicate gates it on the device.
+
+    A canvas step may be queued behind the step before it, predicated on
+    that step's completion. The worker keeps the same decision in the
+    slot's continuation flag and runs the step as a no-op on the device
+    once an earlier step stopped its block (``CanvasRunner.step``), so the
+    predicate is never read on the host and the step does not wait for it.
+    """
+    return call.kind is ForwardMode.TOKEN_DENOISING and call.canvas is not None
 
 
 def _predicated_outcome(

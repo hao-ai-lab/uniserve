@@ -1,6 +1,7 @@
 //! Server-facing client for request submission and engine health control.
 //!
-//! `EngineClient` owns the in-process `uniserve_engine::EngineCore` and the
+//! `EngineClient` owns the in-process `uniserve_engine::EngineCore`s, one per
+//! data-parallel replica, routes every request to one of them, and owns the
 //! `requests::RequestRegistry` that maps external request identifiers to
 //! engine `RequestId`s and tracks each request's lifecycle state. The serving
 //! runtime (`serving::ServingRuntime`) registers, submits, cancels, and aborts

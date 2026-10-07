@@ -43,13 +43,13 @@ use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
     BufferAllocation, BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind,
-    CallStatus, DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout,
-    ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
+    CallStatus, CanvasSampling, CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound,
+    DrawLayout, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
     ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
-    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
+    MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
     SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
-    TransferHandle, TransferMode, TransferTransport, VideoAdmission, WorkerEndpoint, WorkerInfo,
-    WorkerRequest, WorkerResponse, WorkerResponseError,
+    TransferHandle, TransferMode, TransferTransport, VideoAdmission, VisionInput, WorkerEndpoint,
+    WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 use uniserve_core::{
     AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
@@ -579,6 +579,15 @@ fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRe
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
         initial_position: admission.initial_position(),
+        canvas: admission.canvas().map(|canvas| CanvasSampling {
+            canvas_length: canvas.canvas_length(),
+            max_steps: canvas.max_steps(),
+            entropy_bound: canvas.entropy_bound(),
+            t_min: canvas.t_min(),
+            t_max: canvas.t_max(),
+            confidence_threshold: canvas.confidence_threshold(),
+            stability_threshold: canvas.stability_threshold(),
+        }),
     })
 }
 
@@ -732,6 +741,24 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .input_token_ids()
             .map(|ids| ids.iter().collect())
             .unwrap_or_default(),
+        readout: call.readout().map(|readout| Readout {
+            slot_tokens: readout
+                .slot_tokens()
+                .map(|ids| ids.iter().collect())
+                .unwrap_or_default(),
+            candidate_offsets: readout
+                .candidate_offsets()
+                .map(|ids| ids.iter().collect())
+                .unwrap_or_default(),
+            candidate_ids: readout
+                .candidate_ids()
+                .map(|ids| ids.iter().collect())
+                .unwrap_or_default(),
+        }),
+        canvas: call.canvas().map(|canvas| CanvasStep {
+            block: canvas.block(),
+            step: canvas.step(),
+        }),
         consumer_slots: call
             .consumer_slots()
             .map(|slots| slots.iter().collect())
@@ -786,7 +813,21 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .unwrap_or_default(),
         token_input: call.token_input().map(tensor_ref_from_table).transpose()?,
         token_output: call.token_output().map(tensor_ref_from_table).transpose()?,
-        vision_input: call.vision_input().map(tensor_ref_from_table).transpose()?,
+        vision_inputs: call
+            .vision_inputs()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        Ok(VisionInput {
+                            offset: item.offset(),
+                            feature: tensor_ref_from_table(item.feature())?,
+                        })
+                    })
+                    .collect::<CodecResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
         latent_feature_input: call
             .latent_feature_input()
             .map(tensor_ref_from_table)
@@ -1040,6 +1081,10 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
                     .collect()
             })
             .unwrap_or_default(),
+        candidate_logprobs: record
+            .candidate_logprobs()
+            .map(|values| values.iter().collect())
+            .unwrap_or_default(),
         request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
         call_id: computation_id_from_fb(record.call_id())?,
         status: call_status_from_fb(record.status())?,
@@ -1194,6 +1239,8 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         queue_depth: info.queue_depth(),
         max_batch_calls: info.max_batch_calls(),
         max_batch_tokens: info.max_batch_tokens(),
+        max_prefill_calls: info.max_prefill_calls(),
+        max_decode_calls: info.max_decode_calls(),
         request_slots: info.request_slots(),
         kv_cache: info.kv_cache().map(kv_cache_from_table).transpose()?,
         latent_page_units: info.latent_page_units(),
@@ -1572,6 +1619,7 @@ fn forward_mode_to_fb(value: ForwardMode) -> fbs::ForwardMode {
         ForwardMode::Prefill => fbs::ForwardMode::Prefill,
         ForwardMode::Decode => fbs::ForwardMode::Decode,
         ForwardMode::Verify => fbs::ForwardMode::Verify,
+        ForwardMode::TokenDenoising => fbs::ForwardMode::TokenDenoising,
     }
 }
 
@@ -1580,6 +1628,7 @@ fn forward_mode_from_fb(value: fbs::ForwardMode) -> CodecResult<ForwardMode> {
         fbs::ForwardMode::Prefill => ForwardMode::Prefill,
         fbs::ForwardMode::Decode => ForwardMode::Decode,
         fbs::ForwardMode::Verify => ForwardMode::Verify,
+        fbs::ForwardMode::TokenDenoising => ForwardMode::TokenDenoising,
         _ => codec_bail!("unknown forward_mode {}", value.0),
     })
 }

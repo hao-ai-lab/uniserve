@@ -45,6 +45,7 @@ from uniserve_worker.protocol.call import (
     MediaCall,
     Rng,
     TransferMode,
+    VisionInput,
 )
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.output import BatchOutput, RequestOutput
@@ -1004,7 +1005,7 @@ def visual_state_call(
         coordinates=CallCoordinates(),
         kind=ForwardMode.PREFILL,
         bounds=Bounds(max_tokens=max_tokens),
-        vision_input=feature,
+        vision_inputs=(VisionInput(0, feature),),
         completion_output=completion,
         token_output=token,
     )

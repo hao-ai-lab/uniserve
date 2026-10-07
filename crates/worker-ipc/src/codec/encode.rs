@@ -234,6 +234,20 @@ fn ar<'a>(
     let sampling = Some(sampling(b, &v.sampling));
     let negative_token_ids = Some(b.create_vector(&v.negative_token_ids));
     let finish_token_ids = Some(b.create_vector(&v.finish_token_ids));
+    let canvas = v.canvas.as_ref().map(|canvas| {
+        fbs::CanvasSampling::create(
+            b,
+            &fbs::CanvasSamplingArgs {
+                canvas_length: canvas.canvas_length,
+                max_steps: canvas.max_steps,
+                entropy_bound: canvas.entropy_bound,
+                t_min: canvas.t_min,
+                t_max: canvas.t_max,
+                confidence_threshold: canvas.confidence_threshold,
+                stability_threshold: canvas.stability_threshold,
+            },
+        )
+    });
     fbs::ArRequestParams::create(
         b,
         &fbs::ArRequestParamsArgs {
@@ -241,6 +255,7 @@ fn ar<'a>(
             negative_token_ids,
             finish_token_ids,
             initial_position: v.initial_position,
+            canvas,
         },
     )
 }
@@ -514,7 +529,23 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
 
     let token_input = v.token_input.as_ref().map(|value| tensor_ref(b, value));
     let token_output = v.token_output.as_ref().map(|value| tensor_ref(b, value));
-    let vision_input = v.vision_input.as_ref().map(|value| tensor_ref(b, value));
+    let vision_inputs = {
+        let items = v
+            .vision_inputs
+            .iter()
+            .map(|input| {
+                let feature = tensor_ref(b, &input.feature);
+                fbs::VisionInput::create(
+                    b,
+                    &fbs::VisionInputArgs {
+                        offset: input.offset,
+                        feature: Some(feature),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        Some(b.create_vector(&items))
+    };
     let latent_feature_input = v
         .latent_feature_input
         .as_ref()
@@ -544,6 +575,16 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     let kv_input = v.kv_input.as_ref().map(|value| buffer_id(b, value));
     let kv_output = v.kv_output.as_ref().map(|value| buffer_id(b, value));
     let consumer_slots = Some(b.create_vector(&v.consumer_slots));
+    let readout = v.readout.as_ref().map(|value| readout(b, value));
+    let canvas = v.canvas.as_ref().map(|value| {
+        fbs::CanvasStep::create(
+            b,
+            &fbs::CanvasStepArgs {
+                block: value.block,
+                step: value.step,
+            },
+        )
+    });
 
     fbs::Call::create(
         b,
@@ -562,7 +603,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             outputs,
             token_input,
             token_output,
-            vision_input,
+            vision_inputs,
             latent_feature_input,
             encoder_output,
             latent_input,
@@ -579,6 +620,22 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             kv_input,
             kv_output,
             consumer_slots,
+            readout,
+            canvas,
+        },
+    )
+}
+
+fn readout<'a>(b: &mut FlatBufferBuilder<'a>, v: &Readout) -> WIPOffset<fbs::Readout<'a>> {
+    let slot_tokens = Some(b.create_vector(&v.slot_tokens));
+    let candidate_offsets = Some(b.create_vector(&v.candidate_offsets));
+    let candidate_ids = Some(b.create_vector(&v.candidate_ids));
+    fbs::Readout::create(
+        b,
+        &fbs::ReadoutArgs {
+            slot_tokens,
+            candidate_offsets,
+            candidate_ids,
         },
     )
 }
@@ -1068,6 +1125,7 @@ fn completion<'a>(
     let finish_flags = Some(finish_flags(b, &v.finish_flags));
     let media_output = v.media_output.as_ref().map(|value| media_output(b, value));
     let kv_output = v.kv_output.as_ref().map(|value| kv_transfer(b, value));
+    let candidate_logprobs = Some(b.create_vector(&v.candidate_logprobs));
     fbs::RequestOutput::create(
         b,
         &fbs::RequestOutputArgs {
@@ -1089,6 +1147,7 @@ fn completion<'a>(
             finish_flags,
             media_output,
             kv_output,
+            candidate_logprobs,
         },
     )
 }
@@ -1498,6 +1557,8 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             host_lane_capacity: v.host_lane_capacity,
             checkpoint_identity,
             video_denoiser,
+            max_prefill_calls: v.max_prefill_calls,
+            max_decode_calls: v.max_decode_calls,
         },
     )
 }

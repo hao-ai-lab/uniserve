@@ -92,4 +92,5 @@ class _CUBLASOperator(_Operator):
 
 
 class Backend(_Backend):
+    name = "cublas"
     operator_class = _CUBLASOperator

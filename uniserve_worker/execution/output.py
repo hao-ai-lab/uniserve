@@ -3,8 +3,8 @@
 `reserve_outputs` in `uniserve_worker.execution.prepare` calls
 `create_outputs` to create one `PendingOutput` per call of a batch, each bound
 to one row of the batch's pinned `OutputBuffer`. Execution then stages the
-call's domain results into it: sampling captures and speculative
-verification coordinates (`TokenResult`), latent trajectory updates
+call's domain results into it: sampling captures, canvas readouts and
+speculative verification coordinates (`TokenResult`), latent trajectory updates
 (`LatentResult`), host tasks and media (`HostResult`), and the projected
 `RequestProgress`.
 
@@ -18,6 +18,7 @@ calls `abandon` instead. No method here installs request progress itself.
 from __future__ import annotations
 
 import logging
+import struct
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -46,6 +47,7 @@ from uniserve_worker.protocol.output import (
 )
 from uniserve_worker.protocol.transfer import KvTransfer, Locator
 from uniserve_worker.sampling.result import LogprobValues, SamplerRow
+from uniserve_worker.storage.canvas_slots import STEP_SKIPPED, STEP_STOPPED
 from uniserve_worker.storage.latent_pool import LatentStaging, LatentUpdate
 from uniserve_worker.storage.output import OutputBuffer
 from uniserve_worker.storage.tensor_store import TensorRead, TensorRecord
@@ -269,6 +271,13 @@ class TokenResult:
     logprobs: tuple[float, tuple[tuple[int, float, int], ...]] | None = None
     prompt_logprobs: tuple[tuple[tuple[int, float, int], ...], ...] = ()
     sampled: SamplerRow | None = None
+    # A canvas readout's `(offset, count)` span: one word per candidate,
+    # holding its FP32 log-probability's bits sign-extended from int32.
+    candidate_range: tuple[int, int] | None = None
+    candidate_logprobs: tuple[float, ...] = ()
+    # A canvas step's `(offset, count)` span: its stop flag, then its canvas
+    # tokens, which become the committed tokens when the flag is set.
+    canvas_range: tuple[int, int] | None = None
 
     # These borrowed numerical views survive until DecodeState accepts them.
     runtime_logical_position: int | torch.Tensor = 0
@@ -504,6 +513,9 @@ class PendingOutput:
         runtime = self.progress
         tokens = self.token.committed_tokens
         suppressed = status is CallStatus.PREDICATED
+        # A canvas step queued behind the one that stopped its block ran as
+        # a no-op (`STEP_SKIPPED`), which reports as a predicated call.
+        skipped = False
         if not suppressed:
             try:
                 # A `finish` callback consumes every host task result. Without
@@ -541,6 +553,22 @@ class PendingOutput:
                     self._buffer.logprob_values(span)[1]
                     for span in self.token.prompt_logprob_ranges
                 )
+                if self.token.candidate_range is not None:
+                    words = self._buffer.read_tokens(
+                        *self.token.candidate_range
+                    )
+                    self.token.candidate_logprobs = struct.unpack(
+                        f"<{len(words)}f",
+                        struct.pack(f"<{len(words)}i", *words),
+                    )
+                if self.token.canvas_range is not None:
+                    outcome, *canvas = self._buffer.read_tokens(
+                        *self.token.canvas_range
+                    )
+                    skipped = outcome == STEP_SKIPPED
+                    self.token.committed_tokens = (
+                        tuple(canvas) if outcome == STEP_STOPPED else ()
+                    )
             except Exception:
                 logger.exception(
                     "completion materialization failed: request=%s "
@@ -596,6 +624,9 @@ class PendingOutput:
                                 kv_visible_len=visible,
                             )
 
+        if skipped and status is CallStatus.OK:
+            status = CallStatus.PREDICATED
+            suppressed = True
         # A predicated call did not run, so it reports the request's accepted
         # coordinates and carries no error code.
         if status is CallStatus.PREDICATED:
@@ -648,6 +679,11 @@ class PendingOutput:
                 ()
                 if suppressed or not self._reports_output
                 else self.token.prompt_logprobs
+            ),
+            candidate_logprobs=(
+                ()
+                if suppressed or not self._reports_output
+                else self.token.candidate_logprobs
             ),
             finish_flags=FinishFlags() if suppressed else self.finish_flags,
             media_output=self.host.media,

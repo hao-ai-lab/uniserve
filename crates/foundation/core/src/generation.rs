@@ -77,6 +77,87 @@ pub struct MultimodalInputs {
     pub images: Vec<ImageInput>,
 }
 
+/// One token canvas a readout request denoises once over its prompt.
+///
+/// Canvas token `j` sits at the model position that follows the prompt's
+/// logical positions by `j`. Every canvas token attends to the whole prompt
+/// and to every token of its own row, and the pass writes no KV. The rows of
+/// one request are independent computations over the same prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadoutRow {
+    /// Canvas token ids.
+    pub token_ids: Vec<u32>,
+    /// Positions whose candidate log-probabilities the row reports, in
+    /// increasing position order, which is also report order.
+    pub slots: Vec<ReadoutSlot>,
+}
+
+/// One canvas position whose candidate log-probabilities a readout reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadoutSlot {
+    /// Index of the slot's token within its row.
+    pub position: u32,
+    /// Token ids whose natural-log probabilities, under the log-softmax over
+    /// the full vocabulary of the model's logits at `position`, are reported
+    /// in this order.
+    pub candidates: Vec<u32>,
+}
+
+/// Block-diffusion sampling of a generating request.
+///
+/// Text is generated in blocks of `canvas_length` tokens. A block starts as
+/// uniformly random tokens and is denoised for at most `max_steps` steps: a
+/// step samples every position from the model's logits at a temperature that
+/// falls linearly from `t_max` to `t_min`, accepts the lowest-entropy samples
+/// within `entropy_bound` and renoises the others. A block stops early once
+/// its argmax canvas has held for `stability_threshold` steps and its mean
+/// entropy is below `confidence_threshold`. The block's argmax canvas is then
+/// committed to the request's context as causal prompt, and the next block
+/// follows it. Every draw follows the request's `SamplingParams::seed`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CanvasSampling {
+    /// Tokens of one block.
+    pub canvas_length: u32,
+    /// Denoising steps a block runs at most.
+    pub max_steps: u32,
+    /// Entropy, in nats, the accepted samples of one step may carry beyond
+    /// the largest one.
+    pub entropy_bound: f32,
+    /// Sampling temperature of a block's last step.
+    pub t_min: f32,
+    /// Sampling temperature of a block's first step.
+    pub t_max: f32,
+    /// Mean canvas entropy, in nats, below which a stable block stops; zero
+    /// never stops a block early.
+    pub confidence_threshold: f32,
+    /// Steps the argmax canvas must hold unchanged before a block stops;
+    /// zero stops a block on confidence alone.
+    pub stability_threshold: u32,
+}
+
+impl CanvasSampling {
+    /// Returns the first parameter the scheduler cannot plan with, if any:
+    /// an empty canvas or step limit, or a non-finite sampling value. The
+    /// worker's sampler checks the sampling values' domain itself.
+    fn invalid_parameter(&self) -> Option<&'static str> {
+        if self.canvas_length == 0 {
+            Some("canvas_length")
+        } else if self.max_steps == 0 {
+            Some("max_steps")
+        } else if !self.entropy_bound.is_finite() {
+            Some("entropy_bound")
+        } else if !self.t_min.is_finite() {
+            Some("t_min")
+        } else if !self.t_max.is_finite() {
+            Some("t_max")
+        } else if !self.confidence_threshold.is_finite() {
+            Some("confidence_threshold")
+        } else {
+            None
+        }
+    }
+}
+
 /// An encoded image and the model's requirements for adding it to context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageInput {
@@ -96,6 +177,20 @@ pub struct ImageInput {
     pub num_positions: u32,
     /// Required encoder stages in context write order, with their KV contributions.
     pub encoders: Vec<ImageEncoderInput>,
+}
+
+impl ImageInput {
+    /// Whether every encoder of the image injects token-model features (a
+    /// vision encoder), so the image enters the context as attention blocks
+    /// of a context prefill. An image with a latent encoder is ingested by
+    /// calls of its own instead.
+    pub fn injects_features(&self) -> bool {
+        !self.encoders.is_empty()
+            && self
+                .encoders
+                .iter()
+                .all(|input| input.encoder == ImageIngestStep::VitEncode)
+    }
 }
 
 /// One encoder input and its physical KV contribution.
@@ -311,10 +406,7 @@ impl ImageGenerationConfig {
 
         // Context images require the encoder stages declared by their inputs.
         for step in context_image_steps {
-            needs.insert(match step {
-                ImageIngestStep::VaeEncode => GenerationFeatures::LATENT_ENCODE,
-                ImageIngestStep::VitEncode => GenerationFeatures::VISION_ENCODE,
-            });
+            needs.insert(step.required_feature());
         }
 
         if self.generates_images(constraint) {
@@ -325,13 +417,20 @@ impl ImageGenerationConfig {
         // materialization.
         if self.feeds_back_images(constraint) {
             for step in self.feedback_encoders.iter().map(|input| input.encoder) {
-                needs.insert(match step {
-                    ImageIngestStep::VaeEncode => GenerationFeatures::LATENT_ENCODE,
-                    ImageIngestStep::VitEncode => GenerationFeatures::VISION_ENCODE,
-                });
+                needs.insert(step.required_feature());
             }
         }
         needs
+    }
+}
+
+impl ImageIngestStep {
+    /// Returns the runtime feature that executes this encoder stage.
+    const fn required_feature(self) -> GenerationFeatures {
+        match self {
+            Self::VaeEncode => GenerationFeatures::LATENT_ENCODE,
+            Self::VitEncode => GenerationFeatures::VISION_ENCODE,
+        }
     }
 }
 
@@ -347,6 +446,9 @@ bitflags::bitflags! {
         const LATENT_ENCODE = 1 << 2;
         /// Diffusion denoising and image materialization.
         const IMAGE_GENERATION = 1 << 3;
+        /// Denoising passes of token canvases that read a prompt's KV cache
+        /// without writing it.
+        const TOKEN_DENOISING = 1 << 4;
     }
 }
 
@@ -354,7 +456,7 @@ impl GenerationFeatures {
     /// Returns the admission diagnostic name of one represented feature.
     ///
     /// Features are checked in the order understanding, latent encode, vision
-    /// encode, image generation; an empty set yields
+    /// encode, image generation, token denoising; an empty set yields
     /// `runtime_generation_features`.
     pub fn name(self) -> &'static str {
         if self.contains(Self::UNDERSTANDING) {
@@ -365,6 +467,8 @@ impl GenerationFeatures {
             "runtime_vit_encode"
         } else if self.contains(Self::IMAGE_GENERATION) {
             "runtime_gen_denoise"
+        } else if self.contains(Self::TOKEN_DENOISING) {
+            "runtime_token_denoise"
         } else {
             "runtime_generation_features"
         }
@@ -837,9 +941,60 @@ pub struct GenerationRequest {
     pub include_stop_token: bool,
     /// Model-specific image trigger and feedback requirements.
     pub image_generation: ImageGenerationConfig,
+    /// Canvas rows a readout request denoises once over its prompt, in
+    /// report order. A readout generates nothing: it answers with the
+    /// candidate log-probabilities of every row's slots, and an empty list
+    /// makes the request a generating one.
+    #[serde(default)]
+    pub readout: Vec<ReadoutRow>,
+    /// Block-diffusion sampling of a generating request, whose text is
+    /// denoised in canvases rather than decoded token by token; `None`
+    /// decodes autoregressively.
+    #[serde(default)]
+    pub canvas: Option<CanvasSampling>,
 }
 
 impl GenerationRequest {
+    /// Returns whether the request reads canvas slots instead of generating.
+    pub fn is_readout(&self) -> bool {
+        !self.readout.is_empty()
+    }
+
+    /// Returns whether the request generates its text in denoised canvases.
+    pub fn is_canvas_generation(&self) -> bool {
+        self.canvas.is_some()
+    }
+
+    /// Returns the number of candidate log-probabilities a readout reports:
+    /// one per candidate of every slot of every row.
+    pub fn readout_candidates(&self) -> usize {
+        self.readout
+            .iter()
+            .flat_map(|row| &row.slots)
+            .map(|slot| slot.candidates.len())
+            .sum()
+    }
+
+    /// Returns the runtime features the request's computation reaches.
+    ///
+    /// A readout or a canvas-generating request needs token denoising and
+    /// the encoders of its context images; any other request needs what its
+    /// generation graph reaches (`ImageGenerationConfig::required_features`).
+    pub fn required_features(&self) -> GenerationFeatures {
+        let context_steps = self
+            .multimodal_inputs
+            .images
+            .iter()
+            .flat_map(|image| image.encoders.iter().map(|input| input.encoder));
+        if self.is_readout() || self.is_canvas_generation() {
+            return context_steps.fold(GenerationFeatures::TOKEN_DENOISING, |needs, step| {
+                needs | step.required_feature()
+            });
+        }
+        self.image_generation
+            .required_features(self.constraint, context_steps)
+    }
+
     /// Validates image conditions, input positions, and sampling.
     ///
     /// These checks depend only on the request; checks against loaded
@@ -850,8 +1005,13 @@ impl GenerationRequest {
         if self.prompt_token_ids.is_empty() && self.multimodal_inputs.images.is_empty() {
             return Err(GenerationRequestError::EmptyContext);
         }
-        if self.max_und_tokens == 0 && !self.finishes_after_image() {
+        if self.is_readout() {
+            validate_readout(self)?;
+        } else if self.max_und_tokens == 0 && !self.finishes_after_image() {
             return Err(GenerationRequestError::ZeroMaxUndTokens);
+        }
+        if let Some(canvas) = &self.canvas {
+            validate_canvas(self, canvas)?;
         }
 
         self.sampling
@@ -912,6 +1072,17 @@ impl GenerationRequest {
                 return Err(GenerationRequestError::EmptyImagePayload);
             }
             validate_image_encoders(&image.encoders, image.num_positions)?;
+            // A feature-injected image is a block of a context prefill whose
+            // later tokens follow it in the same call, so its KV length must
+            // be known when the call is planned.
+            if image.injects_features()
+                && image
+                    .encoders
+                    .iter()
+                    .any(|input| input.num_kv_tokens.is_none())
+            {
+                return Err(GenerationRequestError::FeatureImageKvUnknown);
+            }
             if image.position as usize > context_tokens {
                 return Err(GenerationRequestError::ImagePositionBeyondPrompt {
                     position: image.position,
@@ -931,6 +1102,57 @@ impl GenerationRequest {
         }
         Ok(())
     }
+}
+
+/// Validates a canvas-generating request: it generates text only, names the
+/// seed its draws follow, and its sampling parameters are in range.
+fn validate_canvas(
+    request: &GenerationRequest,
+    canvas: &CanvasSampling,
+) -> Result<(), GenerationRequestError> {
+    if request.is_readout() || request.generates_images() {
+        return Err(GenerationRequestError::CanvasGeneratesTextOnly);
+    }
+    if request.sampling.seed.is_none() {
+        return Err(GenerationRequestError::UnseededCanvas);
+    }
+    match canvas.invalid_parameter() {
+        Some(parameter) => Err(GenerationRequestError::InvalidCanvasSampling { parameter }),
+        None => Ok(()),
+    }
+}
+
+/// Validates a readout's canvas rows: it generates no tokens or images, and
+/// every row holds tokens and reads at least one slot inside itself, each
+/// with at least one candidate.
+fn validate_readout(request: &GenerationRequest) -> Result<(), GenerationRequestError> {
+    if request.max_und_tokens != 0 || request.generates_images() {
+        return Err(GenerationRequestError::GeneratingReadout);
+    }
+    for row in &request.readout {
+        if row.token_ids.is_empty() || row.slots.is_empty() {
+            return Err(GenerationRequestError::EmptyReadoutRow);
+        }
+        if row
+            .slots
+            .windows(2)
+            .any(|pair| pair[0].position >= pair[1].position)
+        {
+            return Err(GenerationRequestError::UnorderedReadoutSlots);
+        }
+        for slot in &row.slots {
+            if slot.position as usize >= row.token_ids.len() {
+                return Err(GenerationRequestError::ReadoutSlotOutsideRow {
+                    position: slot.position,
+                    row_tokens: row.token_ids.len(),
+                });
+            }
+            if slot.candidates.is_empty() {
+                return Err(GenerationRequestError::EmptyReadoutSlot);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validates an image's encoder inputs and logical position contribution.
@@ -993,6 +1215,12 @@ pub enum GenerationRequestError {
     /// An exact image contribution must fit its declared capacity.
     #[error("image KV length {tokens} exceeds capacity {max_tokens}")]
     ImageKvExceedsCapacity { tokens: u32, max_tokens: u32 },
+    /// A feature-injected input image does not declare the exact KV length
+    /// of every encoder.
+    #[error(
+        "an input image whose encoders inject features must declare each encoder's exact KV length"
+    )]
+    FeatureImageKvUnknown,
     /// A suffix or round-close trigger contains no tokens.
     #[error("generation trigger patterns must not be empty")]
     EmptyTriggerPattern,
@@ -1008,6 +1236,38 @@ pub enum GenerationRequestError {
     /// A configured stop string is empty.
     #[error("stop strings must not be empty")]
     EmptyStopString,
+    /// A readout request also asks to generate tokens or images.
+    #[error("a readout request generates no tokens or images")]
+    GeneratingReadout,
+    /// A readout row has no tokens or reads no slot.
+    #[error("every readout row must hold tokens and read at least one slot")]
+    EmptyReadoutRow,
+    /// A readout slot lies beyond its row.
+    #[error("readout slot {position} lies outside its {row_tokens}-token row")]
+    ReadoutSlotOutsideRow {
+        /// Slot position within its row.
+        position: u32,
+        /// Length of the row.
+        row_tokens: usize,
+    },
+    /// A readout slot names no candidate token.
+    #[error("every readout slot must read at least one candidate")]
+    EmptyReadoutSlot,
+    /// A readout row's slot positions do not strictly increase.
+    #[error("readout slots must be listed in increasing position order")]
+    UnorderedReadoutSlots,
+    /// A canvas-generating request also reads slots or generates images.
+    #[error("a canvas-generating request generates text only")]
+    CanvasGeneratesTextOnly,
+    /// A canvas-generating request names no seed for its draws.
+    #[error("a canvas-generating request requires a sampling seed")]
+    UnseededCanvas,
+    /// A block-diffusion sampling parameter is out of range.
+    #[error("block-diffusion sampling parameter `{parameter}` is out of range")]
+    InvalidCanvasSampling {
+        /// Name of the parameter.
+        parameter: &'static str,
+    },
     /// Text sampling parameters are invalid.
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[source] SamplingParamsError),
@@ -1126,6 +1386,8 @@ mod tests {
                 isolation_key: Some(91),
             },
             image_generation: policy,
+            readout: Vec::new(),
+            canvas: None,
         }
     }
 
@@ -1358,6 +1620,29 @@ mod tests {
         exact_capacity.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
         assert_eq!(exact_capacity.validate(), Ok(()));
 
+        // An image whose encoders all inject features joins a context
+        // prefill, so each encoder must declare its exact KV length; a
+        // latent encoder's image may leave it to the worker.
+        let mut injected = complete_request();
+        injected.multimodal_inputs.images[0].encoders.truncate(1);
+        injected.multimodal_inputs.images[0].encoders[0] = ImageEncoderInput {
+            encoder: ImageIngestStep::VitEncode,
+            num_kv_tokens: None,
+            max_kv_tokens: Some(64),
+        };
+        assert_eq!(
+            injected.validate(),
+            Err(GenerationRequestError::FeatureImageKvUnknown)
+        );
+        injected.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
+        assert_eq!(injected.validate(), Ok(()));
+        assert!(
+            complete_request().multimodal_inputs.images[0].encoders[0]
+                .num_kv_tokens
+                .is_none()
+        );
+        assert_eq!(complete_request().validate(), Ok(()));
+
         let mut invalid_sampling = complete_request();
         invalid_sampling.sampling.top_p = 0.0;
         assert!(matches!(
@@ -1400,6 +1685,99 @@ mod tests {
         assert_eq!(
             unordered_images.validate(),
             Err(GenerationRequestError::UnorderedImageInputs)
+        );
+    }
+
+    /// A readout of one context image's prompt: two canvas rows, the first
+    /// with two slots and the second with one.
+    fn readout_request() -> GenerationRequest {
+        let mut request = complete_request();
+        request.constraint = GenerationConstraint::UndOnly;
+        request.max_und_tokens = 0;
+        request.image_generation = ImageGenerationConfig::default();
+        request.multimodal_inputs.images[0].encoders.truncate(1);
+        request.multimodal_inputs.images[0].encoders[0].encoder = ImageIngestStep::VitEncode;
+        request.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
+        request.readout = vec![
+            ReadoutRow {
+                token_ids: vec![11, 4, 12, 4, 13],
+                slots: vec![
+                    ReadoutSlot {
+                        position: 1,
+                        candidates: vec![30, 31],
+                    },
+                    ReadoutSlot {
+                        position: 3,
+                        candidates: vec![40, 41, 42],
+                    },
+                ],
+            },
+            ReadoutRow {
+                token_ids: vec![11, 30, 4],
+                slots: vec![ReadoutSlot {
+                    position: 2,
+                    candidates: vec![50],
+                }],
+            },
+        ];
+        request
+    }
+
+    /// A readout generates nothing, counts every candidate it reports, and
+    /// needs canvas denoising plus the encoders of its context images rather
+    /// than text decoding.
+    #[test]
+    fn a_readout_reports_its_candidates_and_needs_canvas_denoising() {
+        let request = readout_request();
+        assert_eq!(request.validate(), Ok(()));
+        assert!(request.is_readout());
+        assert_eq!(request.readout_candidates(), 6);
+        assert_eq!(
+            request.required_features(),
+            GenerationFeatures::TOKEN_DENOISING | GenerationFeatures::VISION_ENCODE
+        );
+        // Its KV holds the prompt and image only; canvases write none.
+        assert_eq!(request.max_kv_tokens(&runtime_limits()).unwrap(), 4 + 64);
+    }
+
+    #[test]
+    fn readout_validation_rejects_generation_and_misplaced_slots() {
+        let mut generating = readout_request();
+        generating.max_und_tokens = 4;
+        assert_eq!(
+            generating.validate(),
+            Err(GenerationRequestError::GeneratingReadout)
+        );
+
+        let mut empty = readout_request();
+        empty.readout[1].slots.clear();
+        assert_eq!(
+            empty.validate(),
+            Err(GenerationRequestError::EmptyReadoutRow)
+        );
+
+        let mut outside = readout_request();
+        outside.readout[1].slots[0].position = 3;
+        assert_eq!(
+            outside.validate(),
+            Err(GenerationRequestError::ReadoutSlotOutsideRow {
+                position: 3,
+                row_tokens: 3
+            })
+        );
+
+        let mut unread = readout_request();
+        unread.readout[0].slots[0].candidates.clear();
+        assert_eq!(
+            unread.validate(),
+            Err(GenerationRequestError::EmptyReadoutSlot)
+        );
+
+        let mut unordered = readout_request();
+        unordered.readout[0].slots.swap(0, 1);
+        assert_eq!(
+            unordered.validate(),
+            Err(GenerationRequestError::UnorderedReadoutSlots)
         );
     }
 }

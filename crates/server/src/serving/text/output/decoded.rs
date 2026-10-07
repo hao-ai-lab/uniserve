@@ -90,12 +90,14 @@ pub enum DecodedTextEvent {
     },
     /// Newly decoded text and token metadata.
     ///
-    /// With intermediate output enabled, each non-terminal update covers one
-    /// generated token (its text may be empty while the decoder holds bytes
-    /// back). The terminal update carries the flushed remainder of the text
-    /// and, when a stop string ended the stream, the matching token. Without
-    /// intermediate output, a single terminal update carries the complete
-    /// text, token IDs, and logprobs.
+    /// With intermediate output enabled, each non-terminal update covers the
+    /// tokens of one engine output event: one generated token, or a block of
+    /// tokens committed together (its text may be empty while the decoder
+    /// holds bytes back). The terminal update carries the flushed remainder
+    /// of the text and, when a stop string ended the stream, the tokens of
+    /// the event up to the matching one. Without intermediate output, a
+    /// single terminal update carries the complete text, token IDs, and
+    /// logprobs.
     TextDelta {
         /// Newly visible decoded text.
         delta: String,
@@ -182,20 +184,23 @@ impl DecodeState<'_> {
         Ok(())
     }
 
-    /// Decodes one committed token, applies stop-string holdback, and emits terminal metadata.
+    /// Decodes committed tokens in order, applies stop-string holdback, and
+    /// emits terminal metadata.
     ///
-    /// Returns `true` when the token completed a stop string. In that case the
-    /// engine has been told to stop at this token, the decoder has been
-    /// flushed and truncated at the match, and the terminal `TextDelta` has
-    /// been yielded, so the caller must end the stream. Otherwise the token is
-    /// acknowledged to the engine and, with intermediate output, yielded as
-    /// its own `TextDelta`.
+    /// `token_ids` are the tokens of one engine output event and `positions`
+    /// their requested logprobs, if any. Returns `true` when a token completed
+    /// a stop string. In that case the engine has been told to stop at the
+    /// tokens received so far, the decoder has been flushed and truncated at
+    /// the match, and the terminal `TextDelta`, covering the tokens through
+    /// the matching one, has been yielded, so the caller must end the stream.
+    /// Otherwise the tokens are acknowledged to the engine and, with
+    /// intermediate output, yielded as one `TextDelta`.
     #[allow(clippy::too_many_arguments)]
-    async fn consume_token(
+    async fn consume_tokens(
         &mut self,
         tokenizer: &HuggingFaceTokenizer,
         prompt_token_count: usize,
-        token_id: u32,
+        token_ids: &[u32],
         positions: Vec<PositionLogprobs>,
         intermediate: bool,
         raw_stream: &mut EventRx,
@@ -204,26 +209,33 @@ impl DecodeState<'_> {
         let decoded_logprobs = (!positions.is_empty())
             .then(|| decode_logprobs(tokenizer, &positions, self.options.skip_special_tokens))
             .transpose()?;
-        let decoded = decode_one_token(
-            &mut self.decoder,
-            token_id,
-            self.output_token_count,
-            &mut self.options,
-            intermediate,
-        )?;
-        self.output_token_count = self.output_token_count.saturating_add(1);
-        if !intermediate {
-            self.accumulated_token_ids.push(token_id);
-            if let Some(logprobs) = decoded_logprobs.as_ref() {
-                self.accumulated_logprobs
-                    .get_or_insert_with(|| DecodedLogprobs {
-                        positions: Vec::new(),
-                    })
-                    .positions
-                    .extend_from_slice(&logprobs.positions);
-            }
+        if !intermediate && let Some(logprobs) = decoded_logprobs.as_ref() {
+            self.accumulated_logprobs
+                .get_or_insert_with(|| DecodedLogprobs {
+                    positions: Vec::new(),
+                })
+                .positions
+                .extend_from_slice(&logprobs.positions);
         }
-        if let Some((stop_string, offset)) = decoded.stop {
+
+        let mut delta = String::new();
+        for (index, &token_id) in token_ids.iter().enumerate() {
+            let decoded = decode_one_token(
+                &mut self.decoder,
+                token_id,
+                self.output_token_count,
+                &mut self.options,
+                intermediate,
+            )?;
+            self.output_token_count = self.output_token_count.saturating_add(1);
+            if !intermediate {
+                self.accumulated_token_ids.push(token_id);
+            }
+            delta.push_str(&decoded.delta);
+            let Some((stop_string, offset)) = decoded.stop else {
+                continue;
+            };
+
             // Stop generation at exactly the tokens received so far, which
             // include this one.
             raw_stream.cancel_at_consumed_prefix(
@@ -239,8 +251,8 @@ impl DecodeState<'_> {
             let (last_chunk, text) = self.decoder.flush(truncate_to)?;
             let (delta, token_ids, logprobs) = if intermediate {
                 (
-                    last_chunk.unwrap_or_default(),
-                    vec![token_id],
+                    delta + last_chunk.unwrap_or_default().as_str(),
+                    token_ids[..=index].to_vec(),
                     decoded_logprobs,
                 )
             } else {
@@ -270,8 +282,8 @@ impl DecodeState<'_> {
         raw_stream.acknowledge_consumed_prefix();
         if intermediate {
             y.yield_ok(DecodedTextEvent::TextDelta {
-                delta: decoded.delta,
-                token_ids: vec![token_id],
+                delta,
+                token_ids: token_ids.to_vec(),
                 logprobs: decoded_logprobs,
                 finished: None,
             })
@@ -450,10 +462,51 @@ pub async fn decoded_text_event_stream(
                 if generated_logprobs_requested {
                     state.pending_token = Some(id);
                 } else if state
-                    .consume_token(
+                    .consume_tokens(
                         tokenizer.as_ref(),
                         prompt_token_count,
-                        id,
+                        &[id],
+                        Vec::new(),
+                        intermediate,
+                        &mut raw_stream,
+                        &mut y,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
+            // Tokens committed together, such as a block-diffusion canvas,
+            // carry no logprobs and decode as one update.
+            EngineCoreOutput::TextTokens { ids } => {
+                state
+                    .emit_start_if_ready(
+                        &request_id,
+                        tokenizer.as_ref(),
+                        &prompt_token_ids,
+                        prompt_logprobs_requested,
+                        expected_prompt_positions,
+                        &mut y,
+                    )
+                    .await?;
+                if !state.started {
+                    return Err(Error::MalformedOutput {
+                        request_id: request_id.clone(),
+                        message: "generation began before prompt metadata was complete".to_string(),
+                    });
+                }
+                if state.pending_token.is_some() || generated_logprobs_requested {
+                    return Err(Error::MalformedOutput {
+                        request_id: request_id.clone(),
+                        message: "engine emitted committed tokens without their requested logprobs"
+                            .to_string(),
+                    });
+                }
+                if state
+                    .consume_tokens(
+                        tokenizer.as_ref(),
+                        prompt_token_count,
+                        &ids,
                         Vec::new(),
                         intermediate,
                         &mut raw_stream,
@@ -481,10 +534,10 @@ pub async fn decoded_text_event_stream(
                     });
                 }
                 if state
-                    .consume_token(
+                    .consume_tokens(
                         tokenizer.as_ref(),
                         prompt_token_count,
-                        id,
+                        &[id],
                         vec![PositionLogprobs {
                             entries: candidates,
                         }],
@@ -578,13 +631,15 @@ pub async fn decoded_text_event_stream(
                     message,
                 });
             }
-            // Media lifecycle events cannot be represented by a text-only stream.
+            // Media lifecycle events and readout answers cannot be
+            // represented by a text-only stream.
             EngineCoreOutput::ImageBegin { .. }
             | EngineCoreOutput::ImageStep { .. }
             | EngineCoreOutput::ImageCommit { .. }
             | EngineCoreOutput::ImageDone { .. }
             | EngineCoreOutput::Artifact(_)
-            | EngineCoreOutput::MediaProgress { .. } => {
+            | EngineCoreOutput::MediaProgress { .. }
+            | EngineCoreOutput::Readout { .. } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message: "text-only request received a non-text lifecycle event".to_string(),

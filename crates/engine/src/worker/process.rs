@@ -217,6 +217,10 @@ impl Default for WorkerProcessArgs {
             block_size: None,
             max_batch_calls: 128,
             max_batch_tokens: 16_384,
+            // The engine's default running-request limit plus the largest
+            // row reserve a runtime keeps outside it.
+            max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
+                + crate::scheduler::MAX_FLOW_PREFIX_ROWS) as u32,
             attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
             capability_groups: Vec::new(),
             transfer: Default::default(),
@@ -233,12 +237,15 @@ impl Default for WorkerProcessArgs {
             lanes: Vec::new(),
             graph_policy: "auto".into(),
             decode_graph_batch_sizes: None,
-            prefill_cuda_graph: false,
+            prefill_cuda_graph: true,
+            prefill_outputs: true,
             prefill_graph_token_sizes: None,
+            flow_cuda_graph: true,
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,
             video_frame_sizes: None,
+            canvas_sampling: None,
             flashinfer_workspace_size: 512 * 1024 * 1024,
             flashinfer_use_tensor_core: None,
             flashinfer_decode_backend: FlashInferBackend::Fa2,
@@ -251,6 +258,7 @@ impl Default for WorkerProcessArgs {
             max_condition_rows: 0,
             ffmpeg: "ffmpeg".into(),
             min_video_seconds: None,
+            expert_parallel: None,
         }
     }
 }
@@ -331,6 +339,7 @@ impl WorkerProcessArgs {
         registration: &str,
         rendezvous: Option<&str>,
         rendezvous_listen_fd: Option<std::os::fd::RawFd>,
+        expert_listen_fd: Option<std::os::fd::RawFd>,
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
@@ -427,6 +436,22 @@ impl WorkerProcessArgs {
             uniserve_core::launch::RENDEZVOUS_LISTEN_FD.into(),
             json!(rendezvous_listen_fd),
         );
+        // A replica sharing its experts joins the expert-parallel world at the
+        // store world rank 0 serves on the socket it inherits at the named
+        // descriptor; the other replicas receive only the address.
+        fields.insert(
+            "expert_parallel".into(),
+            match &self.expert_parallel {
+                Some(placement) => json!({
+                    "rank": placement.rank,
+                    "size": placement.size,
+                    "address": placement.address,
+                    "listen_fd": expert_listen_fd,
+                    "exchange": placement.exchange,
+                }),
+                None => Value::Null,
+            },
+        );
         fields.insert(
             "distributed_backend".into(),
             json!(self.distributed_backend),
@@ -467,6 +492,10 @@ impl WorkerProcessArgs {
         fields.insert("block_size".into(), json!(self.block_size));
         fields.insert("max_batch_calls".into(), json!(self.max_batch_calls));
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
+        fields.insert(
+            "max_request_pool_size".into(),
+            json!(self.max_request_pool_size),
+        );
         fields.insert("max_model_len".into(), json!(self.max_model_len));
         fields.insert("max_video_seconds".into(), json!(self.max_video_seconds));
         fields.insert("max_condition_rows".into(), json!(self.max_condition_rows));
@@ -478,10 +507,12 @@ impl WorkerProcessArgs {
             json!(self.decode_graph_batch_sizes),
         );
         fields.insert("prefill_cuda_graph".into(), json!(self.prefill_cuda_graph));
+        fields.insert("prefill_outputs".into(), json!(self.prefill_outputs));
         fields.insert(
             "prefill_graph_token_sizes".into(),
             json!(self.prefill_graph_token_sizes),
         );
+        fields.insert("flow_cuda_graph".into(), json!(self.flow_cuda_graph));
         fields.insert(
             "flow_graph_batch_sizes".into(),
             json!(self.flow_graph_batch_sizes),
@@ -492,6 +523,10 @@ impl WorkerProcessArgs {
             json!(self.video_text_capacities),
         );
         fields.insert("video_frame_sizes".into(), json!(self.video_frame_sizes));
+        fields.insert(
+            "canvas_sampling".into(),
+            serde_json::to_value(self.canvas_sampling)?,
+        );
         fields.insert(
             "flashinfer_workspace_size".into(),
             json!(self.flashinfer_workspace_size),
@@ -644,15 +679,27 @@ enum OutstandingKind {
 /// Caching-allocator variables PyTorch reads, the first taking precedence.
 const ALLOCATOR_VARIABLES: [&str; 2] = ["PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"];
 
-/// Returns the caching-allocator variables every rank is launched with,
-/// given a lookup into the head's environment.
+/// The transparent-huge-page option of mimalloc, which PyTorch builds in as
+/// its CPU allocator on aarch64 Linux.
+const HOST_ALLOCATOR_THP_VARIABLE: &str = "MIMALLOC_ALLOW_THP";
+
+/// Returns the allocator variables every rank is launched with, given a
+/// lookup into the head's environment.
 ///
-/// Every rank serves varying shapes from expandable allocator segments,
-/// unless the head's environment already configures the allocator under
-/// either name, in which case each rank receives exactly the head's
-/// variables. Publication never depends on the caching allocator: a device
-/// product is exported from the rank's own VMM arena or copied into its
-/// bounded VMM pool, both reserved outside the allocator.
+/// Every rank serves varying shapes from expandable caching-allocator
+/// segments, unless the head's environment already configures the caching
+/// allocator under either name, in which case each rank receives exactly
+/// the head's variables. Publication never depends on the caching
+/// allocator: a device product is exported from the rank's own VMM arena or
+/// copied into its bounded VMM pool, both reserved outside the allocator.
+///
+/// Every rank also keeps its host heap out of transparent huge pages unless
+/// the head sets `MIMALLOC_ALLOW_THP` itself. mimalloc otherwise advises its
+/// 1 GiB arenas for huge pages. On a kernel with 64 KiB base pages a huge
+/// page is 512 MiB, and each time khugepaged collapses one it holds the
+/// rank's memory map for about 90 ms, which stalls the rank's service
+/// thread. With the option off, mimalloc disables transparent huge pages
+/// for the rank process.
 ///
 /// The variables are set explicitly on each rank's command, even where a
 /// local child would inherit them, because a launcher on another host
@@ -661,15 +708,27 @@ const ALLOCATOR_VARIABLES: [&str; 2] = ["PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLO
 fn allocator_environment(
     head: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<(&'static str, std::ffi::OsString)> {
-    let configured: Vec<_> = ALLOCATOR_VARIABLES
+    let mut configured: Vec<_> = ALLOCATOR_VARIABLES
         .into_iter()
         .filter_map(|name| head(name).map(|value| (name, value)))
         .collect();
     if configured.is_empty() {
-        vec![("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True".into())]
-    } else {
-        configured
+        configured.push(("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True".into()));
     }
+    configured.push((
+        HOST_ALLOCATOR_THP_VARIABLE,
+        head(HOST_ALLOCATOR_THP_VARIABLE).unwrap_or_else(|| "0".into()),
+    ));
+    configured
+}
+
+/// Bound listening sockets a rank inherits and serves collective stores on.
+#[derive(Default)]
+pub(crate) struct RankSockets {
+    /// The group's rendezvous store, served by the group's first rank.
+    pub(crate) group: Option<std::net::TcpListener>,
+    /// The expert-parallel world's store, served by that world's rank 0.
+    pub(crate) experts: Option<std::net::TcpListener>,
 }
 
 impl PendingRank {
@@ -677,12 +736,14 @@ impl PendingRank {
     ///
     /// The rank's channel is bound afterwards from that report, so nothing here
     /// names the endpoint and nothing waits for model readiness. `rendezvous`
-    /// is the group's collective store address, and `store_listener` the
+    /// is the group's collective store address, and `sockets.group` the
     /// socket this rank serves that store on when it is the group's first rank
     /// and this process spawns it; the rank inherits the socket and this
     /// process keeps no copy. With `remote`, the launch goes to that host's
     /// launcher and no process is started here. `startup_abort` is the
     /// startup cancellation flag shared by the ranks launched together.
+    /// `sockets.experts` is the socket this rank serves its expert-parallel
+    /// world's store on, when it is that world's rank 0.
     ///
     /// Fails when the descriptor directory cannot be created, the rank's
     /// host-relative values or its descriptor cannot be built, the descriptor
@@ -692,7 +753,7 @@ impl PendingRank {
         args: &WorkerProcessArgs,
         rank: u32,
         rendezvous: Option<&str>,
-        store_listener: Option<std::net::TcpListener>,
+        sockets: RankSockets,
         remote: Option<&mut super::launcher::RemoteHost<'_>>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         registration: &str,
@@ -727,8 +788,8 @@ impl PendingRank {
             .env("LOCAL_RANK", local_rank.to_string())
             .env("LOCAL_WORLD_SIZE", local_world_size.to_string());
 
-        // The allocator setting is stated even for a local child, which would
-        // inherit it, so that a remote launch carries it as well.
+        // The allocator settings are stated even for a local child, which
+        // would inherit them, so that a remote launch carries them as well.
         cmd.envs(allocator_environment(|name| std::env::var_os(name)));
 
         // The engine's working directory leads the worker's import path.
@@ -739,14 +800,23 @@ impl PendingRank {
 
         // The command owns the store socket from here and closes this
         // process's copy when it is dropped, after the spawn below.
-        let rendezvous_listen_fd = store_listener
+        let rendezvous_listen_fd = sockets
+            .group
+            .map(|listener| uniserve_core::launch::inherit_listener(&mut cmd, listener));
+        let expert_listen_fd = sockets
+            .experts
             .map(|listener| uniserve_core::launch::inherit_listener(&mut cmd, listener));
 
         // One typed descriptor carries every launch value. argv keeps the
         // process identity and the descriptor's location so a running worker
         // remains identifiable from the process table.
-        let descriptor =
-            args.launch_descriptor(rank, registration, rendezvous, rendezvous_listen_fd)?;
+        let descriptor = args.launch_descriptor(
+            rank,
+            registration,
+            rendezvous,
+            rendezvous_listen_fd,
+            expert_listen_fd,
+        )?;
         std::fs::write(&descriptor_path, serde_json::to_vec_pretty(&descriptor)?)
             .context("writing the worker launch descriptor")?;
 
@@ -1525,13 +1595,13 @@ mod tests {
             ..WorkerProcessArgs::default()
         };
         let descriptor = args
-            .launch_descriptor(0, "127.0.0.1:1", None, None)
+            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
             .expect("descriptor");
         assert!(descriptor.get("base_model").is_none());
 
         args.base_model = Some("/models/MiniMax-H3".into());
         let descriptor = args
-            .launch_descriptor(0, "127.0.0.1:1", None, None)
+            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
             .expect("descriptor");
         assert_eq!(descriptor["base_model"], "/models/MiniMax-H3");
     }
@@ -1566,10 +1636,12 @@ mod tests {
         }
     }
 
-    /// Every rank runs with the head's allocator configuration, under
-    /// whichever names the head sets, or with expandable segments when the
-    /// head configures none. The result names each variable, since a remote
-    /// launch carries only the variables its command sets.
+    /// Every rank runs with the head's caching-allocator configuration,
+    /// under whichever names the head sets, or with expandable segments when
+    /// the head configures none, and with its host heap out of transparent
+    /// huge pages unless the head decides otherwise. The result names each
+    /// variable, since a remote launch carries only the variables its
+    /// command sets.
     #[test]
     fn ranks_run_with_the_heads_allocator_configuration() {
         let resolve = |head: &[(&'static str, &str)]| {
@@ -1587,7 +1659,10 @@ mod tests {
 
         assert_eq!(
             resolve(&[]),
-            expected(&[("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")])
+            expected(&[
+                ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+                ("MIMALLOC_ALLOW_THP", "0"),
+            ])
         );
         for head in [
             vec![(
@@ -1600,7 +1675,16 @@ mod tests {
                 ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False"),
             ],
         ] {
-            assert_eq!(resolve(&head), expected(&head));
+            let mut ranks = head.clone();
+            ranks.push(("MIMALLOC_ALLOW_THP", "0"));
+            assert_eq!(resolve(&head), expected(&ranks));
         }
+        assert_eq!(
+            resolve(&[("MIMALLOC_ALLOW_THP", "1")]),
+            expected(&[
+                ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+                ("MIMALLOC_ALLOW_THP", "1"),
+            ])
+        );
     }
 }

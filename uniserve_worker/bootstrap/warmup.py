@@ -589,6 +589,7 @@ def _build_warmup_batch(
             ForwardMode.PREFILL,
             ForwardMode.DECODE,
             ForwardMode.VERIFY,
+            ForwardMode.TOKEN_DENOISING,
             TransferMode.KV_PUBLISH,
             TransferMode.KV_INSTALL,
             MediaCall.LATENT_PREPARATION,
@@ -640,6 +641,16 @@ def _build_warmup_batch(
                 (visible + input_length,),
                 (input_length,),
                 (True,),
+            )
+        elif call.kind is ForwardMode.TOKEN_DENOISING:
+            # A canvas step is one read-only row of its canvas over the
+            # visible prefix.
+            canvas = int(call.bounds.max_tokens)
+            forward_inputs[identity] = (
+                (request_pool_indices[call.request_key],),
+                (visible + canvas,),
+                (canvas,),
+                (False,),
             )
 
     # Size each image request's latent page table: its latent units are the
@@ -907,6 +918,10 @@ def warmup_requests(worker: Worker) -> None:
             _warmup_tokens(requests)
             logger.info("completed token runtime warmup")
 
+        if worker.canvas_slots is not None:
+            _warmup_canvas(requests)
+            logger.info("completed canvas generation warmup")
+
         if worker.runner.image_builder is not None:
             _warmup_flow(requests)
             logger.info("completed flow runtime warmup")
@@ -1089,6 +1104,122 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
+    for sid in request_ids:
+        requests.drop_request(sid)
+
+
+def _warmup_canvas(requests: _WarmupRequests) -> None:
+    """Exercise the canvas steps and block commits of a generating denoiser.
+
+    Admits one request per row of the largest sampler chunk
+    (``CanvasSlots.step_rows``) with the served canvas sampling, prefills
+    one prompt token each, runs one canvas step over each row count up to a
+    whole chunk, and commits one canvas-length block. A step splits its
+    rows into whole chunks and one remainder, so these are all the chunk
+    shapes a step can run: the sampler kernels load and its
+    self-conditioning product chooses each shape's algorithm, and the
+    canvas pass's attention and expert kernels and the commit's prefill
+    kernels are chosen, before any request arrives. Returns without running
+    when the worker already holds requests. Drops its requests afterwards.
+    """
+    from uniserve.sampling import SamplingParams
+    from uniserve_worker.protocol.batch import GenerationParams, NewRequest
+    from uniserve_worker.protocol.call import (
+        Bounds,
+        Call,
+        CallCoordinates,
+        CanvasStep,
+    )
+
+    slots = requests.worker.canvas_slots
+    if slots is None or requests.worker.requests.request_ids():
+        return
+
+    length = slots.canvas_length
+    request_ids = tuple(range(1, slots.step_rows + 1))
+    keys = {sid: RequestKey(0, sid, 1) for sid in request_ids}
+    sampling = slots.served
+    admissions = tuple(
+        NewRequest(
+            keys[sid],
+            request_pool_idx=sid,
+            generation=GenerationParams(
+                sampling=SamplingParams(seed=sid), canvas=sampling
+            ),
+        )
+        for sid in request_ids
+    )
+
+    def prefill(sid, call_id, start, tokens):
+        """A prefill of ``tokens`` that writes KV and samples nothing."""
+        return Call(
+            request_key=keys[sid],
+            call_id=call_id,
+            coordinates=CallCoordinates(start, start, start),
+            kind=ForwardMode.PREFILL,
+            bounds=Bounds(max_tokens=len(tokens)),
+            input_token_ids=tokens,
+        )
+
+    def step(sid, call_id, block, number):
+        """Step ``number`` of canvas ``block`` after the request's token."""
+        return Call(
+            request_key=keys[sid],
+            call_id=call_id,
+            coordinates=CallCoordinates(1, 1, 1),
+            kind=ForwardMode.TOKEN_DENOISING,
+            bounds=Bounds(max_tokens=length, max_completion_bytes=4 * length),
+            canvas=CanvasStep(block, number),
+        )
+
+    batch = requests._batch_id + 1
+    _execute_warmup(
+        requests,
+        _build_warmup_batch(
+            requests,
+            admissions=admissions,
+            calls=tuple(
+                prefill(sid, CallId(batch, index), 0, (0,))
+                for index, sid in enumerate(request_ids)
+            ),
+        ),
+    )
+
+    # Every row count from one to a whole chunk. Row ``i`` steps in every
+    # call over at least ``i + 1`` rows, starting its next canvas once it
+    # has run the served sampling's every step.
+    progress = dict.fromkeys(request_ids, (0, 0))
+    for rows in range(1, len(request_ids) + 1):
+        batch = requests._batch_id + 1
+        calls = []
+        for index, sid in enumerate(request_ids[:rows]):
+            block, number = progress[sid]
+            calls.append(step(sid, CallId(batch, index), block, number))
+            progress[sid] = (
+                (block + 1, 0)
+                if number + 1 == sampling.max_steps
+                else (block, number + 1)
+            )
+        _execute_warmup(
+            requests,
+            _build_warmup_batch(requests, admissions=(), calls=tuple(calls)),
+        )
+
+    batch = requests._batch_id + 1
+    _execute_warmup(
+        requests,
+        _build_warmup_batch(
+            requests,
+            admissions=(),
+            calls=(
+                prefill(request_ids[0], CallId(batch, 0), 1, (0,) * length),
+            ),
+        ),
+    )
+
+    device = torch.device(requests.worker.worker_config.device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     for sid in request_ids:
         requests.drop_request(sid)
 

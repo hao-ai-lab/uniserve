@@ -15,8 +15,11 @@ comes from one of three places:
 
 - Persistent products borrow `BufferPool` ranges through the scheduler's
   `BufferAllocation`; this store bounds their count per device.
-- Encoder features also borrow `BufferPool` ranges, but are bounded by their
-  own entry-count and per-entry byte limits.
+- Encoder features also borrow `BufferPool` ranges and are bounded by a fixed
+  per-entry byte limit. How many stay resident is the scheduler's encoder
+  cache policy: it retains up to ``WorkerInfo.encoder_cache_entries``
+  features past their requests, places each new feature in its buffer pool
+  before it evicts a retained one, and frees evicted features by buffer.
 - Request-relay products are single scalars in flat arenas owned here, one
   element per (request slot, lane, dtype, field). A slot's physical
   generation changes on every rebinding so stale handles fail validation.
@@ -363,9 +366,11 @@ class TensorStore:
     reentrant lock guards all tables; the retirement callbacks also take it.
 
     Three bounds are independent: ``capacity`` limits resident (not yet
-    reclaimed) generic persistent products per device, ``entry_capacity``
-    and ``max_entry_bytes`` limit encoder features, and ``byte_capacity``
-    limits relay-arena bytes, the only storage this store allocates itself.
+    reclaimed) generic persistent products per device, ``max_entry_bytes``
+    limits one encoder feature, and ``byte_capacity`` limits relay-arena
+    bytes, the only storage this store allocates itself. Encoder features
+    have no count bound here: the scheduler's buffer-pool placements, which
+    `BufferPool.bind` validates, bound their storage.
     """
 
     def __init__(
@@ -373,7 +378,6 @@ class TensorStore:
         *,
         capacity: int = 0,
         byte_capacity: int | None = None,
-        entry_capacity: int = 0,
         max_entry_bytes: int = 1,
         devices: tuple[torch.device | str, ...] = (),
         request_capacity: int = 0,
@@ -390,7 +394,6 @@ class TensorStore:
             capacity: Resident generic persistent products per device.
             byte_capacity: Bound on relay-arena bytes; defaults to the
                 `BufferPool` byte capacity.
-            entry_capacity: Resident encoder features across all devices.
             max_entry_bytes: Largest ``max_bytes`` of one encoder feature.
             devices: Devices on which encoder features may be reserved.
             request_capacity: Request slots; relay request slots are
@@ -410,14 +413,9 @@ class TensorStore:
         # Validate the independent capacities and the coupled request-relay
         # dimensions before creating any registries.
         self.capacity = int(capacity)
-        self.entry_capacity = int(entry_capacity)
         self.max_entry_bytes = int(max_entry_bytes)
         self.devices = tuple(canonical_device(device) for device in devices)
-        if (
-            self.capacity < 0
-            or self.entry_capacity < 0
-            or self.max_entry_bytes < 1
-        ):
+        if self.capacity < 0 or self.max_entry_bytes < 1:
             raise ValueError("tensor store capacities are invalid")
 
         self.byte_capacity = int(
@@ -623,9 +621,12 @@ class TensorStore:
     ) -> tuple[TensorRecord, ...]:
         """Reserve encoder features in persistent storage.
 
-        Features count against ``entry_capacity`` and ``max_entry_bytes``
-        instead of the per-device product capacity, must use a floating-point
-        dtype, and must target a device the store was constructed with. The
+        Features do not count against the per-device product capacity:
+        each is bounded by ``max_entry_bytes`` and by its buffer allocation,
+        whose placement `BufferPool.bind` validates, so the scheduler's
+        encoder cache may keep its full budget of retained features resident
+        while the next one is encoded. Features must use a floating-point
+        dtype and target a device the store was constructed with. The
         arguments mean the same as in `bind_outputs`, but every output needs
         a buffer allocation and shapes and regions are not checked against
         the shape bounds here.
@@ -646,11 +647,11 @@ class TensorStore:
         """Bind outputs to the `BufferPool` ranges of their allocations.
 
         This store rejects repeated or registered identities and missing
-        allocations and enforces its count bounds (and, for features, the
-        dtype, byte, and device limits); `BufferPool.bind` validates and
-        places each allocation, first-fit when the pool is compact. On any
-        failure every binding made by this call is released and no record
-        remains.
+        allocations and enforces the generic products' per-device count bound
+        (and, for features, the dtype, byte, and device limits);
+        `BufferPool.bind` validates and places each allocation, first-fit
+        when the pool is compact. On any failure every binding made by this
+        call is released and no record remains.
         """
         keys = tuple(
             _reference_key(reference) for reference, _device in bindings
@@ -665,21 +666,12 @@ class TensorStore:
 
             # Generic products share the per-device slot bound; features and
             # relay lanes are bounded independently and do not consume slots.
-            records = self._writes.values()
             counts: dict[str, int] = {}
-            for entry in records:
+            for entry in self._writes.values():
                 if not entry.feature and entry.relay_slot is None:
                     counts[entry.device_name] = (
                         counts.get(entry.device_name, 0) + 1
                     )
-            if (
-                feature
-                and sum(entry.feature for entry in records) + len(bindings)
-                > self.entry_capacity
-            ):
-                raise resource_error(
-                    "encoder cache has no query-ready entry capacity"
-                )
 
             # Validate every output and count it against its bound before
             # binding any placement.

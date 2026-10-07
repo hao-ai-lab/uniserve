@@ -407,6 +407,9 @@ struct SimRequestState {
     /// admission root: the call a later chained call follows, as a rank
     /// derives it from its own request state.
     state_call_id: uniserve_worker_ipc::CallId,
+    /// The generation canvas step the request's next canvas call must run:
+    /// blocks stopped so far and steps run on the current block.
+    canvas: uniserve_worker_ipc::CanvasStep,
 }
 
 impl SimRequestState {
@@ -433,6 +436,7 @@ impl SimRequestState {
             predicate_values: HashMap::new(),
             penalty_counts: BTreeMap::new(),
             state_call_id: uniserve_worker_ipc::CallId::new(0, 0),
+            canvas: uniserve_worker_ipc::CanvasStep::default(),
         }
     }
 
@@ -473,6 +477,12 @@ pub struct SimEngine {
     /// every configured control token, and never shrinks.
     vocab: usize,
     results_on_wait: bool,
+    /// Readout candidate whose log-probability is reported as NaN, as a
+    /// worker with a numerical defect reports it.
+    non_finite_candidate: Option<u32>,
+    /// Releases for batches that skip a predicated call: such a batch returns
+    /// only after taking one release, or once the sender is dropped.
+    predicated_release: Option<Receiver<()>>,
     /// Admitted requests by id, removed when a `Finish` for the same request
     /// key executes.
     requests: HashMap<RequestId, SimRequestState>,
@@ -502,6 +512,8 @@ impl SimEngine {
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
             results_on_wait: false,
+            non_finite_candidate: None,
+            predicated_release: None,
             requests: HashMap::new(),
         }
     }
@@ -523,7 +535,7 @@ impl SimEngine {
         let natural = if index >= text_len {
             fake_eos
         } else {
-            1_000 + ((request_id.0 as u32 * 7 + index as u32) % 5_000)
+            sim_text_token(request_id, index)
         };
         logits[natural as usize] = 10.0;
         let alternate_one = 1_000 + ((request_id.0 as u32 * 13 + index as u32 + 1) % 5_000);
@@ -639,6 +651,7 @@ impl SimEngine {
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
+        non_finite_candidate: Option<u32>,
         call: &Call,
         request: &mut SimRequestState,
     ) -> anyhow::Result<RequestOutput> {
@@ -679,6 +692,7 @@ impl SimEngine {
             kv_computed_len: 0,
             num_completed_steps: 0,
             committed_tokens: Vec::new(),
+            candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
             kv_output: None,
@@ -690,10 +704,11 @@ impl SimEngine {
             work @ (CallKind::Forward(ForwardMode::Prefill)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)) => {
-                // A call that ingests vision or latent features extends KV by
-                // its token bound but leaves logical positions to the model.
+                // A call that writes image blocks, alone or among the prompt
+                // tokens of a context prefill, extends KV by its token bound
+                // but leaves logical positions to the model.
                 let visual_state =
-                    call.vision_input.is_some() || call.latent_feature_input.is_some();
+                    !call.vision_inputs.is_empty() || call.latent_feature_input.is_some();
                 let samples_token = call.token_output.is_some();
                 if visual_state {
                     request.positions_from_model = true;
@@ -706,9 +721,17 @@ impl SimEngine {
                     }
                 }
                 if !visual_state && !samples_token {
+                    // A readout's prompt chunk samples nothing and advances
+                    // positions with its tokens; the `CloseKv` write, which
+                    // declares a completion, only extends KV.
                     request.kv_visible_len = request
                         .kv_visible_len
                         .saturating_add(call.bounds.max_tokens);
+                    if call.completion_output.is_none() {
+                        request.logical_position = request
+                            .logical_position
+                            .saturating_add(call.bounds.max_tokens);
+                    }
                     record.position = request.logical_position;
                     set_kv_lengths(&mut record, request.kv_visible_len);
                 } else if samples_token {
@@ -813,6 +836,73 @@ impl SimEngine {
                         .collect();
                 }
             }
+            CallKind::Forward(ForwardMode::TokenDenoising) => {
+                // A canvas pass reads KV without writing it and reports one
+                // deterministic log-probability per readout candidate, or runs
+                // one step of the request's generation canvas.
+                if let Some(step) = call.canvas {
+                    // A step queued behind the one that stopped its block is
+                    // predicated on that step's false completion and never
+                    // reaches this branch.
+                    anyhow::ensure!(
+                        step == request.canvas,
+                        "canvas call {:?} runs {step:?}, but the request's canvas is at {:?}",
+                        call.call_id,
+                        request.canvas
+                    );
+                    let max_steps = request
+                        .admission
+                        .ar
+                        .as_ref()
+                        .and_then(|branch| branch.canvas.as_ref())
+                        .map(|canvas| canvas.max_steps)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "canvas call for a request admitted without canvas sampling"
+                            )
+                        })?;
+                    let request_id = call.request_key.request_id;
+                    if step.step < sim_canvas_stop_step(request_id, step.block, max_steps) {
+                        request.canvas.step += 1;
+                    } else {
+                        // The stopped block holds the synthetic text from its
+                        // first position on, and EOS past the text's end.
+                        let length = call.bounds.max_tokens as usize;
+                        let first = step.block as usize * length;
+                        record.committed_tokens = (first..first + length)
+                            .map(|index| {
+                                if index < text_len {
+                                    sim_text_token(request_id, index)
+                                } else {
+                                    fake_eos
+                                }
+                            })
+                            .collect();
+                        request.canvas = uniserve_worker_ipc::CanvasStep {
+                            block: step.block + 1,
+                            step: 0,
+                        };
+                        // The block stops here, so a step queued behind this
+                        // one is a no-op.
+                        if let Some(completion) = call.completion_output.as_ref() {
+                            request.predicate_values.insert(completion.clone(), false);
+                        }
+                    }
+                }
+                if let Some(readout) = &call.readout {
+                    record.candidate_logprobs = readout
+                        .candidate_ids
+                        .iter()
+                        .map(|&token| {
+                            if non_finite_candidate == Some(token) {
+                                f32::NAN
+                            } else {
+                                sim_candidate_logprob(call.request_key.request_id, token)
+                            }
+                        })
+                        .collect();
+                }
+            }
             CallKind::Media(MediaCall::MediaReading)
             | CallKind::Media(MediaCall::TextEncoding)
             | CallKind::Media(MediaCall::VisionEncoding)
@@ -911,6 +1001,7 @@ impl SimEngine {
             kv_computed_len: request.kv_visible_len,
             num_completed_steps: u32::from(request.flow_step),
             committed_tokens: Vec::new(),
+            candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
             kv_output: None,
@@ -997,13 +1088,47 @@ impl SimEngine {
         }
     }
 
+    /// Reports NaN as the log-probability of readout candidate `token`,
+    /// wherever a readout reads it.
+    pub fn set_non_finite_candidate(&mut self, token: u32) {
+        self.non_finite_candidate = Some(token);
+    }
+
+    /// Holds every batch that skips a predicated call until the returned
+    /// sender releases it, as a worker whose skipped step is still running
+    /// holds its batch's result: each message releases one held batch, and
+    /// dropping the sender releases the rest.
+    pub fn hold_predicated_batches(&mut self) -> Sender<()> {
+        let (release, held) = crossbeam_channel::unbounded();
+        self.predicated_release = Some(held);
+        release
+    }
+
     /// Returns mutable access to the simulator's advertised capabilities.
     pub fn mut_info_for_test(&mut self) -> &mut WorkerInfo {
         &mut self.info
     }
 }
 
+/// Synthetic text token `index` of request `request_id`: the natural token
+/// the simulator samples at that generated position, in `1_000..6_000`.
+pub fn sim_text_token(request_id: RequestId, index: usize) -> u32 {
+    1_000 + ((request_id.0 as u32 * 7 + index as u32) % 5_000)
+}
+
+/// Zero-based step at which the simulator stops block `block` of request
+/// `request_id`: one of its first three steps, within `max_steps`.
+pub fn sim_canvas_stop_step(request_id: RequestId, block: u32, max_steps: u32) -> u32 {
+    ((request_id.0 as u32).wrapping_add(block) % 3).min(max_steps.saturating_sub(1))
+}
+
 /// Sets every logical KV frontier to the visible token position.
+/// Deterministic natural-log probability the simulator reports for readout
+/// candidate `token` of request `request_id`: a value in `[-7, -1]`.
+pub fn sim_candidate_logprob(request_id: RequestId, token: u32) -> f32 {
+    -1.0 - ((request_id.0.wrapping_add(u64::from(token))) % 7) as f32
+}
+
 fn set_kv_lengths(lengths: &mut RequestOutput, visible: u32) {
     lengths.kv_visible_len = visible;
     lengths.kv_computed_len = visible;
@@ -1126,6 +1251,7 @@ impl SimEngine {
         let vocab = self.vocab;
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
+        let non_finite_candidate = self.non_finite_candidate;
         let mut completions = Vec::with_capacity(batch.requests.len());
         for (call, _) in batch.requests {
             let request = self
@@ -1181,11 +1307,27 @@ impl SimEngine {
                 continue;
             }
 
-            let completion = Self::execute_call(vocab, text_len, fake_eos, &call, request)?;
+            let completion = Self::execute_call(
+                vocab,
+                text_len,
+                fake_eos,
+                non_finite_candidate,
+                &call,
+                request,
+            )?;
             if completion.status == CallStatus::Ok && call.advances_state() {
                 request.state_call_id = call.call_id;
             }
             completions.push(completion);
+        }
+
+        if let Some(release) = &self.predicated_release
+            && completions
+                .iter()
+                .any(|completion| completion.status == CallStatus::Predicated)
+        {
+            // A disconnected sender releases every later batch.
+            let _ = release.recv();
         }
 
         let report = BatchOutput {
@@ -1237,6 +1379,7 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
+                canvas: None,
             }),
             None,
             0,
@@ -1266,7 +1409,7 @@ mod tests {
             token_input: None,
 
             token_output: Some(token_output(CallId::new(batch_id, request_index))),
-            vision_input: None,
+            vision_inputs: Vec::new(),
             latent_feature_input: None,
             encoder_output: None,
             latent_input: None,
@@ -1280,6 +1423,8 @@ mod tests {
             kv_input: None,
             kv_output: None,
             input_token_ids: Vec::new(),
+            readout: None,
+            canvas: None,
             sampling_state: None,
             request_key,
             call_id: CallId::new(batch_id, request_index),

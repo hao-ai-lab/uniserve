@@ -15,6 +15,35 @@
 use super::*;
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
+/// How one understanding token ends or continues its request
+/// (`Scheduler::und_token_outcome`).
+enum TokenOutcome {
+    /// The token is ordinary output.
+    Continue,
+    /// The token is one of the request's stop tokens, published only with
+    /// `include_stop_token`.
+    StopToken,
+    /// The token ends the request by EOS or the token limit; it is published
+    /// unless it is an EOS token.
+    Finish(FinishReason),
+}
+
+/// Builds the terminal `Finished` event of a token request with its final
+/// usage.
+fn terminal_event(
+    state: &RequestState,
+    reason: FinishReason,
+    stop_reason: Option<uniserve_core::StopReason>,
+) -> EngineCoreOutput {
+    EngineCoreOutput::Finished {
+        reason,
+        stop_reason,
+        prompt_tokens: state.req.prompt_token_ids.len(),
+        completion_tokens: state.num_generated_tokens,
+        images: state.num_generated_images,
+    }
+}
+
 /// Flushes journaled public events into the output channel in order.
 ///
 /// Returns `true` only when the receiver has closed, in which case the journal
@@ -369,19 +398,19 @@ impl Scheduler {
                     // `process_generation_result` has already moved the request
                     // to `PublishKv`.
                     (false, _) if !is_prompt_extend(&call) => return,
-                    // Input-image state ingest. The encoder index wraps to zero
-                    // once the image's last encoder output has been ingested.
+                    // Latent input-image block ingest. The encoder index wraps
+                    // to zero once the image's last block has been written.
                     (true, false) => {
+                        self.free_consumed_products(id, &call);
                         let is_final_step = self
                             .running
                             .get(&id)
                             .is_some_and(|state| state.image_encoder_index == 0);
-                        if is_final_step {
-                            self.free_transient_products(id);
-                        }
 
-                        // Ingesting the last image of a fully consumed prompt
-                        // starts understanding decode from BOS.
+                        // Writing the last image of a fully consumed prompt
+                        // starts a readout's canvases, a canvas-generating
+                        // request's first block, or understanding decode from
+                        // BOS.
                         if is_final_step
                             && self.running.get(&id).is_some_and(|st| {
                                 st.num_ingested_images >= st.req.multimodal_inputs.images.len()
@@ -391,9 +420,15 @@ impl Scheduler {
                         {
                             let bos = self.ctrl.bos;
                             if let Some(st) = self.running.get_mut(&id) {
-                                st.next_token = bos;
-                                st.round_token_ids.clear();
-                                st.phase = Phase::DecodeUnd;
+                                if st.req.is_readout() {
+                                    st.phase = Phase::Readout;
+                                } else if st.req.is_canvas_generation() {
+                                    st.phase = Phase::Canvas;
+                                } else {
+                                    st.next_token = bos;
+                                    st.round_token_ids.clear();
+                                    st.phase = Phase::DecodeUnd;
+                                }
                             }
                         }
                         return;
@@ -491,7 +526,9 @@ impl Scheduler {
                 }
 
                 // Prompt extension. Partial prefill remains in ingest until every
-                // text and multimodal position has been consumed.
+                // text and multimodal position has been consumed. The vision
+                // blocks it wrote no longer need their request-local products.
+                self.free_consumed_products(id, &call);
                 let Some(st) = self.running.get(&id) else {
                     return;
                 };
@@ -507,6 +544,34 @@ impl Scheduler {
                     st.num_ingested_images < st.req.multimodal_inputs.images.len()
                         || st.num_computed_prompt_tokens < st.req.prompt_token_ids.len() as u32
                 }) {
+                    return;
+                }
+
+                // A readout's complete prompt samples nothing; its canvases
+                // follow. So does a canvas-generating request's, and each of
+                // its block commits, which extend the context the same way;
+                // the next block follows.
+                if let Some(st) = self.running.get_mut(&id)
+                    && (st.req.is_readout() || st.req.is_canvas_generation())
+                {
+                    st.phase = if st.req.is_readout() {
+                        Phase::Readout
+                    } else {
+                        Phase::Canvas
+                    };
+                    return;
+                }
+
+                // A context that ends with an image block sampled nothing:
+                // understanding decode starts from BOS, as after a trailing
+                // latent block.
+                if call.token_output.is_none() {
+                    let bos = self.ctrl.bos;
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.next_token = bos;
+                        st.round_token_ids.clear();
+                        st.phase = Phase::DecodeUnd;
+                    }
                     return;
                 }
 
@@ -591,6 +656,37 @@ impl Scheduler {
                 {
                     self.begin_image(id);
                 }
+            }
+            // A canvas step that stopped its block left the block's tokens
+            // for their commit; they are published first, in order, and the
+            // request finishes on the first that ends it.
+            CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
+                let tokens = match self.running.get(&id) {
+                    Some(st) if st.phase == Phase::CommitCanvas => st.canvas_commit.clone(),
+                    _ => return,
+                };
+                self.emit_or_finish_block(id, &tokens);
+            }
+            CallKind::Forward(ForwardMode::TokenDenoising) => {
+                // `process_generation_result` accepted the pass's rows and
+                // their log-probabilities. Once every row has reported, the
+                // request answers with all of them, in report order.
+                let Some(st) = self.running.get_mut(&id) else {
+                    return;
+                };
+                if st.readout_rows < st.req.readout.len() {
+                    return;
+                }
+                let candidate_logprobs = std::mem::take(&mut st.readout_logprobs);
+                if candidate_logprobs.len() != st.req.readout_candidates() {
+                    tracing::error!(
+                        request_id = id.0,
+                        "a completed readout lacks candidate log-probabilities"
+                    );
+                    return self.finish(id, FinishReason::Error);
+                }
+                self.emit(id, EngineCoreOutput::Readout { candidate_logprobs });
+                self.finish(id, FinishReason::Completed);
             }
             CallKind::Media(MediaCall::Denoising) => {
                 // Publish every newly committed step exactly once, including steps
@@ -717,25 +813,25 @@ impl Scheduler {
             CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {
                 match is_feedback_computation(&call) {
-                    // Input-image encoding: the product feeds the next state
-                    // ingest and, when the request writes the encoder cache,
-                    // becomes a shared cache entry.
+                    // Input-image encoding of the next block the context needs
+                    // (`next_context_encode`): the product feeds the call that
+                    // writes the block and, when the request writes the
+                    // encoder cache, becomes a shared cache entry.
                     false => {
-                        let encoder_cache_key = self.running.get(&id).and_then(|state| {
-                            let image = state
-                                .req
-                                .multimodal_inputs
-                                .images
-                                .get(state.num_ingested_images)?;
-                            let encoder = image.encoders.get(state.image_encoder_index)?;
-                            state.req.cache.write.then(|| {
-                                encoder_cache_key(
-                                    image.hash,
-                                    state.image_encoder_index,
-                                    encoder.encoder,
-                                )
+                        let Some((block, step, block_cache_key)) =
+                            self.next_context_encode(id).and_then(|(block, step)| {
+                                let state = self.running.get(&id)?;
+                                let (image, _) = state.input_block(block)?;
+                                let key =
+                                    state.req.cache.write.then(|| {
+                                        encoder_cache_key(image.hash, block.encoder, step)
+                                    });
+                                Some((block, step, key))
                             })
-                        });
+                        else {
+                            return self.finish(id, FinishReason::Error);
+                        };
+                        let encoder_cache_key = block_cache_key;
                         let Some(feature) = call.encoder_output.clone() else {
                             return self.finish(id, FinishReason::Error);
                         };
@@ -805,9 +901,17 @@ impl Scheduler {
                             feature.clone()
                         };
 
+                        // A latent block is written by its own extension; a
+                        // vision block joins the context prefill that reaches
+                        // it. Encodes follow the blocks' context order.
                         if let Some(st) = self.running.get_mut(&id) {
-                            st.input_image_features = Some(selected_product);
-                            st.phase = Phase::IngestState;
+                            if step == ImageIngestStep::VaeEncode {
+                                st.input_image_features = Some(selected_product);
+                                st.phase = Phase::IngestState;
+                            } else {
+                                debug_assert!(block.image >= st.num_ingested_images);
+                                st.context_features.push(selected_product);
+                            }
                         }
 
                         if !free_products.is_empty() {
@@ -881,8 +985,33 @@ impl Scheduler {
         );
     }
 
-    /// Frees the request's transient products: uncached input-image encoder
-    /// outputs, feedback encoder outputs, and the device feedback source.
+    /// Frees the request-local encoder products an image-writing `call`
+    /// consumed: its latent feature or its vision blocks' features. Products
+    /// the encoder cache holds stay pinned until the request finishes, and
+    /// products of blocks the context has not reached yet stay held.
+    pub(super) fn free_consumed_products(&mut self, id: RequestId, call: &Call) {
+        let consumed: Vec<TensorRef> = call
+            .latent_feature_input
+            .iter()
+            .chain(call.vision_inputs.iter().map(|input| &input.feature))
+            .cloned()
+            .collect();
+        let freed = self
+            .running
+            .get_mut(&id)
+            .map(|state| {
+                let (freed, kept) = std::mem::take(&mut state.transient_encoder_products)
+                    .into_iter()
+                    .partition(|product| consumed.contains(product));
+                state.transient_encoder_products = kept;
+                freed
+            })
+            .unwrap_or_default();
+        self.free_buffers(freed.into_iter().map(|product| product.buffer_id()));
+    }
+
+    /// Frees the request's transient products: uncached encoder outputs,
+    /// feedback encoder outputs, and the device feedback source.
     pub(super) fn free_transient_products(&mut self, id: RequestId) {
         let products = self
             .running
@@ -1006,6 +1135,15 @@ impl Scheduler {
     /// Returns `false` for a request that is not running. A closed receiver
     /// also returns `false` and marks the request for cancellation.
     pub(super) fn emit(&mut self, id: RequestId, event: EngineCoreOutput) -> bool {
+        // A request whose terminal event is published publishes nothing more.
+        if self
+            .inflight
+            .pending_finishes
+            .get(&id)
+            .is_some_and(|finish| finish.terminal_published)
+        {
+            return false;
+        }
         let Some(state) = self.running.get_mut(&id) else {
             return false;
         };
@@ -1036,6 +1174,101 @@ impl Scheduler {
             state.output.tokens_sent = state.output.tokens_sent.saturating_add(1);
         }
         true
+    }
+
+    /// Records accepted text tokens and publishes them as one event when the
+    /// request emits text.
+    ///
+    /// A running request always records the tokens in `generated_token_ids`.
+    /// `tokens_sent` advances only when the event was accepted.
+    pub(super) fn emit_text_tokens(&mut self, id: RequestId, tokens: Vec<u32>) {
+        let Some(st) = self.running.get_mut(&id) else {
+            return;
+        };
+        st.generated_token_ids.extend_from_slice(&tokens);
+        st.text_tokens_since_image = st.text_tokens_since_image.saturating_add(tokens.len());
+        if !st.req.emits_text() || tokens.is_empty() {
+            return;
+        }
+        let count = tokens.len();
+        let published = self.emit(id, EngineCoreOutput::TextTokens { ids: tokens });
+        if published && let Some(state) = self.running.get_mut(&id) {
+            state.output.tokens_sent = state.output.tokens_sent.saturating_add(count);
+        }
+    }
+
+    /// Resolves the stop conditions of a stopped canvas block's tokens in
+    /// order and publishes the visible ones as one event.
+    ///
+    /// Every token counts toward `num_generated_tokens` and is resolved as
+    /// `emit_or_finish_und_token` resolves a sampled token: the first token
+    /// that ends the request (a stop token, EOS, or the token limit) closes
+    /// the block, which is published up to it, and the request finishes after
+    /// its in-flight work. Tokens after it are never generated output.
+    pub(super) fn emit_or_finish_block(&mut self, id: RequestId, tokens: &[u32]) {
+        let mut visible = Vec::with_capacity(tokens.len());
+        let mut finish = None;
+        for &token_id in tokens {
+            let Some(state) = self.running.get_mut(&id) else {
+                return;
+            };
+            state.num_generated_tokens += 1;
+            match self.und_token_outcome(id, token_id) {
+                TokenOutcome::Continue => visible.push(token_id),
+                TokenOutcome::StopToken => {
+                    if self
+                        .running
+                        .get(&id)
+                        .is_some_and(|state| state.req.include_stop_token)
+                    {
+                        visible.push(token_id);
+                    }
+                    finish = Some((
+                        FinishReason::Stop,
+                        Some(uniserve_core::StopReason::Token(token_id)),
+                    ));
+                    break;
+                }
+                TokenOutcome::Finish(reason) => {
+                    if !self.ctrl.eos.contains(&token_id) {
+                        visible.push(token_id);
+                    }
+                    finish = Some((reason, None));
+                    break;
+                }
+            }
+        }
+        self.emit_text_tokens(id, visible);
+        if let Some((reason, stop_reason)) = finish {
+            self.finish_after_inflight(id, reason, stop_reason);
+        }
+    }
+
+    /// Decides how one understanding token, already counted in
+    /// `num_generated_tokens`, ends or continues its request.
+    ///
+    /// Stop tokens and EOS are honored only once at least `min_tokens` tokens
+    /// precede the token; the token limit applies regardless of that floor,
+    /// and a stop-token match takes precedence over EOS and the limit. A
+    /// request that is not running continues, and its caller finds it gone.
+    fn und_token_outcome(&self, id: RequestId, token_id: u32) -> TokenOutcome {
+        let Some(state) = self.running.get(&id) else {
+            return TokenOutcome::Continue;
+        };
+        let generated = state.num_generated_tokens;
+        let under_floor = generated <= state.req.sampling.min_tokens;
+        if !under_floor && state.req.stop_token_ids.contains(&token_id) {
+            TokenOutcome::StopToken
+        } else if generated >= state.req.max_und_tokens {
+            TokenOutcome::Finish(FinishReason::MaxTokens)
+        } else if self.ctrl.eos.contains(&token_id)
+            && !state.req.sampling.ignore_eos
+            && !under_floor
+        {
+            TokenOutcome::Finish(FinishReason::Eos)
+        } else {
+            TokenOutcome::Continue
+        }
     }
 
     /// Emits one visible token and its requested candidate log probabilities.
@@ -1094,46 +1327,31 @@ impl Scheduler {
         top_logprobs: Option<Vec<TokenLogprob>>,
         sampled: bool,
     ) -> bool {
-        let Some(state) = self.running.get(&id) else {
-            return true;
-        };
-        // `num_generated_tokens` already counts the token being resolved, so
-        // stop tokens and EOS are honored only once at least `min_tokens`
-        // tokens precede it. The token limit applies regardless of the floor.
-        let generated = state.num_generated_tokens;
-        let under_floor = generated <= state.req.sampling.min_tokens;
-        let stop_hit = !under_floor && state.req.stop_token_ids.contains(&token_id);
-        let eos_hit =
-            self.ctrl.eos.contains(&token_id) && !state.req.sampling.ignore_eos && !under_floor;
-        let max_hit = generated >= state.req.max_und_tokens;
-
-        if stop_hit {
-            self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs);
-            self.finish_after_inflight(
-                id,
-                FinishReason::Stop,
-                Some(uniserve_core::StopReason::Token(token_id)),
-            );
+        if !self.running.contains_key(&id) {
             return true;
         }
-        if eos_hit || max_hit {
-            if !self.ctrl.eos.contains(&token_id) {
-                if sampled {
-                    self.emit_sampled_text(id, token_id, logprob, top_logprobs);
-                } else {
-                    self.emit_text(id, token_id, logprob);
-                }
+        match self.und_token_outcome(id, token_id) {
+            TokenOutcome::StopToken => {
+                self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs);
+                self.finish_after_inflight(
+                    id,
+                    FinishReason::Stop,
+                    Some(uniserve_core::StopReason::Token(token_id)),
+                );
+                return true;
             }
-            self.finish_after_inflight(
-                id,
-                if max_hit {
-                    FinishReason::MaxTokens
-                } else {
-                    FinishReason::Eos
-                },
-                None,
-            );
-            return true;
+            TokenOutcome::Finish(reason) => {
+                if !self.ctrl.eos.contains(&token_id) {
+                    if sampled {
+                        self.emit_sampled_text(id, token_id, logprob, top_logprobs);
+                    } else {
+                        self.emit_text(id, token_id, logprob);
+                    }
+                }
+                self.finish_after_inflight(id, reason, None);
+                return true;
+            }
+            TokenOutcome::Continue => {}
         }
         if sampled {
             self.emit_sampled_text(id, token_id, logprob, top_logprobs);
@@ -1154,6 +1372,16 @@ impl Scheduler {
     /// not wait for stop-string decoder decisions. Otherwise records a
     /// `PendingFinish` that `finish_pending_if_idle` applies later. The first
     /// recorded reason is kept, except that an error replaces it.
+    ///
+    /// A non-error finish that waits only for calls in flight publishes its
+    /// terminal event at once. Those calls were queued speculatively behind
+    /// the call whose output finished the request, such as the no-op step
+    /// behind the step that stopped a block, and a request with a pending
+    /// finish resolves none of their results, so its output is already
+    /// final. Only retirement, which releases the request's resources and
+    /// sends the worker's `Finish`, waits for them to drain. A finish that
+    /// waits for a stop-string decision is published at retirement, since
+    /// that decision may still end the request earlier.
     pub(super) fn finish_after_inflight(
         &mut self,
         id: RequestId,
@@ -1169,17 +1397,46 @@ impl Scheduler {
             self.finish_with(id, reason, stop_reason);
             return;
         }
-        if !self.inflight.pending_finishes.contains_key(&id)
-            || matches!(reason, FinishReason::Error)
-        {
-            self.inflight.pending_finishes.insert(
-                id,
-                PendingFinish {
-                    reason,
-                    stop_reason,
-                },
-            );
+        let recorded = self.inflight.pending_finishes.get(&id);
+        if recorded.is_some() && !matches!(reason, FinishReason::Error) {
+            return;
         }
+        let mut terminal_published = recorded.is_some_and(|finish| finish.terminal_published);
+        if !terminal_published && !decoder_pending && !matches!(reason, FinishReason::Error) {
+            // A closed receiver drops the event; nothing is published later
+            // either way.
+            if let Some(state) = self.running.get_mut(&id) {
+                let terminal = terminal_event(state, reason.clone(), stop_reason.clone());
+                state.output.events.enqueue(terminal);
+                terminal_published = true;
+            }
+        }
+        self.inflight.pending_finishes.insert(
+            id,
+            PendingFinish {
+                reason,
+                stop_reason,
+                terminal_published,
+            },
+        );
+    }
+
+    /// Fails a running token request whose worker result was rejected.
+    ///
+    /// The first cause recorded for the request becomes its terminal `Error`
+    /// event, sent at once so the client's failure carries it, and appears
+    /// in the log line of its error finish, which `finish_after_inflight`
+    /// applies once the request's in-flight calls drain. A later cause for
+    /// the same request changes neither.
+    pub(super) fn fail_after_inflight(&mut self, id: RequestId, cause: String) {
+        let Some(state) = self.running.get_mut(&id) else {
+            return;
+        };
+        if state.failure.is_none() {
+            state.failure = Some(cause.clone());
+            self.emit(id, EngineCoreOutput::Error { message: cause });
+        }
+        self.finish_after_inflight(id, FinishReason::Error, None);
     }
 
     /// Applies a deferred finish once no in-flight work or decoder decision remains.
@@ -1192,7 +1449,9 @@ impl Scheduler {
         {
             return;
         }
-        if let Some(pending) = self.inflight.pending_finishes.remove(&id) {
+        // `finish_with` consumes the pending finish, including whether its
+        // terminal event is already published.
+        if let Some(pending) = self.inflight.pending_finishes.get(&id).cloned() {
             self.finish_with(id, pending.reason, pending.stop_reason);
         }
     }
@@ -1210,7 +1469,11 @@ impl Scheduler {
         reason: FinishReason,
         stop_reason: Option<uniserve_core::StopReason>,
     ) {
-        self.inflight.pending_finishes.remove(&id);
+        let terminal_published = self
+            .inflight
+            .pending_finishes
+            .remove(&id)
+            .is_some_and(|finish| finish.terminal_published);
 
         // Report accepted request progress before error teardown removes it.
         if reason == FinishReason::Error
@@ -1218,6 +1481,7 @@ impl Scheduler {
         {
             tracing::error!(
                 request_id = id.0,
+                cause = state.failure.as_deref().unwrap_or("unrecorded"),
                 phase = ?state.phase,
                 generated_tokens = state.num_generated_tokens,
                 images_done = state.num_generated_images,
@@ -1305,15 +1569,14 @@ impl Scheduler {
             // A full event channel transfers ownership to the retired-output
             // queue, which drains the terminal event under normal backpressure
             // or hands it to the receiver when the control loop stops. A
-            // closed receiver drops the terminal event with the journal.
-            let terminal = EngineCoreOutput::Finished {
-                reason,
-                stop_reason,
-                prompt_tokens: st.req.prompt_token_ids.len(),
-                completion_tokens: st.num_generated_tokens,
-                images: st.num_generated_images,
-            };
-            let accepted = st.output.events.enqueue(terminal);
+            // closed receiver drops the terminal event with the journal. A
+            // terminal event published by `finish_after_inflight` may still
+            // be journaled, and it is the only one the request publishes.
+            let accepted = terminal_published
+                || st
+                    .output
+                    .events
+                    .enqueue(terminal_event(&st, reason, stop_reason));
             if accepted {
                 self.output.retire(id, st.output.events);
             }
