@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from threading import Barrier
 
 import pytest
 import torch
@@ -205,13 +207,18 @@ def test_shared_parameter_rejects_conflicting_placement_before_materialization(
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("explicit_stream", (False, True))
+@pytest.mark.parametrize("stream_kind", ("default", "external", "partitioned"))
 @torch.inference_mode()
 def test_contexts_deliver_cross_device_components_with_independent_graphs(
-    component_checkpoint, explicit_stream
+    component_checkpoint, stream_kind
 ):
     from uniserve.model import TextSize
-    from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
+    from uniserve.runtime import (
+        CUDAGraph,
+        CUDAStream,
+        ExecutionContext,
+        partition_streams,
+    )
 
     root, io = component_checkpoint
     model = _load(
@@ -219,11 +226,20 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
     ).model
     first = torch.tensor([[1.0, 2.0]], device="cuda:0")
     second = torch.tensor([[3.0, 4.0]], device="cuda:0")
+    if stream_kind == "partitioned":
+        owners = partition_streams(torch.device("cuda:0"), (64, 64))
+    else:
+        owners = tuple(
+            CUDAStream.external(torch.cuda.Stream(device="cuda:0"))
+            if stream_kind == "external"
+            else None
+            for _ in range(2)
+        )
     streams = tuple(
-        torch.cuda.Stream(device="cuda:0")
-        if explicit_stream
+        owner.stream
+        if owner is not None
         else torch.cuda.current_stream("cuda:0")
-        for _ in range(2)
+        for owner in owners
     )
     # MemPool ownership is associated with the current device at construction.
     # Each graph keeps its secondary-device allocation domain alive for replay.
@@ -231,10 +247,6 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
         pools = tuple(
             {torch.device("cuda:1"): torch.cuda.MemPool()} for _ in range(2)
         )
-    owners = tuple(
-        CUDAStream.external(stream) if explicit_stream else None
-        for stream in streams
-    )
     with ExecutionContext(model, stream=owners[0]) as a:
         a.prepare(TextSize(1, 1))
         streams[0].wait_stream(torch.cuda.default_stream("cuda:0"))
@@ -276,3 +288,146 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
     for owner in owners:
         if owner is not None:
             owner.close()
+
+
+@pytest.mark.gpu
+def test_shared_components_deliver_independently_on_concurrent_contexts(
+    component_checkpoint,
+):
+    from uniserve.model import TextSize
+    from uniserve.runtime import CUDAStream, ExecutionContext
+
+    root, io = component_checkpoint
+    model = _load(
+        root, io, device="cuda:0", devices={"decoder": "cuda:1"}
+    ).model
+    barrier = Barrier(2, timeout=30)
+
+    @torch.inference_mode()
+    def execute(index):
+        with torch.cuda.device(0):
+            value = torch.tensor([[1.0, 2.0]], device="cuda:0") + index * 2
+            with (
+                CUDAStream.external(
+                    torch.cuda.Stream(device="cuda:0")
+                ) as stream,
+                ExecutionContext(model, stream=stream) as context,
+            ):
+                context.prepare(TextSize(1, 1))
+                stream.stream.wait_stream(torch.cuda.default_stream("cuda:0"))
+                # Both contexts use the same numerical modules concurrently.
+                # One failing call must leave the other's delivery intact.
+                barrier.wait()
+                if index == 0:
+                    with pytest.raises(
+                        ValueError, match="contraction dimension"
+                    ):
+                        model.decoder(value.new_zeros((1, 3)))
+                result = model(value).cpu()
+                barrier.wait()
+                return result
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(execute, range(2)))
+    for result, expected in zip(
+        results, ([[5.0, 66.0]], [[11.0, 150.0]]), strict=True
+    ):
+        torch.testing.assert_close(result, torch.tensor(expected))
+
+
+@pytest.mark.gpu
+@pytest.mark.timeout(30)
+@torch.inference_mode()
+def test_cpu_context_unwinds_a_pending_gpu_call_without_waiting(
+    component_checkpoint,
+):
+    from tests.python.fixtures.cuda_stream import blocked_stream
+    from uniserve.model import TextSize
+    from uniserve.runtime import ExecutionContext
+
+    root, io = component_checkpoint
+    model = _load(root, io, device="cpu", devices={"decoder": "cuda:1"}).model
+    value = torch.tensor([[1.0, 2.0]], device="cuda:1")
+    invalid = value.new_zeros((1, 3))
+    context = ExecutionContext(model)
+    context.prepare(TextSize(1, 1))
+    with context.activate():
+        torch.testing.assert_close(
+            model.decoder(value), value.new_tensor([[1.0, 12.0]])
+        )
+
+    # The module's delivery stream waits for this producer. Exceptional context
+    # cleanup must return while that work is still pending on the device.
+    with blocked_stream("cuda:0") as producer, torch.cuda.stream(producer):
+        with pytest.raises(ValueError, match="contraction dimension"):
+            with context:
+                model.decoder(invalid)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    ("source", "destination"),
+    (("cuda:0", "cpu"), ("cuda:0", "cuda:1"), ("cpu", "cuda:1")),
+)
+@torch.inference_mode()
+def test_component_delivery_preserves_nested_inputs_and_named_output_storage(
+    source,
+    destination,
+):
+    from uniserve.model import TextSize
+    from uniserve.runtime import ExecutionContext
+
+    @dataclass(frozen=True)
+    class Residual:
+        hidden: torch.Tensor
+        skip: tuple[torch.Tensor, float]
+
+    class Component(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("scale", torch.tensor(3.0, device=destination))
+
+        def forward(self, value, *, out=None):
+            result = {
+                "hidden": value.hidden * self.scale,
+                "skip": value.skip[0] + value.skip[1] * self.scale,
+            }
+            if out is None:
+                return result
+            for name, tensor in result.items():
+                out[name].copy_(tensor)
+            return out
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("offset", torch.tensor(2.0, device=source))
+            self.component = Component()
+
+        def forward(self, value, *, out=None):
+            value = replace(value, hidden=value.hidden + self.offset)
+            return self.component(value, out=out)
+
+    value = Residual(
+        torch.tensor([[1.0, 2.0]], device=source),
+        (torch.tensor([[4.0, 5.0]], device=source), 2.0),
+    )
+    model = Model()
+    with torch.cuda.device(0), ExecutionContext(model) as context:
+        context.prepare(TextSize(1, 1))
+        expected = {
+            "hidden": value.hidden.new_tensor([[9.0, 12.0]]),
+            "skip": value.hidden.new_tensor([[10.0, 11.0]]),
+        }
+        for name, result in model(value).items():
+            torch.testing.assert_close(result, expected[name])
+
+        output = {
+            name: torch.empty_like(tensor) for name, tensor in expected.items()
+        }
+        assert model(value, out=output) is output
+        for name, result in output.items():
+            torch.testing.assert_close(result, expected[name])
+        torch.testing.assert_close(
+            value.hidden, value.hidden.new_tensor([[1.0, 2.0]])
+        )

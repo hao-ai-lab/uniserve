@@ -3,6 +3,7 @@
 mod activation;
 mod attention;
 mod preparation;
+mod transfers;
 mod workspace;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
@@ -13,6 +14,7 @@ use pyo3::types::{PyDict, PySet, PyString, PyTuple, PyType};
 use super::execution::close_all;
 use super::tensor_buffers::{Scratch, TensorBuffers};
 use activation::Activation;
+use transfers::DeviceTransfers;
 
 /// Bind ordinary numerical modules to independent operator plans and backing.
 /// Callers retire captured graphs and readers before preparation or closure.
@@ -56,7 +58,7 @@ struct State {
     exchange: Py<PyDict>,
     chunks: Py<PyDict>,
     gather_pools: Py<PyDict>,
-    transfers: Py<PyAny>,
+    transfers: Py<DeviceTransfers>,
     graph_streams: Py<PySet>,
     max_tokens: Option<usize>,
 }
@@ -110,10 +112,7 @@ impl ExecutionContext {
             Some(scratch) => scratch,
             None => Py::new(py, Scratch::new(py))?,
         };
-        let transfers = py
-            .import("uniserve.runtime._transfers")?
-            .call_method1("_Transfers", (&module, &device))?
-            .unbind();
+        let transfers = Py::new(py, DeviceTransfers::new(module.bind(py), device.bind(py))?)?;
         let empty = empty_views(py)?;
         Ok(Self {
             state: Some(State {
@@ -362,12 +361,10 @@ impl ExecutionContext {
         }
 
         let released = release(slf);
-        let state = slf.borrow_mut().state.take();
-        let closed = match state {
-            Some(state) => state.transfers.call_method0(slf.py(), "close").map(drop),
-            None => Ok(()),
-        };
-        close_all(slf.py(), [released, closed])
+        if let Some(state) = slf.borrow_mut().state.take() {
+            state.transfers.borrow_mut(slf.py()).close();
+        }
+        released
     }
 
     fn __enter__(slf: &Bound<'_, Self>) -> PyResult<Py<Self>> {
@@ -424,7 +421,6 @@ impl ExecutionContext {
                 &state.moe_backend,
                 &state.constants,
                 &state.workspace,
-                &state.transfers,
             ] {
                 visit.call(value)?;
             }
@@ -434,6 +430,7 @@ impl ExecutionContext {
             for allocation in &state.allocations {
                 visit.call(allocation)?;
             }
+            visit.call(&state.transfers)?;
             visit.call(&state.scratch)?;
             visit.call(&state.graph_streams)?;
         }
@@ -517,26 +514,19 @@ impl State {
     }
 
     fn idle(&self, py: Python<'_>) -> PyResult<bool> {
-        if self.device.bind(py).getattr("type")?.extract::<String>()? != "cuda" {
-            return Ok(true);
-        }
-        let mut streams = self
-            .transfers
-            .bind(py)
-            .getattr("streams")?
-            .cast::<PyDict>()?
-            .values()
-            .iter()
-            .map(Bound::unbind)
-            .collect::<Vec<_>>();
+        // A CPU root can call GPU submodules; their streams still determine
+        // whether exceptional teardown may release numerical resources.
+        let mut streams = self.transfers.borrow(py).streams(py);
         streams.extend(self.graph_streams.bind(py).iter().map(Bound::unbind));
         let stream = self.stream.bind(py);
         if stream.is_none() {
-            streams.push(
-                py.import("torch.cuda")?
-                    .call_method1("current_stream", (&self.device,))?
-                    .unbind(),
-            );
+            if self.device.bind(py).getattr("type")?.extract::<String>()? == "cuda" {
+                streams.push(
+                    py.import("torch.cuda")?
+                        .call_method1("current_stream", (&self.device,))?
+                        .unbind(),
+                );
+            }
         } else {
             streams.push(stream.getattr("stream")?.unbind());
             for communicator in stream
@@ -591,7 +581,6 @@ fn release(owner: &Bound<'_, ExecutionContext>) -> PyResult<()> {
         if state.owns_scratch {
             actions.push(state.scratch.getattr(py, "close")?);
         }
-        actions.push(state.transfers.getattr(py, "reset")?);
         actions
     };
     let released = close_all(
@@ -601,6 +590,7 @@ fn release(owner: &Bound<'_, ExecutionContext>) -> PyResult<()> {
     let empty = empty_views(py)?;
     let mut context = owner.borrow_mut();
     let state = context.open_mut()?;
+    state.transfers.borrow_mut(py).reset();
     for bindings in state.bindings() {
         bindings.bind(py).clear();
     }
