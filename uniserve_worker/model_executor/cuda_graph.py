@@ -384,13 +384,22 @@ class Execution:
         # ``share`` names another owner whose pools this one borrows; see
         # ``GraphStorage.reserve``.
         self.context = context
-        # The executions sharing one microbatch rotation, this one included,
-        # in microbatch order; every peer has this execution's class.
-        self.peers: tuple[Self, ...] = (self,)
+        # The executions sharing this one's microbatch rotation, in
+        # microbatch order and all of this execution's class, set by
+        # ``bind_microbatches``. An unbound execution is its own only peer;
+        # ``peers`` derives that instead of storing ``(self,)``, so an unbound
+        # execution forms no reference cycle and is released, with the model
+        # its context holds, as soon as its owner drops it.
+        self._peers: tuple[Self, ...] | None = None
         self.microbatches = None
         self.buckets: OrderedDict[object, GraphBucket] = OrderedDict()
         self.storage = storage if storage is not None else GraphStorage()
         self.pools = self.storage.reserve(self, devices, share=share)
+
+    @property
+    def peers(self) -> tuple[Self, ...]:
+        """The executions sharing this one's rotation, itself included."""
+        return (self,) if self._peers is None else self._peers
 
     def bind_microbatches(self, peers):
         """Share one host rotation across independently prepared executions.
@@ -404,7 +413,7 @@ class Execution:
             raise ValueError("the first microbatch execution owns its rotation")
         owner = Microbatches([peer.context for peer in peers])
         for peer in peers:
-            peer.peers, peer.microbatches = peers, owner
+            peer._peers, peer.microbatches = peers, owner
 
     def begin_expert_step(self, capacity):
         for peer in self.peers:
@@ -478,3 +487,6 @@ class Execution:
         finally:
             self.storage.release(self)
             self.pools.clear()
+            # Bound peers reference each other through the rotation; a closed
+            # execution leaves it so that none keeps another alive.
+            self._peers = self.microbatches = None
