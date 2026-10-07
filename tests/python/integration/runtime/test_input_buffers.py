@@ -9,14 +9,58 @@ import torch
 from uniserve.nn.attention import AttentionBatch, PagedInput
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import (
+    InputBuffers,
+    RowBufferConfig,
     TokenBufferConfig,
-    TokenBuffers,
 )
-from uniserve_worker.protocol.call import ForwardMode
+from uniserve_worker.protocol.call import ForwardMode, MediaCall
 from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.storage.decode_state import DecodeState
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+
+@pytest.mark.parametrize(
+    "kind", (MediaCall.VISION_ENCODING, MediaCall.IMAGE_DECODING)
+)
+def test_closing_input_buffers_preserves_borrowed_results_and_other_callers(
+    kind,
+):
+    from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
+
+    value = torch.arange(12, device="cuda:0").reshape(3, 2, 2).float()
+    if kind is MediaCall.VISION_ENCODING:
+        row = VisionRow(kind, request_pool_idx=3, encode_pixels=value)
+    else:
+        row = DecodeRow(
+            kind,
+            request_pool_idx=3,
+            latent=value,
+            image_height=2,
+            image_width=2,
+        )
+    owners = tuple(
+        InputBuffers(kind, config=RowBufferConfig(1), device="cuda:0")
+        for _ in range(2)
+    )
+    try:
+        result = owners[0].prepare_inputs((row,), forward_mode=kind)
+        owners[0].close()
+        with pytest.raises(RuntimeError, match="input buffers are closed"):
+            owners[0].prepare_inputs((row,), forward_mode=kind)
+
+        other = owners[1].prepare_inputs((row,), forward_mode=kind)
+        for batch in (result, other):
+            assert batch.request_pool_indices.cpu().tolist() == [3]
+            tensors = (
+                batch.inputs.images
+                if kind is MediaCall.VISION_ENCODING
+                else batch.inputs.latents
+            )
+            torch.testing.assert_close(tensors[0], value)
+    finally:
+        for owner in owners:
+            owner.close()
 
 
 @pytest.mark.parametrize("devices", (("cpu", "cuda:0"), ("cuda:0", "cpu")))
@@ -51,7 +95,8 @@ def test_token_positions_preserve_row_order_across_source_devices(
             device="cpu",
         )
     )
-    buffers = TokenBuffers(
+    buffers = InputBuffers(
+        ForwardMode.PREFILL,
         config=TokenBufferConfig(
             max_rows=2,
             max_tokens=2,
@@ -118,7 +163,8 @@ def test_mixed_forward_reads_current_continuation_in_row_order(
             device="cpu",
         )
     )
-    buffers = TokenBuffers(
+    buffers = InputBuffers(
+        ForwardMode.PREFILL,
         config=TokenBufferConfig(
             max_rows=2,
             max_tokens=3,
@@ -166,7 +212,7 @@ def test_mixed_forward_reads_current_continuation_in_row_order(
         buffers.close()
 
 
-def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls():  # noqa: E501
+def test_indexed_decode_prepares_tokens_cache_addresses_and_finish_controls():
     from tests.python.fixtures.cache import mha_pool
 
     pool = mha_pool(
@@ -188,7 +234,8 @@ def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls()
         continuation_width=1,
         device="cuda:0",
     )
-    buffers = TokenBuffers(
+    buffers = InputBuffers(
+        ForwardMode.PREFILL,
         config=TokenBufferConfig(
             max_rows=2,
             max_tokens=2,

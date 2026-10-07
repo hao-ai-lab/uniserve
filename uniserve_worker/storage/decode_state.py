@@ -8,7 +8,7 @@ prompt scoring is requested, the last prompt logits of a prefill chunk.
 The native executor retains each call's pending numerical values and applies
 them when the batch commits. The
 executor resets a slot's rows when a request is admitted to it and when the
-request's storage is released. Input preparation (``TokenBuffers``) reads next
+request's storage is released. Input preparation (``InputBuffers``) reads next
 tokens and logical lengths by slot, and token sampling reads the committed
 penalty counts.
 

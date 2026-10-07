@@ -78,7 +78,7 @@ from .graph_inputs import (
     replay_hidden,
 )
 from .input_batch import CanvasStepInput, InputBatch, ReadoutInput
-from .input_buffers import CanvasBuffers
+from .input_buffers import clear_padding, sampler_buffers
 from .model_runner import ModelRunner, joining_experts
 from .output import ExecutionOutput
 
@@ -226,7 +226,7 @@ class CanvasRunner(ModelRunner):
         fields = denoiser_fields(denoiser)
         length = fields.pop("tokens").length
         vocab = fields.pop("vocab_size")
-        buffers = CanvasBuffers.sampler_buffers(
+        buffers = sampler_buffers(
             max_rows=max_rows,
             canvas_length=length,
             history_depth=history_depth,
@@ -777,7 +777,7 @@ def _pad_attention(
     prefixes = SequenceLengths(
         host=host_prefixes, values=prefix_values, offsets=prefix_offsets
     )
-    buffers.clear_padding(live_rows=live, rows=rows, live_tokens=0, tokens=0)
+    clear_padding(buffers, live_rows=live, rows=rows, live_tokens=0, tokens=0)
 
     # Every canvas token sees its whole canvas.
     visible = values[:, None].expand(-1, width)

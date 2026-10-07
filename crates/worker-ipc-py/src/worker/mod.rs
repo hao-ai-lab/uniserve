@@ -23,6 +23,7 @@ mod graph_shapes;
 mod graph_storage;
 mod host;
 mod host_buffers;
+mod input_buffers;
 mod inputs;
 mod kv_cache;
 mod kv_import;
@@ -136,6 +137,8 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<host::HostLane>()?;
     module.add_class::<host::HostTask>()?;
     module.add_class::<host_buffers::HostBuffers>()?;
+    module.add_class::<input_buffers::InputBuffers>()?;
+    module.add("ROW_SECTIONS", input_buffers::ROW_SECTIONS)?;
     module.add_class::<inputs::BatchInputs>()?;
     module.add_class::<kv_cache::KVCacheManager>()?;
     module.add_class::<kv_import::KVImport>()?;
