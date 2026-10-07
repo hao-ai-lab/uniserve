@@ -138,7 +138,7 @@ def stage_inputs(value, borrow):
     references stay aliased.
     """
     leaves, _ = pytree.tree_flatten(value, is_leaf=_register)
-    unique = {}
+    unique: dict[int, torch.Tensor] = {}
     for item in leaves:
         if isinstance(item, torch.Tensor) and 0 not in item.stride():
             unique.setdefault(id(item), item)
