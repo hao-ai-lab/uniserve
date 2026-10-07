@@ -217,6 +217,21 @@ def test_qkv_bias_fusion_preserves_outputs(
         expected.append(normalized)
     expected_query, expected_key = expected
     expected_value = value + value_bias.view(32, head_dim)
+    if device == "cuda" and layout == "transposed":
+        # The in-place CUDA kernel addresses tokens as rows of one stride;
+        # CUDA token layouts it cannot address raise instead of computing.
+        with pytest.raises(ValueError, match="token axes"):
+            qk_bias_rms_norm_rope_(
+                query,
+                key,
+                cosine,
+                sine,
+                query_bias=query_bias,
+                key_bias=key_bias,
+                value=value,
+                value_bias=value_bias,
+            )
+        return
     actual_query, actual_key = qk_bias_rms_norm_rope_(
         query,
         key,
@@ -361,3 +376,28 @@ def test_video_patch_geometry_preserves_logical_channel_coordinates(
         patch_shape=patch_shape,
     )
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_residual_norms_of_strided_rows_raise():
+    rows = torch.randn((8, 2 * 256), device="cuda")[:, :256]
+    weight = torch.ones(256, device="cuda")
+    with pytest.raises(ValueError, match="weighted_rms_norm.*contiguous"):
+        weighted_rms_norm_absmax(rows, weight, eps=1e-6)
+    with pytest.raises(
+        ValueError, match="scaled_residual_rms_norm_absmax_.*contiguous"
+    ):
+        scaled_residual_rms_norm_absmax_(
+            rows, torch.zeros_like(rows), weight, weight, eps=1e-6
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_video_unpacking_of_strided_tokens_raises():
+    tokens = torch.randn((1, 3, 2 * 48), device="cuda")[..., :48]
+    with pytest.raises(ValueError, match="unpatchify_video_tokens.*contiguous"):
+        unpatchify_video_tokens(
+            tokens, None, grid_shape=(1, 1, 3), patch_shape=(1, 4, 4)
+        )

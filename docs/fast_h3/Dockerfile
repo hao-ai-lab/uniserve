@@ -1,7 +1,10 @@
 FROM docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
 
+# The image build sees no GPU, so the native kernels compile for the named
+# architectures: Hopper, data-center Blackwell and RTX PRO 6000 Blackwell.
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST="9.0;10.0;12.0" \
     UV_PROJECT_ENVIRONMENT=/opt/uniserve-venv \
     MAX_JOBS=2 \
     PATH=/opt/uniserve-venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:${PATH}

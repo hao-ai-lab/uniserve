@@ -219,3 +219,72 @@ def test_rmsnorm_preserves_normalization_and_residual_values(device, dtype):
         torch.testing.assert_close(
             normalized, expected_normalized, rtol=2e-2, atol=2e-2
         )
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+@pytest.mark.parametrize(
+    ("shape", "view"),
+    (
+        # Value heads [tokens, 8, 256] of a merged [tokens, 32 * 256] QKV row.
+        ((33, 32, 256), (slice(None), slice(24, 32))),
+        # Q heads [2, 5, 7, 128] of a merged [2, 5, 21 * 128] projection row.
+        ((2, 5, 21, 128), (slice(None), slice(None), slice(0, 7))),
+    ),
+)
+@pytest.mark.parametrize("in_place", (False, True))
+def test_rms_norm_normalizes_strided_head_views(device, shape, view, in_place):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA RMSNorm needs a device")
+    generator = torch.Generator(device=device).manual_seed(19)
+    packed = torch.randn(shape, generator=generator, device=device).to(
+        torch.bfloat16
+    )
+    heads = packed[view]
+    weight = torch.rand(shape[-1], generator=generator, device=device) + 0.5
+    expected = _rms_reference(heads.double(), weight.double(), 1e-6)
+    untouched = packed.clone()
+    untouched[view] = 0
+
+    with torch.inference_mode():
+        actual = functional.rms_norm(
+            heads, weight, 1e-6, out=heads if in_place else None
+        )
+
+    torch.testing.assert_close(actual.double(), expected, rtol=2e-2, atol=2e-2)
+    if in_place:
+        assert actual is heads
+        remainder = packed.clone()
+        remainder[view] = 0
+        assert torch.equal(remainder, untouched)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA RMSNorm needs a device"
+)
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    (
+        ("too_wide", "row width"),
+        ("strided_channels", "unit-strided"),
+        ("records_autograd", "autograd"),
+    ),
+)
+def test_cuda_rms_norm_raises_without_a_kernel(case, reason):
+    width = 8193 if case == "too_wide" else 128
+    x = torch.randn((4, width), device="cuda")
+    weight = torch.ones(width, device="cuda")
+    if case == "strided_channels":
+        x = torch.randn((4, width, 2), device="cuda")[..., 0]
+    elif case == "records_autograd":
+        weight.requires_grad_()
+
+    with pytest.raises(ValueError, match=f"rms_norm.*{reason}"):
+        functional.rms_norm(x, weight, 1e-6)
+    residual = torch.zeros_like(x)
+    if case == "strided_channels":
+        reason = "contiguous rows"
+    with pytest.raises(ValueError, match=f"add_rms_norm.*{reason}"):
+        functional.add_rms_norm(x, residual, weight, 1e-6)

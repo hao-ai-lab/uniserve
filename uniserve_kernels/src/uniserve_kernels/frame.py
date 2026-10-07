@@ -2,19 +2,22 @@
 
 A causal 3D convolution over ``[batch, channels, frames, height, width]``
 reads its input padded on both sides of height and width (reflected or
-replicated) and preceded by zero frames. ``triton_frame_pad`` writes that
-padded input into contiguous storage in one pass, reading the source through
-its own strides, so channel-first, channels-last and permuted views all
-work. The output equals the two-step ``F.pad`` result bit for bit: every
-element is a copy of one source element or zero. Callers run
-``can_run_triton_frame_pad`` first; the launcher does not revalidate.
+replicated) and preceded by zero frames. :func:`pad` writes that padded input
+into contiguous storage in one pass, reading the source through its own
+strides, so channel-first, channels-last and permuted views all work. The
+output equals the two-step ``F.pad`` result bit for bit: every element is a
+copy of one source element or zero.
+
+The kernel backs ``uniserve.nn.functional.frame_pad``, which validates the
+padding, allocates the contiguous output and raises on CUDA whenever
+:func:`unsupported` reports a reason; the launcher does not revalidate.
 """
 
 from __future__ import annotations
 
 import torch
 
-from uniserve_kernels.triton import launchable, tl, triton
+from uniserve_kernels.triton import tl, triton, unsupported_operands
 
 # Output pixels along the width and channels each program writes.
 _PAD_PIXELS = 32
@@ -115,28 +118,28 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
             tl.store(destination, copied, mask=valid)
 
 
-def can_run_triton_frame_pad(values: torch.Tensor, out: torch.Tensor) -> bool:
-    """Check a ``[batch, channels, frames, height, width]`` input and output.
+def unsupported(values: torch.Tensor, out: torch.Tensor) -> str | None:
+    """Return why the kernel cannot pad ``values`` into ``out``, or ``None``.
 
-    The input may use any strides; the output must be contiguous storage of
-    the same dtype on the same CUDA device. The launch records no autograd
-    graph, so calls that record one take the tensor operations.
+    The input may use any strides. The output must be contiguous storage of
+    the input's dtype, batch and channels; the caller sizes its frames, rows
+    and columns from the padding. The launch records no autograd graph.
     """
-    return (
-        triton is not None
-        and not torch.is_grad_enabled()
-        and launchable(values.device)
-        and values.is_cuda
-        and out.device == values.device
-        and values.ndim == 5
-        and out.ndim == 5
-        and out.dtype == values.dtype
-        and out.is_contiguous()
-        and out.shape[:2] == values.shape[:2]
-    )
+    reason = unsupported_operands(values, out)
+    if reason is not None:
+        return reason
+    if values.ndim != 5 or out.ndim != 5:
+        return "values and output are not [batch, channels, frames, h, w]"
+    if out.dtype != values.dtype:
+        return f"output dtype {out.dtype} differs from {values.dtype}"
+    if not out.is_contiguous():
+        return "the output is not contiguous"
+    if out.shape[:2] != values.shape[:2]:
+        return "the output's batch and channels differ from the input's"
+    return None
 
 
-def triton_frame_pad(
+def pad(
     values: torch.Tensor,
     out: torch.Tensor,
     *,
