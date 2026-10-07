@@ -2,9 +2,10 @@
 
 This package is the Python face of ``csrc/peer_storage.cpp``, a C++
 extension built on the CUDA driver's virtual memory management API and
-compiled on first use through :mod:`uniserve_kernels.extension`. It supplies
-physical allocations whose shareable handles other processes can import,
-the mapping of those handles into tensors, and strided host/device DMA.
+compiled with the package into :mod:`uniserve_kernels.peer_storage._C`. It
+supplies physical allocations whose shareable handles other processes can
+import, the mapping of those handles into tensors, and strided host/device
+DMA.
 
 The primitives own no transfer policy. Callers such as
 ``uniserve.runtime._peer_storage``, ``uniserve_worker.transport.cuda_vmm``
@@ -12,34 +13,16 @@ and ``uniserve_worker.storage.buffer_pool`` decide how handles travel between
 processes, when grants are withdrawn, and when storage retires.
 """
 
-from functools import lru_cache
 from math import prod
-from pathlib import Path
 
 import torch
 
-from uniserve_kernels import extension
 
-
-@lru_cache(maxsize=1)
 def _extension():
-    return extension.load(
-        "uniserve_peer_storage",
-        Path(__file__).parent / "csrc",
-        ["peer_storage.cpp"],
-        extra_cflags=["-O2", "-std=c++20"],
-        extra_ldflags=["-lcuda"],
-        with_cuda=True,
-    )
+    # Imported on first use: a CPU build of the package has no native module.
+    from uniserve_kernels.peer_storage import _C
 
-
-def load() -> None:
-    """Compile or load the cached extension before its first timed use.
-
-    ``uniserve_worker.transport.cuda_vmm.CudaVmmTransport`` calls this at
-    construction.
-    """
-    _extension()
+    return _C
 
 
 def allocation_granularity(device: torch.device) -> int:

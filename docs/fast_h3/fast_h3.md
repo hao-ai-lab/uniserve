@@ -28,7 +28,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashInfer, FlashAttention-4, the peer-storage and sparse-attention kernels, and the CuTe and CUTLASS DSLs. These are shared runtime capabilities rather than model-specific packages, so there is no FastH3-specific dependency group. The sync also builds the `_uniserve_ipc` extension and the `uniserve` and `uniserve-host` binaries from this checkout. FastVideo itself is not a runtime dependency. The environment is the repository's `.venv`, which the evaluation profiles and the [Dynamo guide](dynamo.md) run from. UniServe's native kernels compile on the first startup, as described in [Build and run with Docker](#build-and-run-with-docker); `MAX_JOBS` bounds that compilation's parallelism.
+The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashInfer, FlashAttention-4, and the CuTe and CUTLASS DSLs. These are shared runtime capabilities rather than model-specific packages, so there is no FastH3-specific dependency group. The sync also builds the `_uniserve_ipc` extension, the `uniserve` and `uniserve-host` binaries, and UniServe's native kernels, including the peer-storage and sparse-attention kernels, from this checkout. The kernels compile for the visible GPUs, or for the architectures `TORCH_CUDA_ARCH_LIST` names, and `MAX_JOBS` bounds the compilation's parallelism. A later sync recompiles them when their sources, `UNISERVE_KERNELS_DEVICE` or `TORCH_CUDA_ARCH_LIST` change. FastVideo itself is not a runtime dependency. The environment is the repository's `.venv`, which the evaluation profiles and the [Dynamo guide](dynamo.md) run from.
 
 ## Supported checkpoints
 
@@ -168,7 +168,7 @@ docker run --rm \
     --max-running-requests 2
 ```
 
-The first startup compiles UniServe's native kernels and the Triton and FlashInfer kernels FastH3 runs; later startups load the cached builds without compiling. They land in `~/.cache/torch_extensions/uniserve_kernels`, `~/.triton/cache`, and `~/.cache/flashinfer`. If container restarts must reuse them, mount `/root/.cache` and `/root/.triton`, or point `TORCH_EXTENSIONS_DIR`, `TRITON_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE` at mounted directories. The native kernels' directory must be on a file system that supports `flock` locks, which serialize concurrent builds and are released when a stopped or killed startup exits.
+The image build compiles UniServe's native kernels. The first startup compiles the Triton and FlashInfer kernels FastH3 runs; later startups load the cached builds without compiling. They land in `~/.triton/cache` and `~/.cache/flashinfer`. If container restarts must reuse them, mount `/root/.cache` and `/root/.triton`, or point `TRITON_CACHE_DIR` and `FLASHINFER_WORKSPACE_BASE` at mounted directories.
 
 ## Generate a video
 
@@ -320,7 +320,7 @@ export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 | Error | Action |
 | --- | --- |
 | `_uniserve_ipc` import or protocol error | Run `uv sync --locked --python /usr/bin/python3.12 --extra gpu` again and use the resulting `uniserve` executable. |
-| CUDA or sparse-attention compile error | Check CUDA 13 `nvcc`, `CUDA_HOME`, supported Hopper or Blackwell hardware, C++ build tools, and a writable `TORCH_EXTENSIONS_DIR` whose file system supports `flock`. |
+| CUDA or sparse-attention compile error during `uv sync` | Check CUDA 13 `nvcc`, `CUDA_HOME`, C++ build tools, and a `TORCH_CUDA_ARCH_LIST` naming the target GPUs when none is visible to the build. |
 | Missing audio VAE or codec | Restore the locked environment with `uv sync`; do not mix in older Diffusers or PyAV packages. |
 | `unsupported FastH3 checkpoint` | Use a complete checkpoint from the table above; the message names the model ID and revision it expects. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config`: a packed NVFP4 checkpoint carries its own precision contract. |

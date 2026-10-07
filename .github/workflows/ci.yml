@@ -8,6 +8,10 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    # The hosted runner has no CUDA toolkit; the kernel package installs its
+    # Python modules without compiling the native extensions.
+    env:
+      UNISERVE_KERNELS_DEVICE: cpu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,6 +36,10 @@ jobs:
 
   python:
     runs-on: ubuntu-latest
+    # The hosted runner has no CUDA toolkit; the kernel package installs its
+    # Python modules without compiling the native extensions.
+    env:
+      UNISERVE_KERNELS_DEVICE: cpu
     steps:
       - uses: actions/checkout@v4
       # The sync builds the worker IPC extension and the server binaries.

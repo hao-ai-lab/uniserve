@@ -23,15 +23,13 @@ dependencies = [
     "av>=14",
     # NVML's per-process device usage, which device storage grants charge.
     "nvidia-ml-py",
-    # UniServe's own Triton and CuTe device kernels. Native extensions and
-    # their build tools are selected through the kernel package's extras.
+    # UniServe's own Triton, CuTe and native device kernels. The kernel
+    # package compiles its native extensions when it builds.
     "uniserve-kernels",
 ]
 
 [project.optional-dependencies]
 test = [
-    # Extension build tests drive torch's C++ extension build.
-    "ninja>=1.13",
     "pytest>=8.1",
     "pytest-timeout>=2.3",
 ]
@@ -46,21 +44,27 @@ bench = [
     "uniserve-eval[datasets]",
 ]
 # Optional accelerator kernels for GPU serving. Model bindings require their
-# declared native capabilities at startup. The extras of the `uniserve-kernels`
-# pack add its native extensions and FlashAttention-4 runtime. The dense,
-# sparse, and quantized providers these packages back are shared runtime
-# capabilities, so they are selected by hardware rather than by model; native
-# builds require a CUDA 13 toolkit.
+# declared native capabilities at startup. The `uniserve-kernels` extra adds
+# the FlashAttention-4 runtime. The dense, sparse, and quantized providers
+# these packages back are shared runtime capabilities, so they are selected
+# by hardware rather than by model. FlashInfer compiles its own kernels at
+# run time with Ninja.
 gpu = [
     "flashinfer-python==0.6.18",
     "ninja>=1.13",
     "requests[socks]>=2",
-    "uniserve-kernels[peer_storage,sparse_attention,flash_attn_4]",
+    "uniserve-kernels[flash_attn_4]",
 ]
 
 [tool.uv.sources]
 uniserve-kernels = { path = "uniserve_kernels", editable = true }
 uniserve-eval = { path = "uniserve_eval", editable = true }
+
+[tool.uv]
+# The kernel package compiles its C++ and CUDA extensions against the
+# libraries installed in this environment, so uv builds it here, without
+# isolation, after installing every package that builds in isolation.
+no-build-isolation-package = ["uniserve-kernels"]
 
 [project.scripts]
 uniserve-worker = "uniserve_worker.main:main"

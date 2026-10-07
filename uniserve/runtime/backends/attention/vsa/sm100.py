@@ -12,7 +12,7 @@ from . import Operator as BaseOperator
 
 
 def available(device):
-    """Report support without compiling the native extension."""
+    """Report whether ``device`` runs both SM100 kernels."""
     return vsa_cute.available(device) and vsa_native.supported(device)
 
 
@@ -32,8 +32,3 @@ class _Operator(BaseOperator):
 
 class Backend(BaseBackend):
     operator_class = _Operator
-
-    def prepare(self, pattern, **options):
-        # Compilation belongs to preparation, before serving or capture.
-        vsa_native.load()
-        return super().prepare(pattern, **options)

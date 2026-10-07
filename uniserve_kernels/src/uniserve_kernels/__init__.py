@@ -8,8 +8,8 @@ such as the numerical entry points in ``uniserve.nn.functional`` run that
 check, select the kernel and define the portable formula, while provider
 adapters in ``uniserve.runtime.backends.attention`` bind the attention
 kernels. Kernels know nothing about workers, requests, lanes, models or
-runtime owners. ``extension`` builds and caches the native C++ and CUDA
-extensions that ``peer_storage`` and ``attention.vsa_native`` bind.
+runtime owners. The package build compiles the C++ and CUDA extensions
+(``setup.py``).
 """
 
 from __future__ import annotations

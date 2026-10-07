@@ -69,7 +69,6 @@ def test_sparse_query_partitions_preserve_complete_key_attention(heads):
 
     if not vsa_native.supported():
         pytest.skip("the native sparse kernel requires SM100")
-    vsa_native.load()
 
     torch.manual_seed(972)
     rows, width, scale = 512, 128, 0.07

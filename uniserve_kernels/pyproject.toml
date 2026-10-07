@@ -1,7 +1,8 @@
 # Packages UniServe's device kernels independently from the computation
-# library. Extras select native extensions and their optional runtimes.
+# library. The package build compiles the native extensions (setup.py);
+# extras select optional kernel runtimes.
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68", "wheel", "ninja>=1.13"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,12 +15,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-peer_storage = [
-  "ninja>=1.13",
-]
-sparse_attention = [
-    "ninja>=1.13",
-]
 flash_attn_4 = [
   "flash-attn-4[cu13]==4.0.0b30",
   "nvidia-cutlass-dsl[cu13]==4.6.2",
@@ -33,4 +28,17 @@ where = ["src"]
 include = ["uniserve_kernels*"]
 
 [tool.setuptools.package-data]
-uniserve_kernels = ["py.typed", "attention/vsa_native/csrc/*.cu", "attention/vsa_native/csrc/*.cuh", "attention/vsa_native/LICENSE", "peer_storage/csrc/*.cpp"]
+uniserve_kernels = ["py.typed", "attention/vsa_native/LICENSE"]
+
+[tool.uv]
+# Rebuild the compiled extensions when their sources or build target change.
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "setup.py" },
+  { file = "src/**/*.cpp" },
+  { file = "src/**/*.cu" },
+  { file = "src/**/*.cuh" },
+  { file = "src/**/*.h" },
+  { env = "UNISERVE_KERNELS_DEVICE" },
+  { env = "TORCH_CUDA_ARCH_LIST" },
+]
