@@ -2783,10 +2783,9 @@ gpu = [
     { name = "flashinfer-python" },
     { name = "ninja" },
     { name = "requests", extra = ["socks"] },
-    { name = "uniserve-kernels", extra = ["flash-attn-4", "peer-storage", "sparse-attention"] },
+    { name = "uniserve-kernels", extra = ["flash-attn-4"] },
 ]
 test = [
-    { name = "ninja" },
     { name = "pytest" },
     { name = "pytest-timeout" },
 ]
@@ -2801,7 +2800,6 @@ requires-dist = [
     { name = "markdown-it-py", marker = "extra == 'dev'", specifier = "<4.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
     { name = "ninja", marker = "extra == 'gpu'", specifier = ">=1.13" },
-    { name = "ninja", marker = "extra == 'test'", specifier = ">=1.13" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
     { name = "packaging", specifier = "<=25.0" },
@@ -2817,7 +2815,7 @@ requires-dist = [
     { name = "transformers", specifier = ">=4.57.1" },
     { name = "uniserve-eval", extras = ["datasets"], marker = "extra == 'bench'", editable = "uniserve_eval" },
     { name = "uniserve-kernels", editable = "uniserve_kernels" },
-    { name = "uniserve-kernels", extras = ["peer-storage", "sparse-attention", "flash-attn-4"], marker = "extra == 'gpu'", editable = "uniserve_kernels" },
+    { name = "uniserve-kernels", extras = ["flash-attn-4"], marker = "extra == 'gpu'", editable = "uniserve_kernels" },
 ]
 provides-extras = ["test", "dev", "bench", "gpu"]
 
@@ -2858,22 +2856,14 @@ flash-attn-4 = [
     { name = "flash-attn-4", extra = ["cu13"] },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
 ]
-peer-storage = [
-    { name = "ninja" },
-]
-sparse-attention = [
-    { name = "ninja" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "flash-attn-4", extras = ["cu13"], marker = "extra == 'flash-attn-4'", specifier = "==4.0.0b30" },
-    { name = "ninja", marker = "extra == 'peer-storage'", specifier = ">=1.13" },
-    { name = "ninja", marker = "extra == 'sparse-attention'", specifier = ">=1.13" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'flash-attn-4'", specifier = "==4.6.2" },
     { name = "torch", specifier = ">=2.13,<2.14" },
 ]
-provides-extras = ["peer-storage", "sparse-attention", "flash-attn-4"]
+provides-extras = ["flash-attn-4"]
 
 [[package]]
 name = "urllib3"
