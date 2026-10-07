@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import torch
 from torch.nn import functional as F
+from uniserve_kernels.triton import require_kernel
 
 
 def frame_pad(
@@ -27,6 +28,10 @@ def frame_pad(
     ``front`` zero frames before the first frame. Reflection mirrors once,
     so each reflected side must be shorter than its extent. Returns a new
     contiguous tensor.
+
+    Raises:
+        ValueError: when the padding or values are malformed, or on CUDA
+            when the kernel cannot take the operands.
     """
     if len(padding) != 5 or any(
         type(value) is not int or value < 0 for value in padding
@@ -50,8 +55,6 @@ def frame_pad(
     ):
         raise ValueError("reflected padding must be shorter than its extent")
 
-    from uniserve_kernels import frame as kernels
-
     out = torch.empty(
         (
             batch,
@@ -63,8 +66,13 @@ def frame_pad(
         dtype=values.dtype,
         device=values.device,
     )
-    if kernels.can_run_triton_frame_pad(values, out):
-        kernels.triton_frame_pad(
+    if values.is_cuda:
+        from uniserve_kernels import frame
+
+        require_kernel(
+            "frame_pad", frame.unsupported(values, out), values=values
+        )
+        frame.pad(
             values, out, padding=(top, left, front), reflect=mode == "reflect"
         )
         return out

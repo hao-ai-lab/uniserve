@@ -1,18 +1,26 @@
 """RMS and layer normalization with residual and modulation epilogues.
 
 Statistics, residual sums and affine transforms accumulate in FP32 and round
-once at the output dtype boundary. The modulation epilogues also evaluate the
-``Rounding.STEPWISE`` recipe, which rounds after each operation of the eager
-expression. Eligible CUDA calls use UniServe's kernels; every other call
-evaluates the same formula with tensor operations.
+once at the output dtype boundary. The modulation epilogues also evaluate
+``Rounding.STEPWISE``, which rounds after each operation of the eager
+expression. CUDA calls run UniServe's kernels and raise ``ValueError`` when
+no kernel accepts their operands; other devices evaluate the same formula
+with tensor operations.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch.nn import functional as F
+from uniserve_kernels.triton import require_kernel
 
+from ._moe import Routes
 from ._tensors import Rounding, check_output, result
+
+if TYPE_CHECKING:
+    from uniserve.quantization import Quantizer
 
 
 def _rms(value: torch.Tensor, eps: float) -> torch.Tensor:
@@ -47,15 +55,25 @@ def rms_norm(
     """Normalize the last axis as ``x * rsqrt(mean(x^2) + eps) * weight``.
 
     Variance and scaling accumulate in FP32; the result has ``x``'s dtype.
-    ``out`` receives the result and may alias ``x``.
+    ``out`` receives the result and may alias ``x``. On CUDA, ``x`` and
+    ``out`` may be strided views (for example heads of a merged projection)
+    whose channels are unit-strided.
     """
     from uniserve_kernels.norm import rms
 
     if weight.shape != x.shape[-1:] or weight.device != x.device:
         raise ValueError("RMS weight must match the final width and device")
-    target = torch.empty_like(x) if out is None else out
-    check_output(x, target)
-    if rms.can_run(x, weight, target):
+    if out is not None:
+        check_output(x, out)
+    if x.is_cuda:
+        target = torch.empty_like(x) if out is None else out
+        require_kernel(
+            "rms_norm",
+            rms.unsupported(x, weight, target),
+            x=x,
+            weight=weight,
+            out=target,
+        )
         rms.rms_norm(x, weight, eps, target)
         return target
     return result((_rms(x, eps) * weight.float()).to(x.dtype), out)
@@ -87,7 +105,16 @@ def add_rms_norm(
     targets = (torch.empty_like(x), torch.empty_like(x)) if out is None else out
     for target in targets:
         check_output(x, target)
-    if rms.can_run(x, weight, residual, *targets):
+    if x.is_cuda:
+        require_kernel(
+            "add_rms_norm",
+            rms.unsupported_add(x, weight, residual, *targets),
+            x=x,
+            residual=residual,
+            weight=weight,
+            normalized=targets[0],
+            summed=targets[1],
+        )
         rms.add_rms_norm(x, residual, weight, eps, *targets)
         return targets
 
@@ -96,6 +123,148 @@ def add_rms_norm(
     if out is None:
         return normalized, summed.to(x.dtype)
     return result(normalized, out[0]), result(summed.to(x.dtype), out[1])
+
+
+def sandwich_rms_norm(
+    residual: torch.Tensor,
+    updates: tuple[tuple[torch.Tensor | Routes, torch.Tensor | None], ...],
+    weight: torch.Tensor,
+    *,
+    eps: float,
+    scale: torch.Tensor | None = None,
+    norms: tuple[tuple, ...] = (),
+    encodings: tuple[Quantizer | None, ...] = (),
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    """Add post-normalized sublayer outputs to a residual stream.
+
+    Sandwich normalization, as the Gemma layers apply it around each
+    sublayer. Each ``(update, branch_weight)`` pair contributes
+    ``rms_norm(update, branch_weight)``, or ``update`` itself when the
+    weight is ``None``; the contributions sum left to right. An update may
+    be :class:`Routes`, whose value it contributes; on CUDA the launch
+    evaluates that value while reading the routes. Then::
+
+        stream = residual + rms_norm(summed, weight)
+        stream = stream * scale                      # when scale is given
+
+    Each entry ``(norm_weight, *factors)`` of ``norms`` also returns
+    ``rms_norm(stream, norm_weight)`` multiplied by its factors in order
+    (vectors over the width or numbers); a ``None`` weight normalizes
+    without one. Every step rounds to the residual dtype exactly as that
+    tensor expression does, and each normalization accumulates in FP32; all
+    normalizations share ``eps``. ``encodings`` pairs normalizations, in
+    order, with a calibrated NVFP4 ``Quantizer`` or ``None``: a
+    normalization with a quantizer returns as
+    ``quantizer.quantize(normalization)``, a ``QuantizedTensor`` with linear
+    block scales, as the consumer that reads that encoding would encode it.
+    Returns the stream and the tuple of normalizations. Inputs are not
+    modified. On CUDA one launch evaluates the whole expression, encodings
+    included, and its results are bit-identical to the :func:`rms_norm`
+    launches, tensor operations and encodings it replaces.
+    """
+    from uniserve_kernels.norm import sandwich
+
+    if not updates or any(
+        update.shape != residual.shape for update, _ in updates
+    ):
+        raise ValueError("sandwich updates must match the residual rows")
+    for vector in (
+        weight,
+        *(branch for _, branch in updates if branch is not None),
+        *(norm[0] for norm in norms if norm[0] is not None),
+    ):
+        if vector.shape != residual.shape[-1:] or vector.device != (
+            residual.device
+        ):
+            raise ValueError(
+                "normalization weights must match the final width and device"
+            )
+
+    if len(encodings) > len(norms):
+        raise ValueError("sandwich encodings exceed the normalizations")
+    encodings = tuple(encodings) + (None,) * (len(norms) - len(encodings))
+
+    if residual.is_cuda:
+        # The kernel takes routes as (rows, weights) tensor pairs.
+        kernel_updates: tuple[
+            tuple[
+                torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+                torch.Tensor | None,
+            ],
+            ...,
+        ] = tuple(
+            ((update.rows, update.weights), branch)
+            if isinstance(update, Routes)
+            else (update, branch)
+            for update, branch in updates
+        )
+        require_kernel(
+            "sandwich_rms_norm",
+            sandwich.unsupported(
+                residual, kernel_updates, weight, scale, norms, encodings
+            ),
+            residual=residual,
+            **{
+                f"update{i}": update.rows
+                if isinstance(update, Routes)
+                else update
+                for i, (update, _) in enumerate(updates)
+            },
+            scale=scale,
+        )
+        stream = torch.empty_like(residual)
+        outputs = tuple(
+            torch.empty_like(residual)
+            if quantizer is None
+            else quantizer.empty(
+                tuple(residual.shape),
+                dtype=residual.dtype,
+                device=residual.device,
+            )
+            for quantizer in encodings
+        )
+        sandwich.sandwich(
+            residual,
+            kernel_updates,
+            weight,
+            scale,
+            norms,
+            eps,
+            stream,
+            outputs,
+            encodings,
+        )
+        return stream, outputs
+
+    # The composition that defines the kernel's rounding points.
+    values = [
+        update.combine() if isinstance(update, Routes) else update
+        for update, _ in updates
+    ]
+    terms = [
+        value if branch is None else rms_norm(value, branch, eps)
+        for value, (_, branch) in zip(values, updates, strict=True)
+    ]
+    summed = terms[0]
+    for term in terms[1:]:
+        summed = summed + term
+    stream = residual + rms_norm(summed, weight, eps)
+    if scale is not None:
+        stream = stream * scale
+    normalized: list[torch.Tensor] = []
+    for norm_weight, *factors in norms:
+        value = (
+            _rms(stream, eps).to(stream.dtype)
+            if norm_weight is None
+            else rms_norm(stream, norm_weight, eps)
+        )
+        for factor in factors:
+            value = value * factor
+        normalized.append(value)
+    return stream, tuple(
+        value if quantizer is None else quantizer.quantize(value)
+        for value, quantizer in zip(normalized, encodings, strict=True)
+    )
 
 
 def _autocast_dtype(value: torch.Tensor) -> torch.dtype:
@@ -129,7 +298,13 @@ def weighted_rms_norm(
 
     _check_vectors(hidden, weight)
     output = torch.empty_like(hidden, dtype=_autocast_dtype(hidden))
-    if residual.can_run(hidden, weight, output):
+    if hidden.is_cuda:
+        require_kernel(
+            "weighted_rms_norm",
+            residual.unsupported(hidden, weight, output),
+            hidden=hidden,
+            weight=weight,
+        )
         residual.weighted_rms_norm(hidden, weight, eps, output)
         return output
     return (_rms(hidden, eps) * weight.float()).to(output.dtype)
@@ -143,7 +318,13 @@ def weighted_rms_norm_absmax(
 
     _check_vectors(hidden, weight)
     output = torch.empty_like(hidden, dtype=_autocast_dtype(hidden))
-    if residual.can_run(hidden, weight, output):
+    if hidden.is_cuda:
+        require_kernel(
+            "weighted_rms_norm_absmax",
+            residual.unsupported(hidden, weight, output),
+            hidden=hidden,
+            weight=weight,
+        )
         partials = _partials(hidden)
         residual.weighted_rms_norm(hidden, weight, eps, output, partials)
         return output, _absmax(output, partials)
@@ -166,6 +347,18 @@ def _scaled_sum(hidden, update, scale, update_bias) -> torch.Tensor:
     return hidden.float() + biased * scale.float()
 
 
+def _require_residual(function, hidden, update, *vectors, output=None):
+    """Raise unless the residual kernels accept a CUDA call's operands."""
+    from uniserve_kernels.norm import residual
+
+    require_kernel(
+        function,
+        residual.unsupported(hidden, update, *vectors, output),
+        hidden=hidden,
+        update=update,
+    )
+
+
 def scaled_residual_rms_norm_(
     hidden: torch.Tensor,
     update: torch.Tensor,
@@ -186,7 +379,16 @@ def scaled_residual_rms_norm_(
     _check_update(hidden, update)
     _check_vectors(hidden, scale, weight, update_bias)
     output = torch.empty_like(hidden, dtype=_autocast_dtype(update))
-    if residual.can_run(hidden, update, scale, weight, update_bias, output):
+    if hidden.is_cuda:
+        _require_residual(
+            "scaled_residual_rms_norm_",
+            hidden,
+            update,
+            scale,
+            weight,
+            update_bias,
+            output=output,
+        )
         residual.scaled_residual_rms_norm_(
             hidden, update, scale, weight, update_bias, eps, output
         )
@@ -214,7 +416,16 @@ def scaled_residual_rms_norm_absmax_(
     _check_update(hidden, update)
     _check_vectors(hidden, scale, weight, update_bias)
     output = torch.empty_like(hidden, dtype=_autocast_dtype(update))
-    if residual.can_run(hidden, update, scale, weight, update_bias, output):
+    if hidden.is_cuda:
+        _require_residual(
+            "scaled_residual_rms_norm_absmax_",
+            hidden,
+            update,
+            scale,
+            weight,
+            update_bias,
+            output=output,
+        )
         partials = _partials(hidden)
         residual.scaled_residual_rms_norm_(
             hidden, update, scale, weight, update_bias, eps, output, partials
@@ -237,7 +448,10 @@ def scaled_residual_(
 
     _check_update(hidden, update)
     _check_vectors(hidden, scale, update_bias)
-    if residual.can_run(hidden, update, scale, update_bias):
+    if hidden.is_cuda:
+        _require_residual(
+            "scaled_residual_", hidden, update, scale, update_bias
+        )
         residual.scaled_residual_(hidden, update, scale, update_bias)
         return hidden
     biased = update.float()
@@ -265,9 +479,17 @@ def scaled_residual_layer_norm(
     _check_update(hidden, update)
     _check_vectors(hidden, scale, weight, bias, update_bias)
     output = torch.empty_like(hidden, dtype=_autocast_dtype(update))
-    if residual.can_run(
-        hidden, update, scale, weight, bias, update_bias, output
-    ):
+    if hidden.is_cuda:
+        _require_residual(
+            "scaled_residual_layer_norm",
+            hidden,
+            update,
+            scale,
+            weight,
+            bias,
+            update_bias,
+            output=output,
+        )
         residual.scaled_residual_layer_norm(
             hidden, update, scale, weight, bias, update_bias, eps, output
         )
@@ -295,9 +517,17 @@ def scaled_residual_layer_norm_absmax(
     _check_update(hidden, update)
     _check_vectors(hidden, scale, weight, bias, update_bias)
     output = torch.empty_like(hidden, dtype=_autocast_dtype(update))
-    if residual.can_run(
-        hidden, update, scale, weight, bias, update_bias, output
-    ):
+    if hidden.is_cuda:
+        _require_residual(
+            "scaled_residual_layer_norm_absmax",
+            hidden,
+            update,
+            scale,
+            weight,
+            bias,
+            update_bias,
+            output=output,
+        )
         partials = _partials(hidden)
         residual.scaled_residual_layer_norm(
             hidden,
@@ -376,9 +606,23 @@ def modulated_rms_norm(
         or not retain.is_contiguous()
     ):
         raise ValueError("retained rows must match the normalized value")
-    if value.shape[-1] <= modulation.MAX_WIDTH and modulation.can_run(
-        value, weight, shift, scale, row_indices
-    ):
+    if value.is_cuda:
+        require_kernel(
+            "modulated_rms_norm",
+            modulation.unsupported(
+                value,
+                weight,
+                shift,
+                scale,
+                row_indices,
+                rows=() if retain is None else (retain,),
+            ),
+            value=value,
+            weight=weight,
+            shift=shift,
+            scale=scale,
+            row_indices=row_indices,
+        )
         output = torch.empty_like(value)
         modulation.modulated_rms_norm(
             value,
@@ -415,9 +659,17 @@ def gated_residual(
     """
     from uniserve_kernels.norm import modulation
 
-    if update.is_contiguous() and modulation.can_run(
-        hidden, update, gate, row_indices
-    ):
+    if hidden.is_cuda:
+        require_kernel(
+            "gated_residual",
+            modulation.unsupported(
+                hidden, gate, row_indices, rows=(update,), normalizes=False
+            ),
+            hidden=hidden,
+            update=update,
+            gate=gate,
+            row_indices=row_indices,
+        )
         modulation.gated_residual(
             hidden,
             update,
@@ -428,6 +680,19 @@ def gated_residual(
         return update
     return _gated_sum(hidden, update, gate, row_indices, rounding).to(
         hidden.dtype
+    )
+
+
+def _require_gated_modulation(function, hidden, update, gate, *parameters):
+    """Raise unless the fused gated modulation accepts a CUDA call."""
+    from uniserve_kernels.norm import modulation
+
+    require_kernel(
+        function,
+        modulation.unsupported(hidden, gate, *parameters, rows=(update,)),
+        hidden=hidden,
+        update=update,
+        gate=gate,
     )
 
 
@@ -452,13 +717,17 @@ def gated_residual_rms_norm(
     """
     from uniserve_kernels.norm import modulation
 
-    if (
-        hidden.shape[-1] <= modulation.MAX_WIDTH
-        and update.is_contiguous()
-        and modulation.can_run(
-            hidden, update, gate, weight, shift, scale, row_indices
+    if hidden.is_cuda:
+        _require_gated_modulation(
+            "gated_residual_rms_norm",
+            hidden,
+            update,
+            gate,
+            weight,
+            shift,
+            scale,
+            row_indices,
         )
-    ):
         normalized = torch.empty_like(hidden)
         modulation.modulated_rms_norm(
             hidden,
@@ -502,13 +771,17 @@ def gated_residual_rms_norm_fp8(
     """
     from uniserve_kernels.norm import modulation
 
-    if (
-        hidden.shape[-1] <= modulation.MAX_WIDTH
-        and update.is_contiguous()
-        and modulation.can_run(
-            hidden, update, gate, weight, shift, scale, row_indices
+    if hidden.is_cuda:
+        _require_gated_modulation(
+            "gated_residual_rms_norm_fp8",
+            hidden,
+            update,
+            gate,
+            weight,
+            shift,
+            scale,
+            row_indices,
         )
-    ):
         rows = hidden.numel() // hidden.shape[-1]
         values = torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
         scales = torch.empty(

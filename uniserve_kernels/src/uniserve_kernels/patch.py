@@ -2,15 +2,14 @@
 
 The kernel backs ``uniserve.nn.functional.unpatchify_video_tokens``, which
 validates grid, patch, token and bias shapes, allocates the contiguous output
-and evaluates the same rearrangement with tensor operations whenever
-:func:`can_run` rejects a call.
+and raises on CUDA whenever :func:`unsupported` reports a reason.
 """
 
 from __future__ import annotations
 
 import torch
 
-from uniserve_kernels.triton import launchable, tl, triton
+from uniserve_kernels.triton import tl, triton, unsupported_operands
 
 if triton is not None:
 
@@ -91,23 +90,27 @@ if triton is not None:
         tl.store(output_ptr + offsets, value, mask=mask)
 
 
-def can_run(source: torch.Tensor, bias: torch.Tensor | None) -> bool:
-    """Return whether contiguous CUDA tokens and bias fit the kernel.
+def unsupported(source: torch.Tensor, bias: torch.Tensor | None) -> str | None:
+    """Return why the kernel cannot unpack these tokens, or ``None``.
 
-    Shape agreement and the output buffer are not checked here: the caller
-    validates the grid, patch and bias shapes and passes a contiguous
-    ``out`` of the source dtype.
+    The kernel reads contiguous floating ``[batch, tokens, width]`` tokens
+    and an optional contiguous bias of the same dtype. Shape agreement and
+    the output buffer are not checked here: the caller validates the grid,
+    patch and bias shapes and passes a contiguous ``out`` of the source
+    dtype.
     """
-    return (
-        launchable(source.device)
-        and source.is_cuda
-        and source.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and source.is_contiguous()
-        and (
-            bias is None
-            or (bias.is_contiguous() and bias.dtype == source.dtype)
-        )
-    )
+    reason = unsupported_operands(source, bias)
+    if reason is not None:
+        return reason
+    if source.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return f"dtype {source.dtype} is not float16, bfloat16 or float32"
+    if not source.is_contiguous():
+        return "the token rows are not contiguous"
+    if bias is not None and (
+        not bias.is_contiguous() or bias.dtype != source.dtype
+    ):
+        return "the bias is not a contiguous vector of the token dtype"
+    return None
 
 
 def unpatchify_video_tokens(

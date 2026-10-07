@@ -15,6 +15,7 @@ from uniserve.quantization import QuantizedTensor, Quantizer
 
 from . import _binding
 from .attention.config import AttentionParallelConfig
+from .functional._activation import softcap
 from .functional._linear import apply_linear, apply_merged_linear
 from .functional._tensors import as_matrix
 
@@ -636,6 +637,12 @@ class VocabParallelEmbedding(nn.Module):
 class VocabParallelHead(ColumnParallelLinear):
     """Project local padded vocabulary columns; Logits.gather gathers
     explicitly.
+
+    ``softcap`` bounds every logit to ``(-softcap, softcap)`` as
+    ``softcap * tanh(logits / softcap)``. The projection first rounds to the
+    activation dtype; the cap then evaluates in FP32 (``functional.softcap``,
+    one pass over the projected logits on CUDA), and capped logits are FP32
+    unless the caller asks for another ``output_dtype``.
     """  # noqa: D205
 
     def __init__(
@@ -645,12 +652,19 @@ class VocabParallelHead(ColumnParallelLinear):
         *,
         group: Communicator | None = None,
         bias: bool = False,
+        softcap: float | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         group = Communicator() if group is None else group
         if num_embeddings < 1:
             raise ValueError("vocabulary size must be positive")
+        if softcap is not None and not (
+            isinstance(softcap, (int, float))
+            and not isinstance(softcap, bool)
+            and 0 < softcap < float("inf")
+        ):
+            raise ValueError("logit softcap must be finite and positive")
         super().__init__(
             in_features,
             _padded_vocabulary(num_embeddings, group.size),
@@ -659,8 +673,29 @@ class VocabParallelHead(ColumnParallelLinear):
             device=device,
             dtype=dtype,
         )
+        self.softcap = None if softcap is None else float(softcap)
         self.vocab = _vocabulary(num_embeddings, self.group)
         valid = max(0, num_embeddings - self.vocab.local_slice.start)
         self.weight[valid:].zero_()
         if self.bias is not None:
             self.bias[valid:].zero_()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        output_dtype: torch.dtype | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.softcap is None:
+            return super().forward(x, output_dtype=output_dtype, out=out)
+
+        dtype = torch.float32 if output_dtype is None else output_dtype
+        _check_output(
+            out, (*x.shape[:-1], self.weight.shape[0]), dtype, x.device
+        )
+        # Padding columns project to zero and stay zero under the cap.
+        logits = super().forward(x)
+        if out is not None and not out.is_contiguous():
+            return out.copy_(softcap(logits, self.softcap, dtype=dtype))
+        return softcap(logits, self.softcap, dtype=dtype, out=out)

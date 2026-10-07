@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from uniserve_kernels.triton import require_kernel
 
 
 def patchify(images: torch.Tensor, *, patch_size: int) -> torch.Tensor:
@@ -77,7 +78,9 @@ def unpatchify_video_tokens(
     Grid and patch dimensions follow time, height, width order. Each token
     stores channel-major patch elements; trailing padded tokens are ignored.
     Bias is added in FP32 before storing the rearranged output in the source
-    dtype, as ``[batch, channels, frames, height, width]``.
+    dtype, as ``[batch, channels, frames, height, width]``. CUDA calls run
+    the rearrangement kernel and raise ``ValueError`` when it cannot take
+    the operands.
     """
     from uniserve_kernels import patch
 
@@ -112,7 +115,13 @@ def unpatchify_video_tokens(
         height * patch_height,
         width * patch_width,
     )
-    if patch.can_run(source, bias):
+    if source.is_cuda:
+        require_kernel(
+            "unpatchify_video_tokens",
+            patch.unsupported(source, bias),
+            source=source,
+            bias=bias,
+        )
         output = torch.empty(shape, dtype=source.dtype, device=source.device)
         patch.unpatchify_video_tokens(
             source,

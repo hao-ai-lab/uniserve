@@ -1,9 +1,10 @@
 """Gated activations over packed or separate value and gate channels.
 
 Bias, activation and multiplication accumulate in FP32 before one rounding;
-``silu_and_mul`` also evaluates the ``Rounding.STEPWISE`` recipe, which
-rounds the activated gate before the product. Eligible CUDA calls use
-UniServe's kernels; every other call evaluates the same formula with tensor
+``silu_and_mul`` also evaluates ``Rounding.STEPWISE``, which rounds the
+activated gate before the product. CUDA calls run UniServe's kernels and
+raise ``ValueError`` when no kernel accepts their operands; other devices
+evaluate the same formula with tensor
 operations.
 """
 
@@ -13,6 +14,7 @@ from typing import Literal
 
 import torch
 from torch.nn import functional as F
+from uniserve_kernels.triton import require_kernel
 
 from uniserve.quantization import QuantizedTensor
 
@@ -30,17 +32,108 @@ def _row_fp8(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return buffers["values"].reshape(values.shape), buffers["scale"]
 
 
-def _gated_silu(gate, value, rounding) -> torch.Tensor:
-    """Return FP32 ``silu(gate) * value`` under ``rounding``.
+def _gate_value(
+    x: torch.Tensor, activation: str, rounding: Rounding
+) -> torch.Tensor:
+    """Return FP32 ``activation(gate) * value`` for packed ``[gate, value]``."""
+    gate, value = x.float().chunk(2, dim=-1)
+    if activation == "silu":
+        activated = F.silu(gate)
+    else:
+        activated = F.gelu(
+            gate, approximate="tanh" if activation == "gelu_tanh" else "none"
+        )
+    if rounding is Rounding.STEPWISE:
+        activated = activated.to(x.dtype).float()
+        return (activated * value).to(x.dtype).float()
+    return activated * value
 
-    Stepwise rounding rounds the activated gate and the product to the
-    input dtype, so the FP32 result holds an activation-dtype value.
+
+def _act_and_mul(
+    function: str,
+    x: torch.Tensor,
+    activation: str,
+    out: torch.Tensor | None,
+    *,
+    rounding: Rounding = Rounding.ONCE,
+) -> torch.Tensor:
+    """Evaluate packed gating into a plain or row-scaled FP8 output.
+
+    ``activation`` names a formula of ``uniserve_kernels.activation``. A
+    row-scaled FP8 ``QuantizedTensor`` output receives the E4M3 encoding of
+    the unrounded FP32 products with one scale per row.
     """
-    activated = F.silu(gate.float())
-    if rounding is Rounding.ONCE:
-        return activated * value.float()
-    activated = activated.to(gate.dtype).float()
-    return (activated * value.float()).to(gate.dtype).float()
+    from uniserve.quantization import Quantizer
+    from uniserve_kernels import activation as kernels
+
+    if x.ndim < 1 or x.shape[-1] % 2 or x.shape[-1] == 0:
+        raise ValueError("gating requires equal channel halves")
+    shape = (*x.shape[:-1], x.shape[-1] // 2)
+
+    if isinstance(out, QuantizedTensor):
+        if out.quantizer != Quantizer("fp8", axis=0):
+            raise ValueError("fused gating output requires row-scaled FP8")
+        if x.is_cuda:
+            require_kernel(
+                function,
+                "a row-scaled FP8 output keeps one scale per leading index "
+                "of a rank-2 input; other ranks have no kernel"
+                if x.ndim != 2
+                else kernels.unsupported(x, fp8_width=shape[-1]),
+                x=x,
+            )
+            values = torch.empty(
+                shape, dtype=torch.float8_e4m3fn, device=x.device
+            )
+            scales = torch.empty(
+                (x.shape[0], 1), dtype=torch.float32, device=x.device
+            )
+            kernels.act_and_mul_fp8(
+                x,
+                values,
+                scales,
+                activation=activation,
+                stepwise=rounding is Rounding.STEPWISE,
+            )
+        elif x.ndim != 2:
+            # Axis zero of a higher-rank tensor retains that axis alone; it
+            # must not silently become one separate scale per flattened row.
+            encoded = out.quantizer.quantize(
+                _gate_value(x, activation, rounding)
+            )
+            return result(encoded.to(dtype=x.dtype), out)
+        else:
+            values, scales = _row_fp8(_gate_value(x, activation, rounding))
+        encoded = out.quantizer.from_tensors(
+            {"values": values, "scale": scales},
+            shape=tuple(values.shape),
+            dtype=x.dtype,
+        )
+        return result(encoded, out)
+
+    if out is not None and (
+        out.shape != shape or out.dtype != x.dtype or out.device != x.device
+    ):
+        raise ValueError(
+            "output must match the numerical result's shape, dtype and device"
+        )
+    if x.is_cuda:
+        # The kernel stores contiguous rows; another caller layout receives
+        # a copy of them.
+        target = (
+            out
+            if out is not None and out.is_contiguous()
+            else torch.empty(shape, dtype=x.dtype, device=x.device)
+        )
+        require_kernel(function, kernels.unsupported(x, target), x=x, out=out)
+        kernels.act_and_mul(
+            x,
+            target,
+            activation=activation,
+            stepwise=rounding is Rounding.STEPWISE,
+        )
+        return target if out is None else result(target, out)
+    return result(_gate_value(x, activation, rounding).to(x.dtype), out)
 
 
 def silu_and_mul(
@@ -56,54 +149,7 @@ def silu_and_mul(
     ``rounding`` selects whether the activated gate rounds to ``x.dtype``
     before the product.
     """
-    from uniserve_kernels import activation
-
-    if x.ndim < 1 or x.shape[-1] % 2 or x.shape[-1] == 0:
-        raise ValueError("gating requires equal channel halves")
-    shape = (*x.shape[:-1], x.shape[-1] // 2)
-    stepwise = rounding is Rounding.STEPWISE
-
-    if isinstance(out, QuantizedTensor):
-        from uniserve.quantization import Quantizer
-
-        if out.quantizer != Quantizer("fp8", axis=0):
-            raise ValueError("fused SiLU output requires row-scaled FP8")
-        if x.ndim != 2:
-            gate, value = x.chunk(2, dim=-1)
-            activated = _gated_silu(gate, value, rounding)
-            # Axis zero of a higher-rank tensor retains that axis alone; it
-            # must not silently become one separate scale per flattened row.
-            encoded = out.quantizer.quantize(activated)
-            return result(encoded.to(dtype=x.dtype), out)
-
-        if activation.can_run(x):
-            values = torch.empty(
-                shape, dtype=torch.float8_e4m3fn, device=x.device
-            )
-            scales = torch.empty(
-                (x.shape[0], 1), dtype=torch.float32, device=x.device
-            )
-            activation.silu_and_mul_fp8(x, values, scales, stepwise=stepwise)
-        else:
-            gate, value = x.chunk(2, dim=-1)
-            values, scales = _row_fp8(_gated_silu(gate, value, rounding))
-        encoded = out.quantizer.from_tensors(
-            {"values": values, "scale": scales},
-            shape=tuple(values.shape),
-            dtype=x.dtype,
-        )
-        return result(encoded, out)
-
-    if activation.can_run(x):
-        target = (
-            torch.empty(shape, dtype=x.dtype, device=x.device)
-            if out is None or not out.is_contiguous()
-            else out
-        )
-        activation.silu_and_mul(x, target, stepwise=stepwise)
-        return target if out is None else result(target, out)
-    gate, value = x.chunk(2, dim=-1)
-    return result(_gated_silu(gate, value, rounding).to(x.dtype), out)
+    return _act_and_mul("silu_and_mul", x, "silu", out, rounding=rounding)
 
 
 def gelu_and_mul(
@@ -114,14 +160,19 @@ def gelu_and_mul(
 ) -> torch.Tensor:
     """Apply the selected GELU formula to the first channel half, then
     multiply by the second.
+
+    ``approximate="none"`` is the exact erf form; ``"tanh"`` is PyTorch's
+    tanh approximation (``gelu_pytorch_tanh``). Outputs follow
+    :func:`silu_and_mul`, including a row-scaled FP8 ``QuantizedTensor``.
     """  # noqa: D205
-    if x.ndim < 1 or x.shape[-1] % 2 or approximate not in {"none", "tanh"}:
-        raise ValueError(
-            "GELU gating requires equal channel halves and a supported "
-            "approximation"
-        )
-    gate, value = x.chunk(2, dim=-1)
-    return result(F.gelu(gate, approximate=approximate) * value, out)
+    if approximate not in {"none", "tanh"}:
+        raise ValueError("GELU gating requires a supported approximation")
+    return _act_and_mul(
+        "gelu_and_mul",
+        x,
+        "gelu_tanh" if approximate == "tanh" else "gelu",
+        out,
+    )
 
 
 def _value_first_width(
@@ -165,8 +216,14 @@ def value_first_swiglu(
     from uniserve_kernels import activation
 
     width = _value_first_width(value_gate, bias)
-    if not activation.can_run(value_gate):
+    if not value_gate.is_cuda:
         return _value_first(value_gate, bias).to(value_gate.dtype)
+    require_kernel(
+        "value_first_swiglu",
+        activation.unsupported(value_gate, bias),
+        value_gate=value_gate,
+        bias=bias,
+    )
     output = torch.empty(
         (*value_gate.shape[:-1], width),
         dtype=value_gate.dtype,
@@ -183,9 +240,15 @@ def value_first_swiglu_absmax(
     from uniserve_kernels import activation
 
     width = _value_first_width(value_gate, bias)
-    if not activation.can_run(value_gate):
+    if not value_gate.is_cuda:
         output = _value_first(value_gate, bias).to(value_gate.dtype)
         return output, output.float().abs().amax()
+    require_kernel(
+        "value_first_swiglu_absmax",
+        activation.unsupported(value_gate, bias),
+        value_gate=value_gate,
+        bias=bias,
+    )
     output = torch.empty(
         (*value_gate.shape[:-1], width),
         dtype=value_gate.dtype,
@@ -207,8 +270,13 @@ def value_first_swiglu_fp8(
     from uniserve_kernels import activation
 
     width = _value_first_width(value_gate, None)
-    if width > activation.MAX_FP8_WIDTH or not activation.can_run(value_gate):
+    if not value_gate.is_cuda:
         return _row_fp8(_value_first(value_gate, None))
+    require_kernel(
+        "value_first_swiglu_fp8",
+        activation.unsupported(value_gate, fp8_width=width),
+        value_gate=value_gate,
+    )
     rows = value_gate.numel() // (2 * width)
     output = torch.empty(
         (*value_gate.shape[:-1], width),
@@ -244,27 +312,11 @@ def _swiglu_width(value, gate, value_bias, gate_bias) -> int:
     return width
 
 
-def _strided_rows(value: torch.Tensor, gate: torch.Tensor) -> bool:
-    """Report whether separate views flatten to unit-strided channel rows."""
-    if value.stride(-1) != 1 or gate.stride(-1) != 1:
-        return False
-    try:
-        value.view(-1, value.shape[-1])
-        gate.view(-1, gate.shape[-1])
-    except RuntimeError:
-        return False
-    return True
-
-
 def _swiglu(value, gate, value_bias, gate_bias, *, absmax: bool):
-    from uniserve_kernels.triton import launchable
-
     from uniserve_kernels import activation
 
     _swiglu_width(value, gate, value_bias, gate_bias)
-    if not (value.is_cuda and launchable(value.device)) or not _strided_rows(
-        value, gate
-    ):
+    if not value.is_cuda:
         value_fp32, gate_fp32 = value.float(), gate.float()
         if value_bias is not None:
             value_fp32 = value_fp32 + value_bias.float()
@@ -273,6 +325,16 @@ def _swiglu(value, gate, value_bias, gate_bias, *, absmax: bool):
         output = (value_fp32 * F.silu(gate_fp32)).to(value.dtype)
         return (output, output.float().abs().amax()) if absmax else output
 
+    # Separate views keep their own row strides; each must flatten to rows.
+    require_kernel(
+        "swiglu_absmax" if absmax else "swiglu",
+        activation.unsupported(value, value_bias, gate_bias)
+        or activation.unsupported(gate),
+        value=value,
+        gate=gate,
+        value_bias=value_bias,
+        gate_bias=gate_bias,
+    )
     output = torch.empty_like(value, memory_format=torch.contiguous_format)
     partials = (
         torch.empty(
@@ -313,3 +375,40 @@ def swiglu_absmax(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return :func:`swiglu` and the FP32 absmax of its rounded output."""
     return _swiglu(value, gate, value_bias, gate_bias, absmax=True)
+
+
+def softcap(
+    x: torch.Tensor,
+    cap: float,
+    *,
+    dtype: torch.dtype = torch.float32,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Bound values to ``(-cap, cap)`` as ``tanh(x / cap) * cap``.
+
+    Evaluates ``torch.tanh(x.float() / cap) * cap`` in FP32, rounded once to
+    ``dtype`` (or ``out``'s dtype). On CUDA one launch reads ``x`` and
+    writes the result, bit-identical to that tensor expression; ``out``, a
+    contiguous tensor of ``x``'s shape, receives it directly.
+    """
+    from uniserve_kernels import activation
+
+    if out is not None:
+        dtype = out.dtype
+    if x.is_cuda:
+        target = (
+            torch.empty(x.shape, dtype=dtype, device=x.device)
+            if out is None
+            else out
+        )
+        require_kernel(
+            "softcap",
+            activation.unsupported_softcap(x, target),
+            x=x,
+            out=target,
+        )
+        activation.softcap(x, cap, target)
+        return target
+
+    capped = (torch.tanh(x.float() / cap) * cap).to(dtype)
+    return capped if out is None else out.copy_(capped)

@@ -7,18 +7,19 @@ the residual ``hidden`` in place; the RMS variant normalizes the unrounded sum.
 variants, selected by passing ``partials``, record one per-row absolute maximum
 of the stored output; ``uniserve_kernels.reduction.absmax`` finishes them.
 
-``uniserve.nn.functional`` owns validation, output allocation and the
-tensor-operation fallback for these kernels.
+``uniserve.nn.functional`` owns validation and output allocation, and
+raises on CUDA when :func:`unsupported` reports a reason.
 """
 
 from __future__ import annotations
 
 import torch
 
-from uniserve_kernels.triton import launchable, tl, triton
+from uniserve_kernels.triton import tl, triton, unsupported_operands
 
 #: One program reduces a complete row, bounding the normalized width.
 MAX_WIDTH = 32768
+_FLOATING = (torch.float16, torch.bfloat16, torch.float32)
 
 
 if triton is not None:
@@ -344,23 +345,31 @@ if triton is not None:
         )
 
 
-def can_run(value: torch.Tensor, *operands: torch.Tensor | None) -> bool:
-    """Return whether contiguous CUDA rows and operands fit the kernels.
+def unsupported(
+    value: torch.Tensor, *operands: torch.Tensor | None
+) -> str | None:
+    """Return why the kernels cannot take these operands, or ``None``.
 
-    Operands are channel vectors, updates or outputs on ``value``'s device.
+    ``value`` is the floating ``[..., width]`` residual stream and
+    ``operands`` are channel vectors, updates or outputs (``None`` for an
+    absent bias). Every tensor is contiguous on one CUDA device: rows are
+    addressed as ``row * width``. ``width`` is at most :data:`MAX_WIDTH`,
+    because one program reduces a complete row.
     """
-    return (
-        launchable(value.device)
-        and value.is_cuda
-        and value.numel() > 0
-        and 0 < int(value.shape[-1]) <= MAX_WIDTH
-        and value.is_contiguous()
-        and all(
-            operand is None
-            or (operand.device == value.device and operand.is_contiguous())
-            for operand in operands
-        )
-    )
+    reason = unsupported_operands(value, *operands)
+    if reason is not None:
+        return reason
+    width = int(value.shape[-1]) if value.ndim else 0
+    if value.dtype not in _FLOATING:
+        return f"dtype {value.dtype} is not float16, bfloat16 or float32"
+    if value.numel() == 0 or not 0 < width <= MAX_WIDTH:
+        return f"rows are empty or wider than the kernel's {MAX_WIDTH}"
+    if not value.is_contiguous() or any(
+        operand is not None and not operand.is_contiguous()
+        for operand in operands
+    ):
+        return "the residual stream or an operand is not contiguous"
+    return None
 
 
 def _rows(value: torch.Tensor) -> tuple[int, int]:

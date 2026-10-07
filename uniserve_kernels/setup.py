@@ -81,6 +81,15 @@ def _cuda_extensions():
             **driver,
         ),
         *sparse_attention,
+        # Softmax top-k expert routing, for every target architecture.
+        CUDAExtension(
+            "uniserve_kernels._topk_softmax",
+            [_source("csrc", "topk_softmax.cu")],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20"],
+                "nvcc": ["-O3", "-std=c++20"],
+            },
+        ),
     ]
 
 
