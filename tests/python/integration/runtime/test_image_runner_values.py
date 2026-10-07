@@ -26,13 +26,12 @@ from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.diffusion import (
-    flow_rows,
     image_state,
-    prefix_row,
 )
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.attention import from_tables, table_pages
 from uniserve_worker.model_executor.component_binding import ComponentBinding
+from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.call import (
     Bounds,
     Call,
@@ -42,6 +41,7 @@ from uniserve_worker.protocol.call import (
     MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
+from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.storage.block_tables import GroupShape, GroupTable
 from uniserve_worker.storage.kv_cache import KVCacheManager
 from uniserve_worker.storage.latent_pool import LatentPool
@@ -248,7 +248,14 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             result = forward_batch(
                 runner,
                 tuple(
-                    prefix_row(tokens, slot + 1, 0)
+                    TokenRow(
+                        forward_mode=ForwardMode.PREFILL,
+                        token_ids=torch.tensor(tokens, dtype=torch.long),
+                        positions=torch.arange(len(tokens), dtype=torch.long),
+                        selection=TokenSelection.HIDDEN,
+                        request_pool_idx=slot + 1,
+                        write_kv=True,
+                    )
                     for slot, tokens in enumerate(prefixes)
                 ),
                 calls=calls(ForwardMode.PREFILL),
@@ -321,9 +328,8 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                         workspace=oracle.workspace,
                     )["image"]
                 )
-            rows = flow_rows(
+            rows = trajectory.prepare_inputs(
                 factory,
-                trajectory,
                 sample,
                 time,
                 tuple(

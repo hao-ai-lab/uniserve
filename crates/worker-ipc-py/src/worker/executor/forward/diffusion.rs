@@ -4,12 +4,15 @@ use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PySlice, PyTuple};
-use uniserve_worker_ipc::{DrawLayout, LatentParams};
+use pyo3::types::{PySlice, PyTuple};
+use uniserve_worker::TokenSelection;
+use uniserve_worker_ipc::{CallKind, DrawLayout, ForwardMode, LatentParams};
 
 use super::{BatchState, DiffusionStep, ForwardRow, PythonBackend, Trajectories};
+use crate::worker::diffusion_state::DiffusionState;
 use crate::worker::error::{invalid, native_error};
 use crate::worker::latent::LatentBuffer;
+use crate::worker::model_inputs::{AttentionRow, InputRow, Row, TokenRow};
 use crate::worker::request::{KVConditioning, Request, resolve_prefix};
 
 impl PythonBackend {
@@ -33,7 +36,7 @@ impl PythonBackend {
         request: &Py<Request>,
         params: &LatentParams,
         fresh: bool,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<Py<DiffusionState>> {
         let size = py
             .import("uniserve.media.image")?
             .getattr("Config")?
@@ -45,7 +48,7 @@ impl PythonBackend {
             .map(|state| state.clone_ref(py));
         if !fresh
             && let Some(previous) = previous
-            && previous.bind(py).getattr("size")?.eq(&size)?
+            && previous.borrow(py).size.bind(py).eq(&size)?
         {
             return Ok(previous);
         }
@@ -57,7 +60,7 @@ impl PythonBackend {
         let state = py
             .import("uniserve_worker.execution.diffusion")?
             .call_method1("image_state", (self.image_builder(py)?, size, image))?
-            .unbind();
+            .extract::<Py<DiffusionState>>()?;
         let mut request = request.borrow_mut(py);
         request.diffusion = Some(state.clone_ref(py));
         request.kv = Some(KVConditioning::default());
@@ -291,12 +294,13 @@ impl PythonBackend {
         let mut inputs = HashMap::new();
         let mut prefixes = Vec::new();
         for &(index, step) in steps {
-            let trajectory = trajectories[&index].bind(py);
-            let schedule = trajectory.getattr("schedules")?.get_item("image")?;
-            let guidance = trajectory.getattr("guidance")?;
-            if guidance.is_none() {
-                return Err(invalid(py, "image diffusion requires guidance"));
-            }
+            let trajectory = trajectories[&index].borrow(py);
+            let schedule = trajectory.schedules.bind(py).get_item("image")?;
+            let guidance = trajectory
+                .guidance
+                .as_ref()
+                .ok_or_else(|| invalid(py, "image diffusion requires guidance"))?
+                .bind(py);
             let branches = guidance.call_method1("branches", (&schedule, step))?;
             let pending = batch.pending(py, index);
             let slot = pending.borrow(py).request.borrow(py).request.slot() as i64;
@@ -330,7 +334,7 @@ impl PythonBackend {
             }
             let pending = batch.pending(py, prefix.index);
             let task = prefix.task.bind(py);
-            let count: u64 = task.getattr("query_tokens")?.extract()?;
+            let count: u64 = Row::borrow(task)?.query_tokens(py)? as u64;
             self.record_token_kv(py, &mut pending.borrow_mut(py), task, count, false)?;
             let request = pending.borrow(py).request.clone_ref(py);
             let mut request = request.borrow_mut(py);
@@ -338,7 +342,7 @@ impl PythonBackend {
                 .kv
                 .as_mut()
                 .ok_or_else(|| invalid(py, "guidance prefix lost its conditioning"))?;
-            let slot = task.getattr("request_pool_idx")?.extract::<u32>()?;
+            let slot = task.cast::<InputRow>()?.borrow().request_pool_idx;
             for coordinates in kv.branches.values_mut() {
                 if coordinates.0 == slot && coordinates.1 == 0 {
                     coordinates.1 = count;
@@ -375,7 +379,7 @@ impl PythonBackend {
         batch: &BatchState,
         index: usize,
         input: &DiffusionStep,
-        trajectory: &Py<PyAny>,
+        trajectory: &Py<DiffusionState>,
     ) -> PyResult<Vec<ForwardRow>> {
         let pending = batch.pending(py, index);
         let request = pending.borrow(py).request.clone_ref(py);
@@ -406,34 +410,27 @@ impl PythonBackend {
                 })
                 .collect::<PyResult<Vec<_>>>()?
         };
-        let options = PyDict::new(py);
-        options.set_item(
-            "device",
-            self.model_runner
-                .borrow(py)
-                .call_devices(
-                    py,
-                    &*batch
-                        .call(py, index)?
-                        .extract::<PyRef<crate::calls::Call>>()?,
-                )?
-                .into_bound(py)
-                .get_item(1)?,
+        let device = self
+            .model_runner
+            .borrow(py)
+            .call_devices(
+                py,
+                &*batch
+                    .call(py, index)?
+                    .extract::<PyRef<crate::calls::Call>>()?,
+            )?
+            .into_bound(py)
+            .get_item(1)?;
+        let rows = trajectory.borrow_mut(py).prepare_inputs(
+            py,
+            &self.image_builder(py)?,
+            &self.latent_values(py, batch, index)?,
+            input.timestep.bind(py),
+            coordinates,
+            &device,
         )?;
-        let rows = py
-            .import("uniserve_worker.execution.diffusion")?
-            .call_method(
-                "flow_rows",
-                (
-                    self.image_builder(py)?,
-                    trajectory,
-                    self.latent_values(py, batch, index)?,
-                    &input.timestep,
-                    PyTuple::new(py, coordinates)?,
-                ),
-                Some(&options),
-            )?;
-        rows.try_iter()?
+        rows.bind(py)
+            .try_iter()?
             .map(|row| Ok(ForwardRow::new(index, row?.unbind())))
             .collect()
     }
@@ -620,17 +617,27 @@ impl KVConditioning {
 
             // Branches that share a physical prefix submit one prefill.
             if coordinates.1 == 0 && !tokens.is_empty() && initialized_slots.insert(coordinates.0) {
-                let row = py
-                    .import("uniserve_worker.execution.diffusion")?
-                    .call_method1(
-                        "prefix_row",
-                        (
-                            PyTuple::new(py, tokens.iter())?,
-                            coordinates.0,
-                            coordinates.1,
-                        ),
-                    )?;
-                rows.push(row.unbind());
+                let row = TokenRow {
+                    selection: Some(TokenSelection::Hidden),
+                    ..TokenRow::default()
+                }
+                .with_tokens(
+                    py,
+                    InputRow {
+                        kind: CallKind::Forward(ForwardMode::Prefill),
+                        request_pool_idx: coordinates.0,
+                    },
+                    AttentionRow {
+                        positions: None,
+                        seq_len: coordinates.1 as i64,
+                        write_kv: true,
+                        causal: Some(true),
+                    },
+                    tokens,
+                    coordinates.1,
+                    None,
+                )?;
+                rows.push(row.into_any());
             }
         }
         Ok((names, rows))

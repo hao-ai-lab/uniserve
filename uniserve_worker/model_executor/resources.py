@@ -27,12 +27,13 @@ from uniserve.model import (
     VideoPostprocessor,
 )
 from uniserve.tensors import BufferConfig, OutputLayout
+from uniserve_worker._uniserve_ipc import buffer_envelope
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.model_executor.component_binding import (
     Call,
     ComponentBinding,
 )
-from uniserve_worker.model_executor.media_inputs import MediaBuilder, envelope
+from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
 
 def bounding_layout(layouts: tuple[OutputLayout, ...]) -> OutputLayout:
@@ -96,7 +97,7 @@ def media_state_buffers(
                 fields = builder.capacity_buffers()
             elif isinstance(call.module, VideoPostprocessor):
                 # The overlap of the longest video at every admitted canvas.
-                fields = envelope(
+                fields = buffer_envelope(
                     tuple(
                         call.module.state_buffers(size)
                         for size in builder.video_sizes()

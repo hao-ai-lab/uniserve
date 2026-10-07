@@ -92,7 +92,7 @@ pub mod schema {
 }
 
 pub use channel::{
-    Outstanding, RankChannel, RankServer, SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL, Wake,
+    Outstanding, RankChannel, RankReport, RankServer, SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL, Wake,
 };
 pub use iceoryx::{
     ClientEndpoint, DEFAULT_SERVICE_PREFIX, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT,

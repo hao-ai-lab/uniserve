@@ -304,11 +304,12 @@ fn reserve_inputs(
         }
         for call in item.get_item(1)?.try_iter()? {
             let call = call?;
-            let kinds: BTreeSet<String> = declarations
-                .call_method1("call_kinds", (PyTuple::new(py, [&call])?,))?
-                .extract()?;
+            let kinds = crate::worker::component_binding::calls::kinds(
+                PyTuple::new(py, [&call])?.as_any(),
+            )?;
             let kinds: BTreeSet<_> = kinds
                 .into_iter()
+                .map(|kind| kind.as_str().to_owned())
                 .filter(|kind| buffered.contains_key(kind))
                 .collect();
             let target = if kinds.contains("latent_encoding") || kinds.contains("image_decoding") {
@@ -348,10 +349,7 @@ fn reserve_inputs(
                     && cuda
                     && config_native.graph_policy != "off"
                 {
-                    rows = py
-                        .import("uniserve_worker.model_executor.canvas_runner")?
-                        .call_method1("canvas_buffer_rows", (rows,))?
-                        .extract()?;
+                    rows = crate::worker::model_runner::CanvasRunner::input_rows(rows);
                 }
                 if rows != input.getattr("max_rows")?.extract::<usize>()? {
                     let options = PyDict::new(py);
@@ -431,18 +429,13 @@ fn shared_bytes(
         .import("uniserve_worker.storage.block_tables")?
         .getattr("BlockTables")?
         .call_method("buffers", (), Some(&options))?;
-    let options = PyDict::new(py);
-    options.set_item("request_pool_size", info.request_slots)?;
-    options.set_item(
-        "vocab_size",
-        text.getattr("backbone")?.getattr("vocab_size")?,
+    let decode = crate::worker::decode_state::DecodeState::buffers(
+        py,
+        info.request_slots as usize,
+        text.getattr("backbone")?.getattr("vocab_size")?.extract()?,
+        1,
+        dtype,
     )?;
-    options.set_item("continuation_width", 1)?;
-    options.set_item("logits_dtype", dtype)?;
-    let decode = py
-        .import("uniserve_worker.storage.decode_state")?
-        .getattr("DecodeState")?
-        .call_method("buffers", (), Some(&options))?;
     let mut elements = 0;
     let mut scales = 0;
     for group in planes.getattr("groups")?.try_iter()? {

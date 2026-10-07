@@ -1,26 +1,29 @@
 //! Numerical invocation order, stream dependencies and result observations.
 //!
-//! Python supplies row packing and numerical forwards. A failed invocation
+//! Rust prepares native rows; Python supplies numerical tensor operations. A failed invocation
 //! joins any submitted input copies or model kernels before its caller can
 //! retire the borrowed request storage.
 
 use std::time::Instant;
 
 use super::ModelExecutor;
-use pyo3::exceptions::{PyException, PyRuntimeError};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::PyTuple;
 use std::sync::Arc;
+use uniserve_worker::TokenSelection;
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
 use crate::calls::Call;
-use crate::ids::CallId;
 use crate::stats::ForwardStats;
 
 use super::super::events::CUDAEvent;
 use super::super::host::with_context;
 use super::super::model_results::ExecutionOutput;
 use super::super::stream::CUDAStream;
+use crate::worker::error::model_failure;
+use crate::worker::input_buffers::InputBuffers;
+use crate::worker::model_inputs::{InputBatch, InputRow, TokenRow};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_batch<'py>(
@@ -37,8 +40,7 @@ pub(super) fn run_batch<'py>(
     super::modules::ensure_open(owner)?;
 
     let started = Instant::now();
-    let mode = rows.get_item(0)?.getattr("forward_mode")?;
-    let kind: CallKind = pythonize::depythonize(&mode)?;
+    let kind = rows.get_item(0)?.cast::<InputRow>()?.borrow().kind;
     let eligible = matches!(
         kind,
         CallKind::Forward(_) | CallKind::Media(MediaCall::Denoising)
@@ -51,7 +53,6 @@ pub(super) fn run_batch<'py>(
         Some(runtime.cast::<CUDAStream>()?.clone())
     };
     let cuda = py.import("torch.cuda")?;
-    let backend = py.import("uniserve_worker.execution.model_executor")?;
     let component = calls
         .get_item(0)?
         .extract::<PyRef<'_, Call>>()?
@@ -80,41 +81,21 @@ pub(super) fn run_batch<'py>(
                 None => py.import("contextlib")?.call_method0("nullcontext")?,
             };
             with_context(&scope, || {
-                let count = runner.getattr("peers")?.len()?;
-                let partitions = (0..count).map(|index| {
-                    // Whole rows give concurrent microbatches disjoint KV writes.
-                    let first = index * rows.len() / count;
-                    let last = (index + 1) * rows.len() / count;
-                    rows.get_slice(first, last)
-                });
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("cache", cache)?;
-                kwargs.set_item("tables", tables)?;
-                kwargs.set_item("states", states)?;
-                backend
-                    .call_method(
-                        "_prepare_inputs",
-                        (runner, rows, PyTuple::new(py, partitions)?),
-                        Some(&kwargs),
-                    )?
-                    .extract::<(Bound<'_, PyTuple>, Bound<'_, PyAny>, bool)>()
+                prepare_inputs(runner, rows, kind, cache, tables, states)
             })
         })();
         let (batches, slots, borrow) = match prepared {
             Ok(value) => value,
             Err(error) => {
                 join_failure(py, stream.as_ref(), &cuda, &device, None)?;
-                return Err(classify(py, error, "_input_failure", &mode, calls));
+                return Err(model_failure(py, error, true, kind, calls));
             }
         };
 
         let mut completed = None;
         let executed = (|| {
             let (output, tokens) = super::dispatch::run(runner, &batches, eligible, borrow)?;
-            backend.call_method1(
-                "_validate_outputs",
-                (output.borrow(py).values.bind(py), rows, &device),
-            )?;
+            output.borrow(py).validate(rows, &device)?;
 
             completed = record(py, stream.as_ref(), &cuda, &device)?;
             let elapsed = started.elapsed().as_micros() as u64;
@@ -158,10 +139,81 @@ pub(super) fn run_batch<'py>(
             Ok(output) => Ok(output),
             Err(error) => {
                 join_failure(py, stream.as_ref(), &cuda, &device, completed)?;
-                Err(classify(py, error, "_execution_failure", &mode, calls))
+                Err(model_failure(py, error, false, kind, calls))
             }
         }
     })
+}
+
+/// Partition whole request rows into independent numerical buffers. Empty peers
+/// retain their position so every AFD microbatch keeps the collective sequence.
+fn prepare_inputs<'py>(
+    runner: &Bound<'py, PyAny>,
+    rows: &Bound<'py, PyTuple>,
+    kind: CallKind,
+    cache: &Bound<'py, PyAny>,
+    tables: &Bound<'py, PyAny>,
+    states: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyAny>, bool)> {
+    let py = runner.py();
+    let peers = runner.getattr("peers")?.cast_into::<PyTuple>()?;
+    if !runner
+        .getattr("execution")?
+        .getattr("microbatches")?
+        .is_none()
+    {
+        runner
+            .getattr("input_buffers")?
+            .cast::<InputBuffers>()?
+            .borrow()
+            .validate(rows)?;
+    }
+    let mut batches = Vec::with_capacity(peers.len());
+    let mut slots = Vec::new();
+    for (index, peer) in peers.iter().enumerate() {
+        let first = index * rows.len() / peers.len();
+        let last = (index + 1) * rows.len() / peers.len();
+        if first == last {
+            batches.push(py.None());
+            continue;
+        }
+        let buffers = peer.getattr("input_buffers")?.cast_into::<InputBuffers>()?;
+        let batch = InputBuffers::prepare(
+            &buffers,
+            &rows.get_slice(first, last),
+            kind,
+            None,
+            (!cache.is_none()).then_some(cache),
+            (!tables.is_none()).then_some(tables),
+            (!states.is_none()).then_some(states),
+        )?;
+        let batch = batch.cast_bound::<InputBatch>(py)?;
+        slots.push(batch.borrow().request_pool_indices.clone_ref(py));
+        batches.push(batch.clone().into_any().unbind());
+    }
+    let slots = if peers.len() == 1 {
+        slots
+            .pop()
+            .ok_or_else(|| PyRuntimeError::new_err("numerical call has no input rows"))?
+            .into_bound(py)
+    } else {
+        py.import("torch")?
+            .call_method1("cat", (PyTuple::new(py, slots)?,))?
+    };
+
+    let mut borrow = true;
+    for row in rows {
+        let Ok(row) = row.cast::<TokenRow>() else {
+            borrow = false;
+            break;
+        };
+        let row = row.borrow();
+        if row.query_tokens(py)? != 1 || row.selection != Some(TokenSelection::LastLogits) {
+            borrow = false;
+            break;
+        }
+    }
+    Ok((PyTuple::new(py, batches)?, slots, borrow))
 }
 
 fn record<'py>(
@@ -197,50 +249,4 @@ fn join_failure<'py>(
         event.borrow(py).wait(py, Some(&current))?;
     }
     Ok(())
-}
-
-fn classify(
-    py: Python<'_>,
-    error: PyErr,
-    operation: &str,
-    mode: &Bound<'_, PyAny>,
-    calls: &Bound<'_, PyTuple>,
-) -> PyErr {
-    if !error.is_instance_of::<PyException>(py) {
-        return error;
-    }
-
-    let classified = (|| {
-        // Request coordinates are only needed on failure, never for a successful
-        // numerical invocation. Read the native calls without Python field walks.
-        let keys = calls
-            .iter()
-            .map(|call| {
-                let call = call.extract::<PyRef<'_, Call>>()?;
-                let request = call.inner.request_key;
-                Ok((
-                    request.engine_id,
-                    request.request_id.0,
-                    request.request_epoch,
-                    Py::new(
-                        py,
-                        CallId {
-                            inner: call.inner.call_id,
-                        },
-                    )?,
-                ))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        py.import("uniserve_worker.execution.model_executor")?
-            .call_method1(operation, (error.value(py), mode, PyTuple::new(py, keys)?))
-    })();
-    match classified {
-        Ok(value) if value.is(error.value(py)) => error,
-        Ok(value) => {
-            let classified = PyErr::from_value(value);
-            classified.set_cause(py, Some(error));
-            classified
-        }
-        Err(classification) => classification,
-    }
 }

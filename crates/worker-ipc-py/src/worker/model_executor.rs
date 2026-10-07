@@ -2,7 +2,7 @@
 
 mod binding;
 mod diffusion;
-mod discovery;
+pub(super) mod discovery;
 mod dispatch;
 mod encoders;
 mod execute;
@@ -10,6 +10,7 @@ mod experts;
 mod forward;
 mod graphs;
 mod inputs;
+mod kernel_records;
 mod modules;
 mod outputs;
 mod resources;
@@ -29,11 +30,12 @@ use uniserve_worker_ipc::{CallKind, MediaCall};
 use crate::calls::Call;
 
 use super::config::WorkerConfig;
+use super::error::input_error;
 use super::execution::Execution;
 use super::graph_storage::GraphStorage;
 use super::host::{HostLane, with_context};
 use super::model_results::ExecutionOutput;
-use modules::{Module, ensure_open, input_error};
+use modules::{Module, ensure_open};
 
 /// One rank's model bindings, numerical executions and their resource lifetime.
 /// Tensor construction and model mathematics remain in the numerical backend.
@@ -60,7 +62,7 @@ pub(crate) struct ModelExecutor {
     #[pyo3(get)]
     pub(super) image_builder: Py<PyAny>,
     #[pyo3(get)]
-    pub(super) media_builder: Py<PyAny>,
+    pub(super) media_builder: Option<Py<super::media_inputs::MediaBuilder>>,
     #[pyo3(get)]
     text: Py<PyAny>,
     #[pyo3(get)]
@@ -84,7 +86,7 @@ pub(crate) struct ModelExecutor {
     #[pyo3(get)]
     pub(super) latent_pool: Py<PyAny>,
     #[pyo3(get)]
-    pub(super) canvas_slots: Py<PyAny>,
+    pub(super) canvas_slots: Option<Py<super::canvas_slots::CanvasSlots>>,
     #[pyo3(get)]
     pub(super) noise_draws: Option<Py<HostLane>>,
     #[pyo3(get)]
@@ -98,7 +100,7 @@ pub(crate) struct ModelExecutor {
     pub(super) flow_captures: Py<PyTuple>,
     flow_cfg_branches: Vec<usize>,
     table_widths: Vec<usize>,
-    kernels: Py<PyAny>,
+    kernels: kernel_records::KernelRecords,
     kernel_choices: usize,
 
     inner: NativeModelRunners<Py<PyAny>>,
@@ -109,7 +111,7 @@ pub(crate) struct ModelExecutor {
     closed: bool,
     #[pyo3(get)]
     sealed: bool,
-    diffusion: Option<Py<PyAny>>,
+    diffusion: Option<Py<super::model_runner::DiffusionRunner>>,
     diffusion_layouts: Option<Py<PyDict>>,
     exchanges: Vec<Py<PyAny>>,
     expert_executions: Vec<Py<Execution>>,
@@ -122,8 +124,8 @@ pub(crate) struct ModelExecutor {
 impl ModelExecutor {
     /// Standalone media denoising is distinct from KV-conditioned image batches.
     #[getter]
-    pub(super) fn denoises(&self, py: Python<'_>) -> bool {
-        !self.media_builder.is_none(py) && self.modules.values().any(|module| module.denoiser)
+    pub(super) fn denoises(&self) -> bool {
+        self.media_builder.is_some() && self.modules.values().any(|module| module.denoiser)
     }
 
     /// Borrow request storage before constructing the standalone denoiser.
@@ -153,7 +155,10 @@ impl ModelExecutor {
             .map(|runner| runner.clone_ref(py))
     }
 
-    pub(super) fn bind_canvas_slots(slf: &Bound<'_, Self>, slots: Py<PyAny>) -> PyResult<()> {
+    pub(super) fn bind_canvas_slots(
+        slf: &Bound<'_, Self>,
+        slots: Py<super::canvas_slots::CanvasSlots>,
+    ) -> PyResult<()> {
         let py = slf.py();
         let runner = slf.borrow().canvas_runner(py).ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("this rank runs no token denoising")
@@ -161,21 +166,24 @@ impl ModelExecutor {
         for peer in runner.bind(py).getattr("peers")?.try_iter()? {
             peer?.call_method1("bind_canvas_slots", (&slots,))?;
         }
-        slf.borrow_mut().canvas_slots = slots;
+        slf.borrow_mut().canvas_slots = Some(slots);
         Ok(())
     }
 
-    pub(super) fn diffusion_entry(&self, py: Python<'_>, call: &Call) -> PyResult<Py<PyAny>> {
+    pub(super) fn diffusion_entry(
+        &self,
+        py: Python<'_>,
+        call: &Call,
+    ) -> PyResult<Py<super::model_runner::DiffusionRunner>> {
         let runner = self
             .inner
             .get(&call.inner.component, CallKind::Media(MediaCall::Denoising));
-        let class = py
-            .import("uniserve_worker.model_executor.diffusion_runner")?
-            .getattr("DiffusionRunner")?;
         if let Some(runner) = runner
-            && runner.bind(py).is_instance(&class)?
+            && let Ok(runner) = runner
+                .bind(py)
+                .cast::<super::model_runner::DiffusionRunner>()
         {
-            return Ok(runner.clone_ref(py));
+            return Ok(runner.clone().unbind());
         }
         Err(crate::worker::error::invalid(
             py,
@@ -305,7 +313,7 @@ impl ModelExecutor {
     }
 
     pub(super) fn warmup(slf: &Bound<'_, Self>, storage: &Bound<'_, PyAny>) -> PyResult<()> {
-        if !slf.borrow().media_builder.is_none(slf.py()) {
+        if slf.borrow().media_builder.is_some() {
             let media = slf.py().import("uniserve_worker.execution.media")?;
             media.call_method1("prepare_denoising", (slf, storage))?;
             encoders::prepare(slf)?;
@@ -462,10 +470,7 @@ impl ModelExecutor {
     ) -> PyResult<Py<PyAny>> {
         ensure_open(slf)?;
         let module = slf.borrow().module(slf.py(), name, method, path)?;
-        let key = slf
-            .py()
-            .import("uniserve_worker.model_executor.cuda_graph")?
-            .call_method1("input_signature", (size,))?;
+        let key = super::cuda_graph::input_signature(size)?;
         module.prepare(slf, size, &key).map(Bound::unbind)
     }
 
@@ -501,9 +506,7 @@ impl ModelExecutor {
         let module = slf.borrow().module(py, name, method, path)?;
         let none = py.None().into_bound(py);
         let size = size.unwrap_or(&none);
-        let key = py
-            .import("uniserve_worker.model_executor.cuda_graph")?
-            .call_method1("input_signature", (size,))?;
+        let key = super::cuda_graph::input_signature(size)?;
         with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
             let runner = module.prepare(slf, size, &key)?;
             let rank: usize = Arc::clone(&slf.borrow().config).rank;
@@ -583,7 +586,9 @@ impl ModelExecutor {
     }
 
     #[getter]
-    pub(super) fn diffusion<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+    pub(super) fn diffusion<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<Bound<'py, super::model_runner::DiffusionRunner>> {
         diffusion::runner(slf)
     }
 
@@ -600,11 +605,11 @@ impl ModelExecutor {
 
     pub(super) fn run_denoising(
         slf: &Bound<'_, Self>,
-        ladder: &Bound<'_, PyAny>,
+        sequence: &Bound<'_, super::model_runner::DenoisingSequence>,
         index: usize,
         bank: i64,
     ) -> PyResult<Py<ExecutionOutput>> {
-        diffusion::run(slf, ladder, index, bank)
+        diffusion::run(slf, sequence, index, bank)
     }
 
     fn prepare_denoising(slf: &Bound<'_, Self>, storage: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -788,7 +793,6 @@ impl ModelExecutor {
         visit.call(&self.diffusion_bank)?;
         visit.call(&self.graph_storage)?;
         visit.call(&self.flow_captures)?;
-        visit.call(&self.kernels)?;
         for runner in self.inner.iter() {
             visit.call(runner)?;
         }
@@ -822,7 +826,7 @@ impl ModelExecutor {
         self.processor = py.None();
         self.flow_prompt = py.None();
         self.image_builder = py.None();
-        self.media_builder = py.None();
+        self.media_builder = None;
         self.text = py.None();
         self.video_decoder = py.None();
         self.audio_decoder = py.None();
@@ -833,9 +837,9 @@ impl ModelExecutor {
         self.kv_cache = py.None();
         self.expert_weights = py.None();
         self.latent_pool = py.None();
-        self.canvas_slots = py.None();
+        self.canvas_slots = None;
         self.noise_draws = None;
-        self.kernels = py.None();
+        self.kernels = kernel_records::KernelRecords::default();
         self.outputs = py.None();
         self.declarations = PyDict::new(py).unbind();
         self.diffusion_bank = PyDict::new(py).unbind();
@@ -857,7 +861,12 @@ impl ModelExecutor {
 }
 
 pub(super) fn execution<'py>(runner: &Bound<'py, PyAny>) -> PyResult<Bound<'py, Execution>> {
-    Ok(runner.getattr("execution")?.cast_into()?)
+    Ok(runner
+        .cast::<super::model_runner::ModelRunner>()?
+        .borrow()
+        .execution
+        .bind(runner.py())
+        .clone())
 }
 
 pub(super) fn context<'py>(runner: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
@@ -997,7 +1006,7 @@ impl ModelExecutor {
             .collect();
         runners.extend(slf.borrow().prepared(py)?.iter());
         if let Some(diffusion) = &slf.borrow().diffusion {
-            runners.push(diffusion.bind(py).clone());
+            runners.push(diffusion.bind(py).clone().into_any());
         }
         PyTuple::new(py, runners)
     }
@@ -1020,5 +1029,17 @@ impl ModelExecutor {
     pub(super) fn set_config(&mut self, py: Python<'_>, config: Py<WorkerConfig>) {
         self.config = Arc::clone(&config.borrow(py).inner);
         self.worker_config = config;
+    }
+}
+
+impl ModelExecutor {
+    pub(super) fn media_inputs<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, super::media_inputs::MediaBuilder>> {
+        self.media_builder
+            .as_ref()
+            .map(|builder| builder.bind(py).clone())
+            .ok_or_else(|| input_error(py, "rank has no media input builder"))
     }
 }

@@ -3,14 +3,45 @@
 import pytest
 import torch
 
-from uniserve.distributed import Communicator
+from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.model import ComponentEntry, Encoder, EntryPoint
 from uniserve_worker.bootstrap.components import validate_components
-from uniserve_worker.config.deployment import ComponentConfig
+from uniserve_worker.config.deployment import (
+    ComponentConfig,
+    ParallelConfig,
+    SequenceConfig,
+)
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize(
+    "sequence,outputs",
+    (("ulysses", (5, 2)), ("allgather", (5, 4))),
+)
+def test_pipeline_routing_keeps_sequence_shards_and_one_tensor_replica(
+    sequence, outputs
+):
+    config = ComponentConfig(
+        (7, 0, 6, 1, 5, 2, 4, 3),
+        ParallelConfig(2, 2, SequenceConfig(sequence, (2,))),
+    )
+    binding = ComponentBinding(
+        "text",
+        config,
+        Communicator(ranks=tuple(range(8))),
+        DeviceMesh(
+            ranks=config.ranks,
+            rank=0,
+            shape=tuple(size for _, size in config.parallel_config.dimensions),
+            axes=tuple(axis for axis, _ in config.parallel_config.dimensions),
+        ),
+        torch.device("cpu"),
+    )
+    assert binding.input_ranks == (7, 0, 6, 1)
+    assert binding.output_ranks == outputs
 
 
 @pytest.mark.parametrize("rank", (0, 1))

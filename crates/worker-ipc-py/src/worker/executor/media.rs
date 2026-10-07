@@ -3,14 +3,16 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PySlice, PyTuple};
+use pyo3::types::{PyDict, PySlice, PyTuple};
 use uniserve_worker_ipc::{CallKind, MediaCall, TensorTransfer, TransferHandle, TransferTransport};
 
 use super::{BatchState, PythonBackend};
 use crate::worker::error::invalid;
 use crate::worker::host::HostTask;
 use crate::worker::locator::Locator;
-use crate::worker::media::{HostTensors, MediaTask, MuxSession, read_units};
+use crate::worker::media::{
+    HostTensors, MediaTask, MuxSession, host_array, read_encoded_unit, read_units,
+};
 use crate::worker::request::Request;
 use crate::worker::shared_buffer::SharedRead;
 use crate::worker::storage::{Buffer, TensorRead};
@@ -103,22 +105,15 @@ impl PythonBackend {
             return Err(invalid(py, "media reading requires one reserved host task"));
         }
 
-        let model = self.model_runner.bind(py);
+        let model = self.model_runner.borrow(py).model.bind(py).clone();
         let library = py.import("uniserve.model")?;
-        let loading = py.import("uniserve_worker.bootstrap.inputs")?;
-        let vision = loading.call_method1(
-            "capability",
-            (
-                { model.borrow().model.bind(py).clone() },
-                library.getattr("PatchEncoder")?,
-            ),
+        let vision = crate::worker::model_executor::discovery::inputs::capability(
+            &model,
+            &library.getattr("PatchEncoder")?,
         )?;
-        let audio = loading.call_method1(
-            "capability",
-            (
-                { model.borrow().model.bind(py).clone() },
-                library.getattr("AudioEncoder")?,
-            ),
+        let audio = crate::worker::model_executor::discovery::inputs::capability(
+            &model,
+            &library.getattr("AudioEncoder")?,
         )?;
         if vision.is_none() || audio.is_none() {
             return Err(invalid(py, "media reading requires the condition encoders"));
@@ -160,10 +155,7 @@ impl PythonBackend {
 
         options.set_item("vision", vision)?;
         options.set_item("sample_rate", audio.getattr("sample_rate")?)?;
-        options.set_item(
-            "ffmpeg",
-            { model.borrow().worker_config.bind(py).clone() }.getattr("ffmpeg")?,
-        )?;
+        options.set_item("ffmpeg", &self.model_runner.borrow(py).config.ffmpeg)?;
 
         let conditions = video.getattr("conditions")?;
         let function = py
@@ -296,9 +288,7 @@ impl PythonBackend {
                     let expected = frames.get_item(unit)?.extract::<usize>()? * height * width * 3;
                     let source = if let Some(imported) = &imported {
                         let value = imported.bind(py).get_item(position)?;
-                        let array = py
-                            .import("uniserve_worker.media.mux")?
-                            .call_method1("host_array", (value,))?;
+                        let array = host_array(&value)?;
                         if array.len()? < expected {
                             return Err(invalid(
                                 py,
@@ -355,9 +345,7 @@ impl PythonBackend {
                             return Err(invalid(py, "audio encoding requires one PCM input"));
                         }
                         let inputs = self.media_inputs(py, batch, index, 0..1)?;
-                        let array = py
-                            .import("uniserve_worker.media.mux")?
-                            .call_method1("host_array", (&inputs[0],))?;
+                        let array = host_array(inputs[0].bind(py))?;
                         let pcm = array
                             .call_method1("view", (py.import("numpy")?.getattr("int16")?,))?
                             .unbind();
@@ -379,18 +367,12 @@ impl PythonBackend {
                             } else {
                                 let values =
                                     self.media_inputs(py, batch, index, input..input + 1)?;
-                                let codec = py.import("uniserve_worker.media.mux")?;
                                 for row in values[0]
                                     .bind(py)
                                     .call_method1("unbind", (0,))?
                                     .try_iter()?
                                 {
-                                    units.push(
-                                        codec
-                                            .call_method1("read_encoded_unit", (row?,))?
-                                            .cast_into::<PyBytes>()?
-                                            .unbind(),
-                                    );
+                                    units.push(read_encoded_unit(&row?)?);
                                 }
                             }
                         }

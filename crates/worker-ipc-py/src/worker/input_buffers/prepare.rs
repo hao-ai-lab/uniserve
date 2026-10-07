@@ -7,9 +7,11 @@ use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
 use super::{InputBuffers, copy, fill, numerical, prefix};
 use crate::worker::block_tables::pages_to_py;
+use crate::worker::decode_state::DecodeState;
+use crate::worker::model_inputs::{CanvasStepRow, InputBatch, InputRow, Row, TokenRow};
 
 impl InputBuffers {
-    pub(super) fn validate(&self, rows: &Bound<'_, PyTuple>) -> PyResult<()> {
+    pub(in crate::worker) fn validate(&self, rows: &Bound<'_, PyTuple>) -> PyResult<()> {
         self.open()?;
         if rows.is_empty() || rows.len() > self.max_rows {
             return Err(PyValueError::new_err(
@@ -18,13 +20,28 @@ impl InputBuffers {
         }
         let mut tokens = 0;
         for row in rows {
-            if !row.is_instance(self.row_types.bind(rows.py()))? {
+            let row = Row::borrow(&row)?;
+            let matches = match (&row, self.kind) {
+                (Row::Token(_), CallKind::Forward(mode)) => mode != ForwardMode::TokenDenoising,
+                (
+                    Row::Canvas(_) | Row::CanvasStep(_),
+                    CallKind::Forward(ForwardMode::TokenDenoising),
+                ) => true,
+                (Row::Diffusion(_), CallKind::Media(MediaCall::Denoising)) => true,
+                (
+                    Row::Vision(_),
+                    CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding),
+                ) => true,
+                (Row::Decode(_), CallKind::Media(MediaCall::ImageDecoding)) => true,
+                _ => false,
+            };
+            if !matches {
                 return Err(PyTypeError::new_err(
                     "input rows do not match this computation",
                 ));
             }
             if !self.table_widths.is_empty() {
-                tokens += row.getattr("query_tokens")?.extract::<usize>()?;
+                tokens += row.query_tokens(rows.py())?;
             }
         }
         if tokens > self.max_tokens {
@@ -41,10 +58,10 @@ impl InputBuffers {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn prepare(
+    pub(in crate::worker) fn prepare(
         slf: &Bound<'_, Self>,
         rows: &Bound<'_, PyTuple>,
-        forward_mode: &Bound<'_, PyAny>,
+        mode: CallKind,
         attention: Option<&Bound<'_, PyAny>>,
         cache: Option<&Bound<'_, PyAny>>,
         tables: Option<&Bound<'_, PyAny>>,
@@ -52,17 +69,17 @@ impl InputBuffers {
     ) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         slf.borrow().validate(rows)?;
-        let mode = pythonize::depythonize::<CallKind>(forward_mode)?;
         let mut slots = Vec::with_capacity(rows.len());
         for row in rows {
-            let kind = pythonize::depythonize::<CallKind>(&row.getattr("forward_mode")?)?;
+            let row = row.cast::<InputRow>()?.borrow();
+            let kind = row.kind;
             if kind != mode && !matches!((kind, mode), (CallKind::Forward(_), CallKind::Forward(_)))
             {
                 return Err(PyValueError::new_err(
                     "one input call requires homogeneous computations",
                 ));
             }
-            slots.push(row.getattr("request_pool_idx")?.extract::<i64>()?);
+            slots.push(i64::from(row.request_pool_idx));
         }
         let (ring, requests, kind) = {
             let owner = slf.borrow();
@@ -78,17 +95,14 @@ impl InputBuffers {
         ring.borrow(py).record_copy(py, slot)?;
 
         let functions = numerical(py)?;
-        let mut selections = PyTuple::empty(py);
+        let mut selections = Vec::new();
         let mut finish = py.None();
         let inputs = match kind {
             CallKind::Forward(ForwardMode::TokenDenoising) => {
-                let class = py
-                    .import("uniserve_worker.model_executor.input_batch")?
-                    .getattr("CanvasStepRow")?;
                 let steps = rows
                     .iter()
-                    .map(|row| row.is_instance(&class))
-                    .collect::<PyResult<Vec<_>>>()?;
+                    .map(|row| row.is_instance_of::<CanvasStepRow>())
+                    .collect::<Vec<_>>();
                 if steps.iter().any(|value| *value) && !steps.iter().all(|value| *value) {
                     return Err(PyValueError::new_err(
                         "one canvas call contains readout rows or canvas steps",
@@ -102,12 +116,14 @@ impl InputBuffers {
                 }
             }
             CallKind::Forward(_) => {
-                selections = PyTuple::new(
-                    py,
-                    rows.iter()
-                        .map(|row| row.getattr("selection"))
-                        .collect::<PyResult<Vec<_>>>()?,
-                )?;
+                selections = rows
+                    .iter()
+                    .map(|row| {
+                        row.cast::<TokenRow>()?.borrow().selection.ok_or_else(|| {
+                            PyValueError::new_err("text input requires an output selection")
+                        })
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
                 finish = Self::finish_column(slf, rows)?;
                 Self::tokens(slf, rows, attention, cache, tables, states)?
             }
@@ -125,25 +141,33 @@ impl InputBuffers {
             }
             _ => unreachable!("construction selects a buffered computation"),
         };
-        Ok(py
-            .import("uniserve_worker.model_executor.input_batch")?
-            .call_method1(
-                "InputBatch",
-                (forward_mode, inputs, requests, selections, finish),
-            )?
-            .unbind())
+        Ok(Py::new(
+            py,
+            InputBatch::build(
+                py,
+                mode,
+                inputs,
+                requests.unbind(),
+                selections,
+                if finish.is_none(py) {
+                    None
+                } else {
+                    Some(finish)
+                },
+            )?,
+        )?
+        .into_any())
     }
 
     fn finish_column(slf: &Bound<'_, Self>, rows: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         let mut values = Vec::with_capacity(rows.len());
         for row in rows {
-            if row.getattr("decode_predicate")?.is_none()
-                || !row.getattr("decode_predicate_tagged")?.is_truthy()?
-            {
+            let row = row.cast::<TokenRow>()?.borrow();
+            if row.decode_predicate.is_none() || !row.decode_predicate_tagged {
                 return Ok(py.None());
             }
-            values.push(u8::from(row.getattr("decode_force_finish")?.is_truthy()?));
+            values.push(u8::from(row.decode_force_finish));
         }
         let (ring, destination) = {
             let owner = slf.borrow();
@@ -179,36 +203,31 @@ impl InputBuffers {
         let py = slf.py();
         let indexed = rows
             .iter()
-            .map(|row| row.getattr("request_indexed_decode")?.is_truthy())
+            .map(|row| Ok(row.cast::<TokenRow>()?.borrow().request_indexed_decode))
             .collect::<PyResult<Vec<_>>>()?;
         let mut resolved = rows.clone();
         if indexed.iter().any(|value| *value) {
             let invalid =
                 || PyValueError::new_err("indexed decode requires valid resident request slots");
             let states = states.ok_or_else(invalid)?;
-            let capacity = states.getattr("request_pool_size")?.extract::<i64>()?;
+            let resident = states.cast::<DecodeState>()?.borrow();
+            let capacity = resident.request_pool_size as i64;
             for (row, indexed) in rows.iter().zip(&indexed) {
                 if !indexed {
                     continue;
                 }
-                let kind = pythonize::depythonize::<CallKind>(&row.getattr("forward_mode")?)?;
-                let slot = row.getattr("request_pool_idx")?.extract::<i64>()?;
-                let views = [
-                    "token_ids",
-                    "positions",
-                    "token_embeddings",
-                    "token_embedding_mask",
-                ];
-                if kind != CallKind::Forward(ForwardMode::Decode)
+                let row = row.cast::<TokenRow>()?.borrow();
+                let attention = row.as_super();
+                let input = attention.as_super();
+                let slot = i64::from(input.request_pool_idx);
+                if input.kind != CallKind::Forward(ForwardMode::Decode)
                     || slot <= 0
                     || slot > capacity
-                    || row.getattr("selection")?.is_none()
-                    || views
-                        .into_iter()
-                        .map(|name| row.getattr(name).map(|value| !value.is_none()))
-                        .collect::<PyResult<Vec<_>>>()?
-                        .into_iter()
-                        .any(|value| value)
+                    || row.selection.is_none()
+                    || row.token_ids.is_some()
+                    || attention.positions.is_some()
+                    || row.token_embeddings.is_some()
+                    || row.token_embedding_mask.is_some()
                 {
                     return Err(invalid());
                 }
@@ -220,7 +239,7 @@ impl InputBuffers {
             {
                 let device = slf.borrow().device.clone_ref(py);
                 if device.bind(py).getattr("type")?.extract::<String>()? == "cuda"
-                    && states.getattr("device")?.eq(device.bind(py))?
+                    && resident.device.bind(py).eq(device.bind(py))?
                     && tables
                         .getattr("unit_tables")?
                         .getattr("device")?

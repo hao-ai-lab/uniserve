@@ -6,18 +6,16 @@
 //! or, with a [`ComponentDistribution`], runs an independent local instance on
 //! every rank and deals independent units among them.
 //!
-//! These types describe the layout only. [`SequenceParallel::size`] and
-//! [`ParallelConfig::world_size`] reject zero degrees and overflow, but the
-//! agreement between a component's ranks and its degrees is checked by
-//! `WorkerConfig::validate_members` in the engine, by `WorkerInfo::validate`
-//! in the worker IPC crate, and by the Python mirror's `ComponentConfig` in
-//! `uniserve_worker.config.deployment`. The same shape crosses the worker
-//! boundary as the flatbuffer `ParallelConfig` and `ComponentInfo` tables.
+//! [`ComponentConfig::validate`] checks membership and parallel degrees for
+//! launch, worker registration and Python callers. Process-world bounds belong
+//! to the owner of that world. The same configuration crosses worker IPC as
+//! the flatbuffer `ParallelConfig` and `ComponentInfo` tables.
+
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-/// Invalid parallel degrees: a zero degree or a degree product that overflows
-/// `usize`.
+/// Invalid component membership or parallel degrees.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct ParallelConfigError(pub &'static str);
@@ -61,6 +59,20 @@ pub enum SequenceParallel {
 }
 
 impl SequenceParallel {
+    /// Context ranks precede the Ulysses ranks, which vary fastest.
+    pub fn dimensions(&self) -> [(&'static str, usize); 2] {
+        let (context, ulysses) = match *self {
+            Self::Local => (1, 1),
+            Self::Ulysses { ulysses_degree } => (1, ulysses_degree),
+            Self::Allgather { allgather_degree } => (allgather_degree, 1),
+            Self::Hybrid {
+                ulysses_degree,
+                allgather_degree,
+            } => (allgather_degree, ulysses_degree),
+        };
+        [("cp", context), ("ulysses", ulysses)]
+    }
+
     /// Derives sequence degree from the selected strategy's independent dimensions.
     ///
     /// # Errors
@@ -114,6 +126,17 @@ impl Default for ParallelConfig {
 }
 
 impl ParallelConfig {
+    /// Row-major rank order shared by placement, numerical meshes and routing.
+    pub fn dimensions(&self) -> [(&'static str, usize); 4] {
+        let [context, ulysses] = self.sequence_parallel.dimensions();
+        [
+            ("pp", self.pipeline_parallel_size),
+            context,
+            ("tp", self.tensor_parallel_size),
+            ulysses,
+        ]
+    }
+
     /// Returns the rank count one model-parallel group needs: the product of
     /// the tensor, pipeline, and sequence degrees.
     ///
@@ -148,9 +171,8 @@ pub enum ComponentDistribution {
 ///
 /// Without a `distribution`, `ranks` form one model-parallel group and must
 /// number exactly `parallel_config.world_size()`. With a distribution, the
-/// parallel world size must be one. `WorkerConfig::validate_members` in the
-/// engine and `WorkerInfo::validate` in the worker IPC crate enforce both
-/// rules in Rust; this type does not.
+/// parallel world size must be one. Call [`Self::validate`] after parsing and
+/// before using the rank-selection methods.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentConfig {
@@ -170,6 +192,62 @@ pub struct ComponentConfig {
 }
 
 impl ComponentConfig {
+    /// Check a component's membership and its independent parallel degrees.
+    /// Process-world bounds are checked by the caller that owns that world.
+    pub fn validate(&self) -> Result<(), ParallelConfigError> {
+        if self.ranks.is_empty()
+            || self.ranks.iter().collect::<HashSet<_>>().len() != self.ranks.len()
+        {
+            return Err(ParallelConfigError(
+                "component ranks must be unique and non-empty",
+            ));
+        }
+        if self.units_per_rank == 0 {
+            return Err(ParallelConfigError("units_per_rank must be positive"));
+        }
+
+        let degree = self.parallel_config.world_size()?;
+        if self.distribution.is_some() {
+            if degree != 1 {
+                return Err(ParallelConfigError(
+                    "temporal unit distribution requires local decoder parallelism",
+                ));
+            }
+        } else if degree != self.ranks.len() {
+            return Err(ParallelConfigError(
+                "component membership must equal TP × sequence × pipeline degrees",
+            ));
+        }
+        Ok(())
+    }
+
+    /// First pipeline-stage input ranks, in component order.
+    pub fn input_ranks(&self) -> &[usize] {
+        if self.distribution.is_some() {
+            &self.ranks
+        } else {
+            &self.ranks[..self.ranks.len() / self.parallel_config.pipeline_parallel_size]
+        }
+    }
+
+    /// Final-stage output ranks with tensor replicas counted once.
+    pub fn output_ranks(&self) -> Vec<usize> {
+        if self.distribution.is_some() {
+            return self.ranks.clone();
+        }
+        let stage = self.ranks.len() / self.parallel_config.pipeline_parallel_size;
+        let ulysses = self.parallel_config.sequence_parallel.dimensions()[1].1;
+        self.ranks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &rank)| {
+                (index >= self.ranks.len() - stage
+                    && (index / ulysses).is_multiple_of(self.parallel_config.tensor_parallel_size))
+                .then_some(rank)
+            })
+            .collect()
+    }
+
     /// Builds an undistributed component that runs `parallel_config` over
     /// `ranks`.
     pub fn parallel(ranks: Vec<usize>, parallel_config: ParallelConfig) -> Self {

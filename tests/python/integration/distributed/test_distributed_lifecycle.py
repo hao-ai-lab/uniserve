@@ -46,6 +46,19 @@ def _construction_scope(rank, directory, outcome):
                     value = torch.tensor([rank + 1])
                     dist.all_reduce(value)
                     assert value.item() == 3
+
+                    # A nested owner borrows this world. Closing its own scope
+                    # must leave the enclosing caller's collective usable.
+                    with initialize_process_groups(
+                        rank=rank,
+                        local_rank=rank,
+                        world_size=2,
+                        device="cpu",
+                    ):
+                        borrowed = torch.tensor([rank + 1])
+                        dist.all_reduce(borrowed)
+                        assert borrowed.item() == 3
+                    assert dist.is_initialized()
             except RuntimeError as error:
                 if outcome == "body_error":
                     assert error is failure

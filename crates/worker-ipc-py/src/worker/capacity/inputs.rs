@@ -104,9 +104,7 @@ pub(super) fn input_buffer_config<'py>(
         max_tokens = max_tokens.min(lane.max_batch_tokens.unwrap_or(tokens));
     }
 
-    let flow = py
-        .import("uniserve_worker.bootstrap.inputs")?
-        .call_method1("image_builder", (model,))?;
+    let flow = crate::worker::model_executor::discovery::inputs::image_builder(model)?;
     let branches = if flow.is_none() {
         1
     } else {

@@ -1,36 +1,26 @@
-"""Typed worker error taxonomy.
+"""Python exception values classified by the native worker.
 
-Every worker failure is represented as a `WorkerError` carrying a stable
-``code`` (`WorkerErrorCode`), a ``message``, and ``fatal`` (whether the
-worker process is unsafe for further work and must be torn down). Worker code
-raises one directly through the constructors here, and `classify` maps any
-other exception onto the taxonomy where failures are caught (in `Service`,
-`Executor` and `ModelExecutor`).
-
-``WorkerError.to_mapping`` produces the ``WorkerResponseError`` fields that
-the native service sends to the engine. Those fields are scalars, short
-strings, and call identities, never tensors. `_POLICY`
-defines each code's default fatality and whether its log record carries a
-stack trace.
+The exception classes carry request context for Python callers. Rust owns
+classification, fatality policy and the failure path through execution and IPC.
 """
 
 from __future__ import annotations
 
-import logging
-import traceback
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
-from uniserve.runtime import EventPoolError
+from uniserve_worker._uniserve_ipc import classify_error as classify
+from uniserve_worker._uniserve_ipc import (
+    should_capture_trace as should_capture_trace,
+)
+from uniserve_worker._uniserve_ipc import worker_error_mapping
 
 if TYPE_CHECKING:
-    from uniserve_worker._uniserve_ipc import BatchState
     from uniserve_worker.protocol.identity import CallId
 
 __all__ = [
     "WorkerErrorCode",
-    "ErrorPolicy",
     "WorkerError",
     "InputError",
     "ComputeError",
@@ -67,53 +57,6 @@ class WorkerErrorCode(StrEnum):
     SCHEDULER_BUG = "SchedulerBug"
 
 
-class ErrorPolicy(NamedTuple):
-    """Define the handling policy for an error class.
-
-    Fatal errors leave the worker unsafe for further requests and require host
-    teardown; non-fatal errors fail only the offending request or call.
-    ``capture_trace`` marks errors whose log record includes a stack trace.
-
-    ``fatal`` is only a default: `_make`, the `WorkerError` subclasses, and
-    `classify` (for an exception it wraps) apply it unless the caller passes
-    ``fatal``. Constructing `WorkerError` directly does not consult the
-    policy and defaults to non-fatal.
-    """
-
-    fatal: bool
-    capture_trace: bool
-
-
-# ``capture_trace`` here is the single source for "which errors warrant a
-# traceback" so request-handling code never re-lists that set by hand.
-# `_DEFAULT_POLICY` applies to a code missing from `_POLICY`.
-_DEFAULT_POLICY = ErrorPolicy(fatal=False, capture_trace=False)
-
-_POLICY: dict[WorkerErrorCode, ErrorPolicy] = {
-    WorkerErrorCode.UNSUPPORTED_CALL: ErrorPolicy(False, False),
-    WorkerErrorCode.UNSUPPORTED_CONTROL: ErrorPolicy(False, False),
-    WorkerErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False),
-    WorkerErrorCode.UNSUPPORTED_SETUP: ErrorPolicy(False, False),
-    WorkerErrorCode.RESOURCE_LEASE_VIOLATION: ErrorPolicy(False, False),
-    WorkerErrorCode.INPUT_ERROR: ErrorPolicy(False, False),
-    WorkerErrorCode.COMPUTE_ERROR: ErrorPolicy(False, True),
-    WorkerErrorCode.RESOURCE_ERROR: ErrorPolicy(False, True),
-    WorkerErrorCode.INVARIANT_VIOLATION: ErrorPolicy(True, True),
-    WorkerErrorCode.FATAL_WORKER_FAILURE: ErrorPolicy(True, True),
-    WorkerErrorCode.SCHEDULER_BUG: ErrorPolicy(False, False),
-}
-
-
-def should_capture_trace(code: WorkerErrorCode) -> bool:
-    """Return whether an error of this class warrants a stack trace.
-
-    `uniserve_worker.profiling.record_failure` and the batch failure log in
-    `classify_batch_failure` consult this to choose between logging
-    with a traceback and a warning without one.
-    """
-    return _POLICY.get(code, _DEFAULT_POLICY).capture_trace
-
-
 @dataclass
 class WorkerError(Exception):
     """A classified worker error.
@@ -121,7 +64,7 @@ class WorkerError(Exception):
     Raise it directly or build via ``classify``. Only ``code``, ``message``,
     ``fatal``, ``phase``, ``route`` and ``calls`` cross the IPC boundary (see
     ``to_mapping``); ``req_id``, ``call_id``, ``call_kind`` and ``details``
-    stay in this process, where `record_failure` logs the first three.
+    stay in this process for diagnostic logging.
 
     Attributes:
         phase: Worker phase that failed, such as ``"batch registration"``.
@@ -155,32 +98,7 @@ class WorkerError(Exception):
 
     def to_mapping(self) -> dict[str, Any]:
         """Serialize the native error's code, message and affected calls."""
-        # Only the fields of the Rust ``WorkerResponseError`` cross the IPC
-        # boundary; richer context (req_id, call_id, call_kind, details)
-        # stays in this process.
-        return {
-            "code": str(self.code),
-            "message": self.message,
-            "fatal": bool(self.fatal),
-            "phase": self.phase,
-            "route": self.route,
-            "calls": [
-                {
-                    "request_key": {
-                        "engine_id": engine_id,
-                        "request_id": request_id,
-                        "request_epoch": request_epoch,
-                    },
-                    "call_id": call_id.to_mapping(),
-                }
-                for (
-                    engine_id,
-                    request_id,
-                    request_epoch,
-                    call_id,
-                ) in self.calls
-            ],
-        }
+        return worker_error_mapping(self)
 
 
 class InputError(WorkerError):
@@ -189,12 +107,8 @@ class InputError(WorkerError):
     def __init__(self, message: str, **kw: Any) -> None:
         """Create a request-scoped input failure.
 
-        ``fatal`` defaults to the `_POLICY` entry for ``INPUT_ERROR`` unless
-        the caller passes it; other keyword arguments set `WorkerError`
-        fields.
+        Keyword arguments attach request context; fatality defaults to false.
         """
-        policy = _POLICY[WorkerErrorCode.INPUT_ERROR]
-        kw.setdefault("fatal", policy.fatal)
         super().__init__(
             code=WorkerErrorCode.INPUT_ERROR, message=message, **kw
         )
@@ -206,12 +120,8 @@ class ComputeError(WorkerError):
     def __init__(self, message: str, **kw: Any) -> None:
         """Create a request-scoped execution failure.
 
-        ``fatal`` defaults to the `_POLICY` entry for ``COMPUTE_ERROR`` unless
-        the caller passes it; other keyword arguments set `WorkerError`
-        fields.
+        Keyword arguments attach request context; fatality defaults to false.
         """
-        policy = _POLICY[WorkerErrorCode.COMPUTE_ERROR]
-        kw.setdefault("fatal", policy.fatal)
         super().__init__(
             code=WorkerErrorCode.COMPUTE_ERROR, message=message, **kw
         )
@@ -223,79 +133,16 @@ class ResourceError(WorkerError):
     def __init__(self, message: str, **kw: Any) -> None:
         """Create a resource failure.
 
-        ``fatal`` defaults to the `_POLICY` entry for ``RESOURCE_ERROR`` unless
-        the caller passes it; other keyword arguments set `WorkerError`
-        fields.
+        Keyword arguments attach request context; fatality defaults to false.
         """
-        policy = _POLICY[WorkerErrorCode.RESOURCE_ERROR]
-        kw.setdefault("fatal", policy.fatal)
         super().__init__(
             code=WorkerErrorCode.RESOURCE_ERROR, message=message, **kw
         )
 
 
-def _make(code: WorkerErrorCode, message: str, **kw: Any) -> WorkerError:
-    """Construct a `WorkerError` whose ``fatal`` defaults to its policy.
-
-    Keyword arguments set the other `WorkerError` fields, and an explicit
-    ``fatal`` overrides the policy.
-    """
-    policy = _POLICY.get(code, _DEFAULT_POLICY)
-    kw.setdefault("fatal", policy.fatal)
-    return WorkerError(code=code, message=message, **kw)
-
-
-# OOM is recognized by name rather than by exception type: any class in the
-# exception's MRO whose lowercased name contains a type token (such as torch's
-# ``OutOfMemoryError``), or a lowercased message of any exception type that
-# contains a text token (these cover allocation failures raised as plain
-# runtime errors).
-_OOM_TYPE_TOKENS = ("outofmemory",)
-_OOM_TEXT_TOKENS = ("out of memory", "cuda oom", "cublas_status_alloc_failed")
-
-# Context-corrupting CUDA failures leave the worker unsafe for further requests
-# and require host teardown. Match their messages because the leaf exception is
-# usually a plain RuntimeError.
-_FATAL_CUDA_TEXT_TOKENS = (
-    "illegal memory access",
-    "cudaerrorillegaladdress",
-    "an illegal memory access",
-    "device-side assert",
-    "device-side assertion",
-    "cudaerrorlaunchfailure",
-    "unspecified launch failure",
-    "unrecoverable",
-    "uncorrectable ecc",
-    "misaligned address",
-)
-
-
-def _looks_like_oom(exc: BaseException, lowered_msg: str) -> bool:
-    """Return whether an exception denotes memory exhaustion.
-
-    True when a class in the exception's MRO has a name containing an
-    `_OOM_TYPE_TOKENS` entry, or when ``lowered_msg`` contains an
-    `_OOM_TEXT_TOKENS` entry.
-    """
-    for cls in type(exc).__mro__:
-        lname = cls.__name__.lower()
-        if any(tok in lname for tok in _OOM_TYPE_TOKENS):
-            return True
-    return any(tok in lowered_msg for tok in _OOM_TEXT_TOKENS)
-
-
-def _looks_like_fatal_cuda(lowered_msg: str) -> bool:
-    """Return whether a message denotes a context-corrupting CUDA failure.
-
-    ``lowered_msg`` must already be lowercased; any `_FATAL_CUDA_TEXT_TOKENS`
-    substring matches.
-    """
-    return any(tok in lowered_msg for tok in _FATAL_CUDA_TEXT_TOKENS)
-
-
 def unsupported_call(kind: str, req_id: int | None = None) -> WorkerError:
     """Create a classified error for a call kind this worker cannot run."""
-    return _make(
+    return WorkerError(
         WorkerErrorCode.UNSUPPORTED_CALL,
         f"call kind {kind!r} is not supported by this worker",
         req_id=req_id,
@@ -305,7 +152,7 @@ def unsupported_call(kind: str, req_id: int | None = None) -> WorkerError:
 
 def invalid_descriptor(message: str, **kw: Any) -> WorkerError:
     """Create a classified error for malformed scheduler or transport input."""
-    return _make(WorkerErrorCode.INVALID_DESCRIPTOR, message, **kw)
+    return WorkerError(WorkerErrorCode.INVALID_DESCRIPTOR, message, **kw)
 
 
 def unsupported_setup(message: str, **kw: Any) -> WorkerError:
@@ -314,179 +161,9 @@ def unsupported_setup(message: str, **kw: Any) -> WorkerError:
     Used for launch configuration and for missing worker resources that a
     call requires, such as request block tables.
     """
-    return _make(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
+    return WorkerError(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
 
 
 def resource_error(message: str, **kw: Any) -> ResourceError:
     """Create a classified error for exhausted or unavailable resources."""
     return ResourceError(message, **kw)
-
-
-# Ordered exception -> code rules, evaluated top to bottom; the first matching
-# predicate wins, so precedence is positional. Each predicate takes the
-# exception and its lowered message. The ordering is load-bearing:
-#   - fatal-CUDA before OOM: a context-corrupting CUDA error is FATAL even when
-#     it also mentions "out of memory" (the worker cannot serve further work).
-#   - the typed checks (EventPoolError / NotImplementedError / the standard
-#     lookup, type and value errors / AssertionError) follow the
-#     text/hierarchy heuristics, so for example a ValueError whose message
-#     mentions "out of memory" classifies as RESOURCE_ERROR.
-# An exception matching no rule falls through to ComputeError in `classify`.
-_CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
-    (
-        lambda exc, lowered: _looks_like_fatal_cuda(lowered),
-        WorkerErrorCode.FATAL_WORKER_FAILURE,
-    ),
-    (
-        lambda exc, lowered: _looks_like_oom(exc, lowered),
-        WorkerErrorCode.RESOURCE_ERROR,
-    ),
-    (
-        lambda exc, lowered: isinstance(exc, EventPoolError),
-        WorkerErrorCode.INVARIANT_VIOLATION,
-    ),
-    (
-        lambda exc, lowered: isinstance(exc, NotImplementedError),
-        WorkerErrorCode.UNSUPPORTED_CALL,
-    ),
-    # Treated as a malformed call or descriptor decoded from IPC. The rule
-    # applies wherever the exception was raised, including during execution.
-    (
-        lambda exc, lowered: isinstance(
-            exc, (KeyError, IndexError, TypeError, ValueError)
-        ),
-        WorkerErrorCode.INPUT_ERROR,
-    ),
-    (
-        lambda exc, lowered: isinstance(exc, AssertionError),
-        WorkerErrorCode.INVARIANT_VIOLATION,
-    ),
-]
-
-
-def classify(
-    exc: BaseException, *, context: str | None = None, **kw: Any
-) -> WorkerError:
-    """Map an arbitrary exception onto the taxonomy.
-
-    An already-classified ``WorkerError`` is returned as the same object:
-    each non-None ``kw`` value fills a field that is currently None, fields
-    already set are kept (always so for ``fatal``, ``calls`` and ``details``,
-    whose defaults are not None), and ``context`` is ignored.
-
-    Any other exception becomes a new error whose message is the exception
-    text (or its type name when empty), prefixed with ``"<context>: "`` when
-    ``context`` is given; the first matching `_CLASSIFY_RULES` entry picks its
-    code, ``COMPUTE_ERROR`` otherwise, and ``kw`` sets the remaining fields.
-    """
-    if isinstance(exc, WorkerError):
-        for k, v in kw.items():
-            if getattr(exc, k, None) is None and v is not None:
-                setattr(exc, k, v)
-        return exc
-
-    name = type(exc).__name__
-    msg = str(exc) or name
-    if context:
-        msg = f"{context}: {msg}"
-
-    # Rules match the context-prefixed message, not the bare exception text.
-    lowered = msg.lower()
-    code = WorkerErrorCode.COMPUTE_ERROR
-    for predicate, rule_code in _CLASSIFY_RULES:
-        if predicate(exc, lowered):
-            code = rule_code
-            break
-    if code is WorkerErrorCode.INPUT_ERROR:
-        return InputError(msg, **kw)
-    if code is WorkerErrorCode.COMPUTE_ERROR:
-        return ComputeError(msg, **kw)
-    if code is WorkerErrorCode.RESOURCE_ERROR:
-        return ResourceError(msg, **kw)
-    return _make(code, msg, **kw)
-
-
-def classify_batch_failure(
-    error: BaseException,
-    *,
-    phase: str,
-    state: BatchState,
-    committed: bool,
-) -> WorkerError:
-    """Classify and log a batch failure using the executor's commit state.
-
-    A failure after resources become visible is fatal; earlier errors follow
-    the ordinary worker error policy.
-
-    An error built from any other exception carries the coordinates of every
-    call of the batch, plus request and call identity when the batch holds
-    exactly one call. Its route is the batch's call kind (`BatchState.route`).
-    ``classify`` returns an existing ``WorkerError`` itself and fills only
-    its None-valued fields, so a route the raiser set (a model forward's
-    mode), ``calls`` and ``fatal`` stay as raised.
-    """
-    scheduled = tuple(
-        (
-            int(call.request_key.engine_id),
-            int(call.request_key.request_id),
-            int(call.request_key.request_epoch),
-            call.call_id,
-        )
-        for call in state.batch.calls
-    )
-    if committed:
-        classified = WorkerError(
-            code=WorkerErrorCode.INVARIANT_VIOLATION,
-            message=f"batch export failed after visibility began: {error}",
-            fatal=True,
-            phase="batch export",
-            route=state.route,
-            calls=scheduled,
-        )
-    else:
-        sole = state.batch.calls[0] if len(state.batch.calls) == 1 else None
-        classified = classify(
-            error,
-            context=phase,
-            phase=phase,
-            calls=scheduled,
-            req_id=None if sole is None else int(sole.request_key.request_id),
-            call_id=None if sole is None else sole.call_id,
-            call_kind=None if sole is None else sole.kind.value,
-            route=state.route,
-        )
-    _log_failure(classified, cause=error)
-    return classified
-
-
-def _log_failure(
-    error: WorkerError,
-    *,
-    cause: BaseException | None = None,
-) -> None:
-    """Log a batch failure and clear the frames of its exception chain.
-
-    Error classes for which ``should_capture_trace`` holds log at error level
-    with the cause's traceback; the others log a warning without it.
-    """
-    capture_trace = should_capture_trace(error.code)
-    logger = logging.getLogger(__name__)
-    log = logger.error if capture_trace else logger.warning
-    log(
-        "batch failed: %s [code=%s route=%s calls=%s]",
-        error.message,
-        error.code,
-        error.route,
-        error.calls,
-        exc_info=(type(cause), cause, cause.__traceback__)
-        if capture_trace and cause is not None
-        else None,
-    )
-    # A queued log record may outlive the worker. Keep the traceback locations
-    # and exception chain, but do not let diagnostic frames retain borrowed
-    # buffer tensors after their CUDA stream has been closed.
-    seen: set[int] = set()
-    while cause is not None and id(cause) not in seen:
-        seen.add(id(cause))
-        traceback.clear_frames(cause.__traceback__)
-        cause = cause.__cause__ or cause.__context__

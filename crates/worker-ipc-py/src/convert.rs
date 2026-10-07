@@ -37,6 +37,19 @@ use uniserve_worker_ipc::{
 #[cfg(test)]
 use uniserve_worker_ipc::Bounds;
 
+/// Convert a call kind at an infrequent Python numerical interface. Batch
+/// conversion keeps its existing enum cache for the execution path.
+pub(crate) fn call_kind_to_py(py: Python<'_>, kind: CallKind) -> PyResult<Bound<'_, PyAny>> {
+    let class = match kind {
+        CallKind::Forward(_) => "ForwardMode",
+        CallKind::Media(_) => "MediaCall",
+        CallKind::Transfer(_) => "TransferMode",
+    };
+    py.import("uniserve_worker.protocol.call")?
+        .getattr(class)?
+        .call1((kind.as_str(),))
+}
+
 pub(crate) fn cached<'py>(
     py: Python<'py>,
     cache: &PyOnceLock<Py<PyAny>>,

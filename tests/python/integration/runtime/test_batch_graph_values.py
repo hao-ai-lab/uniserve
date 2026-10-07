@@ -1,7 +1,6 @@
 """Captured worker calls preserve live text values and prefix state."""
 
 from contextlib import contextmanager
-from dataclasses import replace
 
 import pytest
 import torch
@@ -496,7 +495,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
             (
                 (rows[0], calls[0]),
                 (
-                    replace(rows[1], forward_mode=ForwardMode.PREFILL),
+                    rows[1].replace(forward_mode=ForwardMode.PREFILL),
                     calls[1].replace(kind=ForwardMode.PREFILL),
                 ),
             ),
@@ -529,7 +528,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
         outputs = runner.forward(
             (
                 (rows[0], calls[0].replace(component="unbound")),
-                (replace(rows[1], token_ids=torch.tensor([13])), calls[1]),
+                (rows[1].replace(token_ids=torch.tensor([13])), calls[1]),
             ),
             cache=manager,
             tables=manager.block_tables,

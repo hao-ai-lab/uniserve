@@ -8,17 +8,14 @@ pub(super) fn media_builder<'py>(
     model: &Bound<'py, PyAny>,
     config: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    model
-        .py()
-        .import("uniserve_worker.bootstrap.inputs")?
-        .call_method1("media_builder", (model, config))
+    crate::worker::model_executor::discovery::inputs::media_builder(
+        model,
+        config.cast::<crate::worker::config::WorkerConfig>()?,
+    )
 }
 
 pub(super) fn image_builder<'py>(model: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-    model
-        .py()
-        .import("uniserve_worker.bootstrap.inputs")?
-        .call_method1("image_builder", (model,))
+    crate::worker::model_executor::discovery::inputs::image_builder(model)
 }
 
 pub(super) fn outputs<'py>(
@@ -35,16 +32,14 @@ pub(super) fn media_components<'py>(
     model: &Bound<'py, PyAny>,
     config: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    model
-        .py()
-        .import("uniserve_worker.bootstrap.components")?
-        .call_method1(
-            "media_components",
-            (
-                model,
-                &crate::worker::config::native(config)?.deployment_components,
-            ),
-        )
+    let held = PyTuple::new(
+        model.py(),
+        &crate::worker::config::native(config)?.deployment_components,
+    )?;
+    Ok(
+        crate::worker::component_binding::calls::media_components(model, Some(held.as_any()))?
+            .into_any(),
+    )
 }
 
 pub(super) fn scalar_bytes(py: Python<'_>) -> PyResult<u64> {
@@ -184,13 +179,17 @@ pub(super) fn latent_pool_plan(
     if builder.is_none() {
         return Ok(None);
     }
-    let pages = builder.getattr("sample_pages")?;
+    let pages = builder
+        .cast::<crate::worker::media_inputs::MediaBuilder>()?
+        .borrow_mut()
+        .sample_pages(model.py())?;
+    let pages = pages.borrow(model.py());
     Ok(Some(LatentPoolPlan {
         request_pool_size: slots,
-        num_pages: slots * pages.getattr("pages")?.extract::<usize>()? + 1,
-        page_units: pages.getattr("page_units")?.extract()?,
+        num_pages: slots * pages.pages + 1,
+        page_units: pages.page_units,
         latent_width: 1,
-        dtype: pages.getattr("dtype")?.unbind(),
+        dtype: pages.dtype.clone_ref(model.py()),
         with_workspace: false,
     }))
 }

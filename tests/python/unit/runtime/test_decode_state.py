@@ -13,6 +13,50 @@ from uniserve_worker.storage.decode_state import DecodeState
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 
 
+@pytest.mark.parametrize("device", ("cpu", "cuda:0"))
+@pytest.mark.parametrize("stride", (1, 2))
+def test_tagged_decode_counts_only_active_tokens(device, stride):
+    state = DecodeState(
+        request_pool_size=3, vocab_size=8, continuation_width=2, device=device
+    )
+    slots = (3, 1)
+    indices = torch.tensor([3, 0, 1, 0], device=device)[::2]
+    tokens = torch.tensor([5 | (1 << 31), 0, 7 | (1 << 31), 0], device=device)[
+        ::2
+    ]
+    predicates = torch.tensor([True, True, False, True], device=device)[::2]
+    if stride == 1:
+        indices, tokens, predicates = (
+            value.contiguous() for value in (indices, tokens, predicates)
+        )
+    state.apply_tokens(
+        slots,
+        device_slots=indices,
+        tokens=tokens,
+        predicates=predicates,
+        valid=torch.tensor([True, True], device=device),
+        active=torch.tensor([True, False], device=device),
+        penalty_bases=[state.penalty_counts[slot] for slot in slots],
+    )
+
+    assert state.future_input_tokens[:, 0].tolist() == [1, 7, 1, 5]
+    assert state.valid_cache_lengths.tolist() == [0, 1, 0, 1]
+    assert state.predicates.tolist() == [False, False, False, True]
+    expected = torch.zeros_like(state.penalty_counts)
+    expected[3, 5] = 1
+    torch.testing.assert_close(state.penalty_counts, expected)
+
+
+def test_device_indices_cannot_reset_a_cpu_states_padding_slot():
+    state = DecodeState(
+        request_pool_size=1, vocab_size=8, continuation_width=1, device="cpu"
+    )
+    indices = torch.tensor([0], device="cuda:0")
+    with pytest.raises(ValueError, match="outside runtime-state capacity"):
+        state.reset(indices, valid_cache_lengths=[7])
+    assert state.valid_cache_lengths.tolist() == [0, 0]
+
+
 @pytest.mark.parametrize("capacity", (17, 257))
 @pytest.mark.parametrize("axes", (1, 3))
 def test_decode_export_and_inputs_follow_live_request_coordinates(

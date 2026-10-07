@@ -1,8 +1,8 @@
 """Numerical inputs for image diffusion over borrowed KV prefixes.
 
 The native executor owns latent-bank selection, prefix preparation and
-request progress. These functions build schedules, seeded samples and
-model rows; the numerical runner integrates the guided predictions.
+request progress. These functions build schedules and seeded samples;
+the numerical runner integrates the guided predictions.
 """
 
 from __future__ import annotations
@@ -12,10 +12,7 @@ import torch
 from uniserve.diffusion import Renorm
 from uniserve.nn.rng import flow_noise_seed
 from uniserve_worker.execution.diffusion_state import DiffusionState
-from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow
-from uniserve_worker.model_executor.input_batch import TokenRow
-from uniserve_worker.protocol.call import ForwardMode, ImageParams, MediaCall
-from uniserve_worker.sampling.metadata import TokenSelection
+from uniserve_worker.protocol.call import ImageParams
 
 
 def _to_device(
@@ -65,61 +62,8 @@ def initial_latent(
     )
 
 
-def prefix_row(tokens: tuple[int, ...], slot: int, visible: int) -> TokenRow:
-    """Append a guidance prefix without computing token logits."""
-    return TokenRow(
-        forward_mode=ForwardMode.PREFILL,
-        token_ids=torch.tensor(tokens, dtype=torch.long),
-        positions=torch.arange(
-            visible, visible + len(tokens), dtype=torch.long
-        ),
-        selection=TokenSelection.HIDDEN,
-        request_pool_idx=slot,
-        seq_len=visible,
-        write_kv=True,
-        causal=True,
-    )
-
-
-def flow_rows(
-    builder,
-    trajectory: DiffusionState,
-    current: torch.Tensor,
-    timestep: torch.Tensor,
-    coordinates: tuple[tuple[int, int, int], ...],
-    *,
-    device: torch.device,
-) -> tuple[DiffusionRow, ...]:
-    """Build rows over executor-selected (slot, KV length, temporal position).
-
-    Every branch borrows one sample and timestep. Position tensors are
-    shared by temporal position within the request's fixed image size.
-    """
-    current = _to_device(current, device)
-    timestep = _to_device(timestep, device).reshape(1)
-    size = trajectory.size
-    rows = []
-
-    for slot, visible, temporal in coordinates:
-        if temporal not in trajectory.positions:
-            trajectory.positions[temporal] = builder.positions(
-                size, temporal, device=device
-            )
-
-        rows.append(
-            DiffusionRow(
-                forward_mode=MediaCall.DENOISING,
-                positions=trajectory.positions[temporal],
-                timestep=timestep,
-                latent=current,
-                image_tokens=builder.sequence_length(size),
-                image_height=size.height,
-                image_width=size.width,
-                request_pool_idx=slot,
-                seq_len=visible,
-                write_kv=False,
-                causal=False,
-            )
-        )
-
-    return tuple(rows)
+def diffusion_values(
+    current: torch.Tensor, timestep: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Borrow or transfer the tensors shared by one step's guidance branches."""
+    return _to_device(current, device), _to_device(timestep, device).reshape(1)

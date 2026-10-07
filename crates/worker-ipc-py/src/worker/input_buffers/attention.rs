@@ -8,6 +8,7 @@ use super::{InputBuffers, ROW_SECTIONS, copy, numerical, prefix, with_host};
 use crate::worker::block_tables::pages_to_py;
 use crate::worker::error::invalid;
 use crate::worker::kv_cache::KVCacheManager;
+use crate::worker::model_inputs::Row;
 
 impl InputBuffers {
     pub(super) fn pages<'py>(
@@ -20,11 +21,15 @@ impl InputBuffers {
         let rows = rows
             .iter()
             .map(|row| {
+                let row = Row::borrow(&row)?;
+                let attention = row
+                    .attention()
+                    .ok_or_else(|| invalid(py, "attention requires a sequence row"))?;
                 Ok((
-                    row.getattr("request_pool_idx")?.extract()?,
-                    row.getattr("seq_len")?.extract()?,
-                    row.getattr("query_tokens")?.extract()?,
-                    row.getattr("write_kv")?.extract()?,
+                    row.input().request_pool_idx,
+                    attention.seq_len,
+                    row.query_tokens(py)? as i64,
+                    attention.write_kv,
                 ))
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -55,11 +60,18 @@ impl InputBuffers {
         let mut prefixes = Vec::with_capacity(rows.len());
         let mut writes = Vec::with_capacity(rows.len());
         let mut causal = Vec::with_capacity(rows.len());
-        for row in rows {
-            queries.push(row.getattr("query_tokens")?.extract::<usize>()?);
-            prefixes.push(row.getattr("seq_len")?.extract::<i64>()?);
-            writes.push(row.getattr("write_kv")?.is_truthy()?);
-            causal.push(row.getattr("causal")?.is_truthy()?);
+        let native = rows
+            .iter()
+            .map(|row| Row::borrow(&row))
+            .collect::<PyResult<Vec<_>>>()?;
+        for row in &native {
+            let attention = row
+                .attention()
+                .ok_or_else(|| invalid(py, "attention requires a sequence row"))?;
+            queries.push(row.query_tokens(py)?);
+            prefixes.push(attention.seq_len);
+            writes.push(attention.write_kv);
+            causal.push(attention.causal.unwrap_or(false));
         }
         if !writes.iter().any(|value| *value) && causal.iter().any(|value| *value) {
             return Err(PyValueError::new_err(
@@ -96,8 +108,8 @@ impl InputBuffers {
             let mut prefix_offset = 0;
             columns[4 * stride].set(0);
             columns[5 * stride].set(0);
-            for (index, row) in rows.iter().enumerate() {
-                columns[index].set(row.getattr("request_pool_idx")?.extract()?);
+            for (index, row) in native.iter().enumerate() {
+                columns[index].set(i64::from(row.input().request_pool_idx));
                 columns[stride + index].set(prefixes[index]);
                 columns[2 * stride + index].set(queries[index] as i64);
                 columns[3 * stride + index].set(i64::from(writes[index]));

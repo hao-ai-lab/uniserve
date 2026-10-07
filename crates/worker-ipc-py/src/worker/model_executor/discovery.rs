@@ -1,5 +1,7 @@
 //! Bind loaded numerical modules once, before requests begin.
 
+pub(in crate::worker) mod inputs;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -45,15 +47,14 @@ pub(super) fn create(
             Some(&options),
         )?;
 
-    let inputs = py.import("uniserve_worker.bootstrap.inputs")?;
     let types = py.import("uniserve.model")?;
-    let capability = |name: &str| inputs.call_method1("capability", (&model, types.getattr(name)?));
+    let capability = |name: &str| inputs::capability(model.bind(py), &types.getattr(name)?);
     let text = capability("CausalLM")?;
     let video_decoder = capability("VideoDecoder")?;
     let audio_decoder = capability("AudioDecoder")?;
     let video_postprocessor = capability("VideoPostprocessor")?;
-    let image_builder = inputs.call_method1("image_builder", (&model,))?;
-    let media_builder = inputs.call_method1("media_builder", (&model, &worker_config))?;
+    let image_builder = inputs::image_builder(model.bind(py))?;
+    let media_builder = inputs::media_builder(model.bind(py), worker_config.bind(py))?;
     let outputs = py
         .import("uniserve_worker.bootstrap.outputs")?
         .call_method1("resolve_outputs", (&model, &worker_config))?;
@@ -70,9 +71,12 @@ pub(super) fn create(
             .cast_into::<PyDict>()?,
         None => local_bindings(py, &declarations, &device, config.rank, config.world_size)?,
     };
-    let options = PyDict::new(py);
-    options.set_item("declarations", &declarations)?;
-    components.call_method("bind_components", (&model, &bindings), Some(&options))?;
+    crate::worker::component_binding::bind_components(
+        model.bind(py),
+        bindings.as_any(),
+        None,
+        Some(&declarations),
+    )?;
     let mut numerical = config.role == "experts";
     for (_, binding) in bindings.iter() {
         numerical |= binding.getattr("calls")?.is_truthy()?;
@@ -81,9 +85,6 @@ pub(super) fn create(
         .import("uniserve_worker.model_executor.resources")?
         .call_method1("media_state_buffers", (&bindings, &media_builder))?;
     let graph_storage = py.get_type::<GraphStorage>().call0()?.extract()?;
-    let kernels = py
-        .import("uniserve_worker.execution.kernel_table")?
-        .call_method0("KernelRecords")?;
     let owner = Py::new(
         py,
         ModelExecutor {
@@ -96,7 +97,7 @@ pub(super) fn create(
             processor: image_processor.unwrap_or_else(|| py.None()),
             flow_prompt: flow_prompt.unwrap_or_else(|| py.None()),
             image_builder: image_builder.unbind(),
-            media_builder: media_builder.unbind(),
+            media_builder: media_builder.extract()?,
             text: text.unbind(),
             video_decoder: video_decoder.unbind(),
             audio_decoder: audio_decoder.unbind(),
@@ -118,9 +119,9 @@ pub(super) fn create(
             expert_weights: py.None(),
             diffusion_bank: PyDict::new(py).unbind(),
             latent_pool: py.None(),
-            canvas_slots: py.None(),
+            canvas_slots: None,
             noise_draws: None,
-            kernels: kernels.unbind(),
+            kernels: super::kernel_records::KernelRecords::default(),
             kernel_choices: 0,
             inner: NativeModelRunners::default(),
             modules: IndexMap::new(),
@@ -140,7 +141,9 @@ pub(super) fn create(
         for (name, binding) in bindings.iter() {
             for call in binding.getattr("calls")?.try_iter()? {
                 let call = call?;
-                let kinds = components.call_method1("call_kinds", ((&call,),))?;
+                let kinds = crate::worker::component_binding::calls::call_kinds(
+                    PyTuple::new(py, [&call])?.as_any(),
+                )?;
                 if !kinds.is_truthy()? {
                     continue;
                 }
@@ -166,7 +169,7 @@ pub(super) fn create(
                 )?;
             }
         }
-        if owner.borrow(py).denoises(py) {
+        if owner.borrow(py).denoises() {
             let draws = HostLane::new(
                 py,
                 owner.borrow(py).config.max_request_pool_size,

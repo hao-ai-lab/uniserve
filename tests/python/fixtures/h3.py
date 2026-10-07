@@ -2,7 +2,10 @@
 
 from dataclasses import replace
 
+from torch import nn
+
 from uniserve.media import image
+from uniserve.model import ComponentEntry, EntryPoint
 from uniserve.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     Config,
@@ -13,6 +16,7 @@ from uniserve_models.minimax_h3 import (
     SparseAttention,
     TransformerConfig,
     UniformGrid,
+    VideoPostprocessor,
     audio_vae,
     video_vae,
 )
@@ -20,6 +24,22 @@ from uniserve_models.minimax_h3.encoder import TextEncoderConfig
 
 # The 16:9 canvas FastH3 DMD exports generate.
 WIDE = image.Config(768, 1344)
+
+
+class DenoisingModel(nn.Module):
+    """Serve a loaded H3 denoiser with its output sampling clock."""
+
+    def __init__(self, denoiser):
+        super().__init__()
+        self.config = denoiser.config
+        self.denoiser = denoiser
+        self.video_postprocessor = VideoPostprocessor(frame_rate=24)
+
+
+def entry_points(config):
+    return {
+        "denoiser": ComponentEntry("denoiser", (EntryPoint("forward"),)),
+    }
 
 
 def dmd_denoiser(

@@ -181,7 +181,7 @@ impl ExecutionContext {
     }
 
     #[getter]
-    fn experts(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+    pub(super) fn experts(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         self.state.as_ref().map(|state| state.experts.clone_ref(py))
     }
 
@@ -215,7 +215,7 @@ impl ExecutionContext {
     /// are derived once when enabled; serving supplies those mirrors itself.
     /// Replay checks one reader per table if launches consume device metadata.
     #[pyo3(signature = (batch, *, replay=false))]
-    fn bind_attention(
+    pub(super) fn bind_attention(
         slf: &Bound<'_, Self>,
         batch: &Bound<'_, PyAny>,
         replay: bool,
@@ -224,7 +224,7 @@ impl ExecutionContext {
     }
 
     /// Complete the open expert step at layers skipped by this rank's forward.
-    fn join_expert_layers(slf: &Bound<'_, Self>) -> PyResult<()> {
+    pub(super) fn join_expert_layers(slf: &Bound<'_, Self>) -> PyResult<()> {
         attention::join(slf)
     }
 

@@ -172,17 +172,19 @@ def resolve_outputs(
         # The media reader's products are the condition media it decodes,
         # declared only where the deployment serves conditions.
         if component == MEDIA_READER_COMPONENT and config.max_condition_rows:
-            encoders = (
-                capability(model, VideoEncoder),
-                capability(model, AudioEncoder),
-                capability(model, PatchEncoder),
-            )
-            if builder is None or any(value is None for value in encoders):
+            video_encoder = capability(model, VideoEncoder)
+            audio_encoder = capability(model, AudioEncoder)
+            vision = capability(model, PatchEncoder)
+            if (
+                builder is None
+                or video_encoder is None
+                or audio_encoder is None
+                or vision is None
+            ):
                 raise ValueError(
                     "media reading requires the condition encoders and a "
                     "video timeline"
                 )
-            video_encoder, audio_encoder, vision = encoders
             # A condition encodes one frame (an image) or a reference
             # video's leading frames, a count the denoiser generates.
             denoiser = builder.denoiser

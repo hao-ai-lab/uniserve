@@ -14,7 +14,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use serde::Deserialize;
 
 /// Deadline for the whole group's reports, measured from the start of
 /// `RankRegistry::collect`, which runs after every rank of the group has been
@@ -29,23 +28,7 @@ const ACCEPT_INTERVAL: Duration = Duration::from_millis(20);
 /// Deadline for one accepted connection to deliver its report line.
 const REPORT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 // The two channel mechanisms a rank may report; `collect` refuses any other.
-use uniserve_worker_ipc::{SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL};
-
-/// One rank's report of the channel endpoint the engine connects to.
-///
-/// `register_endpoint` in `uniserve_worker.bootstrap.launch` writes it as one
-/// JSON line with these field names.
-#[derive(Debug, Deserialize)]
-pub(crate) struct RankReport {
-    /// Worker identity the rank was launched under.
-    pub worker_id: String,
-    /// Global rank within that worker.
-    pub rank: u32,
-    /// Channel mechanism the endpoint names.
-    pub transport: String,
-    /// Endpoint the engine binds this rank's channel to.
-    pub endpoint: String,
-}
+use uniserve_worker_ipc::{RankReport, SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL};
 
 /// A worker group's collective rendezvous.
 pub(crate) struct Rendezvous {

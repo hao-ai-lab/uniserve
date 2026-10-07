@@ -11,10 +11,7 @@ from uniserve_worker.protocol.identity import CallId
 pytestmark = pytest.mark.unit
 
 
-# Message variants that the production text/heuristic matcher actually
-# treats as CUDA OOM (case-insensitive substring match against "out of
-# storage", "cuda oom", "cublas_status_alloc_failed"). The cuBLAS
-# allocation-failure string is the load-bearing "incl. cuBLAS variant" case.
+# PyTorch and CUDA libraries may report allocation failures as RuntimeError.
 OOM_MESSAGE_VARIANTS = [
     "CUDA out of memory. Tried to allocate 2.00 GiB (GPU 0; 39.59 GiB total)",
     "CUDA error: out of memory",
@@ -142,3 +139,57 @@ def test_to_mapping_emits_canonical_error_context():
             "call_id": {"batch_id": 7, "request_index": 0},
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "fatal"),
+    [
+        (ValueError("bad dimensions"), WorkerErrorCode.INPUT_ERROR, False),
+        (
+            NotImplementedError("unsupported operator"),
+            WorkerErrorCode.UNSUPPORTED_CALL,
+            False,
+        ),
+        (
+            AssertionError("invalid resource state"),
+            WorkerErrorCode.INVARIANT_VIOLATION,
+            True,
+        ),
+    ],
+)
+def test_failure_policy_preserves_request_context(error, code, fatal):
+    calls = ((5, 42, 3, CallId(7, 0)),)
+    result = classify(
+        error, context="forward", phase="execute", route="decode", calls=calls
+    )
+
+    assert result.code == code
+    assert result.fatal is fatal
+    assert result.phase == "execute"
+    assert result.route == "decode"
+    assert result.calls == calls
+    assert result.message == f"forward: {error}"
+
+
+def test_classification_keeps_existing_fields_and_fills_missing_context():
+    error = WorkerError(
+        WorkerErrorCode.RESOURCE_ERROR,
+        "workspace exhausted",
+        fatal=True,
+        route="decode",
+    )
+    result = classify(
+        error, context="submit", phase="execute", route="prefill", fatal=False
+    )
+
+    assert result is error
+    assert result.message == "workspace exhausted"
+    assert result.fatal is True
+    assert result.route == "decode"
+    assert result.phase == "execute"
+
+
+def test_empty_failure_message_uses_exception_type():
+    result = classify(RuntimeError(), context="forward")
+
+    assert result.message == "forward: RuntimeError"

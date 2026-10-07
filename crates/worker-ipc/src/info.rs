@@ -542,10 +542,9 @@ impl WorkerInfo {
                         .all(|&rank| rank < self.world_size as usize),
                 "component membership is outside the process world"
             );
-            ensure_valid!(
-                params.ranks.iter().collect::<HashSet<_>>().len() == params.ranks.len(),
-                "component repeats process ranks"
-            );
+            params
+                .validate()
+                .map_err(|error| invalid_message!("{error}"))?;
             let degree = params
                 .parallel_config
                 .world_size()
@@ -557,17 +556,6 @@ impl WorkerInfo {
             ensure_valid!(
                 params.units_per_rank > 0 && params.units_per_rank <= u32::MAX as usize,
                 "component unit capacity is outside protocol range"
-            );
-            // A distributed component spreads independent units over its member
-            // ranks without model parallelism, so its degree is one; otherwise
-            // every member rank is one position in the parallel degrees.
-            ensure_valid!(
-                if params.distribution.is_some() {
-                    degree == 1
-                } else {
-                    degree == params.ranks.len()
-                },
-                "component membership disagrees with parallel degrees"
             );
         }
 

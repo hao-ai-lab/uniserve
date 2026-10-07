@@ -13,9 +13,10 @@ from tests.python.fixtures.execution_worker import execution_worker
 from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
 from uniserve.runtime import CUDAStream, ExecutionContext
 from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.execution.kernel_table import KERNEL_TABLE_TAG
 
 pytestmark = pytest.mark.integration
+
+KERNEL_TABLE_TAG = "uniserve-kernel-table"
 
 # Providers that are not native CUDA kernels: the portable reference, the
 # FlashAttention-2 library and FlashInfer's own attention templates.

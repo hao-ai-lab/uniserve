@@ -1,7 +1,9 @@
 //! Python tensor allocation for the native host input buffer ring.
 
+use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
+use pyo3::buffer::{Element, PyBuffer};
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -123,4 +125,30 @@ fn error(error: Error) -> PyErr {
         Error::Invalid(message) => PyValueError::new_err(message),
         error => PyRuntimeError::new_err(error.to_string()),
     }
+}
+
+/// The ring has retired its previous DMA reader before these CPU writes.
+/// Buffer exports keep the allocation alive and check the element representation.
+pub(super) fn with_host<T: Element>(
+    tensor: &Bound<'_, PyAny>,
+    count: usize,
+    write: impl FnOnce(&[Cell<T>]) -> PyResult<()>,
+) -> PyResult<()> {
+    let py = tensor.py();
+    let array = tensor.call_method0("numpy")?;
+    let buffer = PyBuffer::<T>::get(&array)?;
+    let destination = buffer
+        .as_mut_slice(py)
+        .and_then(|slice| slice.get(..count))
+        .ok_or_else(|| PyValueError::new_err("host input column exceeds contiguous backing"))?;
+    write(destination)
+}
+
+pub(super) fn fill<T: Element + Copy>(tensor: &Bound<'_, PyAny>, values: &[T]) -> PyResult<()> {
+    with_host(tensor, values.len(), |destination| {
+        for (cell, value) in destination.iter().zip(values) {
+            cell.set(*value);
+        }
+        Ok(())
+    })
 }

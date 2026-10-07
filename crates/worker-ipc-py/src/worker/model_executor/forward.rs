@@ -8,10 +8,10 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use uniserve_worker::ModelRunners;
-use uniserve_worker_ipc::CallKind;
 
 use crate::calls::Call;
 use crate::worker::error::invalid;
+use crate::worker::model_inputs::Row;
 use crate::worker::model_results::ExecutionOutput;
 
 use super::execute;
@@ -41,45 +41,33 @@ pub(super) fn prepare(
     tables: Py<PyAny>,
     states: Py<PyAny>,
 ) -> PyResult<ModelBatches> {
-    let inputs = py.import("uniserve_worker.model_executor.input_batch")?;
-    let images = py.import("uniserve_worker.model_executor.image_inputs")?;
-    let diffusion = py.import("uniserve_worker.model_executor.diffusion_inputs")?;
-    let token = inputs.getattr("TokenRow")?;
-    let vision = images.getattr("VisionRow")?;
-    let decode = images.getattr("DecodeRow")?;
-    let flow = diffusion.getattr("DiffusionRow")?;
-
     let mut rows = Vec::with_capacity(tasks.bind(py).len());
     for task in tasks.bind(py) {
         let (row, call): (Bound<'_, PyAny>, PyRef<'_, Call>) = task.extract()?;
-        let shape = if row.is_instance(&vision)? {
-            row.getattr("encode_pixels")?
-                .getattr("shape")?
-                .extract::<Vec<usize>>()?
-        } else if row.is_instance(&flow)? || row.is_instance(&decode)? {
-            vec![
-                row.getattr("image_height")?.extract()?,
-                row.getattr("image_width")?.extract()?,
-            ]
-        } else {
-            Vec::new()
+        let row = Row::borrow(&row)?;
+        let shape = match &row {
+            Row::Vision(row) => row
+                .encode_pixels
+                .getattr(py, "shape")?
+                .extract::<Vec<usize>>(py)?,
+            Row::Diffusion(row) => vec![row.image_height, row.image_width],
+            Row::Decode(row) => vec![row.image_height, row.image_width],
+            _ => Vec::new(),
         };
-        let causal = row.is_instance(&token)? && row.getattr("causal")?.extract::<bool>()?;
+        let causal = match &row {
+            Row::Token(token) => token.as_super().causal,
+            _ => Some(false),
+        };
         rows.push((
             Arc::clone(&call.inner),
-            pythonize::depythonize::<CallKind>(&row.getattr("forward_mode")?)?,
-            row.get_type(),
+            row.input().kind,
+            std::mem::discriminant(&row),
             shape,
-            Some(causal),
+            causal,
         ));
     }
     let (missing, groups) = runners.group(rows.iter().map(|(call, kind, class, shape, causal)| {
-        (
-            call.as_ref(),
-            *kind,
-            (class.as_ptr() as usize, shape),
-            *causal,
-        )
+        (call.as_ref(), *kind, (*class, shape), *causal)
     }));
 
     Ok(ModelBatches {

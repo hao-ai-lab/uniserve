@@ -69,14 +69,9 @@ impl PythonBackend {
 
             // Keep execution/commit timings at their established sampling
             // point, before cross-resource preflight and device-state updates.
-            let started_ns = numerical.borrow(py).started_ns;
+            let bound_at = numerical.borrow(py).started;
             batch.record_component(py, "commit_lane", started)?;
-            let elapsed = (py
-                .import("time")?
-                .call_method0("perf_counter_ns")?
-                .extract::<u64>()?
-                - started_ns)
-                / 1000;
+            let elapsed = bound_at.map_or(0, |started| started.elapsed().as_micros() as u64);
             let stats = numerical.borrow(py).execution_stats(py)?.inner;
             if let Some(cache) = &self.cache {
                 cache
@@ -221,13 +216,13 @@ impl PythonBackend {
             }
             return Ok(());
         };
-        let state = state.bind(py);
+        let state = state.borrow(py);
 
         // Install verified extents before advancing tokens. Tensor lengths and
         // coordinates remain on device, including speculative acceptance.
         for (slot, update) in &updates {
             if let Some(length) = &update.cache_length {
-                state.call_method1("set_cache_length", (slot, length))?;
+                state.set_cache_length(py, *slot as i64, length.bind(py))?;
             }
         }
 
@@ -263,29 +258,31 @@ impl PythonBackend {
                     (samples, ("tokens", "continuation", "valid", "active")),
                 )?
                 .extract()?;
-            let options = PyDict::new(py);
-            for (name, column) in ["tokens", "predicates", "valid", "active"]
-                .into_iter()
-                .zip(columns)
-            {
-                options.set_item(name, column)?;
-            }
-            options.set_item(
-                "device_slots",
-                py.import("uniserve.tensors")?
-                    .call_method1("concatenate_views", (indices,))?,
+            let indices = py
+                .import("uniserve.tensors")?
+                .call_method1("concatenate_views", (indices,))?;
+            let penalties = decode
+                .iter()
+                .map(|(_, update, _)| {
+                    update
+                        .penalty_base
+                        .as_ref()
+                        .map(|value| value.clone_ref(py))
+                })
+                .collect();
+            let slots = decode.iter().map(|(slot, _, _)| **slot as i64).collect();
+            state.apply_tokens(
+                py,
+                slots,
+                &columns[0],
+                &columns[1],
+                &columns[2],
+                &columns[3],
+                penalties,
+                Some(&indices),
+                None,
+                None,
             )?;
-            options.set_item(
-                "penalty_bases",
-                PyTuple::new(
-                    py,
-                    decode.iter().map(|(_, update, _)| {
-                        update.penalty_base.as_ref().map(|value| value.bind(py))
-                    }),
-                )?,
-            )?;
-            let slots = PyTuple::new(py, decode.iter().map(|(slot, _, _)| slot))?;
-            state.call_method("apply_tokens", (slots,), Some(&options))?;
         }
 
         // Prefill and verification have explicit per-call coordinates; decode
@@ -295,27 +292,28 @@ impl PythonBackend {
                 && !update.decode_increment
             {
                 let sample = sample.bind(py);
-                let options = PyDict::new(py);
-                for (name, field) in [
-                    ("tokens", "tokens"),
-                    ("predicates", "continuation"),
-                    ("valid", "valid"),
-                    ("active", "active"),
-                ] {
-                    options.set_item(name, sample.getattr(field)?)?;
-                }
-                options.set_item("logical_position", &update.logical_position)?;
-                options.set_item("sampling_position", &update.sampling_position)?;
-                options.set_item(
-                    "penalty_bases",
-                    (update.penalty_base.as_ref().map(|value| value.bind(py)),),
+                state.apply_tokens(
+                    py,
+                    vec![*slot as i64],
+                    &sample.getattr("tokens")?,
+                    &sample.getattr("continuation")?,
+                    &sample.getattr("valid")?,
+                    &sample.getattr("active")?,
+                    vec![
+                        update
+                            .penalty_base
+                            .as_ref()
+                            .map(|value| value.clone_ref(py)),
+                    ],
+                    None,
+                    Some(update.logical_position.bind(py)),
+                    Some(update.sampling_position.bind(py)),
                 )?;
-                state.call_method("apply_tokens", ((slot,),), Some(&options))?;
             }
         }
         for (slot, update) in &updates {
             if let Some(logits) = &update.prompt_logits {
-                state.call_method1("set_prompt_logits", (slot, logits))?;
+                state.set_prompt_logits(py, *slot as i64, logits.bind(py))?;
             }
         }
         Ok(())

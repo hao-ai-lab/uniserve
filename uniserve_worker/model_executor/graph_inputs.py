@@ -1,9 +1,8 @@
 """Worker graph shapes, stable numerical inputs and captured call ownership.
 
-Text calls replay graphs captured at configured bucket shapes. Selection
-(``text_shape``) picks a bucket for a prepared batch, ``pad_text`` widens the
-batch's views of the runner's fixed buffers to that bucket and makes the
-padding inert. Decode buckets capture the call together with
+Native runners select configured graph buckets from host sequence lengths.
+``pad_text`` widens the batch's views of the runner's fixed buffers to that
+bucket and makes the padding inert. Decode buckets capture the call with
 graph-capturable greedy decoding (``capture_batch``/``replay_batch``);
 prefill buckets capture the backbone's hidden states alone
 (``capture_hidden``/``replay_hidden``), and the runner selects each row's
@@ -15,7 +14,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from itertools import accumulate
-from typing import cast
 
 import torch
 
@@ -32,16 +30,17 @@ from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.sampling import greedy
 from uniserve.tensors import adjacent_view
 from uniserve_worker._uniserve_ipc import PrefillShape as PrefillShape
-from uniserve_worker._uniserve_ipc import TextShapes
+from uniserve_worker._uniserve_ipc import capture_batch as capture_batch
+from uniserve_worker._uniserve_ipc import capture_hidden as capture_hidden
 from uniserve_worker._uniserve_ipc import (
     prefill_captures as prefill_captures,
 )
 from uniserve_worker._uniserve_ipc import prefill_units as prefill_units
-from uniserve_worker.model_executor.cuda_graph import CUDAGraphRunner
+from uniserve_worker._uniserve_ipc import replay_batch as replay_batch
+from uniserve_worker._uniserve_ipc import replay_hidden as replay_hidden
 from uniserve_worker.model_executor.input_batch import InputBatch
 from uniserve_worker.model_executor.input_buffers import clear_padding
 from uniserve_worker.model_executor.output import ExecutionOutput
-from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.sampling.result import (
     TOKEN_CONTINUATION_BIT,
@@ -62,100 +61,6 @@ class DiffusionShape:
     height: int
     width: int
     cfg_branches: int
-
-
-def bind_attention(static, live):
-    """Pair captured addresses with the current host sequence metadata.
-
-    ``static`` and ``live`` are ``AttentionBatch`` values over the same
-    tables and rows. Returns ``static`` with its device tensors unchanged
-    and every table's host query and prefix lengths and host start pages
-    taken from ``live``, for ``ExecutionContext.bind_attention`` planning
-    before a replay.
-    """
-    queries = replace(static.queries, host=live.queries.host)
-    entries = {}
-    for table, entry in static.entries.items():
-        current = live.entries[table]
-        blocks = entry.block_table
-        if blocks.start_page is not None:
-            blocks = replace(
-                blocks, start_page_host=current.block_table.start_page_host
-            )
-        entries[table] = replace(
-            entry,
-            queries=queries,
-            prefixes=replace(entry.prefixes, host=current.prefixes.host),
-            block_table=blocks,
-        )
-        if isinstance(entry, PagedInput):
-            entries[table] = replace(entries[table], causal=current.causal)
-    return AttentionBatch(entries, queries)
-
-
-def text_shape(batch, *, shapes: TextShapes, table_widths):
-    """Pair native bucket selection with this input's numerical table widths.
-
-    Returns ``(padding_shape, outputs)`` or None for eager prefill. Native
-    selection matches causality, embedding replacement and output kind; the
-    tensor backend supplies paged attention and exact host query lengths.
-    No device tensor is read back to choose a graph.
-    """
-    inputs = batch.inputs
-    if not isinstance(inputs, TextInput) or not all(
-        isinstance(entry, PagedInput)
-        for entry in inputs.attention.entries.values()
-    ):
-        raise CUDAGraphError("text graphs require paged text inputs")
-    if set(inputs.attention.entries) != set(
-        range(len(inputs.attention.entries))
-    ):
-        raise CUDAGraphError("text graph tables must use contiguous indices")
-
-    entries = tuple(
-        cast(PagedInput, inputs.attention.entries[table])
-        for table in range(len(inputs.attention.entries))
-    )
-    attention = entries[0]
-    causal = (
-        None if attention.causal_values is not None else attention.causal[0]
-    )
-    if causal is not None and any(
-        value != causal for entry in entries for value in entry.causal
-    ):
-        raise CUDAGraphError(
-            "no prefill graph for mixed causality without device flags"
-        )
-    queries = attention.queries.host
-    if queries is None:
-        raise ValueError("graph shape selection requires host query lengths")
-
-    selected = shapes.select(
-        queries,
-        inputs.input_ids.numel(),
-        decode=batch.forward_mode is ForwardMode.DECODE,
-        causal=causal,
-        embeddings=inputs.embeddings is not None,
-        last_logits=all(
-            value is TokenSelection.LAST_LOGITS
-            for value in batch.token_selections
-        ),
-        cache_only=all(
-            value is TokenSelection.CACHE for value in batch.token_selections
-        ),
-    )
-    if selected is None:
-        return None
-
-    rows, tokens, decode, outputs = selected
-    widths = tuple(
-        max(
-            table_widths[table] if table < len(table_widths) else 1,
-            entry.block_table.indices.shape[1],
-        )
-        for table, entry in enumerate(entries)
-    )
-    return (rows, tokens, widths, decode), outputs
 
 
 def _fixed_view(tensor, shape):
@@ -323,8 +228,7 @@ def pad_text(batch, rows, tokens, widths, decode, *, buffers):
         finish = _fixed_view(finish, (rows,))
         finish[live_rows:].zero_()
 
-    return replace(
-        batch,
+    return batch.replace(
         inputs=replace(
             inputs,
             input_ids=ids,
@@ -359,8 +263,7 @@ def widen_prefix(batch, widths):
         entries[number] = replace(
             entry, block_table=replace(entry.block_table, indices=table)
         )
-    return replace(
-        batch,
+    return batch.replace(
         inputs=replace(
             batch.inputs,
             attention=AttentionBatch(entries, attention.queries),
@@ -415,108 +318,10 @@ def restore_writes(batch, cache: PrefixCache | None):
     return restore
 
 
-def capture_batch(
-    context,
-    batch,
-    call,
-    *,
-    pools=None,
-    cache=None,
-    predicates=None,
-    warmup=None,
-):
-    """Capture numerical batch output and greedy decoding on common backing.
-
-    The graph returns ``(ExecutionOutput, SamplerOutput | None)`` and retains
-    ``batch`` as its fixed input. The state ``restore_writes`` snapshots is
-    restored after the warm call and after capture.
-    """
-    restore = _prepare_capture(context, batch, cache)
-
-    def compute(static):
-        output = call(static)
-        return output, greedy_decode(static, output, predicates)
-
-    return CUDAGraphRunner.capture(
-        context,
-        batch,
-        compute,
-        pools=pools,
-        restore=restore,
-        warmup=None if warmup is None else lambda value: warmup(compute, value),
-    )
-
-
-def capture_hidden(
-    context, batch, call, *, pools=None, cache=None, warmup=None
-):
-    """Capture a prefill bucket's hidden states on the batch's fixed backing.
-
-    ``call(static)`` returns the ``[tokens, hidden]`` backbone output of the
-    padded ``batch``, which the graph retains as its fixed input. The state
-    ``restore_writes`` snapshots is restored after the warm call and after
-    capture.
-    """
-    restore = _prepare_capture(context, batch, cache)
-    return CUDAGraphRunner.capture(
-        context, batch, call, pools=pools, restore=restore, warmup=warmup
-    )
-
-
-def _prepare_capture(context, batch, cache):
-    """Plan the batch's attention and snapshot the cache blocks it writes."""
-    with context.activate():
-        attention = getattr(batch.inputs, "attention", None)
-        if attention is not None:
-            context.bind_attention(attention)
-        return restore_writes(batch, cache)
-
-
-def _replay(graph, batch):
-    """Copy ``batch`` into the graph's inputs, rebind its lengths, replay.
-
-    Attention plans take the live host sequence lengths and start pages
-    with the captured device addresses. Returns the graph's retained output
-    views, which the next replay overwrites.
-    """
-    context = graph.executable.context
-    with context.activate():
-        graph.inputs.copy(batch)
-        attention = getattr(batch.inputs, "attention", None)
-        if attention is not None:
-            context.bind_attention(
-                bind_attention(graph.inputs.value.inputs.attention, attention),
-                replay=True,
-            )
-        return graph.executable.replay()
-
-
-def replay_batch(graph: CUDAGraphRunner, batch, *, rows=None, borrow=False):
-    """Replay prepared inputs and retain the live output rows.
-
-    ``rows`` is the live row count (default: ``batch.row_count``); outputs of
-    padding rows are dropped. With ``borrow``, the result views the graph's
-    output storage, which the next replay overwrites; otherwise it is cloned.
-    """
-    output, greedy = _replay(graph, batch)
-    count = batch.row_count if rows is None else rows
-    result = output.replace(
-        values=output.values[:count],
-        vocabularies=output.vocabularies[:count],
-        layouts=output.layouts[:count],
-        greedy=trim_greedy(greedy, count),
-    )
-    return result if borrow else result.clone()
-
-
-def replay_hidden(graph: CUDAGraphRunner, batch) -> torch.Tensor:
-    """Replay a prefill bucket and return its hidden states.
-
-    The result is the graph's ``[token bucket, hidden]`` output view, whose
-    rows past the batch's live tokens hold padding; the next replay of any
-    graph sharing that backing overwrites it.
-    """
-    return _replay(graph, batch)
+def batch_output(call, predicates, batch):
+    """Evaluate model outputs and graph-capturable greedy continuations."""
+    output = call(batch)
+    return output, greedy_decode(batch, output, predicates)
 
 
 def greedy_decode(

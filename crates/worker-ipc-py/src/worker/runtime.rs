@@ -1,15 +1,18 @@
 //! Resource ownership and lifecycle of one model worker rank.
 
 mod bootstrap;
+pub(super) mod launch;
 mod warmup;
 
 use super::model_executor::ModelExecutor;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyType};
+use pyo3::types::{PyDict, PyTuple, PyType};
 
 use super::buffer::BufferPool;
+use super::canvas_slots::CanvasSlots;
+use super::decode_state::DecodeState;
 use super::events::EventPool;
 use super::execution::close_all;
 use super::executor::{Executor, Submission};
@@ -45,12 +48,12 @@ pub(crate) struct Worker {
     #[pyo3(get)]
     sampling_group: Option<Py<PyAny>>,
     #[pyo3(get)]
-    process_groups: Option<Py<PyAny>>,
+    process_groups: Option<Py<super::process_groups::ProcessGroups>>,
 
     #[pyo3(get)]
     requests: Option<Py<RequestPool>>,
     #[pyo3(get)]
-    decode_state: Option<Py<PyAny>>,
+    decode_state: Option<Py<DecodeState>>,
     #[pyo3(get)]
     block_tables: Option<Py<PyAny>>,
     #[pyo3(get)]
@@ -58,7 +61,7 @@ pub(crate) struct Worker {
     #[pyo3(get)]
     latent_pool: Option<Py<LatentPool>>,
     #[pyo3(get)]
-    canvas_slots: Option<Py<PyAny>>,
+    canvas_slots: Option<Py<CanvasSlots>>,
 
     #[pyo3(get)]
     output_pool: Option<Py<OutputPool>>,
@@ -79,7 +82,7 @@ pub(crate) struct Worker {
     #[pyo3(get)]
     ipc_endpoint: Option<Py<PyServer>>,
     #[pyo3(get)]
-    profiler: Option<Py<PyAny>>,
+    pub(super) profiler: Option<Py<super::profiling::WorkerProfiler>>,
     #[pyo3(get)]
     codec_slot: bool,
 
@@ -120,7 +123,7 @@ impl Worker {
         image_processor: Option<Py<PyAny>>,
         flow_prompt: Option<Py<PyAny>>,
         components: Option<Py<PyAny>>,
-        process_groups: Option<Py<PyAny>>,
+        process_groups: Option<Py<super::process_groups::ProcessGroups>>,
         bindings: Option<Py<PyAny>>,
         model_name: Option<Py<PyAny>>,
         attention_ranks: usize,
@@ -305,13 +308,18 @@ impl Worker {
             let (slots, tokenizer, latents) = {
                 let worker = slf.borrow();
                 (
-                    worker
-                        .requests
-                        .as_ref()
-                        .ok_or_else(closed)?
-                        .bind(py)
-                        .getattr("storage")?
-                        .getattr("tensor_slots")?,
+                    PyTuple::new(
+                        py,
+                        &worker
+                            .requests
+                            .as_ref()
+                            .ok_or_else(closed)?
+                            .borrow(py)
+                            .storage
+                            .borrow(py)
+                            .tensor_slots,
+                    )?
+                    .into_any(),
                     worker.tokenizer.as_ref().map(|value| value.clone_ref(py)),
                     worker.latent_pool.as_ref().map(|value| value.clone_ref(py)),
                 )
@@ -447,15 +455,12 @@ impl Worker {
                 "worker binding requires an open IPC endpoint",
             ));
         }
-        let profiler = py
-            .import("uniserve_worker.profiling")?
-            .getattr("WorkerProfiler")?
-            .call_method0("from_env")?;
+        let profiler = Py::new(py, super::profiling::WorkerProfiler::from_env(None)?)?;
         let wake = endpoint.getattr("wake")?.unbind();
         let wake_on_stream = endpoint.getattr("wake_on_stream")?.unbind();
         {
             let mut worker = slf.borrow_mut();
-            worker.profiler = Some(profiler.unbind());
+            worker.profiler = Some(profiler);
             worker.ipc_endpoint = Some(endpoint.unbind());
         }
         slf.borrow()
@@ -600,7 +605,10 @@ impl Worker {
             results.push(ModelExecutor::close(runner.bind(py), true));
         }
         if let Some(groups) = &self.process_groups {
-            results.push(abort(py, groups.bind(py)));
+            results.push(super::process_groups::ProcessGroups::close(
+                groups.bind(py),
+                true,
+            ));
         }
         close_all(py, results)
     }
@@ -612,7 +620,7 @@ impl Worker {
             results.push(ModelExecutor::synchronize(runner));
         }
         if let Some(profiler) = &self.profiler {
-            results.push(profiler.call_method0(py, "close").map(drop));
+            profiler.borrow_mut(py).close(py);
         }
         if let Some(executor) = &self.executor {
             results.push(executor.borrow_mut(py).close(py));
@@ -651,7 +659,7 @@ impl Worker {
             results.push(cache.call_method0(py, "close").map(drop));
         }
         if let Some(canvas) = &self.canvas_slots {
-            results.push(canvas.call_method0(py, "close").map(drop));
+            canvas.borrow(py).close(py);
         }
         if let Some(latents) = &self.latent_pool {
             results.push(LatentPool::close(latents.bind(py).clone()));
@@ -672,17 +680,14 @@ impl Worker {
             results.push(requests.borrow_mut(py).close(py));
         }
         if let Some(groups) = &self.process_groups {
-            results.push(groups.call_method0(py, "close").map(drop));
+            results.push(super::process_groups::ProcessGroups::close(
+                groups.bind(py),
+                false,
+            ));
         }
         results.push(self.set_completion_wake(py, None, None));
         close_all(py, results)
     }
-}
-
-fn abort(py: Python<'_>, owner: &Bound<'_, PyAny>) -> PyResult<()> {
-    let options = PyDict::new(py);
-    options.set_item("aborted", true)?;
-    owner.call_method("close", (), Some(&options)).map(drop)
 }
 
 fn closed() -> PyErr {

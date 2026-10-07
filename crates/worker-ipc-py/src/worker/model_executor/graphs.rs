@@ -198,7 +198,7 @@ pub(super) fn run_module(
     let output = on_stream(&context(runner)?, &runner.getattr("device")?, || {
         let backend = py.import("uniserve_worker.model_executor.cuda_graph")?;
         let values = (args, kwargs);
-        let key = backend.call_method1("input_signature", (values,))?;
+        let key = crate::worker::cuda_graph::input_signature(values.into_pyobject(py)?.as_any())?;
         let buckets = execution(runner)?.borrow().buckets.bind(py).clone();
         let bucket = buckets.get_item(&key)?;
         let graph = bucket

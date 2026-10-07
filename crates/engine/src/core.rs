@@ -175,29 +175,7 @@ impl WorkerConfig {
                 !entry.ranks.is_empty() && entry.ranks.iter().all(|&rank| rank < ranks.len()),
                 "component {name} contains invalid members"
             );
-            anyhow::ensure!(
-                entry.ranks.iter().collect::<BTreeSet<_>>().len() == entry.ranks.len(),
-                "component {name} repeats members"
-            );
-            let degree = entry.parallel_config.world_size()?;
-            // A distributed component deals independent units to its ranks, so
-            // each rank runs the component unpartitioned.
-            if entry.distribution.is_some() {
-                anyhow::ensure!(
-                    degree == 1,
-                    "distributed temporal units require local component geometry"
-                );
-            } else {
-                anyhow::ensure!(
-                    degree == entry.ranks.len(),
-                    "component {name} parallel degree {degree} disagrees with {} members",
-                    entry.ranks.len()
-                );
-            }
-            anyhow::ensure!(
-                entry.units_per_rank > 0,
-                "component {name} units_per_rank must be positive"
-            );
+            entry.validate()?;
         }
         Ok(())
     }

@@ -3,17 +3,17 @@
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 
-use super::CUDAGraph;
+use super::{CUDAGraph, GraphInputs};
 use crate::worker::execution_context::ExecutionContext;
 
 /// A graph executable and the tensor correspondence used to update its inputs.
-/// Python's Inputs performs tensor copies; this owner controls its lifetime.
+/// GraphInputs retains the fixed tensor paths used by replay.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct CUDAGraphRunner {
     #[pyo3(get)]
-    executable: Py<CUDAGraph>,
+    pub(super) executable: Py<CUDAGraph>,
     #[pyo3(get)]
-    inputs: Py<PyAny>,
+    pub(in crate::worker) inputs: Py<GraphInputs>,
 }
 
 #[pymethods]
@@ -23,7 +23,7 @@ impl CUDAGraphRunner {
     #[staticmethod]
     #[pyo3(signature = (context, inputs, call, *, pools, restore=None, warm=true, warmup=None))]
     #[allow(clippy::too_many_arguments)]
-    fn capture(
+    pub(in crate::worker) fn capture(
         py: Python<'_>,
         context: Py<ExecutionContext>,
         inputs: Py<PyAny>,
@@ -58,10 +58,7 @@ impl CUDAGraphRunner {
             }
             return Err(error);
         }
-        let inputs = py
-            .import("uniserve_worker.model_executor.cuda_graph")?
-            .call_method1("Inputs", (inputs,))?
-            .unbind();
+        let inputs = Py::new(py, GraphInputs::new(py, inputs)?)?;
         Ok(Self {
             executable: Py::new(py, executable)?,
             inputs,
@@ -79,7 +76,7 @@ impl CUDAGraphRunner {
         let context = executable.context(py)?;
         ExecutionContext::with_active(context.bind(py), || {
             if let Some(live) = live {
-                self.inputs.call_method1(py, "copy", (live,))?;
+                self.inputs.borrow(py).copy(live.bind(py))?;
             }
             executable.replay(py)
         })

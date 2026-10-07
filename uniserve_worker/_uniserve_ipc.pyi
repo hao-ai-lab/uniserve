@@ -22,7 +22,15 @@ from typing_extensions import Buffer as BufferProtocol
 import uniserve_worker.sampling.result as sampling_result
 import uniserve_worker.storage.block_tables as block_tables
 import uniserve_worker.storage.kv_cache as kv_cache
-from uniserve.distributed.mesh import Communicator
+from uniserve.diffusion.canvas import CanvasSampling as CanvasConstants
+from uniserve.distributed.mesh import Communicator, DeviceMesh
+from uniserve.model import (
+    CausalLM,
+    ComponentEntry,
+    Denoiser,
+    TextInput,
+    TokenDenoiser,
+)
 from uniserve.model import VisionInput as ModelVisionInput
 from uniserve.model.logits import VocabShard
 from uniserve.processing import FlowPrompt, ImageProcessor
@@ -31,17 +39,14 @@ from uniserve.runtime.backends.attention.flashinfer import (
     Config as FlashInferConfig,
 )
 from uniserve.runtime.prefix_cache import Planes, PrefixCache
-from uniserve.runtime.process_groups import ProcessGroups
 from uniserve.tensors import BufferConfig, OutputLayout
-from uniserve_worker.config.deployment import ComponentConfig, WorkerProcessArgs
+from uniserve_worker.config.deployment import WorkerProcessArgs
+from uniserve_worker.errors import WorkerError, WorkerErrorCode
 from uniserve_worker.execution.request import RequestResult
-from uniserve_worker.model_executor.canvas_runner import CanvasRunner
-from uniserve_worker.model_executor.component_binding import ComponentBinding
-from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
-from uniserve_worker.model_executor.input_batch import InputBatch, InputRow
+from uniserve_worker.model_executor.component_binding import (
+    Call as ComponentCall,
+)
 from uniserve_worker.model_executor.input_buffers import TokenBufferConfig
-from uniserve_worker.model_executor.model_runner import ModelRunner
-from uniserve_worker.profiling import WorkerProfiler
 from uniserve_worker.protocol.batch import (
     BatchCommand,
     BlockTable,
@@ -79,9 +84,7 @@ from uniserve_worker.protocol.transfer import (
     WorkerEndpoint,
 )
 from uniserve_worker.protocol.worker_info import WorkerInfo
-from uniserve_worker.storage.canvas_slots import CanvasSlots
-from uniserve_worker.storage.decode_state import DecodeState
-from uniserve_worker.storage.request_slots import RequestSlots
+from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.storage.tensor_store import FeatureMetadata, ImageMetadata
 from uniserve_worker.transport.exports import ExportLocations
 
@@ -836,7 +839,9 @@ class ModelExecutor:
     def diffusion(self) -> DiffusionRunner: ...
     def prepare_layouts(self) -> tuple: ...
     def diffusion_layout(self, layout): ...
-    def run_denoising(self, ladder, index, bank): ...
+    def run_denoising(
+        self, sequence: DenoisingSequence, index: int, bank: int
+    ): ...
     def output_layout(
         self,
         entry,
@@ -1168,6 +1173,196 @@ class TensorBuffers:
     def __exit__(self, kind, error, traceback) -> None: ...
 
 @final
+class DecodeState:
+    """Resident request continuation state with an inactive padding row."""
+
+    def __init__(
+        self,
+        *,
+        request_pool_size: int,
+        vocab_size: int,
+        continuation_width: int,
+        device: torch.device | str,
+        logits_dtype: torch.dtype = torch.float32,
+        valid_cache_lengths: torch.Tensor | None = None,
+    ) -> None: ...
+    @staticmethod
+    def buffers(
+        *,
+        request_pool_size: int,
+        vocab_size: int,
+        continuation_width: int,
+        logits_dtype: torch.dtype,
+    ) -> dict[str, BufferConfig]: ...
+    @property
+    def request_pool_size(self) -> int: ...
+    @property
+    def vocab_size(self) -> int: ...
+    @property
+    def continuation_width(self) -> int: ...
+    @property
+    def device(self) -> torch.device: ...
+    @property
+    def logits_dtype(self) -> torch.dtype: ...
+    @property
+    def valid_cache_lengths(self) -> torch.Tensor: ...
+    @property
+    def logical_lengths(self) -> torch.Tensor: ...
+    @property
+    def sampling_positions(self) -> torch.Tensor: ...
+    @property
+    def future_input_tokens(self) -> torch.Tensor: ...
+    @property
+    def penalty_counts(self) -> torch.Tensor: ...
+    @property
+    def prompt_logits(self) -> torch.Tensor: ...
+    @property
+    def predicates(self) -> torch.Tensor: ...
+    def reset(
+        self,
+        request_pool_indices: torch.Tensor | Sequence[int],
+        *,
+        valid_cache_lengths: torch.Tensor | Sequence[int] | None = None,
+        logical_lengths: torch.Tensor | Sequence[int] | None = None,
+        sampling_positions: torch.Tensor | Sequence[int] | None = None,
+    ) -> None: ...
+    def set_cache_length(
+        self, slot: int, length: int | torch.Tensor
+    ) -> None: ...
+    def set_prompt_logits(self, slot: int, logits: torch.Tensor) -> None: ...
+    def apply_tokens(
+        self,
+        slots: Sequence[int],
+        *,
+        tokens: torch.Tensor,
+        predicates: torch.Tensor,
+        valid: torch.Tensor,
+        active: torch.Tensor,
+        penalty_bases: Sequence[torch.Tensor | None],
+        device_slots: torch.Tensor | None = None,
+        logical_position: int | torch.Tensor | None = None,
+        sampling_position: int | torch.Tensor | None = None,
+    ) -> None: ...
+
+@final
+class DiffusionState:
+    """Retain schedules and positional tensors for one diffusion request."""
+
+    def __init__(
+        self, size: Any, schedules: Mapping[str, Any], guidance: Any = None
+    ) -> None: ...
+    @property
+    def size(self) -> Any: ...
+    @property
+    def schedules(self) -> Mapping[str, Any]: ...
+    @property
+    def guidance(self) -> Any: ...
+    @staticmethod
+    def open(
+        denoiser,
+        size,
+        *,
+        steps: int,
+        shift: float | None,
+        device: torch.device | str,
+        guidance=None,
+    ) -> DiffusionState: ...
+    def prepare_inputs(
+        self,
+        builder,
+        current: torch.Tensor,
+        timestep: torch.Tensor,
+        coordinates: Sequence[tuple[int, int, int]],
+        *,
+        device: torch.device,
+    ) -> tuple[DiffusionRow, ...]: ...
+
+@final
+class CanvasSlots:
+    """Resident canvas state retained until its numerical readers retire."""
+
+    request_pool_size: int
+    tokens: Any
+    canvas_length: int
+    vocab_size: int
+    hidden_size: int
+    served: CanvasSampling
+    history_depth: int
+    constants: CanvasConstants
+    device: torch.device
+    banks: Mapping[str, torch.Tensor]
+
+    def __init__(
+        self,
+        *,
+        request_pool_size: int,
+        tokens,
+        vocab_size: int,
+        hidden_size: int,
+        sampling: CanvasSampling,
+        dtype: torch.dtype,
+        device: torch.device | str,
+    ) -> None: ...
+    @staticmethod
+    def step_rows(
+        *, canvas_length: int, vocab_size: int, max_rows: int
+    ) -> int: ...
+    @property
+    def live(self) -> torch.Tensor: ...
+    @staticmethod
+    def for_denoiser(
+        denoiser,
+        *,
+        request_pool_size: int,
+        sampling: CanvasSampling,
+        device: torch.device | str,
+    ) -> CanvasSlots: ...
+    @staticmethod
+    def denoiser_bytes(
+        denoiser, *, request_pool_size: int, history_depth: int
+    ) -> int: ...
+    @staticmethod
+    def buffers(
+        *,
+        request_pool_size: int,
+        canvas_length: int,
+        hidden_size: int,
+        history_depth: int,
+        dtype: torch.dtype,
+    ) -> dict[str, BufferConfig]: ...
+    def gather(
+        self, slots: torch.Tensor, views: dict[str, torch.Tensor]
+    ) -> None: ...
+    def commit(
+        self,
+        slots: torch.Tensor,
+        views: dict[str, torch.Tensor],
+        *,
+        live: torch.Tensor,
+    ) -> None: ...
+    def close(self) -> None: ...
+
+@final
+class RequestSlots:
+    """Persistent backing for one-based scheduler request slots."""
+
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        state_buffers: Mapping[str, BufferConfig] | None,
+        device: torch.device | str,
+    ) -> None: ...
+    @property
+    def capacity(self) -> int: ...
+    @property
+    def bank(self) -> Mapping[str, torch.Tensor]: ...
+    @property
+    def tensor_slots(self) -> tuple[TensorBuffers, ...]: ...
+    def tensors(self, request_pool_idx: int) -> TensorBuffers: ...
+    def close(self) -> None: ...
+
+@final
 class Scratch:
     """Shared transient buffers for contexts serialized on one stream."""
 
@@ -1263,13 +1458,52 @@ class CUDAGraph(Generic[Source]):
     def __enter__(self) -> Self: ...
     def __exit__(self, kind, error, traceback) -> None: ...
 
+def capture_batch(
+    context: ExecutionContext,
+    batch: InputBatch,
+    call: Callable,
+    *,
+    pools: Mapping | None = None,
+    cache: PrefixCache | None = None,
+    predicates: torch.Tensor | None = None,
+    warmup: Callable | None = None,
+) -> CUDAGraphRunner: ...
+def capture_hidden(
+    context: ExecutionContext,
+    batch: InputBatch,
+    call: Callable,
+    *,
+    pools: Mapping | None = None,
+    cache: PrefixCache | None = None,
+    warmup: Callable | None = None,
+) -> CUDAGraphRunner: ...
+def replay_batch(
+    graph: CUDAGraphRunner,
+    batch: InputBatch,
+    *,
+    rows: int | None = None,
+    borrow: bool = False,
+) -> ExecutionOutput: ...
+def replay_hidden(
+    graph: CUDAGraphRunner, batch: InputBatch
+) -> torch.Tensor: ...
+
+@final
+class GraphInputs:
+    def __init__(self, value: Any) -> None: ...
+    @property
+    def value(self) -> Any: ...
+    @property
+    def tensors(self) -> tuple[torch.Tensor, ...]: ...
+    def copy(self, live: Any) -> None: ...
+
 @final
 class CUDAGraphRunner:
     """A captured numerical bucket and its fixed tensor inputs."""
     @property
     def executable(self) -> CUDAGraph: ...
     @property
-    def inputs(self) -> Any: ...
+    def inputs(self) -> GraphInputs: ...
     @staticmethod
     def capture(
         context: ExecutionContext,
@@ -1296,14 +1530,6 @@ class GraphBucket:
 
 class DenoisingBuffers:
     """Layout constants and numerical views retained through execution."""
-    def __new__(
-        cls,
-        backing: Any,
-        constants: Mapping[str, torch.Tensor],
-        workspace: Mapping[str, torch.Tensor],
-        pages: int,
-        rows: torch.Tensor,
-    ) -> Self: ...
     @property
     def backing(self) -> Any: ...
     @property
@@ -1318,6 +1544,499 @@ class DenoisingBuffers:
     def state(self) -> Mapping[str, torch.Tensor]: ...
     @property
     def gathers(self) -> tuple: ...
+
+@final
+class Rendezvous:
+    def __init__(
+        self, host: str, port: int, listen_fd: int | None = None
+    ) -> None: ...
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    @property
+    def listen_fd(self) -> int | None: ...
+
+@final
+class ProcessGroups:
+    @property
+    def rank(self) -> int: ...
+    @property
+    def world_size(self) -> int: ...
+    @property
+    def device(self) -> torch.device: ...
+    @property
+    def backend(self) -> str: ...
+    @property
+    def experts(self) -> Communicator: ...
+    @property
+    def process_group(self) -> Communicator: ...
+    def bind(
+        self,
+        mesh: DeviceMesh,
+        *,
+        device: torch.device | str,
+        axes: Iterable[tuple[str, ...]] | None = None,
+    ) -> DeviceMesh: ...
+    def close(self, *, aborted: bool = False) -> None: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+def initialize_process_groups(
+    *,
+    rank: int,
+    local_rank: int,
+    world_size: int,
+    device: torch.device | str,
+    backend: str | None = None,
+    init_method: str | None = None,
+    rendezvous: Rendezvous | None = None,
+    experts: tuple[int, int, Rendezvous] | None = None,
+) -> ProcessGroups: ...
+
+@final
+class SymmetricStorage:
+    @property
+    def coordinator(self) -> Communicator: ...
+    @property
+    def local(self) -> torch.Tensor: ...
+    @property
+    def peers(self) -> tuple[torch.Tensor, ...]: ...
+    @property
+    def handle(self) -> Any: ...
+    @property
+    def rank(self) -> int: ...
+    @property
+    def size(self) -> int: ...
+    def fence(self, input: torch.Tensor, output: torch.Tensor) -> None: ...
+
+def allocate_peer_tensor(
+    group: Communicator, shape: tuple[int, ...], *, dtype: torch.dtype
+) -> torch.Tensor: ...
+def allocate_collective_buffer(
+    shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor: ...
+def allocate_symmetric_storage(
+    group: Communicator, shape: tuple[int, ...], *, dtype: torch.dtype
+) -> SymmetricStorage: ...
+
+@final
+class WorkerProfiler:
+    @staticmethod
+    def from_env(env: Mapping[str, str] | None = None) -> WorkerProfiler: ...
+    @property
+    def enabled(self) -> bool: ...
+    def step(self, debug_name: str) -> AbstractContextManager[None]: ...
+    def close(self) -> None: ...
+
+def timing_events_enabled() -> bool: ...
+
+@final
+class SequenceConfig:
+    def __init__(
+        self, kind: str = "local", degrees: Sequence[int] = ()
+    ) -> None: ...
+    @property
+    def kind(self) -> str: ...
+    @property
+    def degrees(self) -> tuple[int, ...]: ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def dimensions(self) -> tuple[tuple[str, int], ...]: ...
+    @staticmethod
+    def from_dict(value: Mapping[str, object]) -> SequenceConfig: ...
+    def to_dict(self) -> dict[str, object]: ...
+
+@final
+class ParallelConfig:
+    def __init__(
+        self,
+        tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        sequence_parallel: SequenceConfig | None = None,
+    ) -> None: ...
+    @property
+    def tensor_parallel_size(self) -> int: ...
+    @property
+    def pipeline_parallel_size(self) -> int: ...
+    @property
+    def sequence_parallel(self) -> SequenceConfig: ...
+    @property
+    def sequence_parallel_size(self) -> int: ...
+    @property
+    def world_size(self) -> int: ...
+    @property
+    def dimensions(self) -> tuple[tuple[str, int], ...]: ...
+    @staticmethod
+    def from_dict(value: Mapping[str, object]) -> ParallelConfig: ...
+    def to_dict(self) -> dict[str, object]: ...
+
+@final
+class ComponentConfig:
+    def __init__(
+        self,
+        ranks: Sequence[int],
+        parallel_config: ParallelConfig | None = None,
+        distribution: str | None = None,
+        units_per_rank: int = 1,
+    ) -> None: ...
+    @property
+    def ranks(self) -> tuple[int, ...]: ...
+    @property
+    def parallel_config(self) -> ParallelConfig: ...
+    @property
+    def distribution(self) -> str | None: ...
+    @property
+    def units_per_rank(self) -> int: ...
+    @staticmethod
+    def from_dict(value: Mapping[str, object]) -> ComponentConfig: ...
+    def to_dict(self) -> dict[str, object]: ...
+
+def parse_components(
+    value: dict[str, object], world_size: int, *, role: str = "model"
+) -> tuple[tuple[str, ComponentConfig], ...]: ...
+
+@final
+class ComponentBinding:
+    def __init__(
+        self,
+        name: str,
+        config: ComponentConfig,
+        process_group: Communicator,
+        mesh: DeviceMesh | None,
+        device: torch.device,
+        units: Communicator | None = None,
+        groups: tuple[Communicator, ...] = (),
+        call_kinds: tuple[CallKind, ...] = (),
+        calls: tuple[ComponentCall, ...] = (),
+    ) -> None: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def config(self) -> ComponentConfig: ...
+    @property
+    def process_group(self) -> Communicator: ...
+    @property
+    def mesh(self) -> DeviceMesh | None: ...
+    @property
+    def device(self) -> torch.device: ...
+    @property
+    def units(self) -> Communicator | None: ...
+    @property
+    def groups(self) -> tuple[Communicator, ...]: ...
+    calls: tuple[ComponentCall, ...]
+    call_kinds: tuple[CallKind, ...]
+    @property
+    def owns(self) -> bool: ...
+    @property
+    def communicators(self) -> tuple[Communicator, ...]: ...
+    @property
+    def input_ranks(self) -> tuple[int, ...]: ...
+    @property
+    def output_ranks(self) -> tuple[int, ...]: ...
+    def media_units(self, cursor: int, count: int) -> range: ...
+
+def initialize_components(
+    groups: ProcessGroups,
+    components: Mapping[str, ComponentConfig],
+    *,
+    declarations: Mapping[str, tuple[ComponentCall, ...]] | None = None,
+) -> dict[str, ComponentBinding]: ...
+
+@final
+class MuxSession:
+    def __init__(self, config: Any) -> None: ...
+    def append(self, units: tuple[bytes, ...]) -> None: ...
+    def finalize(self, audio: bytes) -> bytes: ...
+    def close(self) -> None: ...
+
+def frame_encoded_unit(
+    payload: bytes, destination: torch.Tensor
+) -> torch.Tensor: ...
+def read_encoded_unit(row: torch.Tensor) -> bytes: ...
+def buffer_envelope(
+    descriptions: tuple[Mapping[str, BufferConfig], ...],
+) -> dict[str, BufferConfig]: ...
+
+@final
+class SamplePages:
+    @property
+    def page_units(self) -> int: ...
+    @property
+    def pages(self) -> int: ...
+    @property
+    def units(self) -> int: ...
+    @property
+    def dtype(self) -> torch.dtype: ...
+
+class MediaBuilder:
+    def __init__(
+        self,
+        denoiser: Any,
+        *,
+        max_frames: int,
+        max_text_tokens: int,
+        min_frames: int = 1,
+        text_capacities: tuple[int, ...] = (),
+        condition_rows: int = 0,
+    ) -> None: ...
+    @property
+    def denoiser(self) -> Any: ...
+    @property
+    def num_steps(self) -> int: ...
+    @property
+    def condition_rows(self) -> int: ...
+    @property
+    def max_text_tokens(self) -> int: ...
+    @property
+    def canvases(self) -> tuple[Any, ...]: ...
+    @property
+    def frame_counts(self) -> tuple[int, ...]: ...
+    @property
+    def text_capacities(self) -> tuple[int, ...]: ...
+    @property
+    def maximum(self) -> Any: ...
+    @property
+    def maximum_layout(self) -> Any: ...
+    @property
+    def sample_pages(self) -> SamplePages: ...
+    def size(
+        self,
+        num_frames: int,
+        num_text_tokens: int,
+        canvas: Any,
+        *,
+        conditions: tuple[Any, ...] = (),
+        vision_spans: tuple[tuple[int, int], ...] = (),
+    ) -> Any: ...
+    def layout(self, size: Any) -> Any: ...
+    def layouts(self) -> tuple[Any, ...]: ...
+    def video_sizes(self) -> tuple[Any, ...]: ...
+    def slot_pages(self, slot: int) -> tuple[int, ...]: ...
+    def layout_pages(self, layout: Any) -> int: ...
+    def sample_views(
+        self, size: Any, flat: torch.Tensor, *, layout: Any = None
+    ) -> Mapping[str, torch.Tensor]: ...
+    def tables(self, size: Any) -> tuple[str, ...]: ...
+    def _layout_tables(self, layout: Any) -> tuple[str, ...]: ...
+    def buffers(self, size: Any) -> Mapping[str, BufferConfig]: ...
+    def layout_buffers(self, layout: Any) -> Mapping[str, BufferConfig]: ...
+    def capacity_buffers(self) -> Mapping[str, BufferConfig]: ...
+
+class ModelRunner:
+    def __new__(
+        cls,
+        name: str,
+        call: Any,
+        device: torch.device,
+        kinds: Sequence[CallKind],
+        stream: CUDAStream | None,
+        context: ExecutionContext,
+        inputs: InputBuffers | None = None,
+        *,
+        storage: GraphStorage,
+        devices: Sequence[torch.device],
+        exact_graphs: bool = False,
+        cache: PrefixCache | None = None,
+        predicates: torch.Tensor | None = None,
+        rank: int = 0,
+        share: ModelRunner | None = None,
+    ) -> Self: ...
+    @property
+    def execution(self) -> Execution: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def call(self) -> Any: ...
+    @property
+    def device(self) -> torch.device: ...
+    @property
+    def model(self) -> torch.nn.Module: ...
+    @property
+    def call_kinds(self) -> tuple[CallKind, ...]: ...
+    @property
+    def cuda_stream(self) -> CUDAStream | None: ...
+    @property
+    def input_buffers(self) -> InputBuffers | None: ...
+    @property
+    def exact_graphs(self) -> bool: ...
+    @property
+    def cache(self) -> PrefixCache | None: ...
+    @property
+    def decode_predicates(self) -> torch.Tensor | None: ...
+    @property
+    def rank(self) -> int: ...
+    table_widths: Sequence[int]
+    peers: tuple[ModelRunner, ...]
+    def prepare_inputs(
+        self,
+        rows: tuple[InputRow, ...],
+        *,
+        forward_mode: CallKind,
+        attention: Any = None,
+        cache: PrefixCache | None = None,
+        tables: Any = None,
+        states: DecodeState | None = None,
+    ) -> InputBatch: ...
+    def batch_forward(
+        self, batch: InputBatch, *, padded: bool = False
+    ) -> ExecutionOutput: ...
+    def graph_tokens(self, key: Any) -> int: ...
+    def expert_tokens(self, batch: InputBatch) -> int: ...
+    def capture_plan(self) -> tuple: ...
+    def select_graph_shape(
+        self, batch: InputBatch, *, eligible: bool
+    ) -> tuple[Any, InputBatch, bool] | None: ...
+    def resources(self) -> dict: ...
+    def kernels(self) -> list[dict[str, object]]: ...
+    def close_graphs(self) -> None: ...
+    def close(self) -> None: ...
+    def batch_graph(self, key: Any) -> Any: ...
+    def capture_graph(
+        self, key: Any, execution: InputBatch, forward: Callable
+    ) -> Any: ...
+    def replay_graph(
+        self,
+        key: Any,
+        execution: InputBatch,
+        batch: InputBatch,
+        *,
+        borrow: bool,
+    ) -> ExecutionOutput: ...
+    @staticmethod
+    def result(result: Any) -> ExecutionOutput: ...
+
+SLOT_BUCKETS: tuple[int, ...]
+
+class CanvasRunner(ModelRunner):
+    @property
+    def model(self) -> TokenDenoiser: ...
+    @property
+    def pipeline(self) -> Communicator: ...
+    @property
+    def canvas_length(self) -> int: ...
+    @property
+    def canvas_slots(self) -> CanvasSlots | None: ...
+    @property
+    def sampler_workspace(self) -> Any: ...
+    @property
+    def step_rows(self) -> int: ...
+    @property
+    def local_tail(self) -> bool: ...
+    @property
+    def max_canvases(self) -> int: ...
+    @property
+    def canvas_rows(self) -> tuple[int, ...]: ...
+    @property
+    def readout_lengths(self) -> tuple[int, ...]: ...
+    pool_rows: int | None
+    def bind_canvas_slots(self, slots: CanvasSlots) -> None: ...
+
+class EncoderRunner(ModelRunner):
+    @property
+    def packs_images(self) -> bool: ...
+    def prepare_tokens(
+        self, tokens: Sequence[int], *, capacity: int
+    ) -> torch.Tensor: ...
+    def capture_packed(
+        self, inputs: tuple[torch.Tensor, ...]
+    ) -> CUDAGraphRunner: ...
+
+class DenoisingSequence:
+    """Bound numerical steps over one request's state slot and sample pages."""
+
+    @property
+    def layout(self) -> Any: ...
+    @property
+    def inputs(self) -> tuple[Any, ...]: ...
+    @property
+    def schedules(self) -> Mapping[str, Any]: ...
+    @property
+    def state(self) -> Mapping[str, torch.Tensor]: ...
+    @property
+    def fields(self) -> dict[int, str]: ...
+    @property
+    def temporal(self) -> tuple[tuple[torch.Tensor, ...], ...]: ...
+
+class DiffusionRunner(ModelRunner):
+    @property
+    def model(self) -> Denoiser[Any, Any]: ...
+    @classmethod
+    def for_layouts(
+        cls,
+        name,
+        call,
+        maximum,
+        *,
+        device,
+        stream,
+        storage,
+        devices=(),
+        bank=None,
+        slots=0,
+        pool,
+        pages,
+        attention=None,
+    ) -> DiffusionRunner: ...
+    @property
+    def pool(self) -> LatentPool | None: ...
+    @property
+    def samples(self) -> torch.Tensor | None: ...
+    @property
+    def _slot_index(self) -> torch.Tensor | None: ...
+    @property
+    def captures(self) -> bool: ...
+    def prepare(self, layout, *, pages: int) -> DenoisingBuffers: ...
+    def layout(self, layout) -> DenoisingBuffers: ...
+    def retire(self, layout) -> None: ...
+    def bind(
+        self,
+        layout,
+        inputs,
+        schedules,
+        *,
+        state,
+        slot: int,
+        pages: Sequence[int],
+    ) -> DenoisingSequence: ...
+    def binds(self, sequence: DenoisingSequence) -> bool: ...
+    def warmup(self, sequence: DenoisingSequence) -> None: ...
+    def capture(self, sequence: DenoisingSequence) -> None: ...
+    def step(
+        self, sequence: DenoisingSequence, index: int, bank: int
+    ) -> tuple[Any, str]: ...
+
+class TextRunner(ModelRunner):
+    @property
+    def model(self) -> CausalLM: ...
+    def __call__(
+        self, inputs: TextInput, selections: Sequence[TokenSelection]
+    ) -> ExecutionOutput: ...
+    def select_outputs(
+        self,
+        hidden: torch.Tensor,
+        inputs: TextInput,
+        selections: Sequence[TokenSelection],
+        *,
+        copy_hidden: bool = False,
+    ) -> ExecutionOutput: ...
+    shapes: TextShapes
+    @property
+    def pipeline(self) -> Communicator: ...
+    @property
+    def vocab(self) -> VocabShard: ...
+    def hidden_states(self, inputs: Any) -> torch.Tensor: ...
+    def decode_output(self, values: torch.Tensor) -> torch.Tensor: ...
+
+def joining_experts(
+    forward: Callable, context: ExecutionContext
+) -> Callable: ...
 
 @final
 class Execution:
@@ -1347,18 +2066,6 @@ class Execution:
     @property
     def expert_order(self) -> int | None: ...
     def encode_images(self, runner: Any, inputs: Any) -> ExecutionOutput: ...
-    def configure_denoising(self, maximum: Any) -> None: ...
-    def prepare_denoising(
-        self, runner: Any, layout: Any, pages: int
-    ) -> DenoisingBuffers: ...
-    def denoising_layout(self, layout: Any) -> DenoisingBuffers: ...
-    def retire_denoising(self, layout: Any) -> None: ...
-    def binds_denoising(self, runner: Any, ladder: Any) -> bool: ...
-    def warm_denoising(self, runner: Any, ladder: Any) -> None: ...
-    def capture_denoising(self, runner: Any, ladder: Any) -> None: ...
-    def step_denoising(
-        self, runner: Any, ladder: Any, index: int, bank: int
-    ) -> tuple[Any, str]: ...
     def seal(self) -> None: ...
     @staticmethod
     def bind_microbatches(peers: Sequence[Execution]) -> None: ...
@@ -1442,7 +2149,6 @@ class BatchState:
     batch: Batch
     inputs: BatchInputs
     stream: torch.cuda.Stream | None
-    started_ns: int
     component_us: dict[str, int]
 
     @property
@@ -3503,3 +4209,255 @@ def loaded_worker_config(
     config: WorkerConfig,
     queue_depth: int,
 ) -> WorkerConfig: ...
+
+class InputRow:
+    @property
+    def forward_mode(self) -> ForwardMode | MediaCall: ...
+    @property
+    def request_pool_idx(self) -> int: ...
+
+class AttentionRow(InputRow):
+    @property
+    def positions(self) -> torch.Tensor | None: ...
+    @property
+    def seq_len(self) -> int: ...
+    @property
+    def write_kv(self) -> bool: ...
+    @property
+    def causal(self) -> bool | None: ...
+
+class TokenRow(AttentionRow):
+    @property
+    def token_ids(self) -> torch.Tensor | None: ...
+    @property
+    def token_embeddings(self) -> torch.Tensor | None: ...
+    @property
+    def token_embedding_mask(self) -> torch.Tensor | None: ...
+    @property
+    def selection(self) -> TokenSelection | None: ...
+    @property
+    def decode_predicate(self) -> torch.Tensor | None: ...
+    @property
+    def decode_predicate_tagged(self) -> bool: ...
+    @property
+    def decode_force_finish(self) -> bool: ...
+    @property
+    def request_indexed_decode(self) -> bool: ...
+    def __init__(
+        self,
+        forward_mode: ForwardMode | MediaCall,
+        request_pool_idx: int = ...,
+        positions: torch.Tensor | None = ...,
+        seq_len: int = ...,
+        write_kv: bool = ...,
+        causal: bool | None = ...,
+        token_ids: torch.Tensor | None = ...,
+        token_embeddings: torch.Tensor | None = ...,
+        token_embedding_mask: torch.Tensor | None = ...,
+        selection: TokenSelection | None = ...,
+        decode_predicate: torch.Tensor | None = ...,
+        decode_predicate_tagged: bool = ...,
+        decode_force_finish: bool = ...,
+        request_indexed_decode: bool = ...,
+    ) -> None: ...
+    def replace(self, **fields: Any) -> Self: ...
+    @property
+    def query_tokens(self) -> int: ...
+
+class CanvasRow(AttentionRow):
+    @property
+    def token_ids(self) -> torch.Tensor | None: ...
+    @property
+    def slot_tokens(self) -> tuple[int, ...]: ...
+    @property
+    def candidate_offsets(self) -> tuple[int, ...]: ...
+    @property
+    def candidate_ids(self) -> tuple[int, ...]: ...
+    def __init__(
+        self,
+        forward_mode: ForwardMode | MediaCall,
+        request_pool_idx: int = ...,
+        positions: torch.Tensor | None = ...,
+        seq_len: int = ...,
+        write_kv: bool = ...,
+        causal: bool | None = ...,
+        token_ids: torch.Tensor | None = ...,
+        slot_tokens: tuple[int, ...] = ...,
+        candidate_offsets: tuple[int, ...] = ...,
+        candidate_ids: tuple[int, ...] = ...,
+    ) -> None: ...
+    def replace(self, **fields: Any) -> Self: ...
+    @property
+    def query_tokens(self) -> int: ...
+
+class CanvasStepRow(AttentionRow):
+    @property
+    def canvas_length(self) -> int: ...
+    @property
+    def seed(self) -> int: ...
+    @property
+    def block(self) -> int: ...
+    @property
+    def step(self) -> int: ...
+    @property
+    def sampling(self) -> CanvasConstants: ...
+    def __init__(
+        self,
+        forward_mode: ForwardMode | MediaCall,
+        request_pool_idx: int = ...,
+        positions: torch.Tensor | None = ...,
+        seq_len: int = ...,
+        write_kv: bool = ...,
+        causal: bool | None = ...,
+        canvas_length: int = ...,
+        seed: int = ...,
+        block: int = ...,
+        step: int = ...,
+        sampling: CanvasConstants | None = ...,
+    ) -> None: ...
+    def replace(self, **fields: Any) -> Self: ...
+    @property
+    def query_tokens(self) -> int: ...
+
+class DiffusionRow(AttentionRow):
+    @property
+    def timestep(self) -> torch.Tensor: ...
+    @property
+    def latent(self) -> torch.Tensor: ...
+    @property
+    def image_tokens(self) -> int: ...
+    @property
+    def image_height(self) -> int: ...
+    @property
+    def image_width(self) -> int: ...
+    def __init__(
+        self,
+        forward_mode: ForwardMode | MediaCall,
+        request_pool_idx: int = ...,
+        positions: torch.Tensor | None = ...,
+        seq_len: int = ...,
+        write_kv: bool = ...,
+        causal: bool | None = ...,
+        *,
+        timestep: torch.Tensor,
+        latent: torch.Tensor,
+        image_tokens: int,
+        image_height: int,
+        image_width: int,
+    ) -> None: ...
+    def replace(self, **fields: Any) -> Self: ...
+    @property
+    def query_tokens(self) -> int: ...
+
+class VisionRow(InputRow):
+    @property
+    def encode_pixels(self) -> torch.Tensor: ...
+    @property
+    def encode_grid(self) -> torch.Tensor | None: ...
+    @property
+    def encode_grid_shape(self) -> tuple[int, int] | None: ...
+    def __init__(
+        self,
+        forward_mode: ForwardMode | MediaCall,
+        request_pool_idx: int = ...,
+        *,
+        encode_pixels: torch.Tensor,
+        encode_grid: torch.Tensor | None = ...,
+        encode_grid_shape: tuple[int, int] | None = ...,
+    ) -> None: ...
+    def replace(self, **fields: Any) -> Self: ...
+
+class DecodeRow(InputRow):
+    @property
+    def latent(self) -> torch.Tensor: ...
+    @property
+    def image_height(self) -> int: ...
+    @property
+    def image_width(self) -> int: ...
+    def __init__(
+        self,
+        forward_mode: ForwardMode | MediaCall,
+        request_pool_idx: int = ...,
+        *,
+        latent: torch.Tensor,
+        image_height: int,
+        image_width: int,
+    ) -> None: ...
+    def replace(self, **fields: Any) -> Self: ...
+
+class InputBatch:
+    @property
+    def forward_mode(self) -> ForwardMode | MediaCall: ...
+    @property
+    def inputs(self) -> Any: ...
+    @property
+    def request_pool_indices(self) -> torch.Tensor: ...
+    @property
+    def token_selections(self) -> tuple[TokenSelection, ...]: ...
+    @property
+    def decode_force_finish(self) -> torch.Tensor | None: ...
+    def __init__(
+        self,
+        forward_mode: ForwardMode | MediaCall,
+        inputs: Any,
+        request_pool_indices: torch.Tensor,
+        token_selections: tuple[TokenSelection, ...] = ...,
+        decode_force_finish: torch.Tensor | None = ...,
+    ) -> None: ...
+    def replace(self, **fields: Any) -> Self: ...
+    @property
+    def query_tokens(self) -> int | None: ...
+    @property
+    def row_count(self) -> int: ...
+
+def classify_error(
+    exc: BaseException, *, context: str | None = None, **kw: Any
+) -> WorkerError: ...
+def should_capture_trace(code: WorkerErrorCode | str) -> bool: ...
+def worker_error_mapping(error: WorkerError) -> dict[str, Any]: ...
+def input_signature(value: Any) -> tuple[Any, tuple[Any, ...]]: ...
+
+_Module = TypeVar("_Module", bound=torch.nn.Module)
+
+def model_capability(
+    model: torch.nn.Module, kind: type[_Module]
+) -> _Module | None: ...
+def image_input_builder(model: torch.nn.Module) -> Any: ...
+def video_denoiser(model: torch.nn.Module, config: WorkerConfig) -> Any: ...
+def executed_video_tasks(denoiser: torch.nn.Module) -> tuple[str, ...]: ...
+def condition_capacity(
+    denoiser: torch.nn.Module, config: WorkerConfig
+) -> int: ...
+def media_input_builder(
+    model: torch.nn.Module, config: WorkerConfig
+) -> Any: ...
+def validate_components(
+    model: torch.nn.Module,
+    components: Mapping[str, ComponentConfig],
+    *,
+    entries: Mapping[str, ComponentEntry] | None = None,
+    declarations: dict[str, tuple[ComponentCall, ...]] | None = None,
+) -> dict[str, tuple[ComponentCall, ...]]: ...
+def bind_components(
+    model: torch.nn.Module,
+    bindings: Mapping[str, ComponentBinding],
+    *,
+    entries: Mapping[str, ComponentEntry] | None = None,
+    declarations: dict[str, tuple[ComponentCall, ...]] | None = None,
+) -> None: ...
+def prepare_worker_launch(
+    cls: type[WorkerProcessArgs], fields: dict[str, Any]
+) -> WorkerProcessArgs: ...
+def endpoint_name(config: WorkerProcessArgs) -> str: ...
+def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None: ...
+def run_worker(config: WorkerProcessArgs) -> None: ...
+def call_kinds(calls: Iterable[ComponentCall]) -> frozenset[CallKind]: ...
+def is_host_component(name: str) -> bool: ...
+def holds_host_components(names: Iterable[str]) -> bool: ...
+def supported_calls(
+    model: torch.nn.Module, held: Iterable[str] = ()
+) -> frozenset[CallKind]: ...
+def media_components(
+    model: torch.nn.Module, held: Iterable[str] = ()
+) -> dict[MediaCall, str]: ...
+def host_components() -> dict[str, frozenset[MediaCall]]: ...

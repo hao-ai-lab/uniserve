@@ -5,11 +5,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 use super::{InputBuffers, copy, host_tensor, numerical, prefix, with_host};
+use crate::worker::canvas_slots::CanvasSlots;
 use crate::worker::host::with_context;
+use crate::worker::model_inputs::{CanvasRow, CanvasStepRow};
 use crate::worker::tensor_buffers::TensorBuffers;
 
 impl InputBuffers {
-    pub(super) fn bind_canvas(slf: &Bound<'_, Self>, slots: Py<PyAny>) -> PyResult<()> {
+    pub(in crate::worker) fn bind_canvas(
+        slf: &Bound<'_, Self>,
+        slots: Py<CanvasSlots>,
+    ) -> PyResult<()> {
         let py = slf.py();
         let (device, rows) = {
             let owner = slf.borrow();
@@ -21,20 +26,18 @@ impl InputBuffers {
             }
             (
                 owner.device.clone_ref(py),
-                owner
-                    .max_rows
-                    .min(slots.getattr(py, "request_pool_size")?.extract(py)?),
+                owner.max_rows.min(slots.borrow(py).request_pool_size),
             )
         };
-        let history = slots.getattr(py, "history_depth")?.extract::<usize>(py)?;
-        let fields = sampler_fields(slots.bind(py), rows, history)?;
+        let history = slots.borrow(py).history_depth;
+        let fields = sampler_fields(slots.bind(py).as_any(), rows, history)?;
         let backing = Py::new(
             py,
             TensorBuffers::allocate(py, &fields, device.bind(py), false, None)?,
         )?;
         let mut owner = slf.borrow_mut();
         owner.canvas_backing = Some(backing);
-        owner.canvas_slots = slots;
+        owner.canvas_slots = Some(slots);
         Ok(())
     }
 
@@ -48,16 +51,19 @@ impl InputBuffers {
         let mut groups = Vec::new();
         let mut row_candidates = Vec::with_capacity(rows.len());
         let mut offset = 0;
-        for row in rows {
-            let tokens = row.getattr("slot_tokens")?.extract::<Vec<usize>>()?;
-            let offsets = row.getattr("candidate_offsets")?.extract::<Vec<usize>>()?;
-            let candidates = row.getattr("candidate_ids")?.extract::<Vec<i64>>()?;
+        let readouts = rows
+            .iter()
+            .map(|row| Ok(row.cast::<CanvasRow>()?.borrow()))
+            .collect::<PyResult<Vec<_>>>()?;
+        for row in &readouts {
+            let offsets = &row.candidate_offsets;
+            let candidates = &row.candidate_ids;
             row_candidates.push(candidates.len());
-            for (index, token) in tokens.into_iter().enumerate() {
+            for (index, token) in row.slot_tokens.iter().enumerate() {
                 slots.push((offset + token) as i64);
-                groups.push(candidates[offsets[index]..offsets[index + 1]].to_vec());
+                groups.push(&candidates[offsets[index]..offsets[index + 1]]);
             }
-            offset += row.getattr("query_tokens")?.extract::<usize>()?;
+            offset += row.query_tokens(py)?;
         }
         if slots.len() > slf.borrow().max_tokens {
             return Err(PyValueError::new_err(
@@ -68,7 +74,7 @@ impl InputBuffers {
         // The padded matrix and its real-element selection share one copy.
         // Padding repeats a candidate only to give every slot equal width;
         // the selection returns each original candidate once, in row order.
-        let width = groups.iter().map(Vec::len).max().unwrap_or(0);
+        let width = groups.iter().map(|group| group.len()).max().unwrap_or(0);
         let matrix = groups.len() * width;
         let size = matrix + row_candidates.iter().sum::<usize>();
         let mut values = Vec::with_capacity(size);
@@ -144,14 +150,20 @@ impl InputBuffers {
                 .as_ref()
                 .ok_or_else(|| PyValueError::new_err("canvas steps require step storage"))?;
             (
-                owner.canvas_slots.clone_ref(py),
+                owner
+                    .canvas_slots
+                    .as_ref()
+                    .ok_or_else(|| {
+                        PyValueError::new_err("canvas steps require bound sampler state")
+                    })?
+                    .clone_ref(py),
                 ring.clone_ref(py),
                 backing.clone_ref(py),
                 owner.column(py, "step_columns")?,
                 owner.max_rows,
             )
         };
-        let length = state.getattr(py, "canvas_length")?.extract::<usize>(py)?;
+        let length = state.borrow(py).canvas_length;
         let mut sampling = Vec::with_capacity(rows.len());
         let mut history = None;
         let mut first = true;
@@ -159,21 +171,20 @@ impl InputBuffers {
         let (slot, host) = ring.borrow(py).acquire(py)?;
         with_host::<i64>(host.bind(py), size, |values| {
             for (index, row) in rows.iter().enumerate() {
-                let constants = row.getattr("sampling")?;
+                let row = row.cast::<CanvasStepRow>()?.borrow();
+                let constants = row.sampling.bind(py).clone();
                 let depth = constants.getattr("stability")?.extract::<usize>()?;
-                if history.is_some_and(|value| value != depth)
-                    || row.getattr("canvas_length")?.extract::<usize>()? != length
-                {
+                if history.is_some_and(|value| value != depth) || row.canvas_length != length {
                     return Err(PyValueError::new_err(
                         "canvas steps of one call share the resident canvas length and one stability threshold",
                     ));
                 }
                 history = Some(depth);
                 sampling.push(constants);
-                values[index].set(row.getattr("request_pool_idx")?.extract()?);
-                values[capacity + index].set(row.getattr("seed")?.extract()?);
-                values[2 * capacity + index].set(row.getattr("block")?.extract()?);
-                let step = row.getattr("step")?.extract::<i64>()?;
+                values[index].set(i64::from(row.as_super().as_super().request_pool_idx));
+                values[capacity + index].set(row.seed);
+                values[2 * capacity + index].set(row.block);
+                let step = row.step;
                 values[3 * capacity + index].set(step);
                 first &= step == 0;
             }
@@ -184,7 +195,7 @@ impl InputBuffers {
             &prefix(&host.bind(py).call_method1("view", (-1,))?, size)?,
         )?;
         ring.borrow(py).record_copy(py, slot)?;
-        let fields = sampler_fields(state.bind(py), rows.len(), history.unwrap_or(0))?;
+        let fields = sampler_fields(state.bind(py).as_any(), rows.len(), history.unwrap_or(0))?;
         let views = backing.borrow(py).view(py, &fields)?;
         Ok(numerical(py)?
             .call_method1(

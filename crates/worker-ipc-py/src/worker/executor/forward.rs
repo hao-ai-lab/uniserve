@@ -60,7 +60,7 @@ struct DiffusionStep {
     step: u32,
 }
 
-type Trajectories = HashMap<usize, Py<PyAny>>;
+type Trajectories = HashMap<usize, Py<crate::worker::diffusion_state::DiffusionState>>;
 
 impl BatchState {
     pub(super) fn call<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, Call>> {
@@ -148,7 +148,7 @@ impl PythonBackend {
             self.worker.bind(py).getattr("block_tables")?.unbind(),
             self.decode_state
                 .as_ref()
-                .map_or_else(|| py.None(), |value| value.clone_ref(py)),
+                .map_or_else(|| py.None(), |value| value.clone_ref(py).into_any()),
         )?;
         let sampling_group = self.worker.bind(py).getattr("sampling_group")?;
         let mut results: Vec<Option<ForwardValue>> = (0..rows.len()).map(|_| None).collect();

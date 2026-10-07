@@ -13,7 +13,7 @@ import pytest
 
 from uniserve_worker.media.container import (
     AvMuxConfig,
-    AvMuxSession,
+    MuxSession,
     encode_audio_track,
     encode_video_unit,
 )
@@ -50,7 +50,7 @@ def test_encoded_units_and_audio_assemble_into_a_decodable_mp4():
     audio = encode_audio_track(config, np.zeros((8000, 2), dtype=np.int16))
     # Rounds arrive one at a time; the artifact is assembled once the audio
     # track follows the last of them.
-    session = AvMuxSession(config)
+    session = MuxSession(config)
     session.append(units[:1])
     session.append(units[1:])
     encoded = session.finalize(audio)
@@ -79,13 +79,22 @@ def test_assembly_requires_every_media_unit_of_the_request():
     config = _config()
     red = np.zeros((4, 16, 32, 3), dtype=np.uint8)
     audio = encode_audio_track(config, np.zeros((8000, 2), dtype=np.int16))
-    session = AvMuxSession(config)
+    session = MuxSession(config)
     session.append((encode_video_unit(config, red),))
     with pytest.raises(Exception, match="every media unit"):
         session.finalize(audio)
     blue = np.zeros((2, 16, 32, 3), dtype=np.uint8)
     session.append((encode_video_unit(config, blue),))
     with pytest.raises(Exception, match="more media units"):
+        session.append((encode_video_unit(config, blue),))
+
+    # A refused append leaves the complete artifact available for delivery.
+    encoded = session.finalize(audio)
+    with av.open(io.BytesIO(encoded)) as container:
+        assert len(tuple(container.decode(video=0))) == config.frame_count
+
+    session.close()
+    with pytest.raises(ValueError, match="closed"):
         session.append((encode_video_unit(config, blue),))
 
 
@@ -115,10 +124,12 @@ def test_a_product_row_carries_one_encoded_unit_and_its_length(
             dtype=np.uint8,
         ),
     )
-    row = torch.zeros(
-        encoded_unit_bytes(frames, height, width), dtype=torch.uint8
+    row = torch.full(
+        (encoded_unit_bytes(frames, height, width),), 173, dtype=torch.uint8
     )
-    frame_encoded_unit(payload, row)
+    initialized = frame_encoded_unit(payload, row)
+    assert initialized.numel() == len(payload) + 8
+    assert torch.all(row[initialized.numel() :] == 173)
     assert read_encoded_unit(row) == payload
     with av.open(io.BytesIO(read_encoded_unit(row))) as container:
         decoded = tuple(container.decode(video=0))
@@ -135,8 +146,10 @@ def test_a_unit_that_exceeds_its_reserved_row_fails_by_name():
     payload = encode_video_unit(
         config, np.zeros((4, 16, 32, 3), dtype=np.uint8)
     )
+    row = torch.full((16,), 173, dtype=torch.uint8)
     with pytest.raises(Exception, match="exceeds the"):
-        frame_encoded_unit(payload, torch.zeros(16, dtype=torch.uint8))
+        frame_encoded_unit(payload, row)
+    assert torch.all(row == 173)
 
 
 @pytest.fixture

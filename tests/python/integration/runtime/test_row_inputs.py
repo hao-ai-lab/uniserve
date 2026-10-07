@@ -258,28 +258,56 @@ def test_rows_gather_the_columns_their_host_layout_describes(
 
 @pytest.mark.gpu
 def test_verification_inputs_keep_the_continuation_on_device():
-    from uniserve_worker.execution.token import token_row
+    from uniserve_worker.execution.token import token_values
 
     current = torch.tensor([71], dtype=torch.long, device="cuda:0")
     mode = torch.cuda.get_sync_debug_mode()
     try:
         torch.cuda.set_sync_debug_mode("error")
-        row = token_row(
-            ForwardMode.VERIFY,
-            (72, 73),
-            12,
-            1,
-            12,
-            TokenSelection.ALL_LOGITS,
-            current=current,
-        )
+        tokens, positions = token_values((72, 73), 12, current=current)
     finally:
         torch.cuda.set_sync_debug_mode(mode)
 
     # Reading values is allowed only after numerical preparation has returned.
-    assert row.token_ids is not None
-    assert row.token_ids.device == current.device
-    assert row.token_ids.cpu().tolist() == [71, 72, 73]
-    assert row.positions is not None
-    assert row.positions.tolist() == [12, 13, 14]
-    assert row.query_tokens == 3
+    assert tokens.device == current.device
+    assert tokens.cpu().tolist() == [71, 72, 73]
+    assert positions.tolist() == [12, 13, 14]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("layout", ("temporal", "sequential"))
+def test_vision_features_keep_host_coordinates_under_a_device_context(layout):
+    from uniserve.processing import (
+        FeatureInjection,
+        FeatureLayout,
+        PositionLayout,
+    )
+    from uniserve_worker.execution.image import vision_values
+
+    features = torch.arange(8, device="cuda:0").reshape(2, 4).float()
+    injection = FeatureInjection(
+        FeatureLayout.FRAMED,
+        PositionLayout(layout),
+        start_token_id=7,
+        end_token_id=9,
+    )
+    with torch.device(features.device):
+        tokens, embeddings, mask, positions = vision_values(
+            features,
+            16,
+            16,
+            12,
+            input_images=1,
+            close_image=False,
+            injection=injection,
+            transform=None,
+        )
+
+    assert tokens.device.type == positions.device.type == "cpu"
+    assert tokens.tolist() == [7, 1, 1, 9]
+    assert positions.tolist() == (
+        [12, 12, 12, 12] if layout == "temporal" else [12, 13, 14, 15]
+    )
+    assert mask.device == features.device
+    assert mask.tolist() == [False, True, True, False]
+    torch.testing.assert_close(embeddings[1:3], features)
