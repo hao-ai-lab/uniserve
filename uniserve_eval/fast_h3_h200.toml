@@ -1,5 +1,5 @@
 # FastH3 on NVIDIA H200 GPUs: the deployments and workload of the H200
-# measurements in docs/fast_h3/fast_h3.md. UNISERVE_FAST_H3_MODEL names a
+# measurements in docs/minimax_h3/evaluation.md. UNISERVE_FAST_H3_MODEL names a
 # local copy of FastVideo/FastVideo-FastH3-8-Step-V2. BF16 servers select the
 # quality tier (BF16 transformer and text, FP16 video projections); FP8
 # servers override only the denoiser MLPs. Every request is a t2va request

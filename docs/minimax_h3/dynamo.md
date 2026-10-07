@@ -6,7 +6,7 @@ This quickstart uses Dynamo 1.5.0 and the FastH3 8-Step V2 checkpoint on four lo
 
 ## Install
 
-First complete the [FastH3 installation](fast_h3.md#install), including GPU providers, shared storage and a complete checkpoint. Run the following commands from the UniServe repository root. The examples use `.venv/bin/python` for UniServe; substitute your installed UniServe interpreter if it is elsewhere.
+First complete the [installation](minimax_h3.md#install), including GPU providers, shared storage and a complete checkpoint. Run the following commands from the UniServe repository root. The examples use `.venv/bin/python` for UniServe; substitute your installed UniServe interpreter if it is elsewhere.
 
 The Rust worker additionally needs Clang's library and builtin headers, a C++ compiler, CMake, pkg-config and protoc. On Ubuntu:
 
