@@ -2191,13 +2191,10 @@ mod placement_tests {
 
     #[test]
     fn every_shipped_deployment_encodes_its_units_on_their_host() {
-        // Every video deployment file shipped in `configs/fast_h3/` and
-        // `configs/minimax_h3/` must pass the placement checks the engine
-        // applies at startup, including the pairing of every decoding worker
-        // with an encoder on its host.
-        for family in ["fast_h3", "minimax_h3"] {
-            check_shipped_deployments(family);
-        }
+        // Every video deployment file shipped in `configs/minimax_h3/` must
+        // pass the placement checks the engine applies at startup, including
+        // the pairing of every decoding worker with an encoder on its host.
+        check_shipped_deployments("minimax_h3");
     }
 
     fn check_shipped_deployments(family: &str) {

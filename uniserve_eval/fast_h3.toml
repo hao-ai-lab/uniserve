@@ -18,12 +18,12 @@
 # its listening port, start `.venv/bin/uniserve-host --head <rank-0
 # address>:<port> --host-identity rank-1` on rank-1.
 root = ".."
-artifact_root = "artifacts/fast_h3/measurements"
+artifact_root = "artifacts/minimax_h3/fasth3-measurements"
 
 [servers.gb200-4-bf16]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-4-bf16.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -33,7 +33,7 @@ server = "gb200-4-bf16"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/latency.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-bf16-latency.load]
@@ -43,7 +43,7 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.gb200-4-bf16-latency.metrics]
 videos_per_second = "higher"
@@ -55,7 +55,7 @@ server = "gb200-4-bf16"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-bf16-throughput-c1.load]
@@ -65,8 +65,8 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c1.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
 [benchmarks.gb200-4-bf16-throughput-c1.metrics]
 videos_per_second = "higher"
@@ -78,7 +78,7 @@ server = "gb200-4-bf16"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-bf16-throughput-c2.load]
@@ -88,8 +88,8 @@ max_concurrency = 2
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c2.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
 [benchmarks.gb200-4-bf16-throughput-c2.metrics]
 videos_per_second = "higher"
@@ -101,7 +101,7 @@ server = "gb200-4-bf16"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-bf16-throughput-c4.load]
@@ -111,8 +111,8 @@ max_concurrency = 4
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c4.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
 [benchmarks.gb200-4-bf16-throughput-c4.metrics]
 videos_per_second = "higher"
@@ -124,7 +124,7 @@ server = "gb200-4-bf16"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-bf16-throughput-c8.load]
@@ -134,8 +134,8 @@ max_concurrency = 8
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c8.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
 [benchmarks.gb200-4-bf16-throughput-c8.metrics]
 videos_per_second = "higher"
@@ -145,7 +145,7 @@ videos_per_second = "higher"
 [servers.gb200-4-nvfp4]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16"]
 
 [servers.gb200-4-nvfp4.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -155,7 +155,7 @@ server = "gb200-4-nvfp4"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/latency.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-nvfp4-latency.load]
@@ -165,7 +165,7 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.gb200-4-nvfp4-latency.metrics]
 videos_per_second = "higher"
@@ -177,7 +177,7 @@ server = "gb200-4-nvfp4"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-nvfp4-throughput-c1.load]
@@ -187,8 +187,8 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c1.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
 [benchmarks.gb200-4-nvfp4-throughput-c1.metrics]
 videos_per_second = "higher"
@@ -200,7 +200,7 @@ server = "gb200-4-nvfp4"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-nvfp4-throughput-c2.load]
@@ -210,8 +210,8 @@ max_concurrency = 2
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c2.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
 [benchmarks.gb200-4-nvfp4-throughput-c2.metrics]
 videos_per_second = "higher"
@@ -223,7 +223,7 @@ server = "gb200-4-nvfp4"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-nvfp4-throughput-c4.load]
@@ -233,8 +233,8 @@ max_concurrency = 4
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c4.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
 [benchmarks.gb200-4-nvfp4-throughput-c4.metrics]
 videos_per_second = "higher"
@@ -246,7 +246,7 @@ server = "gb200-4-nvfp4"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-nvfp4-throughput-c8.load]
@@ -256,8 +256,8 @@ max_concurrency = 8
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c8.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
 [benchmarks.gb200-4-nvfp4-throughput-c8.metrics]
 videos_per_second = "higher"
@@ -267,7 +267,7 @@ videos_per_second = "higher"
 [servers.gb200-8-bf16-latency]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-8-bf16-latency.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -277,7 +277,7 @@ server = "gb200-8-bf16-latency"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/latency.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-bf16-latency.load]
@@ -287,7 +287,7 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.gb200-8-bf16-latency.metrics]
 videos_per_second = "higher"
@@ -297,7 +297,7 @@ videos_per_second = "higher"
 [servers.gb200-8-bf16-throughput]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses4x2-two-node.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2-two-node.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-8-bf16-throughput.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -307,7 +307,7 @@ server = "gb200-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-bf16-throughput-c1.load]
@@ -317,8 +317,8 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c1.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
 [benchmarks.gb200-8-bf16-throughput-c1.metrics]
 videos_per_second = "higher"
@@ -330,7 +330,7 @@ server = "gb200-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-bf16-throughput-c2.load]
@@ -340,8 +340,8 @@ max_concurrency = 2
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c2.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
 [benchmarks.gb200-8-bf16-throughput-c2.metrics]
 videos_per_second = "higher"
@@ -353,7 +353,7 @@ server = "gb200-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-bf16-throughput-c4.load]
@@ -363,8 +363,8 @@ max_concurrency = 4
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c4.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
 [benchmarks.gb200-8-bf16-throughput-c4.metrics]
 videos_per_second = "higher"
@@ -376,7 +376,7 @@ server = "gb200-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-bf16-throughput-c8.load]
@@ -386,8 +386,8 @@ max_concurrency = 8
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c8.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
 [benchmarks.gb200-8-bf16-throughput-c8.metrics]
 videos_per_second = "higher"
@@ -399,7 +399,7 @@ server = "gb200-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-bf16-throughput-c16.load]
@@ -409,8 +409,8 @@ max_concurrency = 16
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c16.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
 
 [benchmarks.gb200-8-bf16-throughput-c16.metrics]
 videos_per_second = "higher"
@@ -420,7 +420,7 @@ videos_per_second = "higher"
 [servers.gb200-8-nvfp4-latency]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off"]
 
 [servers.gb200-8-nvfp4-latency.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -430,7 +430,7 @@ server = "gb200-8-nvfp4-latency"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/latency.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-nvfp4-latency.load]
@@ -440,7 +440,7 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.gb200-8-nvfp4-latency.metrics]
 videos_per_second = "higher"
@@ -450,7 +450,7 @@ videos_per_second = "higher"
 [servers.gb200-8-nvfp4-throughput]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses4x2-two-node.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2-two-node.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0"]
 
 [servers.gb200-8-nvfp4-throughput.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -460,7 +460,7 @@ server = "gb200-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-nvfp4-throughput-c1.load]
@@ -470,8 +470,8 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c1.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
 [benchmarks.gb200-8-nvfp4-throughput-c1.metrics]
 videos_per_second = "higher"
@@ -483,7 +483,7 @@ server = "gb200-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-nvfp4-throughput-c2.load]
@@ -493,8 +493,8 @@ max_concurrency = 2
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c2.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
 [benchmarks.gb200-8-nvfp4-throughput-c2.metrics]
 videos_per_second = "higher"
@@ -506,7 +506,7 @@ server = "gb200-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-nvfp4-throughput-c4.load]
@@ -516,8 +516,8 @@ max_concurrency = 4
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c4.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
 [benchmarks.gb200-8-nvfp4-throughput-c4.metrics]
 videos_per_second = "higher"
@@ -529,7 +529,7 @@ server = "gb200-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-nvfp4-throughput-c8.load]
@@ -539,8 +539,8 @@ max_concurrency = 8
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c8.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
 [benchmarks.gb200-8-nvfp4-throughput-c8.metrics]
 videos_per_second = "higher"
@@ -552,7 +552,7 @@ server = "gb200-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-nvfp4-throughput-c16.load]
@@ -562,8 +562,8 @@ max_concurrency = 16
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c16.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
 
 [benchmarks.gb200-8-nvfp4-throughput-c16.metrics]
 videos_per_second = "higher"
@@ -573,14 +573,14 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-bf16-latency]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses8.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [benchmarks.rtx-pro-6000-8-bf16-latency]
 server = "rtx-pro-6000-8-bf16-latency"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/latency.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-bf16-latency.load]
@@ -590,7 +590,7 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.rtx-pro-6000-8-bf16-latency.metrics]
 videos_per_second = "higher"
@@ -600,14 +600,14 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-bf16-throughput]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses4x2.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c1]
 server = "rtx-pro-6000-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c1.load]
@@ -617,8 +617,8 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c1.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c1.metrics]
 videos_per_second = "higher"
@@ -630,7 +630,7 @@ server = "rtx-pro-6000-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c2.load]
@@ -640,8 +640,8 @@ max_concurrency = 2
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c2.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c2.metrics]
 videos_per_second = "higher"
@@ -653,7 +653,7 @@ server = "rtx-pro-6000-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c4.load]
@@ -663,8 +663,8 @@ max_concurrency = 4
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c4.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c4.metrics]
 videos_per_second = "higher"
@@ -676,7 +676,7 @@ server = "rtx-pro-6000-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c8.load]
@@ -686,8 +686,8 @@ max_concurrency = 8
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c8.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c8.metrics]
 videos_per_second = "higher"
@@ -699,7 +699,7 @@ server = "rtx-pro-6000-8-bf16-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c16.load]
@@ -709,8 +709,8 @@ max_concurrency = 16
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c16.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c16.metrics]
 videos_per_second = "higher"
@@ -720,14 +720,14 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-nvfp4-latency]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses8.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses8.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384"]
 
 [benchmarks.rtx-pro-6000-8-nvfp4-latency]
 server = "rtx-pro-6000-8-nvfp4-latency"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/latency.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-latency.load]
@@ -737,7 +737,7 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-latency.metrics]
 videos_per_second = "higher"
@@ -747,14 +747,14 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-nvfp4-throughput]
 host = "127.0.0.1"
 port = 18083
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses4x2.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4x2.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.92", "--dtype", "bfloat16", "--graph-policy", "off", "--video-text-capacities", "1024,10240,16384"]
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c1]
 server = "rtx-pro-6000-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c1.load]
@@ -764,8 +764,8 @@ max_concurrency = 1
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c1.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c1.jsonl"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c1.metrics]
 videos_per_second = "higher"
@@ -777,7 +777,7 @@ server = "rtx-pro-6000-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c2.load]
@@ -787,8 +787,8 @@ max_concurrency = 2
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c2.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c2.jsonl"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c2.metrics]
 videos_per_second = "higher"
@@ -800,7 +800,7 @@ server = "rtx-pro-6000-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c4.load]
@@ -810,8 +810,8 @@ max_concurrency = 4
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c4.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c4.jsonl"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c4.metrics]
 videos_per_second = "higher"
@@ -823,7 +823,7 @@ server = "rtx-pro-6000-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c8.load]
@@ -833,8 +833,8 @@ max_concurrency = 8
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c8.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c8.jsonl"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c8.metrics]
 videos_per_second = "higher"
@@ -846,7 +846,7 @@ server = "rtx-pro-6000-8-nvfp4-throughput"
 task = "video"
 model = "FastH3"
 dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/fast_h3/throughput.jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c16.load]
@@ -856,8 +856,8 @@ max_concurrency = 16
 warmup_requests = 0
 request_timeout_s = 21600
 seed = 20260925
-warmup_manifest = "uniserve_eval/workloads/fast_h3/warmup.jsonl"
-priming_manifest = "uniserve_eval/workloads/fast_h3/priming-c16.jsonl"
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/fasth3-priming-c16.jsonl"
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c16.metrics]
 videos_per_second = "higher"
