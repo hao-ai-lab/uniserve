@@ -40,6 +40,8 @@ from .cuda_graph import (
     GraphBucket,
     clone_inputs,
     input_signature,
+    stage_inputs,
+    stage_outputs,
 )
 from .graph_inputs import (
     PrefillShape,
@@ -186,15 +188,27 @@ class ModelRunner(Execution, ABC):
             if self.pools and (graph is not None or not self._startup_complete):
                 if graph is None:
                     self.close_bucket(key)
+                    # The output is cloned below before any other call of
+                    # this context's stream replays, so its graphs borrow
+                    # their fixed inputs and outputs from the context's
+                    # ``Scratch``. Startup entries of one call share that
+                    # ``Scratch`` with their graph pool (``prepare_module``).
                     with self.graph_storage.allocate(self):
-                        static = clone_inputs(values)
-                    graph = CUDAGraphRunner.capture(
-                        context,
-                        static,
-                        lambda inputs: self.call.forward(
+                        static = stage_inputs(values, context.scratch)
+
+                    def forward(inputs):
+                        return self.call.forward(
                             *inputs[0], **inputs[1], **resources
-                        ),
-                        pools=self.pools,
+                        )
+
+                    # The eager call warms the computation and fixes the
+                    # output shapes the borrowed backing views.
+                    example = forward(static)
+                    with self.graph_storage.allocate(self):
+                        call = stage_outputs(forward, example, context.scratch)
+                    del example
+                    graph = CUDAGraphRunner.capture(
+                        context, static, call, pools=self.pools, warm=False
                     )
                     # The warm call and the capture leave storage in and
                     # outside the pool; refuse an overrun at this graph.
