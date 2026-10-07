@@ -94,7 +94,7 @@ class GroupTable:
             or start + length > self.end_page * page_tokens
         ):
             raise invalid_descriptor("KV token interval exceeds its unit table")
-        spans = []
+        spans: list[tuple[int, int, int]] = []
         while length:
             page, offset = divmod(start, page_tokens)
             count = min(length, page_tokens - offset)

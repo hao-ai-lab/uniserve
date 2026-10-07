@@ -65,9 +65,19 @@ def plan_cache(model: CausalLM, config: WorkerConfig) -> Planes:
         ValueError: As ``plan_units``, when the model has no resident cache
             layer, or when the page size is unresolved.
     """
+    return _plan(model, config, page_size(config))
+
+
+def page_size(config: WorkerConfig) -> int:
+    """Return the worker's resolved base KV page size in tokens.
+
+    Raises:
+        ValueError: ``block_size`` is unset; ``resolve_page_size`` sets it
+            before anything is planned from it.
+    """
     if config.block_size is None:
         raise ValueError("the worker's KV page size is unresolved")
-    return _plan(model, config, config.block_size)
+    return config.block_size
 
 
 def _plan(model: CausalLM, config: WorkerConfig, block_size: int) -> Planes:
@@ -184,7 +194,7 @@ def table_widths(
     queries intersect, at most ``ceil((window + queries) / page_tokens) +
     1``. Tables are in table order, one per unit position of every group.
     """
-    widths = []
+    widths: list[int] = []
     for group in planes.groups:
         width = ceil_div(max(1, max_sequence_tokens), group.page_tokens)
         if group.window is not None:

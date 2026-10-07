@@ -48,7 +48,11 @@ from uniserve.runtime.device import (
     process_device_bytes,
 )
 from uniserve.tensors import BufferConfig
-from uniserve_worker.bootstrap.cache import plan_cache, table_widths
+from uniserve_worker.bootstrap.cache import (
+    page_size,
+    plan_cache,
+    table_widths,
+)
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import (
     capability,
@@ -507,8 +511,9 @@ def latent_pool_plan(
         WorkerError: With ``UNSUPPORTED_SETUP`` when an image denoiser's
             ``model_dtype`` names no torch dtype.
         ValueError: ``image_builder`` or ``media_builder`` rejects the
-            model's capabilities, or the video denoiser's sample modalities
-            do not share one dtype.
+            model's capabilities, an image denoiser's ``block_size`` is
+            unresolved, or the video denoiser's sample modalities do not
+            share one dtype.
     """
     slots = int(worker_config.max_request_pool_size)
     flow = image_builder(model)
@@ -520,7 +525,7 @@ def latent_pool_plan(
             raise unsupported_setup(
                 f"unsupported latent dtype {worker_config.model_dtype!r}"
             )
-        page_units = int(worker_config.block_size)
+        page_units = page_size(worker_config)
         units = active_latent_capacity_tokens(
             flow.max_tokens, worker_config.kv_token_capacity
         )

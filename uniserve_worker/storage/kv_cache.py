@@ -34,9 +34,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from threading import RLock
+from typing import cast
 
 import torch
 
+from uniserve.cache import mha
 from uniserve.math import ceil_div
 from uniserve.runtime import PrefixCache
 from uniserve_worker.errors import invalid_descriptor, resource_error
@@ -179,8 +181,8 @@ class KVCacheManager:
         if len(complete) != len(info.groups):
             raise ValueError("every cache group requires its transfer layers")
         self.axes: tuple[GroupAxis, ...] = ()
-        for axis, group in zip(complete, info.groups, strict=True):
-            local = tuple(group.layer_ids)
+        for axis, advertised in zip(complete, info.groups, strict=True):
+            local = tuple(advertised.layer_ids)
             if local[0] not in axis:
                 raise ValueError(
                     "cache group layers are missing from their transfer axis"
@@ -192,8 +194,10 @@ class KVCacheManager:
                 )
             self.axes += (GroupAxis(offset, len(axis)),)
 
+        # A ``PrefixCache`` holds only MHA layers (``plan_units`` rejects any
+        # other layout).
         self.compute_dtypes = tuple(
-            cache.config.layers[group.layers[0]].compute_dtype
+            cast(mha.Config, cache.config.layers[group.layers[0]]).compute_dtype
             for group in groups
         )
         self.shapes = tuple(
@@ -1139,7 +1143,7 @@ class KVCacheManager:
                 "KV import requires a destination table per group"
             )
         initialized = self.validate_units(initialized_units)
-        held = set()
+        held: set[int] = set()
         for table in tables:
             held.update(self.validate_units(table.units))
             if (

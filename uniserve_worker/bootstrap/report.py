@@ -35,6 +35,7 @@ from uniserve.model import (
 from uniserve.nn import Linear
 from uniserve.processing import ImageProcessor
 from uniserve.quantization import QuantizedTensor
+from uniserve.runtime.prefix_cache import Planes
 from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.cache import (
     cache_info,
@@ -89,6 +90,7 @@ from uniserve_worker.protocol.call import CALL_KINDS, CallKind
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     ComponentInfo,
+    KVCacheInfo,
     VideoDenoiserInfo,
     WorkerInfo,
 )
@@ -342,16 +344,15 @@ def _token_worker_layout(
     # whose page spans the most units.
     text = capability(model, CausalLM)
     owns_kv = text is not None
-    planes = None if text is None else plan_cache(text, worker_config)
-    cache = (
-        None
-        if text is None
-        else cache_info(
+    planes: Planes | None = None
+    cache: KVCacheInfo | None = None
+    if text is not None:
+        planes = plan_cache(text, worker_config)
+        cache = cache_info(
             text,
             worker_config,
             num_units=1 + max(group.units_per_page for group in planes.groups),
         )
-    )
     unit_bytes = 0 if cache is None else cache.unit_bytes
 
     flow = image_builder(model)

@@ -229,7 +229,7 @@ def from_tables(
     prefixes = SequenceLengths.from_lengths(prefix_lengths, device="cpu")
 
     if any(write):
-        entries = {}
+        entries: dict[int, PagedInput | SegmentedInput] = {}
         for number, table in enumerate(pages):
             entry = PagedInput.from_blocks(
                 blocks=table.rows,

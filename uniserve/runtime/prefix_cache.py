@@ -176,10 +176,12 @@ def plan_units(
             unsupported, ``block_size`` is not a positive power of two, or a
             group's rows do not divide the plane into a power-of-two page.
     """
-    layers = config.layers
-    if not layers or any(
-        not isinstance(layout, mha.Config) for layout in layers.values()
-    ):
+    layers = {
+        name: layout
+        for name, layout in config.layers.items()
+        if isinstance(layout, mha.Config)
+    }
+    if not layers or len(layers) != len(config.layers):
         raise ValueError("a K/V unit pool requires MHA cache layers")
     if quantization is not None and set(quantization) - set(layers):
         raise ValueError(

@@ -45,6 +45,7 @@ from uniserve.runtime.process_groups import (
 from uniserve.runtime.resources import close_resources
 from uniserve_worker.bootstrap.cache import (
     group_layers,
+    page_size,
     plan_cache,
     resident_width,
     resolve_page_size,
@@ -497,7 +498,7 @@ class Worker:
                     PrefixCache(
                         cache,
                         num_units=kv_cache.num_units,
-                        block_size=int(worker_config.block_size),
+                        block_size=page_size(worker_config),
                         device=worker_config.device,
                         dtype=dtype,
                         quantization={

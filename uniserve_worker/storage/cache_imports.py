@@ -27,7 +27,7 @@ consumption but never releases storage a started read may still touch.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -219,7 +219,7 @@ class CacheImports:
             return bool(self._writes)
 
     def dependencies(
-        self, ranges: tuple[tuple[int, int, int], ...]
+        self, ranges: Sequence[tuple[int, int, int]]
     ) -> tuple[Future[None], ...]:
         """Return retirements of imports whose destinations overlap ``ranges``.
 
