@@ -49,6 +49,7 @@ the sentinel slot zero.
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import cast
 
 import torch
 
@@ -266,8 +267,8 @@ class CanvasRunner(ModelRunner):
         ``STEP_SKIPPED``.
         """
         slots = self.canvas_slots
-        if slots is None:
-            raise ValueError("canvas steps require bound sampler state")
+        if slots is None or slots.workspace is None:
+            raise ValueError("canvas steps require bound, open sampler state")
         state = inputs.state
         rows, length = state.canvas.shape
         vocab = slots.vocab_size
@@ -529,7 +530,11 @@ class CanvasRunner(ModelRunner):
             )
         ):
             try:
-                self._capture_tails(replay_hidden(graph, execution))
+                # A readout graph's output is ``_attend_state``'s attend state.
+                state = cast(
+                    tuple[torch.Tensor, ...], replay_hidden(graph, execution)
+                )
+                self._capture_tails(state)
             except BaseException:
                 graph.close()
                 raise
@@ -585,7 +590,11 @@ class CanvasRunner(ModelRunner):
         """
         if key[0] != "canvas":
             return super().replay_graph(key, execution, batch, borrow=borrow)
-        state = replay_hidden(self.batch_graph(key), execution)
+        # A readout graph's output is ``_attend_state``'s attend state.
+        state = cast(
+            tuple[torch.Tensor, ...],
+            replay_hidden(self.batch_graph(key), execution),
+        )
         with self.context.activate():
             if self.local_tail:
                 return self._replay_tails(state, batch.inputs)
@@ -670,6 +679,15 @@ def _pad_attention(
     attention is.
     """
     queries = attention.queries
+    if queries is None or queries.host is None:
+        raise ValueError("canvas padding requires host query lengths")
+    # Canvas rows are read-only (``CanvasRow``), so their staged attention
+    # holds segmented entries alone.
+    segments: dict[int, SegmentedInput] = {}
+    for number, entry in attention.entries.items():
+        if not isinstance(entry, SegmentedInput):
+            raise ValueError("canvas attention entries must be segmented")
+        segments[number] = entry
     live = queries.batch_size
     extra = len(padding)
     rows = live + extra
@@ -685,7 +703,7 @@ def _pad_attention(
         host=queries.host + padding, values=values, offsets=offsets
     )
 
-    first = next(iter(attention.entries.values())).prefixes
+    first = next(iter(segments.values())).prefixes
     prefix_values = _fixed_view(first.values, (rows,))
     prefix_values[live:].zero_()
     prefix_offsets = _fixed_view(first.offsets, (rows + 1,))
@@ -704,7 +722,7 @@ def _pad_attention(
     # Every canvas token sees its whole canvas.
     visible = values[:, None].expand(-1, width)
     entries = {}
-    for number, entry in attention.entries.items():
+    for number, entry in segments.items():
         blocks = entry.block_table
         if blocks.indices.shape[1] > widths[number]:
             raise ValueError("prefix table exceeds its configured graph width")

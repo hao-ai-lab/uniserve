@@ -179,8 +179,9 @@ def reserve_images(
             left. Tasks reserved before the failure stay in
             ``state.image_tasks`` for ``close_inputs`` to withdraw.
     """
+    # Each encoder call with the inline image payload it carries.
     calls = tuple(
-        call
+        (call, call.input_image)
         for call in state.batch.calls
         if call.kind in _ENCODER_CALLS and call.input_image is not None
     )
@@ -188,7 +189,7 @@ def reserve_images(
         return
 
     processor = model_runner.image_processor()
-    for call in calls:
+    for call, encoded in calls:
         admission = request_pool.get(call.request_key.request_id).admission
         device = model_runner.call_devices(call)[1]
         task = host_tasks.reserve()
@@ -198,7 +199,7 @@ def reserve_images(
                 prepare_host_image,
                 processor,
                 cast(MediaCall, call.kind),
-                call.input_image,
+                encoded,
                 input_images=_input_images(admission.input_images),
                 pin=device.type == "cuda",
             ),

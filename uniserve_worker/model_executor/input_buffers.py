@@ -349,9 +349,11 @@ class AttentionBuffers(InputBuffers):
     start_pages: torch.Tensor
     cache_lengths: torch.Tensor
     query_lengths: torch.Tensor
+    causal_values: torch.Tensor
     cumulative_query_lengths: torch.Tensor
     cumulative_prefix_lengths: torch.Tensor
     write_indices: torch.Tensor
+    row_columns: torch.Tensor
 
     def __init__(self, *, config: AttentionBufferConfig, **options):
         super().__init__(config=config, **options)
@@ -500,17 +502,17 @@ class AttentionBuffers(InputBuffers):
             values=self.cache_lengths[:count],
             offsets=self.cumulative_prefix_lengths[: count + 1],
         )
-        entries = {}
-        for table_number, (width, first_pages) in enumerate(
+        entries: dict[int, PagedInput | SegmentedInput] = {}
+        for table_number, (width, start_host) in enumerate(
             zip(widths, firsts, strict=True)
         ):
             blocks = BlockTable(
                 self.block_tables[table_number, :count, :width],
                 block_sizes[table_number],
                 None
-                if first_pages is None
+                if start_host is None
                 else self.start_pages[table_number, :count],
-                first_pages,
+                start_host,
             )
             if any(write):
                 entries[table_number] = PagedInput(

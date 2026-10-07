@@ -351,7 +351,8 @@ class TextRunner(ModelRunner):
             () if selected is None else selected.split(hidden_lengths)
         )
         empty = hidden.new_empty((0, hidden.shape[1]))
-        outputs, vocabularies = [], []
+        outputs: list[torch.Tensor] = []
+        vocabularies: list[VocabShard | None] = []
         for selection in selections:
             if selection in projected:
                 outputs.append(next(logit_rows))

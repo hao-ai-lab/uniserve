@@ -29,11 +29,13 @@ result row reports ``STEP_SKIPPED``.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TypedDict
 
 import torch
 
 from uniserve.diffusion import canvas as sampler
-from uniserve.model import CanvasTokens, TokenDenoiser
+from uniserve.model import CanvasTokens, TokenDenoiser, VocabShard
+from uniserve.nn import VocabParallelEmbedding
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
 from uniserve_worker.errors import invalid_descriptor
@@ -79,12 +81,37 @@ def generating_denoiser(module) -> TokenDenoiser | None:
     return module
 
 
-def denoiser_fields(denoiser: TokenDenoiser) -> dict[str, object]:
-    """The ``CanvasSlots`` dimensions a generating denoiser implies."""
-    embedding = denoiser.backbone.embedding
+class DenoiserFields(TypedDict):
+    """The ``CanvasSlots`` keyword arguments a generating denoiser implies."""
+
+    tokens: CanvasTokens
+    vocab_size: int
+    hidden_size: int
+    dtype: torch.dtype
+
+
+def denoiser_fields(denoiser: TokenDenoiser) -> DenoiserFields:
+    """The ``CanvasSlots`` dimensions a generating denoiser implies.
+
+    ``denoiser`` is one ``generating_denoiser`` returns, so this rank holds
+    its token embedding table and its vocabulary head.
+
+    Raises:
+        TypeError: When the rank lacks the token embedding table or a
+            vocabulary head exposing its ``VocabShard``.
+    """
+    embedding, head = denoiser.backbone.embedding, denoiser.lm_head
+    if not isinstance(embedding, VocabParallelEmbedding) or head is None:
+        raise TypeError(
+            "a generating denoiser holds its token embedding table and "
+            "vocabulary head"
+        )
+    vocab = head.vocab
+    if not isinstance(vocab, VocabShard):
+        raise TypeError("the vocabulary head must expose a VocabShard")
     return {
         "tokens": denoiser.canvas,
-        "vocab_size": denoiser.lm_head.vocab.size,
+        "vocab_size": vocab.size,
         "hidden_size": embedding.embedding_dim,
         "dtype": embedding.weight.dtype,
     }
@@ -92,6 +119,9 @@ def denoiser_fields(denoiser: TokenDenoiser) -> dict[str, object]:
 
 class CanvasSlots:
     """Own the sampler state of every request slot's generating canvas."""
+
+    # The step workspace; None once ``close`` released it.
+    workspace: sampler.CanvasWorkspace | None
 
     def __init__(
         self,
@@ -228,14 +258,14 @@ class CanvasSlots:
         sizing (``bootstrap.report``) charges them without an instance.
         """
         fields = denoiser_fields(denoiser)
-        tokens = fields.pop("tokens")
-        vocab_size = fields.pop("vocab_size")
+        tokens, vocab_size = fields["tokens"], fields["vocab_size"]
         buffers = cls.buffers(
             request_pool_size=request_pool_size,
             max_rows=max_rows,
             canvas_length=tokens.length,
+            hidden_size=fields["hidden_size"],
             history_depth=history_depth,
-            **fields,
+            dtype=fields["dtype"],
         )
         rows = step_rows(
             canvas_length=tokens.length,

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import torch
 
@@ -374,6 +374,16 @@ def prepare_decode(
                     predicates.copy_(saved)
 
 
+class _RowFields(TypedDict):
+    """The ``AttentionRow`` fields every synthetic canvas row shares."""
+
+    forward_mode: ForwardMode
+    positions: torch.Tensor
+    seq_len: int
+    write_kv: bool
+    causal: bool
+
+
 def stage_canvas(
     buffers: CanvasBuffers,
     tables: Sequence[Sequence[GroupTable]],
@@ -405,7 +415,7 @@ def stage_canvas(
         write=(False,) * rows,
     )
     positions = torch.arange(prefix, prefix + length, dtype=torch.int64)
-    common = {
+    common: _RowFields = {
         "forward_mode": ForwardMode.TOKEN_DENOISING,
         "positions": positions,
         "seq_len": prefix,

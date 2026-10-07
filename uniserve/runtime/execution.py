@@ -235,8 +235,11 @@ class ExecutionContext(Generic[SizeT]):
         self._attention: dict[int, AttentionBinding] = {}
         self._vsa: dict[int, VsaBinding] = {}
         # VSA plans depend on numerical shapes, not on layer weights. Keep
-        # one operator per signature across this context's serialized layers.
-        self._vsa_operators: dict[tuple[object, ...], VsaOperator] = {}
+        # one operator per signature across this context's serialized layers,
+        # with the name of the provider that prepared it.
+        self._vsa_operators: dict[
+            tuple[object, ...], tuple[str, VsaOperator]
+        ] = {}
         self._moe: dict[int, MoEBinding] = {}
         self._vsa_output: dict[ParallelAttention, OutputBuffers] = {}
         self._vsa_context: dict[ParallelAttention, AttentionBuffers] = {}
@@ -760,7 +763,7 @@ class ExecutionContext(Generic[SizeT]):
                 binding.builds_launch_plan for binding in readers
             ):
                 # The first layer reading each table checks its entry.
-                first = {}
+                first: dict[int | None, AttentionBinding] = {}
                 for binding in readers:
                     first.setdefault(binding.table, binding)
                 readers = tuple(first.values())

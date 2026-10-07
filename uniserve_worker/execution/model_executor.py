@@ -35,7 +35,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 from torch import nn
@@ -153,6 +153,7 @@ from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.sampling.metadata import TokenSelection
 
 if TYPE_CHECKING:
+    from uniserve.runtime.weight_prefetch import WeightPrefetch
     from uniserve_worker.model_executor.canvas_runner import CanvasRunner
     from uniserve_worker.model_executor.media_inputs import MediaBuilder
     from uniserve_worker.storage.block_tables import BlockTables
@@ -311,7 +312,9 @@ class ModelExecutor:
         # ``configure_inputs`` builds; ``None`` without such layers. The
         # runners stepping through it are registered at capture.
         self.experts = None
-        self.expert_weights = None
+        # DWDP's prefetched expert weights, which ``configure_inputs`` builds
+        # in place of the exchange; ``None`` for any other expert access.
+        self.expert_weights: WeightPrefetch | None = None
         self._expert_runners: list[ModelRunner] = []
         # With graphs, a rank without a forward of its own joins each expert
         # step by replaying the captured join of the step's capacity
@@ -1632,7 +1635,12 @@ class ModelExecutor:
             num_experts=first.num_experts,
             hidden_size=first.hidden_size,
             device=first.up_gate.weight.device,
-            transport=self.worker_config.expert_exchange,
+            # Deployment parsing admits alltoall, megamoe or dwdp, and a dwdp
+            # worker prefetches weights instead of exchanging (above).
+            transport=cast(
+                Literal["alltoall", "megamoe"],
+                self.worker_config.expert_exchange,
+            ),
             intermediate_size=first.intermediate_size,
             activation=first.activation,
         )
@@ -1807,7 +1815,9 @@ class ModelExecutor:
                     phase == "canvas"
                     and ForwardMode.TOKEN_DENOISING in entry.call_kinds
                 ):
-                    prepare_canvas(self, entry)
+                    # A token-denoising entry is a ``CanvasRunner``
+                    # (``runner_type``).
+                    prepare_canvas(self, cast("CanvasRunner", entry))
                 elif (
                     phase == "flow" and MediaCall.DENOISING in entry.call_kinds
                 ):

@@ -705,17 +705,17 @@ def publish_forward_values(
             )
 
     for index, rows in contexts.items():
-        selection = token.finish_context(
+        finished = token.finish_context(
             scheduled[index],
             tuple(rows),
             request_tables=request_tables,
             decode_state=decode_state,
             state=state,
         )
-        if isinstance(selection, PendingOutput):
-            outcomes[index] = selection
+        if isinstance(finished, PendingOutput):
+            outcomes[index] = finished
         else:
-            task, value, sampling = selection
+            task, value, sampling = finished
             samples.append((index, task, value, sampling, None))
 
     stepped = canvas.publish_steps(
@@ -727,10 +727,10 @@ def publish_forward_values(
     for (index, _value), outcome in zip(steps, stepped, strict=True):
         outcomes[index] = outcome
 
-    for index, rows in readouts.items():
+    for index, readout in readouts.items():
         outcomes[index] = canvas.publish(
             scheduled[index],
-            rows,
+            readout,
             request_tables=request_tables,
             state=state,
         )
