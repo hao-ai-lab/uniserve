@@ -17,7 +17,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from itertools import accumulate
-from typing import cast
 
 import torch
 
@@ -363,11 +362,8 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
     if len(entries) != len(inputs.attention.entries):
         return None
     attention = entries[0]
-    # Every entry is a PagedInput (checked above).
     causal = (
-        None
-        if cast(PagedInput, attention).causal_values is not None
-        else attention.causal[0]
+        None if attention.causal_values is not None else attention.causal[0]
     )
     if causal is not None:
         if any(value != causal for entry in entries for value in entry.causal):
