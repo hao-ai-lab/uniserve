@@ -46,6 +46,31 @@ def _cuda_extensions():
         "libraries": ["cuda"],
         "library_dirs": [str(Path(CUDA_HOME, "lib64", "stubs"))],
     }
+    # SM100a block-sparse attention, one module per sparse-block size; the
+    # 128-row configuration defines VSA_BLK128. Architecture-conditional
+    # instructions carry no cross-architecture compatibility, so the target
+    # is exactly sm_100a.
+    sparse_attention = [
+        CUDAExtension(
+            f"uniserve_kernels.attention.vsa_native._block{block}",
+            [_source("attention", "vsa_native", "csrc", "attention.cu")],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20", *configuration],
+                "nvcc": [
+                    "-O3",
+                    "-std=c++20",
+                    "--use_fast_math",
+                    "--expt-extended-lambda",
+                    "--expt-relaxed-constexpr",
+                    "-Xcompiler=-fno-strict-aliasing",
+                    "-gencode=arch=compute_100a,code=sm_100a",
+                    *configuration,
+                ],
+            },
+            **driver,
+        )
+        for block, configuration in ((64, []), (128, ["-DVSA_BLK128=true"]))
+    ]
     return [
         # CUDA virtual memory management, peer handle export and import,
         # and strided host/device DMA.
@@ -55,26 +80,7 @@ def _cuda_extensions():
             extra_compile_args={"cxx": ["-O2", "-std=c++20"]},
             **driver,
         ),
-        # SM100a block-64 sparse attention. Architecture-conditional
-        # instructions carry no cross-architecture compatibility, so the
-        # target is exactly sm_100a.
-        CUDAExtension(
-            "uniserve_kernels.attention.vsa_native._block64",
-            [_source("attention", "vsa_native", "csrc", "attention.cu")],
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++20"],
-                "nvcc": [
-                    "-O3",
-                    "-std=c++20",
-                    "--use_fast_math",
-                    "--expt-extended-lambda",
-                    "--expt-relaxed-constexpr",
-                    "-Xcompiler=-fno-strict-aliasing",
-                    "-gencode=arch=compute_100a,code=sm_100a",
-                ],
-            },
-            **driver,
-        ),
+        *sparse_attention,
     ]
 
 

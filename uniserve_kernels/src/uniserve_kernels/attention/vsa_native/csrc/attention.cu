@@ -5,8 +5,9 @@
 // BlockSparseVsaArgs and launches on the current CUDA stream. Metadata values
 // (block indices, counts, valid sizes) stay on the device and are not read or
 // range-checked here. The package build compiles this file as the only
-// translation unit of uniserve_kernels.attention.vsa_native._block64, in the
-// default block-64 configuration.
+// translation unit of one extension per sparse-block size: _block64 in the
+// default configuration, and _block128 with VSA_BLK128 defined on the
+// command line. BLOCK below is that configuration's block size.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -54,26 +55,26 @@ void sparse_attention(
   }
   TORCH_CHECK(output.sizes() == query.sizes(), "sparse attention output must match the query shape");
   TORCH_CHECK(key.sizes() == value.sizes(), "K/V geometry must agree");
-  TORCH_CHECK(query_rows % 64 == 0 && key_rows % 64 == 0,
-              "query and key rows must divide 64");
+  TORCH_CHECK(query_rows % BLOCK == 0 && key_rows % BLOCK == 0,
+              "query and key rows must divide the sparse block size");
   for (const auto& tensor : {indices, counts, valid_sizes}) {
     TORCH_CHECK(tensor.device() == query.device() && tensor.is_contiguous() &&
                     tensor.scalar_type() == at::kInt,
                 "sparse metadata must be contiguous CUDA int32");
   }
-  const int64_t query_tiles = query_rows / 64;
+  const int64_t query_tiles = query_rows / BLOCK;
   TORCH_CHECK(indices.dim() == 3 && indices.size(0) == heads &&
                   indices.size(1) == query_tiles && indices.size(2) > 0 &&
                   indices.size(2) <= INT_MAX,
               "sparse indices must have shape [heads, query tiles, selected blocks]");
   TORCH_CHECK(counts.dim() == 2 && counts.size(0) == heads &&
                   counts.size(1) == query_tiles && valid_sizes.dim() == 1 &&
-                  valid_sizes.numel() * 64 == key_rows,
+                  valid_sizes.numel() * BLOCK == key_rows,
               "sparse counts and valid key sizes must match Q/K geometry");
   TORCH_CHECK(std::isfinite(scale) && scale > 0, "softmax scale must be positive and finite");
 
   // Value initialization leaves lse null, so the kernel writes no LSE. The
-  // literal 64 and 128 above are the block-64 build's BLOCK and HEAD_DIM.
+  // literal 128 above is the kernel's HEAD_DIM.
   BlockSparseVsaArgs args{};
   args.q = reinterpret_cast<const __nv_bfloat16*>(query.data_ptr());
   args.k = reinterpret_cast<const __nv_bfloat16*>(key.data_ptr());
