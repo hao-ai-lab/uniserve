@@ -78,10 +78,9 @@ impl InputCopies {
             .import("torch.cuda")?
             .call_method1("current_stream", (stream.getattr("device")?,))?;
         let event = stream
-            .getattr("_native")?
-            .cast_into::<CUDAStream>()?
+            .cast::<CUDAStream>()?
             .borrow()
-            .record(py, current.getattr("cuda_stream")?.extract()?)?;
+            .record_for(py, current.getattr("cuda_stream")?.extract()?)?;
         if let Some(event) = event {
             event.wait(py, Some(&current))?;
         }

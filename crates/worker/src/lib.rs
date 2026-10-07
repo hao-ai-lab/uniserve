@@ -21,6 +21,7 @@ mod kv_import;
 mod latent;
 mod microbatches;
 mod model_runners;
+pub mod nccl;
 mod output;
 mod pending;
 mod profiling;

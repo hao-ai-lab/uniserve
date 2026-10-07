@@ -6,6 +6,7 @@ mod batch;
 mod block_tables;
 mod buffer;
 mod capacity;
+mod communication;
 mod completion;
 mod config;
 mod cuda_graph;
@@ -124,6 +125,9 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<completion::Completion>()?;
     module.add_class::<events::CUDAEvent>()?;
     module.add_class::<stream::CUDAStream>()?;
+    module.add_class::<communication::StreamCommunication>()?;
+    module.add_class::<communication::GatherPool>()?;
+    module.add_class::<communication::NcclCommunicator>()?;
     module.add_class::<events::EventPool>()?;
     module.add(
         "EventPoolError",

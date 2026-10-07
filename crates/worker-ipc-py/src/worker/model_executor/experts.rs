@@ -397,7 +397,7 @@ pub(super) fn idle(slf: &Bound<'_, ModelExecutor>, leaving: bool) -> PyResult<bo
     let native = if stream.is_none() {
         None
     } else {
-        Some(stream.getattr("_native")?.cast_into::<CUDAStream>()?)
+        Some(stream.cast::<CUDAStream>()?.clone())
     };
     let current = || {
         py.import("torch.cuda")?
@@ -406,7 +406,7 @@ pub(super) fn idle(slf: &Bound<'_, ModelExecutor>, leaving: bool) -> PyResult<bo
     if let Some(native) = &native {
         native
             .borrow()
-            .wait(py, current()?.getattr("cuda_stream")?.extract()?)?;
+            .wait_for(py, current()?.getattr("cuda_stream")?.extract()?)?;
     }
     let result = with_context(&py.import("torch")?.call_method0("inference_mode")?, || {
         with_context(
@@ -422,7 +422,7 @@ pub(super) fn idle(slf: &Bound<'_, ModelExecutor>, leaving: bool) -> PyResult<bo
             let current = current()?;
             if let Some(event) = native
                 .borrow()
-                .record(py, current.getattr("cuda_stream")?.extract()?)?
+                .record_for(py, current.getattr("cuda_stream")?.extract()?)?
             {
                 event.wait(py, Some(&current))?;
             }

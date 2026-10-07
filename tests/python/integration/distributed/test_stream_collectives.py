@@ -51,6 +51,9 @@ class _Collectives(nn.Module):
     def forward(self, value):
         group = self.group
         half = value.shape[0] // 2
+        splits = (half - 1, half + 1)
+        if group.rank == 1:
+            splits = tuple(reversed(splits))
         destination = (
             value.new_empty((2 * value.shape[0], value.shape[1]))
             if group.rank == 0
@@ -81,6 +84,7 @@ class _Collectives(nn.Module):
             group.all_to_all(
                 value, input_splits=(half, half), output_splits=(half, half)
             ),
+            group.all_to_all(value, input_splits=splits, output_splits=splits),
             group.gather(value, dst=0, out=destination),
             group.send_recv(
                 value,
@@ -128,9 +132,8 @@ def _run_collectives(rank: int, rendezvous: str):
         try:
             for green in greens:
                 with ExecutionContext(module, stream=green) as context:
-                    # Replacing a preparation must retire its registrations and
-                    # plans. The same numerical module remains callable with a
-                    # different row capacity after every graph reader retires.
+                    # The same numerical module remains callable with another
+                    # row capacity after every graph reader retires.
                     for rows in (2, 4):
                         context.prepare(TextSize(2 * rows, 1))
                         value = (
@@ -163,6 +166,15 @@ def _run_collectives(rank: int, rendezvous: str):
                                 peers = [
                                     base + member * 10 for member in group.ranks
                                 ]
+                                # Uneven row exchange includes a zero-row peer
+                                # at rows=2 and changes payloads on each replay.
+                                first = rows // 2 - 1
+                                second = rows - first
+                                uneven = torch.cat(
+                                    (peers[0][:first], peers[1][:second])
+                                    if group.rank == 0
+                                    else (peers[0][first:], peers[1][second:])
+                                )
                                 expected = (
                                     base * 2 + 10,
                                     base + 10,
@@ -176,6 +188,7 @@ def _run_collectives(rank: int, rendezvous: str):
                                             for peer in peers
                                         ]
                                     ),
+                                    uneven,
                                     torch.cat(peers)
                                     if group.rank == 0
                                     else None,

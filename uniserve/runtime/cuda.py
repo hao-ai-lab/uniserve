@@ -4,10 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch
-
-from uniserve_worker._uniserve_ipc import CUDAStream as NativeStream
-
 
 class CUDAError(RuntimeError):
     """A CUDA resource or call could not satisfy its requirements."""
@@ -56,22 +52,3 @@ def cuda_value(result: tuple[Any, ...], call: str) -> Any:
     """Extract the sole value from a successful CUDA driver result."""
     cuda_status(result, call)
     return result[1]
-
-
-def create_sibling_stream(
-    stream: torch.cuda.Stream,
-    owner: NativeStream | None = None,
-) -> tuple[NativeStream, torch.cuda.ExternalStream]:
-    """Own a stream in the origin's context and return its PyTorch view.
-
-    Forking an owned stream retains its SM partition. A caller supplying only
-    a PyTorch view retains the origin's context until the new stream closes.
-    """
-    native = (
-        owner.fork()
-        if owner is not None
-        else NativeStream.sibling(stream.device.index, stream.cuda_stream)
-    )
-    return native, torch.cuda.ExternalStream(
-        native.handle, device=stream.device
-    )
