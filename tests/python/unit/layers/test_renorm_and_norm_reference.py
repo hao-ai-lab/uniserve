@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve.diffusion import AdditiveGuidance, Branch, Renorm, make_schedule
+from uniserve.diffusion import AdditiveGuidance, Branch, LinearGrid, Renorm
 from uniserve.nn import functional
 from uniserve.nn.norm import RMSNorm
 
@@ -14,13 +14,9 @@ pytestmark = pytest.mark.unit
 
 def _combine(base, conditioned, scale, renorm, minimum=0.0):
     guidance = AdditiveGuidance(scale, 1.0, (0.0, 1.0), renorm, minimum)
-    schedule = make_schedule(
-        1,
-        shift=1.0,
-        direction="descending",
-        shift_domain="time",
-        device=base.device,
-    )
+    schedule = LinearGrid(
+        1.0, direction="descending", shift_domain="time"
+    ).schedule(steps=1, device=base.device)
     return guidance.combine(
         {Branch.TEXT_UNCONDITIONAL: base, Branch.CONDITIONED: conditioned},
         schedule,

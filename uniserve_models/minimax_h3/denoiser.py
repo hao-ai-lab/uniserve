@@ -21,7 +21,7 @@ from typing import cast
 
 import torch
 
-from uniserve.diffusion import CleanSampleEulerSolver, Schedule
+from uniserve.diffusion import CleanSampleEulerSolver, RungGrid
 from uniserve.media import image
 from uniserve.model import LatentInput, VideoDenoiser
 from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
@@ -42,35 +42,20 @@ from .packing import (
 from .transformer import Transformer, TransformerLayer
 
 
-def schedules(
-    config: DiffusionConfig, *, device: torch.device | str
-) -> Mapping[str, Schedule]:
-    """Build the video and audio schedules from the checkpoint's DMD ladder.
+def grids(config: DiffusionConfig) -> dict[str, RungGrid]:
+    """Return the checkpoint's video and audio grids.
 
-    Each rung, divided by ``time_scale`` to give ``t`` in (0, 1], is shifted
-    once with the modality's scheduler shift as
-    ``sigma = shift * t / (1 + (shift - 1) * t)``, and the clean endpoint
-    ``sigma = 0`` is appended. Sigma is materialized in FP32 before network
-    times are formed as ``1 - sigma`` in FP32; the analytical coordinates keep
-    the unrounded ``1 - sigma``. Model evaluations exclude the clean endpoint,
-    which the solver still consumes.
+    Both evaluate the trained DMD rungs on the ``time_scale`` clock, each
+    shifted once with its modality's scheduler shift
+    (``uniserve.diffusion.RungGrid``).
     """
-    result = {}
-    for name, shift in (
-        ("video", config.video_shift),
-        ("audio", config.audio_shift),
-    ):
-        sigmas = tuple(
-            shift
-            * (value / config.time_scale)
-            / (1 + (shift - 1) * (value / config.time_scale))
-            for value in (*config.ladder, 0)
+    return {
+        name: RungGrid(config.ladder, shift=shift, clock=config.time_scale)
+        for name, shift in (
+            ("video", config.video_shift),
+            ("audio", config.audio_shift),
         )
-        sigma = torch.tensor(sigmas, dtype=torch.float32, device=device)
-        result[name] = Schedule(
-            1.0 - sigma, sigma, tuple(1.0 - value for value in sigmas)
-        )
-    return result
+    }
 
 
 class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
@@ -129,11 +114,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         )
 
     @property
-    def num_steps(self) -> int:
-        """Number of denoising steps in the checkpoint's trained ladder."""
-        return len(self.diffusion.ladder)
-
-    @property
     def text_condition_width(self) -> int:
         """Feature width of the retained text conditioning."""
         return self.config.hidden_size
@@ -159,9 +139,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             modalities=("video", "audio"),
             prediction_dtype=torch.float32,
             solver=CleanSampleEulerSolver(),
+            grids=grids(diffusion),
         )
         self.config, self.diffusion = config, diffusion
-        self.transformer = Transformer(config, num_steps=len(diffusion.ladder))
+        self.transformer = Transformer(config, num_steps=self.num_steps)
         self.conditioner = Conditioner(config)
         self.rotary = RotaryEmbedding(
             2 * config.rope_frequency_dim, theta=config.rope_theta
@@ -233,20 +214,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 size.frame.width // 16,
             )
         return self.latent_shape(modality, size)
-
-    def make_schedules(
-        self, steps: int, *, shift: float | None, device
-    ) -> Mapping[str, Schedule]:
-        if (
-            type(steps) is not int
-            or steps != len(self.diffusion.ladder)
-            or shift is not None
-        ):
-            raise ValueError(
-                f"H3 requires {len(self.diffusion.ladder)} evaluations with "
-                "its trained modality shifts"
-            )
-        return schedules(self.diffusion, device=device)
 
     def output_layout(self, size: DenoiserSize) -> Mapping[str, OutputLayout]:
         """Locate this rank's predicted rows for requests of one layout.

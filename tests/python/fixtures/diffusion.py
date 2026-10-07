@@ -9,7 +9,7 @@ from torch import nn
 from uniserve.diffusion import (
     CleanSampleEulerSolver,
     EulerSolver,
-    make_schedule,
+    LinearGrid,
 )
 from uniserve.model import Denoiser, DenoiserInput
 from uniserve.nn import Linear
@@ -37,6 +37,13 @@ class LinearDenoiser(Denoiser[DenoiserInput[Size], Size]):
             solver=CleanSampleEulerSolver()
             if solver == "clean_sample_euler"
             else EulerSolver(),
+            # Distinct default shifts give each modality its own schedule.
+            grids={
+                name: LinearGrid(
+                    1 + index * 2, direction="ascending", shift_domain="time"
+                )
+                for index, name in enumerate(modalities)
+            },
         )
         self.offset_scale = nn.Parameter(torch.ones(()), requires_grad=False)
         self.projection = Linear(1, 1, bias=False)
@@ -54,18 +61,6 @@ class LinearDenoiser(Denoiser[DenoiserInput[Size], Size]):
     def prepare_latents(self, sizes, *, noise, state, constants, workspace):
         for name in self.modalities:
             state[name].copy_(noise[name])
-
-    def make_schedules(self, steps, *, shift, device):
-        return {
-            name: make_schedule(
-                steps,
-                shift=1 + index * 2 if shift is None else shift,
-                direction="ascending",
-                shift_domain="time",
-                device=device,
-            )
-            for index, name in enumerate(self.modalities)
-        }
 
     def constant_buffers(self, size):
         return {"offset": BufferConfig((), torch.float32)}

@@ -25,7 +25,7 @@ from uniserve_models import qwen3_vl
 from . import audio_vae, video_vae
 from .conditioning import assignments as conditioning_assignments
 from .config import TEXT_FIELDS, TRANSFORMER_FIELDS, TransformerConfig
-from .denoiser import schedules
+from .denoiser import grids
 from .modulation import TimestepEmbedding
 
 checkpoint_sources = (
@@ -233,7 +233,9 @@ def _prepare_modulation(model, diffusion, reader):
     # The clean endpoint closes each schedule but is never evaluated, so the
     # step count equals the ladder length the transformer was built with.
     # ``activated`` is [steps, 2 timesteps (video, audio), time_dim].
-    ladder = schedules(diffusion, device=device)
+    ladder = {
+        name: grid.endpoints(device) for name, grid in grids(diffusion).items()
+    }
     activated = torch.stack(
         [
             F.silu(embedding(torch.stack((video, audio))))
