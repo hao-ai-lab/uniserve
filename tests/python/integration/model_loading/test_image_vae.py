@@ -123,13 +123,10 @@ def test_posterior_and_reconstruction_match_flux_checkpoint(tmp_path):
         codec = PatchAutoencoder(
             model.encoder,
             model.decoder,
-            model.posterior,
             patch_size=2,
             latent_channels=4,
             latent_dtype=torch.bfloat16,
             downsample=4,
-            scale=0.5,
-            shift=0.25,
         )
         patches = codec.encode(
             pixels, generator=torch.Generator().manual_seed(8)

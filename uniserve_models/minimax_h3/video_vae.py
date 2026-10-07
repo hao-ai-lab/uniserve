@@ -49,6 +49,7 @@ from uniserve.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
 from uniserve.nn.mlp import GatedMLP
 from uniserve.nn.rope import RotaryEmbedding
 from uniserve.nn.vae import (
+    ChannelStatistics,
     LatentDecoder,
     LatentEncoder,
     SpatialDecoder,
@@ -676,7 +677,7 @@ class Decoder(SpatialDecoder):
     def __init__(self, config: Config):
         # Tile extents and minimum overlaps are output pixels and match the
         # native diffusers decoder's default tiling; LatentDecoder.forward
-        # always decodes through SpatialDecoder.decode with tiling enabled.
+        # decodes the whole raster through these tiles.
         super().__init__(
             Transformer(config),
             spatial_compression=config.spatial_compression,
@@ -690,7 +691,7 @@ class Decoder(SpatialDecoder):
             config.latent_channels, config.latent_channels, 1
         )
 
-    def forward(self, latents):
+    def decode_tile(self, latents):
         return self.decoder(self.post_quant_conv(latents))
 
 
@@ -716,12 +717,14 @@ class Model(LatentDecoder):
                 None,
                 None,
             ),
-            mean=torch.tensor(
-                config.latents_mean, dtype=torch.float32, device="cpu"
-            ).view(1, config.latent_channels, 1, 1, 1),
-            std=torch.tensor(
-                config.latents_std, dtype=torch.float32, device="cpu"
-            ).view(1, config.latent_channels, 1, 1, 1),
+            normalization=ChannelStatistics(
+                mean=torch.tensor(
+                    config.latents_mean, dtype=torch.float32, device="cpu"
+                ).view(1, config.latent_channels, 1, 1, 1),
+                std=torch.tensor(
+                    config.latents_std, dtype=torch.float32, device="cpu"
+                ).view(1, config.latent_channels, 1, 1, 1),
+            ),
         )
 
     @property
@@ -1063,7 +1066,7 @@ class Encoder(SpatialEncoder):
             2 * config.latent_channels, 2 * config.latent_channels, 1
         )
 
-    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+    def encode_tile(self, pixels: torch.Tensor) -> torch.Tensor:
         return self.quant_conv(self.encoder(pixels))
 
 

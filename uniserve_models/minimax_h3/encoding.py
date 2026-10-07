@@ -19,7 +19,7 @@ from uniserve.diffusion import normal_noise
 from uniserve.media import image
 from uniserve.model import AudioEncoder as BaseAudioEncoder
 from uniserve.model import VideoEncoder as BaseVideoEncoder
-from uniserve.nn.vae import DiagonalGaussian, LatentEncoder
+from uniserve.nn.vae import ChannelStatistics, DiagonalGaussian, LatentEncoder
 from uniserve.tensors import OutputLayout
 
 from . import audio_vae, video_vae
@@ -70,14 +70,16 @@ class VideoEncoder(BaseVideoEncoder):
         super().__init__(
             LatentEncoder(
                 video_vae.Encoder(config),
-                mean=torch.tensor(
-                    config.latents_mean, dtype=torch.float32, device="cpu"
-                ).view(1, channels, 1, 1, 1),
-                std=torch.tensor(
-                    config.latents_std, dtype=torch.float32, device="cpu"
-                ).view(1, channels, 1, 1, 1),
+                normalization=ChannelStatistics(
+                    mean=torch.tensor(
+                        config.latents_mean, dtype=torch.float32, device="cpu"
+                    ).view(1, channels, 1, 1, 1),
+                    std=torch.tensor(
+                        config.latents_std, dtype=torch.float32, device="cpu"
+                    ).view(1, channels, 1, 1, 1),
+                    latent_dtype=torch.float16,
+                ),
                 posterior=DiagonalGaussian(log_variance_range=(-30.0, 20.0)),
-                latent_dtype=torch.float16,
             )
         )
         # Latent frames one complete clip yields.
@@ -211,12 +213,14 @@ class AudioEncoder(BaseAudioEncoder):
         super().__init__(
             LatentEncoder(
                 audio_vae.Encoder(config),
-                mean=torch.tensor(
-                    config.latents_mean, dtype=torch.float32, device="cpu"
-                ).view(1, channels, 1),
-                std=torch.tensor(
-                    config.latents_std, dtype=torch.float32, device="cpu"
-                ).view(1, channels, 1),
+                normalization=ChannelStatistics(
+                    mean=torch.tensor(
+                        config.latents_mean, dtype=torch.float32, device="cpu"
+                    ).view(1, channels, 1),
+                    std=torch.tensor(
+                        config.latents_std, dtype=torch.float32, device="cpu"
+                    ).view(1, channels, 1),
+                ),
             ),
             sample_rate=sample_rate,
         )

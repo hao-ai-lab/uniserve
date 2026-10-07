@@ -9,7 +9,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_latent_decoder_preserves_float32_normalization():
-    from uniserve.nn.vae import LatentDecoder
+    from uniserve.nn.vae import ChannelStatistics, LatentDecoder
 
     linear = torch.nn.Linear(4, 4, bias=False)
     with torch.no_grad():
@@ -17,13 +17,15 @@ def test_latent_decoder_preserves_float32_normalization():
     decoder = LatentDecoder(
         linear,
         latent_shape=(1, 3, 4),
-        mean=torch.tensor([0.1, 0.2, 0.3]).view(1, 3, 1),
-        std=torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1),
+        normalization=ChannelStatistics(
+            mean=torch.tensor([0.1, 0.2, 0.3]).view(1, 3, 1),
+            std=torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1),
+        ),
     )
     source = torch.linspace(-1, 1, 12).reshape(1, 3, 4).bfloat16()
-    expected = (source.float() * decoder.std + decoder.mean) * torch.tensor(
-        [1.0, 2.0, 3.0, 4.0]
-    )
+    expected = (
+        source.float() * decoder.normalization.std + decoder.normalization.mean
+    ) * torch.tensor([1.0, 2.0, 3.0, 4.0])
     torch.testing.assert_close(decoder(source), expected, rtol=0, atol=0)
     with pytest.raises(ValueError, match="shape"):
         decoder(source[:, :, :3])
@@ -78,7 +80,7 @@ def test_spatial_encoder_tiles_reproduce_a_local_encoding():
     )
     pixels = torch.randn(2, 3, 72, 60)
 
-    tiled = encoder.encode(pixels, tiled=True)
+    tiled = encoder(pixels)
 
     assert tiled.shape == (2, 3, 18, 15)
-    torch.testing.assert_close(tiled, encoder.encode(pixels, tiled=False))
+    torch.testing.assert_close(tiled, encoder.encode_tile(pixels))

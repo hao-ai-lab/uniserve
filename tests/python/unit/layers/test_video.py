@@ -162,12 +162,10 @@ def test_spatial_decoder_preserves_batches_and_raster_alignment(height, width):
             raster[..., 6:8] * (1 - weights) + expected[..., 6:8] * weights
         )
     original = latents.clone()
-    torch.testing.assert_close(
-        decoder.decode(latents, tiled=True), expected, rtol=0, atol=0
-    )
+    torch.testing.assert_close(decoder(latents), expected, rtol=0, atol=0)
     torch.testing.assert_close(latents, original, rtol=0, atol=0)
     torch.testing.assert_close(
-        decoder.decode(latents, tiled=False),
+        decoder.decode_tile(latents),
         latents.repeat_interleave(2, -2).repeat_interleave(2, -1),
         rtol=0,
         atol=0,

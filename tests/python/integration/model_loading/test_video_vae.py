@@ -93,7 +93,7 @@ def test_video_reconstruction_matches_independent_transformer_and_crop(
     ) + torch.tensor(config.latents_mean).view(1, 2, 1, 1, 1)
     with torch.no_grad():
         expected = reference.decoder(reference.post_quant_conv(normalized))
-        actual = model.decoder.decode(normalized, tiled=False)
+        actual = model.decoder.decode_tile(normalized)
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
         reconstructed = model(latents)
     assert reconstructed.shape == (1, 3, 5, 8, 12)

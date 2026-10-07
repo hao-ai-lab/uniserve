@@ -9,12 +9,16 @@ from .layers import (
     ResidualBlock,
     Upsample,
 )
+from .normalization import ChannelStatistics, LatentNormalization, ScaleShift
 from .patch import PatchAutoencoder, RGBDecoder
 from .spatial import SpatialDecoder, SpatialEncoder
 
 __all__ = [
     "LatentDecoder",
     "LatentEncoder",
+    "LatentNormalization",
+    "ChannelStatistics",
+    "ScaleShift",
     "SpatialDecoder",
     "SpatialEncoder",
     "AttentionBlock",

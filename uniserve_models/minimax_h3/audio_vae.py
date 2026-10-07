@@ -20,8 +20,7 @@ from torch.nn import functional as F
 from torch.nn.utils import parametrizations
 
 from uniserve.nn.attention import Attention, DenseInput
-from uniserve.nn.vae import LatentEncoder
-from uniserve.nn.vae.decoder import LatentDecoder
+from uniserve.nn.vae import ChannelStatistics, LatentDecoder, LatentEncoder
 
 __all__ = [
     "Config",
@@ -309,12 +308,14 @@ class Model(LatentDecoder):
         super().__init__(
             decoder,
             latent_shape=(2, config.latent_channels, None),
-            mean=torch.tensor(
-                config.latents_mean, dtype=torch.float32, device="cpu"
-            ).view(1, config.latent_channels, 1),
-            std=torch.tensor(
-                config.latents_std, dtype=torch.float32, device="cpu"
-            ).view(1, config.latent_channels, 1),
+            normalization=ChannelStatistics(
+                mean=torch.tensor(
+                    config.latents_mean, dtype=torch.float32, device="cpu"
+                ).view(1, config.latent_channels, 1),
+                std=torch.tensor(
+                    config.latents_std, dtype=torch.float32, device="cpu"
+                ).view(1, config.latent_channels, 1),
+            ),
         )
         self.config = config
 

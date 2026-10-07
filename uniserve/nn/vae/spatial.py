@@ -83,11 +83,13 @@ def stitch_tiles(
 
 
 class SpatialDecoder(nn.Module):
-    """Decode an aligned raster directly or as one batch of overlapping tiles.
+    """Decode an aligned NCTHW latent raster as one batch of overlapping tiles.
 
-    The concrete ``forward`` defines any latent-channel projection before its
-    decoder. Tile extents and overlaps are output pixels, aligned to the
-    spatial compression ratio. Blending retains decoded-dtype rounding.
+    ``decode_tile`` decodes one raster region directly; a concrete subclass
+    overrides it to add any latent-channel projection before its decoder.
+    Calling the module decodes the whole raster through tiles. Tile extents
+    and overlaps are output pixels, aligned to the spatial compression ratio.
+    Blending retains decoded-dtype rounding.
     """
 
     def __init__(
@@ -111,10 +113,15 @@ class SpatialDecoder(nn.Module):
         self.tile_height, self.tile_width = tile_height, tile_width
         self.overlap_height, self.overlap_width = overlap_height, overlap_width
 
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+    def decode_tile(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode NCTHW latents of one raster region without tiling.
+
+        Tiling calls this once with every tile stacked along the batch, so
+        it must decode batch samples independently.
+        """
         return self.decoder(latents)
 
-    def decode(self, latents: torch.Tensor, *, tiled: bool) -> torch.Tensor:
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
         """Restore NCTHW latents, preserving sample independence within each
         tile.
         """  # noqa: D205
@@ -122,8 +129,6 @@ class SpatialDecoder(nn.Module):
             raise ValueError(
                 "spatial decoding requires a nonempty NCTHW latent"
             )
-        if not tiled:
-            return self(latents)
 
         # Tile extents are output pixels; latent slices divide them by the
         # ratio.
@@ -154,7 +159,7 @@ class SpatialDecoder(nn.Module):
             ),
             dim=0,
         )
-        decoded = self(tiles)
+        decoded = self.decode_tile(tiles)
 
         # Reshape back into a per-sample grid of tiles before blending seams.
         flat_tiles = decoded.split(latents.shape[0], dim=0)
@@ -167,16 +172,17 @@ class SpatialDecoder(nn.Module):
 
 
 class SpatialEncoder(nn.Module):
-    """Encode an aligned raster directly or as overlapping tiles.
+    """Encode an aligned raster as overlapping tiles.
 
-    The concrete ``forward`` encodes one tile, including any latent-channel
-    projection after its encoder. Tile extents and minimum overlaps are input
-    pixels aligned to the spatial compression ratio; ``split_tiles`` spreads
-    any excess overlap over the seams, and the encoded tiles cross-fade over
-    ``overlap / ratio`` latent positions in the encoder's output precision.
-    Tiles are encoded one after another: an encoder's activations at input
-    resolution dominate its memory, so the peak stays that of one tile
-    whatever the raster.
+    ``encode_tile`` encodes one raster region directly; a concrete subclass
+    overrides it to add any latent-channel projection after its encoder.
+    Calling the module encodes the whole raster through tiles. Tile extents
+    and minimum overlaps are input pixels aligned to the spatial compression
+    ratio; ``split_tiles`` spreads any excess overlap over the seams, and the
+    encoded tiles cross-fade over ``overlap / ratio`` latent positions in the
+    encoder's output precision. Tiles are encoded one after another: an
+    encoder's activations at input resolution dominate its memory, so the
+    peak stays that of one tile whatever the raster.
     """
 
     def __init__(
@@ -200,18 +206,17 @@ class SpatialEncoder(nn.Module):
         self.tile_height, self.tile_width = tile_height, tile_width
         self.overlap_height, self.overlap_width = overlap_height, overlap_width
 
-    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+    def encode_tile(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Encode ``[..., height, width]`` pixels of one region untiled."""
         return self.encoder(pixels)
 
-    def encode(self, pixels: torch.Tensor, *, tiled: bool) -> torch.Tensor:
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         """Encode ``[..., height, width]`` pixels into ``[..., h, w]`` latents.
 
-        The raster must align with the spatial compression ratio when tiled.
+        The raster must align with the spatial compression ratio.
         """
         if pixels.ndim < 3 or pixels.shape[0] < 1:
             raise ValueError("spatial encoding requires a nonempty raster")
-        if not tiled:
-            return self(pixels)
 
         ratio = self.spatial_compression
         y_indices, y_lengths, y_overlaps = split_tiles(
@@ -222,7 +227,7 @@ class SpatialEncoder(nn.Module):
         )
         rows = [
             [
-                self(
+                self.encode_tile(
                     pixels[
                         ...,
                         y_pos : y_pos + y_length,

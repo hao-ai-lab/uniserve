@@ -63,13 +63,10 @@ class Model(nn.Module):
         self.latent_encoder = PatchAutoencoder(
             autoencoder.encoder,
             autoencoder.decoder,
-            autoencoder.posterior,
             patch_size=config.latent_patch_size,
             latent_channels=config.vae.latent_channels,
             latent_dtype=torch.bfloat16,
             downsample=config.vae.downsample * config.latent_patch_size,
-            scale=config.vae.scale_factor,
-            shift=config.vae.shift_factor,
         )
         self.image_decoder = ImageDecoder(self.latent_encoder)
 
