@@ -49,7 +49,7 @@ agreement vLLM makes with ``coordinate_batch_across_dp``
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -57,6 +57,9 @@ import torch.distributed as dist
 from uniserve.distributed import Communicator
 from uniserve.nn.moe import Activation
 from uniserve.quantization import QuantizedTensor, ScaleLayout
+
+if TYPE_CHECKING:
+    from .backends.moe import deepgemm, megamoe
 
 __all__ = ["ExpertExchange", "JoinGraphs"]
 
@@ -109,7 +112,9 @@ class ExpertExchange:
         self.device = device
         self.transport = transport
         self.attention_ranks = attention_ranks
-        self.fused = None
+        # The fused MegaMoE staging: the split buffer with attention ranks,
+        # otherwise the symmetric buffer; None for the other transports.
+        self.fused: deepgemm.Buffer | megamoe.MegaMoEBuffer | None = None
         self._elastic = None
         self.source_only = 0 <= group.rank < attention_ranks
         # A tensor/pipeline group submits one forward together. IPC delivery
@@ -121,7 +126,7 @@ class ExpertExchange:
             source_group = (
                 (group.ranks[group.rank],) if group.rank < source_count else ()
             )
-        memberships = [None] * group.size
+        memberships: list[tuple[int, ...] | None] = [None] * group.size
         dist.all_gather_object(
             memberships, tuple(source_group), group=group._require()
         )
@@ -129,7 +134,8 @@ class ExpertExchange:
         for index, members in enumerate(memberships):
             expected_source = index < source_count
             if (
-                bool(members) != expected_source
+                members is None
+                or bool(members) != expected_source
                 or len(set(members)) != len(members)
                 or not set(members) <= sources
                 or (expected_source and group.ranks[index] not in members)
@@ -154,11 +160,16 @@ class ExpertExchange:
                 raise ValueError(
                     "the MegaMoE transport needs the experts' width and gate"
                 )
+            buffer_type: type[deepgemm.Buffer] | type[megamoe.MegaMoEBuffer]
             if attention_ranks:
                 from .backends.moe.deepgemm import Buffer
+
+                buffer_type = Buffer
             else:
-                from .backends.moe.megamoe import MegaMoEBuffer as Buffer
-            self.fused = Buffer(
+                from .backends.moe.megamoe import MegaMoEBuffer
+
+                buffer_type = MegaMoEBuffer
+            self.fused = buffer_type(
                 group,
                 max_tokens=max_tokens,
                 num_experts=num_experts,
@@ -228,9 +239,10 @@ class ExpertExchange:
                 raise ValueError(
                     "microbatches must use the same expert transport"
                 )
-            self.fused.bind_microbatches(
-                [exchange.fused for exchange in exchanges]
-            )
+            # Attention ranks construct the split buffer, which the exchange
+            # holds until ``close``.
+            split = cast("deepgemm.Buffer", self.fused)
+            split.bind_microbatches([exchange.fused for exchange in exchanges])
 
     @staticmethod
     def _build_alltoall(group, max_tokens, top_k, num_experts, hidden, device):
@@ -504,7 +516,9 @@ class ExpertExchange:
             self._elastic.close()
             self._elastic = None
         if self.fused is not None and self.attention_ranks:
-            self.fused.close()
+            # Attention ranks construct the split buffer; the symmetric
+            # buffer has no collective retirement of its own.
+            cast("deepgemm.Buffer", self.fused).close()
             self.fused = None
 
 

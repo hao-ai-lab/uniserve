@@ -367,7 +367,14 @@ class _SplitOperator(Operator):
                 raise ValueError(
                     "expert weights and activations must share an encoding"
                 )
-        self.operands = (fc1, fc2)
+        # ``close`` releases the encoded weights and their pointer table.
+        self.operands: (
+            tuple[
+                tuple[torch.Tensor, torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor],
+            ]
+            | None
+        ) = (fc1, fc2)
         self.descriptors = buffer.native.make_m2n_weight_descs(
             *fc1,
             *fc2,
@@ -376,7 +383,7 @@ class _SplitOperator(Operator):
             buffer.intermediate,
             16 if buffer.format == "nvfp4" else 32,
         ).to(buffer.device)
-        self.pointers = torch.tensor(
+        self.pointers: torch.Tensor | None = torch.tensor(
             [fc1[0].data_ptr()], dtype=torch.int64, device=buffer.device
         )
         self.weight_bytes = fc1[0].numel() * fc1[0].element_size()

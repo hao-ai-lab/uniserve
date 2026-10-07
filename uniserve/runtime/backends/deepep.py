@@ -116,7 +116,21 @@ class DeepEP:
             ).multi_processor_count,
         )
         self._qps = min(self._sms * 16 + 1, 129)
-        self._handle = None
+        # Routing state from dispatch to its matching combine: source
+        # metadata, copied expert ids, cumulative receive counts, optional
+        # token metadata and channel links, the capacity and received shape.
+        self._handle: (
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+                torch.Tensor | None,
+                int,
+                torch.Size,
+            ]
+            | None
+        ) = None
 
     def dispatch(self, hidden, ids, weights, *, capacity=None):
         """Route BF16 or encoded NVFP4 rows without changing their values.
@@ -236,7 +250,8 @@ class DeepEP:
             valid_routes, local_ids + self.local_start, -1
         ).to(torch.int32)
         route_weights = torch.where(valid_routes, route_weights, 0)
-        if encoded:
+        # Encoded inputs, and only those, retained their fields above.
+        if fields is not None:
             # Static unused receive rows have no routes. Initialize their
             # encoded fields as well so subsequent numerical kernels never
             # observe uninitialized scale bytes while masking padding.

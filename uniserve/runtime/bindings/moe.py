@@ -99,6 +99,9 @@ class MoEBinding:
                 max(size.num_tokens, self.size.num_tokens),
                 max(size.batch_size, self.size.batch_size),
             )
+        # Any expert provider, or none when the split MegaMoE buffer binds
+        # the operator itself.
+        provider: moe_backend.Backend | None
         if (
             self.exchange is not None
             and self.exchange.transport == "megamoe"

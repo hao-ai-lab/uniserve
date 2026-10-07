@@ -54,10 +54,16 @@ class Microbatches:
 
     def __init__(self, contexts: Sequence[ExecutionContext]):
         self.contexts = tuple(contexts)
-        if not self.contexts or any(c.stream is None for c in self.contexts):
+        # One borrowed stream per context, in context order.
+        self._streams = tuple(
+            context.stream
+            for context in self.contexts
+            if context.stream is not None
+        )
+        if not self.contexts or len(self._streams) != len(self.contexts):
             raise ValueError("microbatches require explicit CUDA streams")
-        self.device = self.contexts[0].stream.device
-        streams = [context.stream.stream for context in self.contexts]
+        self.device = self._streams[0].device
+        streams = [stream.stream for stream in self._streams]
         if any(stream.device != self.device for stream in streams) or len(
             {stream.cuda_stream for stream in streams}
         ) != len(streams):
@@ -151,8 +157,8 @@ class Microbatches:
             self._active = list(range(len(calls)))
             self._turn, self._error = 0, None
             current = torch.cuda.current_stream(self.device)
-            for context in self.contexts:
-                context.stream.wait(current)
+            for stream in self._streams:
+                stream.wait(current)
             futures = [
                 thread.submit(copy_context().run, self._execute, index, call)
                 for index, (thread, call) in enumerate(
@@ -173,8 +179,8 @@ class Microbatches:
             # An interruption of future.result() need not mean that future
             # completed. Every host turn must retire before state is reused.
             wait(futures)
-            for context in self.contexts:
-                current.wait_stream(context.stream.stream)
+            for stream in self._streams:
+                current.wait_stream(stream.stream)
             if self._error is not None:
                 raise self._error
             return results
