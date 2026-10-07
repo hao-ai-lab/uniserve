@@ -33,12 +33,7 @@ class CausalLM(nn.Module):
         if self.backbone._pipeline.rank == 0:
             hidden = self.embed_input_ids(inputs.input_ids.reshape(-1))
             if inputs.embeddings is not None:
-                replacement = inputs.embeddings
-                hidden = torch.where(
-                    replacement.mask.reshape(-1, 1),
-                    replacement.values.to(hidden.dtype),
-                    hidden,
-                )
+                hidden = inputs.embeddings.apply(hidden)
 
         return self.backbone(
             hidden, inputs.positions, inputs.attention, routes=inputs.routes

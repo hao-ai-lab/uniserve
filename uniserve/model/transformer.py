@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 
@@ -108,14 +110,35 @@ class TransformerDecoder(nn.Module):
         *,
         routes: tuple[RouteSpan, ...] = (),
     ) -> torch.Tensor:
+        """Run this stage's resident layers over the packed tokens.
+
+        ``positions`` is ``[tokens]``, or ``[axes, tokens]`` for layers whose
+        rotary embedding reads several coordinates per token. Returns the
+        final stage's normalized ``[tokens, hidden]`` rows, or the hidden
+        stream an earlier stage forwards.
+        """
+        stream = self._enter(embeddings, positions, routes)
+        for layer in self.layers.values():
+            stream.apply(layer, attention)
+        return self._exit(stream)
+
+    def _enter(
+        self,
+        embeddings: torch.Tensor | None,
+        positions: torch.Tensor,
+        routes: tuple[RouteSpan, ...],
+    ) -> _Stream:
+        """Take this stage's token shard of the streams entering its layers.
+
+        The first stage starts from the packed embeddings without a residual
+        stream; later stages receive both streams from the previous stage.
+        """
         count = positions.shape[-1]
         if not routes and self._default_route is not None:
             routes = (RouteSpan(self._default_route, 0, count),)
         partition = TokenShard(count, self._tokens)
         positions = partition.local(positions, dim=positions.ndim - 1)
 
-        # Routes replace each packed stream with its per-route tensors; the
-        # first stage starts without a residual stream.
         hidden: torch.Tensor | RoutedTensor
         residual: torch.Tensor | RoutedTensor | None
         if self._pipeline.rank == 0:
@@ -135,6 +158,7 @@ class TransformerDecoder(nn.Module):
             for value in (hidden, residual):
                 self._pipeline.recv(src=self._pipeline.rank - 1, out=value)
 
+        # Routes replace each packed stream with its per-route tensors.
         # Clip route spans to this rank's token shard, in shard-local offsets.
         local_routes: tuple[RouteSpan, ...] = ()
         if routes:
@@ -156,28 +180,24 @@ class TransformerDecoder(nn.Module):
                 residual = RoutedTensor.from_packed(
                     residual, local_routes, routes=keys
                 )
+        return _Stream(hidden, residual, positions, partition, local_routes)
 
-        for layer in self.layers.values():
-            if routes:
-                hidden, residual = layer(
-                    hidden, residual, positions, attention, routes=local_routes
-                )
-            else:
-                hidden, residual = layer(hidden, residual, positions, attention)
+    def _exit(self, stream: _Stream) -> torch.Tensor:
+        """Forward an earlier stage's streams, or normalize the final ones."""
         # Every layer returns the residual stream it carries forward.
+        hidden, residual = stream.hidden, stream.residual
         assert residual is not None
 
-        last = self._pipeline.rank == self._pipeline.size - 1
-        if not last:
-            for stream in (hidden, residual):
+        if self._pipeline.rank != self._pipeline.size - 1:
+            for value in (hidden, residual):
                 packed = (
-                    stream.packed(local_routes)
-                    if isinstance(stream, RoutedTensor)
-                    else stream
+                    value.packed(stream.routes)
+                    if isinstance(value, RoutedTensor)
+                    else value
                 )
                 self._pipeline.send(packed, dst=self._pipeline.rank + 1)
             return (
-                hidden.packed(local_routes)
+                hidden.packed(stream.routes)
                 if isinstance(hidden, RoutedTensor)
                 else hidden
             )
@@ -189,7 +209,7 @@ class TransformerDecoder(nn.Module):
         if isinstance(hidden, RoutedTensor):
             assert isinstance(residual, RoutedTensor)
             assert isinstance(norm, nn.ModuleDict)
-            result = hidden.add(residual).apply(norm).packed(local_routes)
+            result = hidden.add(residual).apply(norm).packed(stream.routes)
         else:
             assert isinstance(residual, torch.Tensor)
             if isinstance(norm, RMSNorm):
@@ -198,7 +218,40 @@ class TransformerDecoder(nn.Module):
                 )
             else:
                 result = norm(hidden + residual)
-        return partition.gather(result)
+        return stream.partition.gather(result)
+
+
+@dataclass(slots=True)
+class _Stream:
+    """One stage's token shard of the streams a decoder's layers carry.
+
+    ``hidden`` and ``residual`` are packed tensors, or per-route tensors in
+    a routed pass, whose shard-local spans ``routes`` holds; ``positions``
+    are the shard's rotary coordinates.
+    """
+
+    hidden: torch.Tensor | RoutedTensor
+    residual: torch.Tensor | RoutedTensor | None
+    positions: torch.Tensor
+    partition: TokenShard
+    routes: tuple[RouteSpan, ...]
+
+    def apply(self, layer: nn.Module, attention: AttentionInput) -> None:
+        """Advance both streams through one decoder layer."""
+        # A routed pass carries per-route tensors even on a shard that no
+        # route span reaches.
+        if isinstance(self.hidden, RoutedTensor):
+            self.hidden, self.residual = layer(
+                self.hidden,
+                self.residual,
+                self.positions,
+                attention,
+                routes=self.routes,
+            )
+        else:
+            self.hidden, self.residual = layer(
+                self.hidden, self.residual, self.positions, attention
+            )
 
 
 class TransformerEncoder(nn.Module):

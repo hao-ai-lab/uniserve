@@ -12,7 +12,7 @@ from uniserve.model import ComponentEntry, EntryPoint
 from .config import Config
 from .decoding import AudioDecoder, VideoDecoder
 from .denoiser import Denoiser
-from .encoder import TextEncoder
+from .encoder import text_encoder
 from .output import VideoPostprocessor
 
 
@@ -22,7 +22,7 @@ class Model(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.text_encoder = TextEncoder(config.text_encoder)
+        self.text_encoder = text_encoder(config.text_encoder)
         self.denoiser = Denoiser(config.denoiser, config.diffusion)
         self.video_decoder = VideoDecoder(
             config.video_decoder, frame_sizes=config.output.frame_sizes

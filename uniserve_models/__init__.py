@@ -12,7 +12,8 @@ presets and ``checkpoint_precision`` is the base configuration for a
 calibrated ModelOpt checkpoint; ``entry_points`` declares the methods
 serving ranks may call; and ``image_processor`` and ``flow_prompt`` describe
 caller-side input preparation. Packages absent from that catalog serve other
-roles: ``siglip`` is a vision tower that other models compose, and ``stub``
-holds the deterministic weightless model a worker builds when launched
-without a checkpoint.
+roles: ``siglip`` is a vision tower that other models compose, ``qwen3_vl``
+is the Qwen3-VL vision tower and multimodal text encoding that MiniMax H3
+composes, and ``stub`` holds the deterministic weightless model a worker
+builds when launched without a checkpoint.
 """

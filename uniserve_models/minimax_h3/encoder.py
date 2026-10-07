@@ -1,14 +1,30 @@
-"""H3's retained Qwen language layers for text conditioning."""
+"""H3's retained Qwen3-VL language layers and vision tower for conditioning."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 
+import torch
 from torch import nn
 
-from uniserve.model import TextEncoder as BaseTextEncoder
-from uniserve_models import qwen3
+from uniserve_models import qwen3, qwen3_vl
+
+# The Qwen3-VL-32B vision tower of the H3 text encoder checkpoint.
+_VISION = qwen3_vl.VisionConfig(
+    depth=27,
+    hidden_size=1_152,
+    intermediate_size=4_304,
+    num_heads=16,
+    hidden_act="gelu_pytorch_tanh",
+    in_channels=3,
+    patch_size=16,
+    temporal_patch_size=2,
+    spatial_merge_size=2,
+    out_hidden_size=5_120,
+    num_position_embeddings=2_304,
+    deepstack_visual_indexes=(8, 16, 24),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,8 +33,12 @@ class TextEncoderConfig:
 
     ``num_checkpoint_layers`` is the checkpoint's decoder depth; the encoder
     runs only the first ``num_retained_layers`` of them. ``read_config``
-    fills every other field from the checkpoint's ``text_config``, while
-    ``num_retained_layers`` always keeps its default.
+    fills the language fields, ``mrope_sections`` (the interleaved M-RoPE
+    widths of the temporal, height and width axes), the image and video
+    placeholder tokens and ``vision`` (the vision tower) from the
+    checkpoint's text encoder config, while ``num_retained_layers`` and
+    ``pixels`` (its processor's pixel normalization) keep their defaults.
+    The defaults are the H3 checkpoint's Qwen3-VL-32B values.
     """
 
     vocab_size: int = 151_936
@@ -32,6 +52,11 @@ class TextEncoderConfig:
     rope_theta: float = 5_000_000.0
     rms_norm_eps: float = 1e-6
     max_position_embeddings: int = 262_144
+    mrope_sections: tuple[int, ...] = (24, 20, 20)
+    image_token_id: int = 151_655
+    video_token_id: int = 151_656
+    vision: qwen3_vl.VisionConfig = _VISION
+    pixels: qwen3_vl.PixelConfig = qwen3_vl.PixelConfig()
 
     def __post_init__(self) -> None:
         for name in (
@@ -70,34 +95,64 @@ class TextEncoderConfig:
             raise ValueError(
                 "H3 text rotary base and normalization epsilon must be positive"
             )
-
-
-class TextEncoder(BaseTextEncoder):
-    """Return the configured Qwen checkpoint hidden state without final norm."""
-
-    def __init__(self, config: TextEncoderConfig):
-        network = qwen3.Transformer(
-            qwen3.Config(
-                vocab_size=config.vocab_size,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                num_hidden_layers=config.num_checkpoint_layers,
-                num_attention_heads=config.num_attention_heads,
-                num_key_value_heads=config.num_key_value_heads,
-                head_dim=config.head_dim,
-                hidden_act="silu",
-                rms_norm_eps=config.rms_norm_eps,
-                rope_theta=config.rope_theta,
-                max_position_embeddings=config.max_position_embeddings,
-                attention_bias=False,
-                tie_word_embeddings=False,
-                num_experts=0,
-                num_experts_per_tok=1,
-                moe_intermediate_size=config.intermediate_size,
+        if (
+            not isinstance(self.mrope_sections, tuple)
+            or len(self.mrope_sections) != 3
+            or sum(self.mrope_sections) != self.head_dim // 2
+        ):
+            raise ValueError(
+                "H3 text M-RoPE sections must split half the head width "
+                "over three axes"
             )
+        if any(
+            type(token) is not int or not 0 <= token < self.vocab_size
+            for token in (self.image_token_id, self.video_token_id)
+        ):
+            raise ValueError("H3 vision placeholders must be vocabulary tokens")
+        # The vision token width is checked against the language width where
+        # both towers compose (``qwen3_vl.Encoder``).
+        if not isinstance(self.vision, qwen3_vl.VisionConfig):
+            raise ValueError("H3 vision requires a Qwen3-VL vision config")
+
+
+def text_encoder(config: TextEncoderConfig) -> qwen3_vl.Encoder:
+    """Build H3's text encoder: the retained Qwen3-VL layers and vision tower.
+
+    ``vision.encode`` encodes keyframes, reference images and reference
+    video blocks; ``encode`` reads the prompt with those tokens spliced in
+    and returns the retained layers' hidden state without the final norm.
+    Vision tokens use BF16, the checkpoint's representation.
+    """
+    network = qwen3_vl.Transformer(
+        qwen3.Config(
+            vocab_size=config.vocab_size,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_checkpoint_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            hidden_act="silu",
+            rms_norm_eps=config.rms_norm_eps,
+            rope_theta=config.rope_theta,
+            max_position_embeddings=config.max_position_embeddings,
+            attention_bias=False,
+            tie_word_embeddings=False,
+            num_experts=0,
+            num_experts_per_tok=1,
+            moe_intermediate_size=config.intermediate_size,
+            mrope_sections=config.mrope_sections,
         )
-        # H3 conditions on the retained layer's raw hidden state; the Qwen
-        # final norm is not part of the checkpoint's conditioning path.
-        network.norm = nn.Identity()
-        super().__init__(network, tuple(range(config.num_retained_layers)))
-        self.config = config
+    )
+    # H3 conditions on the retained layer's raw hidden state; the Qwen
+    # final norm is not part of the checkpoint's conditioning path.
+    network.norm = nn.Identity()
+    return qwen3_vl.Encoder(
+        network,
+        tuple(range(config.num_retained_layers)),
+        config.vision,
+        pixels=config.pixels,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        dtype=torch.bfloat16,
+    )

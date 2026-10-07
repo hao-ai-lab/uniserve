@@ -19,7 +19,7 @@ from uniserve.nn.mlp import GatedMLP
 from uniserve.nn.modulation import Modulation
 from uniserve.nn.moe import FusedMoE, TopK
 from uniserve.nn.norm import RMSNorm
-from uniserve.nn.rope import RotaryEmbedding
+from uniserve.nn.rope import MRotaryEmbedding, RotaryEmbedding
 from uniserve.nn.routing import RoutedTensor, RouteSpan
 from uniserve.nn.timestep import TimestepEmbedding
 from uniserve.nn.vae.layers import (
@@ -43,6 +43,7 @@ __all__ = [
     "GatedMLP",
     "Linear",
     "MLPConnector",
+    "MRotaryEmbedding",
     "MergedColumnParallelLinear",
     "Modulation",
     "PatchAutoencoder",

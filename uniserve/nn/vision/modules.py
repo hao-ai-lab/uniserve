@@ -1,32 +1,76 @@
 """Reusable image patch projection and feature connection layers."""
 
+from math import prod, sqrt
+
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from uniserve.nn.activation import get_act_fn
 from uniserve.nn.linear import Linear
 
 
 class PatchEmbed(nn.Module):
-    """Project NCHW pixels into non-overlapping spatial token rows."""
+    """Project flattened pixel patches to token rows.
+
+    A patch holds ``in_channels`` channels over ``patch_shape`` pixels:
+    ``(height, width)``, or ``(frames, height, width)`` for a spatiotemporal
+    patch (a tubelet). Each input row flattens one patch channel-major, the
+    packed layout patch encoders read. ``weight`` keeps the checkpoint
+    layout ``[embed_dim, in_channels, *patch_shape]`` of a Conv2d or Conv3d
+    whose kernel equals its stride, so one matrix product over the flattened
+    patches evaluates that convolution.
+    """
 
     def __init__(
         self,
         in_channels: int,
         embed_dim: int,
-        patch_size: int,
+        patch_shape: tuple[int, ...],
         *,
         bias: bool = True,
     ):
         super().__init__()
-        self.patch_size, self.in_channels = patch_size, in_channels
-        self.projection = nn.Conv2d(
-            in_channels, embed_dim, patch_size, stride=patch_size, bias=bias
-        )
+        if (
+            not isinstance(patch_shape, tuple)
+            or len(patch_shape) not in (2, 3)
+            or any(
+                type(value) is not int or value < 1
+                for value in (in_channels, embed_dim, *patch_shape)
+            )
+        ):
+            raise ValueError(
+                "patch embedding requires positive channel, width and 2-D or "
+                "3-D patch dimensions"
+            )
+        shape = (embed_dim, in_channels, *patch_shape)
+        self.weight = nn.Parameter(torch.empty(shape), requires_grad=False)
+        # The convolution initialization: fan-in is one patch's pixel count.
+        nn.init.kaiming_uniform_(self.weight, a=sqrt(5))
+        if bias:
+            bound = 1 / sqrt(prod(shape[1:]))
+            self.bias = nn.Parameter(
+                torch.empty(embed_dim).uniform_(-bound, bound),
+                requires_grad=False,
+            )
+        else:
+            self.register_parameter("bias", None)
 
-    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
-        """Return ``[batch, H*W tokens, embed_dim]`` patch rows."""
-        return self.projection(pixels).flatten(2).transpose(1, 2)
+    @property
+    def in_features(self) -> int:
+        """Pixel values of one flattened patch."""
+        return prod(self.weight.shape[1:])
+
+    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+        """Return ``[..., embed_dim]`` rows of ``[..., in_features]`` patches.
+
+        Pixels convert to the weight dtype before the projection.
+        """
+        if patches.shape[-1] != self.in_features:
+            raise ValueError("patch rows must hold one complete patch")
+        return F.linear(
+            patches.to(self.weight.dtype), self.weight.flatten(1), self.bias
+        )
 
 
 class MLPConnector(nn.Module):

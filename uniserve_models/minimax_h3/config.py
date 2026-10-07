@@ -17,6 +17,8 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
+from uniserve_models import qwen3_vl
+
 from . import audio_vae, output, video_vae
 from .encoder import TextEncoderConfig
 
@@ -372,30 +374,39 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
         raise ValueError(
             "FastH3 checkpoint requires an independent vocabulary head"
         )
-    if text.get("rope_scaling") != {
-        "mrope_interleaved": True,
-        "mrope_section": [24, 20, 20],
-        "rope_type": "default",
-    }:
-        raise ValueError("unsupported FastH3 text encoder rope_scaling")
-    # The text encoder checkpoint also holds a vision tower that H3 never
-    # runs. ``weights`` enumerates checkpoint tensor names from this fixed
-    # vision layout, so the checkpoint must match it.
-    vision = metadata["text_encoder"].get("vision_config")
+    # The language layers rotate by interleaved M-RoPE; its sections are
+    # the checkpoint's.
+    rope = text.get("rope_scaling")
     if (
-        not isinstance(vision, dict)
-        or vision.get("depth") != 27
-        or vision.get("deepstack_visual_indexes") != [8, 16, 24]
+        not isinstance(rope, dict)
+        or rope.get("rope_type") != "default"
+        or rope.get("mrope_interleaved") is not True
+        or not isinstance(rope.get("mrope_section"), list)
     ):
-        raise ValueError("unsupported FastH3 checkpoint visual layer layout")
+        raise ValueError("unsupported FastH3 text encoder rope_scaling")
+    vision = metadata["text_encoder"].get("vision_config")
+    if not isinstance(vision, dict):
+        raise ValueError("FastH3 text encoder requires vision_config")
     missing = set(TEXT_FIELDS) - text.keys()
     if missing:
         raise ValueError(
             f"FastH3 text_encoder.text_config is missing fields: "
             f"{', '.join(sorted(missing))}"
         )
+    missing = {"image_token_id", "video_token_id"} - metadata[
+        "text_encoder"
+    ].keys()
+    if missing:
+        raise ValueError(
+            f"FastH3 text_encoder config is missing fields: "
+            f"{', '.join(sorted(missing))}"
+        )
     encoder = TextEncoderConfig(
-        **{target: text[source] for source, target in TEXT_FIELDS.items()}
+        **{target: text[source] for source, target in TEXT_FIELDS.items()},
+        mrope_sections=tuple(rope["mrope_section"]),
+        image_token_id=metadata["text_encoder"]["image_token_id"],
+        video_token_id=metadata["text_encoder"]["video_token_id"],
+        vision=qwen3_vl.read_vision_config(vision),
     )
 
     video_values = {}
