@@ -1,15 +1,14 @@
 """A worker's conditioned request computes what the model computes.
 
-Each case serves a recorded diffusers reference request
-(``tools/minimax_h3/diffusers_reference.py``) through the worker's request
-path on the released checkpoint's denoiser: ``transformer`` for ``fl2va``,
-``transformer_ref`` for ``ref2va``. The worker sizes the request from its
-admission (``media.video_shape``), evaluates it in a layout of its own that
-its runner prepares while serving beside the captured text-only layouts,
-draws the request's noise, retains its refined prompt, hands over its
-condition latents (``conditions.condition_latents``,
-``MediaBuilder.encode_conditions``) and runs the first denoising step
-eagerly.
+Each case serves a recorded diffusers reference request through the
+worker's request path on the released checkpoint's denoiser:
+``transformer`` for ``fl2va``, ``transformer_ref`` for ``ref2va``. The
+worker sizes the request from its admission (``media.video_shape``),
+evaluates it in a layout of its own that its runner prepares while serving
+beside the captured text-only layouts, draws the request's noise, retains
+its refined prompt, hands over its condition latents
+(``conditions.condition_latents``, ``MediaBuilder.encode_conditions``) and
+runs the first denoising step eagerly.
 
 The same request then runs through the model's public calls on the same
 loaded denoiser: ``make_size`` and ``layout_size`` at the worker's text
@@ -23,10 +22,9 @@ condition's, then the video's and the audio's), the retained conditioning
 initial samples, and the samples after the first step.
 
 How closely the model follows the diffusers reference is the model's own
-contract, judged by the trajectory acceptance rule
-(``tools/minimax_h3/acceptance.py``); each case prints the first step's
-prediction deviation from the reference beside the deviations of the
-reference's alternative attention kernels on the same inputs
+contract, judged against the reference trajectory; each case prints the
+first step's prediction deviation from the reference beside the deviations
+of the reference's alternative attention kernels on the same inputs
 (``acceptance/<workload>/seed42/kernel_steps.json``) for information only.
 
 The cases need the released checkpoint (``UNISERVE_H3_MODEL``), the

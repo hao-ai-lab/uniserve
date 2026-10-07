@@ -1,20 +1,21 @@
 """MiniMax-H3 checkpoints serve keyframe and reference requests.
 
-Serves the published Ulysses-4 deployments and sends the protocol's
-conditioned workloads (``tools/minimax_h3/workloads.py``): the official
-first-frame request (W3) on the diffusers root's ``denoiser`` deployment,
-and the image-plus-audio (W4) and official video-plus-audio (W5) reference
-requests on the ``reference_denoiser`` deployment, with the diffusers root's
-reference DiT and with a FastH3 OmniRef component export. The OmniRef
-export also serves a request just under its 131,072-row sequence bound and
-refuses one just over it before admission. Condition media are read from
-``file://`` URIs under ``--media-directory``. Every response is a complete
-MP4 at the canvas and frame count the request resolves to.
+Serves the published Ulysses-4 deployments and sends the seed-42 requests
+of the packaged conditioned workloads (``uniserve_eval/workloads/minimax_h3``):
+the official first-frame request (W3) on the diffusers root's ``denoiser``
+deployment, and the image-plus-audio (W4) and official video-plus-audio (W5)
+reference requests on the ``reference_denoiser`` deployment, with the
+diffusers root's reference DiT and with a FastH3 OmniRef component export.
+The OmniRef export also serves a request just under its 131,072-row
+sequence bound and refuses one just over it before admission. Condition
+media are read from ``file://`` URIs under ``--media-directory``. Every
+response is a complete MP4 at the canvas and frame count the request
+resolves to.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -32,16 +33,40 @@ from uniserve_eval.transport.video import inspect_video_bytes
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
 
 ROOT = Path(__file__).resolve().parents[3]
+WORKLOADS = ROOT / "uniserve_eval" / "workloads" / "minimax_h3"
 
 
-def _workloads():
-    """Load the protocol's workload definitions from the tools tree."""
-    path = ROOT / "tools" / "minimax_h3" / "workloads.py"
-    spec = importlib.util.spec_from_file_location("minimax_h3_workloads", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.WORKLOADS
+def _request(workload: str, inputs: Path) -> dict:
+    """The seed-42 request of a packaged conditioned workload.
+
+    A workload's warmup manifest holds its seed-42 request: the prompt, the
+    duration and the condition media in request order, named relative to the
+    inputs directory. Conditioned workloads resolve their canvas from
+    ``auto``.
+    """
+    manifest = WORKLOADS / f"{workload}-warmup.jsonl"
+    row = json.loads(manifest.read_text().splitlines()[0])
+    conditions = [
+        {
+            **{
+                key: value for key, value in condition.items() if key != "media"
+            },
+            "uri": f"file://{(inputs / condition['media']).resolve()}",
+        }
+        for condition in row["conditions"]
+    ]
+    return {
+        "model": "MiniMax-H3",
+        "task": row["metadata"]["task"],
+        "prompt": row["prompt"],
+        "conditions": conditions,
+        "target": {
+            "short_edge": 768,
+            "aspect_ratio": "auto",
+            "duration_seconds": row["seconds"],
+        },
+        "seed": row["seed"],
+    }
 
 
 def _root() -> str:
@@ -55,10 +80,10 @@ def _root() -> str:
 
 def _inputs() -> Path:
     inputs = os.environ.get("UNISERVE_MINIMAX_H3_INPUTS")
-    if not inputs or not (Path(inputs) / "prompts.json").is_file():
+    if not inputs or not (Path(inputs) / "media").is_dir():
         pytest.fail(
             "UNISERVE_MINIMAX_H3_INPUTS must name the protocol inputs "
-            "directory holding prompts.json and media/"
+            "directory holding media/"
         )
     return Path(inputs).resolve()
 
@@ -99,7 +124,6 @@ def _check_media(response, *, width, height, frames) -> None:
 
 def test_base_first_frame_request(tmp_path: Path) -> None:
     model, inputs = _root(), _inputs()
-    workload = _workloads()["fl2va_first_8s"]
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     # The official first-frame presentation holds 1935 text rows and its
@@ -124,15 +148,14 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
         video = client.get("/v1/capabilities").json()["video"]
         assert set(video["tasks"]) == {"t2va", "fl2va"}
 
-        body = {"model": "MiniMax-H3", **workload.request_body(inputs, 42)}
-        response = client.post("/v1/videos/sync", json=body)
+        response = client.post("/v1/videos/sync", json=_request("w3", inputs))
         (tmp_path / "fl2va.mp4").write_bytes(response.content)
         # The 16:9 keyframe resolves the 1344x768 canvas; eight seconds
         # are 192 frames.
         _check_media(response, width=1344, height=768, frames=192)
 
 
-def _reference_requests(command, base, tmp_path, *, workloads, inputs):
+def _reference_requests(command, base, tmp_path, *, inputs):
     """Serve ``command`` and check W4 and W5 against it."""
     with (
         server_process(command, base, tmp_path / "server.log", timeout_s=3600),
@@ -141,12 +164,10 @@ def _reference_requests(command, base, tmp_path, *, workloads, inputs):
         video = client.get("/v1/capabilities").json()["video"]
         assert video["tasks"] == ["ref2va"]
 
-        for name in ("ref2va_image_audio_5s", "ref2va_video_audio_5s"):
-            body = {
-                "model": "MiniMax-H3",
-                **workloads[name].request_body(inputs, 42),
-            }
-            response = client.post("/v1/videos/sync", json=body)
+        for name in ("w4", "w5"):
+            response = client.post(
+                "/v1/videos/sync", json=_request(name, inputs)
+            )
             (tmp_path / f"{name}.mp4").write_bytes(response.content)
             # References leave the auto canvas at 16:9; five seconds align
             # up to 124 frames.
@@ -176,7 +197,6 @@ def test_base_reference_requests(tmp_path: Path) -> None:
         ),
         f"http://127.0.0.1:{port}",
         tmp_path,
-        workloads=_workloads(),
         inputs=inputs,
     )
 
@@ -225,7 +245,6 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
         ),
         f"http://127.0.0.1:{port}",
         tmp_path,
-        workloads=_workloads(),
         inputs=inputs,
     )
 
