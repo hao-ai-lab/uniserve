@@ -28,10 +28,14 @@ mod video_jobs;
 use std::sync::Arc;
 
 use crate::engine_client::EngineClient;
-use crate::profile::ModelConfig;
 pub use crate::profile::ModelDescription;
+use crate::profile::assets::ResolvedModelFiles;
+use crate::profile::{ModelConfig, ModelParameters};
 use crate::serving::LoadedModel;
 pub use crate::serving::chat::ChatTemplateContentFormatOption;
+pub use crate::serving::media::ImageFetchPolicy;
+use crate::serving::media::ImageFetcher;
+use crate::serving::systemone::ReadoutEncoder;
 use crate::serving::{InputProcessor, ServingRuntime};
 use anyhow::{Context as _, Result};
 pub use config::{Config, EngineSettings, HttpListenerMode, VideoMediaSettings};
@@ -86,13 +90,24 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
 /// reports.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let LoadedModel {
-        config: model_config,
+        config: mut model_config,
         tokenizer,
         renderer,
         vision,
     } = ModelConfig::load(config)
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
+    // The server's block-diffusion sampling replaces the checkpoint's
+    // defaults once, before any request is lowered.
+    if let ModelParameters::DiffusionGemma(profile) = &mut model_config.parameters {
+        profile.denoising = profile
+            .denoising
+            .with_overrides(&config.diffusion_generation)
+            .map_err(|message| {
+                anyhow::anyhow!("invalid --diffusion-generation-config: {message}")
+            })?;
+    }
+    let runtime_family = model_config.runtime_family();
     let effective_max_model_len = model_config.max_model_tokens();
     let channel_payload_capacity = model_config.channel_payload_capacity();
     let control_tokens = special_token_ids(&model_config);
@@ -148,10 +163,21 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             ),
             _ => None,
         },
+        // Every generated canvas uses the served sampling, which the worker
+        // sizes its canvas state for and prepares its canvas steps with.
+        canvas_sampling: match &model_config.parameters {
+            ModelParameters::DiffusionGemma(profile) => {
+                Some(crate::serving::canvas_sampling(profile))
+            }
+            _ => None,
+        },
+        // A DiffusionGemma prompt, image block or committed block only
+        // conditions canvases: its prefill writes the K/V cache alone.
+        prefill_outputs: !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_)),
         ..config.engine.worker_process.clone()
     };
     let engine_config = EngineConfig {
-        runtime_family: model_config.runtime_family(),
+        runtime_family,
         generation_limits,
         max_batch: config.engine.max_batch,
         max_num_batched_tokens: config.engine.max_num_batched_tokens,
@@ -199,6 +225,32 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         }
         _ => None,
     };
+
+    // A DiffusionGemma checkpoint serves the System One readout, whose
+    // encoder renders prompts with the checkpoint's own chat template.
+    let readout = match &model_config.parameters {
+        ModelParameters::DiffusionGemma(profile) => {
+            let files = ResolvedModelFiles::new(&config.model)
+                .await
+                .context("failed to resolve the readout chat template")?;
+            let encoder = ReadoutEncoder::load(
+                &files,
+                Arc::clone(&tokenizer),
+                profile,
+                config.readout,
+                route_max_model_len,
+            )
+            .context("failed to prepare the System One readout")?;
+            info!(
+                layout = ?config.readout.layout,
+                canvas = ?config.readout.canvas,
+                "serving the System One readout"
+            );
+            Some(encoder)
+        }
+        _ => None,
+    };
+
     let model = InputProcessor::new(
         model_config,
         tokenizer,
@@ -212,7 +264,12 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         config.reasoning_parsing,
     )
     .context("failed to bind the configured model description")?;
-    let runtime = ServingRuntime::new(model, Arc::clone(&engine), config.log_stats);
+    let images = ImageFetcher::new(config.image_fetch)
+        .context("failed to initialize the image URL fetcher")?;
+    let mut runtime = ServingRuntime::new(model, Arc::clone(&engine), images, config.log_stats);
+    if let Some(encoder) = readout {
+        runtime = runtime.with_readout(encoder);
+    }
 
     Ok(Arc::new(
         AppState::new(runtime)

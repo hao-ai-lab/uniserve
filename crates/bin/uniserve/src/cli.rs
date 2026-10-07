@@ -22,11 +22,15 @@ use uniserve_engine::{
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
+use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
 use uniserve_server::profile::omni::resolution::ResolutionName;
 use uniserve_server::profile::video::VideoResolution;
+use uniserve_server::serving::systemone::{
+    CandidateTokens, CanvasMode, ReadoutLayout, ReadoutOptions,
+};
 use uniserve_server::{
-    ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, SchedulingPolicy,
-    VideoMediaSettings,
+    ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, ImageFetchPolicy,
+    SchedulingPolicy, VideoMediaSettings,
 };
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
@@ -357,9 +361,60 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "log-stats", action = ArgAction::Set, default_value_t = true)]
     pub log_stats: bool,
 
+    /// Time limit, in seconds, for fetching one http(s) image URL, covering
+    /// the connection, every redirect, and the complete response body.
+    #[arg(
+        long = "image-fetch-timeout",
+        default_value_t = ImageFetchPolicy::DEFAULT_TIMEOUT.as_secs(),
+        value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+    )]
+    pub image_fetch_timeout: u64,
+    /// Largest accepted input image in bytes, for fetched image URLs and
+    /// decoded data URLs alike.
+    #[arg(
+        long = "image-fetch-max-bytes",
+        default_value_t = ImageFetchPolicy::DEFAULT_MAX_BYTES,
+        value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+    )]
+    pub image_fetch_max_bytes: u64,
+    /// Allow image URLs whose host is or resolves to a loopback, private,
+    /// link-local, unique-local, or cloud metadata address. Scheme, redirect,
+    /// time, size, and content-type limits still apply.
+    #[arg(long = "allow-private-image-urls")]
+    pub allow_private_image_urls: bool,
+
     /// The single model name used in the API. Defaults to the resolved model ID.
     #[arg(long)]
     pub served_model_name: Option<String>,
+
+    /// How a DiffusionGemma server divides System One questions among
+    /// readout prompts and canvases: `joint` packs questions in request order
+    /// into shared canvases up to the canvas length; `independent` gives every
+    /// question its own prompt and canvas.
+    #[arg(long = "readout-layout", default_value = "joint")]
+    pub readout_layout: ReadoutLayout,
+    /// Length of every System One readout canvas on a DiffusionGemma server:
+    /// `full` is the checkpoint's canvas length; `compact` the smallest
+    /// multiple of 16 tokens that holds the answer scaffold; a positive
+    /// multiple of 16 fixes the length, up to the checkpoint's canvas length.
+    #[arg(long = "readout-canvas", default_value = "full")]
+    pub readout_canvas: CanvasMode,
+    /// Candidate token spellings used by System One readouts: `variants`
+    /// sums supported spellings; `primary` uses only each candidate's
+    /// space-prefixed token.
+    #[arg(long = "readout-candidates", default_value = "variants")]
+    pub readout_candidates: CandidateTokens,
+    /// Block-diffusion sampling of every reply a DiffusionGemma server
+    /// generates, as a JSON object that replaces any of the checkpoint's
+    /// `generation_config.json` values `max_denoising_steps`,
+    /// `entropy_bound`, `t_min`, `t_max`, `confidence_threshold`, and
+    /// `stability_threshold`.
+    #[arg(
+        long = "diffusion-generation-config",
+        value_parser = parse_json::<DenoisingOverrides>,
+        value_name = "JSON"
+    )]
+    pub diffusion_generation_config: Option<DenoisingOverrides>,
 }
 
 impl SharedRuntimeArgs {
@@ -498,6 +553,17 @@ impl SharedRuntimeArgs {
                 max_request_bytes: self.max_request_bytes,
                 ffprobe: self.ffprobe,
             },
+            image_fetch: ImageFetchPolicy {
+                timeout: Duration::from_secs(self.image_fetch_timeout),
+                max_bytes: self.image_fetch_max_bytes,
+                allow_private: self.allow_private_image_urls,
+            },
+            readout: ReadoutOptions {
+                layout: self.readout_layout,
+                canvas: self.readout_canvas,
+                candidates: self.readout_candidates,
+            },
+            diffusion_generation: self.diffusion_generation_config.unwrap_or_default(),
         }
     }
 }
@@ -636,8 +702,8 @@ impl WorkerProcessOptions {
 
 /// Parses a JSON command-line value into `T` for clap.
 ///
-/// The error text says "invalid JSON object" whatever `T` is; both callers
-/// parse values that must be objects.
+/// The error text says "invalid JSON object" whatever `T` is; every caller
+/// parses values that must be objects.
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
 }
@@ -947,6 +1013,49 @@ mod tests {
         let Command::Serve(args) = parsed.command;
         let worker = args.runtime.worker_process.to_args();
         assert_eq!(worker.quantization_config, serde_json::json!({}));
+    }
+
+    /// The image fetch flags lower into the server's image fetch policy, which
+    /// defaults to a 20-second fetch, a 20 MB image, and public destinations
+    /// only; a zero time or size limit is refused.
+    #[test]
+    fn serve_lowers_image_fetch_limits() {
+        let serve = |flags: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(
+                ["uniserve", "serve", "model"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+        };
+        let policy = |flags: &[&str]| {
+            let Command::Serve(args) = serve(flags).expect("serve invocation").command;
+            args.to_uniserve_config().image_fetch
+        };
+
+        assert_eq!(
+            policy(&[]),
+            ImageFetchPolicy {
+                timeout: Duration::from_secs(20),
+                max_bytes: 20_000_000,
+                allow_private: false,
+            }
+        );
+        assert_eq!(
+            policy(&[
+                "--image-fetch-timeout",
+                "5",
+                "--image-fetch-max-bytes",
+                "1024",
+                "--allow-private-image-urls",
+            ]),
+            ImageFetchPolicy {
+                timeout: Duration::from_secs(5),
+                max_bytes: 1024,
+                allow_private: true,
+            }
+        );
+        assert!(serve(&["--image-fetch-timeout", "0"]).is_err());
+        assert!(serve(&["--image-fetch-max-bytes", "0"]).is_err());
     }
 
     #[test]

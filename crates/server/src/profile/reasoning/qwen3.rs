@@ -2,7 +2,7 @@
 
 use crate::profile::tokenizer::DynTokenizer;
 
-use super::{DelimitedReasoningParser, ReasoningDelta, Result};
+use super::{DelimitedReasoningParser, ReasoningDelta, ReasoningParser, Result};
 
 /// Reasoning parser for the configured Qwen3 description.
 ///
@@ -23,19 +23,21 @@ impl Qwen3ReasoningParser {
             inner: DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false)?,
         })
     }
+}
 
+impl ReasoningParser for Qwen3ReasoningParser {
     /// Initializes delimiter state from the rendered prompt suffix.
-    pub fn initialize(&mut self, prompt_token_ids: &[u32]) {
+    fn initialize(&mut self, prompt_token_ids: &[u32]) {
         self.inner.initialize(prompt_token_ids);
     }
 
     /// Applies one decoded text delta to the parser.
-    pub fn push(&mut self, delta: &str) -> ReasoningDelta {
+    fn push(&mut self, delta: &str) -> ReasoningDelta {
         self.inner.push(delta)
     }
 
     /// Flushes buffered text at end of generation.
-    pub fn finish(&mut self) -> ReasoningDelta {
+    fn finish(&mut self) -> ReasoningDelta {
         self.inner.finish()
     }
 }

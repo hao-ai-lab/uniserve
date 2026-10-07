@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use super::{Qwen3XmlToolParser, ToolParserOutput};
+use super::{ToolParser, ToolParserOutput};
 use crate::profile::tools::Tool;
 
 /// Builds a reusable set of function tools for parser unit tests and
@@ -92,7 +92,7 @@ pub fn test_tools() -> Vec<Tool> {
     clippy::unwrap_used,
     reason = "this assertion helper intentionally panics on parser failures"
 )]
-pub fn collect_stream(parser: &mut Qwen3XmlToolParser, chunks: &[&str]) -> ToolParserOutput {
+pub fn collect_stream(parser: &mut impl ToolParser, chunks: &[&str]) -> ToolParserOutput {
     let mut output = ToolParserOutput::default();
     for chunk in chunks {
         output.append(parser.parse_chunk(chunk).unwrap());
