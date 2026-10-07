@@ -3,10 +3,12 @@
 Numerical inputs are PyTrees of dataclasses, tuples, mappings and tensors.
 This module keys graph variants by an input's structure and tensor layouts
 (``input_signature``), gives captured graphs their own input backing
-(``clone_inputs``), and copies live inputs into that backing before each
-replay (``Inputs``). ``Execution`` is the base of every ``ModelRunner``: it
-owns the prepared ``ExecutionContext``, the graph buckets and the private
-allocation pools charged to the worker's ``GraphStorage``.
+(``clone_inputs``) or backing borrowed from the context's ``Scratch``
+(``stage_inputs`` and ``stage_outputs``), and copies live inputs into that
+backing before each replay (``Inputs``). ``Execution`` is the base of
+every ``ModelRunner``: it owns the prepared ``ExecutionContext``, the graph
+buckets and the private allocation pools charged to the worker's
+``GraphStorage``.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from torch.utils import _pytree as pytree
 
 from uniserve.runtime import CUDAGraph, ExecutionContext
 from uniserve.runtime.resources import close_resources
+from uniserve.tensors import BufferConfig
 from uniserve_worker.model_executor.graph_storage import GraphStorage
 
 
@@ -63,14 +66,16 @@ def map_tensors(value, transform):
     )
 
 
-def clone_inputs(value):
+def clone_inputs(value, staged=None):
     """Clone backing while preserving broadcasts and repeated references.
 
     A tensor with zero strides clones only one element along those axes and
     is expanded again, so the copy keeps the broadcast. A tensor reachable
     through several paths is cloned once and the clones stay aliased.
+    ``staged`` maps the ids of tensors already copied elsewhere to their
+    copies, which are used instead of new clones.
     """
-    copies = {}
+    copies = dict(staged or {})
 
     def clone(tensor):
         if id(tensor) not in copies:
@@ -82,6 +87,113 @@ def clone_inputs(value):
         return copies[id(tensor)]
 
     return map_tensors(value, clone)
+
+
+# Byte alignment of each tensor packed into a shared graph backing. It matches
+# the CUDA caching allocator's block alignment, so packed tensors keep the
+# alignment their own allocations would have.
+_ALIGNMENT = 512
+
+
+def _borrow_views(borrow, role, tensors):
+    """Borrow contiguous views shaped like ``tensors`` from ``role``'s backing.
+
+    ``borrow`` is ``ExecutionContext.scratch``. The tensors are packed at
+    aligned offsets of one byte buffer, so every caller of ``role`` views the
+    same leading bytes. Returns one view per tensor with unset contents, or
+    ``None`` when the tensors span several devices.
+    """
+    devices = {tensor.device for tensor in tensors}
+    if len(devices) != 1:
+        return None
+
+    offsets, end = [], 0
+    for tensor in tensors:
+        offsets.append(end)
+        nbytes = tensor.numel() * tensor.element_size()
+        end += -(-nbytes // _ALIGNMENT) * _ALIGNMENT
+    backing = borrow(
+        role, {"bytes": BufferConfig((end,), torch.uint8)}, devices.pop()
+    )["bytes"]
+
+    return tuple(
+        backing[offset : offset + tensor.numel() * tensor.element_size()]
+        .view(tensor.dtype)
+        .view(tensor.shape)
+        for offset, tensor in zip(offsets, tensors, strict=True)
+    )
+
+
+def stage_inputs(value, borrow):
+    """Copy ``value`` into borrowed graph-input backing, as ``clone_inputs``.
+
+    Graphs whose calls run one at a time on one stream, each replay's output
+    copied out before the next, need no distinct fixed inputs. Their tensors
+    view the leading bytes of one ``Scratch`` backing (``borrow`` is
+    ``ExecutionContext.scratch``), so the backing holds the largest call's
+    inputs rather than every graph's. A later, larger call borrows a new
+    backing while earlier graphs keep theirs (``Scratch.view``), so startup
+    prepares the largest call first (``ModelExecutor.prepare_module``).
+    Broadcast tensors keep their own one-element clones, and repeated
+    references stay aliased.
+    """
+    leaves, _ = pytree.tree_flatten(value, is_leaf=_register)
+    unique = {}
+    for item in leaves:
+        if isinstance(item, torch.Tensor) and 0 not in item.stride():
+            unique.setdefault(id(item), item)
+    if not unique:
+        return clone_inputs(value)
+
+    views = _borrow_views(borrow, ("graph", "inputs"), tuple(unique.values()))
+    if views is None:
+        return clone_inputs(value)
+    staged = dict(zip(unique, views, strict=True))
+    for key, view in staged.items():
+        view.copy_(unique[key])
+    return clone_inputs(value, staged)
+
+
+def stage_outputs(call, example, borrow):
+    """Wrap ``call`` to write its tensors into borrowed graph-output backing.
+
+    Under the conditions of ``stage_inputs``, the graphs' fixed outputs view
+    the leading bytes of one ``Scratch`` backing instead of each retaining
+    its own; the module's own result becomes a capture intermediate that the
+    shared pool reuses. ``example`` is an eager result of ``call`` fixing the
+    output structure and shapes; writing it warms the copies the wrapped call
+    captures. Returns ``call`` itself when it has no tensor outputs or they
+    span several devices.
+    """
+    leaves, spec = pytree.tree_flatten(example, is_leaf=_register)
+    tensors = tuple(item for item in leaves if isinstance(item, torch.Tensor))
+    if not tensors:
+        return call
+
+    views = _borrow_views(borrow, ("graph", "outputs"), tensors)
+    if views is None:
+        return call
+    for view, tensor in zip(views, tensors, strict=True):
+        view.copy_(tensor)
+
+    def write(inputs):
+        result, result_spec = pytree.tree_flatten(
+            call(inputs), is_leaf=_register
+        )
+        if result_spec != spec:
+            raise ValueError("graph output structure changed")
+
+        backing = iter(views)
+        written = []
+        for item in result:
+            if isinstance(item, torch.Tensor):
+                view = next(backing)
+                view.copy_(item)
+                item = view
+            written.append(item)
+        return pytree.tree_unflatten(written, spec)
+
+    return write
 
 
 def input_signature(value):

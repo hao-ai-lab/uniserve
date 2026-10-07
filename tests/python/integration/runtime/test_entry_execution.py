@@ -24,6 +24,7 @@ from uniserve_worker.errors import InputError
 from uniserve_worker.execution import media
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.component_binding import ComponentBinding
+from uniserve_worker.model_executor.cuda_graph import map_tensors
 from uniserve_worker.protocol.batch import (
     Batch,
     BufferAllocation,
@@ -617,3 +618,82 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         result = finalized_report(worker, worker.submit(run))
         assert result.completions[0].status is CallStatus.ERROR
         assert not result.products
+
+
+@pytest.mark.gpu
+def test_decoder_graphs_share_backing_and_match_eager_decoding():
+    """Every captured decoder size and window views one input and output.
+
+    Graphs captured largest first replay in any order and reproduce the
+    eager reconstruction exactly, so sharing their backing loses nothing.
+    """
+    device = "cuda:0"
+    components = (
+        (
+            "reconstruction",
+            ComponentConfig((0,), distribution="temporal_units"),
+        ),
+    )
+    model = DecodedModel().to(device)
+    graphs, eager = (
+        ModelExecutor(
+            model,
+            WorkerConfig(device=device, graph_policy=policy),
+            bindings=_encoder_bindings(model, components, device),
+        )
+        for policy in ("auto", "off")
+    )
+
+    def decode(runner, frames, window, source):
+        return runner.run_module(
+            "reconstruction",
+            (source,),
+            method="decode",
+            size=frames,
+            frames=(slice(4 * window, 4 * window + 4),),
+            num_frames=(frames,),
+        ).values[0]
+
+    calls = [
+        (frames, window)
+        for frames in (16, 8, 4)
+        for window in range(frames // 4)
+    ]
+    try:
+        generator = torch.Generator(device=device).manual_seed(0)
+
+        def source(frames):
+            return torch.randn(frames, 3, generator=generator, device=device)
+
+        # Startup captures every call, largest first.
+        for frames, window in calls:
+            decode(graphs, frames, window, source(frames))
+        entries = list(graphs._module_entries.values())
+        assert len(entries) == 3
+        captured = [
+            bucket.graphs[None]
+            for entry in entries
+            for bucket in entry.buckets.values()
+        ]
+        assert len(captured) == len(calls)
+        assert (
+            len({graph.inputs.tensors[0][1].data_ptr() for graph in captured})
+            == 1
+        )
+
+        # Replays in a different order match eager decoding bit for bit.
+        for frames, window in reversed(calls[1:] + calls[:1]):
+            value = source(frames)
+            replayed = decode(graphs, frames, window, value)
+            reference = decode(eager, frames, window, value)
+            torch.testing.assert_close(replayed, reference, rtol=0, atol=0)
+        outputs = set()
+        for graph in captured:
+            map_tensors(
+                graph.replay(),
+                lambda tensor: outputs.add(tensor.data_ptr()) or tensor,
+            )
+        assert len(outputs) == 1
+    finally:
+        graphs.close()
+        eager.close()
