@@ -317,6 +317,7 @@ class Encoder(nn.Module):
             or grids.shape[1] != 2
         ) or (
             grid_shapes is not None
+            and counts is not None
             and (
                 pixels.shape[0] != sum(counts)
                 or grids.shape[0] != len(counts)

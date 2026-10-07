@@ -204,7 +204,7 @@ class MoE(nn.Module):
         return self.experts(hidden, ids, weights, combine=False)
 
 
-class Layer(PhasedLayer):
+class Layer(PhasedLayer[torch.Tensor, torch.Tensor]):
     """One Gemma-4 layer with sandwich norms and a trailing layer scalar.
 
     With ``h = x + post_attention_norm(attention(input_norm(x)))`` the layer

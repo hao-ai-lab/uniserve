@@ -241,7 +241,7 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     def assign(reader):
         _check_layer_scalars(reader, config.text.num_hidden_layers)
         available = frozenset(reader.names())
-        result = []
+        result: list[weights.Assignment] = []
         for path, prefix in experts.items():
             module = modules.get(path)
             if module is None:

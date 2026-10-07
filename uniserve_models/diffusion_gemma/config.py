@@ -294,10 +294,11 @@ def _text(config: Mapping) -> TextConfig:
     # The checkpoint's sliding window counts the query itself; the visible
     # history is one token shorter.
     window = _positive_int(config.get("sliding_window"), "sliding_window") - 1
+    context = _positive_int(
+        config.get("max_position_embeddings"), "max_position_embeddings"
+    )
     rotaries = {
-        kind: _rotary(
-            rope.get(kind), kind, config.get("max_position_embeddings")
-        )
+        kind: _rotary(rope.get(kind), kind, context)
         for kind in ("sliding_attention", "full_attention")
     }
     layers = []
@@ -335,21 +336,29 @@ def _text(config: Mapping) -> TextConfig:
         raise ValueError("layer_types must cover every hidden layer")
 
     return TextConfig(
-        vocab_size=config.get("vocab_size"),
-        hidden_size=config.get("hidden_size"),
-        num_attention_heads=config.get("num_attention_heads"),
+        vocab_size=_positive_int(config.get("vocab_size"), "vocab_size"),
+        hidden_size=_positive_int(config.get("hidden_size"), "hidden_size"),
+        num_attention_heads=_positive_int(
+            config.get("num_attention_heads"), "num_attention_heads"
+        ),
         layers=tuple(layers),
-        intermediate_size=config.get("intermediate_size"),
-        num_experts=config.get("num_experts"),
-        top_k_experts=config.get("top_k_experts"),
-        moe_intermediate_size=config.get("moe_intermediate_size"),
+        intermediate_size=_positive_int(
+            config.get("intermediate_size"), "intermediate_size"
+        ),
+        num_experts=_positive_int(config.get("num_experts"), "num_experts"),
+        top_k_experts=_positive_int(
+            config.get("top_k_experts"), "top_k_experts"
+        ),
+        moe_intermediate_size=_positive_int(
+            config.get("moe_intermediate_size"), "moe_intermediate_size"
+        ),
         rms_norm_eps=_positive_float(
             config.get("rms_norm_eps"), "rms_norm_eps"
         ),
         final_logit_softcapping=_positive_float(
             config.get("final_logit_softcapping"), "final_logit_softcapping"
         ),
-        max_position_embeddings=config.get("max_position_embeddings"),
+        max_position_embeddings=context,
     )
 
 
@@ -369,14 +378,25 @@ def _vision(config: Mapping, soft_tokens: int) -> VisionConfig:
     if config.get("num_key_value_heads", heads) != heads:
         raise ValueError("DiffusionGemma vision attention is multi-head")
     return VisionConfig(
-        hidden_size=config.get("hidden_size"),
-        num_hidden_layers=config.get("num_hidden_layers"),
+        hidden_size=_positive_int(
+            config.get("hidden_size"), "vision hidden_size"
+        ),
+        num_hidden_layers=_positive_int(
+            config.get("num_hidden_layers"), "vision num_hidden_layers"
+        ),
         num_attention_heads=heads,
-        head_dim=config.get("head_dim"),
-        intermediate_size=config.get("intermediate_size"),
-        patch_size=config.get("patch_size"),
-        pooling_kernel_size=config.get("pooling_kernel_size"),
-        position_embedding_size=config.get("position_embedding_size"),
+        head_dim=_positive_int(config.get("head_dim"), "vision head_dim"),
+        intermediate_size=_positive_int(
+            config.get("intermediate_size"), "vision intermediate_size"
+        ),
+        patch_size=_positive_int(config.get("patch_size"), "vision patch_size"),
+        pooling_kernel_size=_positive_int(
+            config.get("pooling_kernel_size"), "vision pooling_kernel_size"
+        ),
+        position_embedding_size=_positive_int(
+            config.get("position_embedding_size"),
+            "vision position_embedding_size",
+        ),
         rope_theta=_positive_float(rope.get("rope_theta"), "vision rope_theta"),
         rms_norm_eps=_positive_float(
             config.get("rms_norm_eps"), "vision rms_norm_eps"

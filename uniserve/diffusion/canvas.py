@@ -199,13 +199,16 @@ class CanvasState:
         device: torch.device | str | None = None,
     ) -> CanvasState:
         """Allocate uninitialized state for ``rows`` canvas rows."""
-        long = {"dtype": torch.int64, "device": device}
+
+        def long(*shape: int) -> torch.Tensor:
+            return torch.empty(*shape, dtype=torch.int64, device=device)
+
         return cls(
-            seed=torch.empty(rows, **long),
-            block=torch.empty(rows, **long),
-            step=torch.empty(rows, **long),
-            canvas=torch.empty(rows, canvas_length, **long),
-            history=torch.empty(rows, stability, canvas_length, **long),
+            seed=long(rows),
+            block=long(rows),
+            step=long(rows),
+            canvas=long(rows, canvas_length),
+            history=long(rows, stability, canvas_length),
             self_conditioning=torch.empty(
                 rows * canvas_length, hidden_size, dtype=dtype, device=device
             ),

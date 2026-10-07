@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Generic, TypeVarTuple
 
 import torch
 from torch import nn
@@ -36,7 +37,12 @@ class CacheLayer:
     head_dim: int
 
 
-class PhasedLayer(nn.Module):
+# Types of the state a ``PhasedLayer`` carries from ``attend`` to
+# ``feed_forward``.
+StateT = TypeVarTuple("StateT")
+
+
+class PhasedLayer(nn.Module, Generic[*StateT]):
     """A decoder layer whose evaluation splits after its attention sublayer.
 
     ``forward(hidden, residual, positions, attention)`` equals
@@ -46,10 +52,12 @@ class PhasedLayer(nn.Module):
     tensors; ``feed_forward`` evaluates the rest of the layer from that
     state and returns its ``(hidden, residual)`` streams. The rest acts on
     each token alone, so ``feed_forward`` may evaluate any subset of the
-    state's rows. ``write_cache`` evaluates the layer only up to its K/V
-    cache write and returns nothing, for a pass whose only product is the
-    cache. ``TransformerDecoder`` uses these phases for its final layer; a
-    final layer without them runs whole.
+    state's rows. A subclass parameterizes the class by the types of its
+    state, which ``feed_forward`` receives as its positional arguments.
+    ``write_cache`` evaluates the layer only up to its K/V cache write and
+    returns nothing, for a pass whose only product is the cache.
+    ``TransformerDecoder`` uses these phases for its final layer; a final
+    layer without them runs whole.
     """
 
     def forward(self, hidden, residual, positions, attention):
@@ -58,12 +66,10 @@ class PhasedLayer(nn.Module):
             *self.attend(hidden, residual, positions, attention)
         )
 
-    def attend(
-        self, hidden, residual, positions, attention
-    ) -> tuple[torch.Tensor, ...]:
+    def attend(self, hidden, residual, positions, attention) -> tuple[*StateT]:
         raise NotImplementedError
 
-    def feed_forward(self, *state: torch.Tensor):
+    def feed_forward(self, *state: *StateT):
         raise NotImplementedError
 
     def write_cache(self, hidden, residual, positions, attention) -> None:
@@ -255,6 +261,9 @@ class TransformerDecoder(nn.Module):
         if final is not None:
             state = final.attend(hidden, residual, stream.positions, attention)
         else:
+            # An unrouted pass carries packed tensors.
+            assert isinstance(hidden, torch.Tensor)
+            assert residual is None or isinstance(residual, torch.Tensor)
             state = (hidden,) if residual is None else (hidden, residual)
         return tuple(stream.partition.gather(value) for value in state)
 
@@ -271,7 +280,7 @@ class TransformerDecoder(nn.Module):
         if self._pipeline.rank != self._pipeline.size - 1:
             raise ValueError("the output norm belongs to the final stage")
         selected = tuple(value.index_select(0, rows) for value in state)
-        layer = next(reversed(self.layers.values()))
+        layer = tuple(self.layers.values())[-1]
         if isinstance(layer, PhasedLayer):
             hidden, residual = layer.feed_forward(*selected)
         else:
@@ -343,7 +352,9 @@ class TransformerDecoder(nn.Module):
 
     def _phases(
         self, stream: _Stream
-    ) -> tuple[tuple[nn.Module, ...], PhasedLayer | None]:
+    ) -> tuple[
+        tuple[nn.Module, ...], PhasedLayer[*tuple[torch.Tensor, ...]] | None
+    ]:
         """Split off the final layer a partial pass evaluates in phases.
 
         An unrouted pass on the final pipeline stage leaves the model's
@@ -406,11 +417,11 @@ class TransformerDecoder(nn.Module):
         norm = self.norm
         assert norm is not None
         if residual is None:
-            result = (
-                hidden.apply(norm).packed(local_routes)
-                if isinstance(hidden, RoutedTensor)
-                else norm(hidden)
-            )
+            if isinstance(hidden, RoutedTensor):
+                assert isinstance(norm, nn.ModuleDict)
+                result = hidden.apply(norm).packed(local_routes)
+            else:
+                result = norm(hidden)
         elif isinstance(hidden, RoutedTensor):
             assert isinstance(residual, RoutedTensor)
             assert isinstance(norm, nn.ModuleDict)
