@@ -53,7 +53,7 @@ artifact_root = "artifacts/minimax_h3/measurements"
 
 # ------------------------------------------------------------------ UniServe
 # The serving options follow the FastH3 GB200 deployments in
-# docs/fast_h3/fast_h3.md. Each deployment is sized for the workloads it
+# docs/minimax_h3/minimax_h3.md. Each deployment is sized for the workloads it
 # serves: the text capacity holds the presented prompt (537 tokens for W1
 # and W2; 1935 text rows for W3; up to 6913 for W5), the duration bound the
 # longest target, and the condition capacity the rows the references pack.
@@ -324,7 +324,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.fast-h3-gb200-4.environment]
 NCCL_NVLS_ENABLE = "0"

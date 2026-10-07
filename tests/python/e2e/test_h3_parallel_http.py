@@ -188,7 +188,7 @@ def test_component_bindings_release_cancelled_requests(
     if not model_value or not Path(model_value).is_dir():
         pytest.fail(
             "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/fast_h3/fast_h3.md lists them"
+            "directory; docs/minimax_h3/minimax_h3.md lists them"
         )
     # A layout that holds the whole denoiser on one device cannot also hold a
     # 15-second activation working set: the single-device warmup exhausts a
@@ -514,7 +514,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     if not model or not Path(model).is_dir():
         pytest.fail(
             "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/fast_h3/fast_h3.md lists them"
+            "directory; docs/minimax_h3/minimax_h3.md lists them"
         )
     inference = json.loads(
         (Path(model) / "fastvideo_inference.json").read_text()
@@ -523,8 +523,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     deployment = (
         Path(__file__).resolve().parents[3]
         / "configs"
-        / "fast_h3"
-        / "ulysses4.json"
+        / "minimax_h3"
+        / "fasth3-ulysses4.json"
     )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
