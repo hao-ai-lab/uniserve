@@ -95,20 +95,27 @@ impl CUDAGraph {
                 .graph_streams(py)?
                 .bind(py)
                 .add(&computation)?;
-            (computation, py.None())
+            (computation, None)
         } else {
             (
                 stream.getattr("stream")?,
-                stream.getattr("_native")?.unbind(),
+                Some(stream.extract::<Py<CUDAStream>>()?),
             )
         };
 
         // PyTorch frees capture-stream workspaces at reset. A private sibling
         // prevents closing this graph from invalidating another graph's inputs.
-        let (capture_owner, capture_stream) = py
-            .import("uniserve.runtime.cuda")?
-            .call_method1("create_sibling_stream", (&computation, owner))?
-            .extract()?;
+        let capture_owner = match owner {
+            Some(owner) => owner.get().fork(py)?,
+            None => CUDAStream::sibling(
+                py,
+                device.getattr("index")?.extract()?,
+                computation.getattr("cuda_stream")?.extract()?,
+                2,
+            )?,
+        };
+        let capture_stream = capture_owner.stream(py);
+        let capture_owner = Py::new(py, capture_owner)?;
         Ok(Self {
             resources: Some(Resources {
                 context,

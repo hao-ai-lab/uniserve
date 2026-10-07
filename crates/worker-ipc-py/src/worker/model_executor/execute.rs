@@ -48,7 +48,7 @@ pub(super) fn run_batch<'py>(
     let stream = if runtime.is_none() {
         None
     } else {
-        Some(runtime.getattr("_native")?.cast_into::<CUDAStream>()?)
+        Some(runtime.cast::<CUDAStream>()?.clone())
     };
     let cuda = py.import("torch.cuda")?;
     let backend = py.import("uniserve_worker.execution.model_executor")?;
@@ -74,7 +74,7 @@ pub(super) fn run_batch<'py>(
                     let current = cuda.call_method1("current_stream", (&device,))?;
                     stream
                         .borrow()
-                        .wait(py, current.getattr("cuda_stream")?.extract()?)?;
+                        .wait_for(py, current.getattr("cuda_stream")?.extract()?)?;
                     cuda.call_method1("stream", (runtime.getattr("stream")?,))?
                 }
                 None => py.import("contextlib")?.call_method0("nullcontext")?,
@@ -176,7 +176,7 @@ fn record<'py>(
     let current = cuda.call_method1("current_stream", (device,))?;
     stream
         .borrow()
-        .record(py, current.getattr("cuda_stream")?.extract()?)?
+        .record_for(py, current.getattr("cuda_stream")?.extract()?)?
         .map(|event| Py::new(py, event))
         .transpose()
 }
