@@ -30,9 +30,9 @@ from uniserve.runtime.backends.attention import Backend
 from uniserve.runtime.backends.attention.flashinfer import (
     Config as FlashInferConfig,
 )
-from uniserve.runtime.execution import ExecutionContext
-from uniserve.runtime.prefix_cache import Planes
+from uniserve.runtime.prefix_cache import Planes, PrefixCache
 from uniserve.runtime.process_groups import ProcessGroups
+from uniserve.runtime.stream import CUDAStream as NumericalStream
 from uniserve.tensors import BufferConfig, OutputLayout
 from uniserve_worker.config.deployment import ComponentConfig, WorkerProcessArgs
 from uniserve_worker.execution.request import RequestResult
@@ -1142,6 +1142,100 @@ class Microbatches:
         self, calls: Sequence[Callable[[], Source]]
     ) -> list[Source]: ...
     def close(self) -> None: ...
+
+@final
+class TensorBuffers:
+    """Retain backing and peer mappings until numerical readers retire."""
+
+    def __init__(self) -> None: ...
+    @staticmethod
+    def from_tensors(tensors: Mapping[str, torch.Tensor]) -> TensorBuffers: ...
+    @staticmethod
+    def allocate(
+        configs: Mapping[str, BufferConfig],
+        *,
+        device: torch.device | str,
+        pin_storage: bool = False,
+        symmetric: Mapping[str, Communicator] | None = None,
+    ) -> TensorBuffers: ...
+    def backing(self, name: str) -> torch.Tensor: ...
+    def view(
+        self, configs: Mapping[str, BufferConfig]
+    ) -> Mapping[str, torch.Tensor]: ...
+    def peers(self, name: str) -> tuple[torch.Tensor, ...]: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(self, kind, error, traceback) -> None: ...
+
+@final
+class Scratch:
+    """Shared transient buffers for contexts serialized on one stream."""
+
+    def __init__(self) -> None: ...
+    def view(
+        self,
+        role: object,
+        requirements: Mapping[str, BufferConfig],
+        device: torch.device,
+    ) -> Mapping[str, torch.Tensor]: ...
+    def close(self) -> None: ...
+
+@final
+class ExecutionContext(Generic[Source]):
+    """Numerical bindings and buffers, independent of the model."""
+
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        *,
+        stream: NumericalStream | None = None,
+        cache: PrefixCache | None = None,
+        attention: Any = "auto",
+        vsa: Any = "auto",
+        matmul: Any = "auto",
+        moe: Any = "auto",
+        groups: Sequence[Communicator] | None = None,
+        scratch: Scratch | None = None,
+        derive_host_lengths: bool = True,
+        experts: Any = None,
+        weights: Any = None,
+    ) -> None: ...
+    @property
+    def module(self) -> torch.nn.Module | None: ...
+    @property
+    def stream(self) -> NumericalStream | None: ...
+    @property
+    def cache(self) -> PrefixCache | None: ...
+    @property
+    def experts(self) -> Any: ...
+    @property
+    def weights(self) -> Any: ...
+    @property
+    def constants(self) -> Mapping[str, torch.Tensor]: ...
+    @property
+    def workspace(self) -> Mapping[str, torch.Tensor]: ...
+    @property
+    def _device(self) -> torch.device: ...
+    def prepare(
+        self,
+        size: Source,
+        *,
+        constants: TensorBuffers | None = None,
+        workspace: TensorBuffers | None = None,
+    ) -> None: ...
+    def activate(self) -> AbstractContextManager[None]: ...
+    def scratch(
+        self,
+        role: object,
+        requirements: Mapping[str, BufferConfig],
+        device: torch.device,
+    ) -> Mapping[str, torch.Tensor]: ...
+    def bind_attention(self, batch: Any, *, replay: bool = False) -> None: ...
+    def join_expert_layers(self) -> None: ...
+    def kernels(self) -> list[dict[str, object]]: ...
+    def close(self, *, aborted: bool = False) -> None: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(self, kind, error, traceback) -> None: ...
 
 def graph_storage_budget_bytes(total_device_bytes: int) -> int: ...
 

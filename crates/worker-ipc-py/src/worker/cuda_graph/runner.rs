@@ -3,8 +3,8 @@
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 
-use super::super::host::with_context;
 use super::CUDAGraph;
+use crate::worker::execution_context::ExecutionContext;
 
 /// A graph executable and the tensor correspondence used to update its inputs.
 /// Python's Inputs performs tensor copies; this owner controls its lifetime.
@@ -25,7 +25,7 @@ impl CUDAGraphRunner {
     #[allow(clippy::too_many_arguments)]
     fn capture(
         py: Python<'_>,
-        context: Py<PyAny>,
+        context: Py<ExecutionContext>,
         inputs: Py<PyAny>,
         call: Py<PyAny>,
         pools: Option<&Bound<'_, PyAny>>,
@@ -34,7 +34,7 @@ impl CUDAGraphRunner {
         warmup: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         if warm {
-            with_context(&context.bind(py).call_method0("activate")?, || {
+            ExecutionContext::with_active(context.bind(py), || {
                 let result = warmup.as_ref().unwrap_or(&call).call1(py, (&inputs,));
                 if let Some(restore) = &restore {
                     restore.call0(py)?;
@@ -77,7 +77,7 @@ impl CUDAGraphRunner {
     ) -> PyResult<Py<PyAny>> {
         let executable = self.executable.borrow(py);
         let context = executable.context(py)?;
-        with_context(&context.bind(py).call_method0("activate")?, || {
+        ExecutionContext::with_active(context.bind(py), || {
             if let Some(live) = live {
                 self.inputs.call_method1(py, "copy", (live,))?;
             }

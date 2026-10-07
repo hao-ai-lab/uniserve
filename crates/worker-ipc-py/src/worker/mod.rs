@@ -13,6 +13,7 @@ mod descriptor_grants;
 pub(crate) mod error;
 mod events;
 mod execution;
+mod execution_context;
 mod executor;
 mod expert_exchange;
 mod exports;
@@ -40,6 +41,7 @@ mod sampling;
 mod shared_buffer;
 mod storage;
 mod stream;
+mod tensor_buffers;
 mod transfer;
 mod transport;
 mod vmm_pool;
@@ -95,6 +97,9 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "CUDAGraphError",
         module.py().get_type::<cuda_graph::CUDAGraphError>(),
     )?;
+    module.add_class::<execution_context::ExecutionContext>()?;
+    module.add_class::<tensor_buffers::Scratch>()?;
+    module.add_class::<tensor_buffers::TensorBuffers>()?;
     module.add_class::<execution::Execution>()?;
     module.add_class::<execution::GraphBucket>()?;
     module.add_class::<execution::JoinGraphs>()?;

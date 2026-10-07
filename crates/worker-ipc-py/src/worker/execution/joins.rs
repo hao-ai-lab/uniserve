@@ -8,9 +8,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyFrozenSet;
 
 use crate::worker::cuda_graph::CUDAGraph;
+use crate::worker::execution_context::ExecutionContext;
 
 use super::{GraphBucket, close_all};
-use crate::worker::host::with_context;
 
 /// All ranks warm and capture the same capacities, largest first. Graphs
 /// borrow the supplied numerical context and retire before that context.
@@ -26,7 +26,7 @@ impl JoinGraphs {
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
-        context: &Bound<'_, PyAny>,
+        context: &Bound<'_, ExecutionContext>,
         exchange: &Bound<'_, PyAny>,
         capacities: &Bound<'_, PyAny>,
         pools: Option<&Bound<'_, PyAny>>,
@@ -45,7 +45,7 @@ impl JoinGraphs {
             for capacity in capacities.into_iter().rev() {
                 let call = partial.call1((&join, context, exchange, capacity, step))?;
                 if warm {
-                    with_context(&context.call_method0("activate")?, || call.call0())?;
+                    ExecutionContext::with_active(context, || call.call0())?;
                 }
                 let graph = Py::new(py, CUDAGraph::new(py, context.clone().unbind(), pools)?)?;
                 graphs
@@ -65,7 +65,7 @@ impl JoinGraphs {
     /// A capture callback borrows its arguments only for the numerical call.
     #[staticmethod]
     fn _join(
-        context: &Bound<'_, PyAny>,
+        context: &Bound<'_, ExecutionContext>,
         exchange: &Bound<'_, PyAny>,
         capacity: usize,
         step: Option<&Bound<'_, PyAny>>,
