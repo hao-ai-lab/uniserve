@@ -1,0 +1,1185 @@
+# MiniMax-H3 on NVIDIA GB200 GPUs: the UniServe deployments of the base
+# checkpoint's two denoisers, of the FastH3 OmniRef export and of FastH3
+# 8-Step V2, and the SGLang, vLLM-Omni and FastVideo baselines, on the
+# performance workloads W1 to W5. FastH3 8-Step V2's own workload (W6) is
+# measured by uniserve_eval/fast_h3.toml.
+#
+# Environment:
+# - UNISERVE_MINIMAX_H3_MODEL names a local copy of MiniMaxAI/MiniMax-H3 at
+#   revision 42ed227ee7df40d41602854ae760620d6eb651fe.
+# - UNISERVE_MINIMAX_H3_INPUTS names the protocol inputs directory, whose
+#   media/ holds the condition media the W3, W4 and W5 rows name.
+# - UNISERVE_MINIMAX_H3_OMNIREF names FastVideo/FastH3-OmniRef-DMPDD8-step1900
+#   and UNISERVE_MINIMAX_H3_OMNIREF_BASE a local copy of the MiniMax-H3
+#   revision it pins (9bfb6693f2cf6de171db46d1aa586f67d773a1da).
+# - UNISERVE_FAST_H3_MODEL names a local copy of
+#   FastVideo/FastVideo-FastH3-8-Step-V2, as in uniserve_eval/fast_h3.toml.
+# - UNISERVE_MINIMAX_H3_FFMPEG names the bin directory of the FFmpeg 8.1.2
+#   build whose ffprobe probes condition media and whose ffmpeg decodes
+#   reference videos for UniServe.
+#
+# Workloads (uniserve_eval/workloads/minimax_h3/), each a t2va, fl2va or
+# ref2va request at the 768-pixel short edge:
+# - W1: the official t2va prompt (537 prompt tokens), 16:9 (1344x768), 5 s
+#   (124 frames).
+# - W2: the same prompt, 16:9, 15 s (362 frames).
+# - W3: the official fl2va request: its first keyframe and prompt, auto
+#   canvas (the 16:9 keyframe resolves 1344x768), 8 s (192 frames).
+# - W4: a ref2va image reference (2560x1440) and the official audio
+#   reference, auto canvas (16:9), 5 s.
+# - W5: the official ref2va request: its reference video, whose soundtrack
+#   conditions too, and its audio reference, auto canvas (16:9), 5 s.
+# The base checkpoint's schedule is 50 sigma points (49 denoiser
+# evaluations) with video shift 12 and audio shift 3; OmniRef's is 9 points,
+# its 8 fused-block forwards, with the same shifts. Every base and OmniRef
+# point states its schedule: UniServe refuses one other than its
+# checkpoint's, and the baselines run the schedule they are sent. FastH3
+# points state none and run the checkpoint's own.
+#
+# A point first sends its one warmup row (seed 42), which is not measured,
+# then its measured rows one at a time, each with its own seed from 0: four
+# for W2 (15 s) and eight for every other workload. Rows repeat their
+# workload's prompt and media. Each suite covers one system and deployment
+# on one hardware configuration; run points serially, one server at a time.
+# A server is ready when its /health answers 200, which is when SGLang has
+# also finished its startup warmup; startup time is measured to that point.
+#
+# The gb200-8 deployment spans two four-GPU hosts, rank-0 and rank-1. The
+# evaluator starts the head on rank-0; when it logs "awaiting a launcher" with
+# its listening port, start `.venv/bin/uniserve-host --head <rank-0
+# address>:<port> --host-identity rank-1` on rank-1.
+root = ".."
+artifact_root = "artifacts/minimax_h3/measurements"
+
+# ------------------------------------------------------------------ UniServe
+# The serving options follow the FastH3 GB200 deployments in
+# docs/fast_h3/fast_h3.md. Each deployment is sized for the workloads it
+# serves: the text capacity holds the presented prompt (537 tokens for W1
+# and W2; 1935 text rows for W3; up to 6913 for W5), the duration bound the
+# longest target, and the condition capacity the rows the references pack.
+
+# Base FL2VA (the diffusers root's denoiser) for t2va: the full 15-second
+# range and one 1024-token text capacity.
+[servers.gb200-4]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[servers.gb200-4.environment]
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.gb200-4-w1]
+server = "gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-w1.video]
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 5.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+[benchmarks.gb200-4-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-w2]
+server = "gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-w2.video]
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 15.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+[benchmarks.gb200-4-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# Base FL2VA for the official first-frame request: 8 seconds and a
+# 2048-token text capacity. The keyframe takes 1008 condition rows, within
+# the default condition capacity of two keyframes.
+[servers.gb200-4-keyframe]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "2048", "--video-text-capacities", "2048", "--max-video-seconds", "8", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[servers.gb200-4-keyframe.environment]
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.gb200-4-w3]
+server = "gb200-4-keyframe"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w3.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-w3.video]
+task = "fl2va"
+aspect_ratio = "auto"
+seconds = 8.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-w3.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
+
+[benchmarks.gb200-4-w3.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# Base Ref2VA (the diffusers root's reference_denoiser): 5 seconds, an
+# 8192-token text capacity and 40,960 condition rows, which hold W5's
+# reference video, its soundtrack and the audio reference (about 38,000
+# rows packed densely).
+[servers.gb200-4-reference]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "40960", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[servers.gb200-4-reference.environment]
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.gb200-4-reference-w4]
+server = "gb200-4-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-reference-w4.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-reference-w4.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
+
+[benchmarks.gb200-4-reference-w4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-reference-w5]
+server = "gb200-4-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-reference-w5.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-reference-w5.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
+
+[benchmarks.gb200-4-reference-w5.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# FastH3 OmniRef on the same deployment file: the export's reference DiT
+# with the other components of its pinned base. Its region-sparse attention
+# packs each condition into whole 128-row tiles, so W5 takes 47,104
+# condition rows there; the capacity is 49,152.
+[servers.gb200-4-omniref]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--base-model", "${UNISERVE_MINIMAX_H3_OMNIREF_BASE}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "49152", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[servers.gb200-4-omniref.environment]
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.gb200-4-omniref-w4]
+server = "gb200-4-omniref"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w4.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w4.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
+
+[benchmarks.gb200-4-omniref-w4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w5]
+server = "gb200-4-omniref"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w5.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w5.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
+
+[benchmarks.gb200-4-omniref-w5.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# FastH3 8-Step V2 (UNISERVE_FAST_H3_MODEL, a local copy of
+# FastVideo/FastVideo-FastH3-8-Step-V2) on W1 and W2, with the deployment and
+# options of uniserve_eval/fast_h3.toml's gb200-4-bf16 server, which measures
+# its own workload (W6). The requests state no schedule: the server serves
+# the checkpoint's, 9 sigma points (8 DMD forwards) with shifts 10 and 3.
+[servers.fast-h3-gb200-4]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/fast_h3/ulysses4.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[servers.fast-h3-gb200-4.environment]
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.fast-h3-gb200-4-w1]
+server = "fast-h3-gb200-4"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.fast-h3-gb200-4-w1.video]
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 5.0
+
+[benchmarks.fast-h3-gb200-4-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+[benchmarks.fast-h3-gb200-4-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.fast-h3-gb200-4-w2]
+server = "fast-h3-gb200-4"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.fast-h3-gb200-4-w2.video]
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 15.0
+
+[benchmarks.fast-h3-gb200-4-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+[benchmarks.fast-h3-gb200-4-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# Base FL2VA for t2va on two hosts.
+[servers.gb200-8]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "1024", "--video-text-capacities", "1024", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[servers.gb200-8.environment]
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.gb200-8-w1]
+server = "gb200-8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-w1.video]
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 5.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+[benchmarks.gb200-8-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-w2]
+server = "gb200-8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-w2.video]
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 15.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+[benchmarks.gb200-8-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# ----------------------------------------------------------------- Baselines
+# Baselines on one four-GPU GB200 host. UNISERVE_MINIMAX_H3_SGLANG,
+# UNISERVE_MINIMAX_H3_VLLM_OMNI and UNISERVE_MINIMAX_H3_FASTVIDEO name the
+# virtual environments of SGLang at ef867fa40d, vLLM-Omni at bbee488da (with
+# vLLM 0.30.0) and FastVideo at 8c94e4e (feat/fasth3-omniref-pdd-inference).
+# SGLang and vLLM-Omni load the checkpoint's native FL2VA or Ref2VA partition
+# of the same revision, the release's own layout of the model UniServe loads
+# from the root diffusers components, and hold only that denoiser.
+#
+# Their requests carry the same work as UniServe's: the prompt, the
+# condition media files, the canvas, the frame count, the schedule (vLLM-Omni
+# counts its 49 intervals, FastVideo OmniRef its 8 fused blocks), the shifts
+# and the seed. SGLang reads the media from the same file:// URIs, vLLM-Omni
+# receives the files as uploaded request parts, and FastVideo by their local
+# paths. None runs a lossy path: no step cache, no sparse or quantized
+# attention beyond OmniRef's trained sparsity, no FP8.
+#
+# Disclosed differences that remain:
+# - Noise: SGLang and vLLM-Omni draw the audio noise, and each condition's
+#   noise, from generators reseeded with the request seed rather than
+#   continuing one generator, so a seed gives a different sample than
+#   UniServe's, at the same cost.
+# - MP4 encoders: UniServe libx264 ultrafast; SGLang preset fast at CRF 25, a
+#   preset its source fixes; vLLM-Omni ultrafast at CRF 18; FastVideo
+#   ultrafast at x264's default CRF.
+# - Reference images: vLLM-Omni encodes a reference image at its own size
+#   rounded to 32 pixels (W4: 2560x1440, 3600 condition rows) where the
+#   others scale its short edge to 2048 (3648x2048, 7296 rows), so its W4
+#   conditioning is smaller.
+# - Soundtracks: SGLang and vLLM-Omni extract a reference video's soundtrack
+#   at 44.1 kHz before resampling it to 32 kHz; UniServe and FastVideo
+#   resample the native rate once.
+# - Readiness: vLLM-Omni compiles its DiT regions on the first request, which
+#   the warmup row covers, so its startup time excludes compilation.
+
+# SGLang follows its cookbook's GB200 recipe: Ulysses 4 with every component
+# resident (performance mode speed), the Qwen3-VL text encoder folded across
+# the four ranks, platform attention (cuDNN SDPA for the dense packed
+# attention) and eager execution. Its cross-request conditioning cache, which
+# keeps Qwen3-VL outputs of the text and the reference images and videos, is
+# disabled: every measured row repeats its workload's prompt and media, and
+# UniServe encodes each request's conditions. Requests state quality=lossless,
+# which also keeps an environment-enabled Cache-DiT policy off. SGLang has no
+# synchronous video route, so the evaluator polls the job and fetches the MP4
+# that the server writes to its output directory; the output and upload
+# directories are on the host's local disk rather than in this tree.
+[servers.sglang-gb200-4]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = ["${UNISERVE_MINIMAX_H3_SGLANG}/bin/sglang", "serve", "--model-path", "${UNISERVE_MINIMAX_H3_MODEL}", "--model-variant", "fl2va", "--num-gpus", "4", "--ulysses-degree", "4", "--performance-mode", "speed", "--disable-conditioning-cache", "--output-path", "/tmp/sglang-minimax-h3/outputs", "--input-save-path", "/tmp/sglang-minimax-h3/inputs", "--host", "127.0.0.1", "--port", "18083"]
+
+# The H3 pipeline requires ffmpeg and ffprobe on PATH; the environment's bin
+# directory provides the Ubuntu 24.04 package that SGLang's image installs.
+# Importing the Qwen3-VL encoder imports DeepEP, which H3 never runs; its
+# import-time check counts the host's NCCL network plugin as a second NCCL
+# runtime, so EP_SUPPRESS_NCCL_CHECK skips that check.
+[servers.sglang-gb200-4.environment]
+CUDA_HOME = "/usr/local/cuda"
+PATH = "${UNISERVE_MINIMAX_H3_SGLANG}/bin:/usr/local/cuda/bin:${PATH}"
+SGLANG_RUST_BUILD_MODE = "never"
+EP_SUPPRESS_NCCL_CHECK = "1"
+
+[benchmarks.sglang-gb200-4-w1]
+server = "sglang-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos"
+
+[benchmarks.sglang-gb200-4-w1.video]
+backend = "sglang"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 5.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+[benchmarks.sglang-gb200-4-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+[benchmarks.sglang-gb200-4-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.sglang-gb200-4-w2]
+server = "sglang-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos"
+
+[benchmarks.sglang-gb200-4-w2.video]
+backend = "sglang"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 15.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+[benchmarks.sglang-gb200-4-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+[benchmarks.sglang-gb200-4-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.sglang-gb200-4-w3]
+server = "sglang-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w3.jsonl"
+endpoint = "/v1/videos"
+
+[benchmarks.sglang-gb200-4-w3.video]
+backend = "sglang"
+task = "fl2va"
+aspect_ratio = "auto"
+seconds = 8.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+[benchmarks.sglang-gb200-4-w3.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
+
+[benchmarks.sglang-gb200-4-w3.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# SGLang's Ref2VA partition with the same recipe (--model-variant ref2va).
+# The recipe's platform attention (cuDNN SDPA) measured 65.12 s for W4 and
+# 132.41 s for W5 against 65.49 s and 132.79 s with FlashAttention-4
+# (--attention-backend fa; exploratory, two requests each).
+[servers.sglang-gb200-4-reference]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = ["${UNISERVE_MINIMAX_H3_SGLANG}/bin/sglang", "serve", "--model-path", "${UNISERVE_MINIMAX_H3_MODEL}", "--model-variant", "ref2va", "--num-gpus", "4", "--ulysses-degree", "4", "--performance-mode", "speed", "--disable-conditioning-cache", "--output-path", "/tmp/sglang-minimax-h3/outputs", "--input-save-path", "/tmp/sglang-minimax-h3/inputs", "--host", "127.0.0.1", "--port", "18083"]
+
+[servers.sglang-gb200-4-reference.environment]
+CUDA_HOME = "/usr/local/cuda"
+PATH = "${UNISERVE_MINIMAX_H3_SGLANG}/bin:/usr/local/cuda/bin:${PATH}"
+SGLANG_RUST_BUILD_MODE = "never"
+EP_SUPPRESS_NCCL_CHECK = "1"
+
+[benchmarks.sglang-gb200-4-reference-w4]
+server = "sglang-gb200-4-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
+endpoint = "/v1/videos"
+
+[benchmarks.sglang-gb200-4-reference-w4.video]
+backend = "sglang"
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+[benchmarks.sglang-gb200-4-reference-w4.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
+
+[benchmarks.sglang-gb200-4-reference-w4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.sglang-gb200-4-reference-w5]
+server = "sglang-gb200-4-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
+endpoint = "/v1/videos"
+
+[benchmarks.sglang-gb200-4-reference-w5.video]
+backend = "sglang"
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+[benchmarks.sglang-gb200-4-reference-w5.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
+
+[benchmarks.sglang-gb200-4-reference-w5.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# vLLM-Omni follows its four-GPU recipe: Ulysses 4, ring 1, VAE patch
+# parallelism 4 in the native tile mode, regional torch.compile of the DiT
+# blocks, and the default dense BF16 TRTLLM_ATTN attention. Serving the FL2VA
+# partition directory loads only the FL2VA denoiser, which serves t2va and
+# fl2va, where the recipe's combined service would also hold the Ref2VA one.
+# The server compiles on its first request, which the warmup request covers.
+# --cache-backend none keeps an environment-selected cache backend off, the
+# synchronous route's timeout matches the request timeout, and
+# NCCL_NVLS_ENABLE=0 matches the UniServe deployments and SGLang's default.
+[servers.vllm-omni-gb200-4]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = ["${UNISERVE_MINIMAX_H3_VLLM_OMNI}/bin/vllm", "serve", "${UNISERVE_MINIMAX_H3_MODEL}/FL2VA", "--omni", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--trust-remote-code", "--task-type", "fl2va", "--num-gpus", "4", "--usp", "4", "--ring", "1", "--vae-patch-parallel-size", "4", "--vae-parallel-mode", "tile", "--vae-use-tiling", "--cache-backend", "none"]
+
+# The environment's bin directory provides the ffmpeg and ffprobe the server
+# requires, and opt/x11-lib the X11 and GL client libraries (from the same
+# Ubuntu 24.04 packages) that its opencv-python build loads. Without them the
+# server's OpenCV import fails and leaves OpenCV's package directory on
+# sys.path; the spawned workers inherit it, resolve the standard typing module
+# into OpenCV, and exit before loading the model.
+[servers.vllm-omni-gb200-4.environment]
+PATH = "${UNISERVE_MINIMAX_H3_VLLM_OMNI}/bin:${PATH}"
+LD_LIBRARY_PATH = "${UNISERVE_MINIMAX_H3_VLLM_OMNI}/opt/x11-lib"
+VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT = "3600"
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.vllm-omni-gb200-4-w1]
+server = "vllm-omni-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.vllm-omni-gb200-4-w1.video]
+backend = "vllm-omni"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 5.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.vllm-omni-gb200-4-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+[benchmarks.vllm-omni-gb200-4-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.vllm-omni-gb200-4-w2]
+server = "vllm-omni-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.vllm-omni-gb200-4-w2.video]
+backend = "vllm-omni"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 15.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.vllm-omni-gb200-4-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+[benchmarks.vllm-omni-gb200-4-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.vllm-omni-gb200-4-w3]
+server = "vllm-omni-gb200-4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w3.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.vllm-omni-gb200-4-w3.video]
+backend = "vllm-omni"
+task = "fl2va"
+aspect_ratio = "auto"
+seconds = 8.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.vllm-omni-gb200-4-w3.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
+
+[benchmarks.vllm-omni-gb200-4-w3.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# vLLM-Omni's Ref2VA partition directory; it serves ref2va only. The recipe
+# with the text encoder sharded over the four ranks (--text-encoder-tp-size 4)
+# measured lowest on 4xGB200: 52.48 s for W4 and 138.55 s for W5 against the
+# recipe's 52.65 s and 138.95 s (exploratory, two requests each; the
+# difference is within the run-to-run spread on W5).
+[servers.vllm-omni-gb200-4-reference]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = ["${UNISERVE_MINIMAX_H3_VLLM_OMNI}/bin/vllm", "serve", "${UNISERVE_MINIMAX_H3_MODEL}/Ref2VA", "--omni", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--trust-remote-code", "--task-type", "ref2va", "--num-gpus", "4", "--usp", "4", "--ring", "1", "--vae-patch-parallel-size", "4", "--vae-parallel-mode", "tile", "--vae-use-tiling", "--cache-backend", "none", "--text-encoder-tp-size", "4"]
+
+[servers.vllm-omni-gb200-4-reference.environment]
+PATH = "${UNISERVE_MINIMAX_H3_VLLM_OMNI}/bin:${PATH}"
+LD_LIBRARY_PATH = "${UNISERVE_MINIMAX_H3_VLLM_OMNI}/opt/x11-lib"
+VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT = "3600"
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.vllm-omni-gb200-4-reference-w4]
+server = "vllm-omni-gb200-4-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.vllm-omni-gb200-4-reference-w4.video]
+backend = "vllm-omni"
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.vllm-omni-gb200-4-reference-w4.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
+
+[benchmarks.vllm-omni-gb200-4-reference-w4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.vllm-omni-gb200-4-reference-w5]
+server = "vllm-omni-gb200-4-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.vllm-omni-gb200-4-reference-w5.video]
+backend = "vllm-omni"
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.vllm-omni-gb200-4-reference-w5.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
+
+[benchmarks.vllm-omni-gb200-4-reference-w5.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# FastVideo, the only reference implementation of OmniRef, serves it with
+# its OpenAI-compatible server and uniserve_eval/servers/minimax_h3/
+# fastvideo-omniref.yaml. UNISERVE_MINIMAX_H3_FASTVIDEO_OMNIREF names the
+# model directory that composes the export with its pinned base, as
+# FastVideo's OmniRef example does. FastVideo presents references in type
+# order (images, videos, audio), which W4 and W5 already follow; it rejects a
+# reference start offset, which neither uses. Its HTTP route serves one
+# generation at a time. HF_HUB_OFFLINE keeps every component local, and the
+# environment's bin directory provides the ffmpeg its MP4 encoder pipes to.
+[servers.fastvideo-gb200-4-omniref]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = ["${UNISERVE_MINIMAX_H3_FASTVIDEO}/bin/fastvideo", "serve", "--config", "uniserve_eval/servers/minimax_h3/fastvideo-omniref.yaml", "--generator.model_path", "${UNISERVE_MINIMAX_H3_FASTVIDEO_OMNIREF}"]
+
+[servers.fastvideo-gb200-4-omniref.environment]
+PATH = "${UNISERVE_MINIMAX_H3_FASTVIDEO}/bin:${PATH}"
+HF_HUB_OFFLINE = "1"
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.fastvideo-gb200-4-omniref-w4]
+server = "fastvideo-gb200-4-omniref"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.fastvideo-gb200-4-omniref-w4.video]
+backend = "fastvideo"
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+parallel_decoding = true
+
+[benchmarks.fastvideo-gb200-4-omniref-w4.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
+
+[benchmarks.fastvideo-gb200-4-omniref-w4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.fastvideo-gb200-4-omniref-w5]
+server = "fastvideo-gb200-4-omniref"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.fastvideo-gb200-4-omniref-w5.video]
+backend = "fastvideo"
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+parallel_decoding = true
+
+[benchmarks.fastvideo-gb200-4-omniref-w5.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
+
+[benchmarks.fastvideo-gb200-4-omniref-w5.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# The two-host keyframe deployment: W3's options on ulysses8-two-node.json.
+# Start uniserve-host on rank-1 for its server as for gb200-8.
+[servers.gb200-8-keyframe]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "2048", "--video-text-capacities", "2048", "--max-video-seconds", "8", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--graph-policy", "off", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+
+[servers.gb200-8-keyframe.environment]
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.gb200-8-w3]
+server = "gb200-8-keyframe"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w3.jsonl"
+endpoint = "/v1/videos/sync"
+
+
+[benchmarks.gb200-8-w3.video]
+task = "fl2va"
+aspect_ratio = "auto"
+seconds = 8.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+
+[benchmarks.gb200-8-w3.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
+
+
+[benchmarks.gb200-8-w3.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# Base Ref2VA (the diffusers root's reference_denoiser): 5 seconds, an
+# 8192-token text capacity and 40,960 condition rows, which hold W5's
+# reference video, its soundtrack and the audio reference (about 38,000
+# rows packed densely).
+
+# SGLang across rank-0 and rank-1: its cookbook's GB200 2x4 recipe, Ulysses 4
+# within a host and ring attention of degree 2 across the hosts, resident
+# components, the text encoder replicated across the nodes; ring attention
+# selects FlashAttention. The evaluator starts node rank 0 on rank-0, whose
+# address UNISERVE_MINIMAX_H3_HEAD_ADDRESS names; start node rank 1 on
+# rank-1 with the same command and --node-rank 1 for each server start, and
+# stop it once the head exits.
+[servers.sglang-gb200-8]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = ["${UNISERVE_MINIMAX_H3_SGLANG}/bin/sglang", "serve", "--model-path", "${UNISERVE_MINIMAX_H3_MODEL}", "--model-variant", "fl2va", "--num-gpus", "8", "--sp-degree", "8", "--ulysses-degree", "4", "--ring-degree", "2", "--nnodes", "2", "--node-rank", "0", "--dist-init-addr", "${UNISERVE_MINIMAX_H3_HEAD_ADDRESS}:20000", "--encoder-parallel", "replicate", "--performance-mode", "speed", "--disable-conditioning-cache", "--output-path", "/tmp/sglang-minimax-h3/outputs", "--input-save-path", "/tmp/sglang-minimax-h3/inputs", "--host", "127.0.0.1", "--port", "18083"]
+
+# The H3 pipeline requires ffmpeg and ffprobe on PATH; the environment's bin
+# directory provides the Ubuntu 24.04 package that SGLang's image installs.
+# Importing the Qwen3-VL encoder imports DeepEP, which H3 never runs; its
+# import-time check counts the host's NCCL network plugin as a second NCCL
+# runtime, so EP_SUPPRESS_NCCL_CHECK skips that check.
+
+[servers.sglang-gb200-8.environment]
+CUDA_HOME = "/usr/local/cuda"
+PATH = "${UNISERVE_MINIMAX_H3_SGLANG}/bin:/usr/local/cuda/bin:${PATH}"
+SGLANG_RUST_BUILD_MODE = "never"
+EP_SUPPRESS_NCCL_CHECK = "1"
+
+
+[benchmarks.sglang-gb200-8-w1]
+server = "sglang-gb200-8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
+endpoint = "/v1/videos"
+
+
+[benchmarks.sglang-gb200-8-w1.video]
+backend = "sglang"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 5.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+
+[benchmarks.sglang-gb200-8-w1.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
+
+
+[benchmarks.sglang-gb200-8-w1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+
+[benchmarks.sglang-gb200-8-w2]
+server = "sglang-gb200-8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
+endpoint = "/v1/videos"
+
+
+[benchmarks.sglang-gb200-8-w2.video]
+backend = "sglang"
+task = "t2va"
+aspect_ratio = "16:9"
+seconds = 15.0
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+
+[benchmarks.sglang-gb200-8-w2.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
+
+
+[benchmarks.sglang-gb200-8-w2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+
+[benchmarks.sglang-gb200-8-w3]
+server = "sglang-gb200-8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w3.jsonl"
+endpoint = "/v1/videos"
+
+
+[benchmarks.sglang-gb200-8-w3.video]
+backend = "sglang"
+task = "fl2va"
+aspect_ratio = "auto"
+seconds = 8.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 50
+flow_shift = 12.0
+audio_flow_shift = 3.0
+extra_params = { quality = "lossless" }
+
+
+[benchmarks.sglang-gb200-8-w3.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
+
+
+[benchmarks.sglang-gb200-8-w3.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# SGLang's Ref2VA partition with the same recipe (--model-variant ref2va).
+# The recipe's platform attention (cuDNN SDPA) measured 65.12 s for W4 and
+# 132.41 s for W5 against 65.49 s and 132.79 s with FlashAttention-4
+# (--attention-backend fa; exploratory, two requests each).
+
+[suites.gb200-4]
+points = ["gb200-4-w1", "gb200-4-w2", "gb200-4-w3"]
+
+[suites.gb200-4-reference]
+points = ["gb200-4-reference-w4", "gb200-4-reference-w5"]
+
+[suites.gb200-4-omniref]
+points = ["gb200-4-omniref-w4", "gb200-4-omniref-w5"]
+
+[suites.fast-h3-gb200-4]
+points = ["fast-h3-gb200-4-w1", "fast-h3-gb200-4-w2"]
+
+[suites.gb200-8]
+points = ["gb200-8-w1", "gb200-8-w2", "gb200-8-w3"]
+
+[suites.sglang-gb200-4]
+points = ["sglang-gb200-4-w1", "sglang-gb200-4-w2", "sglang-gb200-4-w3"]
+
+[suites.sglang-gb200-4-reference]
+points = ["sglang-gb200-4-reference-w4", "sglang-gb200-4-reference-w5"]
+
+[suites.vllm-omni-gb200-4]
+points = ["vllm-omni-gb200-4-w1", "vllm-omni-gb200-4-w2", "vllm-omni-gb200-4-w3"]
+
+[suites.vllm-omni-gb200-4-reference]
+points = ["vllm-omni-gb200-4-reference-w4", "vllm-omni-gb200-4-reference-w5"]
+
+[suites.fastvideo-gb200-4-omniref]
+points = ["fastvideo-gb200-4-omniref-w4", "fastvideo-gb200-4-omniref-w5"]
+
+[suites.sglang-gb200-8]
+points = ["sglang-gb200-8-w1", "sglang-gb200-8-w2", "sglang-gb200-8-w3"]
