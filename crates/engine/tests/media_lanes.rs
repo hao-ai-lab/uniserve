@@ -155,8 +155,15 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
     sim
 }
 
-/// A video request decoded in `video_units` media units.
+/// A video request decoded in `video_units` media units at the declared
+/// 24x16 raster.
 fn video_request(id: u64, video_units: u32) -> Request {
+    raster_request(id, video_units, 16, 24)
+}
+
+/// A video request decoded in `video_units` media units of `height` by
+/// `width` frames.
+fn raster_request(id: u64, video_units: u32, height: u32, width: u32) -> Request {
     Request::Diffusion(DiffusionRequest {
         request_id: RequestId(id),
         prompt_token_ids: PROMPT.to_vec(),
@@ -166,6 +173,8 @@ fn video_request(id: u64, video_units: u32) -> Request {
             video_units,
             num_inference_steps: STEPS,
             seed: id,
+            height,
+            width,
         },
     })
 }
@@ -227,6 +236,9 @@ struct Served {
     /// Each submitted media call with the worker its placement names for
     /// every component reading its products, in submission order.
     readers: Vec<(RequestId, MediaCall, BTreeMap<String, WorkerId>)>,
+    /// The frame `(height, width)` of each request's decoded media units, as
+    /// its video decoding calls publish them.
+    decoded_rasters: HashMap<RequestId, Vec<(DimBound, DimBound)>>,
     /// Every event each request's stream delivered.
     outcomes: HashMap<RequestId, Vec<EngineCoreOutput>>,
 }
@@ -295,6 +307,8 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
                 video_units: 32,
                 num_inference_steps: STEPS,
                 seed: 1,
+                height: 16,
+                width: 24,
             },
         }))
         .unwrap();
@@ -343,6 +357,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     Served {
         submissions: Vec::new(),
         readers: Vec::new(),
+        decoded_rasters: HashMap::new(),
         outcomes: HashMap::from([(RequestId(90), events)]),
     }
     .assert_completed(RequestId(90));
@@ -433,6 +448,7 @@ fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option
     let mut in_flight: Vec<(u64, Vec<ObservedCall>)> = Vec::new();
     let mut submissions = Vec::new();
     let mut readers = Vec::new();
+    let mut decoded_rasters: HashMap<RequestId, Vec<(DimBound, DimBound)>> = HashMap::new();
     for event in boundary.iter() {
         match event {
             BatchEvent::Submitted(batch) => {
@@ -446,6 +462,16 @@ fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option
                         placement.readers.clone(),
                     ))
                 }));
+                for (call, _) in &batch.requests {
+                    if call.code == CallKind::Media(MediaCall::VideoDecoding) {
+                        decoded_rasters
+                            .entry(call.request_key.request_id)
+                            .or_default()
+                            .extend(call.outputs.iter().map(|output| {
+                                (output.shape_bound.dims[2], output.shape_bound.dims[3])
+                            }));
+                    }
+                }
                 let calls = media_calls(&batch);
                 if calls.is_empty() {
                     continue;
@@ -466,6 +492,7 @@ fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option
     Served {
         submissions,
         readers,
+        decoded_rasters,
         outcomes,
     }
 }
@@ -708,6 +735,55 @@ fn a_full_waiting_queue_rejects_a_video_request_as_overloaded() {
             events.as_slice(),
             [EngineCoreOutput::Rejected {
                 kind: RejectionKind::Overloaded,
+                ..
+            }]
+        ),
+        "{events:?}"
+    );
+}
+
+/// The video decoder declares its media units at its largest raster. A
+/// request at the transposed raster decodes units of its own height and width,
+/// and one with more pixels than the declared raster is refused as invalid
+/// before admission.
+#[test]
+fn decoded_media_units_follow_the_request_raster() {
+    let landscape = RequestId(1);
+    let portrait = RequestId(2);
+    let oversized = RequestId(3);
+    let served = serve(
+        video_worker(1, 1),
+        vec![
+            raster_request(landscape.0, 2, 16, 24),
+            raster_request(portrait.0, 2, 24, 16),
+            raster_request(oversized.0, 2, 24, 24),
+        ],
+    );
+    served.assert_completed(landscape);
+    served.assert_completed(portrait);
+
+    let rasters = |request| {
+        let rasters = &served.decoded_rasters[&request];
+        assert!(!rasters.is_empty());
+        rasters.clone()
+    };
+    assert!(
+        rasters(landscape)
+            .iter()
+            .all(|raster| *raster == (DimBound::Static(16), DimBound::Static(24)))
+    );
+    assert!(
+        rasters(portrait)
+            .iter()
+            .all(|raster| *raster == (DimBound::Static(24), DimBound::Static(16)))
+    );
+
+    let events = &served.outcomes[&oversized];
+    assert!(
+        matches!(
+            events.as_slice(),
+            [EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 ..
             }]
         ),

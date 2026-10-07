@@ -924,6 +924,8 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             video_units: 1,
             num_inference_steps: 4,
             seed: 1000,
+            height: 768,
+            width: 1344,
         },
     )?;
     let value = TensorRef {
@@ -1579,6 +1581,8 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
                     video_units: 3,
                     num_inference_steps: 4,
                     seed: index as u64,
+                    height: 768,
+                    width: 1344,
                 },
             }))?;
             requests.push((request_id, events));
@@ -3021,6 +3025,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "flow_graph_shapes": null,
     "min_video_seconds": null,
     "video_text_capacities": null,
+    "video_frame_sizes": null,
     "flashinfer_workspace_size": 536870912,
     "flashinfer_use_tensor_core": null,
     "flashinfer_decode_backend": "fa2",

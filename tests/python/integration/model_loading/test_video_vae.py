@@ -11,7 +11,6 @@ from safetensors.torch import save_file
 
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
-from uniserve.media import image
 from uniserve_models.minimax_h3 import video_vae
 
 pytestmark = pytest.mark.integration
@@ -65,7 +64,7 @@ def test_video_reconstruction_matches_independent_transformer_and_crop(
         )
 
     model = loading.load_model(
-        lambda config: video_vae.Model(config, frame_size=image.Config(8, 12)),
+        video_vae.Model,
         config,
         checkpoint=(
             checkpoint.Config().resolve(tmp_path, io=loading.Config()),

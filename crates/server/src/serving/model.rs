@@ -20,8 +20,10 @@ use std::sync::Arc;
 use crate::config::EngineSettings;
 use crate::profile::assets::{ResolvedModelFiles, resolve_model_file, resolve_pipeline_index};
 use crate::profile::omni::bagel::BagelProfile;
+use crate::profile::omni::resolution::ResolutionName;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
+use crate::profile::video::VideoResolution;
 use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
 use thiserror::Error;
 use uniserve_core::{
@@ -260,6 +262,11 @@ impl ModelConfig {
                 &served_name,
                 description,
                 config.engine.max_video_seconds,
+                crate::profile::video::VideoRasters::new(
+                    &config.engine.video_resolutions,
+                    &config.engine.video_aspect_ratios,
+                )
+                .map_err(ModelResolutionError::MediaContract)?,
                 config.engine.max_model_len,
             )?;
             return Ok((model, tokenizer, None));
@@ -432,6 +439,7 @@ impl InputProcessor {
         if let ModelParameters::MiniMaxH3 {
             max_video_seconds,
             num_inference_steps,
+            ..
         } = &mut config.parameters
         {
             validate_video_capacity(*max_video_seconds).map_err(|message| {
@@ -479,8 +487,19 @@ impl InputProcessor {
     pub fn video_capabilities(&self) -> serde_json::Value {
         match &self.config.parameters {
             ModelParameters::MiniMaxH3 {
-                max_video_seconds, ..
+                max_video_seconds,
+                video_rasters,
+                ..
             } => {
+                let default = video_rasters.select(None, None).ok();
+                let mut sizes = serde_json::Map::new();
+                for raster in video_rasters.rasters() {
+                    let entry = sizes
+                        .entry(raster.resolution.as_str())
+                        .or_insert_with(|| serde_json::json!({}));
+                    entry[raster.aspect_ratio.as_str()] =
+                        serde_json::json!({"width": raster.width, "height": raster.height});
+                }
                 let default_seconds = default_video_seconds(*max_video_seconds);
                 let mut suggested_seconds = vec![default_seconds];
                 if *max_video_seconds > default_seconds {
@@ -493,9 +512,26 @@ impl InputProcessor {
                     "max_seconds": *max_video_seconds,
                     "model_max_seconds": MAX_VIDEO_SECONDS,
                     "suggested_seconds": suggested_seconds,
-                    "fps": VIDEO_FPS, "width": 1344, "height": 768,
+                    "fps": VIDEO_FPS,
+                    "width": default.map(|raster| raster.width),
+                    "height": default.map(|raster| raster.height),
+                    "default_resolution": video_rasters.resolutions()[0].as_str(),
+                    "default_aspect_ratio": video_rasters.aspect_ratios()[0].as_str(),
+                    "resolutions": video_rasters
+                        .resolutions()
+                        .iter()
+                        .map(|resolution| resolution.as_str())
+                        .collect::<Vec<_>>(),
+                    "aspect_ratios": video_rasters
+                        .aspect_ratios()
+                        .iter()
+                        .map(|aspect_ratio| aspect_ratio.as_str())
+                        .collect::<Vec<_>>(),
+                    "sizes": sizes,
                     "max_prompt_tokens": self.config.max_model_tokens(),
-                    "request_fields": ["model", "prompt", "seconds", "seed"],
+                    "request_fields": [
+                        "model", "prompt", "seconds", "seed", "resolution", "aspect_ratio",
+                    ],
                 })
             }
             _ => serde_json::Value::Null,
@@ -517,6 +553,8 @@ impl InputProcessor {
             prompt,
             seed,
             seconds,
+            resolution,
+            aspect_ratio,
         } = request;
         crate::openai::utils::check_model_served(&model, self.served_model_name())?;
         if prompt.trim().is_empty() {
@@ -525,7 +563,8 @@ impl InputProcessor {
                 Some("prompt"),
             ));
         }
-        let (_, sampling) = self.video_sampling(request_id, seconds, seed)?;
+        let (_, sampling) =
+            self.video_sampling(request_id, seconds, seed, resolution, aspect_ratio)?;
         // Tokenize and bound the prompt before deriving any media allocation.
         let prompt_token_ids = self
             .tokenizer
@@ -569,17 +608,22 @@ impl InputProcessor {
     ///
     /// # Errors
     ///
-    /// Returns an API error when the model serves no video, or when the duration is not a
-    /// finite number of seconds within `[MIN_VIDEO_SECONDS, max_video_seconds]`.
+    /// Returns an API error when the model serves no video, when the duration is not a
+    /// finite number of seconds within `[MIN_VIDEO_SECONDS, max_video_seconds]`, or when the
+    /// deployment does not provision the requested `resolution` or `aspect_ratio`; an omitted
+    /// field takes the deployment's first configured value.
     pub fn video_sampling(
         &self,
         request_id: &crate::serving::ServeRequestId,
         seconds: Option<f64>,
         seed: u64,
+        resolution: Option<VideoResolution>,
+        aspect_ratio: Option<ResolutionName>,
     ) -> std::result::Result<(f64, uniserve_core::DiffusionSamplingParams), crate::openai::ApiError>
     {
         let ModelParameters::MiniMaxH3 {
             max_video_seconds,
+            video_rasters,
             num_inference_steps,
         } = &self.config.parameters
         else {
@@ -600,6 +644,14 @@ impl InputProcessor {
         // Each H3 video media unit consumes a temporal latent window and emits its
         // non-overlapping frame interval; the model owns overlap reconstruction.
         let video_units = (frame_count - 5) / 17;
+        let raster = video_rasters
+            .select(resolution, aspect_ratio)
+            .map_err(|message| {
+                crate::openai::serve_error_to_api(ServeError::Tokenize {
+                    request_id: request_id.clone(),
+                    source: crate::serving::TokenizeError::Invalid(message),
+                })
+            })?;
         Ok((
             seconds,
             uniserve_core::DiffusionSamplingParams {
@@ -607,6 +659,8 @@ impl InputProcessor {
                 video_units,
                 num_inference_steps: *num_inference_steps,
                 seed,
+                height: raster.height,
+                width: raster.width,
             },
         ))
     }

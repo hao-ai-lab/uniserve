@@ -14,7 +14,7 @@ from collections.abc import Mapping
 
 import torch
 
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.model import AudioDecoder as BaseAudioDecoder
 from uniserve.model import VideoDecoder as BaseVideoDecoder
 from uniserve.tensors import BufferConfig, OutputLayout
@@ -33,20 +33,40 @@ from .packing import (
 class VideoDecoder(BaseVideoDecoder):
     """Unpack tile-major H3 video latents into each native seven-frame VAE window."""  # noqa: E501
 
-    def __init__(self, config: video_vae.Config, *, frame_size: image.Config):
-        super().__init__(
-            video_vae.Model(config, frame_size=frame_size),
-            frame_size=frame_size,
-        )
+    def __init__(
+        self,
+        config: video_vae.Config,
+        *,
+        frame_sizes: tuple[image.Config, ...],
+    ):
+        if any(
+            frame.height % config.spatial_compression
+            or frame.width % config.spatial_compression
+            for frame in frame_sizes
+        ):
+            raise ValueError("video raster must align with spatial compression")
+        super().__init__(video_vae.Model(config), frame_sizes=frame_sizes)
         self.config = config
 
     def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
         return frame_slices(num_frames)
 
-    def output_layout(self, num_frames: int) -> Mapping[str, OutputLayout]:
-        units = len(self.frame_slices(num_frames))
+    def _latent_raster(self, size: video.Config) -> tuple[int, int]:
+        """Return the latent (height, width) of a video this decoder serves."""
+        if size.frame not in self.frame_sizes:
+            raise ValueError(
+                f"H3 video decoder does not serve a {size.frame.width}x"
+                f"{size.frame.height} raster"
+            )
+        self.frame_slices(size.num_frames)
+        compression = self.config.spatial_compression
+        return size.frame.height // compression, size.frame.width // compression
+
+    def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
+        self._latent_raster(size)
+        units = len(self.frame_slices(size.num_frames))
         # Each unit decodes one native 25-frame RGB window at the output raster.
-        shape = (units, 1, 3, 25, self.frame_size.height, self.frame_size.width)
+        shape = (units, 1, 3, 25, size.frame.height, size.frame.width)
         return {
             "video": OutputLayout(
                 shape,
@@ -56,10 +76,10 @@ class VideoDecoder(BaseVideoDecoder):
             )
         }
 
-    def workspace_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
-        self.frame_slices(num_frames)
-        height = self.frame_size.height // self.config.spatial_compression
-        width = self.frame_size.width // self.config.spatial_compression
+    def workspace_buffers(
+        self, size: video.Config
+    ) -> Mapping[str, BufferConfig]:
+        height, width = self._latent_raster(size)
         channels = self.config.latent_channels
         # One seven-latent-frame window: the NCTHW decoder input and the
         # raster patch rows gathered for it.
@@ -72,14 +92,14 @@ class VideoDecoder(BaseVideoDecoder):
             ),
         }
 
-    def constant_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
-        self.frame_slices(num_frames)
-        height = self.frame_size.height // self.config.spatial_compression
-        width = self.frame_size.width // self.config.spatial_compression
+    def constant_buffers(
+        self, size: video.Config
+    ) -> Mapping[str, BufferConfig]:
+        height, width = self._latent_raster(size)
         return {
             "video_raster_order": BufferConfig(
                 (
-                    video_latent_frames(num_frames)
+                    video_latent_frames(size.num_frames)
                     * (height // 2)
                     * (width // 2),
                 ),
@@ -89,9 +109,9 @@ class VideoDecoder(BaseVideoDecoder):
 
     @torch.inference_mode()
     def prepare_constants(
-        self, num_frames: int, *, out: Mapping[str, torch.Tensor]
+        self, size: video.Config, *, out: Mapping[str, torch.Tensor]
     ) -> None:
-        configs = self.constant_buffers(num_frames)
+        configs = self.constant_buffers(size)
         if out.keys() != configs.keys():
             raise ValueError("video decoding requires its raster-order indices")
         target, config = (
@@ -107,15 +127,13 @@ class VideoDecoder(BaseVideoDecoder):
         # row to its position among the packed video rows.
         packed = build_packing(
             num_text_tokens=64,
-            num_frames=num_frames,
-            height=self.frame_size.height,
-            width=self.frame_size.width,
+            num_frames=size.num_frames,
+            height=size.frame.height,
+            width=size.frame.width,
         )
         target.copy_(torch.argsort(packed.video_raster_indices))
 
-    def unpack_latents(
-        self, latent, frames, num_frames, *, constants, workspace
-    ):
+    def unpack_latents(self, latent, frames, size, *, constants, workspace):
         target, tokens = (
             workspace["video_input"],
             workspace["reconstruction_tokens"],
@@ -123,7 +141,7 @@ class VideoDecoder(BaseVideoDecoder):
         height, width = target.shape[-2:]
         tokens_per_frame = (height // 2) * (width // 2)
         shape = (
-            video_latent_frames(num_frames) * tokens_per_frame,
+            video_latent_frames(size.num_frames) * tokens_per_frame,
             self.config.latent_channels * 4,
         )
         if latent.shape != shape:

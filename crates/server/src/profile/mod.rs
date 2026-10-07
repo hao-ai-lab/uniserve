@@ -31,6 +31,7 @@ pub mod omni;
 pub mod reasoning;
 pub mod tokenizer;
 pub mod tools;
+pub mod video;
 
 /// The complete configured model-description set selected at server startup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +158,8 @@ pub enum ModelParameters {
     MiniMaxH3 {
         /// Maximum requested duration in seconds, before frame alignment.
         max_video_seconds: f64,
+        /// Output rasters the worker prepares and requests select from.
+        video_rasters: video::VideoRasters,
         /// Fixed number of denoising predictions in the checkpoint contract.
         ///
         /// [`ModelConfig::from_pipeline`] leaves it zero; `InputProcessor::new`
@@ -277,6 +280,7 @@ impl ModelConfig {
         model_id: &str,
         description: ModelDescription,
         max_video_seconds: f64,
+        video_rasters: video::VideoRasters,
         max_model_tokens: Option<u32>,
     ) -> assets::Result<Self> {
         let (parameters, default_max_model_tokens) = match description {
@@ -284,6 +288,7 @@ impl ModelConfig {
             ModelDescription::MiniMaxH3 => (
                 ModelParameters::MiniMaxH3 {
                     max_video_seconds,
+                    video_rasters,
                     num_inference_steps: 0,
                 },
                 16_384,
@@ -530,8 +535,14 @@ mod tests {
         );
         assert_eq!(ModelDescription::from_model_type("minimax_h3"), None);
 
-        let profile =
-            ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, 15.0, None).unwrap();
+        let profile = ModelConfig::from_pipeline(
+            "h3",
+            ModelDescription::MiniMaxH3,
+            15.0,
+            super::video::VideoRasters::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(profile.description(), ModelDescription::MiniMaxH3);
         assert_eq!(profile.max_model_tokens, Some(16_384));
     }

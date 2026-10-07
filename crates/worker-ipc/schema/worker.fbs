@@ -482,6 +482,9 @@ table DiffusionSamplingParams {
   video_units:uint;
   num_inference_steps:uint;
   seed:ulong;
+  /// Output frame raster in pixels.
+  height:uint;
+  width:uint;
 }
 
 table NewRequest {
