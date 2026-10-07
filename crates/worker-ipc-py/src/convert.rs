@@ -2317,14 +2317,27 @@ mod tests {
         let expected = result_response();
 
         Python::attach(|py| {
-            // Import `uniserve_worker` from this repository's source tree.
+            // Import `uniserve_worker` from this repository's source tree, with
+            // the packages it imports from the repository environment
+            // (`.venv`), as the worker processes run. The embedded interpreter
+            // is the base installation the venv was created from, so the
+            // venv's site-packages directory is added explicitly.
             let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
                 .canonicalize()
                 .unwrap();
-            py.import("sys")
+            let sys = py.import("sys").unwrap();
+            let version = sys.getattr("version_info").unwrap();
+            let site_packages = repo_root.join(format!(
+                ".venv/lib/python{}.{}/site-packages",
+                version.getattr("major").unwrap().extract::<u32>().unwrap(),
+                version.getattr("minor").unwrap().extract::<u32>().unwrap(),
+            ));
+            py.import("site")
                 .unwrap()
-                .getattr("path")
+                .call_method1("addsitedir", (site_packages.to_str().unwrap(),))
+                .unwrap();
+            sys.getattr("path")
                 .unwrap()
                 .call_method1("insert", (0, repo_root.to_str().unwrap()))
                 .unwrap();

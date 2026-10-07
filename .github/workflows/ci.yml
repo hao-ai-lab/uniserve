@@ -19,6 +19,14 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev pkg-config
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The engine's multiprocess tests launch real worker ranks through the
+      # repository's `.venv/bin/python`, and the IPC conversion tests import
+      # the worker's Python packages from it, so cargo test needs the locked
+      # environment.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked --python 3.12 --extra test
       - run: cargo test --workspace
       - run: cargo bench --workspace --no-run
 
