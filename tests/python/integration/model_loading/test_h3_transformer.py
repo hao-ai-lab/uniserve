@@ -12,6 +12,7 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 from safetensors.torch import save_file
 from torch.nn import functional as F
 
+from tests.python.fixtures.h3 import dmd_denoiser
 from tests.python.fixtures.vsa import reference_attention
 from uniserve import loading
 from uniserve.distributed import DeviceMesh
@@ -20,12 +21,12 @@ from uniserve.nn.attention import vsa
 from uniserve.runtime import CUDAGraph, ExecutionContext, TensorBuffers
 from uniserve_models.minimax_h3 import (
     AttentionInput,
-    DiffusionConfig,
-    Packing,
+    TilePacking,
     Transformer,
     TransformerConfig,
 )
 from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
+from uniserve_models.minimax_h3.denoiser import modulation_timesteps
 from uniserve_models.minimax_h3.weights import transformer_component
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -182,16 +183,27 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
             * 0.04
         )
     save_file(source, tmp_path / "model.safetensors")
+    # The Preview export's four DMD rungs; each step reads its video and
+    # audio timestep entries.
+    denoiser = dmd_denoiser(config)
+    _, entries, _ = modulation_timesteps(denoiser)
     model = loading.load_model(
-        Transformer,
-        config,
+        lambda config: Transformer(
+            config,
+            attention=denoiser.attention,
+            entries=entries.numel(),
+            steps=4,
+            groups=2,
+        ),
+        # The FastH3 student's transformer, which rounds once.
+        denoiser.transformer,
         checkpoint=(
             checkpoint.Config("denoiser").resolve(
                 tmp_path, io=loading.Config()
             ),
         ),
         mapping=lambda model: (
-            transformer_component(model, DiffusionConfig()),
+            transformer_component(model, denoiser, "denoiser"),
         ),
         device="cuda",
         weights=weights.Config(
@@ -226,7 +238,7 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
     )
     angles = (positions[..., None] * frequencies).flatten(1)
     cosine, sine = angles.cos(), angles.sin()
-    packing = Packing(
+    packing = TilePacking(
         num_tokens=int(live.sum()),
         padded_tokens=256,
         position_ids=positions.cpu(),

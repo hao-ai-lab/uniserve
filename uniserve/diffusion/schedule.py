@@ -175,8 +175,10 @@ class FixedGrid(Grid):
     """A checkpoint's own grid, which requests cannot change.
 
     A request may restate the step count but not choose another, and may
-    not choose a shift.
+    not choose a shift; ``shift`` is the trained one.
     """
+
+    shift: float
 
     @property
     @abstractmethod

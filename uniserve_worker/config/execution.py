@@ -318,6 +318,12 @@ class WorkerConfig:
     max_batch_tokens: int = 8192
     max_sequence_tokens: int = 16384
     max_video_seconds: float = 15.0
+    # Most denoiser rows a video request's conditions may take. It bounds the
+    # condition products a video worker provisions; zero provisions none, as
+    # a deployment serving text-to-video alone does.
+    max_condition_rows: int = 0
+    # The ffmpeg executable the media reader decodes reference videos with.
+    ffmpeg: str = "ffmpeg"
     # Shortest duration the server admits, which bounds the frame counts the
     # worker provisions from below; ``None`` provisions every frame count
     # the model generates up to the capacity.
@@ -325,9 +331,13 @@ class WorkerConfig:
     # Text capacities, in prompt tokens, of the denoiser's layouts; empty
     # selects ``MediaBuilder``'s default spacing.
     video_text_capacities: tuple[int, ...] = ()
-    # Output (height, width) rasters a video model prepares and serves;
-    # empty keeps the model's configured rasters.
+    # Canvases, as (height, width) pixels, a video deployment prepares and
+    # admits; empty prepares the denoiser's own (``VideoDenoiser.canvases``).
     video_frame_sizes: tuple[tuple[int, int], ...] = ()
+    # Names of every component any worker group of the deployment places;
+    # it selects which of a checkpoint's video denoisers the deployment
+    # serves.
+    deployment_components: tuple[str, ...] = ()
     max_request_pool_size: int = 128
     encoder_cache_entries: int = 256
     generation_device: str | None = None
@@ -389,6 +399,12 @@ class WorkerConfig:
             raise invalid_descriptor(
                 "video duration capacity must be finite and positive"
             )
+        if self.max_condition_rows < 0:
+            raise invalid_descriptor(
+                "video condition capacity must not be negative"
+            )
+        if not self.ffmpeg:
+            raise invalid_descriptor("the media reader needs an ffmpeg path")
         if self.min_video_seconds is not None and not (
             math.isfinite(self.min_video_seconds)
             and 0 < self.min_video_seconds <= self.max_video_seconds
@@ -442,6 +458,8 @@ def worker_config_from_namespace(
         max_batch_tokens=int(namespace.max_batch_tokens),
         max_sequence_tokens=int(namespace.max_model_len),
         max_video_seconds=float(namespace.max_video_seconds),
+        max_condition_rows=int(namespace.max_condition_rows),
+        ffmpeg=str(namespace.ffmpeg),
         min_video_seconds=_optional_float(
             getattr(namespace, "min_video_seconds", None)
         ),
@@ -452,6 +470,9 @@ def worker_config_from_namespace(
             getattr(namespace, "video_frame_sizes", None),
             default=(),
             name="video frame sizes",
+        ),
+        deployment_components=tuple(
+            str(name) for name in namespace.deployment_components
         ),
         kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
         attention_backend=str(namespace.attention_backend),

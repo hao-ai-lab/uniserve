@@ -69,11 +69,15 @@ impl ForwardMode {
     }
 }
 
-/// A concrete encoder, diffusion, decoder, or media-output computation.
+/// A concrete media-input, encoder, diffusion, decoder, or media-output
+/// computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum MediaCall {
+    /// Decodes a video request's condition media on a host rank into the
+    /// inputs of the vision and latent encoders.
+    MediaReading,
     VisionEncoding,
     LatentEncoding,
     TextEncoding,
@@ -92,7 +96,8 @@ impl MediaCall {
     ///
     /// `worker-ipc-py` indexes a Python enum table built from this array with
     /// `call as usize`, so the order must match the declaration order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
+        Self::MediaReading,
         Self::VisionEncoding,
         Self::LatentEncoding,
         Self::TextEncoding,
@@ -108,6 +113,7 @@ impl MediaCall {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::MediaReading => "media_reading",
             Self::VisionEncoding => "vision_encoding",
             Self::LatentEncoding => "latent_encoding",
             Self::TextEncoding => "text_encoding",
@@ -121,22 +127,6 @@ impl MediaCall {
             Self::Muxing => "muxing",
         }
     }
-}
-
-impl MediaCall {
-    /// Fixed calls needed to produce video and audio.
-    ///
-    /// Mirrored by `VIDEO_CALLS` in `uniserve_worker.protocol.call`.
-    pub const VIDEO: [Self; 8] = [
-        Self::TextEncoding,
-        Self::LatentPreparation,
-        Self::Denoising,
-        Self::VideoDecoding,
-        Self::AudioDecoding,
-        Self::VideoEncoding,
-        Self::AudioEncoding,
-        Self::Muxing,
-    ];
 }
 
 /// The storage action performed between concrete producers and consumers.
@@ -296,10 +286,11 @@ impl CallKind {
     /// Mirrored, in the same order, by `CALL_KINDS` in
     /// `uniserve_worker.protocol.call`; the worker's reports list supported
     /// calls in this order.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Forward(ForwardMode::Prefill),
         Self::Forward(ForwardMode::Decode),
         Self::Forward(ForwardMode::Verify),
+        Self::Media(MediaCall::MediaReading),
         Self::Media(MediaCall::VisionEncoding),
         Self::Media(MediaCall::LatentEncoding),
         Self::Media(MediaCall::TextEncoding),
@@ -1046,6 +1037,22 @@ pub struct ArRequestParams {
 
 pub use uniserve_core::DiffusionSamplingParams;
 
+/// What a video request admits besides its sampling controls.
+///
+/// The engine forms it from the `DiffusionRequest` it admits; the conditions'
+/// media stay published by the engine until the request retires, so a
+/// worker reads them by locator while the request lives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoAdmission {
+    /// The task the request runs.
+    pub task: uniserve_core::VideoTask,
+    /// The denoiser's AdaLN tag of each prompt token: 0 for a vision token
+    /// or vision marker, 1 for text.
+    pub text_tags: Vec<u8>,
+    /// The conditions in request order.
+    pub conditions: Vec<uniserve_core::VideoCondition>,
+}
+
 /// Request-start framing. Carries the per-domain parameters a request
 /// needs before its calls run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1061,6 +1068,9 @@ pub struct NewRequest {
     pub image: Option<ImageParams>,
     /// Diffusion request parameters, when applicable.
     pub diffusion: Option<DiffusionSamplingParams>,
+    /// A video request's task, presentation tags and conditions; present
+    /// exactly with `diffusion`.
+    pub video: Option<VideoAdmission>,
     /// Tokenized conditioning supplied at diffusion admission.
     pub prompt_token_ids: Vec<u32>,
     /// Number of input images the request carries. Model image preprocessing
@@ -1092,18 +1102,20 @@ impl NewRequest {
             ar,
             image,
             diffusion: None,
+            video: None,
             prompt_token_ids: Vec::new(),
             input_images,
         };
         Ok(admission)
     }
 
-    /// Constructs static terminal media admission state and validates it.
+    /// Constructs static video admission state and validates it.
     pub fn new_media(
         request_key: RequestKey,
         request_pool_idx: u32,
         prompt_token_ids: Vec<u32>,
         diffusion: DiffusionSamplingParams,
+        video: VideoAdmission,
     ) -> ValidationResult<Self> {
         ensure_valid!(request_pool_idx > 0, "request-pool index must be positive");
         let admission = Self {
@@ -1112,6 +1124,7 @@ impl NewRequest {
             ar: None,
             image: None,
             diffusion: Some(diffusion),
+            video: Some(video),
             prompt_token_ids,
             input_images: 0,
         };
@@ -1153,6 +1166,25 @@ impl NewRequest {
                     && diffusion.num_inference_steps > 0,
                 "diffusion parameters are invalid"
             );
+        }
+        ensure_valid!(
+            self.video.is_some() == self.diffusion.is_some(),
+            "a video admission carries both its sampling and its inputs"
+        );
+        if let Some(video) = &self.video {
+            ensure_valid!(
+                video.text_tags.len() == self.prompt_token_ids.len(),
+                "every video prompt token requires one tag"
+            );
+            ensure_valid!(
+                (video.task == uniserve_core::VideoTask::T2va) == video.conditions.is_empty(),
+                "only a conditioned video task carries conditions"
+            );
+            for condition in &video.conditions {
+                if let Err(message) = condition.validate() {
+                    bail_invalid!("{message}");
+                }
+            }
         }
         Ok(())
     }
@@ -1664,6 +1696,8 @@ impl Batch {
             let call = calls
                 .get(&identity)
                 .ok_or_else(|| invalid_message!("decode params does not name a run call"))?;
+            // A video request's latent encoding also covers a range: the
+            // visual condition units of one round, or its single audio call.
             ensure_valid!(
                 matches!(
                     call.code,
@@ -1672,6 +1706,7 @@ impl Batch {
                             | MediaCall::AudioDecoding
                             | MediaCall::VideoEncoding
                             | MediaCall::AudioEncoding
+                            | MediaCall::LatentEncoding
                     )
                 ),
                 "decode params does not name media decode work"

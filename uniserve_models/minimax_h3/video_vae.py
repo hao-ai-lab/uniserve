@@ -698,7 +698,11 @@ class Decoder(SpatialDecoder):
 
 
 class Model(LatentDecoder):
-    """Denormalize one native temporal segment, decode tiles, and crop its pad."""  # noqa: E501
+    """Denormalize one native temporal segment, decode tiles, and crop its pad.
+
+    The latent raster is the request's canvas divided by the spatial
+    compression; spatial tiling covers any raster on that grid.
+    """
 
     decoder: Decoder
 
@@ -714,8 +718,6 @@ class Model(LatentDecoder):
                 1,
                 config.latent_channels,
                 span + overlap,
-                # The raster is the decoded video's; convolution and tiling
-                # follow the input extent.
                 None,
                 None,
             ),

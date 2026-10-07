@@ -12,9 +12,11 @@ same two calls.
 A model package provides ``config_sources``, ``read_config``, ``Model``,
 ``checkpoint_sources``, ``checkpoint_mappings``, ``entry_points``,
 ``image_processor``, ``flow_prompt``, ``precisions`` and
-``checkpoint_precision``. This module also implements the Python side of the
-checkpoint identity that ranks compare against the head, and recognizes
-calibrated ModelOpt NVFP4 exports.
+``checkpoint_precision``. A package whose checkpoints may be component
+exports, which hold some components and pin a base checkpoint for the rest,
+also provides ``base_checkpoint`` (see ``Base``). This module also implements
+the Python side of the checkpoint identity that ranks compare against the
+head, and recognizes calibrated ModelOpt NVFP4 exports.
 """
 
 from __future__ import annotations
@@ -67,6 +69,43 @@ _metadata_files = (
     "model_index.json",
     "modular_model_index.json",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class Base:
+    """The pinned checkpoint a component export draws components from.
+
+    A package's ``base_checkpoint(root)`` returns one for a checkpoint
+    directory that holds only some of its components, else ``None``.
+    ``read_config`` then resolves the base, from the Hub cache at
+    ``revision`` or from a local copy the caller names, and reads every
+    source and sidecar under ``directories`` from it; the package's own
+    ``read_config`` receives the base directory as ``base``.
+
+    Attributes:
+        repository: Hub repository id of the base.
+        revision: The commit the export pins.
+        directories: Top-level component directories the base supplies.
+    """
+
+    repository: str
+    revision: str
+    directories: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _Snapshot:
+    """One checkpoint directory and where its files come from.
+
+    ``repository`` and ``revision`` name the Hub snapshot that ``root`` is
+    the local cache of, or are ``None`` for a local directory; ``inventory``
+    lists the files ``read_config`` may read, relative to ``root``.
+    """
+
+    root: Path
+    repository: str | None
+    revision: str | None
+    inventory: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,19 +524,27 @@ def _safetensors_headers(repository, revision, names, io):
     )
 
 
-def _config_sources(package, root, inventory, repository, revision, io):
+def _config_sources(package, located, io):
     """Resolve the sources ``package.read_config`` reads tensor headers from.
 
-    Returns ``package.config_sources`` resolved by name. A local checkpoint
-    resolves in place. A Hub checkpoint downloads the files of each source,
-    except under dummy loading, which synthesizes weight values and needs
-    only the headers: a file the Hub cache already holds is read locally, a
-    safetensors file contributes only its header (``_safetensors_headers``),
-    and a PyTorch container, whose tensor metadata is not separable from its
-    payload, is downloaded.
+    Returns ``package.config_sources`` resolved by name, each in the
+    snapshot ``located(directory)`` holds its directory in. A local
+    checkpoint resolves in place. A Hub checkpoint downloads the files of
+    each source, except under dummy loading, which synthesizes weight values
+    and needs only the headers: a file the Hub cache already holds is read
+    locally, a safetensors file contributes only its header
+    (``_safetensors_headers``), and a PyTorch container, whose tensor
+    metadata is not separable from its payload, is downloaded.
     """
     sources = {}
     for declaration in package.config_sources:
+        snapshot = located(declaration.directory)
+        root, repository, revision, inventory = (
+            snapshot.root,
+            snapshot.repository,
+            snapshot.revision,
+            snapshot.inventory,
+        )
         if repository is None:
             sources[declaration.name] = declaration.resolve(root, io=io)
             continue
@@ -929,6 +976,100 @@ def _calibrated_quantization(
     }
 
 
+def _verify_revision(root: Path, base: Base) -> None:
+    """Refuse a local base whose files are not those of the pinned revision.
+
+    ``huggingface_hub`` records, for every file it downloads into a local
+    directory, ``.cache/huggingface/download/<path>.metadata``, whose first
+    line is the commit the file was downloaded at. Every file under the
+    directories the base supplies must carry a record of ``base.revision``.
+
+    Raises:
+        FileNotFoundError: A supplied directory is missing.
+        ValueError: A file has no download record, so its revision cannot be
+            verified, or its record names another commit.
+    """
+    records = root / ".cache" / "huggingface" / "download"
+    unrecorded, mismatched = [], []
+    for directory in sorted(base.directories):
+        folder = root / directory
+        if not folder.is_dir():
+            raise FileNotFoundError(
+                f"base checkpoint {root} has no {directory} directory"
+            )
+        for path in sorted(folder.rglob("*")):
+            name = path.relative_to(root).as_posix()
+            if not path.is_file() or not _identity_includes(name):
+                continue
+            record = records / f"{name}.metadata"
+            if not record.is_file():
+                unrecorded.append(name)
+                continue
+            lines = record.read_text(encoding="utf-8").splitlines()
+            commit = lines[0].strip() if lines else ""
+            if commit != base.revision:
+                mismatched.append(f"{name} at {commit or 'no commit'}")
+    pinned = f"{base.repository}@{base.revision}"
+    if mismatched:
+        raise ValueError(
+            f"base checkpoint {root} is not {pinned}: its download records "
+            f"place {', '.join(mismatched[:4])}"
+            + (
+                f" and {len(mismatched) - 4} more"
+                if len(mismatched) > 4
+                else ""
+            )
+        )
+    if unrecorded:
+        raise ValueError(
+            f"base checkpoint {root} has no Hugging Face download record for "
+            f"{', '.join(unrecorded[:4])}"
+            + (
+                f" and {len(unrecorded) - 4} more"
+                if len(unrecorded) > 4
+                else ""
+            )
+            + f", so it cannot be verified as {pinned}"
+        )
+
+
+def _base_snapshot(base: Base, path: str | Path | None, io) -> _Snapshot:
+    """Resolve a component export's base checkpoint.
+
+    ``path`` names a local copy, verified against the pinned revision by its
+    download records (``_verify_revision``); without one the base is the
+    Hub snapshot of ``base.revision``, read from the Hub cache and fetched
+    into it when absent. Only files under ``base.directories`` are listed.
+
+    Raises:
+        FileNotFoundError: The local copy or a supplied directory is missing.
+        ValueError: The local copy is not the pinned revision.
+    """
+    if path is not None:
+        root = Path(path).expanduser()
+        if not root.is_dir():
+            raise FileNotFoundError(
+                f"base checkpoint {root} is not a directory"
+            )
+        _verify_revision(root, base)
+        repository = revision = None
+    else:
+        root, repository, revision = _root(
+            base.repository, replace(io, revision=base.revision)
+        )
+        if revision != base.revision:
+            raise ValueError(
+                f"the Hub resolved {base.repository}@{base.revision} to "
+                f"commit {revision}"
+            )
+    inventory = frozenset(
+        name
+        for name in _inventory(root, repository, revision, io)
+        if PurePosixPath(name).parts[0] in base.directories
+    )
+    return _Snapshot(root, repository, revision, inventory)
+
+
 def _root_metadata(root: Path) -> dict:
     """Read the first root metadata file the checkpoint publishes."""
     for name in _metadata_files:
@@ -967,6 +1108,7 @@ def read_config(
     *,
     io: loading.Config = loading.Config(),
     modules: frozenset[str] | None = None,
+    base: str | Path | None = None,
 ) -> Config:
     """Normalize one local or immutable Hub snapshot without materializing a
     model.
@@ -984,15 +1126,21 @@ def read_config(
             safetensors headers (see ``_config_sources``).
         modules: Module paths to resolve sources for; ``None`` selects the
             whole model, and an empty set resolves no payload source.
+        base: A local copy of the base checkpoint a component export pins
+            (``Base``), verified against the pinned revision; without it the
+            base comes from the Hub cache at that revision. The checkpoint
+            identity remains the export's own.
 
     Raises:
-        FileNotFoundError: The checkpoint, its metadata, or a declared
-            source's files cannot be found.
+        FileNotFoundError: The checkpoint, its metadata, its base, or a
+            declared source's files cannot be found.
         ValueError: The checkpoint metadata or selection is invalid or
             unsupported, including an architecture outside the catalog, a
             selected path that is not a module, and malformed architecture,
             model configuration, index, tokenizer or quantization metadata
-            (a required field that is missing or a field of the wrong type).
+            (a required field that is missing or a field of the wrong type);
+            a ``base`` for a checkpoint that pins none; or a base that is not
+            the pinned revision.
     """  # noqa: D205
     root, repository, revision = _root(path, io)
     metadata = _root_metadata(root)
@@ -1020,18 +1168,56 @@ def read_config(
         if repository is None
         else _hub_checkpoint_identity(repository, revision, io)
     )
+
+    # A component export reads the directories its base supplies from the
+    # base checkpoint, whose sidecars are fetched like the export's own.
+    export = _Snapshot(root, repository, revision, inventory)
+    declares_base = hasattr(package, "base_checkpoint")
+    pinned = package.base_checkpoint(root) if declares_base else None
+    if pinned is None and base is not None:
+        raise ValueError(
+            f"checkpoint {root} pins no base checkpoint, so it takes no base"
+        )
+    supplier = None if pinned is None else _base_snapshot(pinned, base, io)
+    if supplier is not None:
+        _fetch(
+            supplier.root,
+            {
+                name
+                for name in supplier.inventory
+                if Path(name).suffix in {".json", ".jinja", ".model", ".txt"}
+            },
+            supplier.repository,
+            supplier.revision,
+            io,
+        )
+
+    def located(directory: str) -> _Snapshot:
+        parts = PurePosixPath(directory).parts
+        if pinned is not None and parts and parts[0] in pinned.directories:
+            assert supplier is not None
+            return supplier
+        return export
+
     # Some architectures derive dimensions from checkpoint tensor headers.
     # The package declares those sources before module selection is known.
-    config_sources = _config_sources(
-        package, root, inventory, repository, revision, io
-    )
+    config_sources = _config_sources(package, located, io)
 
     # A meta-device skeleton resolves module selection and the mappings
     # without allocating weights. A source is needed when its mapping's
     # module is selected or when the mapping names any selected parameter as
     # required or optional, which covers parameters shared into an unselected
     # mapping's module.
-    model_config = package.read_config(root, io, sources=config_sources)
+    model_config = (
+        package.read_config(
+            root,
+            io,
+            sources=config_sources,
+            base=None if supplier is None else supplier.root,
+        )
+        if declares_base
+        else package.read_config(root, io, sources=config_sources)
+    )
     with torch.device("meta"):
         model = package.Model(model_config)
     selected = _selection(model, modules)
@@ -1058,15 +1244,18 @@ def read_config(
     for declaration in package.checkpoint_sources:
         if declaration.name not in source_names:
             continue
-        if repository is not None and io.mode != "dummy":
+        snapshot = located(declaration.directory)
+        if snapshot.repository is not None and io.mode != "dummy":
             _fetch(
-                root,
-                _source_files(declaration, root, inventory, io),
-                repository,
-                revision,
+                snapshot.root,
+                _source_files(
+                    declaration, snapshot.root, snapshot.inventory, io
+                ),
+                snapshot.repository,
+                snapshot.revision,
                 io,
             )
-        sources.append(declaration.resolve(root, io=io))
+        sources.append(declaration.resolve(snapshot.root, io=io))
 
     processor = (
         None
@@ -1074,8 +1263,11 @@ def read_config(
         else package.image_processor(model_config)
     )
     processor = _tokens(processor, root)
+    tokenizer_root = located("tokenizer").root
     tokenizer_root = (
-        root / "tokenizer" if (root / "tokenizer").is_dir() else root
+        tokenizer_root / "tokenizer"
+        if (tokenizer_root / "tokenizer").is_dir()
+        else root
     )
     tokenizer = (
         tokenizer_root
@@ -1095,10 +1287,10 @@ def read_config(
     # The package's "default" preset, else its "bf16" preset, else the
     # ``weights.Config`` defaults; the quantization metadata below refines
     # this base or, for a ModelOpt export, replaces it.
-    precision = package.precisions.get(
-        "default", package.precisions.get("bf16", weight_options.Config())
+    precisions = package.precisions(model_config)
+    precision = precisions.get(
+        "default", precisions.get("bf16", weight_options.Config())
     )
-    precisions = package.precisions
     checkpoint_format = None
     quantization = metadata.get("quantization_config")
     if quantization is not None and not isinstance(quantization, dict):
@@ -1121,7 +1313,9 @@ def read_config(
     # rank that loads none of the quantized components; only the resolved
     # sources contribute calibrated modules.
     for declaration in package.checkpoint_sources:
-        declared = _component_quantization(root, declaration)
+        declared = _component_quantization(
+            located(declaration.directory).root, declaration
+        )
         if declared is not None:
             modelopt[declaration.name] = declared
     # Packed exports instead publish native module calibration in a root
@@ -1140,11 +1334,13 @@ def read_config(
         # Packed weights and their calibrated scales form one immutable
         # checkpoint contract. Runtime precision presets apply only to dense
         # checkpoints and must not be offered for this source.
-        base = package.checkpoint_precision
+        checkpoint_precision: weight_options.Config = (
+            package.checkpoint_precision(model_config)
+        )
         precision = replace(
-            base,
+            checkpoint_precision,
             quantization={
-                **base.quantization,
+                **checkpoint_precision.quantization,
                 **_calibrated_quantization(
                     model, declarations, sources, modelopt, io, manifest_scales
                 ),

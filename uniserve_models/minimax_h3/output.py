@@ -1,4 +1,4 @@
-"""H3 output rasters, sampling clocks and RGB reconstruction.
+"""H3 sampling clocks and RGB reconstruction.
 
 A video of ``17 * n + 5`` frames is decoded as ``n`` media units. Each unit
 decodes to 25 frames: a 17-frame body, three VAE padding frames, and a
@@ -12,41 +12,22 @@ from dataclasses import dataclass
 
 import torch
 
-from uniserve.media import image, video
+from uniserve.media import video
 from uniserve.model import VideoPostprocessor as BaseVideoPostprocessor
 from uniserve.tensors import BufferConfig, OutputLayout
-
-from .packing import FRAME_SIZES
 
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Output rasters and the video frame and audio sample clocks in Hz.
+    """The video frame and audio sample clocks in Hz.
 
-    ``frame_sizes`` lists the served rasters, distinct training buckets
-    from ``packing.FRAME_SIZES``. The default is 768p 16:9 landscape, then
-    9:16 portrait; a deployment's ``--video-frame-sizes`` replaces it.
+    The raster is a request's canvas, not a property of the model.
     """
 
-    frame_sizes: tuple[image.Config, ...] = (
-        image.Config(768, 1344),
-        image.Config(1344, 768),
-    )
     frame_rate: int = 24
     sample_rate: int = 32000
 
     def __post_init__(self):
-        if not self.frame_sizes or any(
-            not isinstance(frame, image.Config) for frame in self.frame_sizes
-        ):
-            raise ValueError("H3 output requires at least one raster")
-        if any(
-            (frame.height, frame.width) not in FRAME_SIZES
-            for frame in self.frame_sizes
-        ):
-            raise ValueError("H3 output rasters must be training buckets")
-        if len(set(self.frame_sizes)) != len(self.frame_sizes):
-            raise ValueError("H3 output rasters must be distinct")
         if any(
             type(value) is not int or value < 1
             for value in (self.frame_rate, self.sample_rate)
@@ -112,8 +93,7 @@ class VideoPostprocessor(BaseVideoPostprocessor):
         frame_slices(size.num_frames)
         return {
             "video_overlap": BufferConfig(
-                (1, 3, 5, size.frame.height, size.frame.width),
-                torch.float16,
+                (1, 3, 5, size.frame.height, size.frame.width), torch.float16
             )
         }
 
@@ -132,8 +112,7 @@ class VideoPostprocessor(BaseVideoPostprocessor):
             "rgb_frames": BufferConfig((unit, *layout.shape[1:]), layout.dtype),
             # Receives the predecessor media unit's overlap from the ring.
             "overlap_exchange": BufferConfig(
-                (1, 3, 5, size.frame.height, size.frame.width),
-                torch.float16,
+                (1, 3, 5, size.frame.height, size.frame.width), torch.float16
             ),
         }
 
