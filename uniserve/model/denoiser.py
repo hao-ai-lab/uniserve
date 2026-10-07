@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 import torch
 from torch import nn
@@ -199,8 +199,14 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
 
     def __init__(self, **options):
         super().__init__(**options)
-        if self.num_steps is None:
+        if super().num_steps is None:
             raise ValueError("a video denoiser fixes its step count")
+
+    @property
+    def num_steps(self) -> int:
+        """Network evaluations of the fixed schedule."""
+        # The constructor rejects grids that leave the count to requests.
+        return cast(int, super().num_steps)
 
     @property
     def text_condition_width(self) -> int:
