@@ -258,8 +258,11 @@ def initialize_process_groups(
     if experts is not None:
         expert_rank, expert_size, expert_rendezvous = experts
         _connect_during_initialization()
+        # The union carries host and device tensors. A host without CUDA has
+        # no device backend to create, so its union is gloo alone.
+        union = "cpu:gloo,cuda:nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(
-            backend="cpu:gloo,cuda:nccl",
+            backend=union,
             store=_rendezvous_store(
                 expert_rendezvous, expert_rank, expert_size, "nccl"
             ),
