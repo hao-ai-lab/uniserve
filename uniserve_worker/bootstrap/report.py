@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import cast
 
 import torch
 from torch import nn
@@ -633,11 +632,9 @@ def video_denoiser_info(
         )
     served = canvases or denoiser.canvases
     shifts = denoiser.schedule_shifts
-    # A video denoiser evaluates only fixed grids, which set its step count.
-    steps = cast(int, denoiser.num_steps)
     return VideoDenoiserInfo(
         tasks=tasks,
-        schedule_points=steps + 1,
+        schedule_points=denoiser.num_steps + 1,
         video_shift=float(shifts["video"]),
         audio_shift=float(shifts["audio"]),
         canvases=tuple((canvas.width, canvas.height) for canvas in served),
