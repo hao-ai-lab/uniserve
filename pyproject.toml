@@ -57,7 +57,7 @@ gpu = [
     "flashinfer-python==0.6.18",
     "ninja>=1.13",
     "requests[socks]>=2",
-    "uniserve-kernels[flash_attn_4]",
+    "uniserve-kernels[flash_attn_4,megamoe]",
 ]
 
 [tool.uv.sources]
@@ -79,6 +79,10 @@ uniserve-worker = "uniserve_worker.main:main"
 # root serving distribution cannot mask a missing kernel install and does not
 # ship a console script whose dependencies it never declares.
 include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*"]
+
+[tool.setuptools.package-data]
+# Grouped-expert providers read this fixed tactic catalog at preparation.
+uniserve = ["runtime/backends/moe/tactics.json"]
 
 # Native worker IPC extension (PyO3). Serving runs these native targets, so
 # they build with Cargo's release profile even for an editable install,
@@ -130,6 +134,8 @@ extend-exclude = [
     "refs",
     "target",
     ".venv",
+    # Preserve upstream style for the vendored FlashInfer MegaMoE sources.
+    "uniserve_kernels/src/uniserve_kernels/megamoe",
 ]
 
 [tool.ruff.lint]

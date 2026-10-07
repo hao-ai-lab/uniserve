@@ -3,10 +3,15 @@
 Cached decoding agrees with the checkpoint equations as well.
 """
 
+import json
+
 import pytest
 import torch
 
-from tests.python.fixtures.checkpoints import qwen_checkpoint
+from tests.python.fixtures.checkpoints import (
+    qwen_checkpoint,
+    qwen_moe_checkpoint,
+)
 from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import EmbeddingReplacement, TextInput, TextSize
@@ -463,3 +468,128 @@ def test_public_partial_loading_exposes_selected_decoder_values(tmp_path):
         models.load_model(
             config, device="cpu", precision="bf16", weights=weights.Config()
         )
+
+
+def _moe_logits(root, tokens, *, mesh=None):
+    io = loading.Config()
+    model = loading.load_model(
+        qwen3.Model,
+        qwen3.read_config(root, io, sources={}),
+        checkpoint=tuple(
+            source.resolve(root, io=io) for source in qwen3.checkpoint_sources
+        ),
+        mapping=qwen3.checkpoint_mappings,
+        device="cpu",
+        weights=weights.Config(dtype=torch.float32),
+        meshes=None if mesh is None else {"": mesh},
+    ).model
+    count = tokens.numel()
+    with (
+        PrefixCache(
+            model.cache_config, num_blocks=1, block_size=8, device="cpu"
+        ) as cache,
+        ExecutionContext(model, cache=cache, attention="torch") as context,
+    ):
+        context.prepare(TextSize(count, 1))
+        batch = PagedInput.from_blocks(
+            query_lengths=(count,),
+            prefix_lengths=(0,),
+            blocks=((0,),),
+            block_size=8,
+            causal=True,
+            device="cpu",
+        )
+        context.bind_attention(batch)
+        hidden = model(TextInput(tokens, torch.arange(count), batch))
+        return model.compute_logits(
+            hidden, token_indices=torch.arange(count)
+        ).gather()
+
+
+_YARN = {
+    "rope_type": "yarn",
+    "rope_theta": 1_000_000.0,
+    "factor": 4.0,
+    "original_max_position_embeddings": 16,
+}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"norm_topk_prob": True},
+        {"norm_topk_prob": False},
+        # Layer 0 keeps a dense MLP; only layer 1 routes to experts.
+        {"mlp_only_layers": [0]},
+        {"decoder_sparse_step": 2},
+        # Experts gate with the configured activation, as the dense MLP does.
+        {"hidden_act": "gelu_pytorch_tanh"},
+        {"rope_parameters": _YARN},
+    ],
+    ids=["renormalized", "raw", "mlp-only", "sparse-step", "gelu", "yarn"],
+)
+def test_mixture_of_experts_matches_transformers(tmp_path, fields):
+    reference = qwen_moe_checkpoint(tmp_path, **fields)
+    tokens = torch.tensor([3, 11, 29, 7, 1, 20])
+    with torch.no_grad():
+        expected = reference(tokens[None]).logits[0]
+    torch.testing.assert_close(
+        _moe_logits(tmp_path, tokens), expected, rtol=1e-5, atol=1e-6
+    )
+
+
+def test_legacy_rope_scaling_key_selects_the_same_yarn_positions(tmp_path):
+    reference = qwen_moe_checkpoint(tmp_path, rope_parameters=_YARN)
+    # Checkpoints written before Transformers 5 carry the recipe under
+    # rope_scaling with a top-level rope_theta.
+    path = tmp_path / "config.json"
+    metadata = json.loads(path.read_text())
+    recipe = dict(metadata.pop("rope_parameters"))
+    metadata["rope_theta"] = recipe.pop("rope_theta")
+    metadata["rope_scaling"] = recipe
+    path.write_text(json.dumps(metadata))
+    tokens = torch.tensor([3, 11, 29, 7, 1, 20])
+    with torch.no_grad():
+        expected = reference(tokens[None]).logits[0]
+    torch.testing.assert_close(
+        _moe_logits(tmp_path, tokens), expected, rtol=1e-5, atol=1e-6
+    )
+
+
+def _partitioned_experts(rank, rendezvous, root):
+    from uniserve.distributed import DeviceMesh
+    from uniserve.runtime import initialize_process_groups
+
+    with initialize_process_groups(
+        rank=rank,
+        local_rank=rank,
+        world_size=2,
+        device="cpu",
+        init_method=rendezvous,
+    ) as owner:
+        mesh = owner.bind(
+            DeviceMesh(ranks=(0, 1), shape=(2,), axes=("tp",), rank=rank),
+            device="cpu",
+        )
+        tokens = torch.tensor([3, 11, 29, 7, 1, 20])
+        torch.testing.assert_close(
+            _moe_logits(root, tokens, mesh=mesh),
+            torch.load(root / "expected.pt", weights_only=True),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+
+def test_tensor_parallel_experts_sum_to_the_complete_model(tmp_path):
+    import torch.multiprocessing as mp
+
+    reference = qwen_moe_checkpoint(tmp_path)
+    with torch.no_grad():
+        expected = reference(torch.tensor([[3, 11, 29, 7, 1, 20]])).logits[0]
+    torch.save(expected, tmp_path / "expected.pt")
+    mp.spawn(
+        _partitioned_experts,
+        args=((tmp_path / "rendezvous").as_uri(), tmp_path),
+        nprocs=2,
+        join=True,
+    )

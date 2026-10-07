@@ -25,11 +25,11 @@ from uniserve.nn.linear import (
     VocabParallelEmbedding,
 )
 from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.moe import FusedMoE
+from uniserve.nn.moe import FusedMoE, TopK
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.rope import MRotaryEmbedding, RotaryEmbedding
 
-from .config import Config
+from .config import Config, expert_activation
 
 
 def _activation(name: str) -> str:
@@ -69,7 +69,12 @@ class Attention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        rotary = RotaryEmbedding(config.head_dim, theta=config.rope_theta)
+        rotary = RotaryEmbedding(
+            config.head_dim,
+            theta=config.rope_theta,
+            scaling=config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
+        )
         # A Qwen3-VL language model rotates by multimodal coordinates.
         self.rotary = (
             rotary
@@ -107,25 +112,31 @@ class Attention(nn.Module):
 class MoE(nn.Module):
     """Top-k expert selection with a replicated mathematical router.
 
-    Expert weights are softmax probabilities renormalized over the selected
-    top-k. Every expert is a SiLU ``GatedMLP``, whatever
-    ``Config.hidden_act`` names; only the dense MLP reads it.
+    Expert weights are the selected top-k softmax probabilities, renormalized
+    to one when ``Config.norm_topk_prob`` is set. Experts gate with
+    ``Config.hidden_act``, as the dense MLP does. The weights stay in FP32 and
+    the experts combine in FP32 before one rounding to the hidden dtype; the
+    Transformers eager reference instead rounds the weights and each partial
+    sum to the hidden dtype, a difference within that dtype's rounding.
     """
 
     def __init__(self, config: Config):
         super().__init__()
         self.router = Linear(config.hidden_size, config.num_experts, bias=False)
+        self.topk = TopK(
+            config.num_experts_per_tok, renormalize=config.norm_topk_prob
+        )
         self.experts = FusedMoE(
-            [
-                GatedMLP(config.hidden_size, config.moe_intermediate_size)
-                for _ in range(config.num_experts)
-            ],
+            config.num_experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
             top_k=config.num_experts_per_tok,
-            norm_topk_prob=True,
+            activation=expert_activation(config.hidden_act),
         )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.experts(hidden, self.router(hidden))
+        ids, weights = self.topk(self.router(hidden))
+        return self.experts(hidden, ids, weights)
 
 
 class TransformerLayer(nn.Module):
@@ -140,7 +151,7 @@ class TransformerLayer(nn.Module):
         )
         self.mlp = (
             MoE(config)
-            if config.num_experts
+            if config.sparse(layer)
             else GatedMLP(
                 config.hidden_size,
                 config.intermediate_size,

@@ -49,9 +49,10 @@ def allocate(
     :func:`exports_fabric_handles`); ``map_local()``, a tensor of ``shape``
     over its own storage; and ``map_peers(handles)``, which maps an ordered
     list of handles, one per owner allocating the same shape and dtype, into
-    one tensor whose first dimension is ``shape[0] * len(handles)``. Handle
-    transport, publication, reuse, and retirement belong to the distributed
-    runtime.
+    one tensor whose first dimension is ``shape[0] * len(handles)``. Both
+    mappings retain the originating allocation, keeping its exported handle
+    importable until the tensor retires. Handle transport, publication,
+    reuse, and retirement belong to the distributed runtime.
     """
     return _extension().PeerAllocation(
         torch.empty(0, dtype=dtype, device=device), list(shape)
@@ -98,6 +99,19 @@ def exports_fabric_handles(device: int) -> bool:
     caches the result for the process.
     """
     return _extension().exports_fabric_handles(device)
+
+
+def map_segments(parts: list[torch.Tensor]) -> torch.Tensor:
+    """Alias whole CUDA allocations back to back as one byte tensor.
+
+    Each part must be a contiguous uint8 span starting at the beginning of
+    a VMM physical allocation, with its complete physical byte length.
+    Fabric handles do not permit partial mappings. The result retains each
+    physical handle and owns its virtual mapping; no bytes move. Callers
+    retire every reader before dropping the result and synchronize writes
+    through aliased views.
+    """
+    return _extension().map_segments(parts)
 
 
 def export_handle(tensor: torch.Tensor) -> tuple[bytes, int, int] | None:
