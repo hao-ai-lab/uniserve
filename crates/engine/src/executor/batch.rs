@@ -38,12 +38,14 @@ pub struct RequestPlacement {
     /// Worker-local persistent spans for the call's buffer inputs and outputs.
     /// Request retirement retains every physical reader and writer allocation.
     pub buffers: Vec<BufferAllocation>,
-    /// Worker routed to each component that reads a media call's products,
-    /// keyed by component name. Admission fixes a media request's route, so
-    /// a product is published only toward the replicas that read it. Empty
-    /// for calls outside the video graph, whose readers are the destinations
-    /// of their transfer edges.
-    pub readers: BTreeMap<String, WorkerId>,
+    /// For a video request's call, the worker routed to each component that
+    /// reads its products, keyed by component name, as the request's graph
+    /// connects its calls; empty for a call whose products leave the graph.
+    /// Admission fixes a video request's route, so a product is published
+    /// only toward the replicas that read it. `None` for calls outside a
+    /// video graph, whose readers follow from their call kind
+    /// (`generation_consuming_calls`) or their transfer edges.
+    pub readers: Option<BTreeMap<String, WorkerId>>,
 }
 
 /// One logical executor submission. Its rank projections are derived only inside an executor.

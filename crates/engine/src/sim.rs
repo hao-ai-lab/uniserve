@@ -813,7 +813,8 @@ impl SimEngine {
                         .collect();
                 }
             }
-            CallKind::Media(MediaCall::TextEncoding)
+            CallKind::Media(MediaCall::MediaReading)
+            | CallKind::Media(MediaCall::TextEncoding)
             | CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {}
             CallKind::Transfer(TransferMode::Tensor)

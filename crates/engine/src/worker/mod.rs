@@ -54,6 +54,11 @@ pub struct WorkerProcessArgs {
     /// otherwise. Every rank verifies the checkpoint it loads against it and
     /// reports what it loaded; a launch fills it once before any rank starts.
     pub checkpoint_identity: Option<String>,
+    /// Local copy of the base checkpoint a component export at `model` pins,
+    /// passed to every rank, which verifies its revision from its Hugging
+    /// Face download records. Unset, ranks read the base from the Hugging
+    /// Face cache; a checkpoint that pins no base refuses one.
+    pub base_model: Option<std::path::PathBuf>,
     /// Ordered physical members of this WorkerGroup instance.
     pub ranks: Vec<crate::WorkerRank>,
     /// This process's own host identity. The engine owns exactly the ranks
@@ -140,8 +145,8 @@ pub struct WorkerProcessArgs {
     /// Optional text capacities, in prompt tokens, of a video denoiser's
     /// layouts, as a comma-separated increasing list.
     pub video_text_capacities: Option<String>,
-    /// Optional video output rasters a video worker prepares, as
-    /// comma-separated `HEIGHTxWIDTH`; `None` keeps the model's defaults.
+    /// Optional canvases a video worker prepares and admits, as
+    /// comma-separated `HEIGHTxWIDTH`; `None` prepares the denoiser's own.
     pub video_frame_sizes: Option<String>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
@@ -161,6 +166,11 @@ pub struct WorkerProcessArgs {
     pub max_model_len: u32,
     /// Maximum accepted video duration in seconds.
     pub max_video_seconds: f64,
+    /// Most denoiser rows a video request's conditions may take, which bounds
+    /// the condition products a video worker provisions.
+    pub max_condition_rows: u32,
+    /// The `ffmpeg` executable a media reader decodes reference videos with.
+    pub ffmpeg: std::path::PathBuf,
     /// Shortest video duration in seconds the serving API admits, which
     /// bounds the frame counts a video worker provisions from below; `None`
     /// provisions every frame count the model generates.

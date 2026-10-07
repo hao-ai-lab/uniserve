@@ -507,7 +507,8 @@ impl Scheduler {
                 | CallKind::Transfer(TransferMode::KvInstall),
             ) => 1,
             Some(CallKind::Media(
-                MediaCall::Denoising
+                MediaCall::MediaReading
+                | MediaCall::Denoising
                 | MediaCall::VideoDecoding
                 | MediaCall::AudioDecoding
                 | MediaCall::VideoEncoding

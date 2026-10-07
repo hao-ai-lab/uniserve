@@ -24,7 +24,12 @@ mod events;
 /// Handing a bound socket to a rank process at its launch.
 pub mod launch;
 mod media;
-pub use media::SharedMedia;
+mod video;
+pub use media::{MediaSource, SharedMedia};
+pub use video::{
+    AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
+    VideoCondition, VisionGrid,
+};
 /// Multimodal generation descriptors, resource bounds, and validation.
 pub mod generation;
 /// Counter-based Philox random-number generation.
@@ -33,9 +38,9 @@ pub mod philox;
 pub mod sampling;
 pub use codec::stats::ForwardStats;
 pub use events::{
-    ArtifactEvent, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
+    ArtifactEvent, Canvas, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
     EngineCoreOutput, FinishReason, MediaKind, PositionLogprobs, RejectionKind, Request,
-    RuntimeFamily, StopReason, TokenLogprob,
+    RuntimeFamily, StopReason, TokenLogprob, VideoTask,
 };
 pub use generation::{
     CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,

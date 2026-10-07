@@ -181,21 +181,129 @@ fn admission() -> NewRequest {
     .unwrap()
 }
 
+fn media_sampling() -> DiffusionSamplingParams {
+    DiffusionSamplingParams {
+        num_frames: 22,
+        video_units: 3,
+        num_inference_steps: 4,
+        seed: 17,
+        width: 1024,
+        height: 768,
+    }
+}
+
+/// A `t2va` admission: every prompt token is text.
 fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
+    let text_tags = vec![1; prompt_token_ids.len()];
     NewRequest::new_media(
         request_key(),
         u32::try_from(request_key().request_id.0).unwrap(),
         prompt_token_ids,
-        DiffusionSamplingParams {
-            num_frames: 22,
-            video_units: 3,
-            num_inference_steps: 4,
-            seed: 17,
-            height: 768,
-            width: 1344,
+        media_sampling(),
+        VideoAdmission {
+            task: uniserve_core::VideoTask::T2va,
+            text_tags,
+            conditions: Vec::new(),
         },
     )
     .unwrap()
+}
+
+/// One condition of each media kind: a cover-cropped keyframe, an image
+/// reference, a video reference with its soundtrack and an audio reference.
+fn reference_conditions() -> Vec<uniserve_core::VideoCondition> {
+    use uniserve_core::{
+        AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator,
+        VideoClip, VideoCondition, VisionGrid,
+    };
+
+    let canvas = Canvas {
+        width: 1024,
+        height: 768,
+    };
+    let source = |index: u32| MediaLocator {
+        name: format!("uniserve-media-7-{index}"),
+        bytes: 1_000 + u64::from(index),
+    };
+    let soundtrack = AudioClip {
+        sample_rate: 44_100,
+        start_sample: 22_050,
+        source_samples: 40_425,
+        samples: 29_334,
+    };
+    vec![
+        VideoCondition {
+            role: ConditionRole::LastFrame,
+            source: source(0),
+            media: ConditionMedia::Image(ImageFit {
+                resized: Canvas {
+                    width: 1365,
+                    height: 768,
+                },
+                left: 170,
+                top: 0,
+                size: canvas,
+            }),
+            vision: None,
+            latent_units: vec![768],
+            audio_rows: 0,
+        },
+        VideoCondition {
+            role: ConditionRole::Reference,
+            source: source(1),
+            media: ConditionMedia::Image(ImageFit {
+                resized: Canvas {
+                    width: 2048,
+                    height: 2048,
+                },
+                left: 0,
+                top: 0,
+                size: Canvas {
+                    width: 2048,
+                    height: 2048,
+                },
+            }),
+            vision: Some(ConditionVision {
+                grid: VisionGrid {
+                    t: 1,
+                    h: 128,
+                    w: 128,
+                },
+                tokens: 4096,
+                frame_indices: Vec::new(),
+            }),
+            latent_units: vec![4096],
+            audio_rows: 0,
+        },
+        VideoCondition {
+            role: ConditionRole::Reference,
+            source: source(2),
+            media: ConditionMedia::Video {
+                clip: VideoClip {
+                    canvas,
+                    start_frame: 12,
+                    frames: 22,
+                    vae_frames: 22,
+                },
+                soundtrack: Some(soundtrack),
+            },
+            vision: Some(ConditionVision {
+                grid: VisionGrid { t: 1, h: 32, w: 48 },
+                tokens: 384,
+                frame_indices: vec![0, 12],
+            }),
+            latent_units: vec![3840, 1536],
+            audio_rows: 74,
+        },
+        VideoCondition {
+            role: ConditionRole::Reference,
+            source: source(3),
+            media: ConditionMedia::Audio(soundtrack),
+            vision: None,
+            latent_units: Vec::new(),
+            audio_rows: 74,
+        },
+    ]
 }
 
 /// Encodes `batch` as a submit request, decodes it, and returns the decoded batch.
@@ -991,6 +1099,74 @@ fn new_request_round_trips() {
     assert_eq!(batch.admissions().next(), Some(&admission()));
 }
 
+/// A `ref2va` admission keeps its task, presentation tags and every
+/// condition's media, conditioner view and rows across the wire.
+#[test]
+fn conditioned_media_admission_round_trips() {
+    let admission = NewRequest::new_media(
+        request_key(),
+        u32::try_from(request_key().request_id.0).unwrap(),
+        vec![5, 6, 7, 8],
+        media_sampling(),
+        VideoAdmission {
+            task: uniserve_core::VideoTask::Ref2va,
+            text_tags: vec![1, 0, 0, 1],
+            conditions: reference_conditions(),
+        },
+    )
+    .unwrap();
+    let request = WorkerRequest::submit(batch_with_calls(
+        5,
+        vec![admission.clone()],
+        vec![call_for(
+            CallKind::Media(MediaCall::MediaReading),
+            CallId::new(12, 0),
+        )],
+    ));
+
+    let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+    assert_eq!(
+        decoded.batch().unwrap().admissions().next(),
+        Some(&admission)
+    );
+}
+
+/// A video admission whose tags do not cover its prompt, or whose `t2va`
+/// task carries conditions, is refused.
+#[test]
+fn inconsistent_media_admissions_are_refused() {
+    let admit = |task, text_tags: Vec<u8>, conditions| {
+        NewRequest::new_media(
+            request_key(),
+            1,
+            vec![5, 6, 7],
+            media_sampling(),
+            VideoAdmission {
+                task,
+                text_tags,
+                conditions,
+            },
+        )
+    };
+    assert!(admit(uniserve_core::VideoTask::T2va, vec![1, 1], Vec::new()).is_err());
+    assert!(
+        admit(
+            uniserve_core::VideoTask::T2va,
+            vec![1, 1, 1],
+            reference_conditions()
+        )
+        .is_err()
+    );
+    assert!(
+        admit(
+            uniserve_core::VideoTask::Ref2va,
+            vec![1, 1, 1],
+            reference_conditions()
+        )
+        .is_ok()
+    );
+}
+
 #[test]
 fn maximum_media_prompt_round_trips() {
     let prompt_token_ids = (0..16_384_u32).map(|index| 100_000 + index).collect();
@@ -1193,17 +1369,38 @@ fn worker_info_round_trips() {
             components: vec![ComponentInfo {
                 name: "denoiser".into(),
                 config: ComponentConfig::parallel((0..count).rev().collect(), config),
-                outputs: vec![OutputInfo {
-                    name: "conditioning".into(),
-                    dtype: DType::BF16,
-                    shape_bound: ShapeBound {
-                        dims: vec![
-                            DimBound::Static(1),
-                            DimBound::Device { max: 16384 },
-                            DimBound::Static(2560),
-                        ],
+                outputs: vec![
+                    OutputInfo {
+                        name: "conditioning".into(),
+                        dtype: DType::BF16,
+                        shape_bound: ShapeBound {
+                            dims: vec![
+                                DimBound::Static(1),
+                                DimBound::Device { max: 16384 },
+                                DimBound::Static(2560),
+                            ],
+                        },
+                        raster_axes: None,
                     },
-                }],
+                    // A product laid out at the request's raster names it.
+                    OutputInfo {
+                        name: "video_units".into(),
+                        dtype: DType::U8,
+                        shape_bound: ShapeBound {
+                            dims: vec![
+                                DimBound::Device { max: 8 },
+                                DimBound::Static(22),
+                                DimBound::Static(1344),
+                                DimBound::Static(1536),
+                                DimBound::Static(3),
+                            ],
+                        },
+                        raster_axes: Some(RasterAxes {
+                            height: 2,
+                            width: 3,
+                        }),
+                    },
+                ],
             }],
             ..Default::default()
         };
@@ -1225,7 +1422,10 @@ fn kv_free_worker_info_round_trips() {
     let info = WorkerInfo {
         media_components: video_components(),
         num_inference_steps: 4,
-        supported_calls: MediaCall::VIDEO.into_iter().map(CallKind::Media).collect(),
+        supported_calls: video_components()
+            .into_keys()
+            .map(CallKind::Media)
+            .collect(),
         kv_cache: None,
         latent_page_units: 64,
         latent_pages: 3,

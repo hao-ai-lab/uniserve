@@ -319,3 +319,73 @@ def test_vision_rows_must_cover_the_placeholders(models):
         model.encode((ids,), visual=(torch.zeros(3, 3 * HIDDEN),))
     with pytest.raises(ValueError, match="placeholders"):
         model.encode((ids,), visual=(None,))
+
+
+class _Conditioner(nn.Module):
+    """A model whose conditioner encodes both prompts and vision blocks."""
+
+    config = None
+
+    def __init__(self, encoder):
+        super().__init__()
+        self.text_encoder = encoder
+
+
+def entry_points(config):
+    """Declare ``_Conditioner``'s one component, as a model package does.
+
+    The component exposes ``encode`` on both the conditioner and its vision
+    tower; the worker runs each by its own module.
+    """
+    from uniserve.model import ComponentEntry, EntryPoint
+
+    return {
+        "text_encoder": ComponentEntry(
+            "text_encoder", (EntryPoint("encode"), EntryPoint("vision.encode"))
+        )
+    }
+
+
+def test_worker_vision_and_text_path_follows_the_reference(models):
+    from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.execution.model_executor import ModelExecutor
+
+    reference, model = models
+    (image, image_grid), (video, video_grid) = _media()
+    ids = [1, START, *(IMAGE,) * 6, END, 3, START, *(VIDEO,) * 4, END]
+    ids += [5, START, *(VIDEO,) * 4, END, 6]
+    input_ids = torch.tensor([ids])
+    types = torch.zeros_like(input_ids)
+    types[input_ids == IMAGE] = 1
+    types[input_ids == VIDEO] = 2
+    with torch.no_grad():
+        expected = reference.model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            mm_token_type_ids=types,
+            pixel_values=image,
+            image_grid_thw=torch.tensor([image_grid]),
+            pixel_values_videos=video,
+            video_grid_thw=torch.tensor([video_grid]),
+            use_cache=False,
+            output_hidden_states=True,
+        ).hidden_states[len(_RETAINED)][0]
+
+    runner = ModelExecutor(_Conditioner(model), WorkerConfig(device="cpu"))
+    try:
+        rows = runner.encode_vision(
+            VisionInput(
+                (image, video),
+                (torch.tensor([image_grid]), torch.tensor([video_grid])),
+                (image_grid, video_grid),
+            )
+        ).values
+        (actual,) = runner.encode_text(
+            ids,
+            visual=torch.cat(rows),
+            image_grids=(image_grid,),
+            video_grids=(video_grid,),
+        ).values
+    finally:
+        runner.close()
+    _close(actual, expected)

@@ -69,7 +69,11 @@ class RefinerBlock(nn.Module):
             config.hidden_size,
             bias=False,
         )
-        self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
+        self.mlp = GatedMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            rounding=config.rounding,
+        )
 
     def forward(
         self, hidden: torch.Tensor, visible: VisibleInput | None = None
@@ -144,7 +148,7 @@ class TokenRefiner(nn.Module):
             visible = VisibleInput(
                 counts,
                 counts,
-                lengths.unsqueeze(1).expand(documents, rows).contiguous(),
+                lengths.reshape(documents, 1),
                 None,
                 prefix_bounds=True,
                 fully_visible=False,

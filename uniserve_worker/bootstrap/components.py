@@ -26,6 +26,7 @@ from torch import nn
 from uniserve.distributed import DeviceMesh, communicators
 from uniserve.model import (
     AudioDecoder,
+    AudioEncoder,
     CausalLM,
     ComponentEntry,
     Denoiser,
@@ -34,6 +35,7 @@ from uniserve.model import (
     PatchEncoder,
     TextEncoder,
     VideoDecoder,
+    VideoEncoder,
     VideoPostprocessor,
 )
 from uniserve.nn.vae import PatchAutoencoder
@@ -52,12 +54,16 @@ from uniserve_worker.protocol.call import (
 
 # Host components run on a host worker's ranks and own no numerical method, so
 # the worker declares them rather than the model, which declares numerical
-# components only. The video encoder encodes the media units the video decoder
-# reconstructs; the muxer encodes the audio track and assembles the artifact.
-VIDEO_ENCODER_COMPONENT = "video_encoder"
+# components only. The media reader decodes a request's condition media into
+# the inputs of the vision and latent encoders; the video codec encodes the
+# media units the video decoder reconstructs; the muxer encodes the audio
+# track and assembles the artifact.
+MEDIA_READER_COMPONENT = "media_reader"
+VIDEO_CODEC_COMPONENT = "video_codec"
 MUXER_COMPONENT = "muxer"
 HOST_COMPONENTS: Mapping[str, frozenset[MediaCall]] = {
-    VIDEO_ENCODER_COMPONENT: frozenset({MediaCall.VIDEO_ENCODING}),
+    MEDIA_READER_COMPONENT: frozenset({MediaCall.MEDIA_READING}),
+    VIDEO_CODEC_COMPONENT: frozenset({MediaCall.VIDEO_ENCODING}),
     MUXER_COMPONENT: frozenset({MediaCall.AUDIO_ENCODING, MediaCall.MUXING}),
 }
 #: The muxer's calls, which ``bind_components`` records as its call kinds.
@@ -75,8 +81,9 @@ def is_host_component(name: str) -> bool:
 def holds_host_components(names: Iterable[str]) -> bool:
     """Report whether a rank holding these components is a codec slot.
 
-    A host rank runs one codec task at a time in its own process: one media
-    unit's encode, the audio track's, or one step of a container's assembly.
+    A host rank runs one codec task at a time in its own process: one
+    request's media read, one media unit's encode, the audio track's, or one
+    step of a container's assembly.
     """
     return any(is_host_component(name) for name in names)
 
@@ -108,7 +115,9 @@ def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
                 kinds.add(MediaCall.TEXT_ENCODING)
             elif isinstance(module, PatchEncoder):
                 kinds.add(MediaCall.VISION_ENCODING)
-            elif isinstance(module, PatchAutoencoder):
+            elif isinstance(
+                module, (PatchAutoencoder, VideoEncoder, AudioEncoder)
+            ):
                 kinds.add(MediaCall.LATENT_ENCODING)
             # ``TextEncoder`` and ``PatchEncoder`` subclass ``Encoder``, so
             # the generic encoder is matched only after them.
@@ -362,13 +371,13 @@ def validate_components(
         WorkerError: With ``UNSUPPORTED_SETUP`` when ``describe_components``
             refuses the model, the placement names an undeclared component, a
             non-host component has no calls, or a component's
-            ``distribution`` does not fit its calls. The muxer is never
-            distributed; the video encoder and a component with a
-            ``VideoDecoder`` call require ``temporal_units`` with one unit per
-            rank; a component with an ``AudioDecoder`` call and no
-            ``VideoDecoder`` call accepts no distribution or
-            ``temporal_units`` with at least one unit per rank; every other
-            component accepts no distribution.
+            ``distribution`` does not fit its calls. The muxer and the
+            media reader are never distributed; the video codec and a
+            component with a ``VideoDecoder`` call require ``temporal_units``
+            with one unit per rank; a component with an ``AudioDecoder`` or
+            ``VideoEncoder`` call and no ``VideoDecoder`` call accepts no
+            distribution or ``temporal_units`` with at least one unit per
+            rank; every other component accepts no distribution.
     """
     declared = (
         describe_components(model, entries=entries)
@@ -389,7 +398,15 @@ def validate_components(
                 raise unsupported_setup(
                     "the muxer assembles one artifact and is not distributed"
                 )
-            if name == VIDEO_ENCODER_COMPONENT and (
+            if (
+                name == MEDIA_READER_COMPONENT
+                and component.distribution is not None
+            ):
+                raise unsupported_setup(
+                    "the media reader reads one request's conditions on one "
+                    "rank and is not distributed"
+                )
+            if name == VIDEO_CODEC_COMPONENT and (
                 component.distribution != "temporal_units"
                 or component.units_per_rank != 1
             ):
@@ -407,17 +424,21 @@ def validate_components(
                     "video decoding requires temporal_units with one native "
                     "unit per rank"
                 )
-        elif any(isinstance(call.module, AudioDecoder) for call in calls):
+        elif any(
+            isinstance(call.module, (AudioDecoder, VideoEncoder))
+            for call in calls
+        ):
             # An audio media unit is a span of the latent timeline rather than
-            # a native window, so a rank may reconstruct several of them, but
-            # the division is still by media unit.
+            # a native window, and a condition's encoding unit is one of its
+            # encoder windows, so a rank may take several of them, but the
+            # division is still by media unit.
             if component.distribution not in (None, "temporal_units") or (
                 component.distribution is not None
                 and component.units_per_rank < 1
             ):
                 raise unsupported_setup(
-                    "audio decoding distributes by temporal_units with at "
-                    "least one media unit per rank"
+                    f"{name} distributes by temporal_units with at least one "
+                    "media unit per rank"
                 )
         elif component.distribution is not None:
             raise unsupported_setup(

@@ -53,8 +53,11 @@ class ForwardMode(StrEnum):
 
 
 class MediaCall(StrEnum):
-    """A concrete encoder, diffusion, decoder, or media-output computation."""
+    """A concrete media reading, encoder, diffusion, or decoder computation."""
 
+    # Decodes a video request's condition media on a host rank into the
+    # inputs of the vision and latent encoders.
+    MEDIA_READING = "media_reading"
     VISION_ENCODING = "vision_encoding"
     LATENT_ENCODING = "latent_encoding"
     TEXT_ENCODING = "text_encoding"
@@ -77,19 +80,6 @@ class TransferMode(StrEnum):
 
 
 CallKind: TypeAlias = ForwardMode | MediaCall | TransferMode
-
-# The media calls needed to produce a video with its audio track; mirrors the
-# Rust `MediaCall::VIDEO` set.
-VIDEO_CALLS = (
-    MediaCall.TEXT_ENCODING,
-    MediaCall.LATENT_PREPARATION,
-    MediaCall.DENOISING,
-    MediaCall.VIDEO_DECODING,
-    MediaCall.AUDIO_DECODING,
-    MediaCall.VIDEO_ENCODING,
-    MediaCall.AUDIO_ENCODING,
-    MediaCall.MUXING,
-)
 
 # Every call kind a worker may execute, in the order of the Rust
 # `CallKind::ALL`. Worker reports list supported calls in this order.

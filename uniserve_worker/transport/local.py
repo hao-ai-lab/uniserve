@@ -34,7 +34,11 @@ from uniserve_worker.transport.layout import (
     region_view,
     tensor_nbytes,
 )
-from uniserve_worker.transport.pool import TransferCapacity, TransferPool
+from uniserve_worker.transport.pool import (
+    ReadReservation,
+    TransferCapacity,
+    TransferPool,
+)
 from uniserve_worker.transport.ticket import TransferTicket
 
 if TYPE_CHECKING:
@@ -93,9 +97,6 @@ class LocalTransport(Transport):
         self.source = source or WorkerEndpoint.local()
         self._table: dict[int, _LocalSource] = {}
         self._borrowed: weakref.WeakSet[TransferTicket] = weakref.WeakSet()
-        # Borrowed views draw on the same read-ticket semaphore as the copies
-        # `TransferPool` submits.
-        self._borrow_slots = capacity.read_slots
         self._events = event_pool
         self._next = 0
         self._completion_wake: Any = None
@@ -103,7 +104,7 @@ class LocalTransport(Transport):
         self._endpoint = f"local:{uuid.uuid4().hex}"
         with _endpoint_lock:
             _endpoints[self._endpoint] = self
-        self._bytes = capacity
+        self.capacity = capacity
         self._reads = TransferPool(
             workers=2,
             capacity=capacity,
@@ -159,7 +160,7 @@ class LocalTransport(Transport):
         first = t[0] if isinstance(t, tuple) else t
         self._events.reap()
         nbytes = tensor_nbytes(t)
-        self._bytes.acquire(nbytes)
+        self.capacity.acquire(nbytes)
 
         # A CUDA source carries a producer fence recorded on the caller's
         # current stream; readers order their copies behind it.
@@ -187,7 +188,7 @@ class LocalTransport(Transport):
                 offset=offset,
                 device=str(first.device),
             )
-            self._table[key] = _LocalSource(t, event, self._bytes, locator)
+            self._table[key] = _LocalSource(t, event, self.capacity, locator)
         return locator
 
     def set_completion_wake(self, wake: Any) -> None:
@@ -201,6 +202,7 @@ class LocalTransport(Transport):
         device: torch.device,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
+        reservation: ReadReservation | None = None,
     ) -> TransferTicket:
         """Borrow or copy from a verified publisher in this address space.
 
@@ -268,6 +270,7 @@ class LocalTransport(Transport):
                     event,
                     nbytes=locator.nbytes,
                     destination=target,
+                    reservation=reservation,
                 )
                 ticket.add_retirement_callback(
                     lambda: owner._release_reader(source)
@@ -276,10 +279,14 @@ class LocalTransport(Transport):
 
             # Borrow path: no copy. The source views themselves are handed out
             # and the reader count drops when every consumer stream completes.
-            if not self._borrow_slots.acquire(blocking=False):
-                raise resource_error(
-                    "local borrowed-view ticket capacity is exhausted"
+            # A borrowed view holds a read ticket, like the copies
+            # `TransferPool` submits, until then.
+            if reservation is None:
+                self.capacity.take_reads(
+                    message="local borrowed-view ticket capacity is exhausted"
                 )
+            else:
+                reservation.use()
             try:
                 ticket = TransferTicket(owner._events)
                 if self._completion_wake is not None:
@@ -291,7 +298,7 @@ class LocalTransport(Transport):
                 )
                 self._borrowed.add(ticket)
             except BaseException:
-                self._borrow_slots.release()
+                self.capacity.return_reads()
                 raise
             return ticket
         except BaseException:
@@ -307,7 +314,7 @@ class LocalTransport(Transport):
         self, owner: LocalTransport, source: _LocalSource
     ) -> None:
         owner._release_reader(source)
-        self._borrow_slots.release()
+        self.capacity.return_reads()
 
     def _reclaim(self, source: _LocalSource) -> None:
         # A source is handed back once, after new reads were revoked and its

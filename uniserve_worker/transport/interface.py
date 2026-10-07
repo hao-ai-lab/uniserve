@@ -22,6 +22,11 @@ from uniserve_worker.transport.ticket import TransferTicket
 if TYPE_CHECKING:
     import torch
 
+    from uniserve_worker.transport.pool import (
+        ReadReservation,
+        TransferCapacity,
+    )
+
 
 class TransportKind(StrEnum):
     """Selects in-process, shared storage, device, or rank-channel transport."""
@@ -37,10 +42,15 @@ TRANSPORTS = tuple(kind.value for kind in TransportKind)
 
 
 class Transport(ABC):
-    """Bounded physical publications and asynchronous reads per endpoint."""
+    """Bounded physical publications and asynchronous reads per endpoint.
+
+    ``capacity`` is the rank's byte and read-ticket budget, which every
+    transport `make_transports` builds for the rank shares.
+    """
 
     name: ClassVar[str]
     source: WorkerEndpoint
+    capacity: TransferCapacity
 
     @abstractmethod
     def endpoint(self) -> str:
@@ -95,6 +105,7 @@ class Transport(ABC):
         device: torch.device,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
+        reservation: ReadReservation | None = None,
     ) -> TransferTicket:
         """Read into one tensor or ordered first-axis spans on the device.
 
@@ -102,7 +113,9 @@ class Transport(ABC):
         without dtype conversion. Backend layout restrictions are checked before
         submission. One ticket and one completion fence cover the whole read.
         An omitted destination lets the backend allocate one, or, for `local`,
-        borrow the published views themselves.
+        borrow the published views themselves. The read uses a ticket of
+        ``reservation``, or takes one of ``capacity``'s without one, and
+        raises `ReadBackpressureError` when none is free.
         """
 
     @abstractmethod

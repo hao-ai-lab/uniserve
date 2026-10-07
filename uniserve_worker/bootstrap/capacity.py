@@ -76,7 +76,9 @@ from uniserve_worker.storage.tensor_store import (
 # further batches of ``max_batch_calls`` calls.
 _DEVICE_PRODUCTS_PER_CALL = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
-# Upper bound on ``ArenaCapacity.transfer_tickets``.
+# Upper bound on the reads ``ArenaCapacity.transfer_tickets`` lets a rank
+# keep in flight for its queued calls; see ``request_tensor_arena_capacity``
+# for the floor a request-tensor rank keeps above it.
 _MAX_TRANSFER_ENTRIES = 256
 # A token worker's host-lane bound; request-tensor workers derive theirs.
 _HOST_LANE_INFLIGHT = 256
@@ -334,6 +336,10 @@ def local_product_storage_bytes(
     # These are the concrete persistent Tensor consumers of the video path.
     # Denoising state is resident; encoders consume decoded output buffers.
     for source_call, destination_call in (
+        (MediaCall.MEDIA_READING, MediaCall.VISION_ENCODING),
+        (MediaCall.MEDIA_READING, MediaCall.LATENT_ENCODING),
+        (MediaCall.VISION_ENCODING, MediaCall.TEXT_ENCODING),
+        (MediaCall.LATENT_ENCODING, MediaCall.LATENT_PREPARATION),
         (MediaCall.TEXT_ENCODING, MediaCall.LATENT_PREPARATION),
         (MediaCall.DENOISING, MediaCall.VIDEO_DECODING),
         (MediaCall.DENOISING, MediaCall.AUDIO_DECODING),
@@ -633,7 +639,16 @@ def request_tensor_arena_capacity(
             + relay_bytes
         ),
         transfer_bytes=max(1, state_slots * product_bytes_per_request),
-        transfer_tickets=max(1, min(slots, _MAX_TRANSFER_ENTRIES)),
+        # Read tickets bound the reads in flight: a ticket returns when its
+        # read retires, and a batch whose imports need more than are free
+        # waits for returns (``Executor.advance_inputs``). One product's reads
+        # start together, and a product is written by at most every rank of
+        # the group producing it, so the rank keeps at least its own group's
+        # world size: the products it reads in several regions come from its
+        # own group's sequence-parallel or distributed components.
+        transfer_tickets=max(
+            int(worker_config.world_size), min(slots, _MAX_TRANSFER_ENTRIES)
+        ),
         host_lane_inflight=state_slots * (unresolved_window + 1),
     )
 
@@ -650,7 +665,7 @@ def artifact_import_regions(
     time, and the muxer reads every round. Each round holds one media unit per
     participating rank and the muxer produced one of them itself.
     """
-    components = media_components(model)
+    components = media_components(model, worker_config.deployment_components)
     encoder = components.get(MediaCall.VIDEO_ENCODING)
     binding = None if encoder is None else bindings.get(encoder)
     decoder = capability(model, VideoDecoder)
@@ -658,7 +673,7 @@ def artifact_import_regions(
     if binding is None or decoder is None or builder is None:
         return 0
     ranks = len(binding.config.ranks)
-    units = len(decoder.frame_slices(builder.max_frames))
+    units = len(decoder.frame_slices(builder.maximum.num_frames))
     return ceil_div(units, ranks) * max(0, ranks - 1)
 
 
@@ -721,7 +736,9 @@ def model_arena_capacity(
             product_bytes_per_request=local_product_storage_bytes(
                 resolve_outputs(model, worker_config),
                 bindings=bindings or {},
-                media_components=media_components(model),
+                media_components=media_components(
+                    model, worker_config.deployment_components
+                ),
             ),
             concurrent_imports=artifact_import_regions(
                 model, worker_config, bindings=bindings or {}
@@ -1015,7 +1032,9 @@ def resolve_request_capacity(
                 product_bytes = local_product_storage_bytes(
                     resolve_outputs(model, worker_config),
                     bindings=bindings or {},
-                    media_components=media_components(model),
+                    media_components=media_components(
+                        model, worker_config.deployment_components
+                    ),
                 )
                 arena = request_tensor_arena_capacity(
                     capacity_config,

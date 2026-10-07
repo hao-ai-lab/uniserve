@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
+from uniserve.model import ConditionTiles
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.protocol.call import (
@@ -295,6 +296,97 @@ class ComponentInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class VideoDenoiserInfo:
+    """What the video denoiser a deployment places serves.
+
+    Mirrors the Rust ``VideoDenoiserInfo``. ``schedule_points`` counts the
+    fixed schedule's sigma points, the clean endpoint included; ``canvases``
+    lists the only canvases the deployment serves, those it prepares;
+    ``max_sequence_rows`` is the checkpoint's packed sequence capacity,
+    ``None`` when the checkpoint sets none; ``condition_tiles`` is the
+    whole-tile condition packing of a multi-region denoiser, ``None`` for
+    dense packing.
+    """
+
+    tasks: tuple[str, ...]
+    schedule_points: int
+    video_shift: float
+    audio_shift: float
+    canvases: tuple[tuple[int, int], ...] = ()
+    max_sequence_rows: int | None = None
+    condition_tiles: ConditionTiles | None = None
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "tasks": list(self.tasks),
+            "schedule_points": self.schedule_points,
+            "video_shift": self.video_shift,
+            "audio_shift": self.audio_shift,
+            "canvases": [
+                {"width": width, "height": height}
+                for width, height in self.canvases
+            ],
+            "max_sequence_rows": self.max_sequence_rows,
+            "condition_tiles": None
+            if self.condition_tiles is None
+            else {
+                "rows": self.condition_tiles.rows,
+                "video": list(self.condition_tiles.video),
+            },
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str) -> VideoDenoiserInfo:
+        data = _map(value, where)
+        rows = data.get("max_sequence_rows")
+        tiles = data.get("condition_tiles")
+        if tiles is not None:
+            tiles = _map(tiles, f"{where}.condition_tiles")
+            video = tuple(
+                _uint(size, f"{where}.condition_tiles.video")
+                for size in _seq(
+                    tiles.get("video", ()), f"{where}.condition_tiles.video"
+                )
+            )
+            try:
+                tiles = ConditionTiles(
+                    _uint(tiles.get("rows"), f"{where}.condition_tiles.rows"),
+                    video,  # type: ignore[arg-type]
+                )
+            except ValueError as error:
+                raise invalid_descriptor(
+                    f"{where}.condition_tiles: {error}"
+                ) from None
+        return cls(
+            tasks=tuple(
+                _str(task, f"{where}.tasks")
+                for task in _seq(data.get("tasks", ()), f"{where}.tasks")
+            ),
+            schedule_points=_uint(
+                data.get("schedule_points"), f"{where}.schedule_points"
+            ),
+            video_shift=float(data.get("video_shift", 0.0)),
+            audio_shift=float(data.get("audio_shift", 0.0)),
+            canvases=tuple(
+                (
+                    _uint(canvas.get("width"), f"{where}.canvases"),
+                    _uint(canvas.get("height"), f"{where}.canvases"),
+                )
+                for canvas in (
+                    _map(item, f"{where}.canvases")
+                    for item in _seq(
+                        data.get("canvases", ()), f"{where}.canvases"
+                    )
+                )
+            ),
+            max_sequence_rows=None
+            if rows is None
+            else _uint(rows, f"{where}.max_sequence_rows"),
+            condition_tiles=tiles,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerInfo:
     """Describes a worker’s capabilities, topology, and resource bounds.
 
@@ -348,6 +440,8 @@ class WorkerInfo:
     fabric_handles: bool = False
     media_components: dict[MediaCall, str] = field(default_factory=dict)
     num_inference_steps: int = 0
+    # What the deployment's video denoiser serves; ``None`` without one.
+    video_denoiser: VideoDenoiserInfo | None = None
 
     def output_rank(self, component: str) -> int:
         """Return the rank that publishes a component's host products.
@@ -502,6 +596,11 @@ class WorkerInfo:
                 data.get("num_inference_steps", 0),
                 f"{where}.num_inference_steps",
             ),
+            video_denoiser=None
+            if data.get("video_denoiser") is None
+            else VideoDenoiserInfo.from_mapping(
+                data["video_denoiser"], f"{where}.video_denoiser"
+            ),
             model_dtype=_str(
                 data.get("model_dtype", ""), f"{where}.model_dtype"
             ),
@@ -603,6 +702,9 @@ class WorkerInfo:
                 for call, component in self.media_components.items()
             },
             "num_inference_steps": self.num_inference_steps,
+            "video_denoiser": None
+            if self.video_denoiser is None
+            else self.video_denoiser.to_mapping(),
             "model_name": self.model_name,
             "endpoint": self.endpoint.to_mapping(),
             "device": self.device,

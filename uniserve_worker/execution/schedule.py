@@ -7,8 +7,8 @@ dependency frontiers: each round selects every live call whose in-batch
 producers have completed. A frontier containing model-forward work runs
 through the numerical helpers in ``forward``; any other frontier dispatches
 each call to its owning module (``transfer``, ``diffusion``, ``image``,
-``host_media`` or ``media``). Outcomes stay provisional until
-``commit.commit_batch`` publishes them.
+``media_reader``, ``conditions``, ``host_media`` or ``media``). Outcomes stay
+provisional until ``commit.commit_batch`` publishes them.
 """
 
 from __future__ import annotations
@@ -164,18 +164,22 @@ def _execute_ready_actions(
     Each call dispatches by kind to its owning module and runs inside
     ``state.scope()``, which makes the batch stream current when the batch
     has one. On a video worker (``video_postprocessor`` set), device
-    computation such as denoising and decode rounds also lands here through
-    ``media.execute``. Calls that already have an outcome are skipped.
+    computation also lands here: a request's vision and condition latent
+    encodings through ``conditions``, and denoising and decode rounds
+    through ``media.execute``. Calls that already have an outcome are
+    skipped.
 
     Raises:
         WorkerError: ``invalid_descriptor`` when no module serves the call's
             kind on this worker.
     """
     from uniserve_worker.execution import (
+        conditions,
         diffusion,
         host_media,
         image,
         media,
+        media_reader,
         transfer,
     )
     from uniserve_worker.execution.host_media import HOST_MEDIA_CALLS
@@ -213,6 +217,36 @@ def _execute_ready_actions(
                     request_tables=request_tables,
                     model_runner=model_runner,
                     config=config,
+                    state=state,
+                )
+            elif call.kind is MediaCall.MEDIA_READING:
+                result = media_reader.execute(
+                    call,
+                    tensor_store=tensor_store,
+                    publication_transports=publication_transports,
+                    model_runner=model_runner,
+                    state=state,
+                )
+            elif (
+                call.kind is MediaCall.VISION_ENCODING
+                and model_runner.video_postprocessor is not None
+            ):
+                result = conditions.encode_vision(
+                    call,
+                    tensor_store=tensor_store,
+                    publication_transports=publication_transports,
+                    model_runner=model_runner,
+                    state=state,
+                )
+            elif (
+                call.kind is MediaCall.LATENT_ENCODING
+                and model_runner.video_postprocessor is not None
+            ):
+                result = conditions.encode_latents(
+                    call,
+                    tensor_store=tensor_store,
+                    publication_transports=publication_transports,
+                    model_runner=model_runner,
                     state=state,
                 )
             elif call.kind is MediaCall.TEXT_ENCODING:
@@ -321,17 +355,22 @@ def _execute_calls(
                 f"call products contain an unresolved dependency: {blocked!r}"
             )
 
-        # KV-conditioned image denoising and decoding run as forward rows; a
-        # standalone denoiser's calls are media actions. When the frontier
-        # holds forward work, only those calls run in this round; the other
-        # ready calls stay live and run in a later round.
+        # KV-conditioned image denoising and decoding, and image encodings,
+        # run as forward rows; a standalone denoiser's calls, a video
+        # request's condition encodings included, are media actions. When
+        # the frontier holds forward work, only those calls run in this
+        # round; the other ready calls stay live and run in a later round.
         images = model_runner.image_builder is not None
+        videos = model_runner.video_postprocessor is not None
         numerical = tuple(
             index
             for index in frontier
             if isinstance(scheduled[index].kind, ForwardMode)
-            or scheduled[index].kind
-            in {MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING}
+            or (
+                not videos
+                and scheduled[index].kind
+                in {MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING}
+            )
             or (
                 images
                 and scheduled[index].kind

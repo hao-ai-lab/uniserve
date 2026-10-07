@@ -11,15 +11,12 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 from safetensors.torch import save_file
 
 from tests.python.fixtures.checkpoints import bagel_checkpoint
+from tests.python.fixtures.h3 import dmd_denoiser
 from uniserve import loading
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights
 from uniserve_models import bagel
-from uniserve_models.minimax_h3 import (
-    DiffusionConfig,
-    Transformer,
-    TransformerConfig,
-)
+from uniserve_models.minimax_h3 import Transformer, TransformerConfig
 from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
 from uniserve_models.minimax_h3.weights import transformer_component
 
@@ -106,17 +103,26 @@ def test_h3_loading_rejects_unknown_records_on_each_pipeline_stage(
         )
     save_file(source, tmp_path / "model.safetensors")
 
+    denoiser = dmd_denoiser(config)
+
     def load():
         return loading.load_model(
-            Transformer,
-            config,
+            lambda value: Transformer(
+                value,
+                attention=denoiser.attention,
+                entries=8,
+                steps=4,
+                groups=2,
+            ),
+            # The FastH3 student's transformer, which rounds once.
+            denoiser.transformer,
             checkpoint=(
                 checkpoint.Config("denoiser").resolve(
                     tmp_path, io=loading.Config()
                 ),
             ),
             mapping=lambda model: (
-                transformer_component(model, DiffusionConfig()),
+                transformer_component(model, denoiser, "denoiser"),
             ),
             device="cpu",
             meshes={"": _pipeline(rank)},

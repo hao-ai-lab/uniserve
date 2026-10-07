@@ -256,8 +256,112 @@ fn diffusion<'a>(
             video_units: v.video_units,
             num_inference_steps: v.num_inference_steps,
             seed: v.seed,
-            height: v.height,
             width: v.width,
+            height: v.height,
+        },
+    )
+}
+
+fn canvas(value: uniserve_core::Canvas) -> fbs::Canvas {
+    fbs::Canvas::new(value.width, value.height)
+}
+
+fn audio_clip(value: &uniserve_core::AudioClip) -> fbs::AudioClip {
+    fbs::AudioClip::new(
+        value.sample_rate,
+        value.start_sample,
+        value.source_samples,
+        value.samples,
+    )
+}
+
+fn video_condition<'a>(
+    b: &mut FlatBufferBuilder<'a>,
+    v: &uniserve_core::VideoCondition,
+) -> WIPOffset<fbs::VideoCondition<'a>> {
+    use uniserve_core::{ConditionMedia, ConditionRole};
+
+    let source_name = Some(b.create_string(&v.source.name));
+    let vision = v.vision.as_ref().map(|vision| {
+        let frame_indices = Some(b.create_vector(&vision.frame_indices));
+        fbs::ConditionVision::create(
+            b,
+            &fbs::ConditionVisionArgs {
+                grid: Some(&fbs::VisionGrid::new(
+                    vision.grid.t,
+                    vision.grid.h,
+                    vision.grid.w,
+                )),
+                tokens: vision.tokens,
+                frame_indices,
+            },
+        )
+    });
+    let latent_units = Some(b.create_vector(&v.latent_units));
+    let (image, video, audio) = match &v.media {
+        ConditionMedia::Image(fit) => (
+            Some(fbs::ImageFit::new(
+                &canvas(fit.resized),
+                fit.left,
+                fit.top,
+                &canvas(fit.size),
+            )),
+            None,
+            None,
+        ),
+        ConditionMedia::Video { clip, soundtrack } => (
+            None,
+            Some(fbs::VideoClip::new(
+                &canvas(clip.canvas),
+                clip.start_frame,
+                clip.frames,
+                clip.vae_frames,
+            )),
+            soundtrack.as_ref().map(audio_clip),
+        ),
+        ConditionMedia::Audio(clip) => (None, None, Some(audio_clip(clip))),
+    };
+    fbs::VideoCondition::create(
+        b,
+        &fbs::VideoConditionArgs {
+            role: match v.role {
+                ConditionRole::FirstFrame => fbs::ConditionRole::FirstFrame,
+                ConditionRole::LastFrame => fbs::ConditionRole::LastFrame,
+                ConditionRole::Reference => fbs::ConditionRole::Reference,
+            },
+            source_name,
+            source_bytes: v.source.bytes,
+            image: image.as_ref(),
+            video: video.as_ref(),
+            audio: audio.as_ref(),
+            vision,
+            latent_units,
+            audio_rows: v.audio_rows,
+        },
+    )
+}
+
+fn video_admission<'a>(
+    b: &mut FlatBufferBuilder<'a>,
+    v: &VideoAdmission,
+) -> WIPOffset<fbs::VideoAdmission<'a>> {
+    let text_tags = Some(b.create_vector(&v.text_tags));
+    let conditions = v
+        .conditions
+        .iter()
+        .map(|condition| video_condition(b, condition))
+        .collect::<Vec<_>>();
+    let conditions = Some(b.create_vector(&conditions));
+    fbs::VideoAdmission::create(
+        b,
+        &fbs::VideoAdmissionArgs {
+            task: match v.task {
+                uniserve_core::VideoTask::T2va => fbs::VideoTask::T2va,
+                uniserve_core::VideoTask::Fl2va => fbs::VideoTask::Fl2va,
+                uniserve_core::VideoTask::Ref2va => fbs::VideoTask::Ref2va,
+            },
+            text_tags,
+            conditions,
         },
     )
 }
@@ -267,6 +371,7 @@ fn admission<'a>(b: &mut FlatBufferBuilder<'a>, v: &NewRequest) -> WIPOffset<fbs
     let ar = v.ar.as_ref().map(|value| ar(b, value));
     let image = v.image.as_ref().map(|value| image(b, value));
     let diffusion = v.diffusion.as_ref().map(|value| diffusion(b, value));
+    let video = v.video.as_ref().map(|value| video_admission(b, value));
     let prompt_token_ids = Some(b.create_vector(&v.prompt_token_ids));
     fbs::NewRequest::create(
         b,
@@ -278,6 +383,7 @@ fn admission<'a>(b: &mut FlatBufferBuilder<'a>, v: &NewRequest) -> WIPOffset<fbs
             diffusion,
             prompt_token_ids,
             input_images: v.input_images,
+            video,
         },
     )
 }
@@ -1181,6 +1287,9 @@ fn output_info<'a>(
     let name = Some(b.create_string(&v.name));
     let dtype = dtype_to_fb(v.dtype);
     let extents = Some(b.create_vector(&extents));
+    let (height_axis, width_axis) = v.raster_axes.map_or((-1, -1), |raster| {
+        (raster.height as i32, raster.width as i32)
+    });
     fbs::OutputInfo::create(
         b,
         &fbs::OutputInfoArgs {
@@ -1188,6 +1297,8 @@ fn output_info<'a>(
             dtype,
             extents,
             dynamic_axis,
+            height_axis,
+            width_axis,
         },
     )
 }
@@ -1306,6 +1417,36 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
         Some(b.create_vector(&values))
     };
     let checkpoint_identity = Some(b.create_string(&v.checkpoint_identity));
+    let video_denoiser = v.video_denoiser.as_ref().map(|value| {
+        let tasks = value
+            .tasks
+            .iter()
+            .map(|task| b.create_string(task))
+            .collect::<Vec<_>>();
+        let tasks = Some(b.create_vector(&tasks));
+        let canvases = value
+            .canvases
+            .iter()
+            .map(|canvas| fbs::Canvas::new(canvas.width, canvas.height))
+            .collect::<Vec<_>>();
+        let canvases = Some(b.create_vector(&canvases));
+        let condition_tiles = value.condition_tiles.map(|tiles| {
+            let [frames, height, width] = tiles.video;
+            fbs::ConditionTiles::new(tiles.rows, frames, height, width)
+        });
+        fbs::VideoDenoiserInfo::create(
+            b,
+            &fbs::VideoDenoiserInfoArgs {
+                tasks,
+                schedule_points: value.schedule_points,
+                video_shift: value.video_shift,
+                audio_shift: value.audio_shift,
+                canvases,
+                max_sequence_rows: value.max_sequence_rows,
+                condition_tiles: condition_tiles.as_ref(),
+            },
+        )
+    });
     fbs::WorkerInfo::create(
         b,
         &fbs::WorkerInfoArgs {
@@ -1336,6 +1477,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             num_inference_steps: v.num_inference_steps,
             host_lane_capacity: v.host_lane_capacity,
             checkpoint_identity,
+            video_denoiser,
         },
     )
 }

@@ -13,11 +13,17 @@ from tests.python.fixtures.audio_decoding import (
 )
 from tests.python.fixtures.decoding import Config as DecoderConfig
 from tests.python.fixtures.decoding import DecodedModel
-from tests.python.fixtures.depth_one import finalized_report
+from tests.python.fixtures.depth_one import (
+    ar_params,
+    execution_batch,
+    finalized_report,
+)
 from tests.python.fixtures.encoding import Model as EncodedModel
 from tests.python.fixtures.execution_worker import execution_worker
+from tests.python.fixtures.transport import make_transport
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image, video
+from uniserve.runtime import EventPool
 from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
 from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.errors import InputError
@@ -51,13 +57,19 @@ from uniserve_worker.protocol.tensor import (
     StaticDim,
     TensorRef,
 )
+from uniserve_worker.protocol.transfer import (
+    DeviceProductTransferValue,
+    TensorTransfer,
+    WorkerEndpoint,
+)
+from uniserve_worker.protocol.video import VideoAdmission, VideoTask
 from uniserve_worker.protocol.worker_info import WorkerInfo
 from uniserve_worker.transport.fetch import fetch_tensor
 
 pytestmark = pytest.mark.integration
 
-# One four-frame window of the default one-pixel decoder fixture.
-UNIT = video.Config(4, image.Config(1, 1))
+# A four-frame single-pixel clip: one window of the fixture decoder.
+PIXEL = video.Config(4, image.Config(1, 1))
 
 
 def _encoder_bindings(model, components, device="cpu"):
@@ -104,7 +116,7 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
         group.device,
     )
     runner = ModelExecutor(
-        DecodedModel(DecoderConfig(window=25, height=8, width=12)),
+        DecodedModel(DecoderConfig(window=25)),
         WorkerConfig(rank=rank, world_size=4),
         bindings={"reconstruction": binding},
     )
@@ -115,7 +127,7 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
         result = runner.output_layout(
             "reconstruction",
             0,
-            SimpleNamespace(num_frames=50, height=8, width=12),
+            SimpleNamespace(num_frames=50, canvas=image.Config(8, 12)),
             interval,
             1,
         )
@@ -247,13 +259,8 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(
             return normalized.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
         def decode(runner):
-            return runner.run_module(
-                "reconstruction",
-                (source,),
-                method="decode",
-                size=UNIT,
-                frames=(slice(0, 4),),
-                sizes=(UNIT,),
+            return media.decode_video_unit(
+                runner, "reconstruction", source, slice(0, 4), PIXEL
             ).values[0]
 
         reference = expected(source)
@@ -292,13 +299,8 @@ def test_module_call_statistics_count_the_call_without_tokens():
         bindings=_encoder_bindings(model, components),
     )
     try:
-        output = runner.run_module(
-            "reconstruction",
-            (torch.zeros(4, 3),),
-            method="decode",
-            size=UNIT,
-            frames=(slice(0, 4),),
-            sizes=(UNIT,),
+        output = media.decode_video_unit(
+            runner, "reconstruction", torch.zeros(4, 3), slice(0, 4), PIXEL
         )
     finally:
         runner.close()
@@ -342,6 +344,137 @@ def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
                 runner.run_encoder("conditioning", features)
     finally:
         runner.close()
+
+
+def test_a_batch_reading_more_regions_than_read_tickets_completes():
+    """A rank's read tickets bound the reads in flight, not one batch's.
+
+    Each of four requests' transfer calls imports a product another rank
+    wrote in two regions: eight reads against the rank's four read tickets.
+    While other reads hold three of the tickets, no import can start all of
+    its reads, so the batch waits; as tickets return, it resumes and every
+    call delivers its whole product.
+    """
+    worker = execution_worker(max_batch_calls=4)
+    events = EventPool()
+    producer = make_transport(
+        "local",
+        byte_capacity=1 << 16,
+        ticket_capacity=1,
+        event_pool=events,
+        source=WorkerEndpoint.local("producer"),
+    )
+    local = worker.transports["local"]
+    assert local.capacity.ticket_capacity == 4
+    published = []
+    held = []
+    try:
+        admissions, calls, inputs, expected = [], [], [], {}
+        for index in range(4):
+            admission = ar_params(index + 1)
+            admissions.append(admission)
+            value = torch.arange(24, dtype=torch.float32).reshape(6, 4) + (
+                100 * index
+            )
+            # The producer wrote rows [0, 3) and [3, 6) as separate regions.
+            locations = tuple(
+                producer.publish(value[start : start + 3], offset=(start, 0))
+                for start in (0, 3)
+            )
+            published.extend(locations)
+            reference = TensorRef(
+                admission.request_key,
+                CallId(1, index),
+                0,
+                1,
+                DType.F32,
+                ShapeBound((StaticDim(6), StaticDim(4))),
+            )
+            copied = TensorRef(
+                admission.request_key,
+                CallId(2, index),
+                0,
+                1,
+                DType.F32,
+                ShapeBound((StaticDim(6), StaticDim(4))),
+            )
+            calls.append(
+                Call(
+                    request_key=admission.request_key,
+                    call_id=CallId(2, index),
+                    coordinates=CallCoordinates(),
+                    kind=TransferMode.TENSOR,
+                    bounds=Bounds(max_transfer_bytes=reference.max_bytes),
+                    inputs=(reference,),
+                    outputs=(copied,),
+                )
+            )
+            inputs.append(
+                TensorPublication(
+                    reference,
+                    DeviceProductTransferValue(
+                        0, 0, "", TensorTransfer((6, 4), locations)
+                    ),
+                )
+            )
+            expected[copied] = value
+
+        # Reads elsewhere on the rank hold three of its four tickets: a
+        # borrowed view does until its consumers finish.
+        source = producer.publish(torch.zeros(4))
+        published.append(source)
+        held = [
+            local.fetch(source, device=torch.device("cpu")) for _ in range(3)
+        ]
+        submission = worker.submit(
+            execution_batch(
+                batch_id=2,
+                admissions=admissions,
+                calls=calls,
+                input_products=inputs,
+            )
+        )
+        for _ in range(100):
+            worker.advance()
+        assert worker.poll(submission) is None
+
+        for ticket in held:
+            ticket.close()
+        held = []
+        report = finalized_report(worker, submission)
+        assert [completion.status for completion in report.completions] == [
+            CallStatus.OK
+        ] * 4
+        assert len(report.products) == 4
+        for product in report.products:
+            destination = torch.empty(6, 4)
+            tickets = fetch_tensor(
+                product.value.tensor,
+                destination,
+                bindings={
+                    (location.source, location.backend): worker.transports[
+                        location.backend
+                    ]
+                    for location in product.value.tensor.locations
+                },
+            )
+            for ticket in tickets:
+                ready = threading.Event()
+                ticket.add_done_callback(ready.set)
+                assert ready.wait(5)
+                ticket.result()
+                ticket.close()
+            torch.testing.assert_close(
+                destination, expected[product.product], rtol=0, atol=0
+            )
+    finally:
+        for ticket in held:
+            ticket.close()
+        worker.close()
+        for location in published:
+            producer.release(location)
+        producer.close()
+        events.close()
 
 
 @pytest.mark.parametrize("separate_start", (False, True))
@@ -405,7 +538,12 @@ def test_text_encoder_call_publishes_consumable_conditioning(
                 NewRequest(
                     key,
                     request_pool_idx=1,
-                    diffusion=DiffusionParams(22, 3, 4, 1000, 768, 1344),
+                    diffusion=DiffusionParams(
+                        22, 3, 4, 1000, width=1344, height=768
+                    ),
+                    video=VideoAdmission(
+                        VideoTask.T2VA, text_tags=(1,) * len(prompt)
+                    ),
                     prompt_token_ids=prompt,
                 )
             ),
@@ -604,7 +742,8 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         admission = NewRequest(
             key,
             request_pool_idx=1,
-            diffusion=DiffusionParams(22, 3, 4, 1000, 768, 1344),
+            diffusion=DiffusionParams(22, 3, 4, 1000, width=1344, height=768),
+            video=VideoAdmission(VideoTask.T2VA, text_tags=(1, 1, 1)),
             prompt_token_ids=(3, 8, 1),
         )
         run = Batch(
@@ -622,8 +761,9 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
 
 @pytest.mark.gpu
 def test_decoder_graphs_share_backing_and_match_eager_decoding():
-    """Every captured decoder size and window views one input and output.
+    """Every captured decoder segment views one input and one output.
 
+    A window decodes at its segment, so each raster captures one graph.
     Graphs captured largest first replay in any order and reproduce the
     eager reconstruction exactly, so sharing their backing loses nothing.
     """
@@ -643,50 +783,50 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
         )
         for policy in ("auto", "off")
     )
+    sizes = tuple(
+        video.Config(8, image.Config(height, width))
+        for height, width in ((2, 3), (2, 2), (1, 1))
+    )
 
-    def decode(runner, frames, window, source):
-        size = video.Config(frames, UNIT.frame)
-        return runner.run_module(
+    def decode(runner, size, window, latent):
+        return media.decode_video_unit(
+            runner,
             "reconstruction",
-            (source,),
-            method="decode",
-            size=size,
-            frames=(slice(4 * window, 4 * window + 4),),
-            sizes=(size,),
+            latent,
+            slice(4 * window, 4 * window + 4),
+            size,
         ).values[0]
 
-    calls = [
-        (frames, window)
-        for frames in (16, 8, 4)
-        for window in range(frames // 4)
-    ]
+    calls = [(size, window) for size in sizes for window in range(2)]
     try:
         generator = torch.Generator(device=device).manual_seed(0)
 
-        def source(frames):
-            return torch.randn(frames, 3, generator=generator, device=device)
+        def source(size):
+            # The fixture's packed latent: one row per frame and pixel.
+            rows = size.num_frames * size.frame.height * size.frame.width
+            return torch.randn(rows, 3, generator=generator, device=device)
 
-        # Startup captures every call, largest first.
-        for frames, window in calls:
-            decode(graphs, frames, window, source(frames))
+        # Startup captures every segment, largest first.
+        for size, window in calls:
+            decode(graphs, size, window, source(size))
         entries = list(graphs._module_entries.values())
-        assert len(entries) == 3
+        assert len(entries) == len(sizes)
         captured = [
             bucket.graphs[None]
             for entry in entries
             for bucket in entry.buckets.values()
         ]
-        assert len(captured) == len(calls)
+        assert len(captured) == len(sizes)
         assert (
             len({graph.inputs.tensors[0][1].data_ptr() for graph in captured})
             == 1
         )
 
         # Replays in a different order match eager decoding bit for bit.
-        for frames, window in reversed(calls[1:] + calls[:1]):
-            value = source(frames)
-            replayed = decode(graphs, frames, window, value)
-            reference = decode(eager, frames, window, value)
+        for size, window in reversed(calls[1:] + calls[:1]):
+            value = source(size)
+            replayed = decode(graphs, size, window, value)
+            reference = decode(eager, size, window, value)
             torch.testing.assert_close(replayed, reference, rtol=0, atol=0)
         outputs = set()
         for graph in captured:

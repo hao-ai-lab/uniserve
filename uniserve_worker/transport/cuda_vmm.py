@@ -57,6 +57,7 @@ from uniserve_worker.transport.layout import (
     tensor_nbytes,
 )
 from uniserve_worker.transport.pool import (
+    ReadReservation,
     TransferCapacity,
     TransferPool,
     chunk_word,
@@ -183,7 +184,7 @@ class CudaVmmTransport(Transport):
             ]
             | None
         ) = None
-        self._bytes = capacity
+        self.capacity = capacity
         # Grants exist only where the device exports descriptors, so the
         # socket is bound when the first such publication needs it.
         self._grants: DescriptorGrants | None = None
@@ -339,7 +340,7 @@ class CudaVmmTransport(Transport):
         key = str(device)
         pool = self._pools.get(key)
         if pool is None:
-            pool = VmmPool(device, capacity_bytes=self._bytes.capacity)
+            pool = VmmPool(device, capacity_bytes=self.capacity.capacity)
             self._pools[key] = pool
         return pool
 
@@ -383,7 +384,7 @@ class CudaVmmTransport(Transport):
 
         self._events.reap()
         nbytes = tensor_nbytes(tensor)
-        self._bytes.acquire(nbytes)
+        self.capacity.acquire(nbytes)
 
         event = None
         publication = None
@@ -477,7 +478,7 @@ class CudaVmmTransport(Transport):
                 source,
                 event,
                 nbytes,
-                self._bytes,
+                self.capacity,
                 descriptor,
                 copied_source,
                 pool=pool if chunk is not None else None,
@@ -559,7 +560,7 @@ class CudaVmmTransport(Transport):
                     and len(descriptor) == DESCRIPTOR_HANDLE_BYTES
                 ):
                     os.close(int.from_bytes(descriptor, sys.byteorder))
-                self._bytes.release(nbytes)
+                self.capacity.release(nbytes)
             raise
 
     def fetch(
@@ -569,6 +570,7 @@ class CudaVmmTransport(Transport):
         device: torch.device,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
+        reservation: ReadReservation | None = None,
     ) -> TransferTicket:
         if not isinstance(locator.transport, CudaVmmTransfer):
             raise invalid_descriptor(
@@ -602,6 +604,7 @@ class CudaVmmTransport(Transport):
             region,
             nbytes=locator.nbytes,
             destination=target,
+            reservation=reservation,
         )
 
     def _read(

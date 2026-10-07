@@ -91,8 +91,12 @@ def text(
     """Encode admitted conditioning tokens and publish their declared tensors.
 
     Runs the text encoder on the request's admitted prompt tokens and
-    publishes one tensor per declared output.
+    publishes one tensor per declared output. A video prompt presenting
+    vision blocks reads their encoded features, which the encoder splices in
+    at the blocks' placeholders (``conditions.vision_inputs``).
     """
+    from uniserve_worker.execution.conditions import vision_inputs
+
     request = state.pending_output(call.request_key.request_id)
     admission = request.request.admission
     if admission.diffusion is None or not admission.prompt_token_ids:
@@ -104,7 +108,15 @@ def text(
             "text encoder outputs must declare conditioning tensors"
         )
 
-    result = model_runner.encode_text(admission.prompt_token_ids)
+    result = model_runner.encode_text(
+        admission.prompt_token_ids,
+        **vision_inputs(
+            call,
+            state=state,
+            tensor_store=tensor_store,
+            model_runner=model_runner,
+        ),
+    )
     if len(result.values) != len(call.outputs):
         raise invalid_descriptor(
             "text encoder output declarations disagree with the loaded entry"

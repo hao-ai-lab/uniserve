@@ -12,15 +12,16 @@ from .config import TransformerConfig
 
 
 class TimestepEmbedding(nn.Module):
-    """Apply one checkpoint projection to the video and audio time coordinates.
+    """Apply one checkpoint projection to a step's group time coordinates.
 
-    H3 trains one shared pair of linear maps. Both named modality projections
-    retain that same module and parameter identity; the coordinates differ.
+    H3 trains one shared pair of linear maps for every timestep group (the
+    generated video and audio, and the condition levels). Both named
+    modality projections retain that same module and parameter identity.
     These FP32 products feed SiLU before the BF16 modulation projections.
 
     No resident module holds this embedding: checkpoint loading builds it
-    transiently to precompute the transformer's per-step modulation products
-    for the fixed ladder, then releases it.
+    transiently to precompute the transformer's modulation products for the
+    fixed schedule, then releases it.
     """
 
     def __init__(self, config: TransformerConfig):
@@ -40,14 +41,13 @@ class TimestepEmbedding(nn.Module):
         self.audio_projection = self.video_projection
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        # timesteps carries [..., 2] coordinates in fixed (video, audio) order.
-        if timesteps.ndim < 1 or timesteps.shape[-1] != 2:
-            raise ValueError(
-                "H3 timesteps must end in the ordered video/audio coordinates"
-            )
+        """Embed one step's [groups] FP32 timesteps as [groups, time_dim]."""
+        if timesteps.ndim != 1 or timesteps.numel() < 1:
+            raise ValueError("H3 timesteps must be one step's group vector")
         features = timestep_embedding(timesteps, self.frequency_dim)
-        # One GEMM over both modalities preserves their common FP32 rounding.
-        return self.video_projection(features).reshape(*timesteps.shape, -1)
+        # One GEMM over the step's groups preserves their common FP32
+        # rounding.
+        return self.video_projection(features)
 
 
 class OutputNorm(nn.Module):

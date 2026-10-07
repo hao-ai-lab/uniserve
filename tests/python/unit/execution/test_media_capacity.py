@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
-from uniserve.media import image
-from uniserve.runtime import TensorBuffers
-from uniserve_models.minimax_h3 import Config, Model
+from tests.python.fixtures.h3 import WIDE, base_config, fasth3_config
+from uniserve.media import image, video
+from uniserve.model import Condition, ConditionRole
+from uniserve_models.minimax_h3 import Model
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
 pytestmark = pytest.mark.unit
@@ -18,44 +17,63 @@ pytestmark = pytest.mark.unit
 # each extended to a complete native temporal window.
 ADMITTED_FRAMES = tuple(107 + 17 * index for index in range(16))
 
-# The served output rasters: 16:9 and 9:16.
-LANDSCAPE = image.Config(768, 1344)
-PORTRAIT = image.Config(1344, 768)
-RASTERS = (LANDSCAPE, PORTRAIT)
+# The default FastH3 deployment's canvases: 768p 16:9 and 9:16.
+TALL = image.Config(1344, 768)
+SERVED = (WIDE, TALL)
+
+# FastH3's (height, width) training buckets: 21:9, 16:9, 4:3, 1:1, 3:4 and
+# 9:16 at 768p, then at 480p.
+BUCKETS = tuple(
+    image.Config(height, width)
+    for height, width in (
+        (672, 1536),
+        (768, 1344),
+        (768, 1024),
+        (768, 768),
+        (1024, 768),
+        (1344, 768),
+        (416, 992),
+        (480, 832),
+        (480, 640),
+        (480, 480),
+        (640, 480),
+        (832, 480),
+    )
+)
 
 
 @pytest.fixture(scope="module")
 def denoiser():
     with torch.device("meta"):
-        return Model(Config()).denoiser
+        return Model(fasth3_config()).denoiser
 
 
 def test_capacity_layouts_cover_every_admitted_size(denoiser):
     builder = MediaBuilder(
         denoiser,
-        frame_sizes=RASTERS,
         max_frames=360,
         max_text_tokens=16384,
         min_frames=96,
         text_capacities=(1000, 4096, 16384),
+        canvases=SERVED,
     )
     assert builder.frame_counts == ADMITTED_FRAMES
     # Capacities are whole 64-row text tiles.
     assert builder.text_capacities == (1024, 4096, 16384)
 
     layouts = builder.layouts()
-    assert len(layouts) == len(ADMITTED_FRAMES) * len(RASTERS) * 3
+    assert len(layouts) == len(SERVED) * len(ADMITTED_FRAMES) * 3
     maximum = layouts[0]
     assert (maximum.num_frames, maximum.num_text_tokens) == (362, 16384)
-    assert {layout.frame for layout in layouts} == set(RASTERS)
+    assert {layout.canvas for layout in layouts} == set(SERVED)
 
-    for frames in ADMITTED_FRAMES:
-        for frame in RASTERS:
-            for tokens in (1, 63, 1024, 1025, 4096, 4097, 16384):
-                size = builder.size(frames, frame, tokens)
+    for canvas in SERVED:
+        for frames in ADMITTED_FRAMES:
+            for tokens in (1, 63, 64, 1000, 1024, 1025, 4097, 16384):
+                size = builder.size(frames, tokens, canvas)
                 layout = builder.layout(size)
                 assert layout in layouts
-                assert layout.frame == frame
+                assert layout.canvas == canvas
                 assert denoiser.holds(layout, size)
                 # The smallest capacity that holds the prompt is chosen.
                 assert layout.num_text_tokens == min(
@@ -65,163 +83,219 @@ def test_capacity_layouts_cover_every_admitted_size(denoiser):
                 )
 
 
-def test_both_orientations_pack_the_same_video_rows(denoiser):
-    """A 9:16 request is the 16:9 request's token count, transposed."""
-    for frames in (22, 124):
-        landscape, portrait = (
-            denoiser.make_size(frames, frame, 64) for frame in RASTERS
-        )
-        assert denoiser.latent_shape("video", landscape) == (
-            denoiser.latent_shape("video", portrait)
-        )
-        assert denoiser.latent_shape("audio", landscape) == (
-            denoiser.latent_shape("audio", portrait)
-        )
-        video, portrait_video = (
-            denoiser.noise_shape("video", size)
-            for size in (landscape, portrait)
-        )
-        assert video[-2:] == (48, 84)
-        assert portrait_video[-2:] == (84, 48)
-
-
-def test_request_storage_holds_every_admitted_raster(denoiser):
-    """One request slot's storage holds a request at either raster."""
-    builder = MediaBuilder(
-        denoiser, frame_sizes=RASTERS, max_frames=124, max_text_tokens=1024
-    )
-    capacity = builder.capacity_buffers()
-    with TensorBuffers.allocate(capacity, device="meta") as storage:
-        for frame in RASTERS:
-            for tokens in (1, 1024):
-                size = builder.size(124, frame, tokens)
-                views = storage.view(builder.buffers(size))
-                assert set(views) == set(builder.buffers(size))
-    # Both rasters pack the same rows, so the transposition costs no pages.
-    landscape, portrait = (
-        math.prod(denoiser.latent_shape("video", maximum))
-        for maximum in builder.maxima
-    )
-    assert landscape == portrait
-
-
 def test_sizes_outside_the_admitted_range_have_no_layout(denoiser):
     builder = MediaBuilder(
         denoiser,
-        frame_sizes=RASTERS,
         max_frames=240,
         max_text_tokens=2048,
         min_frames=96,
+        canvases=(WIDE,),
     )
     # 10 seconds is 240 frames, extended to 243.
     assert builder.frame_counts[-1] == 243
     for frames, tokens in ((90, 64), (260, 64), (243, 2049)):
         with pytest.raises(ValueError):
-            builder.size(frames, LANDSCAPE, tokens)
-    # A raster the model does not generate has no size.
-    with pytest.raises(ValueError):
-        builder.size(243, image.Config(1024, 1024), 64)
-    # A served raster the worker was not built for has no layout.
-    landscape = MediaBuilder(
+            builder.size(frames, tokens, WIDE)
+    # A bucket the checkpoint generates but the deployment did not prepare
+    # has no size, and neither does a canvas the checkpoint does not
+    # generate.
+    for canvas in (TALL, image.Config(1024, 1024)):
+        with pytest.raises(ValueError):
+            builder.size(243, 64, canvas)
+
+
+def test_a_deployment_prepares_only_distinct_generated_canvases(denoiser):
+    with pytest.raises(ValueError, match="distinct"):
+        MediaBuilder(
+            denoiser, max_frames=124, max_text_tokens=1024, canvases=SERVED * 2
+        )
+    with pytest.raises(ValueError, match="offers only"):
+        MediaBuilder(
+            denoiser,
+            max_frames=124,
+            max_text_tokens=1024,
+            canvases=(WIDE, image.Config(1024, 1024)),
+        )
+    # Without a selection the deployment prepares every training bucket.
+    builder = MediaBuilder(denoiser, max_frames=124, max_text_tokens=1024)
+    assert set(builder.canvases) == set(BUCKETS)
+
+
+def test_the_maximum_bounds_every_training_bucket(denoiser):
+    """Serving every bucket, the maximum bounds every layout's storage.
+
+    The runner prepares ``maximum_layout`` first and every other layout
+    views its workspace, and every request's buffers view the slot storage,
+    dimension by dimension. Given smallest first, the builder still chooses
+    a maximum that bounds them all.
+    """
+    builder = MediaBuilder(
         denoiser,
-        frame_sizes=(LANDSCAPE,),
         max_frames=240,
-        max_text_tokens=2048,
+        max_text_tokens=1024,
         min_frames=96,
+        canvases=tuple(reversed(BUCKETS)),
     )
-    with pytest.raises(ValueError):
-        landscape.size(243, PORTRAIT, 64)
+    layouts = builder.layouts()
+    assert {layout.canvas for layout in layouts} == set(BUCKETS)
+    assert layouts[0] == builder.maximum_layout
+    capacity = builder.capacity_buffers()
+    maximum = denoiser.workspace_buffers(builder.maximum_layout)
+    for layout in layouts:
+        for name, config in denoiser.workspace_buffers(layout).items():
+            assert all(
+                extent <= bound
+                for extent, bound in zip(
+                    config.shape, maximum[name].shape, strict=True
+                )
+            ), (layout.canvas, name)
+        size = builder.size(layout.num_frames, 1000, layout.canvas)
+        for name, config in builder.buffers(size).items():
+            assert all(
+                extent <= bound
+                for extent, bound in zip(
+                    config.shape, capacity[name].shape, strict=True
+                )
+            ), (layout.canvas, name)
 
 
 def test_default_capacities_step_to_the_prompt_capacity(denoiser):
-    builder = MediaBuilder(
-        denoiser, frame_sizes=RASTERS, max_frames=124, max_text_tokens=5000
-    )
+    builder = MediaBuilder(denoiser, max_frames=124, max_text_tokens=5000)
     assert builder.text_capacities == (1024, 2048, 4096, 5056)
     # A prompt capacity below the first rung is the only capacity.
-    small = MediaBuilder(
-        denoiser, frame_sizes=RASTERS, max_frames=124, max_text_tokens=500
-    )
+    small = MediaBuilder(denoiser, max_frames=124, max_text_tokens=500)
     assert small.text_capacities == (512,)
     # Without a floor, every native frame count up to the capacity is kept.
     assert builder.frame_counts == (22, 39, 56, 73, 90, 107, 124)
 
 
 def test_a_layout_holds_only_prompts_that_fit_at_its_frame_count(denoiser):
-    def make(frames, tokens, frame=LANDSCAPE):
-        return denoiser.make_size(frames, frame, tokens)
+    def make(frames, tokens):
+        return denoiser.make_size(frames, tokens, canvas=WIDE)
 
     layout = make(124, 2048)
     assert denoiser.holds(layout, make(124, 1))
     assert denoiser.holds(layout, make(124, 2048))
     assert not denoiser.holds(layout, make(124, 2049))
     assert not denoiser.holds(layout, make(141, 64))
-    # A layout holds only prompts at its own raster.
-    assert not denoiser.holds(layout, make(124, 64, PORTRAIT))
     # A text region that is not whole tiles is not a layout.
     assert not denoiser.holds(make(124, 100), make(124, 64))
 
 
-def test_the_leading_layout_bounds_every_trained_bucket(denoiser):
-    """Serving every bucket, ``layouts()[0]`` holds every layout's buffers."""
-    from uniserve_models.minimax_h3.packing import FRAME_SIZES
+def test_every_named_canvas_has_layouts_that_fit_the_slot_storage():
+    """A dense denoiser prepares every named canvas within one slot.
 
-    rasters = tuple(
-        image.Config(height, width) for height, width in FRAME_SIZES
-    )
-    # Given smallest first, the builder still leads with the largest bucket.
+    The maximum, prepared first, bounds every layout's row-shaped workspace,
+    and the slot storage holds every layout's buffers dimension by dimension.
+    """
+    with torch.device("meta"):
+        denoiser = Model(base_config()).denoiser
     builder = MediaBuilder(
         denoiser,
-        frame_sizes=tuple(reversed(rasters)),
-        max_frames=240,
-        max_text_tokens=1024,
+        max_frames=360,
+        max_text_tokens=4096,
         min_frames=96,
+        text_capacities=(1024, 4096),
     )
-    assert set(builder.frame_sizes) == set(rasters)
+    canvases = {(canvas.width, canvas.height) for canvas in builder.canvases}
+    assert canvases == {
+        (1536, 672),
+        (1344, 768),
+        (1024, 768),
+        (768, 768),
+        (768, 1024),
+        (768, 1344),
+    }
     layouts = builder.layouts()
-    leading = layouts[0]
-
-    def fields(layout):
-        result = dict(denoiser.state_buffers(layout))
-        result.update(
-            {
-                f"workspace.{name}": field
-                for name, field in denoiser.workspace_buffers(layout).items()
-            }
-        )
-        return result
-
-    bounds = fields(leading)
+    assert layouts[0] == builder.maximum
+    assert len(layouts) == len(canvases) * len(ADMITTED_FRAMES) * 2
+    capacity = builder.capacity_buffers()
+    maximum = denoiser.workspace_buffers(builder.maximum)
     for layout in layouts:
-        for name, field in fields(layout).items():
-            assert name in bounds
-            assert len(field.shape) == len(bounds[name].shape)
+        size = builder.size(layout.num_frames, 1000, layout.canvas)
+        assert builder.layout(size) in layouts
+        for name, config in builder.buffers(size).items():
             assert all(
                 extent <= bound
-                for extent, bound in zip(field.shape, bounds[name].shape)
-            ), (layout.frame, name)
+                for extent, bound in zip(
+                    config.shape, capacity[name].shape, strict=True
+                )
+            ), name
+        for name, config in denoiser.workspace_buffers(layout).items():
+            assert all(
+                extent <= bound
+                for extent, bound in zip(
+                    config.shape, maximum[name].shape, strict=True
+                )
+            ), name
+    with pytest.raises(ValueError):
+        builder.size(124, 64, image.Config(512, 2016))
 
 
-def test_encoded_unit_rows_do_not_depend_on_the_raster():
-    """Every request reserves the encoded row its declaration bounds."""
-    from dataclasses import replace
+def test_a_condition_capacity_bounds_each_conditioned_layout():
+    """Requests with conditions evaluate in their own bounded layouts.
 
-    from uniserve_models.minimax_h3 import output
-    from uniserve_models.minimax_h3.packing import FRAME_SIZES
-    from uniserve_worker.media.mux import encoded_unit_bytes
-    from uniserve_worker.model_executor.resources import encoded_units_layout
-
-    rasters = tuple(
-        image.Config(height, width) for height, width in FRAME_SIZES
-    )
-    config = Config()
-    config = replace(config, output=output.Config(frame_sizes=rasters))
+    A worker serving conditions sizes the slot storage and the layout its
+    runner prepares first by its condition capacity; each conditioned
+    request takes the smallest text capacity with its own condition tiles,
+    and text-only requests keep the prepared ladder.
+    """
     with torch.device("meta"):
-        decoder = Model(config).video_decoder
-    layout = encoded_units_layout(decoder, 243)
-    windows = decoder.frame_slices(243)
-    frames = max(window.stop - window.start for window in windows)
-    assert layout.shape[1] == max(
-        encoded_unit_bytes(frames, frame.height, frame.width)
-        for frame in rasters
+        denoiser = Model(base_config()).denoiser
+    first = Condition(ConditionRole.FIRST_FRAME, video.Config(1, WIDE))
+    plain = MediaBuilder(
+        denoiser, max_frames=124, max_text_tokens=4096, min_frames=96
     )
+    builder = MediaBuilder(
+        denoiser,
+        max_frames=124,
+        max_text_tokens=4096,
+        min_frames=96,
+        condition_rows=2048,
+    )
+    # Without conditions the largest layout bounds every other.
+    assert plain.maximum_layout == plain.layouts()[0]
+    assert builder.layouts() == plain.layouts()
+    assert builder.maximum_layout.condition_rows == 2048
+
+    # One 16:9 keyframe is 1008 rows, 16 whole tiles, beside 100 tokens in
+    # the 1024-token rung.
+    size = builder.size(124, 100, WIDE, conditions=(first,))
+    layout = builder.layout(size)
+    assert layout not in builder.layouts()
+    assert (layout.num_text_tokens, layout.condition_rows) == (1024, 1024)
+    assert denoiser.holds(layout, size)
+    assert builder.layout(builder.size(124, 100, WIDE)) in builder.layouts()
+
+    # The runner's maximum bounds the conditioned layout's workspace, the
+    # slot storage holds its buffers, and the retained conditioning holds
+    # the widened maximum's rows.
+    maximum = denoiser.workspace_buffers(builder.maximum_layout)
+    for name, config in denoiser.workspace_buffers(layout).items():
+        assert all(
+            extent <= bound
+            for extent, bound in zip(
+                config.shape, maximum[name].shape, strict=True
+            )
+        ), name
+    capacity = builder.capacity_buffers()
+    for name, config in builder.buffers(size).items():
+        assert all(
+            extent <= bound
+            for extent, bound in zip(
+                config.shape, capacity[name].shape, strict=True
+            )
+        ), name
+    assert capacity["text_condition"].shape[0] == denoiser.text_condition_rows(
+        builder.maximum_layout
+    )
+    assert capacity["condition_noise"].shape[0] == (
+        denoiser.condition_noise_capacity(builder.maximum_layout)
+    )
+    assert plain.capacity_buffers()["condition_noise"].shape == (0,)
+
+    # Three keyframe rows sets exceed the 2048-row capacity.
+    with pytest.raises(ValueError, match="condition capacity"):
+        builder.size(124, 100, WIDE, conditions=(first, first, first))
+    with pytest.raises(ValueError, match="condition capacity"):
+        plain.size(124, 100, WIDE, conditions=(first,))

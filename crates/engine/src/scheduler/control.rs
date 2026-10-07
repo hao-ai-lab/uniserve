@@ -104,11 +104,7 @@ impl Scheduler {
                         Request::Ar(request) | Request::Umm(request) => {
                             self.enqueue(request, event_tx)
                         }
-                        Request::Diffusion(request) => self.enqueue_media(PendingMedia {
-                            request,
-                            event_tx,
-                            queued_at: now(),
-                        }),
+                        Request::Diffusion(request) => self.enqueue_media(request, event_tx, now()),
                     }
                 }
             }

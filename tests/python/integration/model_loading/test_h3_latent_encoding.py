@@ -31,7 +31,7 @@ from torch.nn import functional as F
 
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve_models.minimax_h3 import audio_vae, video_vae
 from uniserve_models.minimax_h3.encoding import AudioEncoder, VideoEncoder
 
@@ -220,9 +220,9 @@ def test_video_conditioning_matches_native_encoding(
 
     # Every unit is encoded in its own call, last first, and placed where its
     # layout says its rows belong.
-    layout = encoder.output_layout(num_frames, image.Config(height, width))[
-        "video"
-    ]
+    layout = encoder.output_layout(
+        video.Config(num_frames, image.Config(height, width))
+    )["video"]
     assembled = torch.full(layout.shape, torch.nan, device="cuda")
     for unit in reversed(encoder.frame_slices(num_frames)):
         (result,) = encoder.encode(

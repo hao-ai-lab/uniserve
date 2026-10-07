@@ -593,7 +593,11 @@ impl InputProcessor {
         }
         Ok(uniserve_core::DiffusionRequest {
             request_id: uniserve_core::RequestId(0),
+            task: uniserve_core::VideoTask::T2va,
+            text_tags: vec![1; prompt_token_ids.len()],
             prompt_token_ids,
+            conditions: Vec::new(),
+            media: Vec::new(),
             priority: 0,
             sampling,
         })

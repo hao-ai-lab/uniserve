@@ -26,7 +26,12 @@ from torch import nn
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.media import image
-from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
+from uniserve.model import (
+    CausalLM,
+    PatchEncoder,
+    VideoDenoiser,
+    VideoPostprocessor,
+)
 from uniserve.nn import Linear
 from uniserve.processing import ImageProcessor
 from uniserve.quantization import QuantizedTensor
@@ -54,6 +59,7 @@ from uniserve_worker.bootstrap.components import (
 )
 from uniserve_worker.bootstrap.inputs import (
     capability,
+    executed_video_tasks,
     image_builder,
     media_builder,
 )
@@ -76,7 +82,11 @@ from uniserve_worker.model_executor.input_buffers import (
 from uniserve_worker.model_executor.resources import media_state_buffers
 from uniserve_worker.protocol.call import CALL_KINDS, CallKind
 from uniserve_worker.protocol.transfer import WorkerEndpoint
-from uniserve_worker.protocol.worker_info import ComponentInfo, WorkerInfo
+from uniserve_worker.protocol.worker_info import (
+    ComponentInfo,
+    VideoDenoiserInfo,
+    WorkerInfo,
+)
 from uniserve_worker.storage.block_tables import BlockTables
 from uniserve_worker.storage.cache_imports import cache_transfer_workspace_bytes
 from uniserve_worker.storage.decode_state import DecodeState
@@ -568,7 +578,9 @@ def _token_worker_layout(
         latent_pages=num_latent_pages,
         buffer_pool_bytes=buffer_pool_bytes,
         max_unresolved_calls=unresolved_window,
-        media_components=dict(media_components(model)),
+        media_components=dict(
+            media_components(model, worker_config.deployment_components)
+        ),
         num_inference_steps=0,
         host_lane_capacity=1,
         encoder_cache_entries=encoder_cache_entries,
@@ -594,6 +606,40 @@ def _token_worker_layout(
         input_config=input_config,
         fixed_device_bytes=tuple(fixed_bytes.items()),
         physical_buffer_pool_bytes=buffer_pool_bytes,
+    )
+
+
+def video_denoiser_info(
+    denoiser: VideoDenoiser, *, canvases: tuple[image.Config, ...] = ()
+) -> VideoDenoiserInfo:
+    """Describe what the deployment's video denoiser serves.
+
+    The tasks are the denoiser's tasks whose request calls the worker
+    executes, in the denoiser's order. The schedule's sigma points include
+    the clean endpoint the network never evaluates. The canvases are
+    ``canvases``, those the deployment prepares and admits, or without any
+    every canvas the denoiser offers (``VideoDenoiser.canvases``).
+
+    Raises:
+        WorkerError: ``UnsupportedSetup`` when the worker executes none of
+            the denoiser's tasks.
+    """
+    tasks = executed_video_tasks(denoiser)
+    if not tasks:
+        raise unsupported_setup(
+            f"the placed video denoiser serves {', '.join(denoiser.tasks)}, "
+            "none of which this worker executes"
+        )
+    served = canvases or denoiser.canvases
+    shifts = denoiser.schedule_shifts
+    return VideoDenoiserInfo(
+        tasks=tasks,
+        schedule_points=denoiser.num_steps + 1,
+        video_shift=float(shifts["video"]),
+        audio_shift=float(shifts["audio"]),
+        canvases=tuple((canvas.width, canvas.height) for canvas in served),
+        max_sequence_rows=denoiser.max_sequence_rows,
+        condition_tiles=denoiser.condition_tiles,
     )
 
 
@@ -623,6 +669,7 @@ def _request_tensor_worker_layout(
     # Every rank advertises the pool geometry; only a rank that advances the
     # samples allocates it.
     plan = latent_pool_plan(model, worker_config)
+    builder = media_builder(model, worker_config)
 
     info = WorkerInfo(
         model_name=model_name,
@@ -643,8 +690,13 @@ def _request_tensor_worker_layout(
         buffer_pool_bytes=slots
         * product_storage_bytes(resolve_outputs(model, worker_config)),
         max_unresolved_calls=unresolved_window,
-        media_components=dict(media_components(model)),
-        num_inference_steps=media_builder(model, worker_config).num_steps,
+        media_components=dict(
+            media_components(model, worker_config.deployment_components)
+        ),
+        num_inference_steps=builder.num_steps,
+        video_denoiser=video_denoiser_info(
+            builder.denoiser, canvases=builder.canvases
+        ),
         host_lane_capacity=1,
     )
     arena = model_arena_capacity(
@@ -681,7 +733,9 @@ def _request_tensor_worker_layout(
         * local_product_storage_bytes(
             resolve_outputs(model, worker_config),
             bindings=bindings or {},
-            media_components=media_components(model),
+            media_components=media_components(
+                model, worker_config.deployment_components
+            ),
         ),
     )
 

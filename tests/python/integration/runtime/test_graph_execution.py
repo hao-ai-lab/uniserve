@@ -289,12 +289,12 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
 
 
 @torch.inference_mode()
-def test_a_capturing_runner_serves_only_startup_captured_layouts():
-    """Serving never evaluates a capturing runner's steps eagerly.
+def test_a_capturing_runner_replays_only_captured_layouts():
+    """A capturing runner replays the steps of the layouts it captured.
 
-    A step of a layout whose graph startup did not capture is refused rather
-    than run without graphs; once the layout's graph is captured, every
-    solver step replays it.
+    A layout without a captured step, such as one a conditioned request
+    prepares while serving, evaluates eagerly; once the layout's graph is
+    captured, every solver step replays it.
     """
     device = torch.device("cuda:0")
     model = LinearDenoiser().to(device)
@@ -315,9 +315,8 @@ def test_a_capturing_runner_serves_only_startup_captured_layouts():
     try:
         bound = _bind(runner, schedules, size, steps, 1)
         _committed(pool, 1, 1, size).fill_(7.0)
-        for step in range(steps):
-            with pytest.raises(RuntimeError, match="no graph"):
-                runner.step(bound, step, 1)
+        assert runner.step(bound, 0, 1)[1] == "eager"
+        assert runner.step(bound, 1, 0)[1] == "eager"
 
         runner.warmup(bound)
         runner.capture(bound)

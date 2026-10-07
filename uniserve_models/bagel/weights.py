@@ -13,6 +13,7 @@ terminal modules then remain.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
@@ -44,7 +45,7 @@ checkpoint_sources = (
 # ``image_decoder.decoder``. The loader chooses a dtype per module path and
 # refuses a shared parameter whose alias paths disagree, so both paths are
 # named float32; every other module takes the default bfloat16 dtype.
-precisions = MappingProxyType(
+_PRECISIONS = MappingProxyType(
     {
         "bf16": weights.Config(
             dtypes={
@@ -55,10 +56,19 @@ precisions = MappingProxyType(
     }
 )
 
-# Dense base for a calibrated ModelOpt checkpoint: ``read_config`` in
-# ``uniserve_models.loading`` overlays the checkpoint's packed NVFP4 modules
-# onto it and offers no runtime presets.
-checkpoint_precision = precisions["bf16"]
+
+def precisions(config) -> Mapping[str, weights.Config]:
+    """Named presets ``load_model`` accepts for ``config``'s checkpoint."""
+    return _PRECISIONS
+
+
+def checkpoint_precision(config) -> weights.Config:
+    """Dense base for a calibrated ModelOpt checkpoint.
+
+    ``read_config`` in ``uniserve_models.loading`` overlays the checkpoint's
+    packed NVFP4 modules onto it and offers no runtime presets.
+    """
+    return _PRECISIONS["bf16"]
 
 
 def _backbone_names(backbone: TransformerDecoder) -> dict[str, str]:
