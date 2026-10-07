@@ -121,14 +121,12 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
                     audio_samples += int(frame.samples)
                     pcm = frame.to_ndarray()
                     # Report RMS in normalized PCM units for integer formats.
-                    scale = (
-                        max(
-                            abs(np.iinfo(pcm.dtype).min),
-                            np.iinfo(pcm.dtype).max,
-                        )
-                        if np.issubdtype(pcm.dtype, np.integer)
-                        else 1.0
-                    )
+                    scale = 1.0
+                    if np.issubdtype(pcm.dtype, np.integer):
+                        # ``issubdtype`` does not narrow the dtype's type, so
+                        # select the integer limits by the dtype's string form.
+                        limits = np.iinfo(pcm.dtype.str)
+                        scale = max(abs(limits.min), limits.max)
                     normalized = pcm.astype(np.float64) / scale
                     pcm_count += pcm.size
                     pcm_squares += float(np.square(normalized).sum())

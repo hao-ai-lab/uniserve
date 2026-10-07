@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 from urllib.parse import quote, urljoin
 
 import httpx
@@ -53,7 +54,7 @@ async def receive_video(
         )
         # vLLM-Omni's native video endpoint consumes multipart form fields.
         fields = {key: (None, str(value)) for key, value in payload.items()}
-        kwargs = {"files": fields}
+        kwargs: dict[str, Any] = {"files": fields}
     else:
         if backend == "fastvideo":
             # FastVideo validates an already aligned causal-VAE frame count.
