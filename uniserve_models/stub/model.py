@@ -28,8 +28,14 @@ from uniserve.model import (
 )
 from uniserve.nn.attention import Attention, PagedInput, SegmentedInput
 from uniserve.nn.functional import patchify
-from uniserve.nn.vae.layers import DiagonalGaussian
-from uniserve.nn.vae.patch import PatchAutoencoder, RGBDecoder
+from uniserve.nn.vae import (
+    DiagonalGaussian,
+    LatentDecoder,
+    LatentEncoder,
+    PatchAutoencoder,
+    RGBDecoder,
+    ScaleShift,
+)
 
 from .config import Config
 from .denoiser import Denoiser
@@ -210,16 +216,22 @@ class Model(CausalLM):
             output_size=_HIDDEN_SIZE,
             output_dtype=torch.bfloat16,
         )
+        identity = ScaleShift(scale=1.0, shift=0.0)
         self.latent_encoder = PatchAutoencoder(
-            _Moments(),
-            _Scale(),
-            DiagonalGaussian(sample=False),
+            LatentEncoder(
+                _Moments(),
+                normalization=identity,
+                posterior=DiagonalGaussian(sample=False),
+            ),
+            LatentDecoder(
+                _Scale(),
+                normalization=identity,
+                latent_shape=(None, 3, None, None),
+            ),
             patch_size=config.patch_size,
             latent_channels=3,
             latent_dtype=torch.bfloat16,
             downsample=config.patch_size,
-            scale=1.0,
-            shift=0.0,
         )
         self.image_decoder = ImageDecoder(RGBDecoder(config.patch_size))
 

@@ -17,6 +17,7 @@ from ._activation import (
     value_first_swiglu_fp8,
 )
 from ._attention import attention
+from ._frame import frame_pad
 from ._linear import linear, merged_linear
 from ._norm import (
     add_rms_norm,
@@ -40,6 +41,7 @@ __all__ = [
     "add_rms_norm",
     "apply_rotary",
     "attention",
+    "frame_pad",
     "gated_residual",
     "gated_residual_rms_norm",
     "gated_residual_rms_norm_fp8",

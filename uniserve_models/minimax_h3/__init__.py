@@ -20,6 +20,7 @@ from .config import (
 from .decoding import AudioDecoder, VideoDecoder
 from .denoiser import Denoiser
 from .encoder import TextEncoder, TextEncoderConfig
+from .encoding import AudioEncoder, VideoEncoder
 from .inputs import AttentionInput, DenoiserInput, DenoiserSize
 from .model import Model, entry_points
 from .modulation import OutputNorm, TimestepEmbedding
@@ -48,7 +49,9 @@ __all__ = [
     "DiffusionConfig",
     "TransformerConfig",
     "AudioDecoder",
+    "AudioEncoder",
     "VideoDecoder",
+    "VideoEncoder",
     "Denoiser",
     "TextEncoder",
     "TextEncoderConfig",

@@ -1,9 +1,11 @@
-"""Checkpoint-exact resident MiniMax H3 audio decoder.
+"""Checkpoint-exact MiniMax H3 audio encoder and decoder.
 
-Only the decoder half of the checkpoint's audio VAE is resident: a 1x1
-input convolution followed by the BigVGAN network from ``diffusers``. The
-two stereo channels are decoded as a batch of two mono timelines.
-``receptive_field`` bounds the latent context a windowed decode needs.
+The decoder is a 1x1 input convolution followed by the BigVGAN network from
+``diffusers``; ``receptive_field`` bounds the latent context a windowed
+decode needs. The encoder is the DAC waveform network, the causal attention
+projection that narrows its width to the latent channels, and the posterior
+mean head. Both treat the two stereo channels as a batch of two mono
+timelines.
 """
 
 from __future__ import annotations
@@ -14,10 +16,19 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.nn import functional as F
+from torch.nn.utils import parametrizations
 
-from uniserve.nn.vae.decoder import LatentDecoder
+from uniserve.nn.attention import Attention, DenseInput
+from uniserve.nn.vae import ChannelStatistics, LatentDecoder, LatentEncoder
 
-__all__ = ["Config", "Model", "receptive_field"]
+__all__ = [
+    "Config",
+    "Encoder",
+    "Model",
+    "encoder_assignments",
+    "receptive_field",
+]
 
 
 # The BigVGAN alias-free activations resample by this ratio with this filter
@@ -79,9 +90,9 @@ def receptive_field(config: Config) -> int:
 class Config:
     """Native audio network and channel normalization.
 
-    The product of ``encoder_rates`` is the number of output samples per
-    latent frame (``AudioDecoder.latent_rate``); the encoder itself is not
-    loaded.
+    The product of ``encoder_rates`` is the number of samples per latent
+    frame: the encoder's input hop and the decoder's output rate
+    (``AudioDecoder.latent_rate``).
     """
 
     encoder_dim: int = 64
@@ -297,12 +308,14 @@ class Model(LatentDecoder):
         super().__init__(
             decoder,
             latent_shape=(2, config.latent_channels, None),
-            mean=torch.tensor(
-                config.latents_mean, dtype=torch.float32, device="cpu"
-            ).view(1, config.latent_channels, 1),
-            std=torch.tensor(
-                config.latents_std, dtype=torch.float32, device="cpu"
-            ).view(1, config.latent_channels, 1),
+            normalization=ChannelStatistics(
+                mean=torch.tensor(
+                    config.latents_mean, dtype=torch.float32, device="cpu"
+                ).view(1, config.latent_channels, 1),
+                std=torch.tensor(
+                    config.latents_std, dtype=torch.float32, device="cpu"
+                ).view(1, config.latent_channels, 1),
+            ),
         )
         self.config = config
 
@@ -335,6 +348,258 @@ def assignments(model: Model, reader):
         source = name.replace("decoder.input.", "dec_in_proj.").replace(
             "decoder.network.", "decoder."
         )
+        if source in available:
+            values.append(weights.Assignment(parameter, reader.get(source)))
+    return tuple(values)
+
+
+def _normalized(convolution: nn.Conv1d) -> nn.Conv1d:
+    """Parameterize a convolution's weight by magnitude and direction.
+
+    The checkpoint stores the encoder's convolutions in this weight-norm form
+    (``weight_g``, ``weight_v``) and the weight is recomputed from both, as
+    the reference does on every call.
+    """
+    return parametrizations.weight_norm(convolution)
+
+
+class Snake(nn.Module):
+    """Apply ``x + sin(alpha * x)^2 / alpha`` with one frequency per channel."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1, channels, 1))
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        # The 1e-9 offset keeps the reciprocal finite for a zero frequency.
+        return values + (self.alpha + 1e-9).reciprocal() * torch.sin(
+            self.alpha * values
+        ).pow(2)
+
+
+class ResidualUnit(nn.Module):
+    """Add a dilated Snake convolution branch that preserves the length."""
+
+    def __init__(self, channels: int, dilation: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            Snake(channels),
+            _normalized(
+                nn.Conv1d(
+                    channels,
+                    channels,
+                    7,
+                    dilation=dilation,
+                    padding=3 * dilation,
+                )
+            ),
+            Snake(channels),
+            _normalized(nn.Conv1d(channels, channels, 1)),
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return values + self.block(values)
+
+
+class EncoderBlock(nn.Module):
+    """Apply three dilated residual units, then a strided widening step.
+
+    The strided convolution doubles the channels and divides the length by
+    ``stride``.
+    """
+
+    def __init__(self, channels: int, stride: int):
+        super().__init__()
+        width = channels // 2
+        self.block = nn.Sequential(
+            ResidualUnit(width, 1),
+            ResidualUnit(width, 3),
+            ResidualUnit(width, 9),
+            Snake(width),
+            _normalized(
+                nn.Conv1d(
+                    width,
+                    channels,
+                    2 * stride,
+                    stride=stride,
+                    padding=math.ceil(stride / 2),
+                )
+            ),
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return self.block(values)
+
+
+class GeGLU(nn.Module):
+    """Normalize, then apply a tanh-GELU gated linear unit and its output."""
+
+    def __init__(self, channels: int, hidden: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+        self.gate = nn.Linear(channels, hidden)
+        self.value = nn.Linear(channels, hidden)
+        self.output = nn.Linear(hidden, channels)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        values = self.norm(values)
+        return self.output(
+            F.gelu(self.gate(values), approximate="tanh") * self.value(values)
+        )
+
+
+class AttentionProjection(nn.Module):
+    """Narrow ``[batch, frames, width]`` features to the latent channels.
+
+    A linear shortcut of the normalized input adds to causal self-attention
+    over the latent frames, whose heads are averaged instead of concatenated
+    and whose head width is average-pooled down to the latent channels; a
+    normalized GeGLU residual follows. Every frame therefore depends on all
+    earlier frames of the track. The key bias is the checkpoint's stored zero
+    vector.
+    """
+
+    def __init__(self, config: Config):
+        super().__init__()
+        width, channels = config.latent_dim, config.latent_channels
+        heads = config.num_attention_heads
+        self.shortcut_norm = nn.LayerNorm(width)
+        self.shortcut = nn.Linear(width, channels)
+        self.attention_norm = nn.LayerNorm(width)
+        self.qkv = nn.Linear(width, 3 * width)
+        self.attention = Attention(heads, heads, width // heads)
+        self.attention_output = nn.Linear(channels, channels)
+        self.mlp_norm = nn.LayerNorm(channels)
+        self.mlp = GeGLU(channels, 2 * channels)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        batch, frames, _ = values.shape
+        heads, head_dim = self.attention.num_heads, self.attention.head_dim
+
+        # [batch, frames, 3 * width] -> three [batch, heads, frames, head_dim].
+        query, key, value = (
+            self.qkv(self.attention_norm(values))
+            .reshape(batch, frames, 3, heads, head_dim)
+            .permute(2, 0, 3, 1, 4)
+            .unbind(0)
+        )
+        attended = self.attention(
+            query, key, value, DenseInput(causal=True, mask=None)
+        )
+        # Average the heads of every frame, then pool the head width down to
+        # the latent channels: [batch, frames, channels].
+        pooled = F.adaptive_avg_pool1d(
+            attended.transpose(1, 2).mean(dim=2),
+            self.attention_output.in_features,
+        )
+        hidden = self.shortcut(
+            self.shortcut_norm(values)
+        ) + self.attention_output(pooled)
+        return hidden + self.mlp(self.mlp_norm(hidden))
+
+
+class Encoder(nn.Module):
+    """Encode mono ``[batch, 1, samples]`` waveforms into posterior means.
+
+    The DAC network downsamples by the product of ``encoder_rates`` into
+    ``[batch, latent_dim, frames]`` features; the attention projection
+    narrows them to the latent channels, and the mean head returns the
+    posterior mode ``[batch, latent_channels, frames]``, the latent that
+    conditions H3. The log-scale head is never evaluated. ``samples`` must be
+    a whole number of latent frames.
+    """
+
+    def __init__(self, config: Config):
+        super().__init__()
+        width = config.encoder_dim
+        layers: list[nn.Module] = [
+            _normalized(nn.Conv1d(1, width, 7, padding=3))
+        ]
+        for stride in config.encoder_rates:
+            width *= 2
+            layers.append(EncoderBlock(width, stride))
+        layers += [
+            Snake(width),
+            _normalized(nn.Conv1d(width, config.latent_dim, 3, padding=1)),
+        ]
+        self.network = nn.Sequential(*layers)
+        self.projection = AttentionProjection(config)
+        self.mean_projection = nn.Conv1d(
+            config.latent_channels, config.latent_channels, 1
+        )
+
+    def forward(self, samples: torch.Tensor) -> torch.Tensor:
+        hidden = self.network(samples)
+        # The projection attends over frames: [batch, frames, latent_dim].
+        hidden = self.projection(hidden.transpose(1, 2)).transpose(1, 2)
+        return self.mean_projection(hidden)
+
+
+# Module paths of ``Encoder`` and the native names they load from.
+_ENCODER_SOURCES = (
+    ("network.", "encoder.block."),
+    ("projection.shortcut_norm.", "pre_block.norm3."),
+    ("projection.shortcut.", "pre_block.proj."),
+    ("projection.attention_norm.", "pre_block.norm1."),
+    ("projection.qkv.", "pre_block.attn.qkv."),
+    ("projection.attention_output.", "pre_block.attn.proj."),
+    ("projection.mlp_norm.", "pre_block.norm2."),
+    ("projection.mlp.norm.", "pre_block.mlp.norm."),
+    ("projection.mlp.gate.", "pre_block.mlp.w0."),
+    ("projection.mlp.value.", "pre_block.mlp.w1."),
+    ("projection.mlp.output.", "pre_block.mlp.w2."),
+    ("mean_projection.", "mean_proj."),
+)
+
+
+def encoder_assignments(model: Encoder | LatentEncoder, reader):
+    """Map the native DAC encoder, ``pre_block`` and ``mean_proj``.
+
+    The checkpoint's ``encoder.*``, ``pre_block.*`` and ``mean_proj.*``
+    tensors become resident. Weight-normalized convolutions load their
+    ``weight_g`` and ``weight_v`` fields, and the merged attention bias
+    loads the query bias, the stored zero key bias and the value bias.
+    ``logs_proj`` and the decoder half stay nonresident.
+    """
+    from uniserve.loading import weights
+
+    encoder = model.encoder if isinstance(model, LatentEncoder) else model
+    available = frozenset(reader.names())
+    values = []
+    for name, parameter in encoder.named_parameters():
+        if name == "projection.qkv.bias":
+            width = parameter.shape[0] // 3
+            for index, field in enumerate(("q_bias", "zero_k_bias", "v_bias")):
+                source = f"pre_block.attn.{field}"
+                if source in available:
+                    values.append(
+                        weights.Assignment(
+                            parameter,
+                            reader.get(source),
+                            target_slice=(
+                                slice(index * width, (index + 1) * width),
+                            ),
+                        )
+                    )
+            continue
+
+        match = next(
+            (
+                (prefix, native)
+                for prefix, native in _ENCODER_SOURCES
+                if name.startswith(prefix)
+            ),
+            None,
+        )
+        if match is None:
+            raise ValueError(f"unmapped audio encoder weight {name!r}")
+        prefix, native = match
+        source = native + name.removeprefix(prefix)
+        # A weight-norm parametrization holds the magnitude as original0 and
+        # the direction as original1.
+        source = source.replace(
+            ".parametrizations.weight.original0", ".weight_g"
+        ).replace(".parametrizations.weight.original1", ".weight_v")
         if source in available:
             values.append(weights.Assignment(parameter, reader.get(source)))
     return tuple(values)

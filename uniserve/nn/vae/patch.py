@@ -1,4 +1,4 @@
-"""Image latent posterior sampling and canonical patch serialization."""
+"""Canonical patch serialization of image latents."""
 
 import torch
 from torch import nn
@@ -6,47 +6,42 @@ from torch import nn
 from uniserve.media import image
 from uniserve.nn.functional import patchify, unpatchify
 
-from .layers import DiagonalGaussian
+from .decoder import LatentDecoder
+from .encoder import LatentEncoder
 
 
 class PatchAutoencoder(nn.Module):
-    """Compose numerical encoder/decoder modules with latent patch coordinates.
+    """Serialize a latent codec's image latents as canonical patch rows.
 
-    downsample is the output-pixel stride of one latent patch token. Scale and
-    shift normalize posterior samples before their canonical patch conversion.
-    The posterior generator and every input tensor belong to the caller.
+    ``encoder`` samples and normalizes the latent of NCHW pixels and
+    ``decoder`` restores pixels from it; their normalization defines the
+    latent convention. ``downsample`` is the output-pixel stride of one
+    latent patch token, and patch rows hold ``latent_dtype`` values. Inputs
+    reach each network in the dtype of its first parameter. The posterior
+    generator and every input tensor belong to the caller.
     """
 
     value_range = (0.0, 1.0)
 
     def __init__(
         self,
-        encoder: nn.Module,
-        decoder: nn.Module,
-        posterior: DiagonalGaussian,
+        encoder: LatentEncoder,
+        decoder: LatentDecoder,
         *,
         patch_size: int,
         latent_channels: int,
         latent_dtype: torch.dtype,
         downsample: int,
-        scale: float,
-        shift: float,
     ):
         super().__init__()
-        self.encoder, self.decoder, self.posterior = encoder, decoder, posterior
-        if (
-            any(
-                type(value) is not int or value < 1
-                for value in (patch_size, latent_channels, downsample)
-            )
-            or scale <= 0
+        if any(
+            type(value) is not int or value < 1
+            for value in (patch_size, latent_channels, downsample)
         ):
-            raise ValueError(
-                "latent patch dimensions and scale must be positive"
-            )
+            raise ValueError("latent patch dimensions must be positive")
+        self.encoder, self.decoder = encoder, decoder
         self.patch_size, self.latent_channels = patch_size, latent_channels
         self.latent_dtype, self.downsample = latent_dtype, downsample
-        self.scale, self.shift = scale, shift
 
     def encode(
         self, pixels: torch.Tensor, *, generator: torch.Generator | None = None
@@ -56,12 +51,11 @@ class PatchAutoencoder(nn.Module):
             raise ValueError("latent encoding requires NCHW pixels")
 
         dtype = next(self.encoder.parameters()).dtype
-        moments = self.encoder(pixels.to(dtype))
-        latents = self.scale * (
-            self.posterior(moments, generator=generator) - self.shift
-        )
+        latents = self.encoder(pixels.to(dtype), generator=generator)
 
-        # Trim to complete latent patches before serialization.
+        # Trim to complete latent patches before serialization. Trimming
+        # follows sampling, so the posterior draws the reference's full
+        # latent from ``generator``.
         height = pixels.shape[-2] // self.downsample * self.patch_size
         width = pixels.shape[-1] // self.downsample * self.patch_size
         return self.patchify(latents[:, :, :height, :width]).to(
@@ -94,8 +88,7 @@ class PatchAutoencoder(nn.Module):
             latents = latents.unsqueeze(0)
 
         dtype = next(self.decoder.parameters()).dtype
-        latents = latents.to(dtype) / self.scale + self.shift
-        pixels = self.decoder(latents)
+        pixels = self.decoder(latents.to(dtype))
         return (pixels * 0.5 + 0.5).clamp(0, 1)
 
 

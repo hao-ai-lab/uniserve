@@ -8,7 +8,7 @@ from torch import nn
 
 from uniserve.media import image, video
 from uniserve.model import ComponentEntry, EntryPoint, VideoDecoder
-from uniserve.nn.vae import LatentDecoder
+from uniserve.nn.vae import ChannelStatistics, LatentDecoder
 from uniserve.tensors import OutputLayout
 
 
@@ -38,8 +38,10 @@ class Decoder(VideoDecoder):
             LatentDecoder(
                 TemporalProjection(config.window),
                 latent_shape=(1, 3, config.window, config.height, config.width),
-                mean=torch.tensor([0.1, 0.2, 0.3]).view(1, 3, 1, 1, 1),
-                std=torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1, 1, 1),
+                normalization=ChannelStatistics(
+                    mean=torch.tensor([0.1, 0.2, 0.3]).view(1, 3, 1, 1, 1),
+                    std=torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1, 1, 1),
+                ),
             ),
             frame_sizes=(image.Config(config.height, config.width),),
         )
