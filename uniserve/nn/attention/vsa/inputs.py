@@ -6,6 +6,9 @@ from dataclasses import dataclass
 
 import torch
 
+# Rows of one query tile and of one key block that block attention serves.
+TILE_SIZES = (64, 128)
+
 
 @dataclass(frozen=True, slots=True)
 class Pattern:
@@ -14,16 +17,19 @@ class Pattern:
     Counts describe either one shared head or every head. Each bounds its
     query tile's key tiles: the block map's device counts, which backends
     read, may be lower where prefix key tiles hold no valid rows. A dense
-    prefix has at most the keys ``range(dense_key_tiles)``. Backends may
-    specialize this declared mathematical domain without inspecting device
-    data on the host.
+    prefix has at most the keys ``range(dense_key_tiles)``. ``tile`` is the
+    rows of one query tile and of one key block. Backends may specialize this
+    declared mathematical domain without inspecting device data on the host.
     """
 
     row_counts: tuple[tuple[int, ...], ...]
     dense_prefix_tiles: int
     dense_key_tiles: int
+    tile: int
 
     def __post_init__(self):
+        if self.tile not in TILE_SIZES:
+            raise ValueError(f"VSA tiles hold one of {TILE_SIZES} rows")
         if (
             not isinstance(self.row_counts, tuple)
             or not self.row_counts
@@ -207,7 +213,78 @@ class Input:
             (counts,),
             max(0, min(query_tiles, self.prefix_tiles - query_tile_offset)),
             self.valid_tiles,
+            64,
         )
+
+
+# ``Regions.tile_regions`` entry of a tile outside every video region.
+DENSE_TILE = -1
+
+
+@dataclass(frozen=True, slots=True)
+class Regions:
+    """A tile-major packed sequence whose video tiles form several regions.
+
+    Every packed row belongs to one ``tile``-row tile. A dense tile's queries
+    attend every live key tile, and every video query attends every live
+    dense tile. A tile of video region ``r`` is a video tile: its queries
+    attend, besides the dense tiles, the ``region_keep[s]`` best-scoring key
+    tiles of every region ``s``, each region selected independently. A tile
+    whose valid size is zero is empty: it neither attends nor is attended,
+    so a layout can reserve capacity that a request leaves unused. The
+    physical tile order is free; selection reads the tables alone.
+
+    Every table is a device int32 vector with one entry per tile, so the
+    shapes depend on ``padded_tokens`` alone and one captured call serves
+    every assignment of tiles to regions.
+
+    Attributes:
+        tile: Rows of one tile, one of ``TILE_SIZES``.
+        padded_tokens: Packed rows, whole tiles.
+        valid_sizes: Valid rows of each tile; they lead the tile's rows.
+        tile_regions: ``DENSE_TILE`` for a dense or empty tile, else the
+            tile's region index.
+        region_starts: For each region index ``r``, the number of tiles
+            whose ``tile_regions`` entry is below ``r``: the first position
+            of region ``r`` when the key tiles are ordered by region index.
+            Entries past the last region are unread.
+        region_keep: For each region index, the key tiles a video query
+            keeps of that region, at least one and at most the region's
+            tiles. Entries past the last region are unread.
+    """
+
+    tile: int
+    padded_tokens: int
+    valid_sizes: torch.Tensor
+    tile_regions: torch.Tensor
+    region_starts: torch.Tensor
+    region_keep: torch.Tensor
+
+    def __post_init__(self):
+        if (
+            self.tile not in TILE_SIZES
+            or self.padded_tokens < self.tile
+            or self.padded_tokens % self.tile
+        ):
+            raise ValueError("VSA regions require whole tiles of a VSA tile")
+        tiles = self.padded_tokens // self.tile
+        if any(
+            value.shape != (tiles,) or value.dtype != torch.int32
+            for value in (
+                self.valid_sizes,
+                self.tile_regions,
+                self.region_starts,
+                self.region_keep,
+            )
+        ):
+            raise ValueError(
+                "VSA region tables require one int32 entry per tile"
+            )
+
+    @property
+    def tiles(self) -> int:
+        """Tiles of the packed sequence."""
+        return self.padded_tokens // self.tile
 
 
 @dataclass(frozen=True, slots=True)

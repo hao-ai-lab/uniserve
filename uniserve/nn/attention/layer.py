@@ -123,13 +123,14 @@ class Attention(nn.Module):
             return torch.empty_like(q) if out is None else out
 
         # Token shard -> this rank's head shard, over the padded common layout.
+        # One exchange moves Q, K and V; the results are strided views of
+        # its receive storage.
         storage = _binding.attention_storage.get().get(id(self))
         query, key, value = (
-            self.exchange.heads(
-                partition.pad(tensor), storage=storage, role=role
-            )[: partition.num_tokens]
-            for role, tensor in zip(
-                ("query", "key", "value"), (q, k, v), strict=True
+            shard[: partition.num_tokens]
+            for shard in self.exchange.heads(
+                tuple(partition.pad(tensor) for tensor in (q, k, v)),
+                storage=storage,
             )
         )
         attended = self._compute(operator, query, key, value, sequences, None)
@@ -191,10 +192,10 @@ class Attention(nn.Module):
                 return
             storage = _binding.attention_storage.get().get(id(self))
             k, v = (
-                self.exchange.heads(
-                    partition.pad(tensor), storage=storage, role=role
-                )[: partition.num_tokens]
-                for role, tensor in (("key", k), ("value", v))
+                shard[: partition.num_tokens]
+                for shard in self.exchange.heads(
+                    (partition.pad(k), partition.pad(v)), storage=storage
+                )
             )
 
         operator.update_cache(k, v, indices=indices)

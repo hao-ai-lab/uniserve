@@ -202,6 +202,25 @@ class _FlashAttentionOperator(_Operator):
                 else self._cache_values(k, v)
             )
 
+            used = None if batch.block_table is None else batch.keys.values
+            options = {}
+            if not batch.fully_visible and batch.visible_end.shape[1] == 1:
+                # A shared endpoint bounds the sequence's keys: the kernel
+                # reads it as the used key count and evaluates no row mask.
+                used = self.workspace["lengths"][: batch.queries.batch_size]
+                torch.minimum(
+                    batch.visible_end.reshape(-1).to(dtype=torch.int32),
+                    batch.keys.values,
+                    out=used,
+                )
+            else:
+                options = _visible_options(
+                    batch,
+                    batch.keys,
+                    query_capacity=q.shape[0],
+                    key_capacity=k.shape[0],
+                )
+
             self._forward(
                 q,
                 key,
@@ -213,9 +232,7 @@ class _FlashAttentionOperator(_Operator):
                 page_table=None
                 if batch.block_table is None
                 else batch.block_table.indices,
-                seqused_k=None
-                if batch.block_table is None
-                else batch.keys.values,
+                seqused_k=used,
                 max_seqlen_q=q.shape[0],
                 max_seqlen_k=(
                     k.shape[0]
@@ -225,12 +242,7 @@ class _FlashAttentionOperator(_Operator):
                 ),
                 softmax_scale=scale,
                 out=out,
-                **_visible_options(
-                    batch,
-                    batch.keys,
-                    query_capacity=q.shape[0],
-                    key_capacity=k.shape[0],
-                ),
+                **options,
             )
         elif isinstance(batch, SegmentedInput):
             if self.cache is None:

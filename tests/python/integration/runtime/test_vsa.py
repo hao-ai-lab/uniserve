@@ -113,7 +113,7 @@ def test_large_hopper_key_domain_preserves_head_values_on_graph_replay(stream):
     out = torch.empty_like(q)
     valid = torch.full((tiles,), 64, device="cuda", dtype=torch.int32)
     batch = vsa.BlockInput(
-        vsa.Pattern(((selected,) * tiles,), 0, 0),
+        vsa.Pattern(((selected,) * tiles,), 0, 0, 64),
         torch.arange(selected, device="cuda", dtype=torch.int32)
         .expand(heads, tiles, -1)
         .contiguous(),
@@ -359,7 +359,7 @@ def test_row_production_over_many_intervals_matches_one_call(
         expected = module(q, k, v, gate, batch, workspace=workspace).clone()
 
         produced = torch.zeros_like(q)
-        backend = providers.resolve(provider, device=q.device)
+        backend = providers.resolve(provider, device=q.device, tile=64)
         options = {
             "num_heads": q.shape[1],
             "head_dim": q.shape[2],

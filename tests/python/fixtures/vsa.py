@@ -52,3 +52,82 @@ def reference_attention(q, k, v, gate, valid, *, scale=128**-0.5):
         0, 1
     ).repeat_interleave(64, dim=0)
     return result.to(q.dtype), live
+
+
+# A region domain of 128-row tiles: two dense tiles, an empty one, a region
+# of three tiles, another dense tile, a region of four tiles and an empty
+# alignment tile, each region keeping its own key tiles.
+REGION_TILE = 128
+REGION_VALID = (128, 40, 0, 128, 128, 96, 77, 128, 128, 128, 64, 0)
+REGION_INDICES = (-1, -1, -1, 0, 0, 0, -1, 1, 1, 1, 1, -1)
+REGION_KEEP = (2, 1)
+
+
+def region_tables(device):
+    """Return the domain's ``(valid, regions, starts, keep)`` int32 tables."""
+    regions = torch.tensor(REGION_INDICES, dtype=torch.int32)
+    starts = torch.zeros(len(REGION_VALID), dtype=torch.int32)
+    keep = torch.zeros(len(REGION_VALID), dtype=torch.int32)
+    for region, kept in enumerate(REGION_KEEP):
+        starts[region] = int((regions < region).sum())
+        keep[region] = kept
+    valid = torch.tensor(REGION_VALID, dtype=torch.int32)
+    return tuple(value.to(device) for value in (valid, regions, starts, keep))
+
+
+def region_reference(q, k, v, gate):
+    """Evaluate region selection, fine attention and compression in FP64.
+
+    Dense tiles attend every live tile; video tiles attend the live dense
+    tiles and each region's top-scoring tiles; each row adds its gate times
+    the softmax over live tiles of their mean values. Returns the result and
+    the rows that attend (valid rows of live tiles).
+    """
+    tiles, tile = len(REGION_VALID), REGION_TILE
+    heads, width = q.shape[1], q.shape[2]
+    valid = torch.tensor(REGION_VALID, device=q.device)
+    regions = torch.tensor(REGION_INDICES, device=q.device)
+    live = torch.arange(tiles * tile, device=q.device) % tile < (
+        valid.repeat_interleave(tile)
+    )
+    means = []
+    for value in (q, k, v):
+        rows = value.double().view(tiles, tile, heads, width)
+        means.append(
+            (
+                rows.masked_fill(~live.view(tiles, tile, 1, 1), 0).sum(1)
+                / valid.clamp_min(1).view(-1, 1, 1)
+            ).transpose(0, 1)
+        )
+    scores = means[0] @ means[1].transpose(-1, -2) / width**0.5
+    occupied = valid > 0
+    dense, video = occupied & (regions < 0), occupied & (regions >= 0)
+    mask = torch.zeros(heads, tiles, tiles, dtype=torch.bool, device=q.device)
+    mask[:, dense] = occupied
+    mask[:, video] = dense
+    for region, kept in enumerate(REGION_KEEP):
+        members = torch.nonzero(regions == region).flatten()
+        best = scores[:, :, members].topk(kept, dim=-1).indices
+        chosen = torch.zeros_like(mask)
+        chosen.scatter_(-1, members[best], True)
+        mask |= chosen & video.view(1, -1, 1)
+    rows = mask.repeat_interleave(tile, 1).repeat_interleave(tile, 2)
+    rows &= live.view(1, 1, -1)
+    attending = live & occupied.repeat_interleave(tile)
+    fine = torch.zeros(
+        heads, tiles * tile, width, dtype=torch.float64, device=q.device
+    )
+    fine[:, attending] = F.scaled_dot_product_attention(
+        q.transpose(0, 1).double()[:, attending],
+        k.transpose(0, 1).double(),
+        v.transpose(0, 1).double(),
+        attn_mask=rows[:, attending],
+    )
+    compressed = (
+        scores.masked_fill(~occupied.view(1, 1, -1), -torch.inf).softmax(-1)
+        @ means[2]
+    )
+    result = fine.transpose(0, 1) + gate.double() * compressed.transpose(
+        0, 1
+    ).repeat_interleave(tile, dim=0)
+    return result.to(q.dtype), attending

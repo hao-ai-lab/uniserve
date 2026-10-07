@@ -5,6 +5,9 @@ from uniserve_kernels.attention import vsa_cute
 from . import Backend as BaseBackend
 from . import Operator as BaseOperator
 
+# Tile sizes this provider's kernels address.
+TILES = (64,)
+
 
 def available(device):
     return vsa_cute.available(device)

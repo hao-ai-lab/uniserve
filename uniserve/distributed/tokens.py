@@ -66,13 +66,17 @@ class TokenShard:
         return value.narrow(dim, self.token_slice.start, self.count)
 
     def pad(self, value):
-        """Right-pad local tokens with zeros up to the uniform capacity."""
+        """Right-pad local tokens with zeros up to the uniform capacity.
+
+        A full interval returns the caller's tensor, strided views included;
+        each collective arranges the layout its transfer needs.
+        """
         if value.shape[0] != self.count:
             raise ValueError(
                 "the input does not match its local token interval"
             )
         if self.count == self.capacity:
-            return value.contiguous()
+            return value
         result = value.new_zeros((self.capacity, *value.shape[1:]))
         result[: self.count].copy_(value)
         return result
@@ -108,45 +112,74 @@ class HeadExchange:
         count = heads // self.group.size
         return slice(self.group.rank * count, (self.group.rank + 1) * count)
 
-    def heads(self, value, *, storage=None, role):
-        """Scatter all tokens of this member's head slice.
+    def _layout(self, heads):
+        """Return a value's head slots per member and its replica count.
 
-        Gather every member's tokens. Input and output are
-        [tokens, heads, features]; the output carries the full token domain
-        for the local head interval.
+        Partitioned heads give each member ``heads // size`` slots; fewer
+        heads than members give each member one slot of a head shared by
+        ``size // heads`` adjacent members.
         """
-        if value.ndim != 3 or value.shape[1] < 1:
-            raise ValueError("head exchange requires [tokens, heads, features]")
-        if self.group.size == 1:
-            return value
-        if value.shape[0] == 0:
-            return value[:, self.head_slice(value.shape[1])]
-
-        tokens, heads, features = value.shape
-        interval = self.head_slice(heads)
+        self.head_slice(heads)
         if heads < self.group.size:
-            value = value.repeat_interleave(self.group.size // heads, dim=1)
-        width = interval.stop - interval.start
+            return 1, self.group.size // heads
+        return heads // self.group.size, 1
 
-        # [tokens, heads, features] -> [members, tokens, local heads, features]:
-        # one outgoing payload per member holding the heads that member owns.
-        source = value.view(tokens, self.group.size, width, features).transpose(
-            0, 1
-        )
-        if storage is None:
-            outgoing, incoming = source.contiguous(), None
-        else:
-            outgoing = storage.view(f"{role}_send", tuple(source.shape), value)
-            incoming = storage.view(
-                f"{role}_receive", tuple(source.shape), value
+    def heads(self, values, *, storage=None):
+        """Trade this member's tokens of every head for its heads' tokens.
+
+        ``values`` holds one to three ``[tokens, heads, features]`` tensors
+        sharing tokens, features and dtype, such as query, key and value;
+        their rows and heads may be strided. One all-to-all moves them
+        together: each member's part of the payload holds, value by value,
+        the heads that member owns. Returns one ``[members * tokens, local
+        heads, features]`` tensor per value: the complete token domain of
+        this member's heads. With ``storage`` they are views into its
+        ``heads_receive`` backing, valid until the next exchange on it.
+        """
+        values = tuple(values)
+        if not 1 <= len(values) <= 3 or any(
+            value.ndim != 3
+            or value.shape[1] < 1
+            or value.shape[0] != values[0].shape[0]
+            or value.shape[2] != values[0].shape[2]
+            or value.dtype != values[0].dtype
+            for value in values
+        ):
+            raise ValueError(
+                "head exchange requires one to three [tokens, heads, "
+                "features] tensors sharing tokens, features and dtype"
             )
-            outgoing.copy_(source)
+        if self.group.size == 1:
+            return values
+        if values[0].shape[0] == 0:
+            return tuple(
+                value[:, self.head_slice(value.shape[1])] for value in values
+            )
+
+        tokens, _, features = values[0].shape
+        layout = tuple(self._layout(value.shape[1]) for value in values)
+        slots = sum(count for count, _ in layout)
+        # [members, tokens, slots, features]: part m is sent to member m.
+        shape = (self.group.size, tokens, slots, features)
+        if storage is None:
+            outgoing, incoming = values[0].new_empty(shape), None
+        else:
+            outgoing = storage.view("heads_send", shape, values[0])
+            incoming = storage.view("heads_receive", shape, values[0])
+        _pack(values, layout, outgoing)
 
         splits = (1,) * self.group.size
-        result = self.group.all_to_all(
+        received = self.group.all_to_all(
             outgoing, input_splits=splits, output_splits=splits, out=incoming
         )
-        return result.reshape(tokens * self.group.size, width, features)
+        # Part m of the received payload carries member m's tokens, so the
+        # member-major rows are the complete token domain in order.
+        rows = received.view(self.group.size * tokens, slots, features)
+        shards, offset = [], 0
+        for count, _ in layout:
+            shards.append(rows[:, offset : offset + count])
+            offset += count
+        return tuple(shards)
 
     def tokens(self, value, *, storage=None):
         """Inverse of heads: return full-head outputs for this member's tokens.
@@ -179,9 +212,45 @@ class HeadExchange:
         )
 
         splits = (1,) * self.group.size
-        result = self.group.all_to_all(
+        received = self.group.all_to_all(
             outgoing, input_splits=splits, output_splits=splits, out=incoming
         )
-        return result.transpose(0, 1).reshape(
-            tokens, heads * self.group.size, features
+        result = value.new_empty((tokens, heads * self.group.size, features))
+        _merge(received, result)
+        return result
+
+
+def _pack(values, layout, out):
+    """Write each member's head slots of ``values`` destination-major.
+
+    ``out[m, t, offset + j]`` receives ``value[t, (m * count + j) //
+    replicas]`` for each value's ``(count, replicas)`` layout, with
+    ``offset`` the earlier values' slots.
+    """
+    from uniserve_kernels import heads as kernels
+
+    counts = tuple(count for count, _ in layout)
+    replicas = tuple(share for _, share in layout)
+    if kernels.can_run_triton_pack_head_shards(values, counts, replicas, out):
+        kernels.triton_pack_head_shards(values, counts, replicas, out)
+        return
+
+    members = out.shape[0]
+    offset = 0
+    for value, (count, share) in zip(values, layout, strict=True):
+        index = torch.arange(members * count, device=value.device) // share
+        shards = value.index_select(1, index).view(
+            value.shape[0], members, count, value.shape[2]
         )
+        out[:, :, offset : offset + count].copy_(shards.transpose(0, 1))
+        offset += count
+
+
+def _merge(received, out):
+    """Restore received ``[members, tokens, heads, features]`` token-major."""
+    from uniserve_kernels import heads as kernels
+
+    if kernels.can_run_triton_merge_head_shards(received, out):
+        kernels.triton_merge_head_shards(received, out)
+        return
+    out.copy_(received.transpose(0, 1).reshape(out.shape))

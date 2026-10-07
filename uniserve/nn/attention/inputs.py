@@ -257,6 +257,18 @@ class PagedInput:
 
 @dataclass(frozen=True, slots=True)
 class VisibleInput:
+    """Attend each query row to a prefix of its sequence's keys.
+
+    ``visible_end`` holds exclusive key endpoints on the query device, as
+    int32 or int64: either ``[batch, query rows]``, one endpoint per
+    sequence-local query row, or ``[batch, 1]``, one endpoint that every
+    query row of the sequence shares. An endpoint beyond the sequence's keys
+    sees all of them. The shared form bounds each sequence's key length, so
+    kernels attend the visible prefix without evaluating a per-row mask.
+    ``fully_visible`` declares every key visible and leaves the endpoints
+    unread.
+    """
+
     queries: SequenceLengths
     keys: SequenceLengths
     visible_end: torch.Tensor
@@ -266,7 +278,7 @@ class VisibleInput:
 
     def __post_init__(self) -> None:
         _sequences(self.queries, self.keys)
-        _visibility(self.visible_end, self.queries)
+        _visibility(self.visible_end, self.queries, shared=True)
         if self.block_table is not None and (
             self.block_table.indices.shape[0] != self.queries.batch_size
             or self.block_table.indices.device != self.queries.values.device
@@ -292,11 +304,18 @@ class SegmentedInput:
         _visibility(self.visible_current_end, self.queries)
 
 
-def _visibility(value: torch.Tensor, queries: SequenceLengths) -> None:
+def _visibility(
+    value: torch.Tensor, queries: SequenceLengths, *, shared: bool = False
+) -> None:
+    # ``shared`` admits one endpoint column that every query row reads.
     if (
         value.ndim != 2
         or value.shape[0] != queries.batch_size
-        or (queries.maximum is not None and value.shape[1] < queries.maximum)
+        or (
+            queries.maximum is not None
+            and value.shape[1] < queries.maximum
+            and not (shared and value.shape[1] == 1)
+        )
         or value.dtype not in {torch.int32, torch.int64}
         or value.device != queries.values.device
     ):
