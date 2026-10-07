@@ -361,6 +361,9 @@ class Quantizer:
             else quantization.unsupported_rowwise_fp8(matrix),
             x=x,
         )
+        # _kernel_rows names an unmet condition whenever it returns no
+        # matrix, and require_kernel raises for every named condition.
+        assert matrix is not None
         if self.axis == 0 or self.format == "mxfp8":
             quantization.row_absmax(matrix, maximum.view(-1))
         else:
@@ -400,6 +403,9 @@ class Quantizer:
             else quantization.unsupported_rowwise_fp8(matrix),
             x=x,
         )
+        # _kernel_rows names an unmet condition whenever it returns no
+        # matrix, and require_kernel raises for every named condition.
+        assert matrix is not None
         if amax is None and (
             self.axis is None or self._reduces_rows(x, distribution)
         ):
