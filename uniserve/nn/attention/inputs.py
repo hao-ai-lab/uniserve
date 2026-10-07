@@ -498,7 +498,13 @@ class AttentionBatch:
             raise ValueError(
                 "attention batches map nonnegative table IDs to inputs"
             )
-        if any(isinstance(entry, DenseInput) for entry in entries.values()):
+        # Every input except a dense one carries a packed query domain.
+        packed = tuple(
+            entry
+            for entry in entries.values()
+            if not isinstance(entry, DenseInput)
+        )
+        if len(packed) != len(entries):
             if len(entries) != 1 or self.queries is not None:
                 raise ValueError(
                     "dense attention forms a singleton batch without packed "
@@ -507,7 +513,7 @@ class AttentionBatch:
         elif self.queries is None or any(
             entry.queries.values is not self.queries.values
             or entry.queries.offsets is not self.queries.offsets
-            for entry in entries.values()
+            for entry in packed
         ):
             raise ValueError(
                 "attention tables must share one packed query domain"

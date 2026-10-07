@@ -339,10 +339,13 @@ class _FlashAttentionOperator(_Operator):
                     paged_causal_mask,
                 )
 
+                # CuTe's dynamic tensor conversion reads these attributes to
+                # keep each column's inner stride and int32 alignment;
+                # torch's Tensor stubs do not declare them.
                 flags, prefixes = batch.causal_values, batch.prefixes.values
                 for column in (flags, prefixes):
-                    column.__leading_dim__ = 0
-                    column.__assumed_align__ = 4
+                    column.__leading_dim__ = 0  # type: ignore[attr-defined]
+                    column.__assumed_align__ = 4  # type: ignore[attr-defined]
                 common.update(
                     causal=False,
                     mask_mod=paged_causal_mask,

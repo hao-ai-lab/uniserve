@@ -252,12 +252,12 @@ class _Automatic(_Operator):
         self._selections = {}
         self._arguments = kwargs
 
-    @property
-    def builds_launch_plan(self):
-        """Whether any provider this operator may select builds one."""
-        return any(
+        # Whether any provider this operator may select builds a launch
+        # plan. The provider set is fixed when the operator is prepared, so
+        # the answer is too.
+        self.builds_launch_plan = any(
             provider.operator_class.builds_launch_plan
-            for provider in self._providers.values()
+            for provider in providers.values()
         )
 
     def _name(self, batch):

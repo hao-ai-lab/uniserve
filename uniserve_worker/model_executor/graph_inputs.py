@@ -199,15 +199,18 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
         ValueError: If the attention input has no host query lengths.
     """
     inputs = batch.inputs
-    if not isinstance(inputs, TextInput) or not all(
-        isinstance(entry, PagedInput)
-        for entry in inputs.attention.entries.values()
-    ):
+    if not isinstance(inputs, TextInput):
         return None
 
     # Tables share the query domain and causality; they differ only in their
     # pages, so the widest table sets the staged width.
-    entries = tuple(inputs.attention.entries.values())
+    entries = tuple(
+        entry
+        for entry in inputs.attention.entries.values()
+        if isinstance(entry, PagedInput)
+    )
+    if len(entries) != len(inputs.attention.entries):
+        return None
     attention = entries[0]
     selection = batch.token_selections[0]
     causal = attention.causal[0]
@@ -431,29 +434,31 @@ def restore_writes(batch, cache: PrefixCache | None):
     """
     snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
     attention = getattr(batch.inputs, "attention", None)
-    for number, entry in (
-        () if cache is None or attention is None else attention.entries.items()
-    ):
-        if (
-            not isinstance(entry, (PagedInput, SegmentedInput))
-            or entry.write_indices is None
-        ):
-            continue
-        blocks = tuple(
-            sorted(
-                {
-                    int(value) // entry.block_table.block_size
-                    for value in entry.write_indices.cpu().tolist()
-                    if value >= 0
-                }
-            )
-        )
-        # Only the layers addressed through this table own these pages.
-        for name in cache.config.layers:
-            if cache.table(name) != number:
+    if cache is not None and attention is not None:
+        for number, entry in attention.entries.items():
+            if (
+                not isinstance(entry, (PagedInput, SegmentedInput))
+                or entry.write_indices is None
+            ):
                 continue
-            for tensors in cache.state(name).transfer_views(blocks).values():
-                snapshots.extend((tensor, tensor.clone()) for tensor in tensors)
+            blocks = tuple(
+                sorted(
+                    {
+                        int(value) // entry.block_table.block_size
+                        for value in entry.write_indices.cpu().tolist()
+                        if value >= 0
+                    }
+                )
+            )
+            # Only the layers addressed through this table own these pages.
+            for name in cache.config.layers:
+                if cache.table(name) != number:
+                    continue
+                views = cache.state(name).transfer_views(blocks)
+                for tensors in views.values():
+                    snapshots.extend(
+                        (tensor, tensor.clone()) for tensor in tensors
+                    )
     if batch.decode_force_finish is not None:
         snapshots.append(
             (batch.decode_force_finish, batch.decode_force_finish.clone())
@@ -563,6 +568,9 @@ def greedy_decode(
             isinstance(entry, PagedInput)
             for entry in batch.inputs.attention.entries.values()
         )
+        # A paged batch always carries its packed query domain; only a dense
+        # singleton has none.
+        or batch.inputs.attention.queries is None
         or batch.inputs.attention.queries.host != (1,) * batch.row_count
         or predicate_state is None
         or force_finish is None
