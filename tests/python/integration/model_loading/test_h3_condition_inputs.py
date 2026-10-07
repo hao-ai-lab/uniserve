@@ -1,7 +1,7 @@
 """A worker encodes MiniMax-H3 conditions as the reference conditioning does.
 
 Each case serves the conditions of a recorded diffusers reference request
-(``tools/minimax_h3/diffusers_reference.py``) through the worker's own path:
+through the worker's own path:
 the media reader decodes the official media into the conditioner's patch
 rows, the video encoder's pixels and the audio encoder's PCM
 (``tests/python/fixtures/h3_conditions.py``), and a ``ModelExecutor``
