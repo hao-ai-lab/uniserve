@@ -215,10 +215,14 @@ class Worker:
 
         try:
             try:
-                bindings = initialize_components(
-                    distributed,
-                    dict(config.components),
-                    declarations=declarations,
+                bindings = (
+                    {}
+                    if config.execution.role == "experts"
+                    else initialize_components(
+                        distributed,
+                        dict(config.components),
+                        declarations=declarations,
+                    )
                 )
             except ValueError as error:
                 raise unsupported_setup(str(error)) from error
@@ -269,6 +273,10 @@ class Worker:
                 publication_backends=config.data_plane.publication_backends,
                 worker_id=config.worker_id,
                 checkpoint_identity=loaded.checkpoint_identity,
+                model_name=loaded.model_name,
+                attention_ranks=0
+                if config.expert_parallel is None
+                else config.expert_parallel.attention_ranks,
                 queue_depth=config.ipc.queue_depth,
                 completion_payload_bytes=config.ipc.max_payload_bytes,
                 acknowledgment_slot=config.ipc.acknowledgment_slot,
@@ -310,6 +318,8 @@ class Worker:
         process_groups: ProcessGroups | None = None,
         bindings: Mapping[str, ComponentBinding] | None = None,
         checkpoint_identity: str = "",
+        model_name: str | None = None,
+        attention_ranks: int = 0,
         entry_points=None,
     ) -> None:
         """Allocate execution resources for an already-loaded model.
@@ -387,6 +397,10 @@ class Worker:
                 image_processor=image_processor,
                 flow_prompt=flow_prompt,
                 max_inflight=queue_depth,
+                expert_group=None
+                if process_groups is None
+                else process_groups.experts,
+                attention_ranks=attention_ranks,
             )
             self.runner = runner
             startup.callback(runner.close)
@@ -441,6 +455,7 @@ class Worker:
                 transfer_backends=transfer_backends,
                 components=components,
                 checkpoint_identity=checkpoint_identity,
+                model_name=model_name,
                 attention_backend=runner.attention.name,
                 # The scheduler's page indices address every rank's resident
                 # layer and head regions, including stages with different
@@ -726,6 +741,8 @@ class Worker:
                     ),
                     max_inflight=int(queue_depth),
                 )
+            elif worker_config.role == "experts":
+                runner.configure_experts()
 
             # A rank whose token denoiser generates the deployment's canvases
             # keeps every request slot's canvas resident between its steps.
@@ -743,7 +760,6 @@ class Worker:
                 self.canvas_slots = CanvasSlots.for_denoiser(
                     denoiser,
                     request_pool_size=int(info.request_slots),
-                    max_rows=canvas_runner.max_canvases,
                     sampling=worker_config.canvas_sampling,
                     device=canvas_runner.device,
                 )

@@ -126,6 +126,10 @@ def resolve_outputs(
         encoded_units_layout,
     )
 
+    if config.role == "experts":
+        # Expert results return through the bound exchange, not request IPC.
+        return MappingProxyType({})
+
     # Condition products are sized by the condition rows the deployment's
     # denoiser provisions (``condition_capacity``).
     denoiser = video_denoiser(model, config)

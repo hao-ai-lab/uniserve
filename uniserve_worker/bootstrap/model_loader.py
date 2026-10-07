@@ -38,6 +38,7 @@ from uniserve.nn.attention import (
     Ulysses,
 )
 from uniserve.nn.attention.vsa import BlockAttention
+from uniserve.nn.moe import FusedMoE
 from uniserve.nn.vae.patch import PatchAutoencoder
 from uniserve.processing import (
     FlowPrompt,
@@ -93,6 +94,7 @@ class WorkerModel:
     flow_prompt: FlowPrompt | None = None
     checkpoint_identity: str = ""
     entry_points: Mapping[str, ComponentEntry] | None = None
+    model_name: str | None = None
 
 
 def verify_checkpoint_identity(
@@ -158,20 +160,51 @@ def prepare_worker_model(
     )
     with torch.device("meta"):
         model = metadata.model_class(metadata.model)
-    declared = validate_components(
-        model, dict(config.components), entries=metadata.entry_points
+    dedicated = config.execution.role == "experts"
+    declared = (
+        {}
+        if dedicated
+        else validate_components(
+            model, dict(config.components), entries=metadata.entry_points
+        )
     )
+    split = config.expert_parallel is not None and bool(
+        config.expert_parallel.attention_ranks
+    )
+    expert_paths = (
+        frozenset(
+            path
+            for path, module in model.named_modules()
+            if isinstance(module, FusedMoE)
+        )
+        if split
+        else frozenset()
+    )
+    if split and not expert_paths:
+        raise unsupported_setup(
+            "disaggregated workers require routed expert layers"
+        )
 
     # The second read narrows payload downloads, and later the load, to the
     # module paths this rank's components call.
-    resident = frozenset(
-        call.path
-        for name, component in config.components
-        if config.execution.rank in component.ranks
-        for call in declared[name]
+    resident = (
+        expert_paths
+        if dedicated
+        else frozenset(
+            call.path
+            for name, component in config.components
+            if config.execution.rank in component.ranks
+            for call in declared[name]
+        )
     )
     source = models.read_config(
-        launch.path, io=config.load, modules=resident, base=launch.base_model
+        launch.path,
+        io=config.load,
+        modules=resident,
+        base=launch.base_model,
+        exclude_modules=expert_paths
+        if split and not dedicated
+        else frozenset(),
     )
 
     # The host name is the ``node`` the rank's ``WorkerEndpoint`` reports, so
@@ -354,7 +387,7 @@ def load_worker_model(
     if config.use_stub_model:
         from uniserve_models.stub import Model, image_processor
 
-        model = Model().to(config.execution.device)
+        model: nn.Module = Model().to(config.execution.device)
         for path, device in (
             _devices(model, config.execution.generation_device) or {}
         ).items():
@@ -373,7 +406,8 @@ def load_worker_model(
             "validated model worker is missing model configuration"
         )
 
-    if all(
+    dedicated = config.execution.role == "experts"
+    if not dedicated and all(
         is_host_component(name) or not declarations.get(name)
         for name in bindings
     ):
@@ -428,15 +462,38 @@ def load_worker_model(
         },
         config.execution.device,
     )
+    partition = None if experts is None or experts.size == 1 else experts
+    placement = config.expert_parallel
+    if placement is not None and placement.attention_ranks:
+        if experts is None:
+            raise unsupported_setup(
+                "disaggregated loading requires its expert union"
+            )
+        partition = None
+        if dedicated:
+            partition = Communicator(
+                experts.ranks[placement.attention_ranks :],
+                experts.rank - placement.attention_ranks,
+                "experts",
+                experts.device,
+            )
     loaded = models.load_model(
         source,
         device=config.execution.device,
         meshes=meshes,
         attention=attention,
         devices=_devices(description, config.execution.generation_device),
-        experts=None if experts is None or experts.size == 1 else experts,
+        experts=partition,
     )
     model = loaded.model
+    model_name = f"{type(model).__module__}.{type(model).__qualname__}"
+    if dedicated:
+        # Keep the actual loaded expert modules in numerical traversal order.
+        # The worker owns their invocation; no model capability or KV cache
+        # is fabricated for an expert-only participant.
+        model = nn.ModuleList(
+            module for module in model.modules() if isinstance(module, FusedMoE)
+        )
 
     worker_config = loaded_worker_config(
         model, config.execution, config.ipc.queue_depth
@@ -454,11 +511,14 @@ def load_worker_model(
     return WorkerModel(
         model,
         worker_config,
-        None if source.tokenizer is None else load_tokenizer(source.tokenizer),
+        None
+        if dedicated or source.tokenizer is None
+        else load_tokenizer(source.tokenizer),
         source.image_processor,
         source.flow_prompt,
         source.checkpoint_identity,
-        source.entry_points,
+        {} if dedicated else source.entry_points,
+        model_name,
     )
 
 

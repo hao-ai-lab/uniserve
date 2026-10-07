@@ -96,6 +96,8 @@ pub(crate) enum ExpertExchangeArg {
     Alltoall,
     /// The fused CuTeDSL MegaMoE kernel (NVFP4 experts).
     Megamoe,
+    /// Elastic dispatch/combine to dedicated expert workers.
+    Deepep,
     /// Distributed weight data parallelism with asynchronous NVLink prefetch.
     Dwdp,
 }
@@ -105,6 +107,7 @@ impl From<ExpertExchangeArg> for uniserve_engine::ExpertExchange {
         match value {
             ExpertExchangeArg::Alltoall => Self::AllToAll,
             ExpertExchangeArg::Megamoe => Self::MegaMoe,
+            ExpertExchangeArg::Deepep => Self::DeepEp,
             ExpertExchangeArg::Dwdp => Self::Dwdp,
         }
     }
@@ -248,14 +251,13 @@ pub(crate) struct SharedRuntimeArgs {
     /// consecutive blocks of groups.
     #[arg(long = "data-parallel-size", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub data_parallel_size: usize,
-    /// Shard the model's routed experts across the data-parallel replicas:
-    /// each one-rank replica keeps its share of every expert layer and
-    /// uses the selected expert exchange, while attention and every other
-    /// layer stay data-parallel.
+    /// Shard routed experts across data-parallel replicas or dedicated expert
+    /// workers declared in --workers. Attention replicas own request state;
+    /// dedicated expert workers own no request components or KV cache.
     #[arg(long = "expert-parallel", default_value_t = false)]
     pub expert_parallel: bool,
-    /// Access distributed experts through NVLink all-to-all, fused MegaMoE,
-    /// or DWDP's asynchronous weight prefetch with independent rank progress.
+    /// Access distributed experts through NVLink all-to-all, DeepEP elastic
+    /// dispatch/combine, fused MegaMoE, or DWDP asynchronous weight prefetch.
     #[arg(long = "expert-exchange", value_enum, default_value = "alltoall")]
     pub expert_exchange: ExpertExchangeArg,
     /// Path to a JSON deployment configuration: the Worker instances to serve,
@@ -572,6 +574,9 @@ impl SharedRuntimeArgs {
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
 pub(crate) struct WorkerProcessOptions {
+    /// Independent microbatches overlapping attention and disaggregated experts.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub expert_microbatches: u32,
     /// Checkpoint loader format used by every model worker.
     #[arg(long, default_value = "auto", value_parser = ["auto", "safetensors", "pt", "dummy", "layered"])]
     pub load_format: String,
@@ -668,6 +673,7 @@ impl WorkerProcessOptions {
     /// Converts CLI worker options into the engine's process-launch contract.
     fn to_args(&self) -> WorkerProcessArgs {
         WorkerProcessArgs {
+            expert_microbatches: self.expert_microbatches,
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.clone(),
             load_threads: self.load_threads,

@@ -55,11 +55,24 @@ pub struct WorkerRank {
     pub device: String,
 }
 
+/// The numerical work a worker group owns in a deployment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRole {
+    /// Model capabilities, request state, and (when present) attention/KV.
+    #[default]
+    Model,
+    /// Routed experts shared by the deployment's model replicas.
+    Experts,
+}
+
 /// Static computation components and their ordered physical rank membership.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub id: WorkerId,
+    #[serde(default)]
+    pub role: WorkerRole,
     /// Ordered physical members; a rank's position is its rank number within
     /// the group.
     pub ranks: Vec<WorkerRank>,
@@ -101,6 +114,10 @@ impl WorkerConfig {
                 .map_err(|error| anyhow::anyhow!("worker {}: {error}", self.id))?;
         }
         Self::validate_members(&self.ranks, &self.components)?;
+        anyhow::ensure!(
+            self.components.is_empty() == (self.role == WorkerRole::Experts),
+            "model workers require components; expert workers have no request components"
+        );
         Ok(())
     }
 
@@ -125,7 +142,7 @@ impl WorkerConfig {
     ///
     /// Ranks must be nonempty, name a node and a device, and not repeat a
     /// `(node, device)` pair unless the device is `cpu`. Components must be
-    /// nonempty; each needs a nonempty name, a nonempty list of distinct
+    /// valid for their worker role; each needs a nonempty name, a nonempty list of distinct
     /// in-range rank indices, a `parallel_config` whose
     /// `ParallelConfig::world_size` succeeds, and a positive `units_per_rank`.
     /// A component without a distribution must have a parallel world size
@@ -152,10 +169,6 @@ impl WorkerConfig {
                 "worker repeats a physical device"
             );
         }
-        anyhow::ensure!(
-            !components.is_empty(),
-            "worker requires computation components"
-        );
         for (name, entry) in components {
             anyhow::ensure!(!name.is_empty(), "component name must not be empty");
             anyhow::ensure!(
@@ -268,6 +281,7 @@ impl WorkerConfig {
         }
         Self {
             id: WorkerId("model".into()),
+            role: WorkerRole::Model,
             ranks: placement,
             components,
             queue_depth,
@@ -307,6 +321,7 @@ impl WorkerConfig {
             .enumerate()
             .map(|(index, ranks)| Self {
                 id: WorkerId(format!("model-{index}")),
+                role: WorkerRole::Model,
                 ranks: ranks.to_vec(),
                 components: placed.components.clone(),
                 queue_depth,
@@ -506,14 +521,19 @@ impl EngineCore {
     /// names.
     pub fn replicas(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
         let size = config.data_parallel_size;
-        anyhow::ensure!(
-            size > 0 && !config.workers.is_empty() && config.workers.len().is_multiple_of(size),
-            "{} worker groups do not form {size} equal data-parallel replicas",
-            config.workers.len()
-        );
         WorkerConfig::validate_all(&config.workers)?;
+        let (model_workers, expert_workers): (Vec<_>, Vec<_>) = config
+            .workers
+            .iter()
+            .cloned()
+            .partition(|worker| worker.role == WorkerRole::Model);
+        anyhow::ensure!(
+            size > 0 && !model_workers.is_empty() && model_workers.len().is_multiple_of(size),
+            "{} worker groups do not form {size} equal data-parallel replicas",
+            model_workers.len()
+        );
         let replicas: Vec<&[WorkerConfig]> =
-            config.workers.chunks(config.workers.len() / size).collect();
+            model_workers.chunks(model_workers.len() / size).collect();
         for replica in &replicas[1..] {
             for (group, first) in replica.iter().zip(replicas[0]) {
                 anyhow::ensure!(
@@ -529,18 +549,52 @@ impl EngineCore {
             }
         }
 
-        // Replicas that shard their experts are one rank each: the expert
-        // exchange joins one rank per replica, and a replica with tensor
-        // parallel attention would also need its own expert partition.
+        let disaggregated = !expert_workers.is_empty();
         anyhow::ensure!(
-            config.expert_parallel.is_none()
-                || (size > 1
-                    && replicas
-                        .iter()
-                        .all(|replica| { replica.len() == 1 && replica[0].ranks.len() == 1 })),
-            "expert parallelism shards experts across two or more data-parallel \
-             replicas of one rank each"
+            (1..=4).contains(&config.worker_process.expert_microbatches)
+                && (config.worker_process.expert_microbatches == 1 || disaggregated),
+            "one to four expert microbatches require disaggregated placement when greater than one"
         );
+        if disaggregated {
+            anyhow::ensure!(
+                matches!(
+                    config.expert_parallel,
+                    Some(
+                        crate::worker::ExpertExchange::DeepEp
+                            | crate::worker::ExpertExchange::MegaMoe
+                    )
+                ) && replicas.iter().all(|replica| replica.len() == 1),
+                "disaggregated experts require deepep or megamoe and one model group per replica"
+            );
+        } else {
+            anyhow::ensure!(
+                config.expert_parallel.is_none()
+                    || (config.expert_parallel != Some(crate::worker::ExpertExchange::DeepEp)
+                        && size > 1
+                        && replicas
+                            .iter()
+                            .all(|replica| { replica.len() == 1 && replica[0].ranks.len() == 1 })),
+                "colocated expert parallelism requires two or more one-rank replicas; \
+                 deepep requires dedicated expert workers"
+            );
+        }
+        let attention_ranks = if disaggregated {
+            model_workers
+                .iter()
+                .map(|worker| worker.ranks.len())
+                .sum::<usize>()
+        } else {
+            0
+        };
+        let expert_world_size = if disaggregated {
+            attention_ranks
+                + expert_workers
+                    .iter()
+                    .map(|worker| worker.ranks.len())
+                    .sum::<usize>()
+        } else {
+            size
+        };
 
         // Each replica resolves its transfer edges over its own groups. The
         // edges `with_worker_defaults` adds only name the replica's groups, so
@@ -595,7 +649,8 @@ impl EngineCore {
         // of its replica (`peers`), from which the group resolves the ranks,
         // possibly in other groups, that read its products.
         let mut arguments = Vec::with_capacity(config.workers.len());
-        for (index, (replica, transfer)) in replicas.iter().zip(&transfers).enumerate() {
+        let mut union_rank = 0;
+        for (replica, transfer) in replicas.iter().zip(&transfers) {
             let peers = replica
                 .iter()
                 .map(|worker| (worker.id.to_string(), worker.components.clone()))
@@ -603,6 +658,7 @@ impl EngineCore {
             for worker in *replica {
                 arguments.push(WorkerProcessArgs {
                     worker_id: worker.id.to_string(),
+                    role: worker.role,
                     ranks: worker.ranks.clone(),
                     components: worker.components.clone(),
                     peers: peers.clone(),
@@ -614,27 +670,63 @@ impl EngineCore {
                     transfer: transfer.clone(),
                     expert_parallel: config.expert_parallel.map(|exchange| {
                         crate::worker::ExpertParallelPlacement {
-                            rank: index as u32,
-                            size: size as u32,
+                            rank: union_rank as u32,
+                            size: expert_world_size as u32,
+                            attention_ranks: attention_ranks as u32,
                             address: None,
                             exchange,
                         }
                     }),
                     ..config.worker_process.clone()
                 });
+                union_rank += worker.ranks.len();
             }
+        }
+        for worker in &expert_workers {
+            arguments.push(WorkerProcessArgs {
+                worker_id: worker.id.to_string(),
+                role: worker.role,
+                ranks: worker.ranks.clone(),
+                components: worker.components.clone(),
+                peers: BTreeMap::new(),
+                queue_depth: worker.queue_depth,
+                max_request_pool_size,
+                kv_storage_fraction: worker
+                    .storage_fraction
+                    .unwrap_or(config.worker_process.kv_storage_fraction),
+                transfer: transfers[0].clone(),
+                expert_parallel: config.expert_parallel.map(|exchange| {
+                    crate::worker::ExpertParallelPlacement {
+                        rank: union_rank as u32,
+                        size: expert_world_size as u32,
+                        attention_ranks: attention_ranks as u32,
+                        address: None,
+                        exchange,
+                    }
+                }),
+                ..config.worker_process.clone()
+            });
+            union_rank += worker.ranks.len();
         }
 
         // `spawn_all` returns groups in argument order, which pairs each group
         // with its identity and, block by block, with its replica.
-        let mut groups = config
-            .workers
+        let mut groups = model_workers
             .iter()
+            .chain(&expert_workers)
             .map(|worker| worker.id.clone())
-            .zip(WorkerGroup::spawn_all(arguments)?);
+            .zip(WorkerGroup::spawn_all(arguments)?)
+            .collect::<Vec<_>>();
+        // Shared expert groups have one lifecycle owner. They advertise no
+        // request capabilities, so they never become a scheduling replica.
+        let mut shared = groups.split_off(model_workers.len());
+        let mut groups = groups.into_iter();
         let mut cores = Vec::with_capacity(size);
-        for (replica, transfer) in replicas.iter().zip(transfers) {
-            let workers = groups.by_ref().take(replica.len()).collect();
+        for (index, (replica, transfer)) in replicas.iter().zip(transfers).enumerate() {
+            let mut workers = groups.by_ref().take(replica.len()).collect::<Vec<_>>();
+            if index == 0 {
+                workers.append(&mut shared);
+            }
             let executor = WorkerExecutor::try_new(workers, transfer.clone())?;
 
             // A token runtime serves `max_num_seqs` running requests only while
@@ -652,8 +744,12 @@ impl EngineCore {
             );
 
             let waker = executor.command_waker();
+            let mut placement = replica.to_vec();
+            if index == 0 {
+                placement.extend(expert_workers.iter().cloned());
+            }
             let replica_config = EngineConfig {
-                workers: replica.to_vec(),
+                workers: placement,
                 transfer,
                 data_parallel_size: 1,
                 expert_parallel: None,

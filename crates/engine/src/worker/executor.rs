@@ -1889,23 +1889,31 @@ impl Executor for WorkerExecutor {
 
     /// Closes every worker group and refuses later submissions.
     ///
-    /// Every group is closed even when an earlier one fails; the first error
-    /// is returned.
+    /// Groups can share expert communicators, so each must receive shutdown
+    /// before another waits for collective retirement. Every group is joined
+    /// even when one fails; the first error is returned.
     fn close(&mut self) -> anyhow::Result<()> {
         self.closed = true;
-        let mut first_error = None;
-        for worker in &mut self.workers {
-            if let Err(error) = worker.1.close()
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+        std::thread::scope(|scope| {
+            let closing = self
+                .workers
+                .iter_mut()
+                .map(|worker| scope.spawn(|| worker.1.close()))
+                .collect::<Vec<_>>();
+            let mut first_error = None;
+            for handle in closing {
+                let result = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("worker shutdown thread panicked"))
+                    .and_then(|result| result);
+                if let Err(error) = result
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
             }
-        }
-        if let Some(error) = first_error {
-            Err(error)
-        } else {
-            Ok(())
-        }
+            first_error.map_or(Ok(()), Err)
+        })
     }
 }
 

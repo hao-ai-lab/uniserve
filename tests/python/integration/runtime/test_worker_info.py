@@ -5,16 +5,34 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from torch import nn
 
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_config import stub_worker_config
+from uniserve.nn.moe import FusedMoE
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.report import build_worker_layout
 from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.protocol.call import CALL_KINDS, ForwardMode
+from uniserve_worker.protocol.worker_info import WorkerInfo
 from uniserve_worker.worker import Worker
 
 pytestmark = pytest.mark.integration
+
+
+def test_expert_participant_advertises_no_request_work() -> None:
+    """A collective peer is distinct from a request admission target."""
+    model = nn.ModuleList([FusedMoE(4, 256, 128, top_k=2, activation="silu")])
+    info = build_worker_layout(
+        model,
+        WorkerConfig(role="experts", graph_policy="off"),
+        model_name="uniserve_models.qwen3.Model",
+    ).info
+    reported = WorkerInfo.from_mapping(info.to_mapping())
+    assert reported.supported_calls == ()
+    assert reported.components == ()
+    assert reported.kv_cache is None
+    assert reported.latent_pages == 0
 
 
 @pytest.mark.parametrize("backends", (("local",), ("local", "shm")))

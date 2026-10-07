@@ -667,7 +667,14 @@ def restore_writes(batch, cache: PrefixCache | None):
 
 
 def capture_batch(
-    context, batch, call, *, pools=None, cache=None, predicates=None
+    context,
+    batch,
+    call,
+    *,
+    pools=None,
+    cache=None,
+    predicates=None,
+    warmup=None,
 ):
     """Capture numerical batch output and greedy decoding on common backing.
 
@@ -682,11 +689,18 @@ def capture_batch(
         return output, greedy_decode(static, output, predicates)
 
     return CUDAGraphRunner.capture(
-        context, batch, compute, pools=pools, restore=restore
+        context,
+        batch,
+        compute,
+        pools=pools,
+        restore=restore,
+        warmup=None if warmup is None else lambda value: warmup(compute, value),
     )
 
 
-def capture_hidden(context, batch, call, *, pools=None, cache=None):
+def capture_hidden(
+    context, batch, call, *, pools=None, cache=None, warmup=None
+):
     """Capture a prefill bucket's hidden states on the batch's fixed backing.
 
     ``call(static)`` returns the ``[tokens, hidden]`` backbone output of the
@@ -696,7 +710,7 @@ def capture_hidden(context, batch, call, *, pools=None, cache=None):
     """
     restore = _prepare_capture(context, batch, cache)
     return CUDAGraphRunner.capture(
-        context, batch, call, pools=pools, restore=restore
+        context, batch, call, pools=pools, restore=restore, warmup=warmup
     )
 
 

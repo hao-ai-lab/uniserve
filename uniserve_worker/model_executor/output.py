@@ -43,6 +43,53 @@ class ExecutionOutput:
 
     layouts: tuple[OutputLayout | None, ...] = ()
 
+    @classmethod
+    def combine(cls, outputs):
+        """Concatenate completed microbatch rows on their joined stream.
+
+        Graph-greedy completion consists of four row-length sections, so
+        concatenate each section independently. These results precede the
+        general sampler and carry no speculative or logprob columns.
+        """
+        outputs = tuple(outputs)
+        if len(outputs) == 1:
+            return outputs[0]
+        greedy = None
+        if outputs and all(output.greedy is not None for output in outputs):
+            parts = [output.greedy for output in outputs]
+            greedy = replace(
+                parts[0],
+                **{
+                    name: torch.cat([getattr(part, name) for part in parts])
+                    for name in (
+                        "tokens",
+                        "valid",
+                        "active",
+                        "finish",
+                        "continuation",
+                        "tagged_tokens",
+                    )
+                },
+                completion=torch.cat(
+                    [part.completion.reshape(4, -1) for part in parts], dim=1
+                ).reshape(-1),
+            )
+        return cls(
+            values=tuple(
+                value for output in outputs for value in output.values
+            ),
+            vocabularies=tuple(
+                value for output in outputs for value in output.vocabularies
+            ),
+            layouts=tuple(
+                value for output in outputs for value in output.layouts
+            ),
+            greedy=greedy,
+            stats=ForwardStats.combine(
+                [output.stats for output in outputs if output.stats is not None]
+            ),
+        )
+
     def __post_init__(self) -> None:
         if not self.vocabularies:
             object.__setattr__(self, "vocabularies", (None,) * len(self.values))

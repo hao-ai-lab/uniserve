@@ -594,7 +594,7 @@ def warmup_postprocess(
     builder, decoder = runner.media_builder, runner.video_decoder
     binding = runner.bindings[name]
     device = binding.device
-    position = binding.config.ranks.index(binding.process_group.global_rank)
+    position = binding.config.ranks.index(binding.process_group.rank)
     units_per_round = len(binding.config.ranks)
     sizes = (
         video.Config(frames, canvas)

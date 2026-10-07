@@ -554,6 +554,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
         .into_iter()
         .collect();
         let transfer = transfer.with_worker_defaults(&[WorkerConfig {
+            role: uniserve_engine::WorkerRole::Model,
             id: WorkerId("worker".into()),
             ranks: args.ranks.clone(),
             components: args.components.clone(),
@@ -1522,6 +1523,60 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
         );
         worker.close()?;
     }
+    Ok(())
+}
+
+#[test]
+fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("python");
+    let python = serde_json::to_string(&worker_python())?;
+    let records = serde_json::to_string(directory.path())?;
+    // Record process identities at the launch boundary; the numerical
+    // worker and the engine both execute their normal public paths.
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\nrank = sys.argv[sys.argv.index('--rank') + 1]\n(Path({records}) / (rank + '.pid')).write_text(str(os.getpid()))\nos.execv({python}, [{python}, *sys.argv[1:]])\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let mut config = EngineConfig::sim("stub");
+    config.runtime_family = RuntimeFamily::Ar;
+    config.generation_limits = uniserve_core::GenerationLimits {
+        features: uniserve_core::GenerationFeatures::UNDERSTANDING,
+        latent_downsample: 1,
+        max_cfg_branches: 1,
+        ..Default::default()
+    };
+    config.workers = vec![WorkerConfig::placed(
+        &["localhost".to_owned()],
+        "cpu",
+        WORLD_SIZE,
+        2,
+        WorkerConfig::single_component("model", WORLD_SIZE),
+    )];
+    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    config.worker_process.python = wrapper.clone();
+    let engine = EngineCore::new(config)?;
+
+    // Removing the launch executable makes recovery fail at the same OS
+    // boundary as a missing deployment prerequisite, without changing IPC.
+    remove_file(wrapper)?;
+    let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
+    anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !engine.is_dead() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let dead = engine.is_dead();
+    engine.shutdown();
+    assert!(
+        dead,
+        "an engine without execution workers kept accepting work"
+    );
     Ok(())
 }
 

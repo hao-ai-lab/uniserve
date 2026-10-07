@@ -546,8 +546,15 @@ class WorkerInfo:
                     f"worker info.{name} must not be negative"
                 )
 
-        if not self.supported_calls:
-            raise invalid_descriptor("worker info must support a call kind")
+        if not self.supported_calls and (
+            self.components
+            or self.kv_cache is not None
+            or self.latent_pages
+            or self.media_components
+        ):
+            raise invalid_descriptor(
+                "a collective-only worker cannot advertise request resources"
+            )
         if len(set(self.supported_calls)) != len(self.supported_calls):
             raise invalid_descriptor("worker info repeats a call kind")
 

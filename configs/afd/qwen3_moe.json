@@ -1,0 +1,26 @@
+[
+  {
+    "id": "attention",
+    "ranks": [
+      { "node": "rank-0", "device": "cuda:0" },
+      { "node": "rank-0", "device": "cuda:1" }
+    ],
+    "components": {
+      "model": {
+        "ranks": [0, 1],
+        "parallel_config": { "tensor_parallel_size": 2 }
+      }
+    },
+    "queue_depth": 2
+  },
+  {
+    "id": "experts",
+    "role": "experts",
+    "ranks": [
+      { "node": "rank-1", "device": "cuda:0" },
+      { "node": "rank-1", "device": "cuda:1" }
+    ],
+    "components": {},
+    "queue_depth": 2
+  }
+]
