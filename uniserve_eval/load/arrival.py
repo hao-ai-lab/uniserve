@@ -217,8 +217,8 @@ async def run_load(
             try:
                 completed = await asyncio.gather(*session_tasks)
             except BaseException:
-                for task in session_tasks:
-                    task.cancel()
+                for session_task in session_tasks:
+                    session_task.cancel()
                 await asyncio.gather(*session_tasks, return_exceptions=True)
                 raise
             ordered = sorted(
