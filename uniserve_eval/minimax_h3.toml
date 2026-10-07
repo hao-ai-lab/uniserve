@@ -53,7 +53,7 @@ artifact_root = "artifacts/minimax_h3/measurements"
 
 # ------------------------------------------------------------------ UniServe
 # The serving options follow the FastH3 GB200 deployments in
-# docs/fast_h3/fast_h3.md. Each deployment is sized for the workloads it
+# docs/minimax_h3/minimax_h3.md. Each deployment is sized for the workloads it
 # serves: the text capacity holds the presented prompt (537 tokens for W1
 # and W2; 1935 text rows for W3; up to 6913 for W5), the duration bound the
 # longest target, and the condition capacity the rows the references pack.

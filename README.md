@@ -1,6 +1,6 @@
 # UniServe
 
-UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 guide](docs/fast_h3/fast_h3.md) covers every deployment, precision and option. UniServe also serves the base MiniMax-H3 checkpoint, with text-to-video, keyframe and reference requests, and FastH3 OmniRef reference requests; the [MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers them.
+UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
 
 UniServe is a Python computation library and a Rust server. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, scheduling, request state and response assembly.
 
@@ -29,7 +29,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` server and `uniserve-host` launcher binaries, the native worker IPC extension, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/fast_h3/fast_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` server and `uniserve-host` launcher binaries, the native worker IPC extension, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 ## Quickstart
 
@@ -70,7 +70,7 @@ A deployment file passed to `--workers` places FastH3's components on devices an
 | `dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas, shared TP8 text encoder |
 | `gather8.json` | Eight on one host | All-gather sequence-parallel denoiser, TP8 text encoder |
 
-One replica spanning every GPU gives the lowest latency; replicas serve more requests at once. The [FastH3 guide](docs/fast_h3/fast_h3.md#deployments) lists the recommended deployment and options for each GPU type and goal, and describes two-host startup.
+One replica spanning every GPU gives the lowest latency; replicas serve more requests at once. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#deployments) lists the recommended deployment and options for each GPU type and goal, and describes two-host startup.
 
 ## HTTP API
 
@@ -94,7 +94,7 @@ DiffusionGemma readout settings are fixed when the server starts. `--readout-can
 
 See the [DiffusionGemma serving guide](docs/diffusion_gemma/serving.md) for checkpoint setup, four-GPU serving, decision and chat examples, precision choices, and measurement contracts.
 
-A video request is the MiniMax-H3 request body: `model`, `prompt`, `task` (`t2va`), `target` with `short_edge` 768, `aspect_ratio` `16:9` and `duration_seconds` (4 to 15), and an optional `seed` (default 42). The [FastH3 guide](docs/fast_h3/fast_h3.md#generate-a-video) lists every field. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
+A video request is the MiniMax-H3 request body: `model`, `prompt`, `task` (`t2va`), `target` with `short_edge` 768, `aspect_ratio` `16:9` and `duration_seconds` (4 to 15), and an optional `seed` (default 42). The [FastH3 guide](docs/minimax_h3/minimax_h3.md#generate-a-video) lists every field. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
 
 The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requests`, labeled by served-model name, profile, description, and state. `active` is the instantaneous in-flight count; `accepted`, `scheduled`, `finished`, `rejected`, `cancelled`, `aborted`, and `failed` are cumulative for the running serving runtime. Scheduler, worker, request-latency, and HTTP metrics share the same OpenMetrics response.
 
@@ -153,7 +153,7 @@ export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
 ```
 
-The [FastH3 guide](docs/fast_h3/fast_h3.md#reproduce-the-measurements) lists every suite and the two-host procedure.
+The [evaluation guide](docs/minimax_h3/evaluation.md) lists every suite and the two-host procedure.
 
 ## Text and expert parallelism
 
@@ -167,7 +167,7 @@ uniserve serve /models/diffusiongemma-26B-A4B-it \
 
 Adding `--expert-parallel` keeps the four replicas' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the replicas exchange tokens at each expert layer. Every expert layer then runs in steps the replicas take together: a replica without work joins each step another replica starts, and all replicas pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `--expert-exchange megamoe` fuses each expert layer's exchange and expert computation into one kernel.
 
-For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).
+For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 guide](docs/minimax_h3/minimax_h3.md).
 
 For dedicated expert workers, attention tensor parallelism and microbatch overlap across hosts, use the [expert placement guide](docs/expert_parallel.md) and its deployment example.
 
@@ -221,7 +221,7 @@ uniserve_worker/                          Worker lifecycle and rank-local execut
   transport/                             Local, SHM, CUDA VMM, and channel transfers
 uniserve_eval/                            Serving evaluator, profiles, and request workloads
 configs/fast_h3/                          FastH3 deployment files
-docs/fast_h3/                             FastH3 guide, Dynamo guide, and container files
+docs/minimax_h3/                          H3 serving, library, evaluation and Dynamo guides, container files
 ```
 
 ## License
