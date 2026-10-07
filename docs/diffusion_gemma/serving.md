@@ -78,7 +78,7 @@ Readout settings are fixed for the deployment:
 
 For applications whose readout contract specifies 64-token canvases and primary candidates, append `--readout-canvas 64 --readout-candidates primary` to the serving command. Short canvases use graphs sized for their numerical length on independent replicas. These options change the model's input or answer projection, so qualify their accuracy and calibration on the application's data before choosing them. They do not change the canvas length used for chat generation.
 
-Attach images with `x_images`, an ordered list of 1–8 data URLs or HTTP(S) URLs. The prompt identifies them as Image 1, Image 2, and so on. Remote images follow the server's image-fetch limits and public-address policy, documented in the [main README](../../README.md#public-http-api).
+Attach images with `x_images`, an ordered list of 1–8 data URLs or HTTP(S) URLs. The prompt identifies them as Image 1, Image 2, and so on. Remote images follow the server's image-fetch limits and public-address policy, documented in the [main README](../../README.md#http-api).
 
 Malformed System One requests return 422 with a `detail` list; an unknown served-model name returns 404; admission above a configured concurrency limit returns 503. Questions reject unknown fields. State and rubric fields accept strings and structured JSON values as described by the System One schema.
 

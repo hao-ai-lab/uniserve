@@ -6,7 +6,7 @@ A causal `forward` writes prompt KV and returns hidden rows. `fill_cache` writes
 
 `uniserve.diffusion.tokens` defines the temperature schedule, entropy-bound acceptance, Philox draws, re-noising, stopping, EOS truncation and self-conditioning equations. Random draws are keyed by request seed and indexed by block, step, position and stream, so batch composition does not change a request's random bits. `uniserve.diffusion.canvas` applies one step to borrowed resident tensors and provides the same numerical contract through portable formulas and SM100 kernels. A zero confidence threshold runs all configured steps. The caller selects steps, commits accepted blocks and owns request progress.
 
-Cache allocation, native layer preparation, streams and graph lifetimes belong to `PrefixCache` and `ExecutionContext`, as in ordinary causal inference. Image slots can use `PatchEncoder.encode_packed`: each slot's image features equal encoding that image separately, and device grid values can change between graph replays. The [attention](../attention.md) and [cache](../cache.md) contracts define visibility, page-table and lifetime obligations.
+Cache allocation, native layer preparation, streams and graph lifetimes belong to `PrefixCache` and `ExecutionContext`, as in ordinary causal inference. Image slots can use `PatchEncoder.encode_packed`: each slot's image features equal encoding that image separately, and device grid values can change between graph replays.
 
 ## Python example
 

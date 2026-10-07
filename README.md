@@ -119,7 +119,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities prepared at startup |
 | `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
-| `--page-size` | Chosen by the worker | Base KV page size supported by every cache group's attention readers. See [paged KV ownership](docs/cache.md). |
+| `--page-size` | Chosen by the worker | Base KV page size supported by every cache group's attention readers. |
 | `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
 | `--chunked-prefill-size` | `8192` | Per-request prefill bound |
 | `--mem-fraction-static` | `0.70` | Each rank's share of device storage |
@@ -168,8 +168,6 @@ uniserve serve /models/diffusiongemma-26B-A4B-it \
 Adding `--expert-parallel` keeps the four replicas' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the replicas exchange tokens at each expert layer. Every expert layer then runs in steps the replicas take together: a replica without work joins each step another replica starts, and all replicas pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `--expert-exchange megamoe` fuses each expert layer's exchange and expert computation into one kernel.
 
 For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 guide](docs/minimax_h3/minimax_h3.md).
-
-For dedicated expert workers, attention tensor parallelism and microbatch overlap across hosts, use the [expert placement guide](docs/expert_parallel.md) and its deployment example.
 
 ## Development and verification
 
