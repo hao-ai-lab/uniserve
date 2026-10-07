@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from itertools import accumulate
+from itertools import accumulate, chain
+from types import MappingProxyType
 
+import numpy as np
 import torch
 
 
@@ -86,14 +89,28 @@ class SequenceLengths:
 
 @dataclass(frozen=True, slots=True)
 class BlockTable:
-    """Map [sequence, logical block] to physical block IDs.
+    """Map [sequence, page column] to physical block IDs.
 
-    Sequence lengths determine the valid portion of each row. Unused trailing
-    entries have no numerical meaning and are never part of an attention read.
+    Column ``j`` of row ``b`` holds absolute logical page
+    ``start_page[b] + j``, so the absolute token position ``p`` of the row
+    lies in column ``p // block_size - start_page[b]`` at page offset
+    ``p % block_size``. Sequence lengths stay absolute: the valid columns of a
+    row end at the page holding its last key. Pages before a row's start page
+    are retired, a representation only history-windowed caches produce; the
+    row's reader must need none of their keys. Unused trailing entries have
+    no numerical meaning and are never part of an attention read.
+
+    ``start_page`` is an int32 ``[B]`` device column, or ``None`` when every
+    row starts at page zero, as every full-history table does.
+    ``start_page_host`` optionally mirrors the column exactly on the host;
+    the caller keeps both consistent while an invocation uses them, and
+    construction never reads the device column.
     """
 
     indices: torch.Tensor
     block_size: int
+    start_page: torch.Tensor | None = None
+    start_page_host: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -105,6 +122,32 @@ class BlockTable:
             raise ValueError(
                 "block tables require a positive block size and an integer "
                 "matrix"
+            )
+        if self.start_page is None:
+            if self.start_page_host is not None:
+                raise ValueError(
+                    "a host start-page mirror requires its device column"
+                )
+            return
+        if (
+            self.start_page.shape != (self.indices.shape[0],)
+            or self.start_page.dtype != torch.int32
+            or self.start_page.device != self.indices.device
+        ):
+            raise ValueError(
+                "table start pages require one int32 page per row on the "
+                "table's device"
+            )
+        if self.start_page_host is not None and (
+            not isinstance(self.start_page_host, tuple)
+            or len(self.start_page_host) != self.indices.shape[0]
+            or any(
+                type(page) is not int or page < 0
+                for page in self.start_page_host
+            )
+        ):
+            raise ValueError(
+                "host start pages must mirror one nonnegative page per row"
             )
 
 
@@ -173,17 +216,38 @@ class VarlenInput:
 
 @dataclass(frozen=True, slots=True)
 class PagedInput:
+    """Packed cache-appending rows with uniform or per-row causality.
+
+    ``causal_values`` optionally borrows an int32 device mirror of ``causal``
+    (0 or 1). Callers keep the two consistent. Native mixed-block readers
+    consume the device column so graph replay can change row visibility
+    without changing the launch or synchronizing the device.
+    The auto, prefix-block, FlashAttention-4, FlashInfer and portable providers
+    implement this representation; uniform-only native kernels reject it.
+    """
+
     queries: SequenceLengths
     prefixes: SequenceLengths
     block_table: BlockTable
     write_indices: torch.Tensor | None
     causal: tuple[bool, ...]
+    causal_values: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         _paged(
             self.queries, self.prefixes, self.block_table, self.write_indices
         )
         _causal(self.causal, self.queries.batch_size)
+        flags = self.causal_values
+        if flags is not None and (
+            flags.shape != self.queries.values.shape
+            or flags.dtype != torch.int32
+            or flags.device != self.queries.values.device
+            or flags.stride(0) != 1
+        ):
+            raise ValueError(
+                "causal values require one contiguous int32 per row"
+            )
 
     @classmethod
     def from_blocks(
@@ -195,64 +259,143 @@ class PagedInput:
         block_size: int,
         causal: bool | tuple[bool, ...],
         device: torch.device | str,
+        start_pages: tuple[int, ...] | None = None,
     ) -> PagedInput:
         """Build a block table and addresses for appending each query to its
         prefix.
+
+        Each row of ``blocks`` holds the physical blocks of its logical pages
+        from its entry of ``start_pages`` on (page zero when ``None``). The
+        blocks must cover every appended position, which must lie at or
+        after the row's start page.
         """  # noqa: D205
-        if (
-            not isinstance(blocks, tuple)
-            or type(block_size) is not int
-            or block_size < 1
-            or len(blocks) != len(query_lengths)
-            or len(blocks) != len(prefix_lengths)
-        ):
-            raise ValueError(
-                "block lists and sequence lengths must have matching batch "
-                "sizes"
-            )
+        table, addresses = paged_append(
+            blocks,
+            query_lengths=query_lengths,
+            prefix_lengths=prefix_lengths,
+            block_size=block_size,
+            start_pages=start_pages,
+        )
         queries = SequenceLengths.from_lengths(query_lengths, device=device)
         prefixes = SequenceLengths.from_lengths(prefix_lengths, device=device)
         flags = (causal,) * len(blocks) if type(causal) is bool else causal
         _causal(flags, len(blocks))
-
-        width = max(map(len, blocks), default=0)
-        rows = []
-        addresses: list[int] = []
-        for row, query, prefix in zip(
-            blocks, query_lengths, prefix_lengths, strict=True
-        ):
-            if not isinstance(row, tuple) or any(
-                type(block) is not int
-                or block < 0
-                or block > torch.iinfo(torch.int32).max
-                for block in row
-            ):
-                raise ValueError(
-                    "physical block IDs must be nonnegative int32 integers"
-                )
-            if len(row) * block_size < prefix + query:
-                raise ValueError(
-                    "block table does not cover the prefix and query"
-                )
-            # Short rows are zero-padded to the shared table width; padded
-            # entries are never read because lengths bound the valid span.
-            rows.append((*row, *((0,) * (width - len(row)))))
-            # One physical token address per appended query position.
-            addresses.extend(
-                row[position // block_size] * block_size + position % block_size
-                for position in range(prefix, prefix + query)
-            )
-
-        table = torch.tensor(rows, dtype=torch.int32, device=device).reshape(
-            len(blocks), width
-        )
         return cls(
             queries,
             prefixes,
-            BlockTable(table, block_size),
-            torch.tensor(addresses, dtype=torch.int64, device=device),
+            BlockTable(
+                torch.from_numpy(table).to(device),
+                block_size,
+                None
+                if start_pages is None
+                else torch.tensor(
+                    start_pages, dtype=torch.int32, device=device
+                ),
+                start_pages,
+            ),
+            torch.from_numpy(addresses).to(device),
             flags,
         )
+
+
+def paged_append(
+    blocks: tuple[tuple[int, ...], ...],
+    *,
+    query_lengths: tuple[int, ...],
+    prefix_lengths: tuple[int, ...],
+    block_size: int,
+    start_pages: tuple[int, ...] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Lay out appending each query to its prefix on the host.
+
+    Each row of ``blocks`` holds the physical blocks of its logical pages
+    from its entry of ``start_pages`` on (page zero when ``None``). The
+    blocks must cover every appended position, which must lie at or after
+    the row's start page.
+
+    Returns:
+        The zero-padded int32 block table ``[rows, width]`` and the int64
+        physical token address of every appended position, row after row.
+
+    Raises:
+        ValueError: If the rows, lengths and start pages disagree in number,
+            a length or start page is negative, a block id is not a
+            nonnegative int32 Python int, or a row does not cover its prefix
+            and query.
+    """
+    if (
+        not isinstance(blocks, tuple)
+        or type(block_size) is not int
+        or block_size < 1
+        or len(blocks) != len(query_lengths)
+        or len(blocks) != len(prefix_lengths)
+    ):
+        raise ValueError(
+            "block lists and sequence lengths must have matching batch sizes"
+        )
+    if any(
+        type(length) is not int or length < 0
+        for length in (*query_lengths, *prefix_lengths)
+    ):
+        raise ValueError("sequence lengths must be nonnegative integers")
+    starts = (0,) * len(blocks) if start_pages is None else start_pages
+    if (
+        not isinstance(starts, tuple)
+        or len(starts) != len(blocks)
+        or any(type(page) is not int or page < 0 for page in starts)
+    ):
+        raise ValueError(
+            "start pages must give one nonnegative page per block row"
+        )
+
+    if any(not isinstance(row, tuple) for row in blocks) or not set(
+        map(type, chain.from_iterable(blocks))
+    ) <= {int}:
+        raise ValueError(
+            "physical block IDs must be nonnegative int32 integers"
+        )
+    for row, query, prefix, start in zip(
+        blocks, query_lengths, prefix_lengths, starts, strict=True
+    ):
+        if (start + len(row)) * block_size < prefix + query or (
+            query and prefix < start * block_size
+        ):
+            raise ValueError("block table does not cover the prefix and query")
+
+    # Short rows are zero-padded to the shared table width; padded entries
+    # are never read because lengths bound the valid span.
+    count = len(blocks)
+    width = max(map(len, blocks), default=0)
+    table = np.zeros((count, width), dtype=np.int64)
+    try:
+        for index, row in enumerate(blocks):
+            table[index, : len(row)] = row
+    except OverflowError:
+        raise ValueError(
+            "physical block IDs must be nonnegative int32 integers"
+        ) from None
+    if table.size and (table.min() < 0 or table.max() > np.iinfo(np.int32).max):
+        raise ValueError(
+            "physical block IDs must be nonnegative int32 integers"
+        )
+
+    # One physical token address per appended query position, in the row's
+    # columns counted from its start page, gathered for every position at
+    # once: token t of row r is position prefix[r] + t - first[r], where
+    # first[r] is the row's first token.
+    lengths = np.asarray(query_lengths, dtype=np.int64)
+    owners = np.repeat(np.arange(count), lengths)
+    first = np.cumsum(lengths) - lengths
+    positions = (
+        np.asarray(prefix_lengths, dtype=np.int64)[owners]
+        + np.arange(owners.size)
+        - first[owners]
+    )
+    columns = (
+        positions // block_size - np.asarray(starts, dtype=np.int64)[owners]
+    )
+    addresses = table[owners, columns] * block_size + positions % block_size
+    return table.astype(np.int32), addresses
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,3 +471,85 @@ def _visibility(
 AttentionInput = (
     DenseInput | VarlenInput | PagedInput | VisibleInput | SegmentedInput
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionBatch:
+    """One call's numerical attention inputs, one entry per cache table.
+
+    A layer bound to a prefix cache reads the entry of the table that holds
+    its cache; a layer without a cache table reads the batch's only entry.
+    Table IDs come from the prefix cache's layout and are not model
+    configuration. Every packed entry shares ``queries``: the same query
+    order, length and offset tensors. Entries may differ in their prefixes,
+    block tables, write addresses and key visibility. A dense input forms a
+    singleton batch without a packed query domain. The batch borrows its
+    tensors and owns no cache, request or execution state.
+    """
+
+    entries: Mapping[int, AttentionInput]
+    queries: SequenceLengths | None
+
+    def __post_init__(self) -> None:
+        entries = dict(self.entries)
+        if not entries or any(
+            type(table) is not int or table < 0 for table in entries
+        ):
+            raise ValueError(
+                "attention batches map nonnegative table IDs to inputs"
+            )
+        # Every input except a dense one carries a packed query domain.
+        packed = tuple(
+            entry
+            for entry in entries.values()
+            if not isinstance(entry, DenseInput)
+        )
+        if len(packed) != len(entries):
+            if len(entries) != 1 or self.queries is not None:
+                raise ValueError(
+                    "dense attention forms a singleton batch without packed "
+                    "queries"
+                )
+        elif self.queries is None or any(
+            entry.queries.values is not self.queries.values
+            or entry.queries.offsets is not self.queries.offsets
+            for entry in packed
+        ):
+            raise ValueError(
+                "attention tables must share one packed query domain"
+            )
+        object.__setattr__(self, "entries", MappingProxyType(entries))
+
+    @classmethod
+    def single(cls, value: AttentionInput) -> AttentionBatch:
+        """Wrap one input as the only entry, for layers without cache tables."""
+        return cls(
+            {0: value},
+            None if isinstance(value, DenseInput) else value.queries,
+        )
+
+    @property
+    def batch_size(self) -> int | None:
+        """Packed sequence count, or None for a dense singleton."""
+        return None if self.queries is None else self.queries.batch_size
+
+    def entry(self, table: int | None) -> AttentionInput:
+        """Select one table's input; ``None`` selects the only entry.
+
+        Raises:
+            ValueError: ``table`` is absent, or ``None`` names a batch with
+                several entries.
+        """
+        if table is None:
+            if len(self.entries) != 1:
+                raise ValueError(
+                    "a layer without a cache table requires a single-entry "
+                    "attention batch"
+                )
+            return next(iter(self.entries.values()))
+        try:
+            return self.entries[table]
+        except KeyError:
+            raise ValueError(
+                f"attention batch has no entry for cache table {table}"
+            ) from None

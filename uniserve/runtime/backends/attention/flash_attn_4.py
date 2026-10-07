@@ -106,7 +106,13 @@ def _lse(result):
 
 
 class _FlashAttentionOperator(_Operator):
+    # The kernels read every length, offset and table on the device; ``bind``
+    # only checks the batch.
+    builds_launch_plan = False
+
     def requires_host_lengths(self, batch):
+        if isinstance(batch, PagedInput) and batch.causal_values is not None:
+            return False
         return (
             isinstance(batch, (PagedInput, VarlenInput))
             and len(set(batch.causal)) > 1
@@ -118,6 +124,10 @@ class _FlashAttentionOperator(_Operator):
         if self.dtype not in {torch.float16, torch.bfloat16}:
             raise ValueError(
                 "FlashAttention-4 requires FP16 or BF16 computation"
+            )
+        if self.window is not None:
+            raise ValueError(
+                "FlashAttention-4 attention does not take history windows"
             )
         if self.cache is not None and isinstance(
             self.cache.key, QuantizedTensor
@@ -146,6 +156,15 @@ class _FlashAttentionOperator(_Operator):
         if isinstance(batch, DenseInput) and batch.mask is not None:
             raise ValueError(
                 "FlashAttention-4 does not consume arbitrary dense masks"
+            )
+        if self.head_dim == 256 and isinstance(
+            batch, (PagedInput, VisibleInput, SegmentedInput)
+        ):
+            # The dedicated head-dimension-256 kernel rejects per-sequence
+            # key lengths and mask functions, which these inputs require.
+            raise ValueError(
+                "FlashAttention-4 head dimension 256 supports only dense and "
+                "variable-length inputs"
             )
         self._validate(q, k, v, batch, out)
 
@@ -183,7 +202,9 @@ class _FlashAttentionOperator(_Operator):
                 "packed attention rows must match the declared query lengths"
             )
 
-        if isinstance(batch, (PagedInput, VarlenInput)):
+        if isinstance(batch, PagedInput) and batch.causal_values is not None:
+            self._sequence(q, k, v, batch, scale, out)
+        elif isinstance(batch, (PagedInput, VarlenInput)):
             for query_slice, key_slice, run in causal_runs(batch):
                 if query_slice.stop == query_slice.start:
                     continue
@@ -313,6 +334,23 @@ class _FlashAttentionOperator(_Operator):
         }
 
         if isinstance(batch, PagedInput):
+            if batch.causal_values is not None:
+                from uniserve_kernels.attention.visible_end import (
+                    paged_causal_mask,
+                )
+
+                # CuTe's dynamic tensor conversion reads these attributes to
+                # keep each column's inner stride and int32 alignment;
+                # torch's Tensor stubs do not declare them.
+                flags, prefixes = batch.causal_values, batch.prefixes.values
+                for column in (flags, prefixes):
+                    column.__leading_dim__ = 0  # type: ignore[attr-defined]
+                    column.__assumed_align__ = 4  # type: ignore[attr-defined]
+                common.update(
+                    causal=False,
+                    mask_mod=paged_causal_mask,
+                    aux_tensors=[flags, prefixes],
+                )
             key, value = self._cache_values(k, v)
             lengths = self.workspace["lengths"][: batch.queries.batch_size]
             torch.add(batch.prefixes.values, batch.queries.values, out=lengths)
@@ -348,6 +386,14 @@ class Backend(_Backend):
     operator_class = _FlashAttentionOperator
 
     def workspace_buffers(
-        self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache
+        self,
+        *,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        size,
+        cache,
+        window=None,
     ):
         return {"lengths": BufferConfig((size.batch_size,), torch.int32)}

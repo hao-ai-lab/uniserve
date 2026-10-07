@@ -16,7 +16,7 @@ from uniserve.nn.functional._tensors import result
 
 from ._parallel import ParallelAttention
 from .config import AttentionParallelConfig
-from .inputs import AttentionInput, DenseInput, PagedInput, SegmentedInput
+from .inputs import AttentionBatch, DenseInput, PagedInput, SegmentedInput
 
 
 class Attention(nn.Module):
@@ -25,6 +25,17 @@ class Attention(nn.Module):
     Head counts describe the full architecture. Mathematical parallel binding
     assigns local query/KV heads, token ownership and the global cache-head IDs.
     Cache state and mutable kernel resources are borrowed from the active call.
+
+    ``window`` bounds the visible history in tokens; ``None`` reads the whole
+    history. Queries align to the end of their key sequence, so a paged query
+    token ``i`` sits at ``prefix + i`` and a sequence's query tokens are its
+    final keys. A causal query at absolute position ``q`` reads keys
+    ``[max(q - window, 0), q]``. A non-causal query reads every query token
+    of its sequence, a block attending to itself in both directions, and the
+    keys before them from ``max(q - window, 0)`` on. A segmented input's
+    queries read the fixed prefix interval ``[max(P - window, 0), P)`` of
+    their prefix length ``P`` together with their declared current keys,
+    which the window does not bound.
     """
 
     # Recorded by parallelize_ once the layer is bound to its partition.
@@ -39,6 +50,7 @@ class Attention(nn.Module):
         *,
         scale: float | None = None,
         cache_name: str | None = None,
+        window: int | None = None,
     ):
         super().__init__()
         if (
@@ -48,6 +60,11 @@ class Attention(nn.Module):
             raise ValueError(
                 "attention requires positive compatible query and KV heads"
             )
+        if window is not None and (type(window) is not int or window < 0):
+            raise ValueError(
+                "attention windows must be nonnegative token counts"
+            )
+        self.window = window
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -70,15 +87,17 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch: AttentionInput,
+        attention: AttentionBatch,
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply attention to ``[tokens, heads, head_dim]`` projections.
 
-        Returns a tensor shaped like ``q``, written into ``out`` when given.
-        Under Ulysses the token shard is exchanged for this rank's head shard
-        before compute and restored to token layout afterwards.
+        ``attention`` supplies this call's inputs per cache table; the layer
+        reads its own table's entry. Returns a tensor shaped like ``q``,
+        written into ``out`` when given. Under Ulysses the token shard is
+        exchanged for this rank's head shard before compute and restored to
+        token layout afterwards.
         """
         if out is not None and (
             out.shape != q.shape
@@ -91,6 +110,7 @@ class Attention(nn.Module):
 
         group = self.exchange.group
         operator = _binding.attention.get().get(id(self))
+        batch = attention.entry(None if operator is None else operator.table)
         if self.context_parallel is not None:
             if operator is None:
                 raise RuntimeError(
@@ -162,21 +182,27 @@ class Attention(nn.Module):
                     "cached attention requires an active ExecutionContext"
                 )
             return functional.attention(
-                q, k, v, batch, scale=self.scale, out=out
+                q, k, v, batch, scale=self.scale, window=self.window, out=out
             )
         destination = torch.empty_like(q) if out is None else out
         return operator(q, k, v, batch, scale=self.scale, out=destination)
 
     def update_cache(
-        self, k: torch.Tensor, v: torch.Tensor, *, indices: torch.Tensor
+        self, k: torch.Tensor, v: torch.Tensor, attention: AttentionBatch
     ) -> None:
-        """Write one global token view without scheduling or committing a
-        request.
+        """Write this call's K/V at its table's addresses, without attending.
 
-        With Ulysses, each rank supplies its local token interval and TP-local
-        heads. The same exchange as forward produces this rank's cache heads.
-        """  # noqa: D205
+        The layer's own table entry supplies the physical write addresses; an
+        entry without write addresses publishes nothing. No request is
+        scheduled or committed. With Ulysses, each rank supplies its local
+        token interval and TP-local heads, and the same exchange as forward
+        produces this rank's cache heads.
+        """
         operator = _binding.attention.get().get(id(self))
+        entry = attention.entry(None if operator is None else operator.table)
+        indices = getattr(entry, "write_indices", None)
+        if indices is None:
+            return
         if operator is None:
             raise RuntimeError(
                 "cache writes require an active ExecutionContext"

@@ -13,7 +13,12 @@ from uniserve.model import (
     TextEncoder,
     TransformerDecoder,
 )
-from uniserve.nn.attention import Attention, SequenceLengths, VarlenInput
+from uniserve.nn.attention import (
+    Attention,
+    AttentionBatch,
+    SequenceLengths,
+    VarlenInput,
+)
 
 
 @dataclass(frozen=True)
@@ -39,7 +44,9 @@ class DenseAttention(nn.Module):
         lengths = SequenceLengths.from_lengths(
             (tokens,) * batch, device=values.device
         )
-        inputs = VarlenInput(lengths, lengths, (False,) * batch)
+        inputs = AttentionBatch.single(
+            VarlenInput(lengths, lengths, (False,) * batch)
+        )
         packed = values.reshape(-1, heads, width)
         return self.attention(packed, packed, packed, inputs).reshape_as(values)
 

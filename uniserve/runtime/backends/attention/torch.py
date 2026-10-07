@@ -26,6 +26,28 @@ def _host(lengths: SequenceLengths) -> tuple[int, ...]:
     return lengths.host
 
 
+def _origin(table, row: int) -> int:
+    """Return the absolute token position of a table row's first column.
+
+    Eager evaluation reads the exact host start page; a table without start
+    pages begins every row at token zero.
+    """
+    if table is None or table.start_page is None:
+        return 0
+    if table.start_page_host is None:
+        raise ValueError(
+            "eager paged attention over retired pages requires host start pages"
+        )
+    return table.start_page_host[row] * table.block_size
+
+
+def _device_origin(table, row: int):
+    """Return a row's first-column token position without a host read."""
+    if table is None or table.start_page is None:
+        return 0
+    return table.start_page[row] * table.block_size
+
+
 def _paged(value, table, length):
     """Gather one sequence's live prefix pages.
 
@@ -68,7 +90,7 @@ def _paged(value, table, length):
     return gathered.flatten(0, 1)[:length]
 
 
-def _dense(q, k, v, *, causal, scale, mask=None):
+def _dense(q, k, v, *, causal, scale, mask=None, window=None):
     packed = q.ndim == 3
     if packed:
         q, k, v = (value.transpose(0, 1).unsqueeze(0) for value in (q, k, v))
@@ -76,18 +98,35 @@ def _dense(q, k, v, *, causal, scale, mask=None):
     if k.shape[-2] == 0:
         result = torch.zeros_like(q)
     else:
-        causal_flag = causal and mask is None
+        causal_flag = causal and mask is None and window is None
 
-        if causal and (mask is not None or q.shape[-2] != k.shape[-2]):
+        if window is not None or (
+            causal and (mask is not None or q.shape[-2] != k.shape[-2])
+        ):
             # SDPA's is_causal assumes square Q/K alignment and no custom mask;
-            # fold causality into an explicit visibility mask otherwise.
+            # fold causality and the history window into an explicit
+            # visibility mask otherwise. Queries align to the end of the keys.
             query_positions = (
                 torch.arange(q.shape[-2], device=q.device)
                 + k.shape[-2]
                 - q.shape[-2]
             )
             key_positions = torch.arange(k.shape[-2], device=q.device)
-            visible = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+            visible = torch.ones(
+                (q.shape[-2], k.shape[-2]), dtype=torch.bool, device=q.device
+            )
+            if causal:
+                visible &= key_positions[None] <= query_positions[:, None]
+            if window is not None:
+                history = (
+                    key_positions[None] >= query_positions[:, None] - window
+                )
+                if not causal:
+                    # A non-causal row attends to its own tokens, the final
+                    # query-count keys, in both directions; the window bounds
+                    # only the keys before them.
+                    history |= key_positions[None] >= k.shape[-2] - q.shape[-2]
+                visible &= history
             if mask is None:
                 mask = visible
             elif mask.dtype.is_floating_point:
@@ -164,7 +203,7 @@ def _page_capacity(value, table, length):
     return _paged(value, table, table.numel() * value.shape[1])
 
 
-def _captured(q, k, v, batch, cache, scale):
+def _captured(q, k, v, batch, cache, scale, window):
     """Express packed visibility with live device masks during CUDA capture.
 
     Python slices cannot follow changed sequence lengths on replay. The Torch
@@ -193,6 +232,7 @@ def _captured(q, k, v, batch, cache, scale):
                 batch.keys.values[row]
                 if isinstance(batch, VisibleInput)
                 else batch.prefixes.values[row]
+                - _device_origin(batch.block_table, row)
                 + (query_count if isinstance(batch, PagedInput) else 0)
             )
             table = batch.block_table.indices[row]
@@ -214,12 +254,29 @@ def _captured(q, k, v, batch, cache, scale):
         values = torch.where(valid_keys[:, None, None], values, 0)
 
         allowed = queries[:, None] & valid_keys[None, :]
-        if isinstance(batch, (PagedInput, VarlenInput)) and batch.causal[row]:
-            allowed &= (
-                local_key[None, :]
-                <= (local_query + key_count - query_count)[:, None]
+        # Paged and variable-length queries align to the end of their keys.
+        position = local_query + key_count - query_count
+        if isinstance(batch, (PagedInput, VarlenInput)):
+            row_causal = (
+                batch.causal_values[row] != 0
+                if isinstance(batch, PagedInput)
+                and batch.causal_values is not None
+                else batch.causal[row]
             )
-        elif isinstance(batch, VisibleInput) and not batch.fully_visible:
+            allowed &= (local_key[None, :] <= position[:, None]) | (
+                row_causal == False  # noqa: E712 -- also a device predicate
+            )
+        if isinstance(batch, (PagedInput, VarlenInput)) and window is not None:
+            history = local_key[None, :] >= position[:, None] - window
+            # The row's own tokens stay visible to its non-causal queries.
+            history |= (local_key[None, :] >= key_count - query_count) & (
+                row_causal == False  # noqa: E712 -- also a device predicate
+            )
+            allowed &= history
+        if isinstance(batch, SegmentedInput) and window is not None:
+            # The segmented prefix keeps one fixed interval for all queries.
+            allowed &= local_key[None, :] >= key_count - window
+        if isinstance(batch, VisibleInput) and not batch.fully_visible:
             ends = batch.visible_end[row]
             visible = ends[local_query.clamp(0, ends.numel() - 1)]
             allowed &= local_key[None, :] < visible[:, None]
@@ -255,6 +312,22 @@ def _captured(q, k, v, batch, cache, scale):
 
 
 class _TorchOperator(_Operator):
+    # Keys are gathered from each row's first column and positions counted
+    # from its origin; causal and window visibility depend only on relative
+    # positions, so retired pages that no reader needs never enter a result.
+    reads_retired_tables = True
+
+    def _check_batch(self, batch):
+        super()._check_batch(batch)
+        if (
+            isinstance(batch, VisibleInput)
+            and batch.block_table is not None
+            and batch.block_table.start_page is not None
+        ):
+            raise ValueError(
+                "visible key endpoints are not defined over retired pages"
+            )
+
     def __call__(self, q, k, v, batch, *, scale, out):
         self._validate(q, k, v, batch, out)
 
@@ -267,7 +340,13 @@ class _TorchOperator(_Operator):
         if isinstance(batch, DenseInput):
             return out.copy_(
                 _dense(
-                    q, k, v, causal=batch.causal, scale=scale, mask=batch.mask
+                    q,
+                    k,
+                    v,
+                    causal=batch.causal,
+                    scale=scale,
+                    mask=batch.mask,
+                    window=self.window,
                 )
             )
 
@@ -285,7 +364,9 @@ class _TorchOperator(_Operator):
             )
 
         if q.is_cuda and torch.cuda.is_current_stream_capturing():
-            return out.copy_(_captured(q, k, v, batch, self.cache, scale))
+            return out.copy_(
+                _captured(q, k, v, batch, self.cache, scale, self.window)
+            )
 
         qstart = kstart = 0
         for row, count in enumerate(batch.queries.host):
@@ -298,7 +379,12 @@ class _TorchOperator(_Operator):
                     v[kstart : kstart + key_count],
                 )
                 result = _dense(
-                    query, keys, values, causal=batch.causal[row], scale=scale
+                    query,
+                    keys,
+                    values,
+                    causal=batch.causal[row],
+                    scale=scale,
+                    window=self.window,
                 )
                 kstart += key_count
             elif isinstance(batch, PagedInput):
@@ -307,13 +393,22 @@ class _TorchOperator(_Operator):
                     if self.cache is None
                     else (self.cache.key, self.cache.value)
                 )
-                key_count = _host(batch.prefixes)[row] + count
+                key_count = (
+                    _host(batch.prefixes)[row]
+                    - _origin(batch.block_table, row)
+                    + count
+                )
                 keys = _paged(key, batch.block_table.indices[row], key_count)
                 values = _paged(
                     value, batch.block_table.indices[row], key_count
                 )
                 result = _dense(
-                    query, keys, values, causal=batch.causal[row], scale=scale
+                    query,
+                    keys,
+                    values,
+                    causal=batch.causal[row],
+                    scale=scale,
+                    window=self.window,
                 )
             elif isinstance(batch, VisibleInput):
                 key_count = _host(batch.keys)[row]
@@ -347,7 +442,9 @@ class _TorchOperator(_Operator):
                 )
                 kstart += key_count
             elif isinstance(batch, SegmentedInput):
-                prefix = _host(batch.prefixes)[row]
+                prefix = _host(batch.prefixes)[row] - _origin(
+                    batch.block_table, row
+                )
                 keys = _paged(
                     self.cache.key, batch.block_table.indices[row], prefix
                 )
@@ -362,6 +459,16 @@ class _TorchOperator(_Operator):
                         < batch.visible_current_end[row, :count].unsqueeze(1)
                     )
                 )
+                # The window fixes one prefix interval [P - window, P) for
+                # every query; the current keys stay as declared.
+                history = (
+                    None
+                    if self.window is None
+                    else (
+                        torch.arange(prefix, device=q.device)
+                        >= prefix - self.window
+                    ).expand(count, prefix)
+                )
                 result = _merge(
                     _state(
                         query,
@@ -370,7 +477,7 @@ class _TorchOperator(_Operator):
                         scale=scale,
                         allowed=allowed,
                     ),
-                    _state(query, keys, values, scale=scale, allowed=None),
+                    _state(query, keys, values, scale=scale, allowed=history),
                 )
             else:
                 raise TypeError("unsupported numerical attention input")
