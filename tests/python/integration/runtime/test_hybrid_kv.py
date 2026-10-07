@@ -18,8 +18,8 @@ from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import (
+    InputBuffers,
     TokenBufferConfig,
-    TokenBuffers,
 )
 from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
@@ -201,7 +201,8 @@ def test_export_carries_each_group_from_its_first_needed_token(backend, device):
 
 
 def _buffers(device, planes, *, rows, tokens):
-    return TokenBuffers(
+    return InputBuffers(
+        ForwardMode.PREFILL,
         config=TokenBufferConfig(
             max_rows=rows,
             max_tokens=tokens,

@@ -10,7 +10,7 @@ page size, write addresses and, for a history-windowed group, the first page
 each row selects.
 
 Rust selects visible pages and checks cache writes for one homogeneous batch.
-``AttentionBuffers.gather_rows`` gathers units and addresses from resident
+``InputBuffers.prepare_inputs`` gathers units and addresses from resident
 GPU tables. ``from_tables`` constructs host tensors for warmup and direct
 numerical callers using the same native page selection.
 """

@@ -59,6 +59,7 @@ from uniserve_worker.protocol.call import (
     CallStatus,
     CanvasStep,
     ErrorCode,
+    ForwardMode,
     ImageParams,
     MediaCall,
     Readout,
@@ -1583,6 +1584,63 @@ class OutputPool:
         token_capacity: int,
         devices: Sequence[torch.device | str] = (),
     ) -> OutputBuffer: ...
+    def close(self) -> None: ...
+
+ROW_SECTIONS: int
+
+@final
+class InputBuffers:
+    """Fixed columns, host rings and numerical input preparation.
+
+    Copies use the current stream. Retire readers and captured graphs before
+    closing or replacing these buffers; returned tensors borrow their storage.
+    """
+
+    def __new__(
+        cls,
+        kind: ForwardMode | MediaCall,
+        *,
+        config: Any,
+        device: torch.device | str,
+        max_inflight: int = 1,
+        image_builder: Any = None,
+    ) -> Self: ...
+    @property
+    def config(self) -> Any: ...
+    @property
+    def device(self) -> torch.device: ...
+    @property
+    def max_rows(self) -> int: ...
+    @property
+    def max_tokens(self) -> int: ...
+    @property
+    def max_text_tokens(self) -> int: ...
+    @property
+    def hidden_size(self) -> int: ...
+    @property
+    def table_widths(self) -> tuple[int, ...]: ...
+    @property
+    def image_builder(self) -> Any: ...
+    @property
+    def input_embeddings(self) -> torch.Tensor | None: ...
+    @property
+    def canvas_slots(self) -> Any: ...
+    @property
+    def candidate_storage(self) -> torch.Tensor: ...
+    def __getattr__(self, name: str) -> torch.Tensor:
+        """Borrow a numerical column declared by this computation's config."""
+    def validate_rows(self, rows: tuple) -> None: ...
+    def prepare_inputs(
+        self,
+        rows: tuple,
+        *,
+        forward_mode: ForwardMode | MediaCall,
+        attention: Any = None,
+        cache: Any = None,
+        tables: Any = None,
+        states: Any = None,
+    ) -> Any: ...
+    def bind_canvas_slots(self, slots: Any) -> None: ...
     def close(self) -> None: ...
 
 @final

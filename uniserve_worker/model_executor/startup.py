@@ -30,8 +30,8 @@ from uniserve_worker.model_executor.input_batch import (
     TokenRow,
 )
 from uniserve_worker.model_executor.input_buffers import (
-    CanvasBuffers,
-    TokenBuffers,
+    InputBuffers,
+    prepare_causality,
 )
 from uniserve_worker.protocol.call import ForwardMode, ImageParams, MediaCall
 from uniserve_worker.sampling.metadata import TokenSelection
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 
 def make_text_batch(
-    buffers: TokenBuffers,
+    buffers: InputBuffers,
     tokens: tuple[tuple[int, ...], ...],
     tables: Sequence[Sequence[GroupTable]],
     *,
@@ -116,7 +116,7 @@ def make_text_batch(
     if causal is None:
         # Even a one-row warmup must compile the device-flag specialization;
         # later replays can carry any mixture of text and image rows.
-        values = buffers.prepare_causality(flags, dynamic=True)
+        values = prepare_causality(buffers, flags, dynamic=True)
         current = batch.inputs.attention
         batch = replace(
             batch,
@@ -140,7 +140,7 @@ def make_text_batch(
 
 
 def make_canvas_batch(
-    buffers: CanvasBuffers,
+    buffers: InputBuffers,
     tables: Sequence[Sequence[GroupTable]],
     *,
     length: int,

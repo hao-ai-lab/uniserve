@@ -11,14 +11,16 @@ the device from its block table, positions and query starts
 supplies only per-row scalars, each table's selected page count per row and
 each token's row.
 
-``AttentionBuffers.gather_rows`` in ``uniserve_worker.model_executor.
-input_buffers`` builds the host columns and the attention batch around it.
+Native ``InputBuffers`` fills host columns; the numerical input backend
+binds the resulting attention tensors.
 """
 
 from __future__ import annotations
 
 import torch
 from uniserve_kernels.triton import launchable
+
+from uniserve_worker._uniserve_ipc import ROW_SECTIONS
 
 try:
     import triton
@@ -31,7 +33,6 @@ except Exception:
 # prefix, query, writes, query offsets and prefix offsets (``rows + 1``
 # entries each), then one section of selected page counts per table, then
 # each token's row.
-ROW_SECTIONS = 6
 
 if triton is not None:
     # Row, token, cell counts and the output width change every call;

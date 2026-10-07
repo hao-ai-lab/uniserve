@@ -39,6 +39,7 @@ from uniserve_worker._uniserve_ipc import (
 from uniserve_worker._uniserve_ipc import prefill_units as prefill_units
 from uniserve_worker.model_executor.cuda_graph import CUDAGraphRunner
 from uniserve_worker.model_executor.input_batch import InputBatch
+from uniserve_worker.model_executor.input_buffers import clear_padding
 from uniserve_worker.model_executor.output import ExecutionOutput
 from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.sampling.metadata import TokenSelection
@@ -203,7 +204,7 @@ def pad_text(batch, rows, tokens, widths, decode, *, buffers):
     numerical table ``t``.
 
     The batch's tensors must be views of ``buffers``, the runner's fixed
-    buffers (``AttentionBuffers``): padding is written in place past the
+    buffers (``InputBuffers``): padding is written in place past the
     live extents, and the returned batch views the same storage at the
     bucket shape. Padding rows use request slot zero, which the block tables
     reserve for padding. Lengths and offsets derive from the host lengths
@@ -258,8 +259,12 @@ def pad_text(batch, rows, tokens, widths, decode, *, buffers):
 
     # Tables in one batch share one prefix column, padded once; every
     # table's page columns and write addresses pad with one launch each.
-    buffers.clear_padding(
-        live_rows=live_rows, rows=rows, live_tokens=live_tokens, tokens=tokens
+    clear_padding(
+        buffers,
+        live_rows=live_rows,
+        rows=rows,
+        live_tokens=live_tokens,
+        tokens=tokens,
     )
     flags = None
     if first.causal_values is not None:

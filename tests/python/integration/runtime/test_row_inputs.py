@@ -1,6 +1,6 @@
 """Token rows prepare the attention columns their host page layout describes.
 
-``AttentionBuffers.gather_rows`` gathers every numerical table's units, first
+Native input preparation gathers every numerical table's units, first
 gathered pages and write addresses from the request slots' resident tables.
 Over random calls of a model whose windowed and full-attention groups share
 one unit pool (six numerical tables, as DiffusionGemma has), its attention
@@ -28,8 +28,8 @@ from uniserve_worker.model_executor.attention import (
 from uniserve_worker.model_executor.graph_inputs import pad_text
 from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.model_executor.input_buffers import (
+    InputBuffers,
     TokenBufferConfig,
-    TokenBuffers,
 )
 from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.sampling.metadata import TokenSelection
@@ -203,8 +203,12 @@ def test_rows_gather_the_columns_their_host_layout_describes(
         table_widths=(WIDTH,) * 6,
         hidden_size=0,
     )
-    buffers = TokenBuffers(config=buffer_config, device=device)
-    reference = TokenBuffers(config=buffer_config, device=device)
+    buffers = InputBuffers(
+        ForwardMode.PREFILL, config=buffer_config, device=device
+    )
+    reference = InputBuffers(
+        ForwardMode.PREFILL, config=buffer_config, device=device
+    )
     generator = random.Random(1 + (write is None) + 2 * (not causal))
     try:
         extents = _install(manager, generator)

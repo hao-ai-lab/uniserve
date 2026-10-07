@@ -21,7 +21,7 @@ pub(crate) struct HostBuffers {
 impl HostBuffers {
     #[new]
     #[pyo3(signature = (shape, *, dtype, depth, device))]
-    fn new(
+    pub(super) fn new(
         py: Python<'_>,
         shape: &Bound<'_, PyAny>,
         dtype: &Bound<'_, PyAny>,
@@ -48,14 +48,14 @@ impl HostBuffers {
         })
     }
 
-    fn acquire(&self, py: Python<'_>) -> PyResult<(usize, Py<PyAny>)> {
+    pub(super) fn acquire(&self, py: Python<'_>) -> PyResult<(usize, Py<PyAny>)> {
         let mut buffers = self.lock(py)?;
         let owner = &mut *buffers;
         let (slot, tensor) = py.detach(|| owner.acquire()).map_err(error)?;
         Ok((slot, tensor.clone_ref(py)))
     }
 
-    fn record_copy(&self, py: Python<'_>, slot: usize) -> PyResult<()> {
+    pub(super) fn record_copy(&self, py: Python<'_>, slot: usize) -> PyResult<()> {
         if self.lock(py)?.device().is_none() {
             return Ok(());
         }

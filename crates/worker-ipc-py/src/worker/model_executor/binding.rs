@@ -13,6 +13,7 @@ use crate::worker::error::native_error;
 use crate::worker::execution::close_all;
 use crate::worker::graph_shapes::{TextShapes, configured_prefill, decode_shapes};
 use crate::worker::host::with_context;
+use crate::worker::input_buffers::InputBuffers;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn configure(
@@ -263,19 +264,21 @@ pub(super) fn configure(
                     cuda.call_method1("stream", (stream.getattr("stream")?,))?
                 };
                 let bound = with_context(&scope, || {
-                    let selected = buffers
-                        .call_method1("input_buffer_config", (py_kinds.get_item(0)?, &fields))?;
-                    let buffer_type = selected.get_item(0)?;
-                    let options = PyDict::new(py);
-                    options.set_item("config", selected.get_item(1)?)?;
-                    options.set_item("device", &target)?;
-                    options.set_item("max_inflight", max_inflight)?;
-                    if buffer_type.is(&buffers.getattr("TokenBuffers")?)
-                        || buffer_type.is(&buffers.getattr("DiffusionBuffers")?)
-                    {
-                        options.set_item("image_builder", &builder)?;
-                    }
-                    let inputs = buffer_type.call((), Some(&options))?;
+                    let kind = py_kinds.get_item(0)?;
+                    let selected = buffers.call_method1("input_buffer_config", (&kind, &fields))?;
+                    let inputs = Py::new(
+                        py,
+                        InputBuffers::new(
+                            py,
+                            &kind,
+                            selected.unbind(),
+                            &target,
+                            max_inflight as isize,
+                            Some(builder.clone().unbind()),
+                        )?,
+                    )?
+                    .into_bound(py)
+                    .into_any();
                     resources.push(inputs.clone());
 
                     let options = PyDict::new(py);

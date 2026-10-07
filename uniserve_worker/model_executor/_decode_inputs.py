@@ -6,7 +6,7 @@ and initializes inactive capacity in one launch. This keeps graph-replayed
 decode inputs internally consistent while the scheduler changes the set of
 live request slots.
 
-`TokenBuffers` in `uniserve_worker.model_executor.input_buffers` uses it for
+`InputBuffers` in `uniserve_worker.model_executor.input_buffers` uses it for
 a call without prepared attention whose rows are all request-indexed decode
 rows, when the request state is resident on the lane's CUDA device. That
 state comes from `BlockTables` (unit tables, start pages, table shapes and

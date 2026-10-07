@@ -362,9 +362,8 @@ fn reserve_inputs(
                         Some(&options),
                     )?;
                 }
-                let allocation = buffers
-                    .call_method1("input_buffer_config", (&buffered[kind], &fields))?
-                    .get_item(1)?;
+                let allocation =
+                    buffers.call_method1("input_buffer_config", (&buffered[kind], &fields))?;
                 let count = if selected
                     .iter()
                     .any(|kind| matches!(kind.as_str(), "prefill" | "decode" | "token_denoising"))

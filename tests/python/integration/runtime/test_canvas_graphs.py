@@ -642,7 +642,7 @@ def test_a_readout_answers_every_slot_of_many_canvases(tmp_path):
     """A readout returns the candidates of every requested slot.
 
     Every token of nine canvases, one of them half a canvas long, is a slot
-    with two candidates. The result equals the eager pass's log-probabilities
+    with one to three candidates. The result equals the eager log-probabilities
     within the rounding their different shapes allow.
     """
     _checkpoint(tmp_path)
@@ -656,13 +656,16 @@ def test_a_readout_answers_every_slot_of_many_canvases(tmp_path):
 
         def every_token(row):
             tokens = row.query_tokens
+            offsets = [0]
+            for token in range(tokens):
+                offsets.append(offsets[-1] + 1 + token % 3)
             return replace(
                 row,
                 slot_tokens=tuple(range(tokens)),
-                candidate_offsets=tuple(range(0, 2 * tokens + 1, 2)),
+                candidate_offsets=tuple(offsets),
                 candidate_ids=tuple(
                     torch.randint(
-                        7, VOCAB, (2 * tokens,), generator=generator
+                        7, VOCAB, (offsets[-1],), generator=generator
                     ).tolist()
                 ),
             )

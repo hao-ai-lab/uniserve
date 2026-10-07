@@ -23,6 +23,49 @@ pub(crate) struct KVCacheManager {
 }
 
 impl KVCacheManager {
+    /// Select visible pages once for native execution and Python consumers.
+    pub(super) fn prepare_attention(
+        &mut self,
+        py: Python<'_>,
+        rows: Vec<(u32, i64, i64, bool)>,
+    ) -> PyResult<Vec<uniserve_worker::TablePages>> {
+        let rows = rows
+            .into_iter()
+            .map(|(slot, prefix, query, write)| {
+                let length = |value| {
+                    u32::try_from(value)
+                        .map_err(|_| invalid(py, "forward attention lengths are invalid"))
+                };
+                Ok(uniserve_worker::AttentionRow {
+                    slot,
+                    prefix: length(prefix)?,
+                    query: length(query)?,
+                    write,
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let mut spans = Vec::new();
+        let transfers = self.inner.has_transfers();
+        let pages = self
+            .tables
+            .borrow(py)
+            .tables
+            .prepare_attention(&rows, |table, prefix, query| {
+                if transfers {
+                    spans.extend(table.spans(u64::from(prefix), u64::from(query))?);
+                }
+                Ok(())
+            })
+            .map_err(|error| native_error(py, error))?;
+
+        if !spans.is_empty() {
+            self.inner
+                .require_writable(&spans)
+                .map_err(|error| native_error(py, error))?;
+        }
+        Ok(pages)
+    }
+
     /// Reserve the visible suffix before exposing numerical page views.
     /// Completed descriptions stay native until a direct Python caller asks
     /// for one; serving retains them through batch commit and IPC delivery.
@@ -372,47 +415,14 @@ impl KVCacheManager {
         Ok(PyTuple::new(py, completions)?.unbind())
     }
 
-    /// Resolve all row ranges before checking transfers once for this batch.
-    fn prepare_attention<'py>(
+    /// Borrow visible KV pages after capacity and transfer checks.
+    #[pyo3(name = "prepare_attention")]
+    fn prepare_attention_py<'py>(
         &mut self,
         py: Python<'py>,
         rows: Vec<(u32, i64, i64, bool)>,
     ) -> PyResult<Bound<'py, PyTuple>> {
-        let rows = rows
-            .into_iter()
-            .map(|(slot, prefix, query, write)| {
-                let length = |value| {
-                    u32::try_from(value)
-                        .map_err(|_| invalid(py, "forward attention lengths are invalid"))
-                };
-                Ok(uniserve_worker::AttentionRow {
-                    slot,
-                    prefix: length(prefix)?,
-                    query: length(query)?,
-                    write,
-                })
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        let mut spans = Vec::new();
-        let transfers = self.inner.has_transfers();
-        let pages = self
-            .tables
-            .borrow(py)
-            .tables
-            .prepare_attention(&rows, |table, prefix, query| {
-                if transfers {
-                    spans.extend(table.spans(u64::from(prefix), u64::from(query))?);
-                }
-                Ok(())
-            })
-            .map_err(|error| native_error(py, error))?;
-
-        if !spans.is_empty() {
-            self.inner
-                .require_writable(&spans)
-                .map_err(|error| native_error(py, error))?;
-        }
-        pages_to_py(py, pages)
+        pages_to_py(py, self.prepare_attention(py, rows)?)
     }
 
     fn require_reusable(&mut self, py: Python<'_>, spans: Vec<(u32, u32, u32)>) -> PyResult<()> {
