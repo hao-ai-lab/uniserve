@@ -39,6 +39,9 @@ def _construction_scope(rank, directory, outcome):
                     init_method=f"file://{directory}/{outcome}",
                 ):
                     if outcome == "body_error":
+                        # Both callers must finish construction before either
+                        # exits; otherwise this tests a rendezvous failure.
+                        dist.barrier()
                         raise failure
                     value = torch.tensor([rank + 1])
                     dist.all_reduce(value)

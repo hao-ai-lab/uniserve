@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from .cuda_graph import CUDAGraph, CUDAGraphError
     from .events import EventPool, EventPoolError
     from .execution import ExecutionContext, Scratch
+    from .microbatches import Microbatches
     from .prefix_cache import PrefixCache
     from .process_groups import (
         ProcessGroups,
@@ -25,6 +26,7 @@ __all__ = [
     "initialize_process_groups",
     "ExecutionContext",
     "Scratch",
+    "Microbatches",
     "EventPool",
     "EventPoolError",
     "CUDAGraph",
@@ -46,6 +48,7 @@ def __getattr__(name):
         "initialize_process_groups": "process_groups",
         "ExecutionContext": "execution",
         "Scratch": "execution",
+        "Microbatches": "microbatches",
         "EventPool": "events",
         "EventPoolError": "events",
         "CUDAGraph": "cuda_graph",

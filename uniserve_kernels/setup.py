@@ -20,6 +20,7 @@ the visible GPUs when it is unset.
 """
 
 import os
+from importlib.metadata import distribution
 from pathlib import Path
 
 from setuptools import setup
@@ -30,6 +31,11 @@ _DEVICES = ("cuda", "cpu")
 def _source(*parts):
     # setuptools requires sources relative to this directory.
     return str(Path("src", "uniserve_kernels", *parts))
+
+
+def _include(*parts):
+    # The compiler runs in the build directory, so include paths are absolute.
+    return str(Path(__file__).resolve().parent.joinpath(_source(*parts)))
 
 
 def _cuda_extensions():
@@ -111,7 +117,79 @@ def _cuda_extensions():
             },
             libraries=["cublasLt"],
         ),
+        *_expert_extensions(CUDA_HOME, driver),
     ]
+
+
+def _expert_extensions(cuda_home, driver):
+    """Host bindings of the vendored DeepEP and DeepGEMM sources.
+
+    Both libraries compile their device kernels at run time with NVRTC from
+    the headers installed beside these modules, so the bindings link NVRTC
+    and the build compiles host code only.
+    """
+    from torch.utils.cpp_extension import CUDAExtension
+
+    # DeepEP's elastic transport links the NCCL of this environment, the
+    # runtime PyTorch also loads; the run path names that installation.
+    nccl = Path(distribution("nvidia-nccl-cu13").locate_file("nvidia/nccl"))
+    deepep = CUDAExtension(
+        "uniserve_kernels.deepep._C",
+        [
+            _source("deepep", "csrc", "csrc", "python_api.cpp"),
+            _source("deepep", "csrc", "csrc", "kernels", "backend", "nccl.cu"),
+            _source(
+                "deepep", "csrc", "csrc", "kernels", "backend", "cuda_driver.cu"
+            ),
+        ],
+        include_dirs=[
+            _include("deepep", "csrc", "csrc"),
+            _include("deepep", "csrc", "deep_ep", "include"),
+            str(nccl / "include"),
+        ],
+        extra_compile_args={
+            "cxx": [
+                "-std=c++20",
+                "-O3",
+                "-Wno-deprecated-declarations",
+                "-DDISABLE_AGGRESSIVE_PTX_INSTRS",
+            ],
+            "nvcc": [
+                "-std=c++20",
+                "-O3",
+                "--extended-lambda",
+                "--diag-suppress=128,2417",
+                "-DDISABLE_AGGRESSIVE_PTX_INSTRS",
+            ],
+        },
+        libraries=[*driver["libraries"], "nvrtc", ":libnccl.so.2"],
+        library_dirs=[*driver["library_dirs"], str(nccl / "lib")],
+        extra_link_args=[f"-Wl,-rpath,{nccl / 'lib'}"],
+    )
+    # DeepGEMM's host binding, including FastAFD's split MegaMoE. CUTLASS and
+    # fmt are vendored headers, and CCCL ships with the CUDA toolkit.
+    deepgemm = CUDAExtension(
+        "uniserve_kernels.deepgemm._C",
+        [_source("deepgemm", "csrc", "binding.cpp")],
+        include_dirs=[
+            _include("deepgemm", "csrc", "csrc"),
+            _include("deepgemm", "csrc", "deep_gemm", "include"),
+            _include("deepgemm", "csrc", "third-party", "cutlass", "include"),
+            _include("deepgemm", "csrc", "third-party", "fmt", "include"),
+            str(Path(cuda_home, "include", "cccl")),
+        ],
+        extra_compile_args={
+            "cxx": [
+                "-std=c++17",
+                "-O3",
+                "-Wno-psabi",
+                "-Wno-deprecated-declarations",
+            ]
+        },
+        libraries=[*driver["libraries"], "nvrtc"],
+        library_dirs=driver["library_dirs"],
+    )
+    return [deepep, deepgemm]
 
 
 def _build():

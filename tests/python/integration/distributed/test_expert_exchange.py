@@ -93,7 +93,7 @@ def _inputs(rank, device):
 
 
 @torch.inference_mode()
-def _run(rank, port):
+def _run(rank, port, grouped=False):
     device = torch.device("cuda", rank)
     with initialize_process_groups(
         rank=0,
@@ -102,7 +102,9 @@ def _run(rank, port):
         device=device,
         experts=(rank, len(TOKENS), Rendezvous("127.0.0.1", port)),
     ) as groups:
-        up_gate, down, hidden, ids, weights = _inputs(rank, device)
+        up_gate, down, hidden, ids, weights = _inputs(
+            0 if grouped else rank, device
+        )
         module = FusedMoE(
             EXPERTS,
             HIDDEN,
@@ -123,6 +125,7 @@ def _run(rank, port):
             num_experts=EXPERTS,
             hidden_size=HIDDEN,
             device=device,
+            source_group=(0, 1) if grouped else None,
         )
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
         stream.wait(torch.cuda.current_stream(device))
@@ -149,8 +152,15 @@ def _run(rank, port):
                     exchange.end()
                 return output
 
+            if grouped:
+                # The first member received the shared request, while the
+                # second is still polling IPC. Starting a forward here would
+                # leave its tensor collectives without a peer.
+                assert exchange.agree(hidden.shape[0] if rank == 0 else 0) == 0
+                assert not exchange.active
             capacity = exchange.agree(hidden.shape[0])
             assert capacity == CAPACITY
+            assert exchange.active == bool(hidden.shape[0])
             with context.activate():
                 eager = step()
 
@@ -181,6 +191,12 @@ def test_expert_parallel_ranks_return_the_complete_routed_sum():
     if torch.cuda.device_count() < len(TOKENS):
         pytest.fail(f"expert exchange needs {len(TOKENS)} GPUs")
     mp.spawn(_run, (_free_port(),), nprocs=len(TOKENS), join=True)
+
+
+def test_tensor_sources_wait_for_their_shared_request():
+    if torch.cuda.device_count() < 2:
+        pytest.fail("tensor source agreement needs two GPUs")
+    mp.spawn(_run, (_free_port(), True), nprocs=2, join=True)
 
 
 @torch.inference_mode()
@@ -386,27 +402,33 @@ def _check_received(group, exchange, tokens, device):
         assert received.quantizer == encoding
         assert received.shape == (size * CAPACITY, HIDDEN)
         fields = received.buffers()
-        for source, (sent, sent_ids, sent_weights) in enumerate(tokens):
+        expected = []
+        for sent, sent_ids, sent_weights in tokens:
             sent_fields = encoding.quantize(sent).buffers()
-            rows = range(source * CAPACITY, (source + 1) * CAPACITY)
-            arrived = [row for row in rows if (received_ids[row] >= 0).any()]
-            routed = [
-                token
+            expected.extend(
+                (sent_fields, token, sent_weights[token])
                 for token in range(sent.shape[0])
                 if any(expert in local for expert in sent_ids[token].tolist())
+            )
+        arrived = [
+            row
+            for row in range(received.shape[0])
+            if (received_ids[row] >= 0).any()
+        ]
+        assert len(arrived) == len(expected)
+        for sent_fields, token, sent_weights in expected:
+            # The route weights identify each token independently of the
+            # transport's receive order, which has no numerical significance.
+            (row,) = [
+                row
+                for row in arrived
+                if torch.equal(
+                    received_weights[row][received_ids[row] >= 0],
+                    sent_weights[received_ids[row] >= 0],
+                )
             ]
-            assert len(arrived) == len(routed)
-            for row in arrived:
-                # The route weights name the sent token.
-                (token,) = [
-                    token
-                    for token in routed
-                    if torch.equal(received_weights[row], sent_weights[token])
-                ]
-                for name in ("values", "block_scale"):
-                    assert torch.equal(
-                        fields[name][row], sent_fields[name][token]
-                    )
+            for name in ("values", "block_scale"):
+                assert torch.equal(fields[name][row], sent_fields[name][token])
         # The exchange's dispatch pairs with a combine.
         exchange.combine(
             torch.zeros(
@@ -419,7 +441,7 @@ def _check_received(group, exchange, tokens, device):
 
 
 @torch.inference_mode()
-def _run_encoded(rank, port, provider):
+def _run_encoded(rank, port, provider, transport):
     device = torch.device("cuda", rank)
     with initialize_process_groups(
         rank=0,
@@ -435,6 +457,7 @@ def _run_encoded(rank, port, provider):
             num_experts=EXPERTS,
             hidden_size=HIDDEN,
             device=device,
+            transport=transport,
         )
         # Both ranks send tokens, so each receives rows from both.
         _, tokens = _encoded_inputs((24, 16), device)
@@ -483,6 +506,7 @@ def _run_encoded(rank, port, provider):
                 captured = graph.replay()
                 stream.synchronize()
 
+        exchange.close()
         if not hidden.shape[0]:
             assert eager.shape == captured.shape == (0, HIDDEN)
             return
@@ -505,7 +529,8 @@ def _run_encoded(rank, port, provider):
 
 
 @pytest.mark.parametrize("provider", ["cutedsl", "trtllm"])
-def test_nvfp4_hidden_states_cross_the_exchange_encoded(provider):
+@pytest.mark.parametrize("transport", ["alltoall", "deepep"])
+def test_nvfp4_hidden_states_cross_the_exchange_encoded(provider, transport):
     """NVFP4 experts exchange their input encoding in place of BF16 rows.
 
     Encoded rows arrive with the values and block scales their rank sent,
@@ -516,7 +541,7 @@ def test_nvfp4_hidden_states_cross_the_exchange_encoded(provider):
         pytest.fail(f"expert exchange needs {len(TOKENS)} GPUs")
     mp.spawn(
         _run_encoded,
-        (_free_port(), provider),
+        (_free_port(), provider, transport),
         nprocs=len(TOKENS),
         join=True,
     )

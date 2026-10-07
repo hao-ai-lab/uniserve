@@ -93,6 +93,12 @@ class _SortedExperts(Operator):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        from flashinfer.jit.moe_utils import gen_moe_utils_module
+
+        # Build routing utilities before any peer launches dispatch/combine.
+        # A cold native build can exceed the transport's device wait timeout;
+        # kernel provisioning belongs to preparation, outside that protocol.
+        gen_moe_utils_module().build_and_load()
         module = self.module
         # ``experts`` counts the resident experts; an expert-parallel rank
         # holds the global experts ``expert_slice`` and routing names global
