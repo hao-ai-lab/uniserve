@@ -198,11 +198,16 @@ def build_worker_layout(
     if completion_payload_bytes <= 0:
         raise ValueError("completion payload capacity must be positive")
 
-    supported = supported_calls(model, (name for name, _ in components))
+    dedicated = worker_config.role == "experts"
+    supported = (
+        frozenset()
+        if dedicated
+        else supported_calls(model, (name for name, _ in components))
+    )
     if allowed_calls is not None:
         supported = supported & allowed_calls
 
-    if not supported:
+    if not supported and not dedicated:
         raise unsupported_setup(
             "worker model implements none of the requested call kinds"
         )
@@ -295,7 +300,9 @@ def build_worker_layout(
         # Advertised routing and advertised work describe the same placement,
         # including a deployment narrowed to a subset of its call kinds: a
         # call this worker will not accept is a call it does not route.
-        media_components={
+        media_components={}
+        if dedicated
+        else {
             call: component
             for call, component in media_components(model, held).items()
             if call in supported
@@ -465,6 +472,7 @@ def _token_worker_layout(
             and planes is not None
             and input_config is not None
         )
+        from uniserve_worker.model_executor.canvas_runner import CanvasRunner
         from uniserve_worker.model_executor.graph_inputs import (
             decode_captures,
             prefill_captures,
@@ -554,13 +562,25 @@ def _token_worker_layout(
                     _, allocation = call_buffer_config(
                         next(iter(selected)), fields
                     )
-                    fixed_bytes[target] = fixed_bytes.get(target, 0) + sum(
+                    copies = (
+                        worker_config.expert_microbatches
+                        if selected
+                        & {
+                            ForwardMode.PREFILL,
+                            ForwardMode.DECODE,
+                            ForwardMode.TOKEN_DENOISING,
+                        }
+                        else 1
+                    )
+                    fixed_bytes[target] = fixed_bytes.get(
+                        target, 0
+                    ) + copies * sum(
                         field.nbytes for field in allocation.buffers().values()
                     )
 
                 # A token denoiser that generates the deployment's canvases
-                # keeps every request slot's canvas resident, with one step
-                # chunk's sampler workspace.
+                # keeps every request slot's canvas resident. Staging and
+                # sampler scratch are private to each concurrent execution.
                 denoiser = (
                     generating_denoiser(call.module)
                     if ForwardMode.TOKEN_DENOISING in kinds
@@ -568,14 +588,20 @@ def _token_worker_layout(
                 )
                 sampling = worker_config.canvas_sampling
                 if denoiser is not None and sampling is not None:
-                    fixed_bytes[target] = fixed_bytes.get(
-                        target, 0
-                    ) + CanvasSlots.denoiser_bytes(
-                        denoiser,
-                        request_pool_size=worker_config.max_request_pool_size,
-                        max_rows=input_config.max_rows,
-                        history_depth=sampling.stability_threshold,
-                        device_type=torch.device(target).type,
+                    fixed_bytes[target] = (
+                        fixed_bytes.get(target, 0)
+                        + CanvasSlots.denoiser_bytes(
+                            denoiser,
+                            request_pool_size=worker_config.max_request_pool_size,
+                            history_depth=sampling.stability_threshold,
+                        )
+                        + worker_config.expert_microbatches
+                        * CanvasRunner.sampler_bytes(
+                            denoiser,
+                            max_rows=input_config.max_rows,
+                            history_depth=sampling.stability_threshold,
+                            device_type=torch.device(target).type,
+                        )
                     )
 
         # Block tables, decode state and the KV import workspaces are charged
@@ -684,8 +710,12 @@ def _token_worker_layout(
 
     # ``build_worker_layout`` replaces the supported calls and media routes
     # with the placement's narrowed values.
-    supported = tuple(
-        code for code in CALL_KINDS if code in supported_calls(model)
+    supported = (
+        ()
+        if worker_config.role == "experts"
+        else tuple(
+            code for code in CALL_KINDS if code in supported_calls(model)
+        )
     )
     info = WorkerInfo(
         model_name=model_name,
@@ -709,9 +739,9 @@ def _token_worker_layout(
         latent_pages=num_latent_pages,
         buffer_pool_bytes=buffer_pool_bytes,
         max_unresolved_calls=unresolved_window,
-        media_components=dict(
-            media_components(model, worker_config.deployment_components)
-        ),
+        media_components={}
+        if worker_config.role == "experts"
+        else dict(media_components(model, worker_config.deployment_components)),
         num_inference_steps=0,
         host_lane_capacity=1,
         encoder_cache_entries=encoder_cache_entries,

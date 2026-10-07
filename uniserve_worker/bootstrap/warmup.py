@@ -1112,7 +1112,7 @@ def _warmup_canvas(requests: _WarmupRequests) -> None:
     """Exercise the canvas steps and block commits of a generating denoiser.
 
     Admits one request per row of the largest sampler chunk
-    (``CanvasSlots.step_rows``) with the served canvas sampling, prefills
+    (``CanvasRunner.step_rows``) with the served canvas sampling, prefills
     one prompt token each, runs one canvas step over each row count up to a
     whole chunk, and commits one canvas-length block. A step splits its
     rows into whole chunks and one remainder, so these are all the chunk
@@ -1134,9 +1134,14 @@ def _warmup_canvas(requests: _WarmupRequests) -> None:
     slots = requests.worker.canvas_slots
     if slots is None or requests.worker.requests.request_ids():
         return
+    # Bound canvas slots imply the token-denoising runner they were lent to
+    # (``ModelExecutor.bind_canvas_slots``), which sizes the sampler chunk.
+    runner = requests.worker.runner.canvas_runner
+    if runner is None:
+        raise RuntimeError("canvas slots are bound without a canvas runner")
 
     length = slots.canvas_length
-    request_ids = tuple(range(1, slots.step_rows + 1))
+    request_ids = tuple(range(1, runner.step_rows + 1))
     keys = {sid: RequestKey(0, sid, 1) for sid in request_ids}
     sampling = slots.served
     admissions = tuple(

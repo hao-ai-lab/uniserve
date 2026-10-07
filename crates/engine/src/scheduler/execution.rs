@@ -2748,8 +2748,10 @@ impl Scheduler {
     ///
     /// A `WorkerFailure` is reconciled by `fail_after_worker_failure`; the
     /// worker codes `SchedulerBug` and `InvariantViolation` also latch
-    /// engine-fatal. Any other error latches engine-fatal and fails every
-    /// in-flight call.
+    /// engine-fatal. Losing every execution-capable worker also stops the
+    /// engine, so later admissions cannot wait for capacity that will never
+    /// return. Any other error latches engine-fatal and fails every in-flight
+    /// call.
     pub(super) fn on_executor_error(&mut self, error: anyhow::Error) {
         if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
             let execution = failure.execution.as_ref();
@@ -2763,6 +2765,18 @@ impl Scheduler {
                 tracing::warn!(worker = %failure.worker_id, ?code, "Worker failed affected work: {error}");
             }
             self.fail_after_worker_failure(failure);
+            // Worker recovery completes before its loss is reported. Keep
+            // independent ready workers usable, but an expert-only group
+            // cannot serve requests after all model workers have retired.
+            if !self
+                .executor
+                .info()
+                .workers
+                .iter()
+                .any(|(id, info)| !info.supported_calls.is_empty() && self.executor.is_ready(id))
+            {
+                self.fatal = true;
+            }
             return;
         }
         self.fatal = true;

@@ -538,6 +538,8 @@ class JoinGraphs:
     Construction is collective over ``exchange``'s group: every rank
     captures the same ``capacities`` in the same order, largest first, and
     warms each with one eager join step, which exchanges with every rank.
+    With ``warm=False``, the caller has already warmed those same bindings
+    and capacities; construction only captures and performs no exchange.
     The graphs allocate from ``pools`` (see ``CUDAGraph``) and read the
     bindings ``context`` has prepared, so the caller closes them before the
     context.
@@ -551,6 +553,7 @@ class JoinGraphs:
         *,
         pools=None,
         step=None,
+        warm=True,
     ) -> None:
         from .cuda_graph import CUDAGraph
 
@@ -567,8 +570,9 @@ class JoinGraphs:
                     finally:
                         exchange.end()
 
-                with context.activate():
-                    join()
+                if warm:
+                    with context.activate():
+                        join()
                 # A join returns nothing; its graph retains no outputs.
                 graph: CUDAGraph[None] = CUDAGraph(context=context, pools=pools)
                 self._graphs[capacity] = graph

@@ -22,8 +22,8 @@
 
 use crate::executor::{CallResult, WorkerResult};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::registration::RankRegistry;
@@ -93,6 +93,18 @@ impl WorkerProcessArgs {
     ) -> anyhow::Result<LaunchedRanks> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         crate::WorkerConfig::validate_members(&self.ranks, &self.components)?;
+        anyhow::ensure!(
+            self.components.is_empty() == (self.role == crate::WorkerRole::Experts),
+            "worker role disagrees with request component placement"
+        );
+        if self.role == crate::WorkerRole::Experts {
+            anyhow::ensure!(
+                self.expert_parallel.as_ref().is_some_and(|placement| {
+                    placement.attention_ranks > 0 && placement.rank >= placement.attention_ranks
+                }),
+                "expert workers must belong to a disaggregated expert union"
+            );
+        }
         // This process spawns exactly the ranks placed on its own host. A rank
         // placed elsewhere is started by that host's launcher, which presented
         // to the deployment's registry before any rank is sent to it.
@@ -120,7 +132,7 @@ impl WorkerProcessArgs {
             Some(registry) => Some(super::launcher::lock(registry)?.reachable_host()?),
             None => None,
         };
-        let mut rendezvous = if self.ranks.len() > 1 {
+        let mut rendezvous = if self.ranks.len() > 1 && self.expert_parallel.is_none() {
             let first = &self.ranks[0].node;
             Some(match launchers.as_ref() {
                 Some(registry) if *first != self.host => {
@@ -261,11 +273,39 @@ pub struct WorkerGroup {
     closed: bool,
     /// Rank loss is reported after all already-agreed results have been delivered.
     failure: Option<anyhow::Error>,
+    /// Groups sharing an expert communicator cannot recover independently.
+    /// The first terminal loss wakes every group's ordinary progress loop.
+    failure_domain: Option<Arc<FailureDomain>>,
+    failure_wake: Option<crate::handle::WakeSignal>,
     /// The deployment's launchers of the hosts this instance does not run
     /// on, shared with the other groups. A launcher terminates the ranks it
     /// started when the registry's last owner closes the connection, so the
     /// group holds it for as long as it holds those ranks.
     launchers: Option<super::launcher::Launchers>,
+}
+
+/// One terminal failure shared by groups participating in the same collectives.
+///
+/// Each owner keeps its own pollable wake, so an idle replica observes failure
+/// even when another replica consumes its notification first. Normal request
+/// errors and graceful retirement do not fail the domain.
+struct FailureDomain {
+    cause: OnceLock<String>,
+    wakers: Vec<uniserve_core::CommandWaker>,
+}
+
+impl FailureDomain {
+    fn fail(&self, worker: &str, cause: &anyhow::Error) {
+        if self
+            .cause
+            .set(format!("worker {worker}: {cause:#}"))
+            .is_ok()
+        {
+            for waker in &self.wakers {
+                waker.wake();
+            }
+        }
+    }
 }
 
 /// A call's identity across request epochs: engine identifier, request
@@ -447,11 +487,6 @@ impl WorkerGroup {
                         args.worker_id
                     )
                 })?;
-                anyhow::ensure!(
-                    args.ranks.len() == 1,
-                    "expert-parallel replica {} must be one rank",
-                    args.worker_id
-                );
                 placement.address = Some(rendezvous.address.clone());
                 if placement.rank == 0 {
                     anyhow::ensure!(
@@ -466,6 +501,7 @@ impl WorkerGroup {
 
         // Every group's processes start before any group waits for reports, so
         // their interpreter and library import overlap.
+        let startup_cancel = Arc::new(AtomicBool::new(false));
         let launched = arguments
             .iter()
             .map(|args| {
@@ -473,7 +509,7 @@ impl WorkerGroup {
                     Some(placement) if placement.rank == 0 => expert_store.take(),
                     _ => None,
                 };
-                args.spawn_ranks(None, launchers.clone(), store)
+                args.spawn_ranks(Some(Arc::clone(&startup_cancel)), launchers.clone(), store)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let groups = arguments
@@ -487,6 +523,34 @@ impl WorkerGroup {
                 rank.finish_startup()?;
             }
             workers.push(Self::from_ranks(args, ranks, launchers)?);
+        }
+        if workers
+            .iter()
+            .any(|worker| worker.process_args.expert_parallel.is_some())
+        {
+            let wakes = (0..workers.len())
+                .map(|_| crate::handle::WakeSignal::new())
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let domain = Arc::new(FailureDomain {
+                cause: OnceLock::new(),
+                wakers: wakes.iter().map(crate::handle::WakeSignal::waker).collect(),
+            });
+            for (worker, wake) in workers.iter_mut().zip(wakes) {
+                worker.failure_domain = Some(Arc::clone(&domain));
+                worker.failure_wake = Some(wake);
+            }
+        }
+        // Detach cancellation only after every group is ready. A later
+        // startup failure must still terminate already prepared peers.
+        for group in &mut workers {
+            for rank in &mut group.workers {
+                rank.check_worker("deployment readiness")?;
+            }
+        }
+        for group in &mut workers {
+            for rank in &mut group.workers {
+                rank.set_startup_cancel(None);
+            }
         }
         Ok(workers)
     }
@@ -661,12 +725,10 @@ impl WorkerGroup {
                 .unwrap_or(cache.unit_bytes);
         }
 
-        // Startup is over. A rank's death watcher raises the group's shared
-        // startup cancellation; detaching it keeps a later exit from reading
-        // as a cancelled startup on the surviving ranks.
+        // Keep startup cancellation attached until every deployment group
+        // is ready; expert peers may still be preparing their resources.
         for worker in &mut workers {
             worker.check_worker("WorkerGroup readiness")?;
-            worker.set_startup_cancel(None);
         }
 
         let depth = info.queue_depth.max(1) as usize;
@@ -686,6 +748,8 @@ impl WorkerGroup {
             readiness_changed: false,
             closed: false,
             failure: None,
+            failure_domain: None,
+            failure_wake: None,
         })
     }
 
@@ -798,6 +862,9 @@ impl WorkerGroup {
     /// not the replacement group started; a failed replacement also closes
     /// this group.
     fn recover_workers(&mut self, cause: &anyhow::Error) -> anyhow::Error {
+        if let Some(domain) = &self.failure_domain {
+            domain.fail(&self.process_args.worker_id, cause);
+        }
         // The lost endpoints, resident requests, and reported capabilities
         // are captured before the ranks and bookkeeping are cleared.
         let endpoints = self
@@ -967,7 +1034,24 @@ impl WorkerGroup {
         self.workers
             .iter()
             .flat_map(RankProcess::progress_fds)
+            .chain(
+                self.failure_wake
+                    .iter()
+                    .filter(|_| !self.closed)
+                    .map(|wake| libc::pollfd {
+                        fd: wake.descriptor(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }),
+            )
             .collect()
+    }
+
+    fn peer_failure(&self) -> Option<anyhow::Error> {
+        self.failure_domain
+            .as_ref()
+            .and_then(|domain| domain.cause.get())
+            .map(|cause| anyhow::anyhow!("shared expert communicator failed: {cause}"))
     }
 
     /// Resolves a batch once every rank reports either success or a compatible error.
@@ -1822,6 +1906,9 @@ impl WorkerGroup {
                 "WorkerGroup is closed"
             )));
         }
+        if let Some(error) = self.peer_failure() {
+            return Err(BatchSubmitError::Failed(self.recover_workers(&error)));
+        }
         if self
             .last_batch_id
             .is_some_and(|last| batch.batch_id <= last)
@@ -1961,6 +2048,9 @@ impl WorkerGroup {
             if let Some(error) = self.failure.take() {
                 return Err(error);
             }
+            if let Some(error) = self.peer_failure() {
+                return Err(error);
+            }
             self.pump_once()?;
             if let Some(result) = self.try_join()? {
                 self.last_progress = Instant::now();
@@ -2006,6 +2096,22 @@ impl WorkerGroup {
     /// absorbed, so this returns `Ok`.
     pub fn close(&mut self) -> anyhow::Result<()> {
         self.closed = true;
+        for worker in &self.workers {
+            worker.cancel_startup();
+        }
+        if self.peer_failure().is_some() {
+            // A failed collective cannot drain. Terminate the local readers
+            // and ask remote launchers to do the same before dropping storage.
+            for worker in &mut self.workers {
+                worker.terminate();
+            }
+            if let Some(registry) = &self.launchers {
+                let _ = super::launcher::lock(registry)
+                    .and_then(|mut hosts| hosts.stop_worker(&self.process_args.worker_id));
+            }
+            self.release_closed_resources();
+            return Ok(());
+        }
         super::process::close_ranks(
             &mut self.workers,
             self.launchers
