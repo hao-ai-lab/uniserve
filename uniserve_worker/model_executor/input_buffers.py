@@ -1080,7 +1080,9 @@ class CanvasBuffers(AttentionBuffers):
         # Candidate matrix and selection indices share one int64 backing.
         self._candidates = torch.empty(0, dtype=torch.int64, device=self.device)
         self._canvas_slots = None
-        self._canvas_backing = None
+        # This staging's own sampler input storage, allocated with the
+        # bound canvas slots.
+        self._canvas_backing: TensorBuffers | None = None
         # Pinned sources of the step columns, which stage with one copy.
         self._step_host = HostBuffers(
             self.step_columns.shape,
@@ -1214,8 +1216,8 @@ class CanvasBuffers(AttentionBuffers):
         The rows' argmax histories are staged at the depth of their shared
         stability threshold.
         """
-        state = self._canvas_slots
-        if state is None:
+        state, backing = self._canvas_slots, self._canvas_backing
+        if state is None or backing is None:
             raise ValueError("canvas steps require bound sampler state")
         depths = {row.sampling.stability for row in rows}
         lengths = {row.canvas_length for row in rows}
@@ -1256,7 +1258,7 @@ class CanvasBuffers(AttentionBuffers):
         # The staged canvases are the model's input tokens, and their
         # self-conditioning rows its self-conditioning input, back to back.
         views = dict(
-            self._canvas_backing.view(
+            backing.view(
                 self.sampler_buffers(
                     max_rows=count,
                     canvas_length=length,

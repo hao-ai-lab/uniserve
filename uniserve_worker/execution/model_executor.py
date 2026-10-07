@@ -153,8 +153,10 @@ from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.sampling.metadata import TokenSelection
 
 if TYPE_CHECKING:
+    from uniserve.runtime.expert_exchange import ExpertExchange, JoinGraphs
     from uniserve.runtime.weight_prefetch import WeightPrefetch
     from uniserve_worker.model_executor.canvas_runner import CanvasRunner
+    from uniserve_worker.model_executor.cuda_graph import Execution
     from uniserve_worker.model_executor.media_inputs import MediaBuilder
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.canvas_slots import CanvasSlots
@@ -317,8 +319,10 @@ class ModelExecutor:
         # ``configure_inputs`` builds; ``None`` without such layers. The
         # runners stepping through it are registered at capture.
         self.experts = None
-        self._expert_exchanges = ()
-        self._microbatch_streams = []
+        # One exchange per expert microbatch, the first being ``experts``,
+        # and the forked lane stream of each microbatch after the first.
+        self._expert_exchanges: tuple[ExpertExchange, ...] = ()
+        self._microbatch_streams: list[CUDAStream] = []
         # DWDP's prefetched expert weights, which ``configure_inputs`` builds
         # in place of the exchange; ``None`` for any other expert access.
         self.expert_weights: WeightPrefetch | None = None
@@ -327,9 +331,10 @@ class ModelExecutor:
         # step by replaying the captured join of the step's capacity
         # (``JoinGraphs``), which startup captures after the runners' graphs.
         self._expert_joins = None
-        self._microbatch_joins = []
+        self._microbatch_joins: list[JoinGraphs] = []
         self._expert_execution = None
-        self._expert_executions = ()
+        # An expert-only rank's executions, one per microbatch exchange.
+        self._expert_executions: tuple[Execution, ...] = ()
         # A standalone denoiser's component, binding and call, the request
         # bank and latent pool its ladders gather through, and the one
         # runner that serves every layout the media builder admits.

@@ -387,7 +387,7 @@ def load_worker_model(
     if config.use_stub_model:
         from uniserve_models.stub import Model, image_processor
 
-        model = Model().to(config.execution.device)
+        model: nn.Module = Model().to(config.execution.device)
         for path, device in (
             _devices(model, config.execution.generation_device) or {}
         ).items():

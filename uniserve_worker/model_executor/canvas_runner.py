@@ -107,7 +107,9 @@ class CanvasRunner(ModelRunner):
         mesh = self.model.backbone.mesh
         self.pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
         self.canvas_slots = None
-        self.sampler_workspace = None
+        # This runner's sampler scratch and the canvases of one sampler
+        # chunk, set by ``bind_canvas_slots``; ``close`` releases the scratch.
+        self.sampler_workspace: sampler.CanvasWorkspace | None = None
         self.step_rows = 0
         # Rows of one page of every cache group the KV unit pool holds, set
         # by ``ModelExecutor.bind``; None leaves canvases unbounded by it.
@@ -221,13 +223,14 @@ class CanvasRunner(ModelRunner):
     def sampler_bytes(denoiser, *, max_rows, history_depth, device_type):
         """Per-execution canvas staging and sampler workspace reservation."""
         fields = denoiser_fields(denoiser)
-        length = fields.pop("tokens").length
-        vocab = fields.pop("vocab_size")
+        length = fields["tokens"].length
+        vocab = fields["vocab_size"]
         buffers = CanvasBuffers.sampler_buffers(
             max_rows=max_rows,
             canvas_length=length,
+            hidden_size=fields["hidden_size"],
             history_depth=history_depth,
-            **fields,
+            dtype=fields["dtype"],
         )
         return sum(
             config.nbytes for config in buffers.values()
@@ -318,7 +321,7 @@ class CanvasRunner(ModelRunner):
         ``STEP_SKIPPED``.
         """
         slots = self.canvas_slots
-        if slots is None or slots.workspace is None:
+        if slots is None or self.sampler_workspace is None:
             raise ValueError("canvas steps require bound, open sampler state")
         state = inputs.state
         rows, length = state.canvas.shape

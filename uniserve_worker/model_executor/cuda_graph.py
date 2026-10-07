@@ -17,7 +17,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field, is_dataclass
 from itertools import count
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Self
 
 import torch
 from torch.utils import _pytree as pytree
@@ -374,7 +374,7 @@ class Execution:
     """
 
     def __init__(
-        self,
+        self: Self,
         context: ExecutionContext,
         *,
         devices=(),
@@ -384,7 +384,9 @@ class Execution:
         # ``share`` names another owner whose pools this one borrows; see
         # ``GraphStorage.reserve``.
         self.context = context
-        self.peers = (self,)
+        # The executions sharing one microbatch rotation, this one included,
+        # in microbatch order; every peer has this execution's class.
+        self.peers: tuple[Self, ...] = (self,)
         self.microbatches = None
         self.buckets: OrderedDict[object, GraphBucket] = OrderedDict()
         self.storage = storage if storage is not None else GraphStorage()
