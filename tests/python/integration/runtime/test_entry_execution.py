@@ -645,13 +645,14 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
     )
 
     def decode(runner, frames, window, source):
+        size = video.Config(frames, UNIT.frame)
         return runner.run_module(
             "reconstruction",
             (source,),
             method="decode",
-            size=frames,
+            size=size,
             frames=(slice(4 * window, 4 * window + 4),),
-            num_frames=(frames,),
+            sizes=(size,),
         ).values[0]
 
     calls = [
