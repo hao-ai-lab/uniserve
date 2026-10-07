@@ -125,13 +125,20 @@ def verify_graph_context(
 
     cu = driver()
     raw_graph = graph.raw_cuda_graph()
-    nodes_result = cu.cuGraphGetNodes(cu.CUgraph(raw_graph), 1 << 20)
+    # The binding materializes every requested entry, including unused NULL
+    # handles. Query the size before enumeration so small graph segments do
+    # not each allocate a million Python handles during startup.
+    size_result = cu.cuGraphGetNodes(cu.CUgraph(raw_graph), 0)
+    cuda_status(size_result, "count CUDA graph nodes")
+    count = int(size_result[2])
+    if count == 0:
+        return 0
+    nodes_result = cu.cuGraphGetNodes(cu.CUgraph(raw_graph), count)
     cuda_status(nodes_result, "enumerate CUDA graph nodes")
     nodes = nodes_result[1]
-    count = int(nodes_result[2])
 
     kernels = 0
-    for node in nodes[:count]:
+    for node in nodes:
         node_type = cuda_value(
             cu.cuGraphNodeGetType(node), "query CUDA graph node type"
         )

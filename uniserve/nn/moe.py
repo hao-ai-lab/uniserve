@@ -1,85 +1,226 @@
-"""Shared mixture-of-experts primitives."""
+"""Routed mixture-of-experts over stacked expert weights."""
 
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
+from typing import Literal
 
-__all__ = [
-    "TopK",
-    "FusedMoE",
-]
+import torch
+from torch import nn
+
+from uniserve.distributed import Communicator
+from uniserve.nn import _binding, functional
+from uniserve.nn.functional import Routes
+from uniserve.quantization import Quantizer
+
+__all__ = ["ExpertLinear", "FusedMoE", "Routes", "TopK"]
+
+Activation = Literal["silu", "gelu_tanh"]
 
 
 class TopK(nn.Module):
-    """Selects and renormalizes the highest-scoring experts for each token."""
+    """Select the highest-probability experts of each token.
+
+    Returns ``(topk_ids int32 [T, K], topk_weights fp32 [T, K])``: a full
+    softmax over the router scores followed by top-k, with the selected
+    weights renormalized to sum to one when ``renormalize`` is set and
+    multiplied by ``scale[id]`` when a per-expert scale is given (see
+    :func:`uniserve.nn.functional.topk_softmax`).
+    """
 
     def __init__(self, k: int, *, renormalize: bool = True) -> None:
-        """Validate the expert count and configure optional probability
-        renormalization.
-        """  # noqa: D205
         super().__init__()
-        if k <= 0:
-            raise ValueError("k must be positive")
+        if type(k) is not int or k <= 0:
+            raise ValueError("expert top-k must be a positive integer")
         self.k = k
         self.renormalize = renormalize
 
     def forward(
-        self, scores: torch.Tensor
+        self, scores: torch.Tensor, *, scale: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select the highest-probability experts per row and optionally
-        renormalize weights.
-        """  # noqa: D205
-        probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
-        weights, ids = torch.topk(probs, self.k, dim=-1)
-        if self.renormalize:
-            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
-                torch.finfo(weights.dtype).eps
-            )
-        return weights, ids
+        return functional.topk_softmax(
+            scores, self.k, renormalize=self.renormalize, scale=scale
+        )
 
 
-class FusedMoE(nn.Module):
-    """Evaluate every expert densely and accumulate top-k per-token
-    contributions.
+class ExpertLinear(nn.Module):
+    """One projection stacked over experts: ``weight [E, out, in]``.
 
-    The implementation preserves exact top-k routing semantics without token
-    dispatch: every expert processes every row, so compute scales with the full
-    expert count even though unselected outputs receive a zero gate.
-    """  # noqa: D205
+    The module owns its weight's representation and the static activation
+    encoding applied to its inputs (``input_quantizer``), exactly as
+    ``Linear`` does for one matrix. Tensor-parallel binding narrows the
+    output or input channels of every expert alike.
+    """
 
     def __init__(
         self,
-        experts: list[nn.Module] | nn.ModuleList,
-        top_k: int = 1,
+        num_experts: int,
+        in_features: int,
+        out_features: int,
         *,
-        norm_topk_prob: bool = True,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
-        """Register every expert and configure the per-token top-k gate."""
         super().__init__()
-        self.experts = nn.ModuleList(experts)
-        self.topk = TopK(top_k, renormalize=norm_topk_prob)
+        if min(num_experts, in_features, out_features) < 1:
+            raise ValueError("expert projections require positive extents")
+        self.num_experts = num_experts
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(
+            torch.empty(
+                num_experts,
+                out_features,
+                in_features,
+                device=device,
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.input_quantizer: Quantizer | None = None
+
+
+class FusedMoE(nn.Module):
+    """Routed expert FFN over stacked expert weights.
+
+    ``up_gate.weight`` is ``[E, 2I, H]`` with each expert's up rows followed
+    by its gate rows; ``down.weight`` is ``[E, H, I]``. These are logical
+    orders: an encoded weight may store each expert's rows in the physical
+    ``RowOrder`` its prepared kernel reads, which the runtime provider
+    places once and every consumer decodes. ``forward(hidden [T, H],
+    topk_ids [T, K] int32, topk_weights [T, K] fp32) -> [T, H]`` computes
+
+        sum_k topk_weights[t, k] * down_e(act(gate_e(x_t)) * up_e(x_t)),
+        e = topk_ids[t, k],
+
+    where ``act`` is SiLU or tanh-approximated GELU. ``hidden`` may arrive
+    already encoded as ``up_gate.input_quantizer.quantize(hidden)`` would
+    encode it (a producer that stores its rows in that encoding directly,
+    such as ``sandwich_rms_norm``, saves the separate encoding pass); the
+    kernels then read it as stored. With ``combine=False`` the call returns
+    the terms of that sum as :class:`Routes` (``rows[t, k]`` the down
+    projection of route ``k``, ``weights`` the route weights), whose value
+    is the combined output bit for bit, for a consumer that evaluates the
+    sum while reading it (``sandwich_rms_norm``). Kernels that combine
+    routes internally, and expert-parallel exchanges, which combine the
+    ranks' partial sums, return their combined rows as the one-route
+    instance of unit weight. Routing belongs to the model; this module
+    consumes its result. Tensor-parallel binding splits ``I`` across the
+    tensor-parallel group and sums the partial outputs (route rows when
+    uncombined) once after the experts. Expert-parallel binding
+    (``uniserve.distributed.partition_experts``) keeps the global experts
+    ``expert_slice`` resident, ``[E / P, ...]`` of each stacked weight for an
+    expert group of ``P`` ranks, while ``topk_ids`` keep naming global
+    experts; its bound operator exchanges every routed token with the rank
+    holding its experts and returns the complete sum to the token's rank.
+    An active ``ExecutionContext`` supplies a prepared expert kernel. A
+    standalone call prepares a native kernel for itself on a GPU and
+    evaluates the portable reference on the CPU; a GPU representation no
+    native kernel covers is an error, not a slower path, and an
+    expert-parallel call needs the operator an execution context binds.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        top_k: int,
+        activation: Activation,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        if activation not in ("silu", "gelu_tanh"):
+            raise ValueError(f"unsupported expert activation {activation!r}")
+        if type(top_k) is not int or not 0 < top_k <= num_experts:
+            raise ValueError(
+                "expert top-k must select between one and all experts"
+            )
+        self.num_experts = num_experts
+        # Routes per token; it sizes kernel workspace, so calls must match it.
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.activation: Activation = activation
+        self.up_gate = ExpertLinear(
+            num_experts,
+            hidden_size,
+            2 * intermediate_size,
+            device=device,
+            dtype=dtype,
+        )
+        self.down = ExpertLinear(
+            num_experts,
+            intermediate_size,
+            hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        # Tensor-parallel binding records this rank's interval of I, in the
+        # global intermediate coordinate, and the group whose partial sums
+        # complete each output.
+        self.intermediate_slice = slice(0, intermediate_size)
+        self.group = Communicator()
+        self.communication_groups = (self.group,)
+        # Expert-parallel binding records the global experts this rank keeps
+        # and the group holding the rest. The group's exchange is bound by
+        # the runtime, so it is not a communication group of this module.
+        self.expert_slice = slice(0, num_experts)
+        self.expert_group = Communicator()
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """Route flattened rows to top-k experts and accumulate their gated
-        outputs.
-        """  # noqa: D205
-        original_shape = hidden_states.shape
-        flat = hidden_states.reshape(-1, original_shape[-1])
-        flat_logits = router_logits.reshape(-1, router_logits.shape[-1])
+        hidden: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        combine: bool = True,
+    ) -> torch.Tensor | Routes:
+        if (
+            hidden.ndim != 2
+            or topk_ids.shape != topk_weights.shape
+            or topk_ids.ndim != 2
+            or topk_ids.shape != (hidden.shape[0], self.top_k)
+            or topk_ids.dtype != torch.int32
+            or topk_weights.dtype != torch.float32
+        ):
+            raise ValueError(
+                "expert routing requires [tokens, hidden] states with int32 "
+                "ids and fp32 weights of shape [tokens, top_k]"
+            )
+        operator = _binding.moe.get().get(id(self))
+        if operator is not None:
+            result = operator(hidden, topk_ids, topk_weights, combine=combine)
+        elif self.expert_group.size > 1:
+            raise RuntimeError(
+                "distributed experts require the weight access operator "
+                "an execution context binds"
+            )
+        elif hidden.device.type == "cpu":
+            result = functional.fused_moe(
+                hidden,
+                self.up_gate.weight,
+                self.down.weight,
+                topk_ids,
+                topk_weights,
+                activation=self.activation,
+                input_quantizers=(
+                    self.up_gate.input_quantizer,
+                    self.down.input_quantizer,
+                ),
+                combine=combine,
+            )
+        else:
+            from uniserve.runtime.backends.moe import evaluate
 
-        weights, expert_ids = self.topk(flat_logits)
-        weights = weights.to(flat.dtype)
-        out = torch.zeros_like(flat)
-        for expert_idx, expert in enumerate(self.experts):
-            # Summing the one-hot top-k matches yields this expert's scalar gate
-            # for every token and zero for tokens routed elsewhere.
-            gate = (weights * (expert_ids == expert_idx)).sum(dim=-1)
-            expert_out = expert(flat)
-            out += expert_out * gate.unsqueeze(-1).to(expert_out.dtype)
-
-        return out.reshape(original_shape)
+            result = evaluate(
+                self, hidden, topk_ids, topk_weights, combine=combine
+            )
+        if self.group.size > 1:
+            # Partial sums over the intermediate shards complete each route
+            # row as well as each combined row.
+            self.group.all_reduce(
+                result.rows if isinstance(result, Routes) else result
+            )
+        return result

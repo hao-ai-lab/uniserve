@@ -9,7 +9,12 @@ from typing import Generic, TypeVar
 import torch
 from torch import nn
 
-from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.distributed import (
+    Communicator,
+    DeviceMesh,
+    parallelize_,
+    partition_experts,
+)
 from uniserve.nn.attention import AttentionParallelConfig
 
 from . import checkpoint as checkpoint_module
@@ -27,6 +32,37 @@ class Result(Generic[ModelT]):
     model: ModelT
     sources: tuple[checkpoint_module.Source, ...]
     reports: tuple[weight_options.Report, ...]
+
+
+def select_modules(
+    model: nn.Module,
+    modules: frozenset[str] | None = None,
+    *,
+    exclude_modules: frozenset[str] = frozenset(),
+) -> frozenset[nn.Module]:
+    """Resolve selected subtrees, removing excluded subtrees by identity.
+
+    ``None`` selects the model root. Exclusion also removes aliases of the
+    same module, so a shared backbone has one residency decision. This lets
+    callers retain a parent's own parameters while placing a nested expert
+    subtree elsewhere. Unknown paths raise ``ValueError``.
+    """
+    try:
+        selected = {
+            child
+            for path in (("",) if modules is None else modules)
+            for child in model.get_submodule(path).modules()
+        }
+        excluded = {
+            child
+            for path in exclude_modules
+            for child in model.get_submodule(path).modules()
+        }
+    except AttributeError as error:
+        raise ValueError(
+            "module selection requires actual module paths"
+        ) from error
+    return frozenset(selected - excluded)
 
 
 def _load(
@@ -106,13 +142,21 @@ def load_model(
     attention: Mapping[str, AttentionParallelConfig] | None = None,
     devices: Mapping[str, torch.device | str] | None = None,
     modules: frozenset[str] | None = None,
+    exclude_modules: frozenset[str] = frozenset(),
+    experts: Communicator | None = None,
 ) -> Result[ModelT]:
     """Construct on meta, bind partitions, then materialize selected modules.
 
     The bound partitions are mathematical. Module paths choose resources and
     numerical settings. Unselected modules remain on meta so architecture
     dimensions and layout queries stay available. Neither constructors nor
-    the resulting model retain loading state.
+    the resulting model retain loading state. ``experts`` names the
+    expert-parallel group every ``FusedMoE`` shards its experts over
+    (``partition_experts``), so this rank reads only its own experts.
+    ``exclude_modules`` leaves named subtrees on meta even when their
+    ancestors are selected, as when attention ranks borrow remote experts.
+    These subtrees also retain their own mathematical partition instead of
+    inheriting a selected ancestor's mesh.
     """
     with torch.device("meta"):
         model = model_class(config)
@@ -124,8 +168,9 @@ def load_model(
     )
     selected = {
         id(child)
-        for path in (("",) if modules is None else modules)
-        for child in model.get_submodule(path).modules()
+        for child in select_modules(
+            model, modules, exclude_modules=exclude_modules
+        )
     }
 
     meshes = {} if meshes is None else meshes
@@ -155,6 +200,7 @@ def load_model(
             "participation"
         )
     selected.difference_update(remote)
+    excluded = select_modules(model, exclude_modules)
     for path, mesh in meshes.items():
         child = model.get_submodule(path)
         if mesh.rank in mesh.ranks:
@@ -162,7 +208,10 @@ def load_model(
                 child,
                 mesh,
                 attention=attention.get(path, AttentionParallelConfig()),
+                exclude=excluded,
             )
+    if experts is not None:
+        partition_experts(model, experts)
 
     declared = mapping(model)
     parameters = {

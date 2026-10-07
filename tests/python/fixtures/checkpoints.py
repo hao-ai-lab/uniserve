@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import torch
 from safetensors.torch import save_file
-from transformers import Qwen3Config, Qwen3ForCausalLM
+from transformers import (
+    Qwen3Config,
+    Qwen3ForCausalLM,
+    Qwen3MoeConfig,
+    Qwen3MoeForCausalLM,
+)
 
 from uniserve import loading
 from uniserve.diffusion import NoiseScale
@@ -38,6 +43,36 @@ def qwen_checkpoint(root, tied=False, theta=1_000_000.0):
     config._attn_implementation = "eager"
     torch.manual_seed(481)
     model = Qwen3ForCausalLM(config).eval()
+    model.save_pretrained(root)
+    return model
+
+
+def qwen_moe_checkpoint(root, *, norm_topk_prob=True, **overrides):
+    """Save a two-layer Qwen3-MoE checkpoint and return its reference model.
+
+    Transformers writes each expert's gate, up and down projections as
+    separate tensors, the layout of released Qwen3-MoE checkpoints.
+    ``overrides`` replace any ``Qwen3MoeConfig`` field.
+    """
+    fields = {
+        "vocab_size": 37,
+        "hidden_size": 32,
+        "intermediate_size": 48,
+        "moe_intermediate_size": 16,
+        "num_experts": 6,
+        "num_experts_per_tok": 2,
+        "norm_topk_prob": norm_topk_prob,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+    }
+    config = Qwen3MoeConfig(**(fields | overrides))
+    config._attn_implementation = "eager"
+    torch.manual_seed(907)
+    model = Qwen3MoeForCausalLM(config).eval()
     model.save_pretrained(root)
     return model
 

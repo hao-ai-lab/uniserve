@@ -45,6 +45,10 @@ class ProcessGroups:
     world_size: int
     device: torch.device
     backend: str
+    # The deployment's expert union, independent of this worker's numerical
+    # process group. Worker-local rank indices remain stable within replicas.
+    experts: Communicator = field(default_factory=Communicator)
+    _instance: Communicator | None = field(default=None, repr=False)
     _groups: list[Any] = field(default_factory=list, repr=False)
 
     def __enter__(self) -> Self:
@@ -72,6 +76,8 @@ class ProcessGroups:
     @property
     def process_group(self) -> Communicator:
         """Bind component transfers to the instance's ordered physical ranks."""
+        if self._instance is not None:
+            return self._instance
         return Communicator(
             tuple(range(self.world_size)),
             self.rank,
@@ -111,6 +117,9 @@ class ProcessGroups:
         for selection in sorted(set(selections)):
             for members in mesh.members(selection):
                 ordered = tuple(sorted(members))
+                physical = tuple(
+                    self.process_group.ranks[rank] for rank in members
+                )
                 if len(members) > 1 and ordered not in handles:
                     if not dist.is_initialized():
                         raise RuntimeError(
@@ -118,17 +127,20 @@ class ProcessGroups:
                             "initialized process world"
                         )
                     handle = dist.new_group(
-                        ranks=list(ordered),
+                        ranks=sorted(physical),
                         backend=self.backend,
                         pg_options=_group_options(self.backend),
-                        device_id=device if self.backend == "nccl" else None,
+                        device_id=_nccl_device(self.backend, device),
+                        # Replicas create their own disjoint component groups.
+                        # Unrelated replicas need not execute these bindings.
+                        use_local_synchronization=self.experts.size > 1,
                     )
                     handles[ordered] = handle
                     if self.rank in members:
                         self._groups.append(handle)
                 if self.rank in members:
                     groups[selection] = Communicator(
-                        members,
+                        physical,
                         members.index(self.rank),
                         ".".join(selection) or "local",
                         device,
@@ -184,6 +196,7 @@ def initialize_process_groups(
     backend: str | None = None,
     init_method: str | None = None,
     rendezvous: Rendezvous | None = None,
+    experts: tuple[int, int, Rendezvous] | None = None,
 ) -> ProcessGroups:
     """Select the rank's device and join or create its physical process world.
 
@@ -191,6 +204,14 @@ def initialize_process_groups(
     URL, which are exclusive; without either, ``MASTER_ADDR`` and
     ``MASTER_PORT`` name a TCP init method. Both are ignored when the process
     already has a world, which is borrowed.
+
+    ``experts`` is ``(rank, size, rendezvous)`` of the deployment's expert
+    union. It becomes the torch world with Gloo for host tensors and NCCL for
+    device tensors; ``ProcessGroups.experts`` is its communicator. This
+    worker occupies the consecutive union ranks starting at ``expert_rank -
+    rank``. Its component meshes keep worker-local rank indices, mapped here
+    to physical union ranks. Independent replicas create and use their own
+    groups without synchronizing unrelated component bindings.
 
     The returned ProcessGroups owns any group created here. The caller closes it
     after all dependent execution resources retire, or transfers that obligation
@@ -200,6 +221,19 @@ def initialize_process_groups(
         raise ValueError(
             "launch rank must satisfy 0 <= rank < positive world_size"
         )
+    if experts is not None and dist.is_initialized():
+        raise ValueError(
+            "joining an expert union requires an uninitialized process world"
+        )
+    if experts is not None and (
+        rendezvous is not None or init_method is not None
+    ):
+        raise ValueError("the expert union owns the process-world rendezvous")
+    if experts is not None:
+        expert_rank, expert_size, _ = experts
+        start = expert_rank - rank
+        if start < 0 or start + world_size > expert_size:
+            raise ValueError("worker ranks must fit inside the expert union")
     if init_method is not None and rendezvous is not None:
         raise ValueError("init_method and rendezvous are exclusive")
     if rendezvous is not None and rendezvous.listen_fd is not None and rank:
@@ -221,7 +255,50 @@ def initialize_process_groups(
     backend = backend or ("nccl" if local_device.type == "cuda" else "gloo")
     environment = ProcessGroups(rank, world_size, local_device, backend)
 
-    if dist.is_initialized():
+    if experts is not None:
+        expert_rank, expert_size, expert_rendezvous = experts
+        _connect_during_initialization()
+        # The union carries host and device tensors. A host without CUDA has
+        # no device backend to create, so its union is gloo alone.
+        union = "cpu:gloo,cuda:nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(
+            backend=union,
+            store=_rendezvous_store(
+                expert_rendezvous, expert_rank, expert_size, "nccl"
+            ),
+            rank=expert_rank,
+            world_size=expert_size,
+        )
+        environment._groups.append(dist.group.WORLD)
+        if local_device.type == "cuda":
+            # Initialize NCCL and register its collective-storage domain,
+            # without binding WORLD's device_id. A bound parent makes
+            # torch.new_group use ncclCommSplit, which requires every union
+            # rank even when only one worker creates a component subgroup.
+            # Independent workers create ordinary communicators instead.
+            dist.all_reduce(torch.zeros((), device=local_device))
+        environment.experts = Communicator(
+            tuple(range(expert_size)),
+            expert_rank,
+            "experts",
+            local_device,
+            dist.group.WORLD,
+        )
+        members = tuple(
+            range(expert_rank - rank, expert_rank - rank + world_size)
+        )
+        instance = dist.new_group(
+            ranks=list(members),
+            backend=backend,
+            pg_options=_group_options(backend),
+            device_id=_nccl_device(backend, local_device),
+            use_local_synchronization=True,
+        )
+        environment._groups.append(instance)
+        environment._instance = Communicator(
+            members, rank, "instance", local_device, instance
+        )
+    elif dist.is_initialized():
         if (dist.get_rank(), dist.get_world_size()) != (rank, world_size):
             raise ValueError(
                 "existing process world disagrees with supplied rank/world_size"
@@ -237,7 +314,7 @@ def initialize_process_groups(
             rank=rank,
             world_size=world_size,
             pg_options=_group_options(backend),
-            device_id=local_device if backend == "nccl" else None,
+            device_id=_nccl_device(backend, local_device),
         )
         environment._groups.append(dist.group.WORLD)
     elif world_size > 1:
@@ -256,11 +333,20 @@ def initialize_process_groups(
             rank=rank,
             world_size=world_size,
             pg_options=_group_options(backend),
-            device_id=local_device if backend == "nccl" else None,
+            device_id=_nccl_device(backend, local_device),
         )
         environment._groups.append(dist.group.WORLD)
 
     return environment
+
+
+def _nccl_device(backend: str, device: torch.device) -> torch.device | None:
+    """Connect CUDA groups before consumers register collective storage."""
+    if device.type == "cuda" and (
+        backend == "nccl" or "cuda:nccl" in backend.split(",")
+    ):
+        return device
+    return None
 
 
 def _rendezvous_store(

@@ -19,6 +19,11 @@ flash_attn_4 = [
   "flash-attn-4[cu13]==4.0.0b30",
   "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
+# Fused expert-parallel kernels use the locked NVSHMEM Python/native pair.
+megamoe = [
+  "nvshmem4py-cu13==0.4.0",
+  "nvidia-cutlass-dsl[cu13]==4.6.2",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -28,7 +33,7 @@ where = ["src"]
 include = ["uniserve_kernels*"]
 
 [tool.setuptools.package-data]
-uniserve_kernels = ["py.typed", "attention/vsa_native/LICENSE"]
+uniserve_kernels = ["py.typed", "attention/vsa_native/LICENSE", "megamoe/LICENSE"]
 
 [tool.uv]
 # Rebuild the compiled extensions when their sources or build target change.

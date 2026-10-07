@@ -29,6 +29,61 @@ class CUDAGraphError(RuntimeError):
     """
 
 
+class _Capture:
+    """Capture computation around submissions CUDA cannot put in a graph.
+
+    Segments share a pool and always replay in capture order. Submissions
+    between them must use external CUDA events for their dependencies; a
+    stream fork cannot span two captures. The numerical call runs only once.
+    """
+
+    def __init__(self, capture, computation, pool):
+        self.capture = capture
+        self.computation = computation
+        self.pool = pool
+        self.graphs: list[torch.cuda.CUDAGraph] = []
+        self.steps: list[Callable[[], None]] = []
+        self.active = False
+
+    def begin(self):
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        self.graphs.append(graph)
+        with torch.cuda.stream(self.capture):
+            graph.capture_begin(pool=self.pool)
+            self.active = True
+            self.computation.wait_stream(self.capture)
+
+    def end(self):
+        if not self.active:
+            return
+        graph = self.graphs[-1]
+        try:
+            with torch.cuda.stream(self.capture):
+                self.capture.wait_stream(self.computation)
+                graph.capture_end()
+        finally:
+            self.active = False
+        if self.pool is None:
+            self.pool = graph.pool()
+        self.steps.append(graph.replay)
+
+    def submit(self, call: Callable[[], None]):
+        """Record an eager submission between the surrounding graph segments."""
+        self.end()
+        self.steps.append(call)
+        self.begin()
+
+    def replay(self):
+        for step in self.steps:
+            step()
+
+    def reset(self):
+        for graph in self.graphs:
+            graph.reset()
+        self.steps.clear()
+        self.graphs.clear()
+
+
 class CUDAGraph(Generic[ResultT]):
     """Own a captured call, its output views and execution resource references.
 
@@ -74,7 +129,7 @@ class CUDAGraph(Generic[ResultT]):
         )
         # The captured graph, its retained output views and the captured call.
         self._captured: (
-            tuple[torch.cuda.CUDAGraph, ResultT, Callable[[], ResultT]] | None
+            tuple[_Capture, ResultT, Callable[[], ResultT]] | None
         ) = None
         self._closed = False
 
@@ -103,8 +158,15 @@ class CUDAGraph(Generic[ResultT]):
             raise CUDAGraphError("capture requires an open uncaptured graph")
         context._open()
 
-        graph = torch.cuda.CUDAGraph(keep_graph=True)
         device = context._device
+        device_pool = self.pools.get(device)
+        captured = _Capture(
+            self._capture,
+            self._computation,
+            None
+            if device_pool is None
+            else torch.cuda._POOL_HANDLE(device_pool.id),
+        )
         current = torch.cuda.current_stream(device)
         # Capture observes all work the caller has already submitted.
         self._capture.wait_stream(current)
@@ -120,29 +182,33 @@ class CUDAGraph(Generic[ResultT]):
                             torch.cuda.use_mem_pool(pool, target)
                         )
 
-                device_pool = self.pools.get(device)
                 try:
-                    with torch.cuda.graph(
-                        graph,
-                        stream=self._capture,
-                        # MemPool.id is the pool handle graph capture accepts.
-                        pool=None
-                        if device_pool is None
-                        else torch.cuda._POOL_HANDLE(device_pool.id),
-                    ):
-                        # The computation stream joins the capture before
-                        # the call's first launch and the capture stream
-                        # rejoins it after the last, so every launch of the
-                        # call, including collectives bound to the
-                        # computation stream, lands in the graph.
-                        self._computation.wait_stream(self._capture)
-                        with (
-                            torch.cuda.stream(self._computation),
-                            context.activate(),
-                        ):
-                            output = call()
-                        self._capture.wait_stream(self._computation)
-                    graph.instantiate()
+                    # Retire warmup work before capture. Do this once for
+                    # the complete call: freeing pools between segments
+                    # would defeat their shared allocation lifetime.
+                    torch.cuda.synchronize(device)
+                    torch.cuda.empty_cache()
+                    # Warmup can run on a different host thread. cuBLAS
+                    # handles are thread-local and must be created before
+                    # capture, on the stream that will use their workspace.
+                    with torch.cuda.stream(self._computation):
+                        torch.cuda.current_blas_handle()
+                    with ExitStack() as bindings:
+                        if context.weights is not None:
+                            bindings.enter_context(
+                                context.weights.capture(captured.submit)
+                            )
+                        captured.begin()
+                        try:
+                            with (
+                                torch.cuda.stream(self._computation),
+                                context.activate(),
+                            ):
+                                output = call()
+                        finally:
+                            captured.end()
+                    for graph in captured.graphs:
+                        graph.instantiate()
 
                     if context.stream is not None:
                         cu = driver()
@@ -167,14 +233,15 @@ class CUDAGraph(Generic[ResultT]):
                             )
                             for stream in streams
                         )
-                        verify_graph_context(graph, expected)
+                        for graph in captured.graphs:
+                            verify_graph_context(graph, expected)
                 finally:
                     if restore is not None:
                         with context.activate():
                             restore()
         except BaseException as error:
             try:
-                graph.reset()
+                captured.reset()
             except BaseException as cleanup:
                 error.add_note(f"CUDA graph cleanup failed: {cleanup!r}")
             raise CUDAGraphError(
@@ -185,7 +252,7 @@ class CUDAGraph(Generic[ResultT]):
             current.wait_stream(self._computation)
             current.wait_stream(self._capture)
 
-        self._captured = graph, output, call
+        self._captured = captured, output, call
 
     def replay(self) -> ResultT:
         """Replay the captured call and return its retained output views."""

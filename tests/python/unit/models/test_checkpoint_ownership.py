@@ -27,6 +27,33 @@ def _pipeline(rank):
     return DeviceMesh(ranks=(0, 1), rank=rank, shape=(2, 1), axes=("pp", "tp"))
 
 
+def test_module_exclusions_remove_shared_aliases():
+    """Public selection gives one residency decision to a shared subtree."""
+    expert = torch.nn.Linear(4, 4)
+    model = torch.nn.ModuleDict(
+        {"attention": torch.nn.Linear(4, 4), "experts": expert, "alias": expert}
+    )
+    selected = loading.select_modules(
+        model, exclude_modules=frozenset({"experts"})
+    )
+    assert selected == frozenset({model, model["attention"]})
+    assert (
+        loading.select_modules(
+            model, frozenset({"alias"}), exclude_modules=frozenset({"experts"})
+        )
+        == frozenset()
+    )
+
+
+@pytest.mark.parametrize("exclude", [False, True])
+def test_module_selection_rejects_unknown_paths(exclude):
+    options = {
+        "exclude_modules" if exclude else "modules": frozenset({"missing"})
+    }
+    with pytest.raises(ValueError, match="actual module paths"):
+        loading.select_modules(torch.nn.Linear(4, 4), **options)
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 def test_bagel_loading_rejects_unknown_records_on_each_pipeline_stage(
     tmp_path, rank

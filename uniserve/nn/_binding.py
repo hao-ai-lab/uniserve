@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         ExchangeBuffers,
     )
     from uniserve.runtime.bindings.matmul import MatmulBinding
+    from uniserve.runtime.bindings.moe import MoEBinding
     from uniserve.runtime.bindings.vsa import VsaBinding
 
 # Branch (name, weight id) pairs and the interleaved branch width.
@@ -56,4 +57,9 @@ attention_storage: ContextVar[Mapping[int, ExchangeBuffers]] = ContextVar(
 )
 vsa: ContextVar[Mapping[int, VsaBinding]] = ContextVar(
     "uniserve_vsa_operators", default={}
+)
+
+# FusedMoE module id -> prepared routed-expert operator
+moe: ContextVar[Mapping[int, MoEBinding]] = ContextVar(
+    "uniserve_moe_operators", default={}
 )
