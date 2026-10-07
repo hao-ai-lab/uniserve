@@ -504,18 +504,21 @@ impl WorkerGroup {
             );
             // Rank-specific fields take the reference's values before the
             // comparison: the endpoint, device, transfer backends, product
-            // storage, and the rank's KV head offset, layer range, and bytes
-            // per token.
+            // storage, the unit size, and each KV group's layers and head
+            // offset.
             normalized.endpoint = canonical.endpoint.clone();
             normalized.device = canonical.device.clone();
             normalized.transfer_backends = canonical.transfer_backends.clone();
             normalized.buffer_pool_bytes = canonical.buffer_pool_bytes;
             if let (Some(local), Some(reference)) = (&mut normalized.kv_cache, &canonical.kv_cache)
             {
-                local.kv_head_offset = reference.kv_head_offset;
-                local.layer_offset = reference.layer_offset;
-                local.num_layers = reference.num_layers;
-                local.bytes_per_token = reference.bytes_per_token;
+                local.unit_bytes = reference.unit_bytes;
+                if local.groups.len() == reference.groups.len() {
+                    for (group, canonical) in local.groups.iter_mut().zip(&reference.groups) {
+                        group.layer_ids.clone_from(&canonical.layer_ids);
+                        group.kv_head_offset = canonical.kv_head_offset;
+                    }
+                }
             }
             // Placement may give ranks different numerical storage; replacement
             // validation (`validate_replacement_info`) compares each rank with
@@ -537,57 +540,64 @@ impl WorkerGroup {
             &info.media_components,
         )?;
 
-        // Every layer interval between region boundaries must have its KV
-        // heads covered from head 0 to `total_kv_heads` by the regions
-        // spanning it. Overlapping regions are allowed; a gap is not.
+        // Every logical cache layer, numbered from zero without a gap, must
+        // belong to one group on every rank that stores it, and in each group
+        // every layer must have its KV heads covered from head 0 to
+        // `total_kv_heads` by the ranks storing it. Overlapping regions are
+        // allowed; a gap is not. The group reports the union of its ranks'
+        // layers, which bounds publications, and the largest unit, because
+        // the scheduler reserves units shared by every stage.
         if let Some(cache) = &mut info.kv_cache {
             let regions: Vec<_> = workers
                 .iter()
                 .filter_map(|worker| worker.info().kv_cache.as_ref())
                 .collect();
-            let layer_bounds: BTreeSet<_> = regions
-                .iter()
-                .flat_map(|region| [region.layer_offset, region.layer_offset + region.num_layers])
-                .chain([0, cache.total_layers])
-                .collect();
-            let layer_bounds: Vec<_> = layer_bounds.into_iter().collect();
-            for layers in layer_bounds.windows(2) {
-                let mut heads: Vec<_> = regions
-                    .iter()
-                    .filter(|region| {
-                        region.layer_offset <= layers[0]
-                            && region.layer_offset + region.num_layers >= layers[1]
-                    })
-                    .map(|region| {
-                        (
-                            region.kv_head_offset,
-                            region.kv_head_offset + region.num_kv_heads,
-                        )
-                    })
-                    .collect();
-                heads.sort_unstable();
-                let mut covered = 0;
-                for (start, end) in heads {
-                    anyhow::ensure!(
-                        start <= covered,
-                        "worker KV regions leave a logical head gap"
-                    );
-                    covered = covered.max(end);
+            let mut owners = BTreeMap::new();
+            for (index, group) in cache.groups.iter_mut().enumerate() {
+                let mut layers: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
+                for region in &regions {
+                    let local = &region.groups[index];
+                    for layer in &local.layer_ids {
+                        layers.entry(*layer).or_default().push((
+                            local.kv_head_offset,
+                            local.kv_head_offset + local.num_kv_heads,
+                        ));
+                    }
                 }
-                anyhow::ensure!(
-                    covered == cache.total_kv_heads,
-                    "worker KV regions do not cover layers {}..{}",
-                    layers[0],
-                    layers[1],
-                );
+                for (layer, mut heads) in layers {
+                    anyhow::ensure!(
+                        *owners.entry(layer).or_insert(index) == index,
+                        "worker KV layer {layer} belongs to two cache groups"
+                    );
+                    heads.sort_unstable();
+                    let mut covered = 0;
+                    for (start, end) in heads {
+                        anyhow::ensure!(
+                            start <= covered,
+                            "worker KV regions leave a logical head gap"
+                        );
+                        covered = covered.max(end);
+                    }
+                    anyhow::ensure!(
+                        covered == group.total_kv_heads,
+                        "worker KV regions do not cover the heads of layer {layer}"
+                    );
+                }
+                group.layer_ids = owners
+                    .iter()
+                    .filter(|(_, owner)| **owner == index)
+                    .map(|(layer, _)| *layer)
+                    .collect();
             }
-            // The scheduler reserves pages shared by every stage. Its byte
-            // accounting must cover the largest rank-local layer partition.
-            cache.bytes_per_token = regions
+            anyhow::ensure!(
+                owners.keys().copied().eq(0..owners.len() as u32),
+                "worker KV regions do not cover every logical cache layer"
+            );
+            cache.unit_bytes = regions
                 .iter()
-                .map(|region| region.bytes_per_token)
+                .map(|region| region.unit_bytes)
                 .max()
-                .unwrap_or(cache.bytes_per_token);
+                .unwrap_or(cache.unit_bytes);
         }
 
         // Startup is over. A rank's death watcher raises the group's shared
@@ -1312,8 +1322,8 @@ fn rank_projection(
             .block_tables
             .retain(|table| slots.contains(&table.request_pool_idx));
         projection
-            .new_cache_pages
-            .retain(|pages| slots.contains(&pages.request_pool_idx));
+            .new_cache_units
+            .retain(|units| slots.contains(&units.request_pool_idx));
         let identities = projection
             .calls
             .iter()
@@ -1575,7 +1585,7 @@ fn validate_and_order_rank_report(
                 Some(publication.source) == planned.kv_output,
                 "KV publication differs from its declared output"
             );
-            let bytes = publication.tensors.iter().try_fold(0_u64, |sum, tensor| {
+            let bytes = publication.tensors().try_fold(0_u64, |sum, tensor| {
                 Ok::<_, uniserve_worker_ipc::ValidationError>(
                     sum.saturating_add(tensor.validate()?),
                 )

@@ -73,13 +73,13 @@ def _text_runner(model, provider, decode_capacity=2):
         decode_graph_batch_sizes=(decode_capacity,),
     )
     cache = PrefixCache(
-        model.cache_config, num_blocks=16, block_size=16, device="cuda:0"
+        model.cache_config, num_units=16, block_size=16, device="cuda:0"
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model, config, num_blocks=16),
+        info=cache_info(model, config, num_units=16),
         request_pool_size=4,
-        max_blocks_per_request=4,
+        table_width=4,
     )
     runner = ModelExecutor(model, config)
     predicates = torch.tensor([False, True, True, True, True], device="cuda:0")
@@ -89,7 +89,7 @@ def _text_runner(model, provider, decode_capacity=2):
                 max_rows=4,
                 max_tokens=64,
                 max_text_tokens=64,
-                max_blocks_per_row=4,
+                table_widths=(4,),
                 hidden_size=128,
             ),
             kv_cache=manager,
@@ -99,7 +99,7 @@ def _text_runner(model, provider, decode_capacity=2):
             request_slots=4,
             max_tokens=64,
             latent_capacity_units=0,
-            decode_context_blocks=2,
+            table_widths=(2,),
             max_inflight=1,
         )
         saved = _snapshot(cache)
@@ -123,6 +123,7 @@ def _text_runner(model, provider, decode_capacity=2):
                 tuple(
                     (
                         index + 1,
+                        0,
                         0,
                         tuple(page + 1 for page in blocks),
                         len(blocks) * 16,
@@ -374,13 +375,13 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
     )
     runner = ModelExecutor(model, config)
     cache = PrefixCache(
-        model.cache_config, num_blocks=8, block_size=16, device="cuda:0"
+        model.cache_config, num_units=8, block_size=16, device="cuda:0"
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model, config, num_blocks=8),
+        info=cache_info(model, config, num_units=8),
         request_pool_size=2,
-        max_blocks_per_request=2,
+        table_width=2,
     )
     predicates = torch.tensor([False, True, True], device="cuda:0")
     try:
@@ -393,12 +394,14 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
             request_slots=2,
             max_tokens=32,
             latent_capacity_units=0,
-            decode_context_blocks=2,
+            table_widths=(2,),
             max_inflight=1,
         )
         runner.capture(tokenizer=None, latents=None)
         runner.complete_startup()
-        manager.block_tables.install(((1, 0, (4, 5), 32), (2, 0, (6, 7), 32)))
+        manager.block_tables.install(
+            ((1, 0, 0, (4, 5), 32), (2, 0, 0, (6, 7), 32))
+        )
         sequences = ((3, 7, 2, 9), (2, 5, 8))
         for mode in (ForwardMode.PREFILL, ForwardMode.DECODE):
             rows, calls = [], []

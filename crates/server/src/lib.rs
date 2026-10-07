@@ -101,7 +101,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
 
     info!(
         workers = ?config.engine.workers,
-        block_size = config.engine.worker_process.block_size,
+        block_size = ?config.engine.worker_process.block_size,
         queue_depth = config.engine.worker_process.queue_depth,
         "starting UniServe Rust engine"
     );

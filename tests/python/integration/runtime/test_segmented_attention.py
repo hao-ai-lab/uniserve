@@ -89,7 +89,7 @@ def test_segmented_replay_reads_changed_partitions_empty_prefixes_and_page_bound
                 Config(
                     {"attention": mha.Config(2, width, (0, 1), query.dtype)}
                 ),
-                num_blocks=6,
+                num_units=6,
                 block_size=page_size,
                 device=device,
             )

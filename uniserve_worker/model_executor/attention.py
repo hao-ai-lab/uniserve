@@ -1,22 +1,33 @@
-"""Construct explicit attention inputs from scheduler-assigned page tables.
+"""Construct explicit attention inputs from scheduler-assigned unit tables.
 
-The engine's scheduler assigns each request slot its KV pages; the worker's
-``BlockTables`` hold the installed tables. This module validates one
-homogeneous group of ``AttentionRow`` values against those tables and builds
-the host-side attention input (``PagedInput`` for rows that append to the
-cache, ``SegmentedInput`` for read-only prefix/current calls) that
-``uniserve_worker.model_executor.input_buffers`` then stages into its fixed
-device backing.
+The engine's scheduler assigns each request slot its KV units per cache
+group; the worker's ``BlockTables`` hold the installed group tables. A group
+whose logical page spans ``units_per_page`` units owns that many numerical
+block tables (see ``uniserve.runtime.prefix_cache``), so one call's attention
+is an ``AttentionBatch`` with one entry per numerical table. Every entry
+shares the call's query and prefix lengths; entries differ in their pages,
+page size, write addresses and, for a history-windowed group, the first page
+each row stages.
+
+This module validates one homogeneous group of ``AttentionRow`` values
+against the installed tables, selects the pages each numerical table stages,
+and builds the host-side attention batch (``PagedInput`` entries for rows
+that append to the cache, ``SegmentedInput`` entries for read-only
+prefix/current calls) that ``uniserve_worker.model_executor.input_buffers``
+then stages into its fixed device backing.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.math import bucketed_length
+from uniserve.math import ceil_div
 from uniserve.nn.attention import (
+    AttentionBatch,
     BlockTable,
     PagedInput,
     SegmentedInput,
@@ -24,38 +35,62 @@ from uniserve.nn.attention import (
 )
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.model_executor.input_batch import AttentionRow
+from uniserve_worker.storage.block_tables import GroupTable
 
 if TYPE_CHECKING:
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.kv_cache import KVCacheManager
 
 
-def cache_pages(
+@dataclass(frozen=True, slots=True)
+class TablePages:
+    """The pages one numerical block table stages for every row of a call.
+
+    Attributes:
+        block_size: Tokens per page of the table's cache group.
+        windowed: Whether the group keeps a history window, so rows carry
+            their first staged page; a full-history table starts every row
+            at page zero.
+        start_pages: Each row's first staged logical page.
+        rows: Each row's units of pages ``start_pages[row]..``.
+    """
+
+    block_size: int
+    windowed: bool
+    start_pages: tuple[int, ...]
+    rows: tuple[tuple[int, ...], ...]
+
+    @property
+    def width(self) -> int:
+        """Return the most pages any row stages, at least one."""
+        return max(1, *map(len, self.rows))
+
+
+def row_tables(
     tasks: tuple[AttentionRow, ...],
     *,
     tables: BlockTables | None,
     cache: KVCacheManager | None,
-) -> tuple[tuple[tuple[int, ...], ...], int]:
-    """Validate scheduler cache extents and resolve each row's physical pages.
+) -> tuple[tuple[GroupTable, ...], ...]:
+    """Validate scheduler cache extents and resolve each row's group tables.
 
     Args:
-        tasks: Rows of one attention call; all must share one KV group.
+        tasks: Rows of one attention call.
         tables: Installed request block tables.
         cache: Resident KV storage, which authorizes each row's write interval.
 
     Returns:
-        Each row's installed page table, and the block-table width to stage:
-        the longest row rounded up to a power of two and capped at the tables'
-        ``max_blocks_per_request``.
+        Each row's installed table of every cache group, in group order.
 
     Raises:
         WorkerError: An ``invalid_descriptor`` error when ``tasks`` is empty,
-            storage or tables are absent, rows mix KV groups, a length is out
-            of range, a request slot has no installed table, or a row's
-            resulting length exceeds its allocated capacity. Errors from
-            ``cache.require_writable`` for a writing row propagate: a
-            resource error when the interval overlaps a publication or an
-            import destination, or ``invalid_descriptor`` for invalid pages.
+            storage or tables are absent, a length is out of range, a request
+            slot lacks an installed group table, a row's resulting length
+            exceeds its allocated capacity, or a windowed row would read a
+            retired page. Errors from ``cache.require_writable`` for a
+            writing row propagate: a resource error when the interval
+            overlaps a publication or an import destination, or
+            ``invalid_descriptor`` for an interval outside its table.
     """
     if not tasks:
         raise invalid_descriptor("attention metadata requires forward rows")
@@ -63,78 +98,149 @@ def cache_pages(
         raise invalid_descriptor(
             "paged attention requires resident KV storage and request tables"
         )
-    groups = {int(task.group_id) for task in tasks}
-    if len(groups) != 1:
-        raise invalid_descriptor("one attention call cannot mix KV groups")
-    group_id = groups.pop()
 
-    query_lens = tuple(int(task.query_tokens) for task in tasks)
-    prefix_lens = tuple(int(task.seq_len) for task in tasks)
-    if any(length < 1 for length in query_lens) or any(
-        length < 0 for length in prefix_lens
-    ):
-        raise invalid_descriptor("forward attention lengths are invalid")
+    result = []
+    for task in tasks:
+        query, prefix = int(task.query_tokens), int(task.seq_len)
+        if query < 1 or prefix < 0:
+            raise invalid_descriptor("forward attention lengths are invalid")
 
-    pages = tuple(
-        tables.pages(task.request_pool_idx, group_id) for task in tasks
-    )
-    capacities = tuple(
-        tables.allocated_length(task.request_pool_idx) for task in tasks
-    )
-    # Only rows that write KV extend the cached sequence; read-only rows need
-    # capacity for their prefix alone.
-    for task, prefix, query, capacity, row_pages in zip(
-        tasks, prefix_lens, query_lens, capacities, pages, strict=True
-    ):
+        # Only rows that write KV extend the cached sequence; read-only rows
+        # need capacity for their prefix alone.
         resulting = prefix + (query if task.write_kv else 0)
-        if resulting > capacity:
+        if resulting > tables.allocated_length(task.request_pool_idx):
             raise invalid_descriptor(
                 "forward row exceeds its scheduler block table"
             )
-        if task.write_kv:
-            cache.require_writable(
-                row_pages, group=group_id, start=prefix, length=query
+
+        groups = tuple(
+            tables.table(task.request_pool_idx, group)
+            for group in range(len(tables.groups))
+        )
+        for table in groups:
+            window = table.shape.window
+            if (
+                window is not None
+                and _first_page(table, prefix) < table.start_page
+            ):
+                raise invalid_descriptor(
+                    "attention row reads retired window pages"
+                )
+            if task.write_kv:
+                cache.require_writable(table, start=prefix, length=query)
+        result.append(groups)
+    return tuple(result)
+
+
+def _first_page(table: GroupTable, prefix: int) -> int:
+    """Return the first page a row's queries after ``prefix`` read.
+
+    A query at position ``p`` reads keys at positions ``p - window`` through
+    ``p``, so the first query of the row, at ``prefix``, reaches back
+    farthest. A full-history table reads from page zero.
+    """
+    window = table.shape.window
+    if window is None:
+        return 0
+    return max(0, prefix - window) // table.shape.page_tokens
+
+
+def table_pages(
+    tables: Sequence[Sequence[GroupTable]],
+    *,
+    prefix_lengths: Sequence[int],
+    query_lengths: Sequence[int],
+) -> tuple[TablePages, ...]:
+    """Select the pages every numerical table stages for each row.
+
+    ``tables`` holds each row's table of every group, in group order. A
+    full-history table stages every installed page of the row. A windowed
+    table stages the pages from the first one the row's window reaches
+    through the page holding its last query token, or through its last
+    installed page when that comes first; at most ``ceil((window + query) /
+    page_tokens) + 1`` pages.
+
+    Returns:
+        One ``TablePages`` per numerical table in table order: every group's
+        unit positions, group-major.
+    """
+    if not tables:
+        raise ValueError("attention tables require at least one row")
+    result = []
+    for group, first in enumerate(tables[0]):
+        shape = first.shape
+        for position in range(shape.units_per_page):
+            starts, rows = [], []
+            for row, prefix, query in zip(
+                tables, prefix_lengths, query_lengths, strict=True
+            ):
+                table = row[group]
+                units = table.row(position)
+                start = _first_page(table, int(prefix))
+                if shape.window is not None:
+                    end = min(
+                        table.end_page,
+                        ceil_div(int(prefix) + int(query), shape.page_tokens),
+                    )
+                    first_column = start - table.start_page
+                    units = units[
+                        first_column : max(first_column, end - table.start_page)
+                    ]
+                starts.append(start)
+                rows.append(units)
+            result.append(
+                TablePages(
+                    shape.page_tokens,
+                    shape.window is not None,
+                    tuple(starts),
+                    tuple(rows),
+                )
             )
-
-    # Power-of-two widths keep graph shapes few, but the table capacity need
-    # not be a power of two. Resident and staged tables are exactly
-    # ``max_blocks_per_request`` wide, so padding stops at that bound.
-    width = min(
-        bucketed_length(max(1, max(map(len, pages)))),
-        tables.max_blocks_per_request,
-    )
-    return pages, width
+    return tuple(result)
 
 
-def from_blocks(
-    *, pages, query_lengths, prefix_lengths, block_size, causal, write
-):
-    """Build a paged append input or a read-only prefix/current input.
+def from_tables(
+    pages: Sequence[TablePages],
+    *,
+    query_lengths: Sequence[int],
+    prefix_lengths: Sequence[int],
+    causal: Sequence[bool],
+    write: Sequence[bool],
+) -> AttentionBatch:
+    """Build a paged append batch or a read-only prefix/current batch.
 
-    All arguments align by row. When any row writes, the result is a
-    ``PagedInput`` whose rows with ``write`` false keep their query positions
-    but carry write index -1, the convention for "no cache write" that graph
-    padding in ``graph_inputs.pad_text`` also relies on. When no row writes,
-    the result is a ``SegmentedInput`` in which each query sees its prefix
-    and its whole current segment; that form requires every row to be
-    noncausal. Tensors are built on the host for later staging.
+    All row arguments align by row, and ``pages`` holds every numerical
+    table in table order. When any row writes, each entry is a
+    ``PagedInput`` whose rows with ``write`` false keep their query
+    positions but carry write index -1, the convention for "no cache write"
+    that graph padding in ``graph_inputs.pad_text`` also relies on. When no
+    row writes, each entry is a ``SegmentedInput`` in which each query sees
+    its prefix and its whole current segment; that form requires every row
+    to be noncausal. Tensors are built on the host for later staging, and
+    every entry shares one pair of query and prefix lengths.
 
     Raises:
         ValueError: If a read-only call has a causal row or no host query
-            lengths, if a partially writing call has no write indices, or if
-            the attention input constructors reject the pages and lengths.
+            lengths, or if the attention input constructors reject the pages
+            and lengths.
     """
+    query_lengths, prefix_lengths = tuple(query_lengths), tuple(prefix_lengths)
+    queries = SequenceLengths.from_lengths(query_lengths, device="cpu")
+    prefixes = SequenceLengths.from_lengths(prefix_lengths, device="cpu")
+
     if any(write):
-        result = PagedInput.from_blocks(
-            blocks=tuple(tuple(row) for row in pages),
-            query_lengths=query_lengths,
-            prefix_lengths=prefix_lengths,
-            block_size=block_size,
-            causal=causal,
-            device="cpu",
-        )
-        if not all(write):
-            writes = result.write_indices
+        entries: dict[int, PagedInput | SegmentedInput] = {}
+        for number, table in enumerate(pages):
+            entry = PagedInput.from_blocks(
+                blocks=table.rows,
+                query_lengths=query_lengths,
+                prefix_lengths=prefix_lengths,
+                block_size=table.block_size,
+                causal=tuple(causal),
+                device="cpu",
+                start_pages=table.start_pages if table.windowed else None,
+            )
+            writes = entry.write_indices
             if writes is None:
                 raise ValueError("paged appends require cache write addresses")
             offset = 0
@@ -142,17 +248,10 @@ def from_blocks(
                 if not enabled:
                     writes[offset : offset + length].fill_(-1)
                 offset += length
-        return result
+            # Every table reads the same query domain and prefixes.
+            entries[number] = replace(entry, queries=queries, prefixes=prefixes)
+        return AttentionBatch(entries, queries)
 
-    queries = SequenceLengths.from_lengths(query_lengths, device="cpu")
-    prefixes = SequenceLengths.from_lengths(prefix_lengths, device="cpu")
-    # [rows, max pages] int32; short rows are zero-padded and their prefix
-    # lengths bound the valid span.
-    table = torch.zeros(
-        (len(pages), max(1, max(map(len, pages)))), dtype=torch.int32
-    )
-    for index, row in enumerate(pages):
-        table[index, : len(row)] = torch.tensor(row, dtype=torch.int32)
     if any(causal):
         raise ValueError(
             "read-only prefix/current calls require noncausal current sequences"
@@ -165,24 +264,52 @@ def from_blocks(
     # current segment, so the per-position visibility end, [rows, max query],
     # is each row's own query length and the current segment is fully
     # visible.
-    return SegmentedInput(
-        queries,
-        prefixes,
-        BlockTable(table, block_size),
-        None,
-        queries.values[:, None].expand(-1, maximum),
-        True,
+    visible = queries.values[:, None].expand(-1, maximum)
+    entries = {
+        number: SegmentedInput(
+            queries,
+            prefixes,
+            _host_table(table),
+            None,
+            visible,
+            True,
+        )
+        for number, table in enumerate(pages)
+    }
+    return AttentionBatch(entries, queries)
+
+
+def _host_table(pages: TablePages) -> BlockTable:
+    """Pack one table's rows into a zero-padded host ``BlockTable``.
+
+    The table is ``[rows, width]`` int32; short rows are zero-padded and
+    their prefix lengths bound the valid span.
+    """
+    table = torch.zeros((len(pages.rows), pages.width), dtype=torch.int32)
+    for index, row in enumerate(pages.rows):
+        table[index, : len(row)] = torch.tensor(row, dtype=torch.int32)
+    if not pages.windowed:
+        return BlockTable(table, pages.block_size)
+    return BlockTable(
+        table,
+        pages.block_size,
+        torch.tensor(pages.start_pages, dtype=torch.int32),
+        pages.start_pages,
     )
 
 
 def columns(tasks, *, tables, cache):
-    """Build the attention input for one homogeneous group of forward rows."""
-    pages, _width = cache_pages(tasks, tables=tables, cache=cache)
-    return from_blocks(
-        pages=pages,
-        query_lengths=tuple(task.query_tokens for task in tasks),
-        prefix_lengths=tuple(task.seq_len for task in tasks),
-        block_size=cache.info.block_size,
+    """Build the attention batch for one homogeneous group of forward rows."""
+    query_lengths = tuple(task.query_tokens for task in tasks)
+    prefix_lengths = tuple(task.seq_len for task in tasks)
+    return from_tables(
+        table_pages(
+            row_tables(tasks, tables=tables, cache=cache),
+            prefix_lengths=prefix_lengths,
+            query_lengths=query_lengths,
+        ),
+        query_lengths=query_lengths,
+        prefix_lengths=prefix_lengths,
         causal=tuple(task.causal for task in tasks),
         write=tuple(task.write_kv for task in tasks),
     )

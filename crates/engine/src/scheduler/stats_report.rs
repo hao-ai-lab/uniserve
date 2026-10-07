@@ -56,22 +56,19 @@ pub struct SchedulerStatsReporter {
 impl SchedulerStatsReporter {
     /// Captures the live counters in one `SchedulerStats` update.
     ///
-    /// `block_size` converts block-granular prefix-cache query counts into the
-    /// token-granular counts the snapshot shape documents.
-    ///
     /// Advances the reporter's baselines, so each counter increment appears in
     /// exactly one snapshot. The first snapshot reports everything counted
     /// since the scheduler started.
-    pub fn snapshot(&mut self, stats: &SchedulerStats, block_size: u32) -> stats::SchedulerStats {
-        let num_blocks = stats.kv_cache.num_blocks.load(Ordering::Relaxed);
-        let free_blocks = stats.kv_cache.free_blocks.load(Ordering::Relaxed);
-        let kv_cache_usage = if num_blocks > 0 {
-            1.0 - (free_blocks as f64 / num_blocks as f64)
+    pub fn snapshot(&mut self, stats: &SchedulerStats) -> stats::SchedulerStats {
+        let num_units = stats.kv_cache.num_units.load(Ordering::Relaxed);
+        let free_units = stats.kv_cache.free_units.load(Ordering::Relaxed);
+        let kv_cache_usage = if num_units > 0 {
+            1.0 - (free_units as f64 / num_units as f64)
         } else {
             0.0
         };
 
-        let prefix_queries = stats.prefix.queries.load(Ordering::Relaxed);
+        let prefix_queries = stats.prefix.query_tokens.load(Ordering::Relaxed);
         let prefix_hit_tokens = stats.prefix.hit_tokens.load(Ordering::Relaxed);
         let delta_queries = prefix_queries.saturating_sub(self.last_prefix_queries);
         let delta_hit_tokens = prefix_hit_tokens.saturating_sub(self.last_prefix_hit_tokens);
@@ -120,9 +117,8 @@ impl SchedulerStatsReporter {
             prefix_cache_stats: PrefixCacheStats {
                 base: BaseCacheStats {
                     requests: 0,
-                    // Queries count blocks and hits count tokens; scaling queries
-                    // by the block size puts both in tokens.
-                    queries: delta_queries * block_size as u64,
+                    // Queries and hits both count prompt tokens.
+                    queries: delta_queries,
                     hits: delta_hit_tokens,
                 },
                 preempted_requests: 0,
@@ -462,11 +458,11 @@ mod tests {
     #[test]
     fn snapshot_reports_deltas_and_usage() {
         let stats = SchedulerStats::default();
-        stats.kv_cache.num_blocks.store(100, Ordering::Relaxed);
-        stats.kv_cache.free_blocks.store(75, Ordering::Relaxed);
+        stats.kv_cache.num_units.store(100, Ordering::Relaxed);
+        stats.kv_cache.free_units.store(75, Ordering::Relaxed);
         stats.general.running.store(3, Ordering::Relaxed);
         stats.general.pending.store(2, Ordering::Relaxed);
-        stats.prefix.queries.store(10, Ordering::Relaxed);
+        stats.prefix.query_tokens.store(2_560, Ordering::Relaxed);
         stats.prefix.hit_tokens.store(512, Ordering::Relaxed);
         stats.timing.queue_wait_count.store(3, Ordering::Relaxed);
         stats
@@ -504,7 +500,7 @@ mod tests {
             .insert("greedy_device".into(), 4);
 
         let mut reporter = SchedulerStatsReporter::default();
-        let snapshot = reporter.snapshot(&stats, 256);
+        let snapshot = reporter.snapshot(&stats);
 
         assert_eq!(snapshot.num_running_reqs, 3);
         assert_eq!(snapshot.num_waiting_reqs, 2);
@@ -513,7 +509,7 @@ mod tests {
         assert_eq!(snapshot.avg_queue_wait_us, 5_001);
         assert_eq!(snapshot.queue_wait_us_total, 15_003);
         assert_eq!(snapshot.max_queue_wait_us, 9_000);
-        assert_eq!(snapshot.prefix_cache_stats.base.queries, 10 * 256);
+        assert_eq!(snapshot.prefix_cache_stats.base.queries, 2_560);
         assert_eq!(snapshot.prefix_cache_stats.base.hits, 512);
         let worker = snapshot.worker_forward_stats.expect("worker stats present");
         assert_eq!(worker.component_us.get("text_model_forward"), Some(&42));
@@ -527,7 +523,7 @@ mod tests {
         );
 
         // Second snapshot with unchanged counters reports zero deltas.
-        let second_snapshot = reporter.snapshot(&stats, 256);
+        let second_snapshot = reporter.snapshot(&stats);
         assert_eq!(second_snapshot.num_admitted_reqs, 0);
         assert_eq!(second_snapshot.avg_queue_wait_us, 0);
         assert_eq!(second_snapshot.queue_wait_us_total, 0);
@@ -553,14 +549,14 @@ mod tests {
         stats.timing.batch_timing_count.store(3, Ordering::Relaxed);
 
         let mut reporter = SchedulerStatsReporter::default();
-        let snapshot = reporter.snapshot(&stats, 256);
+        let snapshot = reporter.snapshot(&stats);
 
         assert_eq!(snapshot.worker_exec_us, 1_200);
         assert_eq!(snapshot.batch_roundtrip_us, 1_500);
         assert_eq!(snapshot.batch_count, 3);
 
         // Unchanged counters yield zero deltas on the next snapshot.
-        let second_snapshot = reporter.snapshot(&stats, 256);
+        let second_snapshot = reporter.snapshot(&stats);
         assert_eq!(second_snapshot.worker_exec_us, 0);
         assert_eq!(second_snapshot.batch_roundtrip_us, 0);
         assert_eq!(second_snapshot.batch_count, 0);
@@ -583,7 +579,7 @@ mod tests {
             .insert("graph".into(), 5);
 
         let mut reporter = SchedulerStatsReporter::default();
-        let snapshot = reporter.snapshot(&stats, 256);
+        let snapshot = reporter.snapshot(&stats);
 
         let worker = snapshot.worker_forward_stats.expect("worker stats present");
         assert_eq!(worker.attention_backend_counts.get("flashinfer"), Some(&9));
@@ -591,7 +587,7 @@ mod tests {
 
         // Unchanged maps produce no delta, so the second snapshot omits worker
         // stats entirely.
-        let second_snapshot = reporter.snapshot(&stats, 256);
+        let second_snapshot = reporter.snapshot(&stats);
         assert!(second_snapshot.worker_forward_stats.is_none());
     }
 }

@@ -439,7 +439,7 @@ class Bounds:
     """
 
     max_tokens: int = 0
-    max_kv_pages: int = 0
+    max_kv_units: int = 0
     max_latent_bytes: int = 0
     max_completion_bytes: int = 0
     max_transfer_bytes: int = 0
@@ -450,8 +450,8 @@ class Bounds:
         data = _map(value, where)
         return cls(
             max_tokens=_uint(data.get("max_tokens"), f"{where}.max_tokens"),
-            max_kv_pages=_uint(
-                data.get("max_kv_pages"), f"{where}.max_kv_pages"
+            max_kv_units=_uint(
+                data.get("max_kv_units"), f"{where}.max_kv_units"
             ),
             max_latent_bytes=_uint(
                 data.get("max_latent_bytes"), f"{where}.max_latent_bytes"
@@ -469,7 +469,7 @@ class Bounds:
         """Serialize all call resource ceilings for IPC."""
         return {
             "max_tokens": self.max_tokens,
-            "max_kv_pages": self.max_kv_pages,
+            "max_kv_units": self.max_kv_units,
             "max_latent_bytes": self.max_latent_bytes,
             "max_completion_bytes": self.max_completion_bytes,
             "max_transfer_bytes": self.max_transfer_bytes,

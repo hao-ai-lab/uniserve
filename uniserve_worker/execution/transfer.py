@@ -103,12 +103,11 @@ def execute(
             )
         request = state.pending_output(request_id)
 
-        # (request slot, cache group, accepted visible length, capacity).
+        # (request slot, accepted visible length, capacity).
         cache = calls.cache_coordinates(request, tables=request_tables)
         snapshot = publications.publish(
             request_pool_idx=request.request.request_pool_idx,
-            group_id=cache[1],
-            visible_length=cache[2],
+            visible_length=cache[1],
             destination="gen",
             buffer=output,
             transports=transports,

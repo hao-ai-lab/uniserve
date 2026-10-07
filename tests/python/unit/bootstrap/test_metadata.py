@@ -13,6 +13,7 @@ from safetensors.torch import save_file
 from tests.python.fixtures.model_metadata import neo_metadata
 from uniserve.loading import Config as IOConfig
 from uniserve_models import bagel
+from uniserve_worker.protocol.worker_info import KvGroupKind
 
 pytestmark = pytest.mark.unit
 
@@ -336,18 +337,23 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     )
     info = build_worker_layout(model, config).info
     cache = info.kv_cache
-    assert cache.num_blocks == 4
-    assert cache.total_layers == cache.num_layers == 2
-    assert cache.total_kv_heads == cache.num_kv_heads == 2
-    assert cache.layer_offset == cache.kv_head_offset == 0
-    assert cache.head_dim == 8
+    # Both layers share one full-attention group whose 64-token page is one
+    # unit, so 256 tokens take four units.
+    assert cache.num_units == 4
+    (group,) = cache.groups
+    assert group.kind is KvGroupKind.FULL
+    assert (group.page_tokens, group.units_per_page) == (64, 1)
+    assert group.layer_ids == (0, 1)
+    assert group.total_kv_heads == group.num_kv_heads == 2
+    assert group.kv_head_offset == 0
+    assert group.head_dim == 8
     assert cache.dtype == storage
+    # A unit holds both fields of both layers for a page, with one
+    # initialization flag and, for FP8, one scale per layer and field.
     payload = 2 * 2 * 2 * 8 * (1 if storage == "float8_e4m3fn" else 2) * 64
     scales = 2 * 2 * 4 if storage == "float8_e4m3fn" else 0
     initialization = 2 * 2
-    assert (
-        cache.bytes_per_token == (payload + scales + initialization + 63) // 64
-    )
+    assert cache.unit_bytes == payload + scales + initialization
 
 
 def test_h3_media_units_follow_each_request_canvas():

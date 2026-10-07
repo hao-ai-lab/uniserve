@@ -70,7 +70,7 @@ def _run(rank, rendezvous):
                 }
             )
             with PrefixCache(
-                config, num_blocks=1, block_size=16, device="cpu"
+                config, num_units=1, block_size=16, device="cpu"
             ) as cache:
                 with ExecutionContext(
                     layer, cache=cache, attention="torch"
@@ -188,7 +188,7 @@ def _context(rank, rendezvous, gpu):
             with (
                 stream if stream is not None else nullcontext(),
                 PrefixCache(
-                    config, num_blocks=3, block_size=16, device=device
+                    config, num_units=3, block_size=16, device=device
                 ) as cache,
             ):
                 with ExecutionContext(

@@ -38,7 +38,7 @@ def test_checkpoint_prefill_decode_and_selected_logits(tmp_path, tied, theta):
     with torch.no_grad():
         expected = reference(tokens).logits
     with PrefixCache(
-        model.cache_config, num_blocks=2, block_size=4, device="cpu"
+        model.cache_config, num_units=2, block_size=4, device="cpu"
     ) as cache:
         with ExecutionContext(model, cache=cache, attention="torch") as context:
             context.prepare(TextSize(4, 1))
@@ -103,7 +103,7 @@ def test_embedding_replacement_matches_numerical_embedding_input(tmp_path):
         )
     )
     with PrefixCache(
-        model.cache_config, num_blocks=1, block_size=4, device="cpu"
+        model.cache_config, num_units=1, block_size=4, device="cpu"
     ) as cache:
         with ExecutionContext(model, cache=cache, attention="torch") as context:
             context.prepare(TextSize(3, 1))
@@ -171,7 +171,7 @@ def _partitioned(rank, rendezvous, root, shape, axes):
 
         expected = torch.load(root / "expected.pt", weights_only=True)
         with PrefixCache(
-            model.cache_config, num_blocks=1, block_size=4, device="cpu"
+            model.cache_config, num_units=1, block_size=4, device="cpu"
         ) as cache:
             with ExecutionContext(
                 model, cache=cache, attention="torch"
@@ -494,7 +494,7 @@ def _moe_logits(root, tokens, *, mesh=None):
     count = tokens.numel()
     with (
         PrefixCache(
-            model.cache_config, num_blocks=1, block_size=8, device="cpu"
+            model.cache_config, num_units=1, block_size=8, device="cpu"
         ) as cache,
         ExecutionContext(model, cache=cache, attention="torch") as context,
     ):

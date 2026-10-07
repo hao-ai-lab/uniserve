@@ -35,7 +35,7 @@ def test_cache_reset_follows_backing_on_another_device(quantized):
         torch.cuda.device(0),
         PrefixCache(
             Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
-            num_blocks=3,
+            num_units=3,
             block_size=4,
             device="cuda:1",
             quantization={
@@ -46,7 +46,7 @@ def test_cache_reset_follows_backing_on_another_device(quantized):
         state = cache.state("attention")
         source = torch.full((12, 1, 16), 896.0, device="cuda:1")
         state.write((0, 1, 2), start=0, key=source, value=-source)
-        cache.zero_blocks("attention", (0, 2))
+        cache.zero_units((0, 2))
         expected = torch.zeros(12, 1, 16)
         expected[4:8] = 896
         key, value = state.read((0, 1, 2), start=0, length=12)
@@ -67,7 +67,7 @@ def test_cache_updates_follow_backing_and_preserve_existing_values_on_another_de
         torch.cuda.device(0),
         PrefixCache(
             Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
-            num_blocks=3,
+            num_units=3,
             block_size=4,
             device="cuda:1",
             quantization={

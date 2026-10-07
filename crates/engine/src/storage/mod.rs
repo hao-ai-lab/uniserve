@@ -4,14 +4,15 @@
 //! these owned allocations when constructing a batch; no region copies persist.
 //!
 //! The backing storage itself lives in the worker processes, which report its
-//! capacity in `WorkerInfo`; these pools assign its rows, pages, and byte
-//! ranges. Row zero of the request state and page zero of the latent pool are the
-//! worker's inactive sentinels, so neither pool ever hands them out, and the
-//! worker IPC validation rejects a request row or latent page of zero.
+//! capacity in `WorkerInfo`; these pools assign its rows, units, pages, and
+//! byte ranges. Row zero of the request state, unit zero of the KV pool and
+//! page zero of the latent pool are the worker's inactive sentinels, so no
+//! pool ever hands them out, and the worker IPC validation rejects a request
+//! row, KV unit or latent page of zero.
 //!
 //! An allocation is an owned, non-`Clone` value that the issuing pool's `free`
 //! consumes; the value does not record which pool issued it, so the caller
-//! returns it to the right one. `KvAllocation` has no `free`: its pages return
+//! returns it to the right one. `KvAllocation` has no `free`: its units return
 //! to the `BlockPool` when its tables drop.
 
 use std::collections::BTreeMap;
@@ -19,7 +20,8 @@ use std::collections::BTreeMap;
 use uniserve_core::HashAlgo;
 use uniserve_worker_ipc::{RequestKey, WorkerInfo};
 
-use crate::kv::{BlockPool, BlockTable, KvCacheCoordinator};
+pub(crate) use crate::kv::KvAllocation;
+use crate::kv::{BlockPool, GroupShape, KvCacheCoordinator};
 
 /// Owned request row, returned only after its request epoch retires.
 ///
@@ -35,17 +37,6 @@ impl RequestSlot {
     pub(crate) fn index(&self) -> u32 {
         self.index
     }
-}
-
-/// KV page references retain shared prefixes through ordinary ownership.
-///
-/// One `BlockTable` per KV group, in group order. Each page is a counted
-/// reference, so dropping the allocation releases the request's references
-/// and a page shared through the prefix cache stays resident while another
-/// table still holds it.
-#[derive(Debug)]
-pub(crate) struct KvAllocation {
-    pub(crate) tables: Vec<BlockTable>,
 }
 
 /// Pages and capacity of a latent trajectory.
@@ -74,8 +65,8 @@ pub enum OutOfStorage {
     #[error("request slot capacity is exhausted")]
     /// No request-state row remains available.
     RequestSlots,
-    #[error("KV page capacity is exhausted")]
-    /// The paged KV pool cannot satisfy the requested token capacity.
+    #[error("KV unit capacity is exhausted")]
+    /// The paged KV unit pool cannot satisfy the requested token capacity.
     Kv,
     #[error("latent page capacity is exhausted")]
     /// The latent page pool cannot satisfy the requested trajectory capacity.
@@ -187,51 +178,31 @@ impl LatentPool {
     }
 }
 
-/// KV-cache geometry and coordination derived from worker capabilities.
+/// KV unit pool and cross-group coordination derived from worker
+/// capabilities.
 pub(crate) struct KVCacheManager {
     pub(crate) block_pool: BlockPool,
     pub(crate) coordinator: KvCacheCoordinator,
-    /// Allocatable pages summed over every group, as
-    /// `BlockPool::request_page_capacity` reports them.
-    pub(crate) usable_blocks: usize,
 }
 
 impl KVCacheManager {
-    /// Builds scheduler KV state when a worker advertises paged cache capacity.
+    /// Builds scheduler KV state when a worker advertises a paged unit pool.
     ///
-    /// Returns `None` when `info` has no KV cache. The advertised groups are
-    /// laid out as consecutive page ranges in their listed order; without
-    /// groups the pool is one group. `BlockPool::with_groups` panics on a zero
-    /// block size, a zero page count, or groups that do not partition the
-    /// pages; `KvCacheInfo::validate` rejects each of these.
+    /// Returns `None` when `info` has no KV cache. `BlockPool::new` panics on
+    /// a pool without an allocatable unit and `BlockTable::new` on an empty
+    /// page shape; `KvCacheInfo::validate` rejects each of these.
     pub(crate) fn from_worker_info(info: &WorkerInfo) -> Option<Self> {
-        info.kv_cache.as_ref().map(|kv_cache| {
-            let block_pool = if kv_cache.groups.is_empty() {
-                BlockPool::new(kv_cache.num_blocks, kv_cache.block_size as usize)
-            } else {
-                let mut offset = 0_u32;
-                let group_shapes = kv_cache
-                    .groups
-                    .iter()
-                    .map(|group| {
-                        let shape = (offset, group.num_blocks);
-                        offset = offset.saturating_add(group.num_blocks);
-                        shape
-                    })
-                    .collect::<Vec<_>>();
-                BlockPool::with_groups(
-                    kv_cache.num_blocks as usize,
-                    kv_cache.block_size as usize,
-                    &group_shapes,
-                )
-            };
-            let usable_blocks = block_pool.request_page_capacity();
-            KVCacheManager {
-                block_pool,
-                coordinator: KvCacheCoordinator::default(),
-                usable_blocks,
-            }
+        info.kv_cache.as_ref().map(|kv_cache| KVCacheManager {
+            block_pool: BlockPool::new(kv_cache.num_units),
+            coordinator: KvCacheCoordinator::new(
+                kv_cache.groups.iter().map(GroupShape::from_group).collect(),
+            ),
         })
+    }
+
+    /// Returns the units the scheduler may allocate, excluding the sentinel.
+    pub(crate) fn usable_units(&self) -> usize {
+        self.block_pool.usable_units()
     }
 }
 
@@ -385,28 +356,33 @@ impl BufferPool {
 }
 
 impl KVCacheManager {
-    /// Acquire one page table per loaded KV group with atomic initial capacity.
+    /// Acquire one table per cache group holding `tokens` tokens for a read
+    /// from token zero, atomically.
     pub(crate) fn allocate(&self, tokens: u32) -> Result<KvAllocation, OutOfStorage> {
-        let mut tables = (0..self.block_pool.num_groups())
-            .map(|group| BlockTable::new(group, self.block_pool.block_size()))
-            .collect::<Vec<_>>();
+        let mut allocation = self.coordinator.empty();
         self.coordinator
-            .ensure_capacity(&self.block_pool, &mut tables, tokens as usize)
+            .ensure_capacity(&self.block_pool, &mut allocation, 0, tokens as usize)
             .ok_or(OutOfStorage::Kv)?;
-        Ok(KvAllocation { tables })
+        Ok(allocation)
     }
 
-    /// Grow all cache groups atomically while retaining shared prefix references.
+    /// Grow every cache group atomically for a call that reads from token
+    /// `read_start` and holds `tokens` tokens, retaining shared prefix
+    /// references.
     pub(crate) fn grow(
         &self,
         allocation: &mut KvAllocation,
+        read_start: u32,
         tokens: u32,
     ) -> Result<(), OutOfStorage> {
-        let KvAllocation { tables, .. } = allocation;
         self.coordinator
-            .ensure_capacity(&self.block_pool, tables, tokens as usize)
-            .ok_or(OutOfStorage::Kv)?;
-        Ok(())
+            .ensure_capacity(
+                &self.block_pool,
+                allocation,
+                read_start as usize,
+                tokens as usize,
+            )
+            .ok_or(OutOfStorage::Kv)
     }
 
     pub(crate) fn set_prefix_cache(&mut self, enabled: bool) {

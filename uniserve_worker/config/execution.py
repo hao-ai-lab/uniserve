@@ -304,14 +304,19 @@ class WorkerConfig:
     request-slot bounds of a model with a ``VideoDecoder`` and clears its KV
     capacity, attention backend and generation device; capacity fitting on a
     CUDA device sets ``pool_storage_bytes`` from the device storage grant and
-    may shrink the request-slot and batch bounds; and a ``kv_cache_dtype`` in
-    the quantization config overrides the launch value.
+    may shrink the request-slot and batch bounds; a ``kv_cache_dtype`` in
+    the quantization config overrides the launch value; and an unset
+    ``block_size`` is resolved from the model's cache layers and attention
+    kernels (``bootstrap.cache.resolve_page_size``) before the unit pool is
+    planned.
     """
 
     device: str = "cpu"
     rank: int = 0
     world_size: int = 1
-    block_size: int = 64
+    # Tokens per KV page of the cache group with the widest token rows; None
+    # until resolved.
+    block_size: int | None = None
     kv_token_capacity: int | None = None
     attention_backend: str | None = None
     max_batch_calls: int = 1024
@@ -382,7 +387,7 @@ class WorkerConfig:
                 "worker pool storage grant must not be negative"
             )
         if (
-            self.block_size < 1
+            (self.block_size is not None and self.block_size < 1)
             or self.max_batch_calls < 1
             or self.max_batch_tokens < 1
             or self.max_sequence_tokens < 1
@@ -453,7 +458,7 @@ def worker_config_from_namespace(
         rank=int(namespace.rank),
         world_size=int(namespace.world_size),
         generation_device=generation_device,
-        block_size=int(namespace.block_size),
+        block_size=_positive_optional_int(namespace.block_size),
         max_batch_calls=int(namespace.max_batch_calls),
         max_batch_tokens=int(namespace.max_batch_tokens),
         max_sequence_tokens=int(namespace.max_model_len),

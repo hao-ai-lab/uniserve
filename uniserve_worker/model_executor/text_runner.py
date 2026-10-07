@@ -280,7 +280,7 @@ class TextRunner(ModelRunner):
             batch,
             decode_sizes=self.decode_shapes,
             prefill_shapes=prefill_shapes,
-            context_blocks=self.decode_context_blocks,
+            table_widths=self.table_widths,
         )
         if shape is None:
             return None

@@ -17,7 +17,7 @@ def _reject_invalid_index(rank, index):
     # its own process. Replay must validate live addresses, not capture values.
     cache = PrefixCache(
         Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
-        num_blocks=3,
+        num_units=3,
         block_size=4,
         device="cuda",
     )
@@ -43,7 +43,7 @@ def test_cache_replay_rejects_out_of_range_addresses(index):
 def _reject_invalid_copy(rank, targets):
     cache = PrefixCache(
         Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
-        num_blocks=3,
+        num_units=3,
         block_size=4,
         device="cuda",
     )
@@ -72,7 +72,7 @@ def test_block_copy_replay_rejects_invalid_or_repeated_targets(targets):
 def test_state_updates_replay_addresses_and_first_write_scales(quantized):
     cache = PrefixCache(
         Config({"attention": mha.Config(2, 2, (0, 1), torch.float32)}),
-        num_blocks=3,
+        num_units=3,
         block_size=4,
         device="cuda",
         quantization={
@@ -91,12 +91,12 @@ def test_state_updates_replay_addresses_and_first_write_scales(quantized):
     value = -key.clone()
     indices = torch.tensor([0, 1, -1], device="cuda")
     state.update(key, value, indices=indices)
-    cache.zero_blocks("attention", (0, 1, 2))
+    cache.zero_units((0, 1, 2))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         state.update(key, value, indices=indices)
     for slots in ((4, 5, -1), (-1, 8, 0)):
-        cache.zero_blocks("attention", (0, 1, 2))
+        cache.zero_units((0, 1, 2))
         indices.copy_(torch.tensor(slots, device="cuda"))
         graph.replay()
         torch.cuda.synchronize()

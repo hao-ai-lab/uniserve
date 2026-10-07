@@ -26,6 +26,7 @@ from uniserve_worker.protocol.tensor import (
     StaticDim,
     TensorRef,
 )
+from uniserve_worker.storage.block_tables import GroupTable
 from uniserve_worker.storage.buffer_pool import BufferPool
 from uniserve_worker.storage.latent_pool import LatentPool, LatentUpdate
 from uniserve_worker.storage.output import OutputPool
@@ -124,6 +125,12 @@ def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
         buffers.close()
 
 
+def _table(pool, units):
+    """Return a slot table of whole pages of ``units`` in the one group."""
+    shape = pool.shapes[0]
+    return GroupTable(shape, 0, tuple(units), len(units) * shape.page_tokens)
+
+
 @pytest.mark.parametrize(
     "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
 )
@@ -153,21 +160,21 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         torch.cuda.Stream(device=device) if device.startswith("cuda") else None
     )
     try:
-        cache.cache.state(cache.layers[0]).write(
+        cache.cache.state(cache.cache.groups[0].layers[0]).write(
             (1,), start=0, key=values, value=-values
         )
-        cache.cache.state(cache.layers[0]).write(
+        cache.cache.state(cache.cache.groups[0].layers[0]).write(
             (2,), start=0, key=independent, value=independent
         )
         output = outputs.acquire(1, token_capacity=8, devices=(device,))
         completion = output.completion_future()
         cache.retain_execution(
-            request, (1,), group=0, length=3, completion=completion
+            request, _table(cache, (1,)), length=3, completion=completion
         )
         with pytest.raises(WorkerError, match="executing producer or consumer"):
-            cache.zero_pages(0, (1,))
-        cache.require_reusable((1,), group=0, start=3, length=1)
-        for actual in cache.cache.state(cache.layers[0]).read(
+            cache.zero_units((1,))
+        cache.require_reusable(_table(cache, (1,)).spans(3, 1))
+        for actual in cache.cache.state(cache.cache.groups[0].layers[0]).read(
             (2,), start=0, length=4
         ):
             torch.testing.assert_close(actual, independent, rtol=0, atol=0)
@@ -178,9 +185,9 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             buffers=(BufferId(request, CallId(2, 0), 0, 2),)
         )
 
-        source = cache.cache.state(cache.layers[0]).transfer_blocks(
-            (1,), start=0, length=3
-        )["key.values"][0]
+        source = cache.cache.state(
+            cache.cache.groups[0].layers[0]
+        ).transfer_blocks((1,), start=0, length=3)["key.values"][0]
         if stream is not None:
             # First-use reduction initialization can finish prior device work
             # while the host is still submitting it. Initialize before the
@@ -197,7 +204,7 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             with pytest.raises(
                 WorkerError, match="executing producer or consumer"
             ):
-                cache.zero_pages(0, (1,))
+                cache.zero_units((1,))
         else:
             capture = output.capture(source.sum().reshape(1))
             output.seal()
@@ -215,8 +222,8 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
             output.abandon()
         assert completion.done()
         assert cache.retirement_ready(requests=(request,))
-        cache.zero_pages(0, (1,))
-        for actual in cache.cache.state(cache.layers[0]).read(
+        cache.zero_units((1,))
+        for actual in cache.cache.state(cache.cache.groups[0].layers[0]).read(
             (1,), start=0, length=4
         ):
             assert torch.count_nonzero(actual).item() == 0
@@ -226,15 +233,15 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         next_output = outputs.acquire(1, token_capacity=8, devices=(device,))
         next_completion = next_output.completion_future()
         cache.retain_execution(
-            request, (1,), group=0, length=4, completion=next_completion
+            request, _table(cache, (1,)), length=4, completion=next_completion
         )
         assert completion.done()
         assert not next_completion.done()
         with pytest.raises(WorkerError, match="executing producer or consumer"):
-            cache.zero_pages(0, (1,))
+            cache.zero_units((1,))
         outputs.close()
         assert next_completion.done()
-        cache.zero_pages(0, (1,))
+        cache.zero_units((1,))
     finally:
         outputs.close()
         cache.close()
@@ -270,13 +277,13 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
     locations = []
     readers = []
     try:
-        pool.cache.state(pool.layers[0]).write(
+        pool.cache.state(pool.cache.groups[0].layers[0]).write(
             pages, start=0, key=prefix, value=-prefix
         )
         source = pool.reserve_publication(
-            buffer, pages, group=0, start=0, length=3
+            buffer, _table(pool, pages).spans(0, 3)
         )
-        for tensor in pool.cache.state(pool.layers[0]).read(
+        for tensor in pool.cache.state(pool.cache.groups[0].layers[0]).read(
             pages, start=0, length=3
         ):
             assert tensor is not None
@@ -292,15 +299,17 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         # Appending touches the remaining token of the same page and the next
         # page. Neither call changes the retained prefix's logical value.
         suffix = torch.full((5, 1, 4), 7.0)
-        pool.require_writable(pages, group=0, start=3, length=suffix.shape[0])
-        pool.cache.state(pool.layers[0]).write(
+        pool.require_writable(
+            _table(pool, pages), start=3, length=suffix.shape[0]
+        )
+        pool.cache.state(pool.cache.groups[0].layers[0]).write(
             pages, start=3, key=suffix, value=-suffix
         )
         torch.testing.assert_close(readers[0].result(), prefix, rtol=0, atol=0)
         torch.testing.assert_close(readers[1].result(), -prefix, rtol=0, atol=0)
-        pool.zero_pages(0, (2,))
+        pool.zero_units((2,))
         with pytest.raises(WorkerError, match="published version"):
-            pool.require_writable(pages, group=0, start=2, length=1)
+            pool.require_writable(_table(pool, pages), start=2, length=1)
 
         pool.release_buffers((buffer,))
         for location in locations:
@@ -308,16 +317,13 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         readers[0].close()
         assert not pool.retirement_ready(buffers=(buffer,))
         with pytest.raises(WorkerError, match="published version"):
-            pool.zero_pages(0, (3,))
+            pool.zero_units((3,))
         torch.testing.assert_close(readers[1].result(), -prefix, rtol=0, atol=0)
-        dependencies = pool.write_dependencies(
-            pages, group=0, start=0, length=3
-        )
+        dependencies = pool.write_dependencies(_table(pool, pages).spans(0, 3))
         output = outputs.acquire(1, token_capacity=8, devices=("cpu",))
         pool.retain_execution(
             buffer.owner,
-            pages,
-            group=0,
+            _table(pool, pages),
             length=3,
             completion=output.completion_future(),
         )
@@ -327,11 +333,11 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         assert pool.retirement_ready(buffers=(buffer,))
         assert not pool.retirement_ready(requests=(buffer.owner,))
         with pytest.raises(WorkerError, match="executing producer or consumer"):
-            pool.zero_pages(0, (3,))
+            pool.zero_units((3,))
         output.seal()
         output.abandon()
-        pool.zero_pages(0, (3,))
-        keys, values = pool.cache.state(pool.layers[0]).read(
+        pool.zero_units((3,))
+        keys, values = pool.cache.state(pool.cache.groups[0].layers[0]).read(
             pages, start=0, length=3
         )
         torch.testing.assert_close(
@@ -1144,14 +1150,14 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
         num_pages=2,
         page_size=4,
         device="cpu",
-        max_blocks_per_request=1,
+        table_width=1,
     )
     events = EventPool()
     transport = make_transport(
         "local", byte_capacity=4096, ticket_capacity=4, event_pool=events
     )
     source = BufferId(RequestKey(1, 1, 1), CallId(1, 0), 0, 1)
-    state = pool.cache.state(pool.layers[0])
+    state = pool.cache.state(pool.cache.groups[0].layers[0])
     prefix = torch.tensor([[[1.0, 0.111]]])
     scale = torch.tensor(1.0) / 448
     expected = (
@@ -1159,11 +1165,10 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
     ).unsqueeze(1)
     locations, readers = [], []
     try:
-        pool.block_tables.install(((1, 0, (1,), 4),))
+        pool.block_tables.install(((1, 0, 0, (1,), 4),))
         state.write((1,), start=0, key=prefix, value=-prefix)
         publication = pool.publish(
             request_pool_idx=1,
-            group_id=0,
             visible_length=1,
             destination="consumer",
             buffer=source,
@@ -1179,7 +1184,7 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
         # The import can begin after another invocation appends to the same
         # physical block. Its BufferId still denotes the earlier exact value.
         suffix = torch.full_like(prefix, 896)
-        pool.require_writable((1,), group=0, start=1, length=1)
+        pool.require_writable(_table(pool, (1,)), start=1, length=1)
         state.write((1,), start=1, key=suffix, value=-suffix)
         for index, field in enumerate(publication.tensors[:2]):
             reader = transport.fetch(

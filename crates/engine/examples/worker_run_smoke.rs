@@ -108,7 +108,7 @@ fn main() -> anyhow::Result<()> {
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
         kv_token_capacity: None,
-        block_size: 256,
+        block_size: Some(256),
         max_batch_calls: 32,
         max_batch_tokens: 8192,
         attention_backend: uniserve_engine::AttentionBackend::Auto,

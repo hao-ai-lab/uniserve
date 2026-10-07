@@ -44,11 +44,11 @@ use uniserve_core::{
 };
 use uniserve_worker_ipc::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
-    BufferAllocation, BufferId, CachePageAllocation, Call, CallId, CallKind, CallStatus, DType,
+    BufferAllocation, BufferId, CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DType,
     DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCallIdentity, ErrorCode,
-    FeatureKind, FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput,
-    NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication, TensorRef,
-    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
+    FeatureKind, FinishFlags, ForwardStats, KvGroupTransfer, KvTransfer, LatentParams, Locator,
+    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication,
+    TensorRef, TensorTransfer, TimingCounters, TransferHandle, TransferTransport, VideoAdmission,
     WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
@@ -99,7 +99,7 @@ struct RequestTypes {
     rng: Py<PyAny>,
     sampling_state: Py<PyAny>,
     block_table: Py<PyAny>,
-    cache_page_allocation: Py<PyAny>,
+    cache_unit_allocation: Py<PyAny>,
     start: Py<PyAny>,
     finish: Py<PyAny>,
     free: Py<PyAny>,
@@ -195,6 +195,7 @@ impl RequestTypes {
             class(&module, "LatentTransferValue")?,
         );
         records.insert("TensorTransfer", class(&module, "TensorTransfer")?);
+        records.insert("KvGroupTransfer", class(&module, "KvGroupTransfer")?);
         records.insert("KvTransfer", class(&module, "KvTransfer")?);
         Ok(Self {
             records,
@@ -211,7 +212,7 @@ impl RequestTypes {
             rng: class(&call, "Rng")?,
             sampling_state: class(&call, "SamplingState")?,
             block_table: class(&batch, "BlockTable")?,
-            cache_page_allocation: class(&batch, "CachePageAllocation")?,
+            cache_unit_allocation: class(&batch, "CacheUnitAllocation")?,
             start: class(&batch, "Start")?,
             finish: class(&batch, "Finish")?,
             free: class(&batch, "Free")?,
@@ -428,7 +429,7 @@ impl<'py> RequestConversion<'py> {
         ))?;
         let bounds = self.types.bounds.bind(self.py).call1((
             call.bounds.max_tokens,
-            call.bounds.max_kv_pages,
+            call.bounds.max_kv_units,
             call.bounds.max_latent_bytes,
             call.bounds.max_completion_bytes,
             call.bounds.max_transfer_bytes,
@@ -578,25 +579,26 @@ impl<'py> RequestConversion<'py> {
         self.types.call.bind(py).call1(arguments)
     }
 
-    /// Constructs a typed Python KV block table.
+    /// Constructs a typed Python KV unit table.
     fn block_table(&self, table: &BlockTable) -> PyResult<Bound<'py, PyAny>> {
         self.types.block_table.bind(self.py).call1((
             table.request_pool_idx,
             table.group_id,
-            pyo3::types::PyTuple::new(self.py, table.page_ids.iter().map(|page| page.0))?,
+            table.start_page,
+            pyo3::types::PyTuple::new(self.py, table.unit_ids.iter().map(|unit| unit.0))?,
             table.allocated_tokens,
         ))
     }
 
-    /// Constructs a typed Python KV page allocation.
-    fn cache_page_allocation(
+    /// Constructs a typed Python KV unit allocation.
+    fn cache_unit_allocation(
         &self,
-        allocation: &CachePageAllocation,
+        allocation: &CacheUnitAllocation,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.types.cache_page_allocation.bind(self.py).call1((
+        self.types.cache_unit_allocation.bind(self.py).call1((
             allocation.request_pool_idx,
             allocation.group_id,
-            pyo3::types::PyTuple::new(self.py, allocation.page_ids.iter().map(|page| page.0))?,
+            pyo3::types::PyTuple::new(self.py, allocation.unit_ids.iter().map(|unit| unit.0))?,
         ))
     }
 
@@ -649,10 +651,10 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
         .iter()
         .map(|table| native.block_table(table))
         .collect::<PyResult<Vec<_>>>()?;
-    let new_cache_pages = run
-        .new_cache_pages
+    let new_cache_units = run
+        .new_cache_units
         .iter()
-        .map(|allocation| native.cache_page_allocation(allocation))
+        .map(|allocation| native.cache_unit_allocation(allocation))
         .collect::<PyResult<Vec<_>>>()?;
     let commands = run
         .commands
@@ -676,7 +678,7 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
             run.collective_seq.into_pyobject(py)?.into_any(),
             pyo3::types::PyTuple::new(py, calls)?.into_any(),
             pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
-            pyo3::types::PyTuple::new(py, new_cache_pages)?.into_any(),
+            pyo3::types::PyTuple::new(py, new_cache_units)?.into_any(),
             (
                 pyo3::types::PyTuple::new(py, &run.forward.call_indices)?,
                 pyo3::types::PyTuple::new(py, &run.forward.request_pool_indices)?,
@@ -2014,24 +2016,20 @@ fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
 /// record.
 fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bound<'py, PyAny>> {
     let KvTransfer {
-        tensors,
+        groups,
         source,
         destination,
         base,
         base_extent,
         published_extent,
-        group_id,
         compute_dtype,
-        page_size,
     } = transfer;
     let value = PyDict::new(py);
-    // Tensor order is keys, values, then scales for quantized storage (see
-    // `KvTransfer::tensors`); all of them belong to the one `source` buffer.
-    let tensors = tensors
+    let groups = groups
         .iter()
-        .map(|tensor| tensor_transfer_to_py(py, tensor))
+        .map(|group| kv_group_transfer_to_py(py, group))
         .collect::<PyResult<Vec<_>>>()?;
-    value.set_item(intern!(py, "tensors"), PyTuple::new(py, tensors)?)?;
+    value.set_item(intern!(py, "groups"), PyTuple::new(py, groups)?)?;
     value.set_item(intern!(py, "source"), buffer_id_to_py(py, source)?)?;
     value.set_item(intern!(py, "destination"), destination.as_str())?;
     value.set_item(
@@ -2042,10 +2040,28 @@ fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bo
     )?;
     value.set_item(intern!(py, "base_extent"), base_extent)?;
     value.set_item(intern!(py, "published_extent"), published_extent)?;
-    value.set_item(intern!(py, "group_id"), group_id)?;
     value.set_item(intern!(py, "compute_dtype"), compute_dtype.as_str())?;
-    value.set_item(intern!(py, "page_size"), page_size)?;
     construct(py, "KvTransfer", &value)
+}
+
+/// Converts one cache group's share of a KV publication into a Python
+/// `KvGroupTransfer` record.
+fn kv_group_transfer_to_py<'py>(
+    py: Python<'py>,
+    group: &KvGroupTransfer,
+) -> PyResult<Bound<'py, PyAny>> {
+    let value = PyDict::new(py);
+    value.set_item(intern!(py, "start"), group.start)?;
+    value.set_item(intern!(py, "page_tokens"), group.page_tokens)?;
+    // Tensor order is keys, values, then scales for quantized storage (see
+    // `KvGroupTransfer::tensors`).
+    let tensors = group
+        .tensors
+        .iter()
+        .map(|tensor| tensor_transfer_to_py(py, tensor))
+        .collect::<PyResult<Vec<_>>>()?;
+    value.set_item(intern!(py, "tensors"), PyTuple::new(py, tensors)?)?;
+    construct(py, "KvGroupTransfer", &value)
 }
 
 /// Decodes the KV publication a completion reports in `kv_output`.
@@ -2056,15 +2072,14 @@ fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bo
 fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
     let py = value.py();
     let payload = value.cast::<PyDict>().ok()?;
-    // Preserve tensor order: keys, values, then scales for quantized storage.
-    let raw_tensors = get(payload, intern!(py, "tensors"))?;
-    let raw_tensors = raw_tensors.cast::<PyList>().ok()?;
-    let mut tensors = Vec::with_capacity(raw_tensors.len());
-    for tensor in raw_tensors.iter() {
-        tensors.push(tensor_transfer_from_py(&tensor)?);
+    let raw_groups = get(payload, intern!(py, "groups"))?;
+    let raw_groups = raw_groups.cast::<PyList>().ok()?;
+    let mut groups = Vec::with_capacity(raw_groups.len());
+    for group in raw_groups.iter() {
+        groups.push(kv_group_transfer_from_py(&group)?);
     }
     Some(KvTransfer {
-        tensors,
+        groups,
         source: buffer_id_mapping_from_py(&get(payload, intern!(py, "source"))?)?,
         destination: string_of(&get(payload, intern!(py, "destination"))?)?,
         base: if absent_or_none(payload, intern!(py, "base"))? {
@@ -2077,9 +2092,25 @@ fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
         },
         base_extent: u32_of(&get(payload, intern!(py, "base_extent"))?)?,
         published_extent: u32_of(&get(payload, intern!(py, "published_extent"))?)?,
-        group_id: u32_of(&get(payload, intern!(py, "group_id"))?)?,
         compute_dtype: string_of(&get(payload, intern!(py, "compute_dtype"))?)?,
-        page_size: u32_of(&get(payload, intern!(py, "page_size"))?)?,
+    })
+}
+
+/// Decodes one cache group's share of a KV publication, preserving its key,
+/// value, scale tensor order.
+fn kv_group_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvGroupTransfer> {
+    let py = value.py();
+    let payload = value.cast::<PyDict>().ok()?;
+    let raw_tensors = get(payload, intern!(py, "tensors"))?;
+    let raw_tensors = raw_tensors.cast::<PyList>().ok()?;
+    let mut tensors = Vec::with_capacity(raw_tensors.len());
+    for tensor in raw_tensors.iter() {
+        tensors.push(tensor_transfer_from_py(&tensor)?);
+    }
+    Some(KvGroupTransfer {
+        start: u32_of(&get(payload, intern!(py, "start"))?)?,
+        page_tokens: u32_of(&get(payload, intern!(py, "page_tokens"))?)?,
+        tensors,
     })
 }
 
@@ -2088,7 +2119,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use pythonize::pythonize;
-    use uniserve_core::{BlockId, RequestId};
+    use uniserve_core::{RequestId, UnitId};
     use uniserve_worker_ipc::ClientEndpoint;
 
     use super::*;
@@ -2116,15 +2147,17 @@ mod tests {
             })
             .collect();
         KvTransfer {
-            tensors,
+            groups: vec![KvGroupTransfer {
+                start: 0,
+                page_tokens: 4,
+                tensors,
+            }],
             source,
             destination: "decoder".into(),
             base: None,
             base_extent: 0,
             published_extent: 2,
-            group_id: 0,
             compute_dtype: "bfloat16".into(),
-            page_size: 4,
         }
     }
 
@@ -2193,7 +2226,7 @@ mod tests {
             code: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
-                max_kv_pages: 1,
+                max_kv_units: 1,
                 ..Bounds::default()
             },
             inputs: Vec::new(),
@@ -2204,13 +2237,14 @@ mod tests {
         let block_tables = vec![BlockTable {
             request_pool_idx: 1,
             group_id: 0,
-            page_ids: vec![BlockId(1)],
+            start_page: 0,
+            unit_ids: vec![UnitId(1)],
             allocated_tokens: 2,
         }];
-        let new_cache_pages = vec![CachePageAllocation {
+        let new_cache_units = vec![CacheUnitAllocation {
             request_pool_idx: 1,
             group_id: 0,
-            page_ids: vec![BlockId(1)],
+            unit_ids: vec![UnitId(1)],
         }];
         let forward = uniserve_worker_ipc::ForwardBatch {
             call_indices: vec![0],
@@ -2328,7 +2362,7 @@ mod tests {
         };
         let mut token_batch = Batch::new(11, vec![admission], vec![call]);
         token_batch.block_tables = block_tables;
-        token_batch.new_cache_pages = new_cache_pages;
+        token_batch.new_cache_units = new_cache_units;
         token_batch.forward = forward;
 
         let mut media_batch = Batch::new(12, vec![media_admission], vec![media_call]);
@@ -2463,11 +2497,12 @@ mod tests {
         let expected = result_response();
 
         Python::attach(|py| {
-            // Import `uniserve_worker` from this repository's source tree, with
-            // the packages it imports from the repository environment
-            // (`.venv`), as the worker processes run. The embedded interpreter
-            // is the base installation the venv was created from, so the
-            // venv's site-packages directory is added explicitly.
+            // Import both packages from this source tree, the kernel package
+            // from below its own src directory, with the packages they import
+            // from the repository environment (`.venv`), as the worker
+            // processes run. The embedded interpreter is the base installation
+            // the venv was created from, so the venv's site-packages directory
+            // is added explicitly.
             let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
                 .canonicalize()
@@ -2483,10 +2518,12 @@ mod tests {
                 .unwrap()
                 .call_method1("addsitedir", (site_packages.to_str().unwrap(),))
                 .unwrap();
-            sys.getattr("path")
-                .unwrap()
-                .call_method1("insert", (0, repo_root.to_str().unwrap()))
-                .unwrap();
+            let sys_path = sys.getattr("path").unwrap();
+            for source in [repo_root.join("uniserve_kernels/src"), repo_root] {
+                sys_path
+                    .call_method1("insert", (0, source.to_str().unwrap()))
+                    .unwrap();
+            }
             let canonical = py
                 .import("uniserve_worker.protocol.batch")
                 .unwrap()

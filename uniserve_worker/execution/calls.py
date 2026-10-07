@@ -45,7 +45,7 @@ def require_progress(output: PendingOutput) -> RequestProgress:
 
 def execution_runtime(
     request: PendingOutput,
-    cache: tuple[int, int, int, int] | None,
+    cache: tuple[int, int, int] | None,
     *,
     flow_step: int | None = None,
     computed_len: int | None = None,
@@ -64,7 +64,7 @@ def execution_runtime(
         visible = progress.kv_visible_len
         computed = progress.kv_computed_len
     else:
-        _slot, _group, visible, _capacity = cache
+        _slot, visible, _capacity = cache
         computed = visible if computed_len is None else int(computed_len)
     return replace(
         progress,
@@ -78,19 +78,18 @@ def cache_coordinates(
     request: PendingOutput,
     *,
     tables: BlockTables | None,
-    group_id: int = 0,
-) -> tuple[int, int, int, int]:
-    """Resolve a request's KV-cache coordinates for one cache group.
+) -> tuple[int, int, int]:
+    """Resolve a request's KV-cache coordinates across its cache groups.
 
     Returns:
-        ``(slot, group_id, visible, capacity)``: the request-pool slot, the
-        cache group, the accepted visible prefix the call states (tokens),
-        and the slot's installed token capacity.
+        ``(slot, visible, capacity)``: the request-pool slot, the accepted
+        visible prefix the call states (tokens), and the token capacity
+        every installed group table of the slot covers.
 
     Raises:
         WorkerError: ``unsupported_setup`` when ``tables`` is None;
-            ``invalid_descriptor`` when the slot has no block table installed
-            for the group or the visible prefix exceeds the capacity.
+            ``invalid_descriptor`` when the slot lacks a block table of some
+            cache group or the visible prefix exceeds the capacity.
     """
     slot = int(request.request.request_pool_idx)
     # Scheduler columns may reserve the full unobserved verifier prefix. The
@@ -100,15 +99,16 @@ def cache_coordinates(
     pool = tables
     if pool is None:
         raise unsupported_setup("call requires request-to-token storage")
-    # Called only for its check that a block table is installed.
-    pool.pages(slot, group_id)
+    # Called only for its check that every group's table is installed.
+    for group in range(len(pool.groups)):
+        pool.table(slot, group)
     capacity = pool.allocated_length(slot)
 
     if visible > capacity:
         raise invalid_descriptor(
             "call visibility exceeds scheduler block table"
         )
-    return slot, int(group_id), visible, capacity
+    return slot, visible, capacity
 
 
 def call_identity(call: Call) -> CallIdentity:

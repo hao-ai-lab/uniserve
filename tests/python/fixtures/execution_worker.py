@@ -103,15 +103,20 @@ def execution_worker(
 
     worker.submit = submit_stamped
 
+    # The fixture's scheduler serves one full-attention group whose pages
+    # are single units, as the stub model's cache is.
     flow = worker.runner.image_builder
+    kv_cache = worker.info.kv_cache
+    if kv_cache is not None and (
+        len(kv_cache.groups) != 1 or kv_cache.groups[0].units_per_page != 1
+    ):
+        raise ValueError("the fixture scheduler requires one-unit pages")
     configure_physical_pool(
-        cache_pages=0
-        if worker.info.kv_cache is None
-        else worker.info.kv_cache.num_blocks,
+        cache_pages=0 if kv_cache is None else kv_cache.num_units,
         request_pool_size=worker.info.request_slots,
         block_size=block_size
-        if worker.info.kv_cache is None
-        else worker.info.kv_cache.block_size,
+        if kv_cache is None
+        else kv_cache.groups[0].page_tokens,
         commit_marker_tokens=0 if flow is None else flow.framing,
         max_cfg_branches=1 if flow is None else 3,
         latent_page_units=worker.info.latent_page_units,

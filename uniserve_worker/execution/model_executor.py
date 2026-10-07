@@ -295,7 +295,7 @@ class ModelExecutor:
         self.prefill_row_sizes: tuple[int, ...] = ()
         self.flow_captures: tuple[DiffusionShape, ...] = ()
         self.flow_cfg_branches: tuple[int, ...] = ()
-        self.decode_context_blocks = 0
+        self.table_widths: tuple[int, ...] = ()
         self.decode_predicates = None
         self.kv_cache = None
         # A standalone denoiser's component, binding and call, the request
@@ -456,6 +456,9 @@ class ModelExecutor:
                 scratch=None
                 if self._startup_complete
                 else self._module_scratch.setdefault(key[:3], Scratch()),
+                # Serving inputs carry their host sequence lengths; a call
+                # that lacks one fails rather than copying it from the device.
+                derive_host_lengths=False,
             )
             # An entry given graph devices captures a graph the first time it
             # executes each input signature during startup
@@ -1205,7 +1208,7 @@ class ModelExecutor:
         request_slots,
         max_tokens,
         latent_capacity_units,
-        decode_context_blocks,
+        table_widths,
         max_inflight,
     ):
         """Bind staged input resources and graph budgets for every capability.
@@ -1225,21 +1228,25 @@ class ModelExecutor:
             raise RuntimeError("input execution resources are already bound")
 
         self.kv_cache, self.decode_predicates = kv_cache, decode_predicates
-        self.decode_context_blocks = decode_context_blocks
+        self.table_widths = tuple(table_widths)
         self.prefill_row_sizes = DEFAULT_PREFILL_GRAPH_ROW_BUCKETS
         config = self.worker_config
         self._initialize_streams(event_slots=max_inflight + 1)
 
+        # A decode row holds at least one page of every cache group, and one
+        # prefill row at most the tokens the pool's units cover in every
+        # group.
         max_rows = min(max_calls, request_slots)
         decode_sizes = tuple(
             value
             for value in config.decode_graph_batch_sizes
-            if 0 < value <= max_rows and value < kv_cache.info.num_blocks
+            if 0 < value <= max_rows
+            and value * kv_cache.row_units < kv_cache.info.num_units
         )
         prefill_capacity = min(
             max_tokens,
             config.max_sequence_tokens,
-            (kv_cache.info.num_blocks - 1) * config.block_size,
+            kv_cache.token_capacity,
         )
         prefill_sizes = tuple(
             value
@@ -1371,6 +1378,9 @@ class ModelExecutor:
                                 else {}
                             ),
                         )
+                        # Staging supplies every host sequence length and
+                        # start page, so attention planning never copies
+                        # them from the device while serving.
                         context = ExecutionContext(
                             call.module,
                             cache=kv_cache.cache
@@ -1381,6 +1391,7 @@ class ModelExecutor:
                             attention=self.attention,
                             stream=stream,
                             groups=call.groups,
+                            derive_host_lengths=False,
                         )
                         # Text staging counts canonical tokens. Spatial codecs
                         # and vision towers expand those into different query
@@ -1442,7 +1453,7 @@ class ModelExecutor:
                 )
 
                 entry.decode_shapes, entry.prefill_shapes = decode, prefill
-                entry.decode_context_blocks = decode_context_blocks
+                entry.table_widths = self.table_widths
 
                 for kind in kinds:
                     key = (name, kind)

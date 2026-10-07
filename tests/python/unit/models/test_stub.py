@@ -30,7 +30,7 @@ def test_token_cycle_projects_selected_rows_and_writes_only_supplied_slots():
     )
     inputs = TextInput(tokens, torch.arange(10), AttentionBatch.single(batch))
     with PrefixCache(
-        model.cache_config, num_blocks=1, block_size=16, device="cpu"
+        model.cache_config, num_units=1, block_size=16, device="cpu"
     ) as cache:
         state = cache.state(next(iter(model.cache_config.layers)))
         state.key.fill_(7)

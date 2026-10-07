@@ -336,7 +336,7 @@ impl EngineConfig {
                 WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )
             .ranks,
-            block_size: 64,
+            block_size: Some(64),
             queue_depth: 2,
             max_batch_calls: DEFAULT_MAX_BATCH as u32,
             max_batch_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS as u32,

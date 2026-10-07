@@ -35,8 +35,14 @@ from uniserve.model import (
 from uniserve.nn import Linear
 from uniserve.processing import ImageProcessor
 from uniserve.quantization import QuantizedTensor
+from uniserve.runtime.prefix_cache import Planes
 from uniserve.tensors import BufferConfig
-from uniserve_worker.bootstrap.cache import cache_info, resize_cache
+from uniserve_worker.bootstrap.cache import (
+    cache_info,
+    plan_cache,
+    resident_width,
+    resize_cache,
+)
 from uniserve_worker.bootstrap.capacity import (
     ArenaCapacity,
     call_window,
@@ -84,10 +90,11 @@ from uniserve_worker.protocol.call import CALL_KINDS, CallKind
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
     ComponentInfo,
+    KVCacheInfo,
     VideoDenoiserInfo,
     WorkerInfo,
 )
-from uniserve_worker.storage.block_tables import BlockTables
+from uniserve_worker.storage.block_tables import BlockTables, GroupShape
 from uniserve_worker.storage.cache_imports import cache_transfer_workspace_bytes
 from uniserve_worker.storage.decode_state import DecodeState
 
@@ -331,14 +338,22 @@ def _token_worker_layout(
         else 0
     )
 
-    # The one-page cache description supplies the per-token geometry;
-    # ``resize_cache`` attaches the granted page count at the end.
+    # A minimal cache description supplies the unit geometry;
+    # ``resize_cache`` attaches the granted unit count at the end. The
+    # minimal pool holds the unit-zero sentinel and one page of the group
+    # whose page spans the most units.
     text = capability(model, CausalLM)
     owns_kv = text is not None
-    cache = (
-        None if text is None else cache_info(text, worker_config, num_blocks=1)
-    )
-    bytes_per_token = 0 if cache is None else cache.bytes_per_token
+    planes: Planes | None = None
+    cache: KVCacheInfo | None = None
+    if text is not None:
+        planes = plan_cache(text, worker_config)
+        cache = cache_info(
+            text,
+            worker_config,
+            num_units=1 + max(group.units_per_page for group in planes.groups),
+        )
+    unit_bytes = 0 if cache is None else cache.unit_bytes
 
     flow = image_builder(model)
     plan = latent_pool_plan(model, worker_config) if flow is not None else None
@@ -389,16 +404,16 @@ def _token_worker_layout(
         "latent_width": latent_width,
         "max_latent_feature_bytes": max_latent_feature_bytes,
         "max_vision_feature_bytes": max_vision_feature_bytes,
-        "bytes_per_token": bytes_per_token,
+        "unit_bytes": unit_bytes,
     }
 
-    # A provisional arena without KV pages supplies the device-product bytes,
-    # which do not depend on the page count; the final arena below is
-    # recomputed with the granted pages, which bound its transfer bytes.
+    # A provisional arena without KV units supplies the device-product bytes,
+    # which do not depend on the unit count; the final arena below is
+    # recomputed with the granted units, which bound its transfer bytes.
     arena = model_arena_capacity(
         model,
         worker_config,
-        num_blocks=0,
+        num_units=0,
         bindings=None,
         state_buffers=None,
         **arena_args,
@@ -427,7 +442,11 @@ def _token_worker_layout(
     )
 
     if text is not None:
-        assert cache is not None and input_config is not None
+        assert (
+            cache is not None
+            and planes is not None
+            and input_config is not None
+        )
         from uniserve_worker.config.execution import (
             DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
         )
@@ -495,15 +514,23 @@ def _token_worker_layout(
                         field.nbytes for field in allocation.buffers().values()
                     )
 
-        # Block tables (reserved here for one KV group), decode state and the
-        # KV import workspaces are charged to the primary device and shared
-        # by every lane. The workspaces are sized by the same unresolved-call
-        # window the worker gives ``CacheImports``.
+        # Block tables, decode state and the KV import workspaces are charged
+        # to the primary device and shared by every lane. The workspaces are
+        # sized by the same unresolved-call window the worker gives
+        # ``CacheImports``, for the largest page of any group.
         schemas = (
             BlockTables.buffers(
-                group_count=1,
+                groups=tuple(
+                    GroupShape(
+                        group.page_tokens, group.units_per_page, group.window
+                    )
+                    for group in planes.groups
+                ),
                 request_pool_size=worker_config.max_request_pool_size,
-                max_blocks_per_request=input_config.max_blocks_per_row,
+                width=resident_width(
+                    planes,
+                    max_sequence_tokens=worker_config.max_sequence_tokens,
+                ),
             ),
             DecodeState.buffers(
                 request_pool_size=worker_config.max_request_pool_size,
@@ -515,43 +542,49 @@ def _token_worker_layout(
         fixed_bytes[worker_config.device] += sum(
             field.nbytes for schema in schemas for field in schema.values()
         ) + cache_transfer_workspace_bytes(
-            num_layers=int(cache.num_layers),
-            page_size=int(worker_config.block_size),
-            num_kv_heads=int(cache.num_kv_heads),
-            head_dim=int(cache.head_dim),
+            page_elements=max(
+                group.page_tokens
+                * len(group.layers)
+                * group.num_kv_heads
+                * group.head_dim
+                for group in planes.groups
+            ),
+            page_scales=max(
+                group.page_tokens * len(group.layers) * group.num_kv_heads
+                for group in planes.groups
+            ),
             capacity=unresolved_window,
         )
 
-        resident_copies, co_resident_blocks = _kv_residency_shape(
+        page_shapes = tuple(
+            (group.page_tokens, group.units_per_page) for group in planes.groups
+        )
+        resident_copies, co_resident_units = _kv_residency_shape(
             worker_config,
-            bytes_per_token=bytes_per_token,
+            page_shapes=page_shapes,
+            unit_bytes=unit_bytes,
             co_resident_bytes=fixed_bytes[worker_config.device],
         )
         capacity = derive_runtime_kv_capacity(
-            block_size=int(worker_config.block_size),
+            pages=page_shapes,
             kv_token_capacity=worker_config.kv_token_capacity,
-            bytes_per_token=bytes_per_token,
+            unit_bytes=unit_bytes,
             device=worker_config.device,
             available_bytes=worker_config.pool_storage_bytes,
             resident_copies=resident_copies,
-            co_resident_blocks=co_resident_blocks,
+            co_resident_units=co_resident_units,
         )
 
-        # Ranks sharing one logical pool must agree on its page count; the
+        # Ranks sharing one logical pool must agree on its unit count; the
         # minimum keeps every member within its own storage grant.
         if capacity_group is not None and capacity_group.size > 1:
-            pages = torch.tensor(
-                capacity.num_blocks,
+            units = torch.tensor(
+                capacity.num_units,
                 dtype=torch.int64,
                 device=capacity_group.device,
             )
-            capacity_group.all_reduce(pages, op="min")
-            blocks = int(pages.item())
-            capacity = replace(
-                capacity,
-                num_blocks=blocks,
-                token_capacity=blocks * capacity.block_size,
-            )
+            capacity_group.all_reduce(units, op="min")
+            capacity = replace(capacity, num_units=int(units.item()))
 
     # ``build_worker_layout`` replaces the supported calls and media routes
     # with the placement's narrowed values.
@@ -570,7 +603,7 @@ def _token_worker_layout(
         max_batch_tokens=int(worker_config.max_batch_tokens),
         request_slots=int(worker_config.max_request_pool_size),
         kv_cache=(
-            resize_cache(cache, capacity.num_blocks)
+            resize_cache(cache, capacity.num_units)
             if capacity is not None and cache is not None
             else None
         ),
@@ -595,7 +628,7 @@ def _token_worker_layout(
         worker_config,
         bindings=None,
         state_buffers=None,
-        num_blocks=0 if capacity is None else capacity.num_blocks,
+        num_units=0 if capacity is None else capacity.num_units,
         **arena_args,
     )
     return WorkerLayout(
@@ -706,14 +739,14 @@ def _request_tensor_worker_layout(
         state_buffers=state_buffers,
         queue_depth=depth,
         completion_payload_bytes=completion_payload_bytes,
-        num_blocks=0,
+        num_units=0,
         request_pool_size=slots,
         num_latent_pages=0,
         latent_page_units=0,
         latent_width=0,
         max_latent_feature_bytes=0,
         max_vision_feature_bytes=0,
-        bytes_per_token=0,
+        unit_bytes=0,
     )
 
     # A host rank is one codec slot, the same on each of a host worker's
@@ -755,31 +788,31 @@ def _model_dtype_bytes(dtype: str) -> int:
 def _kv_residency_shape(
     worker_config: WorkerConfig,
     *,
-    bytes_per_token: int,
+    page_shapes: tuple[tuple[int, int], ...],
+    unit_bytes: int,
     co_resident_bytes: int,
 ) -> tuple[int, int]:
     """Describe the single KV pool and co-resident fixed allocations.
 
     Returns:
-        ``(resident_copies, co_resident_blocks)`` for
-        ``derive_runtime_kv_capacity``: one resident KV pool, and the graph
-        padding pages plus the graph storage budget and ``co_resident_bytes``,
-        each of the latter rounded up to whole pages of ``bytes_per_token``
-        per token.
+        ``(resident_copies, co_resident_units)`` for
+        ``derive_runtime_kv_capacity``: one resident KV pool, and the units
+        of the graph padding pages of every group plus the graph storage
+        budget and ``co_resident_bytes``, each of the latter rounded up to
+        whole units.
     """
-    block_size = int(worker_config.block_size)
-    padding_blocks = graph_padding_block_count(block_size)
+    padding_units = sum(
+        graph_padding_block_count(page_tokens) * units_per_page
+        for page_tokens, units_per_page in page_shapes
+    )
     # Captured executables are held for the worker's lifetime, so they occupy
     # the same static budget as the KV pools and are reserved before the
     # request pool is sized.
-    graph_blocks = ceil_div(
+    size = max(1, int(unit_bytes))
+    graph_units = ceil_div(
         graph_storage_budget_bytes(device_total_bytes(worker_config.device)),
-        block_size * max(1, int(bytes_per_token)),
+        size,
     )
+    fixed_owner_units = ceil_div(max(0, int(co_resident_bytes)), size)
 
-    fixed_owner_blocks = ceil_div(
-        max(0, int(co_resident_bytes)),
-        block_size * max(1, int(bytes_per_token)),
-    )
-
-    return 1, padding_blocks + graph_blocks + fixed_owner_blocks
+    return 1, padding_units + graph_units + fixed_owner_units

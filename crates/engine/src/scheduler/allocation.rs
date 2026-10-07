@@ -25,8 +25,8 @@ pub(super) struct Storage {
     /// the runtime's `request_slots`.
     pub(super) request_pool: RequestPool,
     pub(super) latent_pool: LatentPool,
-    /// KV blocks reserved by admitted worst-case requests.
-    pub(super) reserved_blocks: usize,
+    /// KV units reserved by admitted worst-case requests.
+    pub(super) reserved_units: usize,
     /// Byte spans of persistent products in the runtime's buffer pool.
     pub(super) buffer_pool: BufferPool,
     /// Per-worker row and buffer address spaces of the media workers.
@@ -91,14 +91,16 @@ impl Storage {
         self.cache.as_ref()
     }
 
-    pub(super) fn free_blocks(&self) -> usize {
+    /// Returns the queued KV units, including cached ones allocation evicts.
+    pub(super) fn free_units(&self) -> usize {
         self.cache
             .as_ref()
-            .map_or(0, |cache| cache.block_pool.free_request_pages())
+            .map_or(0, |cache| cache.block_pool.free_units())
     }
 
-    pub(super) fn usable_blocks(&self) -> usize {
-        self.cache.as_ref().map_or(0, |cache| cache.usable_blocks)
+    /// Returns the KV units the scheduler may allocate.
+    pub(super) fn usable_units(&self) -> usize {
+        self.cache.as_ref().map_or(0, KVCacheManager::usable_units)
     }
 
     /// Transfer the existing Tensor allocation to encoder-cache retention.
@@ -185,11 +187,6 @@ impl RequestAllocations {
         &self.kv.tables
     }
 
-    /// Returns mutable access to the request block tables.
-    pub(super) fn block_tables_mut(&mut self) -> &mut Vec<BlockTable> {
-        &mut self.kv.tables
-    }
-
     /// Takes ownership of the request buffer allocation.
     pub(super) fn take_buffer(&mut self, id: BufferId) -> Option<BufferSpan> {
         self.buffers.remove(&id)
@@ -197,7 +194,7 @@ impl RequestAllocations {
 
     /// Releases each resource through its owning pool.
     ///
-    /// KV pages need no explicit release: each page in `kv` is a counted
+    /// KV units need no explicit release: each page in `kv` is a counted
     /// reference, dropped with `self`.
     pub(super) fn free(self, storage: &mut Storage) {
         for buffer in self.buffers.into_values() {

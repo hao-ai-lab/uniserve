@@ -30,32 +30,32 @@ pub struct GeneralStats {
     pub in_flight: AtomicUsize,
 }
 
-/// KV block-cache observability.
+/// KV unit-pool observability.
 #[derive(Default)]
 pub struct KvCacheStats {
-    /// Physical KV blocks currently available for allocation.
-    pub free_blocks: AtomicUsize,
-    /// Usable physical KV blocks managed by the scheduler, set once at
+    /// Physical KV units currently available for allocation, including
+    /// cached ones allocation evicts.
+    pub free_units: AtomicUsize,
+    /// Usable physical KV units managed by the scheduler, set once at
     /// construction.
-    pub num_blocks: AtomicUsize,
-    /// Cumulative KV blocks evicted from the prefix cache.
-    pub blocks_evicted: AtomicU64,
-    /// Cumulative KV blocks inserted into the prefix cache.
-    pub blocks_stored: AtomicU64,
-    /// Current number of reusable prefix-cache blocks.
-    pub cached_blocks: AtomicUsize,
+    pub num_units: AtomicUsize,
+    /// Cumulative pages evicted from the prefix cache.
+    pub pages_evicted: AtomicU64,
+    /// Cumulative pages inserted into the prefix cache.
+    pub pages_stored: AtomicU64,
+    /// Current number of reusable prefix-cache pages.
+    pub cached_pages: AtomicUsize,
 }
 
 /// Prefix-cache hit-rate counters, recorded by `acquire_cached_prefix` when
 /// admission commits a token request.
 #[derive(Default)]
 pub struct PrefixStats {
-    /// Cumulative prompt blocks eligible for prefix reuse. The last block of
-    /// a block-aligned prompt is excluded because it is never reused.
-    pub queries: AtomicU64,
-    /// Cumulative prompt blocks matched in the prefix cache.
-    pub hits: AtomicU64,
-    /// Cumulative prompt tokens reused from matched prefix blocks.
+    /// Cumulative prompt tokens eligible for prefix reuse: per request, the
+    /// longest multiple of the largest page size that leaves one prompt token
+    /// to compute.
+    pub query_tokens: AtomicU64,
+    /// Cumulative prompt tokens reused from the prefix cache.
     pub hit_tokens: AtomicU64,
 }
 

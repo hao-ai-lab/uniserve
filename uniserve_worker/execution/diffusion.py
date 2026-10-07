@@ -182,8 +182,7 @@ def prepare_latent(
         call.request_key,
         conditioning,
         request_pool_idx=request.request.request_pool_idx,
-        group_id=cache[1],
-        visible_length=cache[2],
+        visible_length=cache[1],
         publication=publication
         if isinstance(publication, KvTransfer)
         else None,
@@ -322,8 +321,7 @@ def initialize(
         call.request_key,
         conditioning,
         request_pool_idx=request.request.request_pool_idx,
-        group_id=cache[1],
-        visible_length=cache[2],
+        visible_length=cache[1],
         publication=publication
         if isinstance(publication, KvTransfer)
         else None,
@@ -478,9 +476,10 @@ def prepare_step(
                     "flow prefixes require request page tables"
                 )
             capacity = page_tables.allocated_length(slot)
-            # Called only for its check, which raises when the slot has no
-            # block table installed for cache group 0.
-            page_tables.pages(slot, 0)
+            # Called only for its check, which raises when the slot lacks the
+            # block table of some cache group.
+            for group in range(len(page_tables.groups)):
+                page_tables.table(slot, group)
 
             # A sibling forward in this same submission may already write the
             # prefix; otherwise the branch row carries its own prefix extent.
@@ -495,11 +494,10 @@ def prepare_step(
                 for candidate in descriptors[: -len(branches)]
             )
 
-            # entry = (pool slot, KV group, materialized prefix length, token
+            # entry = (pool slot, materialized prefix length, token
             # capacity).
             entry = (
                 slot,
-                0,
                 0
                 if has_prefix_forward
                 else (
@@ -509,10 +507,10 @@ def prepare_step(
                 capacity,
             )
 
-        prefix_length = kv.cache[2] if copy_conditioning else len(prefix)
-        if prefix_length > entry[3]:
+        prefix_length = kv.cache[1] if copy_conditioning else len(prefix)
+        if prefix_length > entry[2]:
             raise invalid_descriptor("flow prefix exceeds scheduler params")
-        if entry[2] not in {0, prefix_length}:
+        if entry[1] not in {0, prefix_length}:
             raise invalid_descriptor(
                 "flow branch prefix disagrees with its initialized physical "
                 "state"
@@ -520,7 +518,7 @@ def prepare_step(
 
         # ``forward.prepare_diffusion_step`` forwards the prefill rows and
         # advances each entry's materialized length by the rows it wrote.
-        initialize_prefix = entry[2] == 0 and prefix_length > 0
+        initialize_prefix = entry[1] == 0 and prefix_length > 0
         entries[branch] = entry
         if initialize_prefix and prefix:
             prefix_rows.append(prefix_row(prefix, entry))
@@ -706,23 +704,22 @@ def initial_latent(
 
 def prefix_row(
     tokens: tuple[int, ...],
-    entry: tuple[int, int, int, int],
+    entry: tuple[int, int, int],
 ) -> TokenRow:
     """Build the prefill row that writes one guidance branch's KV prefix.
 
-    ``entry`` is the branch's ``(slot, group, materialized prefix length,
-    token capacity)`` coordinate; ``tokens`` are written causally from the
+    ``entry`` is the branch's ``(slot, materialized prefix length, token
+    capacity)`` coordinate; ``tokens`` are written causally from the
     materialized length onward, selecting hidden states rather than logits.
     """
-    positions = torch.arange(entry[2], entry[2] + len(tokens), dtype=torch.long)
+    positions = torch.arange(entry[1], entry[1] + len(tokens), dtype=torch.long)
     return TokenRow(
         forward_mode=ForwardMode.PREFILL,
         token_ids=torch.tensor(tokens, dtype=torch.long),
         positions=positions,
         selection=TokenSelection.HIDDEN,
         request_pool_idx=entry[0],
-        seq_len=entry[2],
-        group_id=entry[1],
+        seq_len=entry[1],
         write_kv=True,
         causal=True,
     )
@@ -756,7 +753,7 @@ def flow_rows(
     for branch in branches:
         entry = kv.entries[branch]
         temporal = (
-            conditioning_position if branch is Branch.CONDITIONED else entry[2]
+            conditioning_position if branch is Branch.CONDITIONED else entry[1]
         )
         if temporal not in kv.positions:
             kv.positions[temporal] = builder.positions(
@@ -772,8 +769,7 @@ def flow_rows(
                 image_height=size.height,
                 image_width=size.width,
                 request_pool_idx=entry[0],
-                seq_len=entry[2],
-                group_id=entry[1],
+                seq_len=entry[1],
                 write_kv=False,
                 causal=False,
             )

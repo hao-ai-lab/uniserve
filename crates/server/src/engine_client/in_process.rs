@@ -79,7 +79,6 @@ impl EngineClient {
         ));
         {
             let stats = Arc::clone(core.stats());
-            let block_size = core.info().kv_block_size();
             let model_name = core.model_name().to_string();
             let guard = Arc::downgrade(&core);
             tokio::spawn(async move {
@@ -93,7 +92,7 @@ impl EngineClient {
                     if guard.upgrade().is_none() {
                         return;
                     }
-                    let snapshot = reporter.snapshot(&stats, block_size);
+                    let snapshot = reporter.snapshot(&stats);
                     crate::engine_client::metrics::record_scheduler_stats(
                         &uniserve_observability::METRICS.scheduler,
                         &model_name,
@@ -145,9 +144,9 @@ impl EngineClient {
         self.core.model_dtype()
     }
 
-    /// Returns aggregate paged-KV capacity across worker pools.
-    pub fn total_num_gpu_blocks(&self) -> u64 {
-        self.core.info().kv_num_blocks() as u64
+    /// Returns the allocatable paged-KV units the scheduler plans against.
+    pub fn total_kv_units(&self) -> u64 {
+        u64::from(self.core.info().kv_usable_units())
     }
 
     /// Returns whether the engine can accept requests.

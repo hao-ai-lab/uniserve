@@ -10,7 +10,7 @@
 use super::WorkerId;
 use std::collections::BTreeMap;
 use uniserve_worker_ipc::{
-    Batch, BatchCommand, BlockTable, BufferAllocation, CachePageAllocation, Call, DecodeRange,
+    Batch, BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
     ForwardBatch, LatentParams, NewRequest, RequestKey, TensorPublication,
 };
 
@@ -26,9 +26,9 @@ pub struct RequestPlacement {
     /// space. Unset placements retain the admission's canonical row;
     /// `WorkerExecutor` applies the override to the `Start` it sends the worker.
     pub request_pool_idx: Option<u32>,
-    /// KV tables and newly acquired pages used by this computation.
+    /// KV tables and newly acquired units used by this computation.
     pub block_tables: Vec<BlockTable>,
-    pub new_cache_pages: Vec<CachePageAllocation>,
+    pub new_cache_units: Vec<CacheUnitAllocation>,
     /// Rows use a local call index until gathered into the physical batch:
     /// `ExecutionBatch::validate` requires every row's index to be zero, and
     /// `into_protocol` offsets it by the call's position.
@@ -173,8 +173,8 @@ impl ExecutionBatch {
             for table in &placement.block_tables {
                 table.validate()?;
             }
-            for pages in &placement.new_cache_pages {
-                pages.validate()?;
+            for units in &placement.new_cache_units {
+                units.validate()?;
             }
             if let Some(latent) = &placement.latent {
                 latent.validate()?;
@@ -247,7 +247,7 @@ impl ExecutionBatch {
             kv_inputs,
         } = self;
         let mut block_tables = Vec::new();
-        let mut new_cache_pages = Vec::new();
+        let mut new_cache_units = Vec::new();
         let mut forward = ForwardBatch::default();
         let mut latent_params = Vec::new();
         let mut decode_ranges = Vec::new();
@@ -256,7 +256,7 @@ impl ExecutionBatch {
 
         for (call_index, (call, placement)) in requests.into_iter().enumerate() {
             block_tables.extend(placement.block_tables);
-            new_cache_pages.extend(placement.new_cache_pages);
+            new_cache_units.extend(placement.new_cache_units);
             forward.append(placement.forward, call_index as u32)?;
             latent_params.extend(placement.latent);
             decode_ranges.extend(placement.decode);
@@ -269,7 +269,7 @@ impl ExecutionBatch {
             collective_seq,
             calls,
             block_tables,
-            new_cache_pages,
+            new_cache_units,
             forward,
             latent_params,
             decode_ranges,

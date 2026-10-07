@@ -177,7 +177,9 @@ def test_worker_info_reports_capabilities_and_cache_limits():
     assert ForwardMode.PREFILL in info.supported_calls
     assert MediaCall.DENOISING in info.supported_calls
     assert info.kv_cache is not None
-    assert info.kv_cache.num_layers == len(TEST_MODEL.cache_config.layers)
+    assert sum(len(group.layer_ids) for group in info.kv_cache.groups) == len(
+        TEST_MODEL.cache_config.layers
+    )
     assert info.model_name == "test-model"
 
 
@@ -231,14 +233,14 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
         worker_config,
         queue_depth=1,
         completion_payload_bytes=1024,
-        num_blocks=2,
+        num_units=2,
         request_pool_size=4,
         num_latent_pages=5,
         latent_page_units=4,
         latent_width=1024,
         max_latent_feature_bytes=1,
         max_vision_feature_bytes=1,
-        bytes_per_token=1,
+        unit_bytes=1,
     )
     expected = latent_trajectory_bytes(1024, 1024, 4)
     assert arena.transfer_bytes == expected * arena.transfer_tickets

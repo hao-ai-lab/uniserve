@@ -23,7 +23,7 @@ from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.protocol.batch import (
     BlockTable,
-    CachePageAllocation,
+    CacheUnitAllocation,
     Finish,
     Free,
     NewRequest,
@@ -48,6 +48,23 @@ from uniserve_worker.transport.endpoint import locator_digest
 from uniserve_worker.transport.shared_storage import open_shared_storage
 
 pytestmark = pytest.mark.integration
+
+
+def _map_locations(publication: KvTransfer, locate) -> KvTransfer:
+    """Replace every published tensor's locations, group by group."""
+    return replace(
+        publication,
+        groups=tuple(
+            replace(
+                group,
+                tensors=tuple(
+                    replace(tensor, locations=locate(tensor))
+                    for tensor in group.tensors
+                ),
+            )
+            for group in publication.groups
+        ),
+    )
 
 
 def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
@@ -151,15 +168,15 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
             # The incoming publication's bytes are real, but the test holds
             # their readiness, so storage retirement and input completion
             # remain distinct.
-            tensors = []
-            for tensor in source.tensors:
+            def gate(tensor):
                 locations = []
                 for locator in tensor.locations:
                     gated, storage = _gated_copy(locator)
                     gated_segments.append(storage)
                     locations.append(gated)
-                tensors.append(replace(tensor, locations=tuple(locations)))
-            incoming_payload = replace(source, tensors=tuple(tensors))
+                return tuple(locations)
+
+            incoming_payload = _map_locations(source, gate)
 
             # An external consumer holds every segment of the worker's own
             # publication unacknowledged across the request's Finish.
@@ -251,7 +268,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     report = BatchOutput.from_mapping(response["result"])
                     assert report.completions[0].status is CallStatus.OK
                     assert report.completions[0].kv_visible_len == 2
-                    for layer in worker.kv_cache.layers:
+                    for layer in worker.kv_cache.cache.config.layers:
                         expected = producer.kv_cache.cache.state(layer).read(
                             (1,), start=0, length=2
                         )
@@ -312,9 +329,9 @@ def _installation_allocation(call: Call, length: int) -> dict[str, object]:
     request_pool_idx = int(call.request_key.request_id) + 1
     return {
         "block_tables": (
-            BlockTable(request_pool_idx, 0, (1,), max(1, int(length))),
+            BlockTable(request_pool_idx, 0, 0, (1,), max(1, int(length))),
         ),
-        "new_cache_pages": (CachePageAllocation(request_pool_idx, 0, (1,)),),
+        "new_cache_units": (CacheUnitAllocation(request_pool_idx, 0, (1,)),),
     }
 
 
@@ -529,7 +546,9 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             batch_id=5,
             calls=(repeated_install,),
             kv_inputs=(repeated.completions[0].kv_output,),
-            block_tables=(BlockTable(admission.request_pool_idx, 0, (1,), 2),),
+            block_tables=(
+                BlockTable(admission.request_pool_idx, 0, 0, (1,), 2),
+            ),
         )
         repeated_prepared = consumer.submit(repeated_batch)
         repeated_prepared = finalized_report(consumer, repeated_prepared)
@@ -619,11 +638,12 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
                 first.transport, name="uniserve-missing-transfer-segment"
             ),
         )
-        broken = replace(
+        broken = _map_locations(
             snapshot,
-            tensors=(
-                replace(snapshot.tensors[0], locations=(missing,)),
-                *snapshot.tensors[1:],
+            lambda tensor: (
+                (missing,)
+                if tensor is snapshot.tensors[0]
+                else tensor.locations
             ),
         )
         payload = broken

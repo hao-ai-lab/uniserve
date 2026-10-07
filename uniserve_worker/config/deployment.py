@@ -555,7 +555,6 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
             option.
     """
     positive_fields = {
-        "--block-size": namespace.block_size,
         "--max-batch-calls": namespace.max_batch_calls,
         "--max-batch-tokens": namespace.max_batch_tokens,
         "--queue-depth": namespace.queue_depth,

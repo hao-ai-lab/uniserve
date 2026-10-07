@@ -413,10 +413,10 @@ def state_outcome(
     cache = calls.cache_coordinates(request, tables=request_tables)
     selected = request.token.runtime_cache_length
     if selected is None:
-        selected = cache[2]
+        selected = cache[1]
     if not isinstance(selected, int):
         raise RuntimeError("visual state completion has a dynamic KV length")
-    cache = (cache[0], cache[1], selected, cache[3])
+    cache = (cache[0], selected, cache[2])
 
     request.status = CallStatus.OK
     request.progress = calls.execution_runtime(request, cache)
@@ -590,8 +590,7 @@ def vision_state_row(
         if logits
         else TokenSelection.HIDDEN,
         request_pool_idx=cache[0],
-        seq_len=cache[2],
-        group_id=cache[1],
+        seq_len=cache[1],
         write_kv=True,
         causal=False,
     )
@@ -731,8 +730,7 @@ def latent_state_row(
         image_height=height,
         image_width=width,
         request_pool_idx=cache[0],
-        seq_len=cache[2],
-        group_id=cache[1],
+        seq_len=cache[1],
         write_kv=True,
         causal=False,
     )
