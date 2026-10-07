@@ -202,6 +202,12 @@ The engine may queue a successor before its predecessor completes. Device contin
 
 ## Prepared execution
 
+`ExecutionContext` owns numerical bindings and workspace lifetimes in Rust, for both direct Python calls and serving. `prepare` replaces its capacity and prepares attention, matrix multiplication, MoE and VSA call sites. Python supplies tensor operations and backend plans. A failed preparation releases partial bindings and views; the context can be prepared again. Stream communicators and registered windows belong to the borrowed stream and survive context replacement.
+
+`TensorBuffers` retains contiguous tensor backing and symmetric peer mappings. Its numerical views are compact prefixes at the requested shape, rather than strided rectangular crops. `Scratch` shares transient buffers by operator role between calls serialized on one stream. Capacity growth happens outside capture and retains earlier backing for existing graphs. Explicitly supplied buffers and scratch remain caller-owned; close them after all borrowing contexts and graphs retire. Without supplied scratch, a context owns and releases its private scratch.
+
+Activation installs call-site bindings, transfer scopes and the borrowed stream for an ordinary model call, and restores the enclosing bindings afterwards. Attention planning derives missing host lengths only when `derive_host_lengths=True`; serving supplies the mirrors and disables that synchronizing copy. Graph replay can use device lengths without rebuilding a host launch plan when its backend supports that execution mode. Retirement queries outstanding streams without waiting; an aborted context retains its resources until process exit.
+
 Startup prepares bounded input storage and captures the configured prefill, decode, canvas and image-denoising shapes. Each call copies its inputs into the retained buffers and selects a graph that holds its rows. Padding carries no request progress. Once prefill, decode or canvas graph preparation is sealed, a call outside its captured capacity is rejected. Graphs, buffers and captured numerical plans are owned by their execution context.
 
 Canvas generation captures the numerical pass, vocabulary projection, sampler and state commit together. Readout graphs evaluate the shared canvas prefix and gather only the answer positions for the final projection. A readout tail that exchanges tokens with expert peers executes once at the agreed exchange capacity, keeping all peers on the same collective sequence.

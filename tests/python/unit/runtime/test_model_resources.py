@@ -85,6 +85,46 @@ def test_tensor_capacity_covers_packed_selections_that_move_between_ranks():
         )
 
 
+def test_preparation_failure_releases_views_and_preserves_borrowed_buffers():
+    from uniserve.runtime import ExecutionContext, TensorBuffers
+
+    class Model(torch.nn.Module):
+        def constant_buffers(self, size):
+            return {"scale": BufferConfig((size,), torch.float32)}
+
+        def prepare_constants(self, size, *, out):
+            if size == 0:
+                raise ValueError("scale requires at least one value")
+            out["scale"].fill_(size)
+
+        def forward(self, values, *, scale):
+            return values * scale
+
+    model = Model()
+    fields = model.constant_buffers(4)
+    with TensorBuffers.allocate(fields, device="cpu") as buffers:
+        with ExecutionContext(model) as context:
+            context.prepare(4, constants=buffers)
+            torch.testing.assert_close(
+                model(torch.ones(4), **context.constants), torch.full((4,), 4.0)
+            )
+
+            with pytest.raises(ValueError, match="at least one value"):
+                context.prepare(0, constants=buffers)
+            assert not context.constants
+
+            # Failed preparation leaves the context reusable. Replacing its
+            # borrowed views must not close the caller's buffer owner.
+            context.prepare(2, constants=buffers)
+            torch.testing.assert_close(
+                model(torch.ones(2), **context.constants), torch.full((2,), 2.0)
+            )
+
+        torch.testing.assert_close(
+            buffers.view(fields)["scale"], torch.tensor([2.0, 2.0, 4.0, 4.0])
+        )
+
+
 def test_closed_request_storage_rejects_admission_and_borrowing():
     from tests.python.fixtures.depth_one import ar_params
     from uniserve_worker.execution.request import RequestPool

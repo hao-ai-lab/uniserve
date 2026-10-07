@@ -4,6 +4,8 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::worker::execution_context::ExecutionContext;
+
 use super::super::execution::close_all;
 use super::super::host::with_context;
 
@@ -116,7 +118,7 @@ impl Capture {
 
 pub(super) fn run(
     sequence: &Bound<'_, Capture>,
-    context: &Bound<'_, PyAny>,
+    context: &Bound<'_, ExecutionContext>,
     call: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let py = context.py();
@@ -126,11 +128,7 @@ pub(super) fn run(
         let result = with_context(
             &py.import("torch.cuda")?
                 .call_method1("stream", (&computation,))?,
-            || {
-                with_context(&context.call_method0("activate")?, || {
-                    call.call0().map(Bound::unbind)
-                })
-            },
+            || ExecutionContext::with_active(context, || call.call0().map(Bound::unbind)),
         );
         let ended = sequence.borrow_mut().end(py);
         ended?;

@@ -10,6 +10,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 
+use super::execution_context::ExecutionContext;
 use super::host::with_context;
 use super::stream::CUDAStream;
 use capture::Capture;
@@ -28,7 +29,7 @@ pub(crate) struct CUDAGraph {
 }
 
 struct Resources {
-    context: Py<PyAny>,
+    context: Py<ExecutionContext>,
     pools: Py<PyDict>,
     computation: Py<PyAny>,
     capture_stream: Py<PyAny>,
@@ -59,12 +60,11 @@ impl CUDAGraph {
     #[pyo3(signature = (*, context, pools=None))]
     pub(super) fn new(
         py: Python<'_>,
-        context: Py<PyAny>,
+        context: Py<ExecutionContext>,
         pools: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let numerical = context.bind(py);
-        numerical.call_method0("_open")?;
-        let device = numerical.getattr("_device")?;
+        let device = numerical.borrow().device(py)?.into_bound(py);
         if device.getattr("type")?.extract::<String>()? != "cuda" {
             return Err(PyValueError::new_err(
                 "CUDA graph execution requires a CUDA module",
@@ -78,7 +78,11 @@ impl CUDAGraph {
                 .cast_into::<PyDict>()?,
             None => PyDict::new(py),
         };
-        let stream = numerical.getattr("stream")?;
+        let stream = numerical
+            .borrow()
+            .stream(py)
+            .unwrap_or_else(|| py.None())
+            .into_bound(py);
         let (computation, owner) = if stream.is_none() {
             let options = PyDict::new(py);
             options.set_item("device", &device)?;
@@ -87,8 +91,10 @@ impl CUDAGraph {
                 .getattr("Stream")?
                 .call((), Some(&options))?;
             numerical
-                .getattr("_graph_streams")?
-                .call_method1("add", (&computation,))?;
+                .borrow()
+                .graph_streams(py)?
+                .bind(py)
+                .add(&computation)?;
             (computation, py.None())
         } else {
             (
@@ -116,7 +122,7 @@ impl CUDAGraph {
     }
 
     #[getter]
-    pub(super) fn context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub(super) fn context(&self, py: Python<'_>) -> PyResult<Py<ExecutionContext>> {
         Ok(self.resources()?.context.clone_ref(py))
     }
 
@@ -139,8 +145,7 @@ impl CUDAGraph {
             ));
         }
         let context = resources.context.bind(py);
-        context.call_method0("_open")?;
-        let device = context.getattr("_device")?;
+        let device = context.borrow().device(py)?.into_bound(py);
         let pool = resources.pools.bind(py).get_item(&device)?;
         let pool = pool
             .map(|pool| {
@@ -174,9 +179,7 @@ impl CUDAGraph {
             let restored = restore
                 .as_ref()
                 .map(|restore| {
-                    with_context(&context.call_method0("activate")?, || {
-                        restore.call0(py).map(drop)
-                    })
+                    ExecutionContext::with_active(context, || restore.call0(py).map(drop))
                 })
                 .transpose();
 
@@ -219,11 +222,8 @@ impl CUDAGraph {
             .as_ref()
             .ok_or_else(|| CUDAGraphError::new_err("replay requires an open captured graph"))?;
         let context = resources.context.bind(py);
-        context.call_method0("_open")?;
-        with_context(&context.call_method0("activate")?, || {
-            captured.sequence.borrow(py).replay(py)
-        })
-        .map_err(|error| failure(py, format!("CUDA graph replay failed: {error}"), error))?;
+        ExecutionContext::with_active(context, || captured.sequence.borrow(py).replay(py))
+            .map_err(|error| failure(py, format!("CUDA graph replay failed: {error}"), error))?;
         Ok(captured.output.clone_ref(py))
     }
 
@@ -324,11 +324,7 @@ impl Resources {
     fn idle(&self, py: Python<'_>) -> bool {
         // A context without a dedicated stream replays on its caller's current
         // stream. The context also accounts for cross-device numerical copies.
-        let context_idle = self
-            .context
-            .call_method0(py, "_idle")
-            .and_then(|value| value.extract(py))
-            .unwrap_or(false);
+        let context_idle = self.context.borrow(py).idle(py).unwrap_or(false);
         context_idle
             && [&self.computation, &self.capture_stream]
                 .iter()
@@ -347,9 +343,10 @@ impl Resources {
         self.captured = None;
         self.pools.bind(py).clear();
         self.context
+            .borrow(py)
+            .graph_streams(py)?
             .bind(py)
-            .getattr("_graph_streams")?
-            .call_method1("discard", (&self.computation,))?;
+            .discard(&self.computation)?;
         self.capture_owner.borrow(py).close(py, false)
     }
 }
