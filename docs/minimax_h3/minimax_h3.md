@@ -166,7 +166,7 @@ The base DiTs evaluate their block epilogues (modulation, gated residuals, rotar
 
 The [Python library guide](library.md) describes direct loading and generation with the same numerical modules.
 
-The [evaluation guide](evaluation.md) documents fixed workloads, serial execution and numerical reference comparisons.
+The [evaluation guide](evaluation.md) documents fixed workloads and serial execution.
 
 ## Troubleshooting
 

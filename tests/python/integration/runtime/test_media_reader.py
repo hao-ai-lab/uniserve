@@ -1,11 +1,10 @@
 """The media reader decodes MiniMax-H3 conditions as the reference does.
 
-Each case reads the media of a recorded diffusers reference run
-(``tools/minimax_h3/diffusers_reference.py``) through the media reader's
-``read_conditions``, from shared memory, with the descriptors the planner
-derives from the media's probed facts (``processing.plan_request``). The
-reader's operations are the reference conditioning's own, in its order, so
-every product is compared bit for bit:
+Each case reads the media of a recorded diffusers reference run through the
+media reader's ``read_conditions``, from shared memory, with the descriptors
+the planner derives from the media's probed facts
+(``processing.plan_request``). The reader's operations are the reference
+conditioning's own, in its order, so every product is compared bit for bit:
 
 - the conditioner's patch rows with the recorded processor output
   (``qwen_pixel_values`` and ``qwen_pixel_values_videos``): the same decode,

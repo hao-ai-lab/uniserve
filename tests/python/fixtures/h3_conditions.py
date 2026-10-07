@@ -1,11 +1,11 @@
 """Recorded MiniMax-H3 reference requests as a worker admits them.
 
-A recorded diffusers reference run (``tools/minimax_h3/diffusers_reference.py``)
-holds its request and the official media it conditions on. These helpers
-probe that media, plan the request with ``processing.plan_request``, the
-planner the server's rules are checked against, describe each condition as
-admission carries it, and read the conditions through the media reader into
-products sized as the engine reserves them.
+A recorded diffusers reference run holds its request and the official media
+it conditions on. These helpers probe that media, plan the request with
+``processing.plan_request``, the planner the server's rules are checked
+against, describe each condition as admission carries it, and read the
+conditions through the media reader into products sized as the engine
+reserves them.
 """
 
 from __future__ import annotations
