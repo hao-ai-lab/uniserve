@@ -2,7 +2,8 @@
 
 Factors are compact: one ``[..., rotated / 2]`` table per rotary axis over the
 tensor's token axes, broadcast over heads. Arithmetic accumulates in FP32 and
-rounds once to the input dtype.
+rounds once to the input dtype; ``qk_norm_rope`` also evaluates the
+``Rounding.STEPWISE`` recipe of eager PyTorch.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from typing import Literal
 
 import torch
 
-from ._tensors import check_output, result
+from ._tensors import Rounding, check_output, result
 
 
 def _factors_match(x, cos, sin) -> bool:
@@ -26,8 +27,11 @@ def _factors_match(x, cos, sin) -> bool:
 
 
 def _rotate(x, cos, sin, rotation):
-    """Rotate the leading ``2 * cos.shape[-1]`` coordinates of FP32 ``x``.
+    """Rotate the leading ``2 * cos.shape[-1]`` coordinates of ``x``.
 
+    The factors are cast to ``x.dtype`` and every product and sum evaluates
+    in that dtype: an FP32 ``x`` accumulates the rotation in FP32, while an
+    activation-dtype ``x`` rounds after each operation as eager PyTorch does.
     Factors broadcast over the omitted head axis: ``[..., 1, width / 2]``.
     Coordinates beyond the rotated width are returned unchanged.
     """
@@ -35,7 +39,8 @@ def _rotate(x, cos, sin, rotation):
     if width == 0:
         return x
 
-    cosine, sine = cos.float().unsqueeze(-2), sin.float().unsqueeze(-2)
+    cosine = cos.to(x.dtype).unsqueeze(-2)
+    sine = sin.to(x.dtype).unsqueeze(-2)
     prefix = x[..., :width]
     # Split pairs the two half-widths; interleaved pairs adjacent coordinates.
     first, second = (
@@ -120,7 +125,17 @@ def _domain_axes(widths, axis_dims):
 
 
 def qk_norm_rope(
-    q, k, q_weights, k_weights, cos, sin, *, eps: float, axis_dims, out=None
+    q,
+    k,
+    q_weights,
+    k_weights,
+    cos,
+    sin,
+    *,
+    eps: float,
+    axis_dims,
+    out=None,
+    rounding: Rounding = Rounding.ONCE,
 ):
     """Normalize Q/K over explicit RMS domains, then rotate each rotary axis.
 
@@ -134,9 +149,12 @@ def qk_norm_rope(
     ``cos`` and ``sin`` hold one compact factor table ``[..., rotated / 2]``
     per axis. Each axis rotates its leading ``rotated`` coordinates split-half
     and only normalizes the remainder; zero-width factors leave an axis
-    unrotated. Normalization, scaling and rotation accumulate in FP32 and round
-    once to the input dtype. ``out`` receives the query and key results and may
-    alias ``q`` and ``k``.
+    unrotated. With ``Rounding.ONCE`` normalization, scaling and rotation
+    accumulate in FP32 and round once to the input dtype. With
+    ``Rounding.STEPWISE`` each weighted normalization domain rounds once, the
+    factors round to the input dtype, and each rotation product and sum
+    rounds in turn. ``out`` receives the query and key results and may alias
+    ``q`` and ``k``.
     """
     widths = tuple(
         weight.shape[0] if weight.ndim == 1 else -1 for weight in q_weights
@@ -183,12 +201,24 @@ def qk_norm_rope(
         check_output(k, key)
 
     if q.ndim == 3 and _fused_qk_norm_rope(
-        q, k, q_weights, k_weights, cos, sin, eps, axis_dims, counts, query, key
+        q,
+        k,
+        q_weights,
+        k_weights,
+        cos,
+        sin,
+        eps,
+        axis_dims,
+        counts,
+        query,
+        key,
+        rounding,
     ):
         return query, key
 
-    # General composition keeps every domain and axis in FP32 and rounds once
-    # while storing, after the complete source has been read.
+    # General composition reads the complete source before storing. A single
+    # rounding keeps every domain and axis in FP32 until the store; stepwise
+    # rounding rounds each normalized domain and rotates in the input dtype.
     for source, weights, target in ((q, q_weights, query), (k, k_weights, key)):
         normalized = torch.cat(
             tuple(
@@ -201,6 +231,8 @@ def qk_norm_rope(
             ),
             dim=-1,
         )
+        if rounding is Rounding.STEPWISE:
+            normalized = normalized.to(source.dtype)
         target.copy_(
             torch.cat(
                 tuple(
@@ -219,23 +251,36 @@ def qk_norm_rope(
 
 
 def _fused_qk_norm_rope(
-    q, k, q_weights, k_weights, cos, sin, eps, axis_dims, counts, query, key
+    q,
+    k,
+    q_weights,
+    k_weights,
+    cos,
+    sin,
+    eps,
+    axis_dims,
+    counts,
+    query,
+    key,
+    rounding,
 ) -> bool:
     """Launch the Triton kernel matching the call's domains and axes.
 
     Selection follows the declared layout: one domain with one axis, or a
     rotated leading domain followed by one shared tail domain that is either
-    unrotated or holds two rotated axes. Returns ``False`` when no kernel
-    accepts the tensors.
+    unrotated or holds two rotated axes. Stepwise rounding has a kernel for
+    one domain whose axis rotates a prefix of the head. Returns ``False``
+    when no kernel accepts the tensors and recipe.
     """
     from uniserve_kernels import rope as kernels
 
+    stepwise = rounding is Rounding.STEPWISE
     rotated = tuple(cosine.shape[-1] * 2 for cosine in cos)
     cos = tuple(cosine.contiguous() for cosine in cos)
     sin = tuple(sine.contiguous() for sine in sin)
 
     if counts == (1,) and rotated[0] == axis_dims[0]:
-        if kernels.can_run_triton_qk_rms_norm_rope(
+        if not stepwise and kernels.can_run_triton_qk_rms_norm_rope(
             q, k, q_weights[0], k_weights[0], cos[0], sin[0], query, key
         ):
             kernels.triton_qk_rms_norm_rope(
@@ -253,29 +298,28 @@ def _fused_qk_norm_rope(
         return False
 
     if counts == (1,) and rotated[0]:
-        # The partial kernel updates its operands in place. Both the sources
-        # and the destinations must satisfy it before the sources are copied.
-        if all(
-            kernels.can_run_triton_qk_rms_norm_rope_inplace(
-                query_value,
-                key_value,
+        # The partial kernel reads the strided sources and writes the outputs,
+        # which may alias them.
+        if kernels.can_run_triton_qk_rms_norm_partial_rope(
+            q, k, q_weights[0], k_weights[0], cos[0], sin[0], query, key
+        ):
+            kernels.triton_qk_rms_norm_partial_rope(
+                q,
+                k,
                 q_weights[0],
                 k_weights[0],
                 cos[0],
                 sin[0],
-            )
-            for query_value, key_value in ((q, k), (query, key))
-        ):
-            if query is not q:
-                query.copy_(q)
-            if key is not k:
-                key.copy_(k)
-            kernels.triton_qk_rms_norm_rope_inplace(
-                query, key, q_weights[0], k_weights[0], cos[0], sin[0], eps
+                eps,
+                stepwise,
+                query,
+                key,
             )
             return True
         return False
 
+    if stepwise:
+        return False
     if (
         len(counts) != 2
         or counts[0] != 1

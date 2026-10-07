@@ -37,13 +37,18 @@ if triton is not None:
 
     @triton.jit
     def _silu_and_mul_kernel(
-        x_ptr, out_ptr, n_cols: tl.constexpr, block: tl.constexpr
+        x_ptr,
+        out_ptr,
+        n_cols: tl.constexpr,
+        block: tl.constexpr,
+        stepwise: tl.constexpr,
     ):
         """Apply ``silu(gate) * value`` to one column block of a packed row.
 
         Grid: ``(rows, ceil(n_cols / block))``. Offsets are int32, so
         :func:`silu_and_mul` launches row chunks small enough to keep them
-        below ``2**31``.
+        below ``2**31``. ``stepwise`` rounds the activated gate to the input
+        dtype before the product, as eager PyTorch does.
         """
         row = tl.program_id(0)
         cols = tl.program_id(1) * block + tl.arange(0, block)
@@ -57,6 +62,8 @@ if triton is not None:
             tl.float32
         )
         silu = x / (1.0 + tl.exp(-x))
+        if stepwise:
+            silu = silu.to(x_ptr.dtype.element_ty).to(tl.float32)
         out = silu * y
         tl.store(out_ptr + row * n_cols + cols, out, mask=mask)
 
@@ -67,13 +74,15 @@ if triton is not None:
         scale_ptr,
         n_cols: tl.constexpr,
         block: tl.constexpr,
+        stepwise: tl.constexpr,
     ):
         """Apply packed SwiGLU and emit its row-scaled E4M3 output.
 
         One program owns one complete ``[gate, value]`` row, with ``block``
         at least ``n_cols``, so the row maximum is a single block reduction.
         Row offsets are int64, so one launch covers every row of a packed
-        input past ``2**31`` elements.
+        input past ``2**31`` elements. ``stepwise`` rounds the activated gate
+        and the product to the input dtype before encoding.
         """
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, block)
@@ -85,10 +94,15 @@ if triton is not None:
             tl.float32
         )
         activated = gate / (1.0 + tl.exp(-gate))
-        output = activated * value
+        if stepwise:
+            dtype = x_ptr.dtype.element_ty
+            activated = activated.to(dtype).to(tl.float32)
+            output = (activated * value).to(dtype).to(tl.float32)
+        else:
+            output = activated * value
 
         # One E4M3 dequantization scale per row from the absolute max of the
-        # unrounded FP32 products; stored codes decode as ``code * scale``.
+        # FP32 products; stored codes decode as ``code * scale``.
         output_fp32 = tl.where(mask, output.to(tl.float32), 0.0)
         scale = tl.maximum(
             tl.max(tl.abs(output_fp32), axis=0), _FP8_SCALE_EPS_TL
@@ -280,11 +294,14 @@ def can_run(x: torch.Tensor, *operands: torch.Tensor | None) -> bool:
     )
 
 
-def silu_and_mul(x: torch.Tensor, out: torch.Tensor) -> None:
+def silu_and_mul(
+    x: torch.Tensor, out: torch.Tensor, *, stepwise: bool = False
+) -> None:
     """Store ``silu(gate) * value`` for packed ``[gate, value]`` rows.
 
     ``x`` is contiguous ``[..., 2 * width]`` and ``out`` is contiguous
     ``[..., width]``; ``out`` receives the result in its own dtype.
+    ``stepwise`` rounds the activated gate to ``x.dtype`` before the product.
     """
     width = int(x.shape[-1]) // 2
     rows = out.numel() // width
@@ -299,19 +316,27 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor) -> None:
             out_rows[start:stop],
             width,
             _ACT_BLOCK,
+            stepwise,
             num_warps=4,
+            # A contracted multiply-add would skip a stepwise rounding.
+            enable_fp_fusion=not stepwise,
         )
 
 
 def silu_and_mul_fp8(
-    x: torch.Tensor, out: torch.Tensor, scale: torch.Tensor
+    x: torch.Tensor,
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    stepwise: bool = False,
 ) -> None:
     """Store row-scaled E4M3 packed SwiGLU values and ``[rows, 1]`` scales.
 
     ``x`` packs ``[gate, value]`` rows like :func:`silu_and_mul`. ``out`` is
     contiguous float8_e4m3fn ``[rows, width]`` and ``scale`` is FP32; one
     program handles each complete row. The kernel indexes rows in int64, so
-    a single launch needs no row chunking.
+    a single launch needs no row chunking. ``stepwise`` rounds the activated
+    gate and the product to ``x.dtype`` before encoding.
     """
     width = int(x.shape[-1]) // 2
     block = triton.next_power_of_2(width)
@@ -321,7 +346,10 @@ def silu_and_mul_fp8(
         scale,
         width,
         block,
+        stepwise,
         num_warps=32 if block >= 32_768 else 16,
+        # A contracted multiply-add would skip a stepwise rounding.
+        enable_fp_fusion=not stepwise,
     )
 
 

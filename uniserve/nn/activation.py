@@ -18,13 +18,23 @@ __all__ = [
 
 
 class SiLUAndMul(nn.Module):
-    """Apply SiLU gating to equal channel halves of a packed tensor."""
+    """Apply SiLU gating to equal channel halves of a packed tensor.
+
+    ``rounding`` selects whether the activated gate rounds to the input dtype
+    before the product (see ``functional.Rounding``).
+    """
+
+    def __init__(
+        self, rounding: functional.Rounding = functional.Rounding.ONCE
+    ) -> None:
+        super().__init__()
+        self.rounding = rounding
 
     def forward(
         self, x: torch.Tensor, *, out: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Apply SiLU to the gate half and multiply by the value half."""
-        return functional.silu_and_mul(x, out=out)
+        return functional.silu_and_mul(x, out=out, rounding=self.rounding)
 
 
 class GELUAndMul(nn.Module):

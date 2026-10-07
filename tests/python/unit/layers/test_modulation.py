@@ -5,6 +5,7 @@ import torch
 from torch.nn import functional as F
 
 from uniserve.nn.functional import (
+    Rounding,
     gated_residual,
     gated_residual_rms_norm,
     gated_residual_rms_norm_fp8,
@@ -338,4 +339,164 @@ def test_modulated_rms_norm_retains_its_source_rows():
             row_indices,
             eps=1e-6,
             retain=retained[:, :128],
+        )
+
+
+def _unit_rows(rows: int, width: int, device: str) -> torch.Tensor:
+    """BF16 rows of +-1, whose RMS normalization is exact in any order.
+
+    A row's mean square is exactly 1, so its weighted normalization
+    ``w * rsqrt(1 + eps)`` rounds to ``w`` in BF16 for every reduction order
+    and reciprocal square root, and stepwise results are exact functions of
+    the operands.
+    """
+    signs = torch.randint(0, 2, (rows, width), device=device) * 2 - 1
+    return signs.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+def test_stepwise_modulation_rounds_each_eager_operation(device) -> None:
+    """Stepwise modulation equals eager BF16 PyTorch bit for bit."""
+    torch.manual_seed(11)
+    rows, width, eps = 64, 5376, 1e-6
+    hidden = _unit_rows(rows, width, device)
+    # The gated update stays below half a BF16 spacing at 1, so the rounded
+    # residual keeps every row's exact unit mean square.
+    update = torch.rand(rows, width, device=device).to(torch.bfloat16)
+    gate = torch.full((3, width), 2.0**-12, device=device).to(torch.bfloat16)
+    weight = (torch.rand(width, device=device) + 0.5).to(torch.bfloat16)
+    shift = torch.randn(3, width, device=device).to(torch.bfloat16)
+    scale = (torch.randn(3, width, device=device) * 0.05).to(torch.bfloat16)
+    row_indices = torch.randint(0, 3, (rows,), device=device)
+
+    def eager(value):
+        normalized = F.rms_norm(value, (width,), weight, eps)
+        return normalized * (
+            1.0 + scale.index_select(0, row_indices)
+        ) + shift.index_select(0, row_indices)
+
+    residual = hidden + gate.index_select(0, row_indices) * update
+    modulated = modulated_rms_norm(
+        hidden,
+        weight,
+        shift,
+        scale,
+        row_indices,
+        eps=eps,
+        rounding=Rounding.STEPWISE,
+    )
+    summed, normalized = gated_residual_rms_norm(
+        hidden,
+        update.clone(),
+        gate,
+        weight,
+        shift,
+        scale,
+        row_indices,
+        eps=eps,
+        rounding=Rounding.STEPWISE,
+    )
+
+    torch.testing.assert_close(modulated, eager(hidden), rtol=0, atol=0)
+    torch.testing.assert_close(summed, residual, rtol=0, atol=0)
+    torch.testing.assert_close(normalized, eager(residual), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+def test_stepwise_gated_residual_rounds_the_gated_update(device) -> None:
+    """Stepwise gated residuals equal eager BF16 PyTorch bit for bit."""
+    torch.manual_seed(12)
+    hidden = torch.randn(96, 384, device=device).to(torch.bfloat16)
+    update = torch.randn(96, 384, device=device).to(torch.bfloat16)
+    gate = torch.randn(3, 384, device=device).to(torch.bfloat16)
+    row_indices = torch.randint(0, 3, (96,), device=device)
+
+    expected = hidden + gate.index_select(0, row_indices) * update
+    actual = gated_residual(
+        hidden,
+        update.clone(),
+        gate,
+        row_indices,
+        rounding=Rounding.STEPWISE,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+def test_stepwise_swiglu_rounds_the_activated_gate(device) -> None:
+    """Stepwise SwiGLU multiplies the BF16-rounded SiLU by the value.
+
+    The activated gate is the call's own SiLU rounded once, read back by
+    gating with unit values, so the expectation does not depend on how
+    either implementation evaluates the exponential.
+    """
+    torch.manual_seed(13)
+    gate = torch.randn(32, 2048, device=device).to(torch.bfloat16)
+    value = torch.randn(32, 2048, device=device).to(torch.bfloat16)
+
+    activated = silu_and_mul(torch.cat((gate, torch.ones_like(value)), -1))
+    actual = silu_and_mul(
+        torch.cat((gate, value), -1), rounding=Rounding.STEPWISE
+    )
+
+    torch.testing.assert_close(actual, activated * value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    ((torch.bfloat16, 2e-2), (torch.float16, 2e-3), (torch.float32, 1e-5)),
+)
+def test_modulation_kernels_cover_every_floating_activation(dtype, tolerance):
+    generator = torch.Generator(device="cuda").manual_seed(43)
+    rows, width, states = 12, 3072, 3
+    hidden = torch.randn((rows, width), generator=generator, device="cuda").to(
+        dtype
+    )
+    update = torch.randn((rows, width), generator=generator, device="cuda").to(
+        dtype
+    )
+    weight = torch.rand(width, generator=generator, device="cuda") + 0.5
+    shift, scale, gate = (
+        torch.randn((states, 3 * width), generator=generator, device="cuda")
+        .to(dtype)
+        .chunk(3, dim=-1)
+    )
+    row_indices = torch.randint(
+        states, (rows,), generator=generator, device="cuda"
+    )
+
+    def modulate(value):
+        return (
+            _rmsnorm(value, weight, 1e-6)
+            * (1.0 + scale.index_select(0, row_indices).double())
+            + shift.index_select(0, row_indices).double()
+        )
+
+    summed = (
+        hidden.double()
+        + gate.index_select(0, row_indices).double() * update.double()
+    )
+    normalized = modulated_rms_norm(
+        hidden, weight, shift, scale, row_indices, eps=1e-6
+    )
+    residual, gated = gated_residual_rms_norm(
+        hidden,
+        update.clone(),
+        gate,
+        weight,
+        shift,
+        scale,
+        row_indices,
+        eps=1e-6,
+    )
+
+    for actual, expected in (
+        (normalized, modulate(hidden)),
+        (residual, summed),
+        (gated, modulate(summed)),
+    ):
+        assert actual.dtype == dtype
+        torch.testing.assert_close(
+            actual.double(), expected, rtol=tolerance, atol=tolerance
         )

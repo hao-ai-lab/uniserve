@@ -3,6 +3,13 @@
 Row indices select modulation parameters whose leading stride may include
 other parameter groups. Statistics and affine expressions accumulate in FP32;
 outputs use the activation dtype or carry a per-row E4M3 dequantization scale.
+By default an expression rounds once when stored. ``stepwise`` launches
+instead round after each operation of the eager expression, as PyTorch
+evaluates it in the activation dtype; the RMS statistics still accumulate in
+FP32 and the normalized row rounds once. Stepwise launches disable
+floating-point contraction: Triton evaluates a BF16 round trip as native BF16
+arithmetic, and a contracted multiply-add would round the rounded product's
+sum only once.
 
 ``uniserve.nn.functional`` owns validation and the tensor-operation fallback
 for these kernels.
@@ -41,6 +48,7 @@ if triton is not None:
         HAS_UPDATE: tl.constexpr,  # noqa: N803
         FP8_OUTPUT: tl.constexpr,  # noqa: N803
         RETAIN: tl.constexpr,  # noqa: N803
+        STEPWISE: tl.constexpr,  # noqa: N803
     ):
         # One program per activation row. ``BLOCK`` is ``WIDTH`` rounded up
         # to a power of two, and masked lanes load zeros so they add nothing
@@ -51,6 +59,8 @@ if triton is not None:
         mask = columns < WIDTH
         offsets = row * WIDTH + columns
         modulation_row = tl.load(row_indices_ptr + row)
+        # The activation dtype, which every stepwise intermediate rounds to.
+        activation = hidden_ptr.dtype.element_ty
 
         # value: one [WIDTH] activation row, accumulated in FP32.
         value = tl.load(hidden_ptr + offsets, mask=mask, other=0.0).to(
@@ -65,9 +75,16 @@ if triton is not None:
                 mask=mask,
                 other=0.0,
             ).to(tl.float32)
-            value = value + gate * update
+            if STEPWISE:
+                # The gated update rounds, then the residual sum rounds, and
+                # the normalization reads that rounded residual.
+                gated = (gate * update).to(activation).to(tl.float32)
+                value = (value + gated).to(activation).to(tl.float32)
+            else:
+                value = value + gate * update
             # ``update`` receives the gated residual rounded to its dtype,
-            # while the normalization below reads the unrounded FP32 sum.
+            # while a single-rounding normalization below reads the
+            # unrounded FP32 sum.
             tl.store(update_ptr + offsets, value, mask=mask)
         if RETAIN:
             # Copy the normalized row's source (the gated sum when HAS_UPDATE)
@@ -88,9 +105,19 @@ if triton is not None:
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        output = (
-            value * tl.rsqrt(mean_square + EPS) * weight * (1.0 + scale) + shift
-        )
+        if STEPWISE:
+            # Eager order: the weighted normalization rounds once, then
+            # ``1 + scale``, its product and the shifted sum each round.
+            normalized = value * tl.rsqrt(mean_square + EPS) * weight
+            normalized = normalized.to(activation).to(tl.float32)
+            factor = (1.0 + scale).to(activation).to(tl.float32)
+            output = (normalized * factor).to(activation).to(tl.float32)
+            output = (output + shift).to(activation).to(tl.float32)
+        else:
+            output = (
+                value * tl.rsqrt(mean_square + EPS) * weight * (1.0 + scale)
+                + shift
+            )
 
         if FP8_OUTPUT:
             # Per-row E4M3 dequantization scale from the row's absolute max,
@@ -117,6 +144,7 @@ if triton is not None:
         ELEMENTS: tl.constexpr,  # noqa: N803
         WIDTH: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
+        STEPWISE: tl.constexpr,  # noqa: N803
     ):
         # Elementwise over the flat [rows, WIDTH] activation: each element
         # recovers its row to select the gate row, so ``MAX_WIDTH`` does not
@@ -138,7 +166,13 @@ if triton is not None:
             other=0.0,
         ).to(tl.float32)
 
-        tl.store(update_ptr + offsets, hidden + gate * update, mask=mask)
+        if STEPWISE:
+            # The gated update rounds before the residual sum.
+            activation = hidden_ptr.dtype.element_ty
+            gated = (gate * update).to(activation).to(tl.float32)
+            tl.store(update_ptr + offsets, hidden + gated, mask=mask)
+        else:
+            tl.store(update_ptr + offsets, hidden + gate * update, mask=mask)
 
 
 def can_run(value: torch.Tensor, *operands: torch.Tensor) -> bool:
@@ -175,6 +209,7 @@ def modulated_rms_norm(
     gate: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     retain: torch.Tensor | None = None,
+    stepwise: bool = False,
 ) -> None:
     """Store ``rms(value) * weight * (1 + scale[i]) + shift[i]`` per row.
 
@@ -187,6 +222,8 @@ def modulated_rms_norm(
     With ``update`` and ``gate``, ``value + gate[i] * update`` is normalized
     and also stored into ``update``. ``output_scale`` selects E4M3 output with
     one ``[rows, 1]`` scale. ``retain`` receives the normalized source rows.
+    ``stepwise`` rounds each intermediate of the eager expression to the
+    activation dtype; an E4M3 output then encodes the rounded result.
     """
     width = int(value.shape[-1])
     rows = value.numel() // width
@@ -213,7 +250,9 @@ def modulated_rms_norm(
         HAS_UPDATE=update is not None,
         FP8_OUTPUT=output_scale is not None,
         RETAIN=retain is not None,
+        STEPWISE=stepwise,
         num_warps=4 if width < 2048 else 8,
+        enable_fp_fusion=not stepwise,
     )
 
 
@@ -222,11 +261,14 @@ def gated_residual(
     update: torch.Tensor,
     gate: torch.Tensor,
     row_indices: torch.Tensor,
+    *,
+    stepwise: bool = False,
 ) -> None:
     """Store ``hidden + gate[i] * update`` into contiguous ``update``.
 
     ``i`` is ``row_indices[row]``; ``gate`` rows may be strided but are
-    unit-strided per channel. ``hidden`` must be contiguous.
+    unit-strided per channel. ``hidden`` must be contiguous. ``stepwise``
+    rounds the gated update before the sum.
     """
     _gated_residual_kernel[(triton.cdiv(hidden.numel(), 1024),)](
         hidden,
@@ -237,5 +279,7 @@ def gated_residual(
         ELEMENTS=hidden.numel(),
         WIDTH=int(hidden.shape[-1]),
         BLOCK=1024,
+        STEPWISE=stepwise,
         num_warps=4,
+        enable_fp_fusion=not stepwise,
     )
