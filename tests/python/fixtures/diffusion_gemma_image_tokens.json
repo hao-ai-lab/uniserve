@@ -1,0 +1,88 @@
+{
+ "source": "transformers 5.17.0 Gemma4Processor._get_num_multimodal_tokens",
+ "patch_size": 16,
+ "pooling_kernel_size": 3,
+ "max_soft_tokens": 280,
+ "cases": [
+  {
+   "width": 640,
+   "height": 480,
+   "soft_tokens": 266
+  },
+  {
+   "width": 480,
+   "height": 640,
+   "soft_tokens": 266
+  },
+  {
+   "width": 300,
+   "height": 1200,
+   "soft_tokens": 264
+  },
+  {
+   "width": 1,
+   "height": 1,
+   "soft_tokens": 256
+  },
+  {
+   "width": 48,
+   "height": 48,
+   "soft_tokens": 256
+  },
+  {
+   "width": 1024,
+   "height": 1024,
+   "soft_tokens": 256
+  },
+  {
+   "width": 4032,
+   "height": 3024,
+   "soft_tokens": 266
+  },
+  {
+   "width": 3000,
+   "height": 20,
+   "soft_tokens": 204
+  },
+  {
+   "width": 20,
+   "height": 3000,
+   "soft_tokens": 204
+  },
+  {
+   "width": 1,
+   "height": 100000,
+   "soft_tokens": 280
+  },
+  {
+   "width": 100000,
+   "height": 1,
+   "soft_tokens": 280
+  },
+  {
+   "width": 777,
+   "height": 333,
+   "soft_tokens": 250
+  },
+  {
+   "width": 803,
+   "height": 803,
+   "soft_tokens": 256
+  },
+  {
+   "width": 2000,
+   "height": 47,
+   "soft_tokens": 218
+  },
+  {
+   "width": 47,
+   "height": 2000,
+   "soft_tokens": 218
+  },
+  {
+   "width": 1920,
+   "height": 1080,
+   "soft_tokens": 264
+  }
+ ]
+}

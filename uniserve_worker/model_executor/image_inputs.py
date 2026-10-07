@@ -4,10 +4,15 @@ The model declares its image policy as a ``uniserve.processing``
 ``ImageProcessor``; this module applies it for the worker. An inline base64
 payload (``prepare_image``) or an already decoded RGB tensor
 (``prepare_tensor_image``) is resized to the model's canvas (a patch tower
-keeps the source size) and then to the selected tower's input size,
-normalized, packed into patches for a ``PatchTransform`` tower, and staged
-on the target device. The input rows for vision encoding and image decoding
-live here as well.
+keeps the source size) and then to the selected tower's input size with the
+declared resampling, normalized, packed into patches in the declared layout
+for a ``PatchTransform`` tower, and staged on the target device. The input
+rows for vision encoding and image decoding live here as well.
+
+An inline payload's host work (``prepare_host_image``: decoding, resizing,
+normalization, patch packing) touches no device, so it can run on a host
+thread, and ``stage_image`` then issues the asynchronous copies to the
+device. ``prepare_image`` runs both steps in the caller's thread.
 """
 
 from __future__ import annotations
@@ -15,7 +20,6 @@ from __future__ import annotations
 import base64
 import binascii
 import io
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,7 +28,9 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
+from torchvision.transforms.v2 import functional as tensor_vision
 
+from uniserve.nn.functional import patchify
 from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
@@ -38,17 +44,40 @@ from uniserve_worker.protocol.call import MediaCall
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
+# The Transformers image processors' rescale factor, 0.00392156862745098;
+# ``"unit"`` normalization multiplies 8-bit values by it in float32.
+_UNIT_SCALE = 1 / 255
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedImage:
     """Normalized pixels, patch coordinates, and model canvas dimensions.
 
     For a ``PatchTransform`` tower, ``pixels`` is
-    [patches, channels * patch * patch] with patches in raster order, and
-    ``grid`` is a [1, 2] int64 tensor holding ``grid_shape`` (rows, columns
-    of patches). For a ``TowerTransform`` tower, ``pixels`` is
-    [channels, height, width] and both grid fields are None. ``height`` and
-    ``width`` are the canvas dimensions, not the tower's input size.
+    [patches, channels * patch * patch] with patches in raster order and
+    each row in the transform's ``patch_layout``, and ``grid`` is a [1, 2]
+    int64 tensor holding ``grid_shape`` (rows, columns of patches). For a
+    ``TowerTransform`` tower, ``pixels`` is [channels, height, width] and
+    both grid fields are None. ``height`` and ``width`` are the canvas
+    dimensions, not the tower's input size.
+    """
+
+    pixels: torch.Tensor
+    grid: torch.Tensor | None
+    grid_shape: tuple[int, int] | None
+    height: int
+    width: int
+
+
+@dataclass(frozen=True, slots=True)
+class HostImage:
+    """A request input image prepared on the host, before device staging.
+
+    ``pixels`` and ``grid`` hold exactly the values ``PreparedImage.pixels``
+    and ``PreparedImage.grid`` receive, the pixels already in the
+    processor's staging dtype, both in page-locked memory when the image is
+    prepared for a CUDA device (see ``prepare_host_image``). ``grid_shape``,
+    ``height`` and ``width`` are as on ``PreparedImage``.
     """
 
     pixels: torch.Tensor
@@ -69,12 +98,11 @@ def _image_plan(
 
     Vision encoding uses the processor's ``vit`` transform and every other
     call kind its ``vae`` transform. A patch tower keeps the source size as
-    its canvas, and its pixel bound depends on ``input_images`` (see
-    ``PatchTransform.pixel_bound``). For a ``TowerTransform``, whether
-    ``vit`` or ``vae``, the canvas is the source resized by the ``vae``
-    stride policy when the processor declares a ``vae`` transform, and the
-    tower input applies the selected transform's stride policy to that
-    canvas.
+    its canvas, and its input size is ``PatchTransform.resized_size`` for
+    ``input_images``. For a ``TowerTransform``, whether ``vit`` or ``vae``,
+    the canvas is the source resized by the ``vae`` stride policy when the
+    processor declares a ``vae`` transform, and the tower input applies the
+    selected transform's stride policy to that canvas.
 
     Returns:
         The selected transform, the canvas (height, width) and the tower's
@@ -82,8 +110,8 @@ def _image_plan(
 
     Raises:
         WorkerError: An ``invalid_descriptor`` error when the model declares
-            no transform for ``kind``, or, for a patch tower, when
-            ``_bounded_grid_shape`` rejects the dimensions.
+            no transform for ``kind``, or, for a patch tower, when its resize
+            policy rejects the dimensions.
     """
     transform = (
         processor.vit if kind is MediaCall.VISION_ENCODING else processor.vae
@@ -93,11 +121,11 @@ def _image_plan(
             f"model declares no {kind.value} image transform"
         )
     if isinstance(transform, PatchTransform):
-        return (
-            transform,
-            (height, width),
-            _patch_image_shape(transform, height, width, input_images),
-        )
+        try:
+            tower = transform.resized_size(height, width, input_images)
+        except ValueError as error:
+            raise invalid_descriptor(str(error)) from error
+        return transform, (height, width), tower
 
     canvas = (
         (height, width)
@@ -107,23 +135,142 @@ def _image_plan(
     return transform, canvas, _stride_image_shape(*canvas, transform.resize)
 
 
+def _packed_pixels(
+    transform: PatchTransform | TowerTransform, pixels: torch.Tensor
+) -> tuple[torch.Tensor, tuple[int, int] | None]:
+    """Pack a patch tower's [C, H, W] input into patch rows.
+
+    Returns the rows and the (rows, columns) patch grid for a
+    ``PatchTransform``, and the unchanged pixels with no grid otherwise.
+    The packing is a pure layout change on the pixels' own device.
+    """
+    if not isinstance(transform, PatchTransform):
+        return pixels, None
+
+    # [C, H, W] -> one flattened row per patch, in raster order over the
+    # patch grid; the declared layout orders the values within a row.
+    patch = transform.patch_size
+    channels, height, width = pixels.shape
+    grid_shape = (height // patch, width // patch)
+    if transform.patch_layout == "channels_last":
+        return patchify(pixels, patch_size=patch), grid_shape
+
+    # [C, H, W] -> [gh, gw, C, patch, patch] -> rows.
+    rows = (
+        pixels.reshape(channels, grid_shape[0], patch, grid_shape[1], patch)
+        .permute(1, 3, 0, 2, 4)
+        .reshape(grid_shape[0] * grid_shape[1], channels * patch * patch)
+    )
+    return rows, grid_shape
+
+
+def _grid_tensor(grid_shape: tuple[int, int], *, pin: bool) -> torch.Tensor:
+    """Build the [1, 2] int64 host grid, page-locked when ``pin`` is set.
+
+    A page-locked source lets the device copy run asynchronously; building
+    the tensor directly on a CUDA device would synchronize the current
+    stream with the host.
+    """
+    grid = torch.tensor([grid_shape], dtype=torch.long)
+    return grid.pin_memory() if pin else grid
+
+
 def _prepared_pixels(processor, transform, pixels, canvas, device):
-    """Pack the numerical tower input and attach its canvas coordinates."""
-    grid = grid_shape = None
-    if isinstance(transform, PatchTransform):
-        # [C, H, W] -> [gh, gw, C, patch, patch] -> one flattened row per
-        # patch, in raster order over the patch grid.
-        patch = int(transform.patch_size)
-        channels, height, width = pixels.shape
-        grid_shape = (height // patch, width // patch)
-        pixels = (
-            pixels.reshape(channels, grid_shape[0], patch, grid_shape[1], patch)
-            .permute(1, 3, 0, 2, 4)
-            .reshape(grid_shape[0] * grid_shape[1], channels * patch * patch)
+    """Pack a device-resident tower input and stage it on ``device``."""
+    pixels, grid_shape = _packed_pixels(transform, pixels)
+    grid = None
+    if grid_shape is not None:
+        grid = _grid_tensor(grid_shape, pin=device.type == "cuda").to(
+            device, non_blocking=True
         )
-        grid = torch.tensor([grid_shape], dtype=torch.long, device=device)
     return PreparedImage(
         _stage(pixels, processor, device), grid, grid_shape, *canvas
+    )
+
+
+def prepare_host_image(
+    processor: ImageProcessor,
+    kind: MediaCall,
+    encoded: str,
+    *,
+    input_images: int,
+    pin: bool,
+) -> HostImage:
+    """Decode a request input image and apply the model's transforms on host.
+
+    ``input_images`` is the number of input images in the image's request;
+    a patch tower whose images share a pixel budget bounds each by its share
+    (see ``PatchTransform.pixel_bound``). With ``pin`` the pixels are copied
+    into page-locked memory, so ``stage_image`` can copy them to a CUDA
+    device without synchronizing the host with the device.
+
+    Touches no device and holds no worker state, so any host thread may run
+    it; decoding, torchvision resizing and NumPy normalization release the
+    GIL for most of their work.
+
+    Raises:
+        WorkerError: An ``invalid_descriptor`` error when the payload is not
+            a decodable image, or when the model's transforms reject it.
+    """
+    image = _decode_rgb(encoded, processor.alpha)
+    transform, canvas, tower = _image_plan(
+        processor, kind, image.height, image.width, input_images
+    )
+    if (
+        isinstance(transform, PatchTransform)
+        and transform.resampling == "torchvision"
+    ):
+        pixels = _normalize(
+            _resample_bytes(image, tower).numpy(), transform.normalization
+        )
+    else:
+        if not isinstance(transform, PatchTransform):
+            image = vision.resize(
+                image,
+                canvas,
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            )
+        image = vision.resize(
+            image,
+            tower,
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+        pixels = _normalize(
+            np.asarray(image).transpose(2, 0, 1), transform.normalization
+        )
+
+    pixels, grid_shape = _packed_pixels(transform, pixels)
+
+    # The staging dtype conversion runs on the host, where a host-to-device
+    # copy with a dtype change performs it as well, so the rounding matches.
+    dtype = _staging_dtype(processor)
+    if dtype is not None:
+        pixels = pixels.to(dtype)
+    pixels = pixels.contiguous()
+    if pin:
+        pixels = pixels.pin_memory()
+    grid = None if grid_shape is None else _grid_tensor(grid_shape, pin=pin)
+    return HostImage(pixels, grid, grid_shape, *canvas)
+
+
+def stage_image(host: HostImage, device: torch.device) -> PreparedImage:
+    """Copy a host-prepared image to ``device`` on the current stream.
+
+    The copies are asynchronous when the host tensors are page-locked. The
+    caching host allocator keeps a page-locked block from reuse until the
+    copies reading it complete, so the caller may drop ``host`` at once.
+    """
+    grid = (
+        None if host.grid is None else host.grid.to(device, non_blocking=True)
+    )
+    return PreparedImage(
+        host.pixels.to(device, non_blocking=True),
+        grid,
+        host.grid_shape,
+        host.height,
+        host.width,
     )
 
 
@@ -135,28 +282,41 @@ def prepare_image(
     device: torch.device,
     input_images: int,
 ) -> PreparedImage:
-    """Decode a request input image and apply the model's transforms.
+    """Decode a request input image, apply the model's transforms and stage it.
 
-    ``input_images`` is the number of input images in the image's request;
-    a patch tower whose images share a pixel budget bounds each by its share
-    (see ``PatchTransform.pixel_bound``).
+    Runs ``prepare_host_image`` and ``stage_image`` in the caller's thread;
+    see ``prepare_host_image`` for ``input_images`` and the errors raised.
     """
-    image = _decode_rgb(encoded)
-    transform, canvas, tower = _image_plan(
-        processor, kind, image.height, image.width, input_images
+    host = prepare_host_image(
+        processor,
+        kind,
+        encoded,
+        input_images=input_images,
+        pin=device.type == "cuda",
     )
-    if not isinstance(transform, PatchTransform):
-        image = vision.resize(
-            image,
-            canvas,
-            interpolation=InterpolationMode.BICUBIC,
-            antialias=True,
-        )
-    image = vision.resize(
-        image, tower, interpolation=InterpolationMode.BICUBIC, antialias=True
+    return stage_image(host, device)
+
+
+def _resample_bytes(image: Image.Image, size: tuple[int, int]) -> torch.Tensor:
+    """Resize an RGB image as a ``uint8`` CHW tensor with torchvision.
+
+    Returns the ``[3, height, width]`` ``uint8`` image at ``size``, following
+    the Transformers torchvision image-processor path call for call:
+    ``pil_to_tensor`` yields a channels-last view of the decoded bytes, and
+    the antialiased bicubic filter runs on it only when the size changes,
+    rounding back to 8 bits. torchvision picks its interpolation kernel by
+    host architecture and memory format, so the same calls on the host
+    reproduce the reference pixels independently of the staging device.
+    """
+    pixels = tensor_vision.pil_to_tensor(image)
+    if tuple(pixels.shape[1:]) == size:
+        return pixels
+    return tensor_vision.resize(
+        pixels,
+        list(size),
+        interpolation=tensor_vision.InterpolationMode.BICUBIC,
+        antialias=True,
     )
-    pixels = _normalize(image, transform.normalization)
-    return _prepared_pixels(processor, transform, pixels, canvas, device)
 
 
 def prepare_tensor_image(
@@ -172,7 +332,9 @@ def prepare_tensor_image(
     ``image`` is [3, height, width] or [1, 3, height, width] with values in
     [0, 1], or in [-1, 1] when ``signed_unit``; values are clamped to [0, 1]
     before the transforms. The view is a generated image rather than a
-    request input, so a patch tower bounds it by ``max_pixels`` alone.
+    request input, so a patch tower applies its single-image pixel bound.
+    Continuous values resize with torch's antialiased bicubic filter
+    whatever resampling the transform declares for 8-bit images.
     """
     value = image.detach().to(dtype=torch.float32)
     if value.ndim == 4:
@@ -198,8 +360,12 @@ def prepare_tensor_image(
     return _prepared_pixels(processor, transform, pixels, canvas, device)
 
 
-def _decode_rgb(encoded: str) -> Image.Image:
-    """Decode a base64 image payload and normalize it to RGB."""
+def _decode_rgb(encoded: str, alpha: str) -> Image.Image:
+    """Decode a base64 image payload and convert it to RGB.
+
+    ``alpha`` is the processor's ``ImageProcessor.alpha`` policy for images
+    with transparency.
+    """
     if not isinstance(encoded, str) or not encoded:
         raise invalid_descriptor(
             "inline image payload must be non-empty base64"
@@ -213,8 +379,10 @@ def _decode_rgb(encoded: str) -> Image.Image:
             "inline image payload is not a valid encoded image"
         ) from error
 
-    # Composite transparency onto white so alpha never reaches the towers.
-    if image.mode == "RGBA" or image.info.get("transparency") is not None:
+    transparent = (
+        image.mode == "RGBA" or image.info.get("transparency") is not None
+    )
+    if alpha == "white" and transparent:
         rgba = image.convert("RGBA")
         rgb = Image.new("RGB", rgba.size, (255, 255, 255))
         rgb.paste(rgba, mask=rgba.getchannel("A"))
@@ -223,7 +391,7 @@ def _decode_rgb(encoded: str) -> Image.Image:
 
 
 def patch_grid_shape(
-    processor: PatchTransform,
+    transform: PatchTransform,
     source_height: int,
     source_width: int,
     input_images: int | None,
@@ -232,75 +400,15 @@ def patch_grid_shape(
 
     ``input_images`` is the number of input images in the request of a
     request input image, or None for a generated image.
-    """
-    height, width = _patch_image_shape(
-        processor, source_height, source_width, input_images
-    )
-    patch = int(processor.patch_size)
-    return height // patch, width // patch
-
-
-def _patch_image_shape(
-    processor: PatchTransform,
-    source_height: int,
-    source_width: int,
-    input_images: int | None,
-) -> tuple[int, int]:
-    """Resolve the resized pixel dimensions for a patch tower.
-
-    Both dimensions become multiples of ``patch_size / downsample_ratio``
-    within the processor's lower pixel bound and the upper bound
-    ``PatchTransform.pixel_bound`` gives for ``input_images``.
-    """
-    factor = int(
-        round(int(processor.patch_size) / float(processor.downsample_ratio))
-    )
-    return _bounded_grid_shape(
-        source_height,
-        source_width,
-        factor=factor,
-        minimum=int(processor.min_pixels),
-        maximum=int(processor.pixel_bound(input_images)),
-    )
-
-
-def _bounded_grid_shape(
-    height: int,
-    width: int,
-    *,
-    factor: int,
-    minimum: int,
-    maximum: int,
-) -> tuple[int, int]:
-    """Fit aspect-preserving pixel dimensions within pixel-area bounds.
-
-    Each dimension is rounded to a multiple of ``factor`` pixels; when the
-    resulting area falls outside [``minimum``, ``maximum``] the image is
-    rescaled, flooring toward ``maximum`` or ceiling toward ``minimum``.
-    Returns (height, width) in pixels.
 
     Raises:
-        WorkerError: An ``invalid_descriptor`` error for a nonpositive
-            dimension or ``factor``, or an aspect ratio above 200.
+        WorkerError: An ``invalid_descriptor`` error when the transform's
+            resize policy rejects the dimensions.
     """
-    if min(height, width, factor) < 1:
-        raise invalid_descriptor("image dimensions must be positive")
-    if max(height, width) / min(height, width) > 200:
-        raise invalid_descriptor("image aspect ratio must be at most 200")
-
-    result_height = max(factor, round(height / factor) * factor)
-    result_width = max(factor, round(width / factor) * factor)
-    if result_height * result_width > maximum:
-        scale = math.sqrt((height * width) / maximum)
-        result_height = max(
-            factor, math.floor(height / scale / factor) * factor
-        )
-        result_width = max(factor, math.floor(width / scale / factor) * factor)
-    elif result_height * result_width < minimum:
-        scale = math.sqrt(minimum / (height * width))
-        result_height = math.ceil(height * scale / factor) * factor
-        result_width = math.ceil(width * scale / factor) * factor
-    return result_height, result_width
+    try:
+        return transform.grid_shape(source_height, source_width, input_images)
+    except ValueError as error:
+        raise invalid_descriptor(str(error)) from error
 
 
 def _stride_image_shape(
@@ -341,12 +449,18 @@ def _stride_shape(
     return align(width * scale), align(height * scale)
 
 
-def _normalize(image: Image.Image, name: str) -> torch.Tensor:
-    """Normalize decoded RGB bytes into contiguous FP32 CHW model inputs."""
+def _normalize(values: np.ndarray, name: str) -> torch.Tensor:
+    """Normalize ``uint8`` CHW RGB bytes into contiguous FP32 model inputs."""
     # PIL decoding and resizing produce host bytes. Keep the pointwise FP32
     # transform in one owned CHW array instead of dispatching each pass through
     # the process-wide tensor thread pool on the serving thread.
-    pixels = np.asarray(image).transpose(2, 0, 1).astype(np.float32, order="C")
+    pixels = values.astype(np.float32, order="C")
+    if name == "unit":
+        # One float32 multiplication by the float32 factor, bit for bit the
+        # Transformers ``rescale`` of a uint8 tensor.
+        pixels *= np.float32(_UNIT_SCALE)
+        return torch.from_numpy(pixels)
+
     pixels /= np.float32(255.0)
     if name == "signed_unit":
         pixels -= np.float32(0.5)
@@ -360,7 +474,9 @@ def _normalize(image: Image.Image, name: str) -> torch.Tensor:
 
 
 def _normalize_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
-    """Apply the named channel normalization policy to an image tensor."""
+    """Apply the named normalization policy to an image tensor in [0, 1]."""
+    if name == "unit":
+        return tensor
     if name == "signed_unit":
         return (tensor - 0.5) / 0.5
     if name == "imagenet":
@@ -383,25 +499,36 @@ def _resize_tensor(
     )[0]
 
 
+def _staging_dtype(processor: ImageProcessor) -> torch.dtype | None:
+    """Return the declared staging dtype, or None to keep FP32.
+
+    Raises:
+        WorkerError: An ``invalid_descriptor`` error for a declaration that
+            is not a ``torch.dtype``.
+    """
+    dtype = processor.staging_dtype
+    if dtype is not None and not isinstance(dtype, torch.dtype):
+        raise invalid_descriptor(f"unknown image staging dtype {dtype!r}")
+    return dtype
+
+
 def _stage(
     value: torch.Tensor, processor: ImageProcessor, device: torch.device
 ) -> torch.Tensor:
     """Convert preprocessing output to the staging dtype and device."""
-    dtype = processor.staging_dtype
-    if processor.staging_dtype is not None and not isinstance(
-        dtype, torch.dtype
-    ):
-        raise invalid_descriptor(
-            f"unknown image staging dtype {processor.staging_dtype!r}"
-        )
-    return value.to(device=device, dtype=dtype, non_blocking=True)
+    return value.to(
+        device=device, dtype=_staging_dtype(processor), non_blocking=True
+    )
 
 
 __all__ = [
+    "HostImage",
     "PreparedImage",
     "patch_grid_shape",
+    "prepare_host_image",
     "prepare_image",
     "prepare_tensor_image",
+    "stage_image",
 ]
 
 

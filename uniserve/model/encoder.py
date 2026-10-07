@@ -123,6 +123,14 @@ class PatchEncoder(Encoder[VisionInput]):
     A packed sample with a ``(time, height, width)`` grid keeps its time
     axis: each output feature merges patches of one time step, so the sample
     yields ``time * height * width / downsample**2`` features.
+
+    With ``max_patches``, the most patch rows one image can have, the
+    encoder also encodes images packed into fixed slots of that many rows
+    (``encode_packed``). The network must then read image grids only as
+    device values, accept ``grid_shapes=None``, and keep every image's
+    output independent of the other segments its grids describe, as
+    attention restricted to each segment and pooling within it do. One
+    prepared or captured call then serves every packing of a slot count.
     """
 
     def __init__(
@@ -134,6 +142,7 @@ class PatchEncoder(Encoder[VisionInput]):
         downsample: int,
         output_size: int,
         output_dtype: torch.dtype,
+        max_patches: int | None = None,
     ):
         super().__init__(network)
         if any(
@@ -144,12 +153,98 @@ class PatchEncoder(Encoder[VisionInput]):
                 "patch encoding requires positive spatial and feature "
                 "dimensions"
             )
+        if max_patches is not None and (
+            type(max_patches) is not int
+            or max_patches < 1
+            or max_patches % downsample**2
+        ):
+            raise ValueError(
+                "packed image slots require a positive patch capacity that "
+                "whole output features divide"
+            )
         self.connector, self.patch_size, self.downsample = (
             connector,
             patch_size,
             downsample,
         )
         self._output_size, self._output_dtype = output_size, output_dtype
+        self.max_patches = max_patches
+
+    def packed_grids(
+        self, shapes: Sequence[tuple[int, int]], slots: int
+    ) -> tuple[tuple[int, int], ...]:
+        """Lay out ``shapes`` in ``slots`` fixed slots for ``encode_packed``.
+
+        Each slot holds ``max_patches`` rows: one image's patch rows first,
+        then padding. It is described by two ``(rows, columns)`` grids: the
+        image's patch grid, ``(0, 0)`` for an empty slot, followed by a
+        ``downsample`` rows high grid covering the slot's remaining rows, or
+        ``(0, 0)`` when the image fills it. Images take the leading slots in
+        order.
+
+        Raises:
+            ValueError: When there are more images than slots, an image has
+                more than ``max_patches`` patches, or a side is not a
+                positive multiple of ``downsample``.
+        """
+        capacity = self.max_patches
+        if capacity is None:
+            raise ValueError("this patch encoder packs no image slots")
+        if len(shapes) > slots:
+            raise ValueError("packed images exceed their slots")
+
+        grids: list[tuple[int, int]] = []
+        for index in range(slots):
+            shape = shapes[index] if index < len(shapes) else (0, 0)
+            rows = shape[0] * shape[1]
+            if index < len(shapes) and (
+                min(shape) < 1
+                or any(side % self.downsample for side in shape)
+                or rows > capacity
+            ):
+                raise ValueError(
+                    "packed image grids must align with spatial "
+                    "downsampling within the slot capacity"
+                )
+            padding = capacity - rows
+            grids.append(shape)
+            grids.append(
+                (self.downsample, padding // self.downsample)
+                if padding
+                else (0, 0)
+            )
+        return tuple(grids)
+
+    def encode_packed(
+        self, pixels: torch.Tensor, grids: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode patch rows packed in fixed slots (see ``packed_grids``).
+
+        ``pixels`` is ``[slots * max_patches, row]`` patch rows and
+        ``grids`` the ``[2 * slots, 2]`` int64 device grids of their
+        images and padding. Padding rows may hold any finite values.
+
+        Returns:
+            ``[slots * max_patches // downsample**2, output_size]`` features
+            in row order: each slot's image features first, then features of
+            its padding, which are unspecified.
+
+        Raises:
+            ValueError: When the encoder packs no slots or the tensors do not
+                span whole slots.
+        """
+        capacity = self.max_patches
+        if capacity is None:
+            raise ValueError("this patch encoder packs no image slots")
+        slots = grids.shape[0] // 2
+        if (
+            pixels.ndim != 2
+            or pixels.shape[0] != slots * capacity
+            or grids.shape != (2 * slots, 2)
+        ):
+            raise ValueError("packed patch rows must span whole image slots")
+        features = self.network(pixels, grids, None)
+        return self.connector(features).to(self._output_dtype)
 
     def encode(self, inputs: VisionInput) -> tuple[torch.Tensor, ...]:
         groups = defaultdict(list)

@@ -9,6 +9,7 @@ from uniserve.processing import (
     FeatureLayout,
     ImageProcessor,
     PatchTransform,
+    PixelBounds,
     PositionLayout,
     StrideResize,
     TowerTransform,
@@ -24,9 +25,8 @@ def image_processor() -> ImageProcessor:
     return ImageProcessor(
         vit=PatchTransform(
             patch_size=16,
-            downsample_ratio=1.0,
-            min_pixels=16 * 16,
-            max_pixels=512 * 512,
+            downsample=1,
+            resize=PixelBounds(min_pixels=16 * 16, max_pixels=512 * 512),
             normalization="signed_unit",
         ),
         vae=TowerTransform(

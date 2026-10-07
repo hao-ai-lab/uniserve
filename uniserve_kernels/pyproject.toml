@@ -33,7 +33,7 @@ where = ["src"]
 include = ["uniserve_kernels*"]
 
 [tool.setuptools.package-data]
-uniserve_kernels = ["py.typed", "attention/vsa_native/LICENSE", "megamoe/LICENSE"]
+uniserve_kernels = ["py.typed", "attention/vsa_native/LICENSE", "megamoe/LICENSE", "diffusion/*.json"]
 
 [tool.uv]
 # Rebuild the compiled extensions when their sources or build target change.

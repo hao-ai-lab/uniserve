@@ -10,6 +10,7 @@ from uniserve.processing import (
     FlowPrompt,
     ImageProcessor,
     PatchTransform,
+    PixelBounds,
     PositionLayout,
 )
 
@@ -29,10 +30,12 @@ def image_processor(config: Config) -> ImageProcessor:
     return ImageProcessor(
         vit=PatchTransform(
             patch_size=int(config.vision.patch_size),
-            downsample_ratio=float(config.vision.downsample_ratio),
-            min_pixels=512 * 512,
-            max_pixels=2048 * 2048,
-            max_total_pixels=4096 * 4096,
+            downsample=round(1 / config.vision.downsample_ratio),
+            resize=PixelBounds(
+                min_pixels=512 * 512,
+                max_pixels=2048 * 2048,
+                max_total_pixels=4096 * 4096,
+            ),
         ),
         staging_dtype=torch.bfloat16,
         feature_injection=FeatureInjection(

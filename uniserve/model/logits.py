@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import torch
+from torch import nn
 
 from uniserve._slices import within
 from uniserve.distributed import Communicator
@@ -77,3 +78,27 @@ class Logits:
             ..., : self.vocab.size
         ]
         return result if out is None else out.copy_(result)
+
+
+def project_logits(
+    head: nn.Module, hidden: torch.Tensor, token_indices: torch.Tensor
+) -> Logits:
+    """Project caller-selected hidden rows through a vocabulary head.
+
+    ``hidden`` holds packed rows ``[tokens, hidden]`` and ``token_indices``
+    the integer rows to project; empty selections remain empty. The head
+    must expose its ``VocabShard`` as ``head.vocab``. Vocabulary columns stay
+    local until the caller requests ``Logits.gather``.
+    """
+    if hidden.ndim != 2 or token_indices.ndim != 1:
+        raise ValueError(
+            "logits require packed hidden rows and one-dimensional token "
+            "indices"
+        )
+    if token_indices.dtype not in {torch.int32, torch.int64}:
+        raise ValueError("token indices must be integers")
+
+    vocab = head.vocab
+    if not isinstance(vocab, VocabShard):
+        raise TypeError("the vocabulary head must expose a VocabShard")
+    return Logits(head(hidden.index_select(0, token_indices)), vocab)
