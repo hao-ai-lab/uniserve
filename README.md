@@ -1,6 +1,6 @@
 # UniServe
 
-UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 guide](docs/fast_h3/fast_h3.md) covers every deployment, precision and option.
+UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 guide](docs/fast_h3/fast_h3.md) covers every deployment, precision and option. UniServe also serves the base MiniMax-H3 checkpoint, with text-to-video, keyframe and reference requests, and FastH3 OmniRef reference requests; the [MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers them.
 
 UniServe is a Python computation library and a Rust server. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, scheduling, request state and response assembly.
 
@@ -50,7 +50,7 @@ Startup prepares and captures every admitted request shape before `/health` repo
 curl --fail-with-body --max-time 600 \
   http://127.0.0.1:8000/v1/videos/sync \
   -H 'Content-Type: application/json' \
-  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","seconds":5,"seed":1000}' \
+  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","task":"t2va","target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5},"seed":1000}' \
   --output forest.mp4
 ```
 
@@ -78,14 +78,14 @@ One replica spanning every GPU gives the lowest latency; replicas serve more req
 | `GET /metrics` | Runtime metrics |
 | `GET /version` | Build information |
 | `GET /v1/models` | Configured served model |
-| `GET /v1/capabilities` | Accepted request fields, frame geometry, duration limits and job retention |
+| `GET /v1/capabilities` | Served tasks, canvases, duration limits, schedule, accepted request fields and job retention |
 | `POST /v1/videos/sync` | Generate one video and return the MP4 |
 | `POST /v1/videos` | Create an asynchronous video job |
 | `GET /v1/videos`, `GET /v1/videos/{id}` | List jobs, or read one job's state and progress |
 | `GET /v1/videos/{id}/content` | Download a completed job's MP4 |
 | `DELETE /v1/videos/{id}` | Cancel or delete a job |
 
-A video request accepts `model`, `prompt`, `seconds` (4 to 15, default 5) and `seed`. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
+A video request is the MiniMax-H3 request body: `model`, `prompt`, `task` (`t2va`), `target` with `short_edge` 768, `aspect_ratio` `16:9` and `duration_seconds` (4 to 15), and an optional `seed` (default 42). The [FastH3 guide](docs/fast_h3/fast_h3.md#generate-a-video) lists every field. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
 
 The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requests`, labeled by served-model name, profile, description, and state. `active` is the instantaneous in-flight count; `accepted`, `scheduled`, `finished`, `rejected`, `cancelled`, `aborted`, and `failed` are cumulative for the running serving runtime. Scheduler, worker, request-latency, and HTTP metrics share the same OpenMetrics response.
 

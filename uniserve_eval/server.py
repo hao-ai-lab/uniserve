@@ -8,11 +8,13 @@ stderr go to its own log file.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import os
 import signal
 import socket
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 from types import TracebackType
 from typing import IO, Self
@@ -29,14 +31,16 @@ _STOP_GRACE_S = 60.0
 
 
 class ManagedServer:
-    """Runs one server process group and waits for its TCP listener.
+    """Runs one server process group and waits until it is ready.
 
     Readiness is a successful TCP connect to `ServerProfile.host` and `port`,
     so those must name the address the launch command binds; configuration
     loading does not derive one from the other. With `uniserve serve`, the
     HTTP listener is bound only after `uniserve_server::build_state` has
     resolved the model assets and started the engine. A server that listens
-    earlier would be reported ready too soon.
+    earlier, such as one that warms up behind its listener, names the HTTP
+    path that reports its readiness as `ServerProfile.ready_path`; readiness
+    then also requires that path to answer 200.
     """
 
     def __init__(
@@ -54,9 +58,13 @@ class ManagedServer:
         self.timeout_s = timeout_s
         self.process: subprocess.Popen[str] | None = None
         self.log: IO[str] | None = None
+        # Monotonic launch time, and the seconds from it until the server was
+        # first found ready.
+        self.started_at: float | None = None
+        self.startup_s: float | None = None
 
     def __enter__(self) -> Self:
-        """Start the server and return after its listener accepts connections."""  # noqa: E501
+        """Start the server and return once it is ready."""
         # `__exit__` does not run when `__enter__` raises, so a failed launch
         # or readiness wait releases the log and any started process here.
         try:
@@ -81,6 +89,7 @@ class ManagedServer:
         # signals as a whole.
         environment = dict(os.environ)
         environment.update(self.launch.environment)
+        self.started_at = time.monotonic()
         self.process = subprocess.Popen(
             self.launch.command,
             cwd=self.launch.working_directory,
@@ -136,11 +145,15 @@ class ManagedServer:
             self.log = None
 
     def wait_until_ready(self) -> None:
-        """Wait for the configured TCP listener or report early process exit.
+        """Wait until the server is ready or report early process exit.
+
+        On success, `startup_s` holds the seconds from the launch until the
+        server was first found ready, its startup time under the readiness
+        rule of this class.
 
         Raises:
-            RuntimeError: If the server process exits before listening.
-            TimeoutError: If no connection succeeds before `timeout_s`
+            RuntimeError: If the server process exits before it is ready.
+            TimeoutError: If the server is not ready before `timeout_s`
                 elapses.
         """  # noqa: E501
         deadline = time.monotonic() + self.timeout_s
@@ -150,26 +163,44 @@ class ManagedServer:
                     f"server exited with code {self.process.returncode}; "
                     f"see {self.log_path}"
                 )
-            try:
-                with socket.create_connection(
-                    (self.profile.host, self.profile.port), timeout=1
-                ):
-                    return
-            except OSError:
-                time.sleep(0.5)
+            if self._ready():
+                assert self.started_at is not None
+                self.startup_s = time.monotonic() - self.started_at
+                return
+            time.sleep(0.5)
         raise TimeoutError(
-            f"server did not listen on "
+            f"server was not ready on "
             f"{self.profile.host}:{self.profile.port} "
             f"within {self.timeout_s}s"
         )
 
+    def _ready(self) -> bool:
+        """Probe the listener and, when configured, the readiness path once."""
+        address = (self.profile.host, self.profile.port)
+        try:
+            with socket.create_connection(address, timeout=1):
+                pass
+        except OSError:
+            return False
+        if self.profile.ready_path is None:
+            return True
+
+        # A warming server answers its readiness path with an error status
+        # until it can serve; any failure to answer counts as not ready.
+        url = f"http://{address[0]}:{address[1]}{self.profile.ready_path}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                return response.status == 200
+        except (OSError, http.client.HTTPException):
+            return False
+
 
 class ManagedDeployment:
-    """Runs every process of one deployment and waits until all listen.
+    """Runs every process of one deployment and waits until all are ready.
 
     Replicas launch together so their model loading overlaps, and readiness
-    requires every listener. Any launch or readiness failure stops all of
-    them, as does leaving the context.
+    requires every process to be ready. Any launch or readiness failure stops
+    all of them, as does leaving the context.
     """
 
     def __init__(
@@ -185,7 +216,7 @@ class ManagedDeployment:
         ]
 
     def __enter__(self) -> Self:
-        """Start every process and return once all listeners accept."""
+        """Start every process and return once all are ready."""
         try:
             for server in self.servers:
                 server.start()
@@ -209,6 +240,18 @@ class ManagedDeployment:
         """Stop every process; each stop is a no-op once completed."""
         for server in self.servers:
             server.stop()
+
+    @property
+    def startup_s(self) -> float | None:
+        """Seconds from the launch until every process was ready, if ready.
+
+        The processes launch together, so the deployment is ready when its
+        slowest process is.
+        """
+        times = [server.startup_s for server in self.servers]
+        if any(value is None for value in times):
+            return None
+        return max(value for value in times if value is not None)
 
     def exited(self) -> list[Path]:
         """Return the logs of processes that are no longer running."""

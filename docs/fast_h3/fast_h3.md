@@ -1,6 +1,6 @@
 # FastH3 cheat sheet
 
-UniServe serves the FastH3 text-to-video-and-audio checkpoints. The output is an H.264/AAC MP4 at 1344×768 (16:9) or 768×1344 (9:16), 24 fps, with stereo 32-kHz audio.
+UniServe serves the FastH3 text-to-video-and-audio checkpoints. The output is an H.264/AAC MP4 at one of the checkpoint's training buckets, 1344×768 and 768×1344 in the default deployment (see [Generate a video](#generate-a-video)), 24 fps, with stereo 32-kHz audio.
 
 ## Requirements
 
@@ -146,7 +146,7 @@ curl --fail-with-body http://127.0.0.1:8000/v1/models
 curl --fail-with-body http://127.0.0.1:8000/v1/capabilities | python -m json.tool
 ```
 
-`/v1/capabilities` reports the accepted request fields, the frame geometry, the duration limits, and the job retention bounds described below.
+`/v1/capabilities` reports the served tasks and their condition rules, the canvas rule and the canvases the checkpoint serves, the duration limits, the checkpoint's schedule, the prompt capacity, the accepted media sources and request fields, and the job retention bounds described below.
 
 ## Build and run with Docker
 
@@ -172,24 +172,39 @@ The image build compiles UniServe's native kernels. The first startup compiles t
 
 ## Generate a video
 
-Only `model`, `prompt`, `seconds`, `seed`, `resolution`, and `aspect_ratio` are accepted, as JSON or as `multipart/form-data`. `resolution` and `aspect_ratio` together select the output raster from the checkpoint's training buckets:
+A request is the MiniMax-H3 request body, sent as JSON or as `multipart/form-data` with the same field names and `conditions` and `target` as JSON text. FastH3 generates text-to-video-and-audio (`t2va`) at the checkpoint's training buckets: `target.short_edge` selects the resolution and `target.aspect_ratio` the aspect ratio.
 
-| `resolution` | `21:9` | `16:9` | `4:3` | `1:1` | `3:4` | `9:16` |
+| `target.short_edge` | `21:9` | `16:9` | `4:3` | `1:1` | `3:4` | `9:16` |
 | --- | --- | --- | --- | --- | --- | --- |
-| `768p` | 1536×672 | 1344×768 | 1024×768 | 768×768 | 768×1024 | 768×1344 |
-| `480p` | 992×416 | 832×480 | 640×480 | 480×480 | 480×640 | 480×832 |
+| 768 | 1536×672 | 1344×768 | 1024×768 | 768×768 | 768×1024 | 768×1344 |
+| 480 | 992×416 | 832×480 | 640×480 | 480×480 | 480×640 | 480×832 |
 
-A deployment serves the rasters it prepares at startup: every resolution in `--video-resolutions` (default `768p`) crossed with every aspect ratio in `--video-aspect-ratios` (default `16:9,9:16`). The first value of each list is the request default, so a request that names neither field gets 1344×768 by default. A request naming a value the deployment does not serve is rejected. `GET /v1/capabilities` lists the served values as `resolutions` and `aspect_ratios`, the defaults as `default_resolution` and `default_aspect_ratio`, and each raster under `sizes`. `seconds` is a finite number of seconds from 4 to 15 inclusive, fractional values included; it defaults to 5 seconds, or to `--max-video-seconds` when that is shorter, and `seed` defaults to 0. `--max-video-seconds` sets the deployment's capacity within that range (default 15); a request longer than the capacity is rejected, and `GET /v1/capabilities` reports the capacity as `max_seconds` next to the API range `min_seconds` and `model_max_seconds`.
+A deployment serves the canvases it prepares at startup: every resolution in `--video-resolutions` (`768p` or `480p`; default `768p`) crossed with every aspect ratio in `--video-aspect-ratios` (default `16:9,9:16`), so the default deployment serves 1344×768 and 768×1344. A request for any other canvas is rejected. `GET /v1/capabilities` lists the served canvases under `canvas.canvases`, the served short edges and aspect ratios under `canvas.short_edges` and `canvas.aspect_ratios`, and the canvas of each served pair under `canvas.sizes`.
+
+| Field | Rule |
+| --- | --- |
+| `model` | Required; the served model name |
+| `prompt` | Required; not blank |
+| `task` | Required; `t2va` |
+| `conditions` | Optional; empty for `t2va` |
+| `target` | Required: `short_edge` 768 or 480, `aspect_ratio` a served ratio or `auto` (16:9 for `t2va`), and `duration_seconds`, a finite number of seconds from 4 to 15 inclusive, fractional values included |
+| `seed` | Optional unsigned integer; defaults to 42 |
+| `num_inference_steps`, `flow_shift`, `audio_flow_shift` | Optional; when present, each must equal the checkpoint's schedule that `/v1/capabilities` reports under `schedule`. `num_inference_steps` counts sigma points including the clean endpoint, one more than the denoiser forwards: 9 for the 8-Step checkpoints and 5 for the 4-step ones |
+| `n`, `num_outputs_per_prompt` | Optional; only 1 |
+| `quality` | Optional; only `lossless` |
+| `seconds`, `size`, `width`, `height` | Optional; accepted only when they agree with the duration and canvas the target resolves to |
+
+Any other field is rejected, and so is a request without `task` or `target`; the response names the field. `--max-video-seconds` sets the deployment's duration capacity within the API range (default 15); a request longer than the capacity is rejected, and `GET /v1/capabilities` reports the capacity as `max_seconds` next to the API range `min_seconds` and `model_max_seconds`.
 
 ```bash
 curl --fail-with-body --max-time 600 \
   http://127.0.0.1:8000/v1/videos/sync \
   -H 'Content-Type: application/json' \
-  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","seconds":5,"seed":1000}' \
+  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","task":"t2va","target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5},"seed":1000}' \
   --output forest.mp4
 ```
 
-The synchronous endpoint returns MP4 bytes at 24 frames per second. H3 converts the requested duration to `seconds * 24` frames, rounded half to even, and extends that count up to its next complete temporal window of `17n + 5` frames, so the video can last slightly longer than requested. A 4-second request produces 107 frames (about 4.46 seconds), a 5-second request 124 frames (about 5.17 seconds), and a 15-second request 362 frames (about 15.08 seconds). A fixed output resolution therefore has exactly 16 frame counts: 107, 124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345, and 362.
+The synchronous endpoint returns MP4 bytes at 24 frames per second. H3 converts the requested `duration_seconds` to `duration_seconds * 24` frames, rounded half to even, and extends that count up to its next complete temporal window of `17n + 5` frames, so the video can last slightly longer than requested. A 4-second request produces 107 frames (about 4.46 seconds), a 5-second request 124 frames (about 5.17 seconds), and a 15-second request 362 frames (about 15.08 seconds). A fixed output resolution therefore has exactly 16 frame counts: 107, 124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345, and 362.
 
 ## Use asynchronous jobs
 
@@ -198,7 +213,7 @@ Create a job:
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/v1/videos \
   -H 'Content-Type: application/json' \
-  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","seconds":5,"seed":1000}'
+  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","task":"t2va","target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5},"seed":1000}'
 ```
 
 Use the returned `video_...` ID:
@@ -212,7 +227,7 @@ curl --fail-with-body http://127.0.0.1:8000/v1/videos
 curl --fail-with-body -X DELETE "http://127.0.0.1:8000/v1/videos/$VIDEO_ID"
 ```
 
-Job states are `queued`, `in_progress`, `completed`, and `failed`. A running job also reports `phase` (`encoding`, `preparing`, `denoising`, `decoding`, then `finalizing`), `completed_steps` against `total_steps`, and both the requested `seconds` and the generated `num_frames` with their duration `actual_seconds`. Jobs and retained MP4s live in the server process, expire after one hour, and disappear on restart. The server retains at most 1 GiB of artifacts, and retained jobs and in-flight synchronous requests share 128 job slots. Deleting a queued or running job cancels it.
+Job states are `queued`, `in_progress`, `completed`, and `failed`. A running job also reports `phase` (`encoding`, `preparing`, `denoising`, `decoding`, then `finalizing`), `completed_steps` against `total_steps`, the requested duration `seconds`, the generated `num_frames` with their duration `actual_seconds`, and the generated canvas `size` (`1344x768`). Jobs and retained MP4s live in the server process, expire after one hour, and disappear on restart. The server retains at most 1 GiB of artifacts, and retained jobs and in-flight synchronous requests share 128 job slots. Deleting a queued or running job cancels it.
 
 A request to either endpoint while all 128 job slots are taken returns HTTP 429 with code `video_job_capacity_exceeded`. A failed job reports `error.code`: `invalid_request_error` when the deployment cannot serve the request as specified, `server_overloaded` when the engine's waiting queue was full and the same request may be resubmitted, and `generation_failed` when execution failed. The synchronous endpoint returns the same conditions as HTTP 400, 503, and 500.
 

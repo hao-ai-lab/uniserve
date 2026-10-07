@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
+use hf_hub::Cache;
 use hf_hub::api::tokio::{Api, ApiBuilder, ApiError, ApiRepo};
 use thiserror_ext::AsReport as _;
 
@@ -98,15 +99,18 @@ impl ModelSource {
         })
     }
 
+    /// The configured model id: the local directory or the repository id.
+    pub(crate) fn id(&self) -> String {
+        match self {
+            Self::Local(directory) => directory.display().to_string(),
+            Self::Hub { repo_id, .. } => repo_id.clone(),
+        }
+    }
+
     /// Resolves one checkpoint-relative file; see [`resolve_model_file`].
     pub(crate) async fn file(&self, filename: &str) -> Result<PathBuf> {
         match self {
-            Self::Local(directory) => {
-                local_file_if_exists(directory, filename).ok_or_else(|| Error::MissingFile {
-                    model: directory.display().to_string(),
-                    file: filename.to_owned(),
-                })
-            }
+            Self::Local(directory) => local_file(directory, filename),
             Self::Hub { api, repo_id } => {
                 fetch_file(&api.model(repo_id.clone()), repo_id, filename).await
             }
@@ -120,6 +124,38 @@ impl ModelSource {
             Self::Hub { api, repo_id } => resolve_remote_model_files(api, repo_id).await,
         }
     }
+}
+
+/// A Hub client and the cache it reads and fills.
+///
+/// `hf_hub` does not expose a client's cache, so a reader that consults the
+/// cache's snapshots directly keeps the cache beside the client.
+pub(crate) struct HubClient {
+    /// Client for Hub requests and downloads into `cache`.
+    pub(crate) api: Api,
+    /// The cache `api` reads and fills.
+    pub(crate) cache: Cache,
+}
+
+impl HubClient {
+    /// Builds the client [`ModelSource::from_model_id`] uses for a Hub
+    /// repository, with the cache it is configured with (under `HF_HOME`
+    /// when set). `model_id` labels a construction failure.
+    pub(crate) fn from_env(model_id: &str) -> Result<Self> {
+        Ok(Self {
+            api: build_api(model_id)?,
+            cache: Cache::from_env(),
+        })
+    }
+}
+
+/// Returns a file of a local checkpoint directory, or
+/// [`Error::MissingFile`] when the directory does not hold it.
+pub(crate) fn local_file(directory: &Path, filename: &str) -> Result<PathBuf> {
+    local_file_if_exists(directory, filename).ok_or_else(|| Error::MissingFile {
+        model: directory.display().to_string(),
+        file: filename.to_owned(),
+    })
 }
 
 /// Resolves the model files present in a local checkpoint directory.
@@ -205,7 +241,7 @@ async fn download_if_present(
 /// A 404 answer, the Hub's response for a file the repository does not
 /// publish, is [`Error::MissingFile`]; every other failure is
 /// [`Error::Remote`].
-async fn fetch_file(repo: &ApiRepo, model_id: &str, filename: &str) -> Result<PathBuf> {
+pub(crate) async fn fetch_file(repo: &ApiRepo, model_id: &str, filename: &str) -> Result<PathBuf> {
     repo.get(filename).await.map_err(|error| match &error {
         ApiError::RequestError(request)
             if request

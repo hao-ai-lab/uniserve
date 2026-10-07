@@ -82,8 +82,8 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
             limits: client.generation_limits(),
             sampling_controls: ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 4096,
-            denoise_steps: 0,
         },
+        None,
         false,
     )
     .unwrap();

@@ -34,6 +34,23 @@ impl VideoResolution {
             Self::P480 => "480p",
         }
     }
+
+    /// The `target.short_edge`, in pixels, that names this class: the short
+    /// edge its buckets start from before an area cap, so a capped bucket
+    /// such as 21:9 has a shorter side.
+    pub const fn short_edge(self) -> u32 {
+        match self {
+            Self::P768 => 768,
+            Self::P480 => 480,
+        }
+    }
+
+    /// Returns the class a `target.short_edge` names.
+    pub fn from_short_edge(short_edge: u32) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|resolution| resolution.short_edge() == short_edge)
+    }
 }
 
 impl fmt::Display for VideoResolution {
@@ -102,12 +119,34 @@ impl VideoRaster {
             height,
         })
     }
+
+    /// Returns the training bucket of a resolution class and a `W:H` aspect
+    /// ratio, or `None` when the checkpoint has no such bucket.
+    pub fn named(resolution: VideoResolution, aspect_ratio: &str) -> Option<Self> {
+        VIDEO_ASPECT_RATIOS
+            .into_iter()
+            .find(|name| name.as_str() == aspect_ratio)
+            .and_then(|name| Self::new(resolution, name))
+    }
+
+    /// Returns the training bucket with exactly these pixel dimensions.
+    pub fn find(width: u32, height: u32) -> Option<Self> {
+        VideoResolution::ALL
+            .into_iter()
+            .flat_map(|resolution| {
+                VIDEO_ASPECT_RATIOS
+                    .into_iter()
+                    .filter_map(move |aspect_ratio| Self::new(resolution, aspect_ratio))
+            })
+            .find(|raster| raster.width == width && raster.height == height)
+    }
 }
 
 /// The rasters a deployment serves: every configured resolution crossed with
 /// every configured aspect ratio, resolution-major.
 ///
-/// The first resolution and the first aspect ratio are the request defaults.
+/// The first resolution and the first aspect ratio are the defaults of a
+/// request that names neither, as a Dynamo request without a `size` does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoRasters {
     resolutions: Vec<VideoResolution>,
@@ -265,6 +304,24 @@ mod tests {
             }
         }
         assert!(VideoRaster::new(VideoResolution::P768, ResolutionName::Landscape3x2).is_none());
+    }
+
+    #[test]
+    fn short_edges_and_sizes_name_the_training_buckets() {
+        for resolution in VideoResolution::ALL {
+            assert_eq!(
+                VideoResolution::from_short_edge(resolution.short_edge()),
+                Some(resolution)
+            );
+        }
+        assert_eq!(VideoResolution::from_short_edge(720), None);
+        // The 480p 21:9 bucket is the training table's, not a rescaled 768p
+        // canvas.
+        let narrow = VideoRaster::named(VideoResolution::P480, "21:9").unwrap();
+        assert_eq!((narrow.width, narrow.height), (992, 416));
+        assert_eq!(VideoRaster::find(992, 416), Some(narrow));
+        assert!(VideoRaster::find(960, 416).is_none());
+        assert!(VideoRaster::named(VideoResolution::P768, "3:2").is_none());
     }
 
     #[test]

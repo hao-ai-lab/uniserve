@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from uniserve_eval.config import ServerLaunch, ServerProfile
-from uniserve_eval.server import ManagedServer
+from uniserve_eval.server import ManagedDeployment, ManagedServer
 
 pytestmark = pytest.mark.unit
 
@@ -29,6 +29,21 @@ if start_worker == "1":
     worker = subprocess.Popen([sys.executable, "-c", sleeper])
     with open(pid_path, "w") as handle:
         handle.write(str(worker.pid))
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen()
+time.sleep(300)
+"""
+
+
+# A stand-in server that loads for a while before it listens. The arguments
+# are the port and the load time in seconds.
+_LATE_SERVER = """
+import socket, sys, time
+
+port, load_s = int(sys.argv[1]), float(sys.argv[2])
+time.sleep(load_s)
 listener = socket.socket()
 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 listener.bind(("127.0.0.1", port))
@@ -127,3 +142,89 @@ def test_stop_terminates_the_group_after_the_server_was_killed(
         if worker is not None:
             with suppress(ProcessLookupError):
                 os.kill(worker, signal.SIGKILL)
+
+
+def test_startup_time_runs_from_launch_to_the_first_accepted_connection(
+    tmp_path: Path,
+) -> None:
+    """A deployment reports how long its slowest process took to listen."""
+    ports = [_free_port(), _free_port()]
+    # Each stand-in loads for its delay before it binds its listener.
+    delays = (0.2, 0.6)
+    processes = []
+    for index, (port, delay) in enumerate(zip(ports, delays, strict=True)):
+        command = (
+            sys.executable,
+            "-c",
+            _LATE_SERVER,
+            str(port),
+            str(delay),
+        )
+        processes.append(
+            (
+                ServerProfile(
+                    f"replica-{index}", command, "127.0.0.1", port, {}
+                ),
+                ServerLaunch(command, tmp_path, {}),
+                tmp_path / f"{index}.log",
+            )
+        )
+
+    deployment = ManagedDeployment(processes, timeout_s=30.0)
+    assert deployment.startup_s is None
+    with deployment:
+        startup = deployment.startup_s
+
+    assert startup is not None and startup >= max(delays)
+    assert startup == max(server.startup_s for server in deployment.servers)
+
+
+# A stand-in server that listens at once and answers its health path with
+# 503 while it warms up, then 200. The arguments are the port and the warmup
+# time in seconds.
+_WARMING_SERVER = """
+import sys, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+port, warmup_s = int(sys.argv[1]), float(sys.argv[2])
+started = time.monotonic()
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        warm = time.monotonic() - started >= warmup_s
+        self.send_response(200 if warm and self.path == "/health" else 503)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"""
+
+
+@pytest.mark.parametrize("ready_path", [None, "/health"])
+def test_a_readiness_path_holds_startup_until_the_server_reports_ready(
+    tmp_path: Path, ready_path: str | None
+) -> None:
+    """A server that warms up behind its listener is ready only when warm."""
+    port = _free_port()
+    warmup_s = 1.0
+    command = (sys.executable, "-c", _WARMING_SERVER, str(port), str(warmup_s))
+    server = ManagedServer(
+        ServerProfile(
+            "local", command, "127.0.0.1", port, {}, ready_path=ready_path
+        ),
+        ServerLaunch(command, tmp_path, {}),
+        tmp_path / "server.log",
+        timeout_s=30.0,
+    )
+
+    with server:
+        startup = server.startup_s
+
+    assert startup is not None
+    if ready_path is None:
+        # The listener alone accepts long before the warmup ends.
+        assert startup < warmup_s
+    else:
+        assert startup >= warmup_s

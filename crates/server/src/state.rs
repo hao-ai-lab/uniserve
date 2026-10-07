@@ -29,6 +29,8 @@ pub struct AppState {
     api_key: Option<String>,
     request_timeout: Option<Duration>,
     max_concurrent_requests: Option<u64>,
+    /// HTTP body limit of the video submission routes, in bytes.
+    video_body_limit: usize,
     /// In-flight requests counted by `http::middleware::track_server_load`,
     /// which counts only requests to the routes listed in its
     /// `TRACKED_HANDLERS`.
@@ -46,6 +48,7 @@ impl AppState {
             api_key: None,
             request_timeout: None,
             max_concurrent_requests: None,
+            video_body_limit: crate::http::BODY_LIMIT,
             server_load: AtomicU64::new(0),
         }
     }
@@ -82,6 +85,18 @@ impl AppState {
     }
 
     /// Returns the serving runtime.
+    /// Sets the HTTP body limit of the video submission routes, whose bodies
+    /// may carry condition media inline (`VideoMediaSettings::body_limit`).
+    pub fn with_video_body_limit(mut self, bytes: usize) -> Self {
+        self.video_body_limit = bytes;
+        self
+    }
+
+    /// Returns the HTTP body limit of the video submission routes.
+    pub fn video_body_limit(&self) -> usize {
+        self.video_body_limit
+    }
+
     pub fn runtime(&self) -> &ServingRuntime {
         &self.runtime
     }

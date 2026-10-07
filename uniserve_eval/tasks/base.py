@@ -22,6 +22,7 @@ from ..types import (
     TaskName,
     TaskRequest,
     ValidationResult,
+    VideoConfig,
 )
 
 
@@ -143,6 +144,13 @@ class BenchmarkTask:
             raise ValueError(
                 f"{context} does not declare a per-request image count"
             )
+
+    @classmethod
+    def check_video(cls, video: VideoConfig, context: str) -> None:
+        """Validate video settings against the task's request contract.
+
+        Tasks that build no video requests accept any settings.
+        """
 
     def apply_text_sampling(self, payload: dict[str, Any]) -> None:
         """Add configured text-sampling fields to an endpoint payload.

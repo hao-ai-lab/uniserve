@@ -7,9 +7,10 @@
 //! component's specification may name its folder explicitly.
 //!
 //! Server startup (`ModelConfig::load` in `serving::model`) consults this
-//! index before any other asset: its presence marks a checkpoint as a
-//! pipeline, and `_class_name` selects the family. The Dynamo worker binary
-//! uses the same index to accept only MiniMax H3 checkpoints.
+//! index, through `PipelineCheckpoint`, before any other asset: its presence
+//! marks a checkpoint as a pipeline, and `_class_name` selects the family.
+//! The Dynamo worker binary uses the same index to accept only MiniMax H3
+//! checkpoints.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -105,7 +106,7 @@ pub async fn resolve_pipeline_index(model_id: &str) -> Result<Option<PipelineInd
 }
 
 /// Resolves the root index from an already classified model source.
-async fn pipeline_index(source: &ModelSource) -> Result<Option<PipelineIndex>> {
+pub(super) async fn pipeline_index(source: &ModelSource) -> Result<Option<PipelineIndex>> {
     for filename in PIPELINE_INDEX_FILES {
         match source.file(filename).await {
             Ok(path) => return read_pipeline_index(&path).map(Some),

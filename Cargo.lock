@@ -9588,6 +9588,7 @@ dependencies = [
  "llm-multimodal",
  "minijinja",
  "minijinja-contrib",
+ "reqwest 0.12.28",
  "serde",
  "serde-json-fmt",
  "serde_json",

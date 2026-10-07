@@ -154,17 +154,12 @@ pub enum ModelParameters {
     SenseNova(SenseNovaProfile),
     /// Bagel image, prompt, and generation settings.
     Bagel(BagelProfile),
-    /// Fast H3 checkpoint and duration limits.
+    /// MiniMax-H3 duration limit. What the placed denoiser serves (tasks,
+    /// schedule, canvases) belongs to the loaded worker, whose startup
+    /// handshake reports it.
     MiniMaxH3 {
         /// Maximum requested duration in seconds, before frame alignment.
         max_video_seconds: f64,
-        /// Output rasters the worker prepares and requests select from.
-        video_rasters: video::VideoRasters,
-        /// Fixed number of denoising predictions in the checkpoint contract.
-        ///
-        /// [`ModelConfig::from_pipeline`] leaves it zero; `InputProcessor::new`
-        /// binds the count the worker advertises in its startup handshake.
-        num_inference_steps: u32,
     },
 }
 
@@ -280,19 +275,13 @@ impl ModelConfig {
         model_id: &str,
         description: ModelDescription,
         max_video_seconds: f64,
-        video_rasters: video::VideoRasters,
         max_model_tokens: Option<u32>,
     ) -> assets::Result<Self> {
         let (parameters, default_max_model_tokens) = match description {
             // MiniMax H3's text encoder serves prompts of up to 16,384 tokens.
-            ModelDescription::MiniMaxH3 => (
-                ModelParameters::MiniMaxH3 {
-                    max_video_seconds,
-                    video_rasters,
-                    num_inference_steps: 0,
-                },
-                16_384,
-            ),
+            ModelDescription::MiniMaxH3 => {
+                (ModelParameters::MiniMaxH3 { max_video_seconds }, 16_384)
+            }
             ModelDescription::Qwen3 | ModelDescription::SenseNova | ModelDescription::Bagel => {
                 return Err(assets::Error::UnsupportedPipeline {
                     class_name: description.id().to_owned(),
@@ -535,14 +524,8 @@ mod tests {
         );
         assert_eq!(ModelDescription::from_model_type("minimax_h3"), None);
 
-        let profile = ModelConfig::from_pipeline(
-            "h3",
-            ModelDescription::MiniMaxH3,
-            15.0,
-            super::video::VideoRasters::default(),
-            None,
-        )
-        .unwrap();
+        let profile =
+            ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, 15.0, None).unwrap();
         assert_eq!(profile.description(), ModelDescription::MiniMaxH3);
         assert_eq!(profile.max_model_tokens, Some(16_384));
     }

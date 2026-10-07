@@ -86,6 +86,10 @@ class ServerProfile:
     `host`, `port` and `environment`, or independent `replicas`, each a
     complete single-process profile. Replicas are separate engines on
     disjoint devices; the client routes each request to one of them.
+
+    A server is ready once its listener accepts a connection and, when
+    `ready_path` names one, that path answers HTTP 200: a server that listens
+    before it finishes starting reports its readiness there.
     """
 
     name: str
@@ -94,6 +98,7 @@ class ServerProfile:
     port: int
     environment: dict[str, str]
     replicas: tuple[ServerProfile, ...] = ()
+    ready_path: str | None = None
 
     @property
     def instances(self) -> tuple[ServerProfile, ...]:
@@ -333,13 +338,14 @@ def _server_profile(name: str, raw: Any) -> ServerProfile:
     """Validate and construct one server profile table.
 
     A table with `replicas` declares an array of single-process tables. Each
-    replica inherits the table's `host` unless it names its own, merges the
-    table's `environment` under its own, and must not repeat a host and port.
+    replica inherits the table's `host` and `ready_path` unless it names its
+    own, merges the table's `environment` under its own, and must not repeat
+    a host and port.
     """
     value = expand_environment(_mapping(raw, f"servers.{name}"))
     _reject_unknown(
         value,
-        {"command", "host", "port", "environment", "replicas"},
+        {"command", "host", "port", "environment", "ready_path", "replicas"},
         f"servers.{name}",
     )
     if "replicas" not in value:
@@ -355,18 +361,26 @@ def _server_profile(name: str, raw: Any) -> ServerProfile:
         raise ValueError(f"servers.{name}.replicas must list two or more")
     host = _server_host(value, f"servers.{name}")
     shared = _server_environment(value, f"servers.{name}")
+    ready_path = _server_ready_path(value, f"servers.{name}")
     replicas = []
     for index, item in enumerate(replicas_value):
         context = f"servers.{name}.replicas[{index}]"
         item = _mapping(item, context)
         _reject_unknown(
-            item, {"command", "host", "port", "environment"}, context
+            item,
+            {"command", "host", "port", "environment", "ready_path"},
+            context,
         )
         environment = {**shared, **_server_environment(item, context)}
         replicas.append(
             _server_process(
                 f"{name}.replica-{index}",
-                {"host": host, **item, "environment": environment},
+                {
+                    "host": host,
+                    "ready_path": ready_path,
+                    **item,
+                    "environment": environment,
+                },
                 context,
             )
         )
@@ -381,6 +395,7 @@ def _server_profile(name: str, raw: Any) -> ServerProfile:
         first.port,
         shared,
         tuple(replicas),
+        ready_path,
     )
 
 
@@ -409,7 +424,18 @@ def _server_process(
         _server_host(value, context),
         port,
         _server_environment(value, context),
+        ready_path=_server_ready_path(value, context),
     )
+
+
+def _server_ready_path(value: dict[str, Any], context: str) -> str | None:
+    """Return a table's validated readiness path, if it names one."""
+    path = value.get("ready_path")
+    if path is not None and (
+        not isinstance(path, str) or not path.startswith("/")
+    ):
+        raise ValueError(f"{context}.ready_path must be an absolute URL path")
+    return path
 
 
 def _server_host(value: dict[str, Any], context: str) -> str:
@@ -484,6 +510,7 @@ def _benchmark_point(
 
     # Construct only after every referenced component has accepted the point.
     task.check_image(image, f"benchmarks.{name}")
+    task.check_video(video, f"benchmarks.{name}.video")
     return BenchmarkPoint(
         name=name,
         server=server,

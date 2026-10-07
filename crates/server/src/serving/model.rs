@@ -12,18 +12,17 @@
 //! sibling `preprocessing` module route through the same `InputProcessor::preprocess_generation`,
 //! which delegates SenseNova and Bagel inputs to the sibling `omni` module; `omni` reads the
 //! `pub(super)` fields.
-//! [`InputProcessor::preprocess_video_request`] produces a `DiffusionRequest` for MiniMax H3.
+//! [`InputProcessor::preprocess_video_request`] produces a `DiffusionRequest` for MiniMax H3
+//! through the deployment's `VideoService`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::EngineSettings;
-use crate::profile::assets::{ResolvedModelFiles, resolve_model_file, resolve_pipeline_index};
+use crate::profile::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::profile::omni::bagel::BagelProfile;
-use crate::profile::omni::resolution::ResolutionName;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use crate::profile::video::VideoResolution;
 use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
 use thiserror::Error;
 use uniserve_core::{
@@ -37,6 +36,8 @@ use crate::serving::input::{
     TextPromptRequest,
 };
 use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
+use crate::serving::video::plan::VisionConfig;
+use crate::serving::video::{PreparedVideo, VideoService};
 use crate::serving::{
     CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key,
 };
@@ -187,6 +188,8 @@ pub struct InputProcessor {
     pub(super) limits: GenerationLimits,
     sampling_controls: Vec<ServedSamplingControl>,
     parse_reasoning: bool,
+    // What the deployment's video denoiser serves; set exactly for MiniMax H3.
+    video: Option<VideoService>,
 }
 
 #[derive(Debug, Error)]
@@ -226,17 +229,54 @@ pub enum ModelResolutionError {
     },
 }
 
+/// The model facts and preprocessing resources startup resolves.
+pub(crate) struct LoadedModel {
+    /// Immutable model facts.
+    pub config: ModelConfig,
+    /// The prompt tokenizer.
+    pub tokenizer: DynTokenizer,
+    /// The chat renderer; `None` for a diffusers pipeline.
+    pub renderer: Option<HfChatRenderer>,
+    /// The vision processor geometry of a video pipeline's conditioner.
+    pub vision: Option<VisionConfig>,
+}
+
+/// Loads a diffusers pipeline's `tokenizer` component as the pipeline's own
+/// `transformers` tokenizer loads it: `tokenizer.json` with the special
+/// tokens its `tokenizer_config.json`, when published, declares.
+///
+/// The conditioner reads token ids, so a declared token missing here would
+/// split into text tokens the reference never presents (MiniMax-H3 declares
+/// its `<d>` dialogue marker only in the configuration).
+pub(crate) async fn pipeline_tokenizer(
+    pipeline: &PipelineCheckpoint,
+) -> std::result::Result<HuggingFaceTokenizer, ModelResolutionError> {
+    let path = pipeline
+        .component_file("tokenizer", "tokenizer.json")
+        .await?;
+    let tokenizer = match pipeline
+        .component_file("tokenizer", "tokenizer_config.json")
+        .await
+    {
+        Ok(config) => HuggingFaceTokenizer::with_config(&path, &config)?,
+        Err(crate::profile::assets::Error::MissingFile { .. }) => HuggingFaceTokenizer::new(&path)?,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(tokenizer)
+}
+
 impl ModelConfig {
     /// Loads model facts and the tokenizer/template resources needed by preprocessing.
     ///
-    /// Returns the renderer as `None` for a diffusers pipeline. The returned
-    /// `max_model_tokens` is always set: the configured `max_model_len`, else, for a root
-    /// configuration, its `max_position_embeddings` or `EngineSettings::DEFAULT_MAX_MODEL_LEN`,
-    /// and for a pipeline the model's default prompt limit.
+    /// A diffusers pipeline has no renderer and carries its conditioner's
+    /// vision processor geometry instead. The returned `max_model_tokens` is
+    /// always set: the configured `max_model_len`, else, for a root
+    /// configuration, its `max_position_embeddings` or
+    /// `EngineSettings::DEFAULT_MAX_MODEL_LEN`, and for a pipeline the model's
+    /// default prompt limit.
     pub(crate) async fn load(
         config: &crate::Config,
-    ) -> std::result::Result<(Self, DynTokenizer, Option<HfChatRenderer>), ModelResolutionError>
-    {
+    ) -> std::result::Result<LoadedModel, ModelResolutionError> {
         let served_name = config
             .served_model_name
             .clone()
@@ -244,32 +284,37 @@ impl ModelConfig {
         // A diffusers pipeline declares its class and component folders in a
         // root index rather than a root `config.json`, so the index selects the
         // profile and locates the tokenizer component before any other asset
-        // is resolved.
-        if let Some(index) = resolve_pipeline_index(&config.model).await? {
-            let description =
-                ModelDescription::from_pipeline_class(&index.class_name).ok_or_else(|| {
-                    crate::profile::assets::Error::UnsupportedPipeline {
-                        class_name: index.class_name.clone(),
-                    }
+        // is resolved. A component export reads the components its pinned
+        // base supplies from `base_model`, or from the Hub cache at the
+        // pinned revision, as its workers do; `base_model` is refused for
+        // any other checkpoint.
+        let base_model = config.base_model.as_deref();
+        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model, base_model).await? {
+            let description = ModelDescription::from_pipeline_class(pipeline.class_name())
+                .ok_or_else(|| crate::profile::assets::Error::UnsupportedPipeline {
+                    class_name: pipeline.class_name().to_owned(),
                 })?;
-            let tokenizer_path = resolve_model_file(
-                &config.model,
-                &index.component_file("tokenizer", "tokenizer.json")?,
-            )
-            .await?;
-            let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?);
+            let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline).await?);
+            // The conditioner's Qwen3-VL processor fixes how condition media
+            // is patched; requests are planned against it.
+            let mut processor = Vec::with_capacity(2);
+            for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
+                processor.push(pipeline.component_file("processor", name).await?);
+            }
+            let vision = VisionConfig::read(&processor[0], &processor[1])
+                .map_err(|error| ModelResolutionError::MediaContract(format!("{error:#}")))?;
             let model = Self::from_pipeline(
                 &served_name,
                 description,
                 config.engine.max_video_seconds,
-                crate::profile::video::VideoRasters::new(
-                    &config.engine.video_resolutions,
-                    &config.engine.video_aspect_ratios,
-                )
-                .map_err(ModelResolutionError::MediaContract)?,
                 config.engine.max_model_len,
             )?;
-            return Ok((model, tokenizer, None));
+            return Ok(LoadedModel {
+                config: model,
+                tokenizer,
+                renderer: None,
+                vision: Some(vision),
+            });
         }
 
         let files = ResolvedModelFiles::new(&config.model).await?;
@@ -301,7 +346,12 @@ impl ModelConfig {
             },
             None,
         )?;
-        Ok((model, tokenizer, Some(renderer)))
+        Ok(LoadedModel {
+            config: model,
+            tokenizer,
+            renderer: Some(renderer),
+            vision: None,
+        })
     }
 
     /// Model's effective startup context ceiling.
@@ -318,10 +368,12 @@ impl ModelConfig {
     /// A host product stays in a shared-storage segment on its host; across
     /// hosts its bytes ride the rank channel, in the producing rank's result
     /// and in the consuming rank's batch, so the capacity admits the largest
-    /// such product a rank publishes at once. A native FastH3 decode unit
-    /// holds 22 RGB frames at 1344x768 (68,124,672 bytes) plus its protocol
-    /// envelope. The rings grow to what a message needs, so the capacity costs
-    /// nothing until a message uses it.
+    /// such product a rank publishes at once. A MiniMax H3 decode unit holds
+    /// 22 RGB frames of its canvas. The canvas rule caps a canvas at
+    /// 768x1344 pixels before rounding each side to 32 pixels, which adds at
+    /// most 4% (68,124,672 bytes for 22 frames at the cap), so 72 MiB holds
+    /// the unit and its protocol envelope. The rings grow to what a message
+    /// needs, so the capacity costs nothing until a message uses it.
     pub(crate) fn channel_payload_capacity(&self) -> usize {
         if matches!(self.parameters, ModelParameters::MiniMaxH3 { .. }) {
             72 << 20
@@ -384,16 +436,14 @@ pub struct WorkerCapabilities {
     pub sampling_controls: Vec<ServedSamplingControl>,
     /// Effective context ceiling after intersecting model and worker limits.
     pub max_model_tokens: u32,
-    /// Fixed media prediction count, zero for a worker that serves no video.
-    pub denoise_steps: u32,
 }
 
 impl InputProcessor {
     /// Binds model resources to verified worker capabilities without rebuilding model data.
     ///
-    /// Replaces the model's context ceiling with `worker.max_model_tokens` and, for MiniMax H3,
-    /// its denoise-step count with `worker.denoise_steps`; `denoise_steps` is ignored for other
-    /// models.
+    /// Replaces the model's context ceiling with `worker.max_model_tokens`. `video` is the
+    /// video service a MiniMax H3 deployment's denoiser handshake built, and must be absent
+    /// for every other model.
     ///
     /// # Errors
     ///
@@ -401,20 +451,20 @@ impl InputProcessor {
     /// - `MissingFeature` when the worker limits do not cover the features the configured
     ///   model needs;
     /// - `MissingTemplate` when a token-generating model has no chat renderer;
-    /// - `MediaContract` when the model is MiniMax H3 and the worker advertises zero denoise
-    ///   steps.
+    /// - `MediaContract` when the model is MiniMax H3 and its duration capacity is out of
+    ///   range or it has no video service, or when another model has one.
     pub fn new(
         mut config: ModelConfig,
         tokenizer: DynTokenizer,
         renderer: Option<HfChatRenderer>,
         worker: WorkerCapabilities,
+        video: Option<VideoService>,
         parse_reasoning: bool,
     ) -> Result<Self> {
         let WorkerCapabilities {
             limits,
             sampling_controls,
             max_model_tokens,
-            denoise_steps,
         } = worker;
 
         let needs = match &config.parameters {
@@ -429,33 +479,28 @@ impl InputProcessor {
         };
         validate_runtime_features(&config, &limits, needs)?;
 
-        if !matches!(config.parameters, ModelParameters::MiniMaxH3 { .. }) && renderer.is_none() {
-            return Err(ServeError::ModelResolution(
-                ModelResolutionError::MissingTemplate,
-            ));
+        let contract = |message: &str| {
+            ServeError::ModelResolution(ModelResolutionError::MediaContract(message.to_owned()))
+        };
+        if let ModelParameters::MiniMaxH3 { max_video_seconds } = &config.parameters {
+            validate_video_capacity(*max_video_seconds).map_err(|message| contract(&message))?;
+            if video.is_none() {
+                return Err(contract(
+                    "a video checkpoint is served without its video denoiser",
+                ));
+            }
+        } else {
+            if video.is_some() {
+                return Err(contract("only a video checkpoint has a video denoiser"));
+            }
+            if renderer.is_none() {
+                return Err(ServeError::ModelResolution(
+                    ModelResolutionError::MissingTemplate,
+                ));
+            }
         }
         // Bind the actual worker ceilings once before sharing immutable model facts.
         config.max_model_tokens = Some(max_model_tokens);
-        if let ModelParameters::MiniMaxH3 {
-            max_video_seconds,
-            num_inference_steps,
-            ..
-        } = &mut config.parameters
-        {
-            validate_video_capacity(*max_video_seconds).map_err(|message| {
-                ServeError::ModelResolution(ModelResolutionError::MediaContract(message))
-            })?;
-            // The denoise-step count belongs to the loaded numerical plan, so
-            // the worker handshake is its only authority.
-            if denoise_steps == 0 {
-                return Err(ServeError::ModelResolution(
-                    ModelResolutionError::MediaContract(
-                        "worker advertised no denoise steps for a video checkpoint".to_owned(),
-                    ),
-                ));
-            }
-            *num_inference_steps = denoise_steps;
-        }
 
         Ok(Self {
             config,
@@ -464,6 +509,7 @@ impl InputProcessor {
             limits,
             sampling_controls,
             parse_reasoning,
+            video,
         })
     }
 
@@ -477,160 +523,39 @@ impl InputProcessor {
         &self.config.served_name
     }
 
-    /// Public duration, geometry and prompt limits from the serving description.
-    ///
-    /// Returns `Value::Null` for a model that serves no video; the Dynamo worker uses that to
-    /// refuse a non-MiniMax H3 checkpoint. `min_seconds` and `model_max_seconds` are the API's
-    /// explicit-duration range; `max_seconds` is the deployment's configured capacity, which is
-    /// a deployment limit whenever it is below `model_max_seconds`. The frame rate and default
-    /// duration (the lesser of 5 seconds and the capacity) match `video_sampling`.
-    pub fn video_capabilities(&self) -> serde_json::Value {
-        match &self.config.parameters {
-            ModelParameters::MiniMaxH3 {
-                max_video_seconds,
-                video_rasters,
-                ..
-            } => {
-                let default = video_rasters.select(None, None).ok();
-                let mut sizes = serde_json::Map::new();
-                for raster in video_rasters.rasters() {
-                    let entry = sizes
-                        .entry(raster.resolution.as_str())
-                        .or_insert_with(|| serde_json::json!({}));
-                    entry[raster.aspect_ratio.as_str()] =
-                        serde_json::json!({"width": raster.width, "height": raster.height});
-                }
-                let default_seconds = default_video_seconds(*max_video_seconds);
-                let mut suggested_seconds = vec![default_seconds];
-                if *max_video_seconds > default_seconds {
-                    suggested_seconds.push(*max_video_seconds);
-                }
-                serde_json::json!({
-                    "tasks": ["t2va"],
-                    "default_seconds": default_seconds,
-                    "min_seconds": MIN_VIDEO_SECONDS,
-                    "max_seconds": *max_video_seconds,
-                    "model_max_seconds": MAX_VIDEO_SECONDS,
-                    "suggested_seconds": suggested_seconds,
-                    "fps": VIDEO_FPS,
-                    "width": default.map(|raster| raster.width),
-                    "height": default.map(|raster| raster.height),
-                    "default_resolution": video_rasters.resolutions()[0].as_str(),
-                    "default_aspect_ratio": video_rasters.aspect_ratios()[0].as_str(),
-                    "resolutions": video_rasters
-                        .resolutions()
-                        .iter()
-                        .map(|resolution| resolution.as_str())
-                        .collect::<Vec<_>>(),
-                    "aspect_ratios": video_rasters
-                        .aspect_ratios()
-                        .iter()
-                        .map(|aspect_ratio| aspect_ratio.as_str())
-                        .collect::<Vec<_>>(),
-                    "sizes": sizes,
-                    "max_prompt_tokens": self.config.max_model_tokens(),
-                    "request_fields": [
-                        "model", "prompt", "seconds", "seed", "resolution", "aspect_ratio",
-                    ],
-                })
-            }
-            _ => serde_json::Value::Null,
-        }
+    /// The video service of a MiniMax H3 deployment; `None` for other models.
+    pub fn video_service(&self) -> Option<&VideoService> {
+        self.video.as_ref()
     }
 
-    /// Validates the video API request, tokenizes its prompt, and prepares the
-    /// checkpoint frame and media unit counts for direct engine submission.
+    /// The served video contract, as `GET /v1/capabilities` reports it.
+    ///
+    /// Returns `Value::Null` for a model that serves no video; the Dynamo worker uses that to
+    /// refuse a non-MiniMax H3 checkpoint. See `VideoService::capabilities`.
+    pub fn video_capabilities(&self) -> serde_json::Value {
+        self.video
+            .as_ref()
+            .map_or(serde_json::Value::Null, |video| {
+                video.capabilities(self.config.max_model_tokens())
+            })
+    }
+
+    /// Validates a video request, fetches, probes and plans its media, presents its prompt,
+    /// and sizes it for direct engine submission.
     ///
     /// The returned request carries a placeholder `RequestId(0)`; the caller must replace it
     /// with the identifier reserved by `EngineClient::register_request` before submission.
-    pub fn preprocess_video_request(
-        &self,
-        request_id: &crate::serving::ServeRequestId,
-        request: crate::openai::VideoGenerationRequest,
-    ) -> std::result::Result<uniserve_core::DiffusionRequest, crate::openai::ApiError> {
-        let crate::openai::VideoGenerationRequest {
-            model,
-            prompt,
-            seed,
-            seconds,
-            resolution,
-            aspect_ratio,
-        } = request;
-        crate::openai::utils::check_model_served(&model, self.served_model_name())?;
-        if prompt.trim().is_empty() {
-            return Err(crate::openai::ApiError::invalid_request(
-                "prompt must not be empty".to_string(),
-                Some("prompt"),
-            ));
-        }
-        let (_, sampling) =
-            self.video_sampling(request_id, seconds, seed, resolution, aspect_ratio)?;
-        // Tokenize and bound the prompt before deriving any media allocation.
-        let prompt_token_ids = self
-            .tokenizer
-            .encode(&prompt, false)
-            .map_err(|source| ServeError::Tokenize {
-                request_id: request_id.clone(),
-                source: crate::serving::TokenizeError::Tokenizer(source),
-            })
-            .map_err(crate::openai::serve_error_to_api)?;
-        if prompt_token_ids.is_empty() {
-            return Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
-                request_id: request_id.clone(),
-                source: crate::serving::TokenizeError::Invalid(
-                    "video prompt must contain at least one token".to_string(),
-                ),
-            }));
-        }
-        if prompt_token_ids.len() > self.config.max_model_tokens() as usize {
-            return Err(crate::openai::serve_error_to_api(
-                ServeError::ContextLengthExceeded {
-                    request_id: request_id.clone(),
-                    prompt_tokens: prompt_token_ids.len(),
-                    max_tokens: self.config.max_model_tokens(),
-                },
-            ));
-        }
-        Ok(uniserve_core::DiffusionRequest {
-            request_id: uniserve_core::RequestId(0),
-            task: uniserve_core::VideoTask::T2va,
-            text_tags: vec![1; prompt_token_ids.len()],
-            prompt_token_ids,
-            conditions: Vec::new(),
-            media: Vec::new(),
-            priority: 0,
-            sampling,
-        })
-    }
-
-    /// Resolves the advertised duration default and the model's frame alignment.
-    ///
-    /// Returns the requested duration in seconds (the default when omitted) and the diffusion
-    /// sampling parameters, whose frame count is the aligned output length `video_frame_count`
-    /// derives. The asynchronous video route calls this directly to learn both before
-    /// submission.
     ///
     /// # Errors
     ///
-    /// Returns an API error when the model serves no video, when the duration is not a
-    /// finite number of seconds within `[MIN_VIDEO_SECONDS, max_video_seconds]`, or when the
-    /// deployment does not provision the requested `resolution` or `aspect_ratio`; an omitted
-    /// field takes the deployment's first configured value.
-    pub fn video_sampling(
+    /// Returns an API error when the model serves no video, the request names another model,
+    /// or `VideoService::prepare` refuses it.
+    pub async fn preprocess_video_request(
         &self,
         request_id: &crate::serving::ServeRequestId,
-        seconds: Option<f64>,
-        seed: u64,
-        resolution: Option<VideoResolution>,
-        aspect_ratio: Option<ResolutionName>,
-    ) -> std::result::Result<(f64, uniserve_core::DiffusionSamplingParams), crate::openai::ApiError>
-    {
-        let ModelParameters::MiniMaxH3 {
-            max_video_seconds,
-            video_rasters,
-            num_inference_steps,
-        } = &self.config.parameters
-        else {
+        request: &crate::openai::VideoGenerationRequest,
+    ) -> std::result::Result<PreparedVideo, crate::openai::ApiError> {
+        let Some(video) = &self.video else {
             return Err(crate::openai::serve_error_to_api(
                 ServeError::UnsupportedFeature {
                     request_id: request_id.clone(),
@@ -638,35 +563,10 @@ impl InputProcessor {
                 },
             ));
         };
-        let seconds = seconds.unwrap_or_else(|| default_video_seconds(*max_video_seconds));
-        let frame_count = video_frame_count(seconds, *max_video_seconds).map_err(|message| {
-            crate::openai::serve_error_to_api(ServeError::Tokenize {
-                request_id: request_id.clone(),
-                source: crate::serving::TokenizeError::Invalid(message),
-            })
-        })?;
-        // Each H3 video media unit consumes a temporal latent window and emits its
-        // non-overlapping frame interval; the model owns overlap reconstruction.
-        let video_units = (frame_count - 5) / 17;
-        let raster = video_rasters
-            .select(resolution, aspect_ratio)
-            .map_err(|message| {
-                crate::openai::serve_error_to_api(ServeError::Tokenize {
-                    request_id: request_id.clone(),
-                    source: crate::serving::TokenizeError::Invalid(message),
-                })
-            })?;
-        Ok((
-            seconds,
-            uniserve_core::DiffusionSamplingParams {
-                num_frames: frame_count,
-                video_units,
-                num_inference_steps: *num_inference_steps,
-                seed,
-                height: raster.height,
-                width: raster.width,
-            },
-        ))
+        crate::openai::utils::check_model_served(&request.model, self.served_model_name())?;
+        video
+            .prepare(request_id, request, self.config.max_model_tokens())
+            .await
     }
 
     /// Builds the model identity stamped onto accepted events.
@@ -1017,17 +917,6 @@ pub const MAX_VIDEO_SECONDS: f64 = 15.0;
 
 /// Frame rate, in frames per second, of every MiniMax H3 video.
 pub const VIDEO_FPS: u32 = 24;
-
-/// Returns the duration, in seconds, of a video request that omits `seconds`.
-///
-/// The default is 5 seconds, capped at the deployment's `max_video_seconds` so an omitted
-/// duration is always within bounds (`validate_video_capacity` keeps the capacity at or above
-/// `MIN_VIDEO_SECONDS`). `InputProcessor::video_sampling` resolves omitted durations with it
-/// and `InputProcessor::video_capabilities` advertises it; any other video entry point into
-/// the same engine must resolve omitted durations with it too.
-pub fn default_video_seconds(max_video_seconds: f64) -> f64 {
-    max_video_seconds.min(5.0)
-}
 
 /// Checks a deployment's video duration capacity against the API range.
 ///
