@@ -1,8 +1,17 @@
-"""Diffusion schedules, guidance, noise and numerical integration."""
+"""Diffusion grids and schedules, guidance, noise and numerical integration."""
 
 from .guidance import AdditiveGuidance, Branch, Guidance, NestedGuidance, Renorm
 from .noise import NoiseScale, normal_noise
-from .schedule import Schedule, make_schedule
+from .schedule import (
+    BlockGrid,
+    FixedGrid,
+    Grid,
+    LinearGrid,
+    RungGrid,
+    Schedule,
+    UniformGrid,
+    fuse_heads,
+)
 from .solver import (
     CleanSampleEulerSolver,
     EulerSolver,
@@ -22,8 +31,14 @@ __all__ = [
     "advance_",
     "NoiseScale",
     "normal_noise",
+    "BlockGrid",
+    "FixedGrid",
+    "Grid",
+    "LinearGrid",
+    "RungGrid",
     "Schedule",
-    "make_schedule",
+    "UniformGrid",
+    "fuse_heads",
     "CleanSampleEulerSolver",
     "EulerSolver",
     "Solver",

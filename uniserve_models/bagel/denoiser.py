@@ -6,10 +6,10 @@ import torch
 
 from uniserve.diffusion import (
     EulerSolver,
+    LinearGrid,
     NestedGuidance,
     NoiseScale,
     Renorm,
-    make_schedule,
 )
 from uniserve.media import image
 from uniserve.model import ImageDenoiser
@@ -52,6 +52,13 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             noise_scale=NoiseScale(1.0, "constant", 1.0, 1.0),
             prediction_dtype=torch.bfloat16,
             solver=EulerSolver("velocity"),
+            # Descending network time equals sigma, from one (noise) to
+            # zero; requests may replace the checkpoint's shift.
+            grid=LinearGrid(
+                config.timestep_shift,
+                direction="descending",
+                shift_domain="time",
+            ),
         )
         self.config, self.backbone = config, backbone
         width = config.latent_patch_size**2 * config.vae.latent_channels
@@ -105,18 +112,6 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         # BAGEL draws noise directly in the canonical [patch rows, patch
         # values] shape, so ``prepare_latents`` scales it without patchifying.
         return self.latent_shape(modality, size)
-
-    def make_schedules(self, steps, *, shift, device):
-        # Descending network time equals sigma, from one (noise) to zero.
-        return {
-            "image": make_schedule(
-                steps,
-                shift=self.config.timestep_shift if shift is None else shift,
-                direction="descending",
-                shift_domain="time",
-                device=device,
-            )
-        }
 
     def make_guidance(
         self,
