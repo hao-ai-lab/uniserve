@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urljoin
 
-import httpx
+import aiohttp
 
 from ..types import RequestRecord, TaskRequest
 
@@ -46,7 +46,7 @@ _TYPE_ORDER = {"image": 0, "video": 1, "video_audio": 1, "audio": 2}
 
 
 async def receive_video(
-    client: httpx.AsyncClient,
+    client: aiohttp.ClientSession,
     base_url: str,
     request: TaskRequest,
     record: RequestRecord,
@@ -59,11 +59,11 @@ async def receive_video(
         await _body(client, "POST", url, record, **kwargs)
         return
 
-    response = await client.post(url, **kwargs)
-    record.note_http(response.status_code)
-    if _failed_status(response, record):
-        return
-    job = response.json()
+    async with client.post(url, **kwargs) as response:
+        record.note_http(response.status)
+        if await _failed_status(response, record):
+            return
+        job = await response.json()
     job_id = quote(str(job["id"]), safe="")
     poll_url = f"{url}/{job_id}"
     while job.get("status") != "completed":
@@ -72,10 +72,10 @@ async def receive_video(
             record.mark_failure("video_job_failed", str(job.get("error", job)))
             return
         await asyncio.sleep(request.poll_interval_s)
-        response = await client.get(poll_url)
-        if _failed_status(response, record):
-            return
-        job = response.json()
+        async with client.get(poll_url) as response:
+            if await _failed_status(response, record):
+                return
+            job = await response.json()
     _record_timings(
         record,
         job.get("inference_time_s"),
@@ -89,7 +89,7 @@ async def receive_video(
 
 
 def native_request(request: TaskRequest) -> dict[str, Any]:
-    """Return the ``httpx`` body arguments of a request on its backend.
+    """Return the JSON or multipart body arguments for the request's backend.
 
     The canonical body states the schedule in sigma points including the
     clean endpoint; a baseline's request always states it (``VideoConfig``
@@ -181,14 +181,17 @@ def _vllm_omni_request(
         # configuration cannot restate the work fields.
         "extra_params": json.dumps({**extra, **request.video_extra_params}),
     }
-    parts: list[tuple[str, tuple[Any, ...]]] = [
-        (key, (None, str(value))) for key, value in fields.items()
-    ]
-    parts.extend(
-        ("input_references", (Path(media.path).name, media.data, media.mime))
-        for media in request.condition_media
-    )
-    return {"files": parts}
+    parts = aiohttp.FormData(default_to_multipart=True)
+    for key, value in fields.items():
+        parts.add_field(key, str(value))
+    for media in request.condition_media:
+        parts.add_field(
+            "input_references",
+            media.data,
+            filename=Path(media.path).name,
+            content_type=media.mime,
+        )
+    return {"data": parts}
 
 
 def _fastvideo_request(
@@ -299,35 +302,38 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _failed_status(response: httpx.Response, record: RequestRecord) -> bool:
-    if response.status_code < 400:
+async def _failed_status(
+    response: aiohttp.ClientResponse, record: RequestRecord
+) -> bool:
+    if response.status < 400:
         return False
-    record.status_code = response.status_code
+    record.status_code = response.status
     if record.final_event_time is None:
         record.close_now()
     record.mark_failure(
-        f"transport_status_{response.status_code}", response.text[:500]
+        f"transport_status_{response.status}",
+        (await response.text(errors="replace"))[:500],
     )
     return True
 
 
 async def _body(
-    client: httpx.AsyncClient,
+    client: aiohttp.ClientSession,
     method: str,
     url: str,
     record: RequestRecord,
     **kwargs,
 ) -> None:
-    async with client.stream(
-        method, url, follow_redirects=True, **kwargs
+    async with client.request(
+        method, url, allow_redirects=True, **kwargs
     ) as response:
-        record.note_http(response.status_code)
+        record.note_http(response.status)
         record.video_mime = response.headers.get("content-type", "")
         # Encoded bodies are buffered in host memory; no media work delays the
         # next slot. Keep even invalid bodies for post-run failure artifacts.
-        record.video_body = await response.aread()
+        record.video_body = await response.read()
         record.close_now()
-        if not _failed_status(response, record):
+        if not await _failed_status(response, record):
             record.mark_success()
             # A synchronous route reports its timings in headers, any of
             # which a server may omit; a job's content download carries

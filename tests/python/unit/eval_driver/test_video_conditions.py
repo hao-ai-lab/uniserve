@@ -15,10 +15,12 @@ from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
 
-import httpx
+import aiohttp
 import pytest
+from aiohttp import web
 from PIL import Image
 
+from tests.python.fixtures.http_stub import stub_server
 from uniserve_eval.metrics import summarize
 from uniserve_eval.tasks.video import VideoTask
 from uniserve_eval.transport.client import send_request
@@ -116,16 +118,17 @@ def send(request):
 
     async def exercise():
         async def handler(received):
-            sent.append(received)
-            return httpx.Response(
-                200, content=b"mp4", headers={"content-type": "video/mp4"}
+            sent.append((received.headers, await received.read()))
+            return web.Response(
+                body=b"mp4", headers={"content-type": "video/mp4"}
             )
 
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with (
+            stub_server(handler) as base_url,
+            aiohttp.ClientSession() as client,
+        ):
             record = await send_request(
-                client, "http://backend", request, "row", task="video"
+                client, base_url, request, "row", task="video"
             )
         assert record.success
         return record
@@ -138,9 +141,9 @@ def multipart(request):
     """Decode a multipart request into its text fields and file parts."""
     message = BytesParser(policy=default).parsebytes(
         b"Content-Type: "
-        + request.headers["content-type"].encode()
+        + request[0]["content-type"].encode()
         + b"\r\n\r\n"
-        + request.content
+        + request[1]
     )
     fields, files = {}, []
     for part in message.iter_parts():
@@ -175,7 +178,7 @@ def test_the_canonical_body_names_condition_media_by_file_uri(
     )
     received, record = send(request)
 
-    body = json.loads(received.content)
+    body = json.loads(received[1])
     assert body["task"] == task
     assert body["target"] == {
         "short_edge": 768,
@@ -266,7 +269,7 @@ def test_fastvideo_receives_reference_paths_and_its_block_count(
     )
     received, _ = send(request)
 
-    body = json.loads(received.content)
+    body = json.loads(received[1])
     for field, entries in references.items():
         assert body[field] == [
             {key: str((inputs / path).resolve())}
@@ -393,15 +396,12 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
     async def exercise():
         async def handler(request):
             if request.method == "POST" and endpoint == "/v1/videos":
-                return httpx.Response(
-                    200, json={"id": "job", "status": "queued"}
-                )
-            if request.method == "GET" and not request.url.path.endswith(
+                return web.json_response({"id": "job", "status": "queued"})
+            if request.method == "GET" and not request.path.endswith(
                 "/content"
             ):
-                return httpx.Response(
-                    200,
-                    json={
+                return web.json_response(
+                    {
                         "id": "job",
                         "status": "completed",
                         "inference_time_s": 33.0,
@@ -416,7 +416,7 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
                     "x-stage-durations": json.dumps(stages),
                     "x-peak-memory-mb": "91000.5",
                 }
-            return httpx.Response(200, content=b"mp4", headers=headers)
+            return web.Response(body=b"mp4", headers=headers)
 
         config = point(
             inputs,
@@ -430,11 +430,12 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
         request = VideoTask(config).build_request(
             Example("row", "scene", seconds=5, conditions=IMAGE_AUDIO)
         )
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with (
+            stub_server(handler) as base_url,
+            aiohttp.ClientSession() as client,
+        ):
             return await send_request(
-                client, "http://backend", request, "row", task="video"
+                client, base_url, request, "row", task="video"
             )
 
     record = asyncio.run(exercise())
@@ -477,15 +478,12 @@ def test_stage_durations_alone_are_recorded_for_a_uniserve_request(
     async def exercise():
         async def handler(request):
             if request.method == "POST" and endpoint == "/v1/videos":
-                return httpx.Response(
-                    200, json={"id": "job", "status": "queued"}
-                )
-            if request.method == "GET" and not request.url.path.endswith(
+                return web.json_response({"id": "job", "status": "queued"})
+            if request.method == "GET" and not request.path.endswith(
                 "/content"
             ):
-                return httpx.Response(
-                    200,
-                    json={
+                return web.json_response(
+                    {
                         "id": "job",
                         "status": "completed",
                         "stage_durations": stages,
@@ -494,7 +492,7 @@ def test_stage_durations_alone_are_recorded_for_a_uniserve_request(
             headers = {"content-type": "video/mp4"}
             if endpoint == VIDEOS_SYNC:
                 headers["x-stage-durations"] = json.dumps(stages)
-            return httpx.Response(200, content=b"mp4", headers=headers)
+            return web.Response(body=b"mp4", headers=headers)
 
         config = replace(
             point(inputs, "ref2va", poll_interval_s=0.001), endpoint=endpoint
@@ -502,11 +500,12 @@ def test_stage_durations_alone_are_recorded_for_a_uniserve_request(
         request = VideoTask(config).build_request(
             Example("row", "scene", seconds=5, conditions=VIDEO_AUDIO)
         )
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with (
+            stub_server(handler) as base_url,
+            aiohttp.ClientSession() as client,
+        ):
             return await send_request(
-                client, "http://backend", request, "row", task="video"
+                client, base_url, request, "row", task="video"
             )
 
     record = asyncio.run(exercise())

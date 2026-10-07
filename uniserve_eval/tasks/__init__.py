@@ -7,6 +7,7 @@ from .base import BenchmarkTask, ImageCountRule
 from .i2i import I2ITask
 from .i2t import I2TTask
 from .interleave import InterleaveTask
+from .systemone import SystemOneTask
 from .t2i import T2ITask
 from .text import TextTask
 from .video import VideoTask
@@ -19,6 +20,7 @@ TASKS: dict[str, type[BenchmarkTask]] = {
     TaskName.I2T.value: I2TTask,
     TaskName.INTERLEAVE.value: InterleaveTask,
     TaskName.VIDEO.value: VideoTask,
+    TaskName.SYSTEMONE.value: SystemOneTask,
 }
 
 
@@ -42,6 +44,7 @@ __all__ = [
     "I2TTask",
     "ImageCountRule",
     "InterleaveTask",
+    "SystemOneTask",
     "T2ITask",
     "TextTask",
     "VideoTask",

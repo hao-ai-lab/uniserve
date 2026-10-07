@@ -11,6 +11,7 @@ under test. Memory is in MiB and utilization in percent.
 from __future__ import annotations
 
 import shutil
+import statistics
 import subprocess
 import threading
 import time
@@ -149,6 +150,53 @@ class GpuStorageSampler:
         self._sample_once()
         while not self._stop.wait(self.interval_s):
             self._sample_once()
+
+    def window_utilization(
+        self,
+        start: float,
+        end: float,
+        indices: tuple[int, ...] | None,
+    ) -> dict[str, Any] | None:
+        """Summarize utilization of selected GPUs within a wall-clock window.
+
+        Unlike ``summary``, which sums every visible GPU over the whole
+        sampling span, this reports each selected GPU separately and only
+        from samples taken between ``start`` and ``end`` (``time.time()``
+        seconds), so other devices' work and the warmup stay out of it.
+
+        Args:
+            start: Window start, inclusive.
+            end: Window end, inclusive.
+            indices: ``nvidia-smi`` indices of the GPUs the server uses, or
+                ``None`` for every sampled GPU.
+
+        Returns:
+            Per-GPU mean and median utilization percent and sample counts,
+            keyed by index as a string, or ``None`` when no sample fell in
+            the window.
+        """
+        per_gpu: dict[int, list[int]] = {}
+        for record in self.sample_records:
+            if not start <= record["time"] <= end:
+                continue
+            for row in record["gpus"]:
+                if indices is None or row["index"] in indices:
+                    per_gpu.setdefault(row["index"], []).append(
+                        row["utilization_gpu_pct"]
+                    )
+        if not per_gpu:
+            return None
+        return {
+            "interval_s": self.interval_s,
+            "gpus": {
+                str(index): {
+                    "samples": len(values),
+                    "mean_pct": sum(values) / len(values),
+                    "p50_pct": float(statistics.median(values)),
+                }
+                for index, values in sorted(per_gpu.items())
+            },
+        }
 
     def summary(self) -> dict[str, Any] | None:
         """Return aggregate telemetry, or ``None`` when no sample succeeded.

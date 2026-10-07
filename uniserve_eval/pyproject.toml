@@ -12,7 +12,7 @@ version = "0.2.0"
 description = "UniServe benchmark and evaluation driver"
 requires-python = ">=3.11"
 dependencies = [
-    "httpx[socks]>=0.27",
+    "aiohttp>=3.9",
     "pillow>=10.4",
 ]
 

@@ -1,4 +1,4 @@
-"""Computes request, token, image, and video benchmark metrics.
+"""Computes request, token, image, video, and decision benchmark metrics.
 
 ``build_summary`` calls ``summarize`` on the measured ``RequestRecord`` list
 and the measured duration from ``run_load``. Record latencies (end-to-end,
@@ -88,8 +88,9 @@ def summarize(
 
     Returns:
         A JSON-compatible metric mapping. Media keys are present only when
-        successful records produced that modality, and retokenized keys only
-        when ``tokenizer`` is given.
+        successful records produced that modality, decision keys only when
+        they answered decision readouts, and retokenized keys only when
+        ``tokenizer`` is given.
     """  # noqa: E501
     # Failed requests remain validation inputs but do not contribute
     # service-rate or latency populations. Token metrics additionally
@@ -221,16 +222,23 @@ def summarize(
             scale=1000,
         )
         summary.update(_server_timings(successful))
+
+    # Decision readouts answer states and questions rather than generating
+    # tokens; their rates share the measured-window denominator.
+    decision_states = sum(record.decision_states for record in successful)
+    if decision_states:
+        decision_questions = sum(
+            record.decision_questions for record in successful
+        )
+        summary["completed_states"] = decision_states
+        summary["states_per_second"] = decision_states / duration
+        summary["completed_questions"] = decision_questions
+        summary["questions_per_second"] = decision_questions / duration
     return summary
 
 
 def _server_timings(successful: list[RequestRecord]) -> dict[str, Any]:
-    """Summarize the timings video servers reported for their requests.
-
-    Each value keeps the reporting server's own definition; a stage that
-    only some requests report is summarized over those. Keys are absent
-    when no request reported the value.
-    """
+    """Summarize reported video timings using each server's definitions."""
     summary: dict[str, Any] = {}
     inference = [
         record.server_inference_s

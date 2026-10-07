@@ -92,3 +92,48 @@ def test_i2t_natural_eos_requires_server_usage_only() -> None:
     )
     assert task.validate([record]).valid is True
     assert "fixed_output_length" not in task.validate([record]).checks
+
+
+def test_server_owned_sampling_sends_no_token_controls() -> None:
+    # A block-diffusion server refuses every token-sampling control.
+    point = BenchmarkPoint(
+        name="text",
+        server="server",
+        task=TaskName.TEXT,
+        model="model",
+        dataset="jsonl",
+        dataset_path="rows.jsonl",
+        metrics=(_metric(),),
+        load=LoadConfig(num_prompts=1),
+        sampling=SamplingConfig(
+            temperature=None,
+            top_p=None,
+            ignore_eos=None,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        ),
+    )
+    task = TextTask(point)
+
+    payload = task.build_request(
+        Example(id="row", prompt="hello", output_len=256)
+    ).payload
+
+    assert payload == {
+        "model": "model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "max_completion_tokens": 256,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    record = RequestRecord(
+        request_id="row",
+        task="text",
+        success=True,
+        requested_output_len=256,
+        output_len=97,
+        finish_reason="stop",
+        output_len_source="server_usage",
+        prompt_len_source="server_usage",
+    )
+    assert task.validate([record]).valid is True

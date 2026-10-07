@@ -12,10 +12,12 @@ from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import aiohttp
 import av
-import httpx
 import pytest
+from aiohttp import web
 
+from tests.python.fixtures.http_stub import stub_server
 from uniserve_eval.config import load_config
 from uniserve_eval.pipeline.run import run_point
 from uniserve_eval.tasks.video import VideoTask
@@ -75,9 +77,9 @@ def form_fields(request):
     """Decode a multipart request's text fields."""
     message = BytesParser(policy=default).parsebytes(
         b"Content-Type: "
-        + request.headers["content-type"].encode()
+        + request[0]["content-type"].encode()
         + b"\r\n\r\n"
-        + request.content
+        + request[1]
     )
     return {
         part.get_param("name", header="content-disposition"): part.get_payload(
@@ -210,9 +212,9 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
 
     async def exercise():
         async def handler(request):
-            sent.append(request)
-            return httpx.Response(
-                200, content=b"mp4", headers={"content-type": "video/mp4"}
+            sent.append((request.headers, await request.read()))
+            return web.Response(
+                body=b"mp4", headers={"content-type": "video/mp4"}
             )
 
         config = point(
@@ -225,11 +227,12 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
         request = VideoTask(config).build_request(
             Example("row", "precise prompt", seconds=seconds, seed=11)
         )
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with (
+            stub_server(handler) as base_url,
+            aiohttp.ClientSession() as client,
+        ):
             record = await send_request(
-                client, "http://backend", request, "row", task="video"
+                client, base_url, request, "row", task="video"
             )
         assert record.success
         assert record.requested_seconds == seconds
@@ -239,7 +242,7 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
     points = schedule["num_inference_steps"]
     if backend in ("uniserve", "sglang"):
         # Both take the official body; the stated schedule restates points.
-        assert json.loads(sent[0].content) == {
+        assert json.loads(sent[0][1]) == {
             "model": "h3",
             "prompt": "precise prompt",
             "task": "t2va",
@@ -269,7 +272,7 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
             "audio_flow_shift": schedule["audio_flow_shift"],
         }
     else:
-        payload = json.loads(sent[0].content)
+        payload = json.loads(sent[0][1])
         assert payload["prompt"] == "precise prompt"
         assert payload["seed"] == 11
         assert payload["size"] == f"{width}x{height}"
@@ -326,19 +329,14 @@ def test_native_transport_waits_for_media_and_enforces_logical_deadline(
     async def exercise():
         async def handler(request):
             if request.method == "POST" and endpoint == "/v1/videos":
-                return httpx.Response(
-                    200, json={"id": "job", "status": "queued"}
-                )
-            if request.method == "GET" and not request.url.path.endswith(
+                return web.json_response({"id": "job", "status": "queued"})
+            if request.method == "GET" and not request.path.endswith(
                 "/content"
             ):
-                return httpx.Response(
-                    200, json={"id": "job", "status": "completed"}
-                )
+                return web.json_response({"id": "job", "status": "completed"})
             await asyncio.sleep(0.03)
-            return httpx.Response(
-                200,
-                content=b"original bytes",
+            return web.Response(
+                body=b"original bytes",
                 headers={"content-type": "video/mp4"},
             )
 
@@ -359,12 +357,13 @@ def test_native_transport_waits_for_media_and_enforces_logical_deadline(
         request = VideoTask(config).build_request(
             Example("row", "precise prompt", seconds=5, seed=11)
         )
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with (
+            stub_server(handler) as base_url,
+            aiohttp.ClientSession() as client,
+        ):
             record = await send_request(
                 client,
-                "http://backend",
+                base_url,
                 request,
                 "row",
                 task="video",
@@ -376,7 +375,7 @@ def test_native_transport_waits_for_media_and_enforces_logical_deadline(
             assert record.latency >= 0.03
             expired = await send_request(
                 client,
-                "http://backend",
+                base_url,
                 request,
                 "row",
                 task="video",
@@ -394,10 +393,15 @@ def test_vllm_omni_request_carries_configured_extra_params():
         sent = {}
 
         async def handler(request):
-            sent.update(json.loads(form_fields(request)["extra_params"]))
-            return httpx.Response(
-                200,
-                content=b"original bytes",
+            sent.update(
+                json.loads(
+                    form_fields((request.headers, await request.read()))[
+                        "extra_params"
+                    ]
+                )
+            )
+            return web.Response(
+                body=b"original bytes",
                 headers={"content-type": "video/mp4"},
             )
 
@@ -411,11 +415,12 @@ def test_vllm_omni_request_carries_configured_extra_params():
         request = VideoTask(config).build_request(
             Example("row", "precise prompt", seconds=10, seed=11)
         )
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with (
+            stub_server(handler) as base_url,
+            aiohttp.ClientSession() as client,
+        ):
             record = await send_request(
-                client, "http://backend", request, "row", task="video"
+                client, base_url, request, "row", task="video"
             )
         assert record.success
         # The configured option joins the fields that fix the work.
@@ -435,13 +440,10 @@ def test_sglang_request_carries_configured_extra_params():
 
         async def handler(request):
             if request.method == "POST":
-                sent.update(json.loads(request.content))
-                return httpx.Response(
-                    200, json={"id": "job", "status": "completed"}
-                )
-            return httpx.Response(
-                200,
-                content=b"original bytes",
+                sent.update(await request.json())
+                return web.json_response({"id": "job", "status": "completed"})
+            return web.Response(
+                body=b"original bytes",
                 headers={"content-type": "video/mp4"},
             )
 
@@ -461,11 +463,12 @@ def test_sglang_request_carries_configured_extra_params():
         request = VideoTask(config).build_request(
             Example("row", "precise prompt", seconds=10, seed=11)
         )
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with (
+            stub_server(handler) as base_url,
+            aiohttp.ClientSession() as client,
+        ):
             record = await send_request(
-                client, "http://backend", request, "row", task="video"
+                client, base_url, request, "row", task="video"
             )
         assert record.success
         # The configured options join the native fields that fix the work.
@@ -578,27 +581,23 @@ def test_async_job_failure_or_published_media_url_is_terminal(failed):
     async def exercise():
         async def handler(request):
             if request.method == "POST":
-                return httpx.Response(
-                    200, json={"id": "job", "status": "queued"}
-                )
-            if request.url.path == "/v1/videos/job":
-                return httpx.Response(
-                    200,
-                    json={
+                return web.json_response({"id": "job", "status": "queued"})
+            if request.path == "/v1/videos/job":
+                return web.json_response(
+                    {
                         "id": "job",
                         "status": "failed" if failed else "completed",
                         "error": "decoder failed",
                         "url": "/published/output.mp4",
                     },
                 )
-            if request.url.path == "/published/output.mp4":
+            if request.path == "/published/output.mp4":
                 await asyncio.sleep(0.02)
-                return httpx.Response(
-                    200,
-                    content=b"published media",
+                return web.Response(
+                    body=b"published media",
                     headers={"content-type": "video/mp4"},
                 )
-            return httpx.Response(404)
+            return web.Response(status=404)
 
         task = VideoTask(
             replace(
@@ -612,12 +611,13 @@ def test_async_job_failure_or_published_media_url_is_terminal(failed):
                 endpoint="/v1/videos",
             )
         )
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with (
+            stub_server(handler) as base_url,
+            aiohttp.ClientSession() as client,
+        ):
             record = await send_request(
                 client,
-                "http://backend",
+                base_url,
                 task.build_request(Example("row", "scene", seconds=5)),
                 "row",
                 task="video",
