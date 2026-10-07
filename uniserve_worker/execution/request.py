@@ -180,6 +180,17 @@ class RequestPool:
     def request_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self._slots_by_request))
 
+    def has_open_requests(self) -> bool:
+        """Whether an admitted request still accepts calls.
+
+        A request closes at its ``Finish`` command, an ``ERROR`` result or a
+        cancelled call; until then its scheduler sends it further calls.
+        """
+        return any(
+            row is not None and not row.closed and not row.retired
+            for row in self._rows
+        )
+
     def bind_calls(
         self,
         calls: Sequence[Call],

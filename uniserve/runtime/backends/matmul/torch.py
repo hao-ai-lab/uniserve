@@ -56,4 +56,5 @@ class _TorchOperator(_Operator):
 
 
 class Backend(_Backend):
+    name = "torch"
     operator_class = _TorchOperator

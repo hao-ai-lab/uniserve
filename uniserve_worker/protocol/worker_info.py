@@ -391,6 +391,15 @@ class WorkerInfo:
             to equal the depth it launched the rank with.
         max_batch_calls: Maximum calls in one run.
         max_batch_tokens: Maximum text tokens represented in one run.
+        max_prefill_calls: Maximum calls in one prefill run, the rows the
+            worker's captured prefill graphs hold; a prefill run no graph
+            holds fails. Zero leaves prefill runs bounded by
+            ``max_batch_calls`` alone, as when they run eagerly.
+        max_decode_calls: Maximum calls in one decode run, the rows the
+            worker's largest captured decode graph holds, fewer when the KV
+            pool cannot hold a page of every cache group for more rows; a
+            decode run no graph holds fails. Zero leaves decode runs bounded
+            by ``max_batch_calls`` alone, as when they run eagerly.
         request_slots: Number of resident request slots.
         latent_page_units: Model-defined units stored in one latent page.
         latent_pages: Physical latent pages, including the reserved sentinel
@@ -416,6 +425,8 @@ class WorkerInfo:
     host_lane_capacity: int
     encoder_cache_entries: int = 0
     encoder_entry_bytes: int = 0
+    max_prefill_calls: int = 0
+    max_decode_calls: int = 0
     model_dtype: str = ""
     attention_backend: str = ""
     weight_formats: tuple[str, ...] = ()
@@ -512,14 +523,13 @@ class WorkerInfo:
                 "endpoint rank must satisfy 0 <= rank < world_size"
             )
 
+        # Every token-model forward reads or extends a request's KV cache.
         requires_kv = any(
-            variant
-            in {ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY}
-            for variant in self.supported_calls
+            isinstance(variant, ForwardMode) for variant in self.supported_calls
         )
         if requires_kv and self.kv_cache is None:
             raise invalid_descriptor(
-                "worker advertises AR work without a KV cache"
+                "worker advertises token work without a KV cache"
             )
 
         for name in (
@@ -528,6 +538,8 @@ class WorkerInfo:
             "buffer_pool_bytes",
             "encoder_cache_entries",
             "encoder_entry_bytes",
+            "max_prefill_calls",
+            "max_decode_calls",
         ):
             if getattr(self, name) < 0:
                 raise invalid_descriptor(
@@ -655,6 +667,14 @@ class WorkerInfo:
             max_batch_tokens=_uint(
                 data.get("max_batch_tokens"), f"{where}.max_batch_tokens"
             ),
+            max_prefill_calls=_uint(
+                data.get("max_prefill_calls", 0),
+                f"{where}.max_prefill_calls",
+            ),
+            max_decode_calls=_uint(
+                data.get("max_decode_calls", 0),
+                f"{where}.max_decode_calls",
+            ),
             request_slots=_uint(
                 data.get("request_slots"), f"{where}.request_slots"
             ),
@@ -719,6 +739,8 @@ class WorkerInfo:
             "queue_depth": self.queue_depth,
             "max_batch_calls": self.max_batch_calls,
             "max_batch_tokens": self.max_batch_tokens,
+            "max_prefill_calls": self.max_prefill_calls,
+            "max_decode_calls": self.max_decode_calls,
             "request_slots": self.request_slots,
             "kv_cache": None
             if self.kv_cache is None

@@ -17,41 +17,36 @@ except Exception:  # pragma: no cover
 
 
 if triton is not None:
-    # Both kernels exclude per-call integers from Triton's value
-    # specialization, so a new row, coordinate or batch size does not compile
-    # another kernel variant.
-    @triton.jit(
-        do_not_specialize=[
-            "row",
-            "valid_cache_length",
-            "logical_length",
-            "sampling_position",
-        ]
-    )
-    def _reset_row_kernel(
+    # Both kernels exclude per-call counts from Triton's value
+    # specialization, so a new batch size does not compile another kernel
+    # variant.
+    @triton.jit(do_not_specialize=["count"])
+    def _reset_rows_kernel(
+        columns_ptr,
         future_tokens_ptr,
         penalty_counts_ptr,
         predicates_ptr,
         logical_lengths_ptr,
         sampling_positions_ptr,
         cache_lengths_ptr,
-        row,
-        valid_cache_length,
-        logical_length,
-        sampling_position,
+        count,
         continuation_width: tl.constexpr,
         vocab_size: tl.constexpr,
         block_size: tl.constexpr,
     ):
-        """Reset one request row.
+        """Reset ``count`` request rows in one launch.
 
-        Continuation tokens become 1, penalty counts and the predicate become
-        zero, and the logical length, sampling position and verified cache
-        length take the supplied values. The launch grid must tile
-        ``max(continuation_width, vocab_size)`` in ``block_size`` chunks, as
-        `DecodeState._reset_device_row` sizes it.
+        ``columns`` is an int64 ``[4, count]`` table: the rows, then their
+        verified cache lengths, logical lengths and sampling positions.
+        Program ``(i, j)`` resets block ``j`` of row ``i``: continuation
+        tokens become 1, penalty counts and the predicate become zero, and
+        the coordinates take the row's column values. The launch grid must be
+        ``count`` by the ``block_size`` chunks of ``max(continuation_width,
+        vocab_size)``, as `DecodeState._reset_rows` sizes it.
         """
-        offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+        index = tl.program_id(0)
+        row = tl.load(columns_ptr + index)
+        offsets = tl.program_id(1) * block_size + tl.arange(0, block_size)
 
         # Row-wide spans: continuation token slots [rows, continuation_width]
         # and per-vocabulary penalty counts [rows, vocab_size].
@@ -66,9 +61,12 @@ if triton is not None:
             mask=offsets < vocab_size,
         )
 
-        # Scalar per-row coordinates [rows]; only lane zero of program zero
+        # Scalar per-row coordinates [rows]; only lane zero of block zero
         # writes them.
         scalar = offsets == 0
+        cache_length = tl.load(columns_ptr + count + index)
+        logical_length = tl.load(columns_ptr + 2 * count + index)
+        sampling_position = tl.load(columns_ptr + 3 * count + index)
         tl.store(predicates_ptr + row + offsets, 0, mask=scalar)
         tl.store(
             logical_lengths_ptr + row + offsets, logical_length, mask=scalar
@@ -78,9 +76,7 @@ if triton is not None:
             sampling_position,
             mask=scalar,
         )
-        tl.store(
-            cache_lengths_ptr + row + offsets, valid_cache_length, mask=scalar
-        )
+        tl.store(cache_lengths_ptr + row + offsets, cache_length, mask=scalar)
 
     @triton.jit(do_not_specialize=["count"])
     def _publish_decode_kernel(

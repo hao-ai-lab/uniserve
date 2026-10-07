@@ -425,7 +425,7 @@ def publish_product(
                 "encoder transfer requires feature dimensions"
             )
         source_call = request.call
-        if source_call.vision_input is not None:
+        if source_call.vision_inputs:
             source_kind = "vision_feature"
         elif source_call.latent_feature_input is not None:
             source_kind = "latent_feature"
@@ -623,11 +623,15 @@ def fetch_product(
     discard completes it.
     """
     request = state.pending_output(call.request_key.request_id)
-    for reference in (call.vision_input, call.latent_feature_input):
-        if reference is None:
-            continue
+    features = (
+        *(block.feature for block in call.vision_inputs),
+        *((call.latent_feature_input,) if call.latent_feature_input else ()),
+    )
+    if features:
+        if len(features) != 1:
+            raise invalid_descriptor("feature transfer requires one source")
         read = tensor_store.consume(
-            reference,
+            features[0],
             consumer_call_id=call.call_id,
             device=model_runner.call_devices(call)[0],
         )

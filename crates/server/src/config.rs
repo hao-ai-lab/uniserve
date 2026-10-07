@@ -62,6 +62,9 @@ pub struct EngineSettings {
     /// The prefill tokens still travel as their own batch and numerical call.
     /// `0` disables co-scheduling.
     pub mixed_prefill_tokens: usize,
+    /// Reuse and retain prompt KV prefixes across requests. Per-request cache
+    /// policy can further restrict this deployment-wide setting.
+    pub prefix_cache: bool,
     /// Waiting queue policy used by the scheduler.
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length override. `None` derives the limit from
@@ -88,6 +91,13 @@ pub struct EngineSettings {
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_vmm`.
     pub transfer: TransferConfig,
+    /// Number of independent replicas `workers` forms, as equal consecutive
+    /// blocks of groups. Each replica runs its own scheduler and KV pool, and
+    /// the engine client routes every request to one of them.
+    pub data_parallel_size: usize,
+    /// Whether the data-parallel replicas shard the model's routed experts,
+    /// and how they exchange tokens at every expert layer.
+    pub expert_parallel: Option<uniserve_engine::ExpertExchange>,
     /// Worker process arguments completed with resolved model assets before spawn.
     pub worker_process: WorkerProcessArgs,
 }
@@ -101,6 +111,7 @@ impl Default for EngineSettings {
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
+            prefix_cache: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: 15.0,
@@ -122,6 +133,8 @@ impl Default for EngineSettings {
                 WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )],
             transfer: TransferConfig::default(),
+            data_parallel_size: 1,
+            expert_parallel: None,
             worker_process: WorkerProcessArgs {
                 resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
                 ..WorkerProcessArgs::default()

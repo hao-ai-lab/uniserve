@@ -46,10 +46,12 @@ pub use crate::scheduler::{
     SchedulerStats, SchedulerStatsReporter, SchedulingPolicy, TimingStats, WorkerStats,
 };
 #[cfg(feature = "testing")]
-pub use crate::sim::{BatchEvent, SimEngine, SimExecutor};
+pub use crate::sim::{
+    BatchEvent, SimEngine, SimExecutor, sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
+};
 pub use crate::worker::{
-    BatchSubmitError, CallReaders, FlashInferBackend, FlashInferBackendParseError, LaneConfig,
-    WorkerExecutor, WorkerGroup, WorkerProcessArgs,
+    BatchSubmitError, CallReaders, ExpertExchange, ExpertParallelPlacement, FlashInferBackend,
+    FlashInferBackendParseError, LaneConfig, WorkerExecutor, WorkerGroup, WorkerProcessArgs,
 };
 pub use uniserve_worker_ipc::{
     AttentionBackend, ConditionTiles, DEFAULT_COMPONENT, VideoDenoiserInfo,

@@ -365,7 +365,6 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
     buffers = BufferPool(byte_capacity=16, devices=("cpu",))
     store = (
         TensorStore(
-            entry_capacity=1,
             max_entry_bytes=16,
             devices=("cpu",),
             buffer_pool=buffers,

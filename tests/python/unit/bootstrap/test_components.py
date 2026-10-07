@@ -3,12 +3,38 @@
 import pytest
 import torch
 
+from uniserve.distributed import Communicator
 from uniserve.model import ComponentEntry, Encoder, EntryPoint
 from uniserve_worker.bootstrap.components import validate_components
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.errors import WorkerError
+from uniserve_worker.model_executor.component_binding import ComponentBinding
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("rank", (0, 1))
+def test_component_media_assignment_uses_worker_local_ranks(rank):
+    binding = ComponentBinding(
+        "decoder",
+        ComponentConfig(
+            (1, 0), distribution="temporal_units", units_per_rank=2
+        ),
+        Communicator(ranks=(4, 5), rank=rank),
+        mesh=None,
+        device=torch.device("cpu"),
+    )
+    assert binding.owns
+    assert tuple(binding.media_units(7, 3)) == ((9,) if rank == 0 else (7, 8))
+
+    nonmember = ComponentBinding(
+        "decoder",
+        ComponentConfig((1 - rank,), distribution="temporal_units"),
+        Communicator(ranks=(4, 5), rank=rank),
+        mesh=None,
+        device=torch.device("cpu"),
+    )
+    assert not nonmember.owns
 
 
 def test_binding_rejects_a_missing_numerical_method():

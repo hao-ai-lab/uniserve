@@ -23,6 +23,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.model import (
     CausalLM,
@@ -332,12 +333,15 @@ def load_worker_model(
     source: models.Config | None,
     description: nn.Module,
     declarations: Mapping[str, tuple[Call, ...]],
+    experts: Communicator | None = None,
 ) -> WorkerModel:
     """Materialize this rank's selected modules on their meshes.
 
     ``source``, ``description`` and ``declarations`` are the results of
     ``prepare_worker_model``; ``bindings`` come from
-    ``initialize_components``. The stub model is built directly on the worker
+    ``initialize_components``. ``experts`` is the expert-parallel group the
+    model's routed experts shard over, when the replica shares them with
+    other replicas' ranks. The stub model is built directly on the worker
     device. When no configured component has numerical calls (a host
     worker), no weights load and the meta-device description is kept.
     Otherwise each outermost declared module path of a meshed component is
@@ -430,6 +434,7 @@ def load_worker_model(
         meshes=meshes,
         attention=attention,
         devices=_devices(description, config.execution.generation_device),
+        experts=None if experts is None or experts.size == 1 else experts,
     )
     model = loaded.model
 
