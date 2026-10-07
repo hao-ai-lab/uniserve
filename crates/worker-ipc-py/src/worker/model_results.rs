@@ -9,6 +9,7 @@ use uniserve_worker_ipc::ForwardStats as NativeStats;
 use crate::stats::ForwardStats;
 
 use super::events::CUDAEvent;
+use super::model_inputs::Row;
 
 /// Tensor views retain their backing; the event orders reads on another stream.
 /// Numerical copies and vocabulary gathers stay with the tensor backend.
@@ -34,6 +35,78 @@ pub(crate) struct ExecutionOutput {
 }
 
 impl ExecutionOutput {
+    /// Check the numerical result before execution exposes it to request consumers.
+    /// Only tensor metadata is read; validation never waits for device values.
+    pub(super) fn validate(
+        &self,
+        rows: &Bound<'_, PyTuple>,
+        device: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let py = rows.py();
+        let values = self.values.bind(py);
+        if values.len() != rows.len() {
+            return Err(PyValueError::new_err(
+                "model must return one output per input row",
+            ));
+        }
+
+        for (value, row) in values.iter().zip(rows) {
+            let actual = value.getattr("device")?;
+            if !actual.eq(device)? {
+                return Err(PyValueError::new_err(format!(
+                    "model output is on {actual}, expected {device}"
+                )));
+            }
+
+            let row = Row::borrow(&row)?;
+            if let Row::CanvasStep(row) = row {
+                // A canvas step returns the sampler's stop flag and token canvas.
+                let shape: Vec<usize> = value.getattr("shape")?.extract()?;
+                if !value
+                    .getattr("dtype")?
+                    .is(&py.import("torch")?.getattr("int64")?)
+                    || shape != [1 + row.canvas_length]
+                {
+                    return Err(PyValueError::new_err(
+                        "a canvas step reports its stop and canvas",
+                    ));
+                }
+                continue;
+            }
+            if !value.call_method0("is_floating_point")?.extract::<bool>()? {
+                return Err(PyValueError::new_err(
+                    "raw neural outputs must use a floating dtype",
+                ));
+            }
+
+            let failure = match row {
+                Row::Token(_) if value.getattr("ndim")?.extract::<usize>()? < 2 => {
+                    Some("token output must retain token and feature dimensions")
+                }
+                Row::Diffusion(row)
+                    if !value
+                        .getattr("shape")?
+                        .eq(row.latent.bind(py).getattr("shape")?)? =>
+                {
+                    Some("flow prediction shape does not match its latent")
+                }
+                Row::Vision(_) if value.call_method0("numel")?.extract::<usize>()? == 0 => {
+                    Some("encoder output must not be empty")
+                }
+                Row::Decode(row) => {
+                    let shape: Vec<usize> = value.getattr("shape")?.extract()?;
+                    (!shape.ends_with(&[row.image_height, row.image_width]))
+                        .then_some("decoded tensor does not match the requested image shape")
+                }
+                _ => None,
+            };
+            if let Some(message) = failure {
+                return Err(PyValueError::new_err(message));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn clone_ref(&self, py: Python<'_>) -> Self {
         Self {
             values: self.values.clone_ref(py),
@@ -47,6 +120,15 @@ impl ExecutionOutput {
             greedy: self.greedy.as_ref().map(|value| value.clone_ref(py)),
             layouts: self.layouts.clone_ref(py),
         }
+    }
+
+    /// Select leading live rows without revalidating unchanged tensor metadata.
+    pub(super) fn rows(&self, py: Python<'_>, start: usize, stop: usize) -> Self {
+        let mut result = self.clone_ref(py);
+        result.values = self.values.bind(py).get_slice(start, stop).unbind();
+        result.vocabularies = self.vocabularies.bind(py).get_slice(start, stop).unbind();
+        result.layouts = self.layouts.bind(py).get_slice(start, stop).unbind();
+        result
     }
 
     /// Copy numerical views after the caller has joined their producer.
@@ -107,7 +189,7 @@ impl ExecutionOutput {
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (values, vocabularies=None, request_pool_indices=None, output_event=None, stats=None, greedy=None, layouts=None))]
-    fn new(
+    pub(super) fn new(
         py: Python<'_>,
         values: Py<PyTuple>,
         vocabularies: Option<Py<PyTuple>>,

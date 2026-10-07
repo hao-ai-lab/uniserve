@@ -15,6 +15,7 @@ use uniserve_worker_ipc::{CallStatus, NewRequest, RequestKey};
 
 use super::error::{invalid, native_error};
 use super::protocol::{call_id, new_request, request_key};
+use super::request_slots::RequestSlots;
 
 /// Immutable observation of accepted or projected native request coordinates.
 #[pyclass(frozen, eq, module = "uniserve_worker._uniserve_ipc")]
@@ -98,7 +99,7 @@ pub(super) struct KVConditioning {
 pub(super) struct VideoState {
     pub(super) denoising: Option<Py<PyAny>>,
     pub(super) overlap: Option<Py<PyAny>>,
-    pub(super) ladder: Option<Py<PyAny>>,
+    pub(super) sequence: Option<Py<super::model_runner::DenoisingSequence>>,
     pub(super) preparation: Option<Py<super::host::HostTask>>,
 }
 
@@ -108,7 +109,7 @@ pub(crate) struct Request {
     pub(super) request: Arc<NativeRequest>,
     #[pyo3(get)]
     pub(super) admission: Py<PyAny>,
-    pub(super) diffusion: Option<Py<PyAny>>,
+    pub(super) diffusion: Option<Py<super::diffusion_state::DiffusionState>>,
     pub(super) kv: Option<KVConditioning>,
     pub(super) video: VideoState,
     pub(super) mux: Option<Arc<super::media::MuxSession>>,
@@ -229,7 +230,7 @@ impl Request {
         visit.call(&self.diffusion)?;
         visit.call(&self.video.denoising)?;
         visit.call(&self.video.overlap)?;
-        visit.call(&self.video.ladder)?;
+        visit.call(&self.video.sequence)?;
         visit.call(&self.video.preparation)?;
         Ok(())
     }
@@ -239,14 +240,14 @@ impl Request {
     }
 }
 
-/// Bind the native pool to its Python numerical storage and slot views.
+/// Retain numerical storage and borrowed views alongside native request leases.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct RequestPool {
     pub(super) pool: NativePool,
     // Cached language views carry numerical state, never a second lifecycle.
     views: Vec<Option<Py<Request>>>,
     #[pyo3(get)]
-    pub(super) storage: Py<PyAny>,
+    pub(super) storage: Py<RequestSlots>,
 }
 
 #[pymethods]
@@ -266,18 +267,18 @@ impl RequestPool {
         }
         let size = max_request_pool_size as usize;
         let pool = NativePool::new(size).map_err(|error| native_error(py, error))?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("state_buffers", state_buffers)?;
-        if let Some(device) = device {
-            kwargs.set_item("device", device)?;
-        } else {
-            kwargs.set_item("device", "cpu")?;
-        }
-        let storage = py
-            .import("uniserve_worker.storage.request_slots")?
-            .getattr("RequestSlots")?
-            .call((size,), Some(&kwargs))?
-            .unbind();
+        let device = device
+            .map(|device| device.into_bound(py))
+            .unwrap_or_else(|| "cpu".into_pyobject(py).unwrap().into_any());
+        let storage = Py::new(
+            py,
+            RequestSlots::new(
+                py,
+                max_request_pool_size,
+                state_buffers.as_ref().map(|fields| fields.bind(py)),
+                &device,
+            )?,
+        )?;
 
         Ok(Self {
             pool,
@@ -299,7 +300,7 @@ impl RequestPool {
         }
         self.views.iter_mut().for_each(|view| *view = None);
         self.pool.close();
-        self.storage.bind(py).call_method0("close")?;
+        self.storage.borrow_mut(py).close(py);
         Ok(())
     }
 

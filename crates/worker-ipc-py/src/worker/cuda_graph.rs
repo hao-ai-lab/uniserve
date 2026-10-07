@@ -1,8 +1,12 @@
 //! Captured numerical calls, segmented replay and their resource lifetime.
 
+pub(super) mod attention;
+pub(super) mod batch;
 mod capture;
+mod inputs;
 mod runner;
 
+pub(super) use inputs::{GraphInputs, input_signature};
 pub(super) use runner::CUDAGraphRunner;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};

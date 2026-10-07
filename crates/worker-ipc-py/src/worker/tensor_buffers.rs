@@ -5,14 +5,56 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
 
+/// Combine tensor descriptions into a dimension-by-dimension allocation bound.
+/// All descriptions must represent the same fields, dtypes and placement.
+#[pyfunction]
+pub(super) fn buffer_envelope(
+    py: Python<'_>,
+    descriptions: &Bound<'_, PyTuple>,
+) -> PyResult<Py<PyDict>> {
+    let first = mapping(&descriptions.get_item(0)?)?;
+    let result = first.copy()?;
+    let replace = py.import("dataclasses")?.getattr("replace")?;
+    for description in descriptions.iter().skip(1) {
+        let description = mapping(&description)?;
+        if description.len() != first.len() {
+            return Err(PyValueError::new_err(
+                "buffer descriptions must name the same tensors",
+            ));
+        }
+        for (name, config) in result.iter() {
+            let value = description.get_item(&name)?.ok_or_else(|| {
+                PyValueError::new_err("buffer descriptions must name the same tensors")
+            })?;
+            let mut shape: Vec<usize> = config.getattr("shape")?.extract()?;
+            let other: Vec<usize> = value.getattr("shape")?.extract()?;
+            if shape.len() != other.len()
+                || !config.getattr("dtype")?.eq(value.getattr("dtype")?)?
+                || !config.getattr("host")?.eq(value.getattr("host")?)?
+            {
+                return Err(PyValueError::new_err(
+                    "buffer descriptions must name the same tensors",
+                ));
+            }
+            for (bound, extent) in shape.iter_mut().zip(other) {
+                *bound = (*bound).max(extent);
+            }
+            let options = PyDict::new(py);
+            options.set_item("shape", PyTuple::new(py, shape)?)?;
+            result.set_item(name, replace.call((config,), Some(&options))?)?;
+        }
+    }
+    Ok(result.unbind())
+}
+
 /// Own tensor references and symmetric mappings until their readers retire.
 /// Numerical views borrow these allocations and can outlive this wrapper.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct TensorBuffers {
-    tensors: Py<PyDict>,
+    pub(super) tensors: Py<PyDict>,
     views: Py<PyDict>,
     peers: Py<PyDict>,
-    symmetric: Vec<Py<PyAny>>,
+    symmetric: Vec<Py<super::peer_storage::SymmetricStorage>>,
     closed: bool,
 }
 
@@ -31,7 +73,7 @@ impl TensorBuffers {
 
     /// Retain contiguous external tensors without changing their values.
     #[staticmethod]
-    fn from_tensors(py: Python<'_>, tensors: &Bound<'_, PyAny>) -> PyResult<Self> {
+    pub(super) fn from_tensors(py: Python<'_>, tensors: &Bound<'_, PyAny>) -> PyResult<Self> {
         let tensors = mapping(tensors)?.copy()?;
         for (name, tensor) in tensors.iter() {
             if name.extract::<String>().is_err()
@@ -87,17 +129,18 @@ impl TensorBuffers {
             let options = PyDict::new(py);
             options.set_item("dtype", config.getattr("dtype")?)?;
             let tensor = if let Some(group) = symmetric.get_item(&name)? {
-                let allocation = py.import("uniserve.runtime._peer_storage")?.call_method(
-                    "allocate_symmetric_storage",
-                    (group, shape),
-                    Some(&options),
+                let allocation = super::peer_storage::allocate_symmetric_storage(
+                    py,
+                    &group,
+                    shape.cast::<PyTuple>()?,
+                    &config.getattr("dtype")?,
                 )?;
-                let tensor = allocation.getattr("local")?;
-                buffers
-                    .peers
-                    .bind(py)
-                    .set_item(&name, allocation.getattr("peers")?)?;
-                buffers.symmetric.push(allocation.unbind());
+                let storage = allocation.borrow(py);
+                let tensor = storage.local.bind(py).clone();
+                buffers.peers.bind(py).set_item(&name, &storage.peers)?;
+                drop(storage);
+                buffers.symmetric.push(allocation);
+
                 tensor
             } else {
                 let host = config.getattr("host")?.is_truthy()?;
@@ -118,7 +161,7 @@ impl TensorBuffers {
     }
 
     /// Borrow a field's entire capacity without changing its layout.
-    fn backing(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+    pub(super) fn backing(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         self.open()?;
         self.tensors
             .bind(py)

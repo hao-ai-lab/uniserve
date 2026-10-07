@@ -7,6 +7,38 @@ use uniserve_worker_ipc::{Call, CallKind};
 
 use crate::{Error, Result};
 
+/// Per-sequence language output, independently of the input's cache writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenSelection {
+    LastLogits,
+    AllLogits,
+    Hidden,
+    Cache,
+}
+
+impl TokenSelection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LastLogits => "last_logits",
+            Self::AllLogits => "all_logits",
+            Self::Hidden => "hidden",
+            Self::Cache => "cache",
+        }
+    }
+
+    pub const fn projects(self) -> bool {
+        matches!(self, Self::LastLogits | Self::AllLogits)
+    }
+
+    pub fn logit_rows(self, tokens: usize) -> usize {
+        match self {
+            Self::LastLogits => tokens.min(1),
+            Self::AllLogits => tokens,
+            Self::Hidden | Self::Cache => 0,
+        }
+    }
+}
+
 /// One numerical invocation and the rows whose outputs it produces.
 pub struct ModelBatch<'a, R> {
     pub runner: &'a R,

@@ -6,7 +6,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
-use super::{Worker, abort, closed};
+use super::{Worker, closed};
 use crate::worker::buffer::BufferPool;
 use crate::worker::capacity::{self, inputs as capacity_inputs, pools, report};
 use crate::worker::error::unsupported;
@@ -16,6 +16,9 @@ use crate::worker::host::HostLane;
 use crate::worker::latent::LatentPool;
 use crate::worker::model_executor::ModelExecutor;
 use crate::worker::output::OutputPool;
+use crate::worker::process_groups::{
+    ProcessGroups, initialize_components, initialize_process_groups,
+};
 use crate::worker::request::RequestPool;
 use crate::worker::storage::TensorStore;
 
@@ -34,43 +37,44 @@ pub(super) fn from_config<'py>(
     let execution = config.getattr("execution")?;
     let execution_native = crate::worker::config::native(&execution)?;
     let experts = config.getattr("expert_parallel")?;
-    let options = PyDict::new(py);
-    options.set_item("rank", execution_native.rank)?;
-    options.set_item("world_size", execution_native.world_size)?;
-    options.set_item("device", &execution_native.device)?;
-    options.set_item("local_rank", config.getattr("local_rank")?)?;
-    options.set_item("backend", config.getattr("distributed_backend")?)?;
-    options.set_item("rendezvous", config.getattr("rendezvous")?)?;
-    if !experts.is_none() {
-        options.set_item(
-            "experts",
-            (
-                experts.getattr("rank")?,
-                experts.getattr("size")?,
-                experts.getattr("rendezvous")?,
-            ),
-        )?;
-    }
-    let groups = py
-        .import("uniserve.runtime.process_groups")?
-        .call_method("initialize_process_groups", (), Some(&options))
-        .map_err(|error| setup_error(py, error))?;
+    let union = if experts.is_none() {
+        None
+    } else {
+        Some((
+            experts.getattr("rank")?.extract()?,
+            experts.getattr("size")?.extract()?,
+            experts.getattr("rendezvous")?.extract()?,
+        ))
+    };
+    let device = execution_native
+        .device
+        .as_str()
+        .into_pyobject(py)?
+        .into_any();
+    let rendezvous = config.getattr("rendezvous")?;
+    let groups = initialize_process_groups(
+        py,
+        execution_native.rank as i64,
+        config.getattr("local_rank")?.extract()?,
+        execution_native.world_size as i64,
+        &device,
+        config.getattr("distributed_backend")?.extract()?,
+        None,
+        rendezvous.extract()?,
+        union,
+    )
+    .map_err(|error| setup_error(py, error))?
+    .into_bound(py);
 
     let result = (|| {
         let components = config.getattr("components")?;
         let bindings = if execution_native.role == "experts" {
             PyDict::new(py).into_any()
         } else {
-            let options = PyDict::new(py);
-            options.set_item("declarations", &declarations)?;
             let components = py.get_type::<PyDict>().call1((&components,))?;
-            py.import("uniserve_worker.bootstrap.distributed")?
-                .call_method(
-                    "initialize_components",
-                    (&groups, components),
-                    Some(&options),
-                )
+            initialize_components(&groups, &components, Some(&declarations))
                 .map_err(|error| setup_error(py, error))?
+                .into_any()
         };
         let options = PyDict::new(py);
         options.set_item("source", source)?;
@@ -143,7 +147,8 @@ pub(super) fn from_config<'py>(
     })();
     match result {
         Ok(worker) => Ok(worker),
-        Err(error) => close_all(py, [Err(error), abort(py, &groups)]).map(|()| unreachable!()),
+        Err(error) => close_all(py, [Err(error), ProcessGroups::close(&groups, true)])
+            .map(|()| unreachable!()),
     }
 }
 
@@ -295,10 +300,9 @@ impl Worker {
         self.info = Some(info.clone());
         let arena = &layout.arena;
         self.device_product_bytes = arena.device_product_bytes;
-        let inputs = py.import("uniserve_worker.bootstrap.inputs")?;
-        let text = inputs.call_method1(
-            "capability",
-            (&model, py.import("uniserve.model")?.getattr("CausalLM")?),
+        let text = crate::worker::model_executor::discovery::inputs::capability(
+            model,
+            &py.import("uniserve.model")?.getattr("CausalLM")?,
         )?;
         if !text.is_none() {
             self.allocate_cache(py, &text, info, queue_depth)?;
@@ -326,34 +330,29 @@ impl Worker {
             ));
         }
         if let Some(tables) = &self.block_tables {
-            let options = PyDict::new(py);
-            options.set_item("request_pool_size", info.request_slots)?;
-            options.set_item(
-                "vocab_size",
-                text.getattr("backbone")?.getattr("vocab_size")?,
-            )?;
-            options.set_item("continuation_width", 1)?;
-            options.set_item("device", &config_native.device)?;
-            options.set_item("logits_dtype", dtype)?;
-            options.set_item(
-                "valid_cache_lengths",
-                tables.bind(py).getattr("verified_lengths")?,
-            )?;
-            self.decode_state = Some(
-                py.import("uniserve_worker.storage.decode_state")?
-                    .getattr("DecodeState")?
-                    .call((), Some(&options))?
-                    .unbind(),
-            );
+            self.decode_state = Some(Py::new(
+                py,
+                super::DecodeState::new(
+                    py,
+                    info.request_slots as usize,
+                    text.getattr("backbone")?.getattr("vocab_size")?.extract()?,
+                    1,
+                    &config_native.device.as_str().into_pyobject(py)?.into_any(),
+                    Some(&dtype),
+                    Some(&tables.bind(py).getattr("verified_lengths")?),
+                )?,
+            )?);
         }
 
-        let denoises = runner.borrow().denoises(py);
+        let denoises = runner.borrow().denoises();
         let generation_device = config_native
             .generation_device
             .as_deref()
             .unwrap_or(&config_native.device);
         if let Some(plan) = &layout.latent_plan
-            && (denoises || !inputs.call_method1("image_builder", (&model,))?.is_none())
+            && (denoises
+                || !crate::worker::model_executor::discovery::inputs::image_builder(model)?
+                    .is_none())
         {
             let options = PyDict::new(py);
             options.set_item("request_pool_size", info.request_slots)?;
@@ -372,7 +371,7 @@ impl Worker {
         if denoises {
             ModelExecutor::bind_diffusion_storage(
                 &runner,
-                &requests.getattr("storage")?.getattr("bank")?,
+                requests.borrow().storage.borrow(py).bank.bind(py),
                 self.latent_pool
                     .as_ref()
                     .ok_or_else(closed)?
@@ -428,10 +427,9 @@ impl Worker {
             .try_iter()?
             .map(|item| item?.get_item(0))
             .collect::<PyResult<Vec<_>>>()?;
-        self.codec_slot = py
-            .import("uniserve_worker.bootstrap.components")?
-            .call_method1("holds_host_components", (component_names,))?
-            .extract()?;
+        self.codec_slot = crate::worker::component_binding::calls::holds_host_components(
+            PyTuple::new(py, component_names)?.as_any(),
+        )?;
         let host_capacity = if self.codec_slot {
             1
         } else {
@@ -444,15 +442,11 @@ impl Worker {
 
         let mut transfer_bytes = arena.transfer_bytes as usize;
         if { runner.borrow().state_buffers.bind(py).clone() }.is_truthy()?
-            || !inputs
-                .call_method1(
-                    "capability",
-                    (
-                        &model,
-                        py.import("uniserve.model")?.getattr("VideoPostprocessor")?,
-                    ),
-                )?
-                .is_none()
+            || !crate::worker::model_executor::discovery::inputs::capability(
+                model,
+                &py.import("uniserve.model")?.getattr("VideoPostprocessor")?,
+            )?
+            .is_none()
         {
             // One export credit per representation plus one read credit per
             // remote rank keeps request tensor lifetimes within the pool.
@@ -489,7 +483,7 @@ impl Worker {
                     .as_ref()
                     .map(|pool| pool.bind(py).as_any().clone())
                     .unwrap_or_else(|| py.None().into_bound(py)),
-                &decode_state.bind(py).getattr("predicates")?,
+                decode_state.borrow(py).predicates(py)?.bind(py),
                 max_calls,
                 info.request_slots as usize,
                 (info.latent_pages.saturating_sub(1) * info.latent_page_units) as usize,
@@ -508,16 +502,16 @@ impl Worker {
                 let denoiser =
                     slots.call_method1("generating_denoiser", (canvas.getattr("model")?,))?;
                 if !denoiser.is_none() {
-                    let options = PyDict::new(py);
-                    options.set_item("request_pool_size", info.request_slots)?;
-                    options.set_item("sampling", sampling)?;
-                    options.set_item("device", canvas.getattr("device")?)?;
-                    self.canvas_slots = Some(
-                        slots
-                            .getattr("CanvasSlots")?
-                            .call_method("for_denoiser", (denoiser,), Some(&options))?
-                            .unbind(),
-                    );
+                    self.canvas_slots = Some(Py::new(
+                        py,
+                        super::CanvasSlots::for_denoiser(
+                            py,
+                            &denoiser,
+                            info.request_slots as usize,
+                            sampling.extract()?,
+                            &canvas.getattr("device")?,
+                        )?,
+                    )?);
                     ModelExecutor::bind_canvas_slots(
                         &runner,
                         self.canvas_slots.as_ref().ok_or_else(closed)?.clone_ref(py),

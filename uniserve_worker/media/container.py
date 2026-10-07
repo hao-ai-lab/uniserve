@@ -14,17 +14,18 @@ the executor schedules codec operations on the host lane.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any
 
 import numpy as np
+
+from uniserve_worker._uniserve_ipc import MuxSession
 
 __all__ = [
     "AUDIO_CODEC",
     "VIDEO_CODEC",
     "AvMuxConfig",
-    "AvMuxSession",
+    "MuxSession",
     "encode_audio_track",
     "encode_video_unit",
     "encoded_video_bytes",
@@ -148,7 +149,7 @@ def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
     """Encode one media unit as a self-contained MP4 starting at a keyframe.
 
     ``rgb24`` holds the unit's uint8 frames as ``[frames, height, width, 3]``.
-    Frame timestamps start at zero in every unit; `AvMuxSession.append`
+    Frame timestamps start at zero in every unit; `MuxSession.append`
     shifts them onto the request's timeline.
 
     Raises:
@@ -248,149 +249,3 @@ def encode_audio_track(config: AvMuxConfig, pcm: np.ndarray) -> bytes:
     finally:
         container.close()
     return buffer.getvalue()
-
-
-class AvMuxSession:
-    """Assembles encoded media units and an encoded audio track into one MP4.
-
-    Both tracks arrive already encoded, so assembly creates each output stream
-    from a template and copies packets across with a running timestamp
-    offset; no frame is decoded or re-encoded. Media units are appended as
-    their rounds complete, and the audio track is muxed when the artifact is
-    finalized, so the container is open from the first unit to the last.
-    """
-
-    def __init__(self, config: AvMuxConfig) -> None:
-        self.config = config
-        # The container and its streams are created by the first `append`.
-        self._buffer: io.BytesIO | None = None
-        self._container: Any = None
-        self._video_out: Any = None
-        self._audio_out: Any = None
-        # End of the video copied so far, in the unit packets' time base; the
-        # next unit's timestamps are shifted by it.
-        self._offset = 0
-        self.units_appended = 0
-
-    @property
-    def total_units(self) -> int:
-        """Return the number of media units the request's video divides into."""
-        return len(self.config.video_unit_frames)
-
-    def _open(self, first_unit: bytes) -> None:
-        """Create the container and both output streams before any packet.
-
-        The video stream is templated from the first unit. The audio stream
-        must exist before the header is written, and the audio track is not
-        encoded until every unit has been reconstructed, so its template is a
-        brief silent track encoded under the same settings, whose codec
-        parameters are the ones the real track carries.
-        """
-        import av
-
-        self._buffer = io.BytesIO()
-        self._container = av.open(self._buffer, mode="w", format="mp4")
-        source = av.open(io.BytesIO(first_unit), mode="r")
-        try:
-            self._video_out = self._container.add_stream_from_template(
-                source.streams.video[0]
-            )
-        finally:
-            source.close()
-        template = encode_audio_track(
-            replace(self.config, frame_count=1, video_unit_frames=(1,)),
-            np.zeros((1, 2), dtype=np.int16),
-        )
-        track = av.open(io.BytesIO(template), mode="r")
-        try:
-            self._audio_out = self._container.add_stream_from_template(
-                track.streams.audio[0]
-            )
-        finally:
-            track.close()
-
-    def append(self, units: tuple[bytes, ...]) -> None:
-        """Copy the packets of the next media units, in order.
-
-        The first unit ever appended also creates the container (`_open`).
-
-        Raises:
-            ValueError: When the units would exceed the request's unit count;
-                nothing is appended in that case.
-        """
-        import av
-
-        if self.units_appended + len(units) > self.total_units:
-            raise ValueError(
-                "artifact assembly received more media units than the request"
-            )
-        for payload in units:
-            if self._container is None:
-                self._open(payload)
-            source = av.open(io.BytesIO(payload), mode="r")
-            try:
-                stream = source.streams.video[0]
-                last = self._offset
-                for packet in source.demux(stream):
-                    # ``demux`` ends a stream with an empty flush packet that
-                    # has no timestamp and nothing to copy.
-                    if packet.dts is None:
-                        continue
-                    packet.stream = self._video_out
-                    packet.pts = (packet.pts or 0) + self._offset
-                    packet.dts = packet.dts + self._offset
-                    self._container.mux(packet)
-                    # A packet without a recorded duration counts one tick.
-                    last = max(last, packet.dts + (packet.duration or 1))
-                self._offset = last
-            finally:
-                source.close()
-            self.units_appended += 1
-
-    def finalize(self, audio: bytes) -> bytes:
-        """Mux the audio track after every unit and return the artifact.
-
-        The session is closed once its container is finalized, so a later
-        call raises.
-
-        Raises:
-            ValueError: When not every media unit has been appended, or the
-                session was closed.
-            RuntimeError: When the finished container is empty.
-        """
-        import av
-
-        if self.units_appended != self.total_units or self._container is None:
-            raise ValueError(
-                "artifact assembly requires every media unit of the request"
-            )
-        # The audio track starts at time zero, as the first unit does, so
-        # its packets are copied without an offset.
-        track = av.open(io.BytesIO(audio), mode="r")
-        try:
-            for packet in track.demux(track.streams.audio[0]):
-                if packet.dts is None:
-                    continue
-                packet.stream = self._audio_out
-                self._container.mux(packet)
-        finally:
-            track.close()
-        self._container.close()
-        assert self._buffer is not None
-        value = self._buffer.getvalue()
-        self.close()
-        if not value:
-            raise RuntimeError("media mux produced an empty container")
-        return value
-
-    def close(self) -> None:
-        """Discard an open container, for a request that ends early."""
-        if self._container is not None:
-            try:
-                self._container.close()
-            except Exception:  # noqa: BLE001 - closing a discarded container
-                pass
-        self._container = None
-        self._buffer = None
-        self._video_out = None
-        self._audio_out = None

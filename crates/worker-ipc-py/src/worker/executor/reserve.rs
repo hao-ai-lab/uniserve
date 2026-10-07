@@ -1,6 +1,7 @@
 //! Bind a batch's output rows and physical resources before numerical launch.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::worker::model_executor::ModelExecutor;
 use indexmap::IndexMap;
@@ -62,10 +63,7 @@ impl PythonBackend {
 
         let scope = NumericalBatch::scope(numerical)?;
         with_context(scope.bind(py), || {
-            let started: u64 = py
-                .import("time")?
-                .call_method0("perf_counter_ns")?
-                .extract()?;
+            let started = Instant::now();
             // Payload capacity uses four-byte units in addition to int64
             // sampling columns. Saturated requests are rejected by OutputPool.
             let words = batch
@@ -132,12 +130,18 @@ impl PythonBackend {
                     }
                 }
                 let images = { model.borrow().image_builder.bind(py).clone() };
-                let media = { model.borrow().media_builder.bind(py).clone() };
+                let media = {
+                    model
+                        .borrow()
+                        .media_builder
+                        .as_ref()
+                        .map(|builder| builder.bind(py).clone())
+                };
                 NumericalBatch::bind_latents(
                     numerical,
                     self.latents.as_ref().map(|pool| pool.bind(py)),
                     (!images.is_none()).then_some(&images),
-                    (!media.is_none()).then_some(&media),
+                    media.as_ref(),
                 )?;
             }
             self.bind_writes(py, batch, &outputs, &devices)?;
@@ -176,9 +180,7 @@ impl PythonBackend {
                     )?;
                 }
             }
-            let components = numerical.borrow().component_us.clone_ref(py);
-            py.import("uniserve_worker.profiling")?
-                .call_method1("record_component", (components, "open_lane", started))?;
+            batch.record_component(py, "open_lane", started)?;
             Ok(())
         })
     }

@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PySlice, PyTuple};
+use pyo3::types::{PySlice, PyTuple};
 
 use super::{BatchState, ForwardRow, PythonBackend};
-use crate::batches::CanvasSampling;
 use crate::worker::error::{invalid, native_error};
+use crate::worker::model_inputs::{AttentionRow, CanvasRow, CanvasStepRow, InputRow};
 use crate::worker::storage::Buffer;
 
 impl PythonBackend {
@@ -40,16 +40,16 @@ impl PythonBackend {
             ));
         }
 
-        let row_type = py.import("uniserve_worker.model_executor.input_batch")?;
-        let options = PyDict::new(py);
-        options.set_item(
-            "forward_mode",
-            crate::convert::RequestConversion::new(py)?.kind(call.code),
-        )?;
-        options.set_item("request_pool_idx", slot)?;
-        options.set_item("seq_len", visible)?;
-        options.set_item("write_kv", false)?;
-        options.set_item("causal", false)?;
+        let input = InputRow {
+            kind: call.code,
+            request_pool_idx: slot as u32,
+        };
+        let attention = |positions| AttentionRow {
+            positions: Some(positions),
+            seq_len: visible as i64,
+            write_kv: false,
+            causal: Some(false),
+        };
         let arange = py.import("torch")?.getattr("arange")?;
 
         if let Some(step) = call.canvas {
@@ -65,12 +65,15 @@ impl PythonBackend {
                 .sampling
                 .seed
                 .ok_or_else(|| invalid(py, "a canvas step requires a seeded request"))?;
-            let slots = { self.model_runner.borrow(py).canvas_slots.bind(py).clone() };
-            if slots.is_none() {
-                return Err(invalid(py, "this worker keeps no generating canvases"));
-            }
-            let served = slots.getattr("served")?.cast_into::<CanvasSampling>()?;
-            if &served.get().inner != sampling {
+            let slots = self
+                .model_runner
+                .borrow(py)
+                .canvas_slots
+                .as_ref()
+                .ok_or_else(|| invalid(py, "this worker keeps no generating canvases"))?
+                .clone_ref(py);
+            let served = slots.borrow(py).served.borrow(py).inner;
+            if &served != sampling {
                 return Err(invalid(
                     py,
                     "the admitted canvas sampling is not the sampling this worker serves",
@@ -95,19 +98,17 @@ impl PythonBackend {
                 .advance_canvas(call.request_key, step)
                 .map_err(|error| native_error(py, error))?;
 
-            options.set_item(
-                "positions",
-                arange.call1((position, position + u64::from(length)))?,
-            )?;
-            options.set_item("canvas_length", length)?;
-            // The sampler stores the unsigned seed in an int64 device column.
-            options.set_item("seed", seed as i64)?;
-            options.set_item("block", step.block)?;
-            options.set_item("step", step.step)?;
-            options.set_item("sampling", slots.getattr("constants")?)?;
-            let row = row_type
-                .getattr("CanvasStepRow")?
-                .call((), Some(&options))?;
+            let row = CanvasStepRow {
+                canvas_length: length as usize,
+                seed: seed as i64,
+                block: i64::from(step.block),
+                step: i64::from(step.step),
+                sampling: slots.borrow(py).constants.clone_ref(py),
+            };
+            let positions = arange
+                .call1((position, position + u64::from(length)))?
+                .unbind();
+            let row = Bound::new(py, row.initializer(py, input, attention(positions))?)?.into_any();
             return Ok(vec![ForwardRow::new(index, row.unbind())]);
         }
 
@@ -149,37 +150,35 @@ impl PythonBackend {
                 }
             };
             let offsets = &readout.candidate_offsets;
-            options.set_item("positions", position_values.clone())?;
-            options.set_item(
-                "token_ids",
-                tokens.get_item(PySlice::new(py, first as isize, end as isize, 1))?,
-            )?;
-            options.set_item(
-                "slot_tokens",
-                PyTuple::new(
+            let row = CanvasRow {
+                token_ids: Some(
+                    tokens
+                        .get_item(PySlice::new(py, first as isize, end as isize, 1))?
+                        .unbind(),
+                ),
+                slot_tokens: readout.slot_tokens[slot_index..last]
+                    .iter()
+                    .map(|token| *token as usize - first)
+                    .collect(),
+                candidate_offsets: offsets[slot_index..=last]
+                    .iter()
+                    .map(|offset| (*offset - offsets[slot_index]) as usize)
+                    .collect(),
+                candidate_ids: readout.candidate_ids
+                    [offsets[slot_index] as usize..offsets[last] as usize]
+                    .iter()
+                    .map(|id| i64::from(*id))
+                    .collect(),
+            };
+            let row = Bound::new(
+                py,
+                row.initializer(
                     py,
-                    readout.slot_tokens[slot_index..last]
-                        .iter()
-                        .map(|token| *token as usize - first),
+                    input.clone(),
+                    attention(position_values.clone().unbind()),
                 )?,
-            )?;
-            options.set_item(
-                "candidate_offsets",
-                PyTuple::new(
-                    py,
-                    offsets[slot_index..=last]
-                        .iter()
-                        .map(|offset| offset - offsets[slot_index]),
-                )?,
-            )?;
-            options.set_item(
-                "candidate_ids",
-                PyTuple::new(
-                    py,
-                    &readout.candidate_ids[offsets[slot_index] as usize..offsets[last] as usize],
-                )?,
-            )?;
-            let row = row_type.getattr("CanvasRow")?.call((), Some(&options))?;
+            )?
+            .into_any();
             rows.push(ForwardRow::new(index, row.unbind()));
             first = end;
             slot_index = last;

@@ -2,19 +2,13 @@
 
 These Triton kernels back `DecodeState` (`storage.decode_state`). The state
 tensors they update are indexed by request slot, with row zero reserved as
-the padding sentinel. `DecodeState` falls back to equivalent tensor
-operations when Triton is unavailable or cannot launch on the device.
+the padding sentinel. The native owner selects these CUDA kernels when
+Triton can launch; other devices use indexed tensor operations.
 """
 
 from __future__ import annotations
 
-try:  # pragma: no cover - availability depends on the serving environment.
-    import triton
-    import triton.language as tl
-except Exception:  # pragma: no cover
-    triton = None
-    tl = None
-
+from uniserve_kernels.triton import tl, triton
 
 if triton is not None:
     # Both kernels exclude per-call counts from Triton's value
@@ -42,7 +36,7 @@ if triton is not None:
         tokens become 1, penalty counts and the predicate become zero, and
         the coordinates take the row's column values. The launch grid must be
         ``count`` by the ``block_size`` chunks of ``max(continuation_width,
-        vocab_size)``, as `DecodeState._reset_rows` sizes it.
+        vocab_size)``, as the numerical `reset_rows` function sizes it.
         """
         index = tl.program_id(0)
         row = tl.load(columns_ptr + index)
@@ -79,7 +73,7 @@ if triton is not None:
         tl.store(cache_lengths_ptr + row + offsets, cache_length, mask=scalar)
 
     @triton.jit(do_not_specialize=["count"])
-    def _publish_decode_kernel(
+    def _commit_tokens_kernel(
         indices_ptr,
         tokens_ptr,
         predicates_in_ptr,
@@ -90,23 +84,33 @@ if triton is not None:
         cache_lengths_ptr,
         count,
         continuation_width: tl.constexpr,
+        index_stride: tl.constexpr,
+        token_stride: tl.constexpr,
+        predicate_stride: tl.constexpr,
         block_size: tl.constexpr,
     ):
-        """Publish batched decode tokens and advance runtime coordinates.
+        """Commit batched decode tokens and advance runtime coordinates.
 
         Runs as a single program: ``block_size`` must be at least ``count``,
         and lanes past ``count`` are masked. Row ``indices`` must be unique,
         because the coordinate updates are unsynchronized load/store pairs.
-        `DecodeState._advance_tokens` checks uniqueness only on the host slot
-        sequence it receives with the device indices, before launch.
+        The native owner checks the host slot sequence before launch; the
+        caller supplies the corresponding device indices.
         """
         offsets = tl.arange(0, block_size)
         mask = offsets < count
-        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
-        tokens = tl.load(tokens_ptr + offsets, mask=mask, other=0).to(tl.int64)
-        predicates = tl.load(predicates_in_ptr + offsets, mask=mask, other=0)
+        # Result columns may be views into a wider sampled-output tensor.
+        indices = tl.load(
+            indices_ptr + offsets * index_stride, mask=mask, other=0
+        )
+        tokens = tl.load(
+            tokens_ptr + offsets * token_stride, mask=mask, other=0
+        ).to(tl.int64)
+        predicates = tl.load(
+            predicates_in_ptr + offsets * predicate_stride, mask=mask, other=0
+        )
 
-        # Publish each token into the first slot of its row's continuation span
+        # Store each token into the first slot of its row's continuation span
         # [rows, continuation_width], keeping only the low 31 token bits: bit
         # 31 is `TOKEN_CONTINUATION_BIT` in tagged relays, never a token bit.
         tl.store(

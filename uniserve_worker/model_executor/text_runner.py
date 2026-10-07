@@ -19,99 +19,60 @@ captures ``fill_cache`` and serves calls whose rows all select ``CACHE``.
 
 from __future__ import annotations
 
-from dataclasses import replace
-from itertools import accumulate
+from typing import cast
 
 import torch
 
-from uniserve.model import TextInput, VocabShard
-from uniserve.runtime.cuda_graph import CUDAGraphError
-from uniserve_worker._uniserve_ipc import TextShapes
+from uniserve.model import Logits, TextInput, VocabShard
+from uniserve_worker._uniserve_ipc import TextRunner as _TextRunner
 from uniserve_worker.model_executor.output import ExecutionOutput
-from uniserve_worker.sampling.metadata import TokenSelection
-
-from .graph_inputs import (
-    capture_hidden,
-    pad_text,
-    replay_hidden,
-    text_shape,
-)
-from .model_runner import ModelRunner, joining_experts
 
 
-def _host_indices(ranges, device):
-    """Copy the token rows of ``ranges`` as one int64 index vector.
-
-    The rows are known on the host from host lengths, so one host-to-device
-    copy replaces a device operation per row.
-    """
-    values = [index for span in ranges for index in span]
-    return torch.tensor(values, dtype=torch.int64).to(device, non_blocking=True)
+def _indices(values, device):
+    """Copy host-selected token positions into a numerical index vector."""
+    return torch.tensor(values, dtype=torch.int64, device="cpu").to(
+        device, non_blocking=True
+    )
 
 
-class TextRunner(ModelRunner):
+def bind_vocabulary(model):
+    """Share vocabulary descriptors across the bound pipeline stages."""
+    mesh = model.backbone.mesh
+    pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
+    tensor_group = mesh.get_group("tp" if "tp" in mesh.axes else ())
+    last = pipeline.rank == pipeline.size - 1
+
+    # The vocabulary head may be nonresident on this pipeline stage. Its
+    # actual descriptor is communicated rather than reproducing the head's
+    # numerical padding/partition rule in execution.
+    descriptor = torch.empty(4, dtype=torch.int64, device=pipeline.device)
+    if last:
+        vocab = model.lm_head.vocab
+        descriptor.copy_(
+            torch.tensor(
+                (
+                    vocab.size,
+                    vocab.padded_size,
+                    vocab.local_slice.start,
+                    vocab.local_slice.stop,
+                ),
+                dtype=torch.int64,
+                device=descriptor.device,
+            )
+        )
+    pipeline.broadcast(descriptor, src=pipeline.size - 1)
+
+    size, padded, start, stop = descriptor.cpu().tolist()
+    return pipeline, VocabShard(size, slice(start, stop), padded, tensor_group)
+
+
+class TextRunner(_TextRunner):
     """Bind vocabulary metadata once and distribute selected pipeline results.
 
     The execution context supplies layer resources around each call. Selection
     belongs to the caller: one backbone evaluation serves LAST/ALL/HIDDEN rows,
     and the final pipeline stage alone projects vocabulary columns.
     """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.shapes = TextShapes((), ())
-
-        # Hidden states of the latest prefill replay: [tokens, hidden] rows
-        # every prefill graph writes, sized by the first (largest) capture.
-        self._prefill_output: torch.Tensor | None = None
-        # Decode graphs run serially on this runner. Their transfer-capacity
-        # variants need one vocabulary output, not one per captured graph.
-        self._decode_output: torch.Tensor | None = None
-        try:
-            self._bind_vocabulary()
-        except BaseException:
-            self.close()
-            raise
-
-    def _bind_vocabulary(self):
-        """Share vocabulary descriptors across the bound pipeline stages."""
-        model = self.model
-        mesh = model.backbone.mesh
-        self.pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
-        tensor_group = mesh.get_group("tp" if "tp" in mesh.axes else ())
-        last = self.pipeline.rank == self.pipeline.size - 1
-
-        # The vocabulary head may be nonresident on this pipeline stage. Its
-        # actual descriptor is communicated rather than reproducing the head's
-        # numerical padding/partition rule in execution.
-        descriptor = torch.empty(
-            4, dtype=torch.int64, device=self.pipeline.device
-        )
-        if last:
-            vocab = model.lm_head.vocab
-            descriptor.copy_(
-                torch.tensor(
-                    (
-                        vocab.size,
-                        vocab.padded_size,
-                        vocab.local_slice.start,
-                        vocab.local_slice.stop,
-                    ),
-                    dtype=torch.int64,
-                    device=descriptor.device,
-                )
-            )
-        self.pipeline.broadcast(descriptor, src=self.pipeline.size - 1)
-
-        size, padded, start, stop = descriptor.cpu().tolist()
-        self.vocab = VocabShard(size, slice(start, stop), padded, tensor_group)
-
-    def close_graphs(self):
-        try:
-            super().close_graphs()
-        finally:
-            self._prefill_output = None
-            self._decode_output = None
 
     def last_logits(self, inputs: TextInput) -> ExecutionOutput:
         """Project one final position per sequence, padding rows included.
@@ -129,383 +90,38 @@ class TextRunner(ModelRunner):
         offsets = queries.offsets
         indices = (offsets[1:].to(torch.int64) - 1).clamp_min(0)
 
-        if self.pipeline.rank == self.pipeline.size - 1:
-            values = self.model.compute_logits(
-                hidden, token_indices=indices
-            ).values
-        else:
-            values = hidden.new_empty(
-                (
-                    inputs.batch_size,
-                    self.vocab.local_slice.stop - self.vocab.local_slice.start,
-                )
-            )
-        self.pipeline.broadcast(values, src=self.pipeline.size - 1)
-        backing = self._decode_output
-        if backing is None:
-            # Startup captures largest first. Retain the first graph's output
-            # inside capture, where the allocator protects its address from
-            # later captures sharing the pool. Eager warmup stays transient.
-            if torch.cuda.is_current_stream_capturing():
-                self._decode_output = values
-        else:
-            if (
-                values.shape[0] > backing.shape[0]
-                or values.shape[1:] != backing.shape[1:]
-                or values.dtype != backing.dtype
-                or values.device != backing.device
-            ):
-                raise CUDAGraphError(
-                    "decode graphs capture largest first; logits exceed "
-                    "the shared output backing"
-                )
-            output = backing[: values.shape[0]]
-            output.copy_(values)
-            values = output
+        values = self._project_logits(hidden, indices, inputs.batch_size)
+        values = self.decode_output(values)
         return ExecutionOutput(
             tuple(values.split(1)), (self.vocab,) * inputs.batch_size
         )
 
-    def __call__(
-        self, inputs: TextInput, selections: tuple[TokenSelection, ...]
-    ) -> ExecutionOutput:
-        """Run one backbone pass and return the per-row selection it requests.
-
-        Each row independently selects final-token logits, all-token logits,
-        raw hidden states, or nothing (``CACHE``). Logit and hidden columns
-        are computed once on the last pipeline stage and broadcast so every
-        stage returns the same rows. A call whose rows all select ``CACHE``
-        only writes the K/V cache.
-        """
-        if all(selection is TokenSelection.CACHE for selection in selections):
-            self.model.fill_cache(inputs)
-            return self._cache_rows(len(selections))
-        return self.select_outputs(self.model(inputs), inputs, selections)
-
-    def _cache_rows(self, rows: int) -> ExecutionOutput:
-        """Empty ``[0, hidden]`` values of ``rows`` cache-only rows."""
-        empty = torch.empty(
-            (0, self.model.backbone.hidden_size), device=self.device
-        )
-        return ExecutionOutput((empty,) * rows, (None,) * rows)
-
-    def hidden_states(self, inputs: TextInput) -> torch.Tensor:
-        """Evaluate the backbone into the runner's prefill output backing.
-
-        This is the call a prefill bucket captures. The backbone's
-        ``[tokens, ...]`` output is copied into leading rows of one backing
-        every prefill graph of the runner shares, so their outputs do not
-        each retain graph storage; the first call, the largest bucket's warm
-        call, allocates it from the runner's graph storage.
-
-        Raises:
-            CUDAGraphError: The backing is missing during capture, or a later
-                output does not fit it.
-        """
-        hidden = self.model(inputs)
-        backing = self._prefill_output
-        if backing is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise CUDAGraphError(
-                    "prefill output backing must exist before capture"
-                )
-            # Later captures reuse free blocks of the shared pools, so this
-            # persistent allocation precedes the first prefill capture.
-            with self.execution.storage.allocate(self.execution):
-                backing = torch.empty_like(hidden)
-            self._prefill_output = backing
-        if (
-            hidden.shape[0] > backing.shape[0]
-            or hidden.shape[1:] != backing.shape[1:]
-            or hidden.dtype != backing.dtype
-            or hidden.device != backing.device
-        ):
-            raise CUDAGraphError(
-                "prefill buckets capture largest first; a later bucket's "
-                "hidden states exceed the output backing"
+    def _project_logits(self, hidden, indices, count):
+        """Project selected tokens on the final stage and share its logits."""
+        if self.pipeline.rank == self.pipeline.size - 1:
+            # The last pipeline stage owns the vocabulary projection.
+            logits = cast(
+                Logits, self.model.compute_logits(hidden, token_indices=indices)
             )
-        output = backing[: hidden.shape[0]]
-        output.copy_(hidden)
-        return output
-
-    def select_outputs(
-        self,
-        hidden: torch.Tensor,
-        inputs: TextInput,
-        selections: tuple[TokenSelection, ...],
-        *,
-        copy_hidden: bool = False,
-    ) -> ExecutionOutput:
-        """Select each row's logits or hidden states from backbone output.
-
-        ``hidden`` holds the packed ``[tokens, hidden]`` rows of ``inputs``,
-        possibly followed by padding rows, and ``selections`` has one entry
-        per row of ``inputs``. Every row selecting logits is projected in one
-        gather and one head call: its final token for ``LAST_LOGITS``, every
-        token for ``ALL_LOGITS``. Hidden rows are views of ``hidden``, or
-        copies with ``copy_hidden``, which a caller whose ``hidden`` is
-        reused storage requests. A ``CACHE`` row receives an empty
-        ``[0, hidden]`` value. On other pipeline stages the last stage's
-        results are received by broadcast.
-
-        Raises:
-            ValueError: Host query lengths are missing or the selections do
-                not align with the input sequences.
-        """
-        queries = inputs.attention.queries
-        if queries is None:
-            count = inputs.input_ids.numel() // inputs.batch_size
-            lengths = (count,) * inputs.batch_size
+            values = logits.values
         else:
-            if queries.host is None:
-                raise ValueError(
-                    "text output selection requires host query lengths"
-                )
-            lengths = queries.host
-        if len(selections) != len(lengths) or any(
-            not isinstance(item, TokenSelection) for item in selections
-        ):
-            raise ValueError(
-                "text output selections must align with the input sequences"
+            width = self.vocab.local_slice.stop - self.vocab.local_slice.start
+            values = hidden.new_empty((count, width))
+        self.pipeline.broadcast(values, src=self.pipeline.size - 1)
+        return values
+
+    def _select_hidden(self, hidden, indices, count, copy_hidden):
+        """Gather live hidden rows and preserve borrowed graph output."""
+        if self.pipeline.rank != self.pipeline.size - 1:
+            selected = hidden.new_empty(
+                (count, self.model.backbone.hidden_size)
             )
-
-        last = self.pipeline.rank == self.pipeline.size - 1
-        width = self.vocab.local_slice.stop - self.vocab.local_slice.start
-        device = hidden.device
-        # Host token offsets: row r spans tokens [starts[r], starts[r + 1]).
-        starts = tuple(accumulate(lengths, initial=0))
-        rows = tuple(zip(starts[:-1], starts[1:], selections, strict=True))
-
-        # Logit rows: the final token of a final-token row (none for an empty
-        # row) and every token of an all-token row.
-        projected = (TokenSelection.LAST_LOGITS, TokenSelection.ALL_LOGITS)
-        logit_counts = tuple(
-            stop - start
-            if selection is TokenSelection.ALL_LOGITS
-            else min(1, stop - start)
-            for start, stop, selection in rows
-            if selection in projected
-        )
-        logits = hidden.new_empty((0, width))
-        if sum(logit_counts):
-            if queries is not None and all(
-                selection is TokenSelection.LAST_LOGITS and stop > start
-                for start, stop, selection in rows
-            ):
-                # Every row's final token, from the input device offsets.
-                indices = queries.offsets[1 : len(rows) + 1] - 1
-            else:
-                indices = _host_indices(
-                    (
-                        range(start, stop)
-                        if selection is TokenSelection.ALL_LOGITS
-                        else range(stop - min(1, stop - start), stop)
-                        for start, stop, selection in rows
-                        if selection in projected
-                    ),
-                    device,
-                )
-            if last:
-                logits = self.model.compute_logits(
-                    hidden, token_indices=indices
-                ).values
-            else:
-                # Earlier stages allocate the receive buffer for the
-                # broadcast below.
-                logits = hidden.new_empty((sum(logit_counts), width))
-            self.pipeline.broadcast(logits, src=self.pipeline.size - 1)
-
-        hidden_lengths = tuple(
-            stop - start
-            for start, stop, selection in rows
-            if selection is TokenSelection.HIDDEN
-        )
-        selected = None
-        if hidden_lengths:
-            if not last:
-                selected = hidden.new_empty(
-                    (sum(hidden_lengths), self.model.backbone.hidden_size)
-                )
-            elif len(hidden_lengths) == len(rows):
-                # Every token participates: the packed live rows.
-                selected = hidden[: starts[-1]]
-                if copy_hidden:
-                    selected = selected.clone()
-            else:
-                selected = hidden.index_select(
-                    0,
-                    _host_indices(
-                        (
-                            range(start, stop)
-                            for start, stop, selection in rows
-                            if selection is TokenSelection.HIDDEN
-                        ),
-                        device,
-                    ),
-                )
-            if selected.numel():
-                self.pipeline.broadcast(selected, src=self.pipeline.size - 1)
-
-        # Interleave both runs back into row order; cache-only rows receive
-        # an empty value.
-        logit_rows = iter(logits.split(logit_counts))
-        hidden_rows = iter(
-            () if selected is None else selected.split(hidden_lengths)
-        )
-        empty = hidden.new_empty((0, hidden.shape[1]))
-        outputs, vocabularies = [], []
-        for selection in selections:
-            if selection in projected:
-                outputs.append(next(logit_rows))
-                vocabularies.append(self.vocab)
-            elif selection is TokenSelection.HIDDEN:
-                outputs.append(next(hidden_rows))
-                vocabularies.append(None)
-            else:
-                outputs.append(empty)
-                vocabularies.append(None)
-        return ExecutionOutput(tuple(outputs), tuple(vocabularies))
-
-    def batch_forward(self, batch, *, padded=False):
-        """Select numerical language outputs from one prepared input batch.
-
-        A padded batch is a decode bucket, whose rows all select final-token
-        logits (``pad_text``) and use ``last_logits``; any other batch
-        selects each row's outputs.
-        """
-        return (
-            self.last_logits(batch.inputs)
-            if padded
-            and batch.token_selections[0] is TokenSelection.LAST_LOGITS
-            else self(batch.inputs, batch.token_selections)
-        )
-
-    def graph_tokens(self, key) -> int:
-        """The local text bucket's token count, including padding."""
-        return key[1][1]
-
-    def select_graph_shape(self, batch, *, eligible):
-        """Choose a captured text graph bucket and pad the batch to it.
-
-        Only buckets that startup captures are candidates. A decode batch
-        (one query token per row) must fit a decode bucket. With prefill
-        graphs enabled, every other batch must fit a prefill bucket of its
-        causality and embedding replacement that evaluates hidden states,
-        or, when every row selects ``CACHE``, a cache-only bucket if the
-        runner has any. Returns ``None`` for eager
-        execution (graphs disabled, the batch ineligible, or prefill graphs
-        disabled for a non-decode batch),
-        otherwise ``(key, padded_batch,
-        True)``; a decode key starts with ``"text"`` and a prefill key with
-        ``"prefill"``, and both carry the ``text_shape`` tuple second. In an
-        expert step, the local bucket's tokens and the shared transfer
-        capacity select separate dimensions of its captured graph.
-
-        Raises:
-            CUDAGraphError: No decode bucket holds a decode batch, or prefill
-                graphs are enabled and no prefill bucket holds another batch.
-        """
-        if not eligible or not self.execution.pools:
-            return None
-
-        selected = text_shape(
-            batch, shapes=self.shapes, table_widths=self.table_widths
-        )
-        if selected is None:
-            return None
-        shape, outputs = selected
-
-        if shape[-1]:
-            if batch.decode_force_finish is None:
-                # Direct token inputs and device continuations use the same
-                # numerical decode graph. Only the latter consumes its greedy
-                # continuation result; the former supplies an inert finish
-                # mask.
-                finish = self.input_buffers.decode_force_finish[
-                    : batch.row_count
-                ]
-                finish.zero_()
-                batch = replace(batch, decode_force_finish=finish)
-            padded = pad_text(batch, *shape, buffers=self.input_buffers)
-            inputs = padded.inputs
-            key: tuple[object, ...] = (
-                "text",
-                shape,
-                inputs.input_ids.dtype,
-                inputs.positions.ndim,
-                inputs.embeddings is not None,
-                next(iter(inputs.attention.entries.values())).causal[0],
-                padded.token_selections[0],
-            )
-            return key, padded, True
-
-        # A prefill graph computes hidden states, or only the K/V cache;
-        # the force-finish column and the rows' selections stay outside it.
-        padded = pad_text(batch, *shape, buffers=self.input_buffers)
-        inputs = padded.inputs
-        attention = next(iter(inputs.attention.entries.values()))
-        key = (
-            "prefill",
-            shape,
-            inputs.input_ids.dtype,
-            inputs.positions.ndim,
-            inputs.embeddings is not None,
-            None
-            if attention.causal_values is not None
-            else attention.causal[0],
-            outputs,
-        )
-        return key, padded, True
-
-    def capture_plan(self):
-        return super().capture_plan(), self.shapes.decode, self.shapes.prefill
-
-    def capture_graph(self, key, execution, forward):
-        """Capture a prefill bucket's hidden states or its K/V cache writes.
-
-        Other buckets defer to the base.
-        """
-        if key[0] != "prefill":
-            return super().capture_graph(key, execution, forward)
-        outputs = key[-1]
-
-        # A prefill that stops after the final layer's cache write skips that
-        # layer's experts; inside an expert step the graph joins them, so its
-        # replay makes all of the step's exchanges.
-        call = joining_experts(
-            lambda static: (
-                self.hidden_states(static.inputs)
-                if outputs
-                else self.model.fill_cache(static.inputs)
-            ),
-            self.execution.context,
-        )
-        return capture_hidden(
-            self.execution.context,
-            execution,
-            call,
-            pools=self.execution.pools,
-            cache=self.cache,
-            warmup=lambda value: self.execution.warm_experts(call, value),
-        )
-
-    def replay_graph(self, key, execution, batch, *, borrow):
-        """Replay a prefill bucket and select the live rows' outputs.
-
-        The selection projects logits into new tensors and copies hidden
-        rows out of the shared backing, so the result owns its values
-        whether or not ``borrow`` is set. A cache-only bucket's rows receive
-        empty values.
-        """
-        if key[0] != "prefill":
-            return super().replay_graph(key, execution, batch, borrow=borrow)
-        hidden = replay_hidden(self.batch_graph(key), execution)
-        if not key[-1]:
-            return self._cache_rows(batch.row_count)
-        with self.execution.context.activate():
-            return self.select_outputs(
-                hidden,
-                batch.inputs,
-                batch.token_selections,
-                copy_hidden=True,
-            )
+        elif indices is None:
+            selected = hidden[:count]
+            if copy_hidden:
+                selected = selected.clone()
+        else:
+            selected = hidden.index_select(0, indices)
+        if selected.numel():
+            self.pipeline.broadcast(selected, src=self.pipeline.size - 1)
+        return selected

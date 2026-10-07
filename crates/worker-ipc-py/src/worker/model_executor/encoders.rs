@@ -6,8 +6,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySlice, PyTuple};
 
-use super::modules::{Module, input_error};
+use crate::worker::model_runner::EncoderRunner;
+
+use super::modules::Module;
 use super::{ExecutionOutput, ModelExecutor, with_context};
+use crate::worker::error::input_error;
 
 impl ModelExecutor {
     pub(super) fn encoder_module(&self, py: Python<'_>, kind: &str) -> PyResult<Arc<Module>> {
@@ -25,14 +28,14 @@ impl ModelExecutor {
     }
 
     fn text_capacity(&self, py: Python<'_>, tokens: usize) -> PyResult<usize> {
-        if self.media_builder.is_none(py) {
+        let Some(builder) = &self.media_builder else {
             return Ok(tokens);
-        }
-        self.media_builder
-            .bind(py)
-            .getattr("text_capacities")?
-            .extract::<Vec<usize>>()?
-            .into_iter()
+        };
+        builder
+            .borrow(py)
+            .text_capacities
+            .iter()
+            .copied()
             .filter(|&capacity| capacity >= tokens)
             .min()
             .ok_or_else(|| PyValueError::new_err("prompt exceeds the configured text capacities"))
@@ -78,16 +81,7 @@ pub(super) fn tokens(owner: &Bound<'_, ModelExecutor>, tokens: &[i64]) -> PyResu
         let owner = owner.borrow();
         owner.text_capacity(py, owner.config.max_sequence_tokens)?
     };
-    let options = PyDict::new(py);
-    options.set_item("capacity", capacity)?;
-    Ok(runner
-        .bind(py)
-        .call_method(
-            "prepare_tokens",
-            (PyTuple::new(py, tokens)?,),
-            Some(&options),
-        )?
-        .unbind())
+    EncoderRunner::prepare(runner.bind(py).cast()?, tokens, capacity)
 }
 
 pub(super) fn text(
@@ -179,10 +173,14 @@ fn trim(
 
 pub(super) fn prepare(owner: &Bound<'_, ModelExecutor>) -> PyResult<()> {
     let py = owner.py();
-    let builder = owner.borrow().media_builder.bind(py).clone();
-    if builder.is_none() {
+    let Some(builder) = owner
+        .borrow()
+        .media_builder
+        .as_ref()
+        .map(|builder| builder.bind(py).clone())
+    else {
         return Ok(());
-    }
+    };
     let (text_module, conditioner) = {
         let owner = owner.borrow();
         let find = |kind| {
@@ -198,13 +196,11 @@ pub(super) fn prepare(owner: &Bound<'_, ModelExecutor>) -> PyResult<()> {
         return Ok(());
     }
     let model = owner.borrow().model.bind(py).clone();
-    let text_encoder = py
-        .import("uniserve_worker.bootstrap.inputs")?
-        .call_method1(
-            "capability",
-            (model, py.import("uniserve.model")?.getattr("TextEncoder")?),
-        )?;
-    let capacities: Vec<usize> = builder.getattr("text_capacities")?.extract()?;
+    let text_encoder = super::discovery::inputs::capability(
+        &model,
+        &py.import("uniserve.model")?.getattr("TextEncoder")?,
+    )?;
+    let capacities = builder.borrow().text_capacities.clone();
     let dtype = py
         .import("torch")?
         .getattr(owner.borrow().config.model_dtype.as_str())?;

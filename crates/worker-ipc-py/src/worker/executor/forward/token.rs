@@ -2,11 +2,13 @@
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyInt, PySlice, PyTuple};
+use pyo3::types::{PyInt, PySlice, PyTuple};
+use uniserve_worker::TokenSelection;
 use uniserve_worker_ipc::{Call, CallKind, ForwardMode};
 
 use super::{BatchState, ForwardRow, ForwardValue, PythonBackend, SampleCandidate};
 use crate::worker::error::{invalid, native_error, unsupported};
+use crate::worker::model_inputs::{AttentionRow, InputRow, Row, TokenRow};
 use crate::worker::pending::PendingOutput;
 use crate::worker::sampling::SamplingMetadata;
 use crate::worker::storage::Buffer;
@@ -25,14 +27,13 @@ impl PythonBackend {
         let visible = self.visible_length(py, &output)?;
         let decode = call.code == CallKind::Forward(ForwardMode::Decode);
         let verify = call.code == CallKind::Forward(ForwardMode::Verify);
-        let indexed = decode
-            && self.indexed_decode
-            && output
-                .predicate
-                .as_ref()
-                .map(|predicate| predicate.bind(py).get_item(1)?.extract::<bool>())
-                .transpose()?
-                .unwrap_or(false);
+        let predicate: Option<(Py<PyAny>, bool)> = output
+            .predicate
+            .as_ref()
+            .map(|predicate| predicate.extract(py))
+            .transpose()?;
+        let indexed =
+            decode && self.indexed_decode && predicate.as_ref().is_some_and(|(_, tagged)| *tagged);
         let relay = call.predicate.is_some()
             && !indexed
             && (decode || verify || call.input_token_ids.is_empty());
@@ -56,44 +57,61 @@ impl PythonBackend {
         }
 
         let selection = if verify || (!decode && scores) {
-            "ALL_LOGITS"
+            TokenSelection::AllLogits
         } else if decode || call.token_output.is_some() {
-            "LAST_LOGITS"
+            TokenSelection::LastLogits
         } else {
-            "CACHE"
+            TokenSelection::Cache
         };
         let position = output.lock(py)?.progress.logical_position;
         let slot = output.request.borrow(py).request.slot();
-        let options = token_options(py, call.code, tokens, position, slot, visible, selection)?;
-        options.set_item("indexed", indexed)?;
-        options.set_item("predicate", &output.predicate)?;
-        options.set_item(
-            "force_finish",
-            call.sampling_state
-                .as_ref()
-                .is_some_and(|state| state.force_finish),
-        )?;
-        if relay {
-            if output.predicate.is_none() {
+        let current = if relay {
+            if predicate.is_none() {
                 return Err(invalid(py, "device token continuation is not registered"));
             }
             let state = self.decode_state.as_ref().ok_or_else(|| {
                 unsupported(py, "device continuation has no request runtime state")
             })?;
-            let slot = output.request.borrow(py).request.slot();
-            let current = state
-                .bind(py)
-                .getattr("future_input_tokens")?
-                .get_item((slot, PySlice::new(py, 0, 1, 1)))?;
-            options.set_item("current", current)?;
+            Some(
+                state
+                    .borrow(py)
+                    .future_input_tokens(py)?
+                    .bind(py)
+                    .get_item((slot, PySlice::new(py, 0, 1, 1)))?,
+            )
+        } else {
+            None
+        };
+        let (decode_predicate, tagged) =
+            predicate.map_or((None, false), |(value, tagged)| (Some(value), tagged));
+        let row = TokenRow {
+            selection: Some(selection),
+            decode_predicate,
+            decode_predicate_tagged: tagged,
+            decode_force_finish: call
+                .sampling_state
+                .as_ref()
+                .is_some_and(|state| state.force_finish),
+            request_indexed_decode: indexed,
+            ..TokenRow::default()
         }
-
-        let row = py.import("uniserve_worker.execution.token")?.call_method(
-            "token_row",
-            (),
-            Some(&options),
+        .with_tokens(
+            py,
+            InputRow {
+                kind: call.code,
+                request_pool_idx: slot as u32,
+            },
+            AttentionRow {
+                positions: None,
+                seq_len: visible as i64,
+                write_kv: true,
+                causal: Some(true),
+            },
+            tokens,
+            position,
+            current.as_ref(),
         )?;
-        Ok(ForwardRow::new(index, row.unbind()))
+        Ok(ForwardRow::new(index, row.into_any()))
     }
 
     /// Guidance prefixes share this KV extent check but do not update the
@@ -106,7 +124,7 @@ impl PythonBackend {
         count: u64,
         update_runtime: bool,
     ) -> PyResult<()> {
-        let query: u64 = task.getattr("query_tokens")?.extract()?;
+        let query: u64 = Row::borrow(task)?.query_tokens(py)? as u64;
         if count > query {
             return Err(PyRuntimeError::new_err(
                 "KV commit count is outside the task query span",
@@ -116,8 +134,8 @@ impl PythonBackend {
             return Ok(());
         }
 
-        let length = task.getattr("seq_len")?.extract::<u64>()? + count;
-        let slot: u32 = task.getattr("request_pool_idx")?.extract()?;
+        let length = task.cast::<AttentionRow>()?.borrow().seq_len as u64 + count;
+        let slot: u32 = task.cast::<InputRow>()?.borrow().request_pool_idx;
         let tables = self
             .tables
             .as_ref()
@@ -210,7 +228,7 @@ impl PythonBackend {
         let count = if call.code == CallKind::Forward(ForwardMode::Decode) {
             1
         } else {
-            task.getattr("query_tokens")?.extract()?
+            Row::borrow(task)?.query_tokens(py)? as u64
         };
         if visual
             || matches!(
@@ -262,10 +280,10 @@ impl PythonBackend {
             let positions = (start + 1..start + draft.len() as u64 + 2).collect();
             (value.value.bind(py).clone(), positions, draft)
         };
-        let state = self
-            .decode_state
-            .as_ref()
-            .map_or_else(|| py.None().into_bound(py), |state| state.bind(py).clone());
+        let state = self.decode_state.as_ref().map_or_else(
+            || py.None().into_bound(py),
+            |state| state.bind(py).as_any().clone(),
+        );
         let metadata = SamplingMetadata::for_call(
             py,
             &batch.call(py, row.index)?.borrow(),
@@ -321,14 +339,20 @@ impl PythonBackend {
             call.code,
             CallKind::Forward(ForwardMode::Prefill | ForwardMode::Decode)
         ) {
-            if !decode && task.getattr("causal")?.extract::<bool>()? && scores_prompt(py, &output)?
+            if !decode
+                && task
+                    .cast::<AttentionRow>()?
+                    .borrow()
+                    .causal
+                    .unwrap_or(false)
+                && scores_prompt(py, &output)?
             {
                 self.score_prompt(py, batch, &mut output, start, task, sample.logits.bind(py))?;
             }
             let count = if decode {
                 1
             } else {
-                task.getattr("query_tokens")?.extract()?
+                Row::borrow(task)?.query_tokens(py)? as u64
             };
             let position = if call.writes_context() {
                 Some(next_position(py, task)?)
@@ -336,7 +360,7 @@ impl PythonBackend {
                 None
             };
             let fallback = if decode {
-                task.getattr("seq_len")?.extract::<u64>()? + count
+                task.cast::<AttentionRow>()?.borrow().seq_len as u64 + count
             } else {
                 self.visible_length(py, &output)?
             };
@@ -367,8 +391,8 @@ impl PythonBackend {
             let draft = metadata.inner.draft_token_ids.clone();
             let terminal = metadata.inner.terminal_draft_prefix;
             drop(metadata);
-            let visible: u64 = task.getattr("seq_len")?.extract()?;
-            let initialized = visible + task.getattr("query_tokens")?.extract::<u64>()?;
+            let visible: u64 = task.cast::<AttentionRow>()?.borrow().seq_len as u64;
+            let initialized = visible + Row::borrow(task)?.query_tokens(py)? as u64;
             let (length, position, sampling_position): (Py<PyAny>, Py<PyAny>, Py<PyAny>) = py
                 .import("uniserve_worker.execution.token")?
                 .call_method1(
@@ -465,32 +489,4 @@ pub(super) fn next_position(py: Python<'_>, task: &Bound<'_, PyAny>) -> PyResult
     py.import("uniserve_worker.execution.token")?
         .call_method1("next_position", (task,))?
         .extract()
-}
-
-/// Common numerical fields selected for a causal prompt run or one token call.
-pub(super) fn token_options<'py>(
-    py: Python<'py>,
-    mode: CallKind,
-    tokens: &[u32],
-    position: u64,
-    slot: usize,
-    visible: u64,
-    selection: &str,
-) -> PyResult<Bound<'py, PyDict>> {
-    let options = PyDict::new(py);
-    options.set_item(
-        "mode",
-        crate::convert::RequestConversion::new(py)?.kind(mode),
-    )?;
-    options.set_item("tokens", PyTuple::new(py, tokens)?)?;
-    options.set_item("position", position)?;
-    options.set_item("slot", slot)?;
-    options.set_item("visible", visible)?;
-    options.set_item(
-        "selection",
-        py.import("uniserve_worker.sampling.metadata")?
-            .getattr("TokenSelection")?
-            .getattr(selection)?,
-    )?;
-    Ok(options)
 }

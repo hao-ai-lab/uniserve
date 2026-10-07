@@ -1,5 +1,8 @@
 //! Python views of native rank configuration and launch normalization.
 
+pub(super) mod deployment;
+mod device;
+
 use std::sync::Arc;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
@@ -54,20 +57,11 @@ impl LaneConfig {
 
     #[getter]
     fn call_kinds<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let module = py.import("uniserve_worker.protocol.call")?;
         let kinds = self
             .inner
             .call_kinds
             .iter()
-            .map(|kind| {
-                module
-                    .getattr(match kind {
-                        uniserve_worker_ipc::CallKind::Forward(_) => "ForwardMode",
-                        uniserve_worker_ipc::CallKind::Media(_) => "MediaCall",
-                        uniserve_worker_ipc::CallKind::Transfer(_) => "TransferMode",
-                    })?
-                    .call1((kind.as_str(),))
-            })
+            .map(|kind| crate::convert::call_kind_to_py(py, *kind))
             .collect::<PyResult<Vec<_>>>()?;
         PyTuple::new(py, kinds)
     }

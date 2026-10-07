@@ -73,6 +73,33 @@ def test_worker_profiler_exports_only_the_selected_execution_window(tmp_path):
     assert captured == {"worker-step-2", "worker-step-3"}
 
 
+def test_close_exports_a_partial_window_without_masking_execution_failure(
+    tmp_path,
+):
+    profiler = WorkerProfiler.from_env(
+        {
+            "UNISERVE_TORCH_PROFILER_DIR": str(tmp_path),
+            "UNISERVE_PROFILE_ACTIVITIES": "CPU",
+            "UNISERVE_PROFILE_STEPS": "3",
+        }
+    )
+    failure = RuntimeError("model forward failed")
+    with pytest.raises(RuntimeError) as raised:
+        with profiler.step("failed-forward"):
+            torch.ones(4).add_(1)
+            raise failure
+    assert raised.value is failure
+    profiler.close()
+
+    with profiler.step("after-close"):
+        torch.ones(4).add_(1)
+    (trace,) = tmp_path.glob("*.trace.json.gz")
+    with gzip.open(trace, "rt") as source:
+        names = {event["name"] for event in json.load(source)["traceEvents"]}
+    assert "failed-forward" in names
+    assert "after-close" not in names
+
+
 def test_bound_worker_exports_the_executed_batch_in_its_window(
     worker_channel, tmp_path, monkeypatch
 ):

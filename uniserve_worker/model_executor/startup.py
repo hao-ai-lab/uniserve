@@ -118,8 +118,7 @@ def make_text_batch(
         # later replays can carry any mixture of text and image rows.
         values = prepare_causality(buffers, flags, dynamic=True)
         current = batch.inputs.attention
-        batch = replace(
-            batch,
+        batch = batch.replace(
             inputs=replace(
                 batch.inputs,
                 attention=replace(
@@ -135,7 +134,7 @@ def make_text_batch(
         # Startup captures the same force-finish address used by live decode.
         force_finish = buffers.decode_force_finish[:rows]
         force_finish.zero_()
-        batch = replace(batch, decode_force_finish=force_finish)
+        batch = batch.replace(decode_force_finish=force_finish)
     return batch
 
 
@@ -170,13 +169,6 @@ def make_canvas_batch(
         write=(False,) * rows,
     )
     positions = torch.arange(prefix, prefix + length, dtype=torch.int64)
-    common = {
-        "forward_mode": ForwardMode.TOKEN_DENOISING,
-        "positions": positions,
-        "seq_len": prefix,
-        "write_kv": False,
-        "causal": False,
-    }
     inputs = tuple(
         CanvasRow(
             request_pool_idx=slot,
@@ -184,7 +176,11 @@ def make_canvas_batch(
             slot_tokens=(0,),
             candidate_offsets=(0, 1),
             candidate_ids=(0,),
-            **common,
+            forward_mode=ForwardMode.TOKEN_DENOISING,
+            positions=positions,
+            seq_len=prefix,
+            write_kv=False,
+            causal=False,
         )
         if sampling is None
         else CanvasStepRow(
@@ -193,7 +189,11 @@ def make_canvas_batch(
             seed=slot,
             step=step,
             sampling=sampling,
-            **common,
+            forward_mode=ForwardMode.TOKEN_DENOISING,
+            positions=positions,
+            seq_len=prefix,
+            write_kv=False,
+            causal=False,
         )
         for slot in range(1, rows + 1)
     )

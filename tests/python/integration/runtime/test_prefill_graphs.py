@@ -19,7 +19,6 @@ K/V cache, and leaves the cache of the eager pass that evaluates outputs.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import replace
 
 import pytest
 import torch
@@ -378,7 +377,7 @@ def test_cache_only_prefill_writes_the_cache_of_the_complete_pass(
                     _install(manager, slots, retired=RETIRED)
                 if graphs:
                     rows = tuple(
-                        replace(row, selection=TokenSelection.CACHE)
+                        row.replace(selection=TokenSelection.CACHE)
                         for row in rows
                     )
                 output = _call(runner, manager, rows)

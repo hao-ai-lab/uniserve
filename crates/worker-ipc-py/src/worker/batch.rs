@@ -42,9 +42,8 @@ pub(crate) struct BatchState {
 
     #[pyo3(get, set)]
     pub(super) stream: Option<Py<PyAny>>,
-    // Python perf_counter_ns at reservation, shared with numerical timers.
-    #[pyo3(get)]
-    pub(super) started_ns: u64,
+    // Reservation starts the host interval reported with committed outputs.
+    pub(super) started: Option<std::time::Instant>,
 
     pub(super) forward_stats: uniserve_worker_ipc::ForwardStats,
     #[pyo3(get)]
@@ -75,7 +74,7 @@ impl BatchState {
             inputs: Py::new(py, BatchInputs::new())?,
             predicate_captures: Vec::new(),
             stream: None,
-            started_ns: 0,
+            started: None,
             forward_stats: uniserve_worker_ipc::ForwardStats::default(),
             component_us: PyDict::new(py).unbind(),
             forward_indices,
@@ -248,7 +247,7 @@ impl BatchState {
         slf: &Bound<'_, Self>,
         pool: Option<&Bound<'_, LatentPool>>,
         image_builder: Option<&Bound<'_, PyAny>>,
-        media_builder: Option<&Bound<'_, PyAny>>,
+        media_builder: Option<&Bound<'_, super::media_inputs::MediaBuilder>>,
     ) -> PyResult<()> {
         let py = slf.py();
         let (plan, batch, selected, outputs) = {
@@ -293,13 +292,7 @@ impl BatchState {
         let sample_pages = if image_shape.is_none() {
             let builder =
                 media_builder.ok_or_else(|| invalid(py, "latent inputs require a denoiser"))?;
-            Some((
-                builder.getattr("slot_pages")?,
-                builder
-                    .getattr("sample_pages")?
-                    .getattr("units")?
-                    .extract::<u64>()?,
-            ))
+            Some(builder.borrow_mut().sample_pages(py)?)
         } else {
             None
         };
@@ -323,9 +316,16 @@ impl BatchState {
                 (request, step)
             };
 
-            if let Some((pages, units)) = &sample_pages {
-                let pages = pages.call1((request.slot(),))?.extract::<Vec<u32>>()?;
-                if params.page_table != pages || u64::from(params.latent_units) != *units {
+            if let Some(pages) = &sample_pages {
+                let pages = pages.borrow(py);
+                let assigned = pages.for_slot(request.slot())?;
+                if !params
+                    .page_table
+                    .iter()
+                    .map(|&page| page as usize)
+                    .eq(assigned)
+                    || params.latent_units as usize != pages.units()
+                {
                     return Err(invalid(
                         py,
                         "latent inputs do not name the request slot's pages",
@@ -607,7 +607,7 @@ impl BatchState {
         slf: &Bound<'_, Self>,
         requests: &Bound<'_, RequestPool>,
         buffer: Py<OutputBuffer>,
-        started_ns: u64,
+        started: std::time::Instant,
         predicated: HashSet<u64>,
     ) -> PyResult<()> {
         let py = slf.py();
@@ -657,7 +657,7 @@ impl BatchState {
         let mut this = slf.borrow_mut();
         this.outputs = outputs;
         this.buffer = Some(buffer);
-        this.started_ns = started_ns;
+        this.started = Some(started);
         Ok(())
     }
 
@@ -841,7 +841,7 @@ impl BatchState {
     }
 
     pub(super) fn execution_stats(&self, py: Python<'_>) -> PyResult<crate::stats::ForwardStats> {
-        if self.started_ns == 0 {
+        if self.started.is_none() {
             return Ok(crate::stats::ForwardStats::from(
                 uniserve_worker_ipc::ForwardStats::default(),
             ));

@@ -111,7 +111,7 @@ def _inputs(schedules, sample, size, steps):
                 )
             },
             (size,),
-            schedules["image"].step(step),
+            schedules["image"].step(step).clone(),
         )
         for step in range(steps)
     )
@@ -238,11 +238,12 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     size = Size(32, 2.0)
     slots = (1, 2)
 
-    def ladder(runner, pool):
+    def trajectory(runner, pool):
         values = {}
         for slot in slots:
             _committed(pool, 1, slot, size).fill_(7.0)
-            bound = _bind(runner, schedules, size, steps, slot)
+            with torch.device(device):
+                bound = _bind(runner, schedules, size, steps, slot)
             bank = 1
             for step in range(steps):
                 result, _ = runner.step(bound, step, bank)
@@ -253,7 +254,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     pool = _pool(2, device=device)
     eager = _runner(model, size, device=device, stream=None, pool=pool)
     try:
-        expected = ladder(eager, pool)
+        expected = trajectory(eager, pool)
     finally:
         torch.cuda.current_stream(device).synchronize()
         eager.close()
@@ -280,7 +281,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
             atol=0,
         )
 
-        actual = ladder(runner, pool)
+        actual = trajectory(runner, pool)
         for slot in slots:
             torch.testing.assert_close(
                 actual[slot], expected[slot], rtol=1e-6, atol=1e-6
@@ -290,6 +291,92 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
         runner.close()
         pool.close()
         stream.close()
+
+
+@pytest.mark.parametrize("graphs", [False, True])
+@torch.inference_mode()
+def test_reused_request_slot_reads_its_current_page_table(graphs):
+    device = torch.device("cuda:0")
+    size = Size(32, 2.0)
+    model = LinearDenoiser().to(device)
+    schedules = model.make_schedules(2, shift=1.0, device=device)
+    pool = _pool(2, device=device)
+    stream = CUDAStream.external(torch.cuda.Stream(device=device))
+    runner = _runner(
+        model,
+        size,
+        device=device,
+        stream=stream,
+        pool=pool,
+        slots=1,
+        devices=(device,) if graphs else (),
+    )
+    try:
+        if graphs:
+            warm = _bind(runner, schedules, size, 2, 1)
+            runner.warmup(warm)
+            runner.capture(warm)
+
+        results = []
+        for page in (1, 2, 1, 2):
+            _committed(pool, 1, page, size).fill_(7)
+            sequence = runner.bind(
+                size,
+                _inputs(
+                    schedules, runner.samples.view(-1)[: size.width], size, 2
+                ),
+                schedules,
+                state={},
+                slot=1,
+                pages=(page,),
+            )
+            result, _ = runner.step(sequence, 0, 1)
+            results.append(result["image"][0].clone())
+        for result in results:
+            torch.testing.assert_close(
+                result, _advanced(size, 1, device=device), rtol=1e-6, atol=1e-6
+            )
+    finally:
+        torch.cuda.current_stream(device).synchronize()
+        runner.close()
+        pool.close()
+        stream.close()
+
+
+@pytest.mark.parametrize(
+    ("pages", "index", "bank"),
+    [((0,), 0, 1), ((3,), 0, 1), ((1,), 2, 1), ((1,), 0, 2)],
+)
+@torch.inference_mode()
+def test_invalid_denoising_coordinates_leave_samples_unchanged(
+    pages, index, bank
+):
+    device = torch.device("cpu")
+    size = Size(32, 2.0)
+    model = LinearDenoiser()
+    schedules = model.make_schedules(2, shift=1.0, device=device)
+    pool = _pool(2, device=device)
+    runner = _runner(model, size, device=device, stream=None, pool=pool)
+    try:
+        pool.storage.fill_(7)
+        with pytest.raises(ValueError):
+            sequence = runner.bind(
+                size,
+                _inputs(
+                    schedules, runner.samples.view(-1)[: size.width], size, 2
+                ),
+                schedules,
+                state={},
+                slot=1,
+                pages=pages,
+            )
+            runner.step(sequence, index, bank)
+        torch.testing.assert_close(
+            pool.storage, torch.full_like(pool.storage, 7)
+        )
+    finally:
+        runner.close()
+        pool.close()
 
 
 @torch.inference_mode()

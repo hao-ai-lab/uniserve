@@ -23,7 +23,10 @@ pub(super) fn layout(
             owner.outputs.bind(py).clone(),
             owner.declarations.bind(py).clone(),
             owner.worker_config.bind(py).clone(),
-            owner.media_builder.bind(py).clone(),
+            owner
+                .media_builder
+                .as_ref()
+                .map(|builder| builder.bind(py).clone()),
             owner.video_postprocessor.bind(py).clone(),
             owner.video_decoder.bind(py).clone(),
         )
@@ -62,7 +65,12 @@ pub(super) fn layout(
     if component == video_codec {
         // A codec row bounds the largest encoded media unit at every canvas.
         let mut layouts = Vec::new();
-        for size in builder.call_method0("video_sizes")?.try_iter()? {
+        for size in owner
+            .borrow()
+            .media_inputs(py)?
+            .call_method0("video_sizes")?
+            .try_iter()?
+        {
             layouts.push(resources.call_method1("encoded_units_layout", (&decoder, size?))?);
         }
         let layout = resources.call_method1("bounding_layout", (PyTuple::new(py, layouts)?,))?;
@@ -142,12 +150,15 @@ pub(super) fn layout(
     } else {
         decode.getattr("max_units")?.extract()?
     };
-    let run = binding.call_method1("media_units", (0, units))?;
-    if !run.is_truthy()? {
+    let run = binding
+        .cast::<crate::worker::component_binding::ComponentBinding>()?
+        .borrow()
+        .unit_range(0, units)?;
+    if run.is_empty() {
         return Ok(py.None());
     }
-    let start: usize = run.getattr("start")?.extract()?;
-    let stop: usize = run.getattr("stop")?.extract()?;
+    let start = run.start;
+    let stop = run.end;
     let options = PyDict::new(py);
     let (first, last) = if audio {
         let spans = module.call_method1("unit_samples", (shape.get_item(0)?, units))?;

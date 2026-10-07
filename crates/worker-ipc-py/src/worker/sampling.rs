@@ -441,9 +441,6 @@ pub(super) fn sample_graph<'py>(
         return Ok(py.None().into_bound(py));
     }
 
-    let row_type = py
-        .import("uniserve_worker.model_executor.input_batch")?
-        .getattr("TokenRow")?;
     let mut finishes = Vec::with_capacity(count);
     let mut forced = Vec::with_capacity(count);
     for ((call, request), task) in calls.iter().zip(&requests).zip(tasks) {
@@ -455,6 +452,10 @@ pub(super) fn sample_graph<'py>(
         };
         let state = call.inner.sampling_state.as_ref();
         let force_finish = state.is_some_and(|state| state.force_finish);
+        let Ok(task) = task.cast::<crate::worker::model_inputs::TokenRow>() else {
+            return Ok(py.None().into_bound(py));
+        };
+        let task = task.borrow();
         if call.inner.code != CallKind::Forward(ForwardMode::Decode)
             || !ar.sampling.device_greedy()
             || ar.sampling.allowed_token_ids.is_some()
@@ -465,10 +466,9 @@ pub(super) fn sample_graph<'py>(
                     || !state.transition_token_ids.is_empty()
             })
             || request.transition_write.is_some()
-            || !task.is_instance(&row_type)?
-            || task.getattr("decode_predicate")?.is_none()
-            || !task.getattr("decode_predicate_tagged")?.extract::<bool>()?
-            || task.getattr("decode_force_finish")?.extract::<bool>()? != force_finish
+            || task.decode_predicate.is_none()
+            || !task.decode_predicate_tagged
+            || task.decode_force_finish != force_finish
             || request.token_write.is_none()
         {
             return Ok(py.None().into_bound(py));

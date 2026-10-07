@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PySet, PyTuple};
+use pyo3::types::{PySet, PyTuple};
 use uniserve_worker_ipc::{CallKind, CallStatus, MediaCall, TransferMode};
 
 use super::{BatchState, PythonBackend};
@@ -24,18 +24,17 @@ impl PythonBackend {
         }
 
         let numerical = batch.numerical.clone_ref(py);
-        let clock = py.import("time")?.getattr("perf_counter_ns")?;
-        let started: u64 = clock.call0()?.extract()?;
-        let profiler = self.worker.bind(py).getattr("profiler")?;
-        let scope = if profiler.is_none() {
-            None
-        } else {
-            let first = &batch.plan.calls[0];
-            Some(profiler.call_method1(
-                "step",
-                (format!("batch:{}:{}", first.code.as_str(), first.component),),
-            )?)
-        };
+        let started = std::time::Instant::now();
+        let profiler = self
+            .worker
+            .bind(py)
+            .cast::<crate::worker::runtime::Worker>()?
+            .borrow()
+            .profiler
+            .as_ref()
+            .map(|profiler| profiler.clone_ref(py));
+        let first = &batch.plan.calls[0];
+        let name = format!("batch:{}:{}", first.code.as_str(), first.component);
         let execute = || {
             let mut phase = "batch registration";
             let executed = (|| {
@@ -50,14 +49,11 @@ impl PythonBackend {
             let Err(error): PyResult<()> = executed else {
                 return Ok(py.None().into_bound(py));
             };
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("phase", phase)?;
-            kwargs.set_item("state", &numerical)?;
-            kwargs.set_item("committed", batch.committed)?;
-            let classified = py.import("uniserve_worker.errors")?.call_method(
-                "classify_batch_failure",
-                (error.value(py),),
-                Some(&kwargs),
+            let classified = crate::worker::error::batch_failure(
+                error.value(py),
+                phase,
+                &batch.plan,
+                batch.committed,
             )?;
 
             // Once stores become visible, rollback could invalidate a reader.
@@ -69,16 +65,14 @@ impl PythonBackend {
                 return Err(PyErr::from_value(classified));
             }
 
-            let bound_at = numerical.borrow(py).started_ns;
-            let elapsed = (clock.call0()?.extract::<u64>()?
-                - if bound_at == 0 { started } else { bound_at })
-                / 1000;
+            let bound_at = numerical.borrow(py).started.unwrap_or(started);
+            let elapsed = bound_at.elapsed().as_micros() as u64;
             let stats = numerical.borrow(py).execution_stats(py)?.inner;
             batch.record_execution(py, elapsed, stats)?;
             Ok(classified)
         };
-        if let Some(scope) = scope {
-            with_context(&scope, execute)
+        if let Some(profiler) = profiler {
+            crate::worker::profiling::WorkerProfiler::with_step(&profiler, py, name, execute)
         } else {
             let mut execute = execute;
             execute()

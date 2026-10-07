@@ -1,12 +1,19 @@
 //! Request-owned containers and codec work on the shared host lane.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+mod container;
+mod units;
+
+pub(super) use container::MuxSession;
+pub(super) use units::{frame_encoded_unit, host_array, read_encoded_unit};
+
+use units::parse_units;
+
+use std::sync::Arc;
 
 use pyo3::buffer::PyBuffer;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::sync::MutexExt;
 use pyo3::types::{PyBytes, PyDict, PySlice, PyTuple};
 use uniserve_worker_ipc::{TensorTransfer, TransferTransport};
 
@@ -19,52 +26,6 @@ use super::shared_buffer::SharedRead;
 use super::storage::TensorStore;
 use super::transfer::TransferTicket;
 use super::transport::Transport;
-
-struct Container {
-    value: Py<PyAny>,
-    audio: Option<Py<PyAny>>,
-}
-
-/// The request and its running tasks share the container's lifetime. Dropping
-/// a request never closes a container underneath a codec using it.
-pub(super) struct MuxSession {
-    config: Py<PyAny>,
-    container: Mutex<Container>,
-}
-
-impl MuxSession {
-    pub(super) fn new(py: Python<'_>, config: Py<PyAny>) -> PyResult<Self> {
-        let value = py
-            .import("uniserve_worker.media.container")?
-            .call_method1("AvMuxSession", (config.bind(py),))?
-            .unbind();
-        Ok(Self {
-            config,
-            container: Mutex::new(Container { value, audio: None }),
-        })
-    }
-
-    fn lock(&self, py: Python<'_>) -> MutexGuard<'_, Container> {
-        self.container
-            .lock_py_attached(py)
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-impl Drop for MuxSession {
-    fn drop(&mut self) {
-        // Every task has released its reference, so closing cannot race a codec.
-        let container = self
-            .container
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Python::attach(|py| {
-            if let Err(error) = container.value.bind(py).call_method0("close") {
-                error.write_unraisable(py, Some(container.value.bind(py)));
-            }
-        });
-    }
-}
 
 pub(super) enum MediaTask {
     Image {
@@ -125,40 +86,14 @@ impl MediaTask {
                 .call_method1("encode_unit", (config, source))
                 .map(Bound::unbind),
             Self::Audio { session, pcm } => {
-                let mut container = session.lock(py);
-                container.audio = Some(
-                    py.import("uniserve_worker.media.container")?
-                        .call_method1(
-                            "encode_audio_track",
-                            (
-                                &session.config,
-                                pcm.bind(py).call_method1("reshape", (-1, 2))?,
-                            ),
-                        )?
-                        .unbind(),
-                );
+                session.encode_audio(py, pcm.bind(py))?;
                 Ok(py.None())
             }
             Self::Append { session, units } => {
-                session
-                    .lock(py)
-                    .value
-                    .bind(py)
-                    .call_method1("append", (PyTuple::new(py, units)?,))?;
+                session.append(py, units.iter().map(|unit| unit.clone_ref(py)).collect())?;
                 Ok(py.None())
             }
-            Self::Finalize { session } => {
-                let container = session.lock(py);
-                let audio = container
-                    .audio
-                    .as_ref()
-                    .ok_or_else(|| invalid(py, "artifact assembly has no encoded audio"))?;
-                container
-                    .value
-                    .bind(py)
-                    .call_method1("finalize", (audio,))
-                    .map(Bound::unbind)
-            }
+            Self::Finalize { session } => session.finish(py),
         }
     }
 
@@ -229,11 +164,10 @@ impl HostTensors {
                     "encoded results do not fill their reserved rows",
                 ));
             }
-            let codec = py.import("uniserve_worker.media.mux")?;
             let mut regions = Vec::with_capacity(results.len());
             for (index, result) in results.iter().enumerate() {
                 let framed =
-                    codec.call_method1("frame_encoded_unit", (result, rows.get_item(index)?))?;
+                    frame_encoded_unit(result.bind(py).cast::<PyBytes>()?, &rows.get_item(index)?)?;
                 let length = framed.call_method0("numel")?.extract::<isize>()?;
                 regions.push(PyTuple::new(
                     py,
@@ -359,25 +293,6 @@ pub(super) fn read_units(
         .into_iter()
         .map(|unit| {
             unit.ok_or_else(|| invalid(py, "artifact assembly requires every encoded media unit"))
-        })
-        .collect()
-}
-
-fn parse_units(py: Python<'_>, bytes: &[u8], stride: usize) -> PyResult<Vec<Py<PyBytes>>> {
-    if stride < 8 {
-        return Err(invalid(py, "encoded media unit has no length prefix"));
-    }
-    bytes
-        .chunks_exact(stride)
-        .map(|row| {
-            let mut header = [0; 8];
-            header.copy_from_slice(&row[..8]);
-            let length = u64::from_ne_bytes(header) as usize;
-            let payload = row
-                .get(8..)
-                .and_then(|value| value.get(..length))
-                .ok_or_else(|| invalid(py, "encoded media unit names an invalid length"))?;
-            Ok(PyBytes::new(py, payload).unbind())
         })
         .collect()
 }

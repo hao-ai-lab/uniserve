@@ -7,7 +7,8 @@ This module resolves those declarations against a model instance into
 kinds they serve (``call_kinds``), validates a deployment's placement against
 them (``validate_components``), and attaches calls and communicator groups to
 each rank's ``ComponentBinding`` (``bind_components``). It also declares the
-host components, which own no numerical method.
+host components, which own no numerical method. Placement policy and rank-local
+binding are implemented by the native component owner.
 
 ``prepare_worker_model`` validates placement on a meta-device skeleton before
 process groups exist; ``ModelExecutor`` binds the loaded model's components.
@@ -17,41 +18,48 @@ from ``supported_calls`` and ``media_components``.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import replace
 from importlib import import_module
 
 from torch import nn
 
-from uniserve.distributed import DeviceMesh, communicators
+from uniserve.distributed import DeviceMesh
 from uniserve.model import (
-    AudioDecoder,
-    AudioEncoder,
     CausalLM,
     ComponentEntry,
-    Denoiser,
-    Encoder,
-    ImageDecoder,
-    PatchEncoder,
-    TextEncoder,
     TokenDenoiser,
-    VideoDecoder,
-    VideoEncoder,
     VideoPostprocessor,
 )
-from uniserve.nn.vae import PatchAutoencoder
-from uniserve_worker.config.deployment import ComponentConfig
+from uniserve_worker._uniserve_ipc import (
+    bind_components as bind_components,
+)
+from uniserve_worker._uniserve_ipc import (
+    call_kinds as call_kinds,
+)
+from uniserve_worker._uniserve_ipc import (
+    holds_host_components as holds_host_components,
+)
+from uniserve_worker._uniserve_ipc import (
+    host_components,
+)
+from uniserve_worker._uniserve_ipc import (
+    is_host_component as is_host_component,
+)
+from uniserve_worker._uniserve_ipc import (
+    media_components as media_components,
+)
+from uniserve_worker._uniserve_ipc import (
+    supported_calls as supported_calls,
+)
+from uniserve_worker._uniserve_ipc import (
+    validate_components as validate_components,
+)
 from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.model_executor.component_binding import (
     Call,
-    ComponentBinding,
 )
-from uniserve_worker.protocol.call import (
-    CallKind,
-    ForwardMode,
-    MediaCall,
-    TransferMode,
-)
+from uniserve_worker.protocol.call import MediaCall
 
 # Host components run on a host worker's ranks and own no numerical method, so
 # the worker declares them rather than the model, which declares numerical
@@ -62,78 +70,13 @@ from uniserve_worker.protocol.call import (
 MEDIA_READER_COMPONENT = "media_reader"
 VIDEO_CODEC_COMPONENT = "video_codec"
 MUXER_COMPONENT = "muxer"
-HOST_COMPONENTS: Mapping[str, frozenset[MediaCall]] = {
-    MEDIA_READER_COMPONENT: frozenset({MediaCall.MEDIA_READING}),
-    VIDEO_CODEC_COMPONENT: frozenset({MediaCall.VIDEO_ENCODING}),
-    MUXER_COMPONENT: frozenset({MediaCall.AUDIO_ENCODING, MediaCall.MUXING}),
-}
+HOST_COMPONENTS: Mapping[str, frozenset[MediaCall]] = host_components()
+
 #: The muxer's calls, which ``bind_components`` records as its call kinds.
 MUXER_CALL_KINDS = HOST_COMPONENTS[MUXER_COMPONENT]
 
 #: Distinguishes an attribute a model never declared from one it cleared.
 _MISSING = object()
-
-
-def is_host_component(name: str) -> bool:
-    """Report whether a component runs on host ranks rather than a device."""
-    return name in HOST_COMPONENTS
-
-
-def holds_host_components(names: Iterable[str]) -> bool:
-    """Report whether a rank holding these components is a codec slot.
-
-    A host rank runs one codec task at a time in its own process: one
-    request's media read, one media unit's encode, the audio track's, or one
-    step of a container's assembly.
-    """
-    return any(is_host_component(name) for name in names)
-
-
-def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
-    """Resolve the call kinds a capability's type and method can execute.
-
-    The kind follows the module's capability type and the declared numerical
-    method. A call no rule matches contributes no kind. Host components have
-    no calls, so ``supported_calls`` and ``media_components`` take their
-    kinds from ``HOST_COMPONENTS``.
-    """
-    kinds: set[CallKind] = set()
-    for call in calls:
-        module, method = call.module, call.entry_point.method
-        if isinstance(module, CausalLM) and method == "forward":
-            kinds.update(
-                (ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY)
-            )
-        elif isinstance(module, TokenDenoiser) and method == "forward":
-            kinds.add(ForwardMode.TOKEN_DENOISING)
-        elif isinstance(module, Denoiser) and method == "forward":
-            kinds.update((MediaCall.LATENT_PREPARATION, MediaCall.DENOISING))
-        elif isinstance(module, VideoPostprocessor) and method == "forward":
-            # The post-processor converts a decoded media unit to RGB on the
-            # rank that decoded it, inside the same decoding call; the RGB
-            # unit is that call's product, which a host rank encodes.
-            kinds.add(MediaCall.VIDEO_DECODING)
-        elif method == "encode":
-            if isinstance(module, TextEncoder):
-                kinds.add(MediaCall.TEXT_ENCODING)
-            elif isinstance(module, PatchEncoder):
-                kinds.add(MediaCall.VISION_ENCODING)
-            elif isinstance(
-                module, (PatchAutoencoder, VideoEncoder, AudioEncoder)
-            ):
-                kinds.add(MediaCall.LATENT_ENCODING)
-            # ``TextEncoder`` and ``PatchEncoder`` subclass ``Encoder``, so
-            # the generic encoder is matched only after them.
-            elif isinstance(module, Encoder):
-                kinds.add(MediaCall.LATENT_PREPARATION)
-        elif method == "decode":
-            if isinstance(module, ImageDecoder):
-                kinds.add(MediaCall.IMAGE_DECODING)
-            elif isinstance(module, VideoDecoder):
-                kinds.add(MediaCall.VIDEO_DECODING)
-            elif isinstance(module, AudioDecoder):
-                kinds.add(MediaCall.AUDIO_DECODING)
-    return frozenset(kinds)
 
 
 def describe_components(
@@ -268,252 +211,3 @@ def _entry_module(model: nn.Module, path: str) -> nn.Module | None:
         raise unsupported_setup(
             f"entry module {path!r} does not exist"
         ) from error
-
-
-def supported_calls(
-    model: nn.Module, held: Iterable[str] = ()
-) -> frozenset[CallKind]:
-    """Collect every call kind and transfer mode this worker can serve.
-
-    A placement names the components this worker holds, and a call the holder
-    of its component cannot serve has nowhere to run. A worker given no
-    placement holds every component the model declares, which is the undivided
-    deployment.
-
-    ``TransferMode.TENSOR`` is always included; KV publish and install are
-    included when a held component contains a ``CausalLM`` call, and a held
-    host component contributes its ``HOST_COMPONENTS`` calls.
-    """
-    components = describe_components(model)
-    names = set(held)
-    if names:
-        components = {
-            name: calls for name, calls in components.items() if name in names
-        }
-    calls = tuple(call for items in components.values() for call in items)
-    kinds = {TransferMode.TENSOR, *call_kinds(calls)}
-    for name, host_kinds in HOST_COMPONENTS.items():
-        if name in components:
-            kinds.update(host_kinds)
-    if any(isinstance(call.module, CausalLM) for call in calls):
-        kinds.update((TransferMode.KV_EXPORT, TransferMode.KV_INSTALL))
-    return frozenset(kinds)
-
-
-def media_components(
-    model: nn.Module, held: Iterable[str] = ()
-) -> dict[MediaCall, str]:
-    """Resolve which component serves each media call this worker holds.
-
-    The engine routes a call to the component named here, so a call a model
-    serves from a component of its own -- a patch encoder placed apart from a
-    language backbone, as much as a denoiser placed apart from a muxer -- is
-    reported whether or not the model reconstructs video. A call whose
-    component this placement does not hold is not reported, because this
-    worker cannot serve it; the engine checks that the video graph is complete
-    across the workers of a deployment.
-
-    Raises:
-        WorkerError: With ``UNSUPPORTED_SETUP`` when latent preparation and
-            denoising are routed to different components, or when
-            ``describe_components`` refuses the model.
-    """
-    components = describe_components(model)
-    names = set(held)
-    if names:
-        components = {
-            name: calls for name, calls in components.items() if name in names
-        }
-    owners: dict[MediaCall, list[str]] = {}
-    for name, calls in components.items():
-        owned = {
-            kind for kind in call_kinds(calls) if isinstance(kind, MediaCall)
-        }
-        if name in HOST_COMPONENTS:
-            # A host component's calls are host tasks with no numerical owner.
-            owned = set(HOST_COMPONENTS[name])
-        for call in owned:
-            owners.setdefault(call, []).append(name)
-
-    # A call several components implement names no single component, so it
-    # is not routed: a model whose modules overlap outside the media graph
-    # serves no media call through them, and a media deployment missing a
-    # call is refused by the engine, which names the call, when it checks the
-    # graph across workers.
-    routes = {
-        call: holders[0]
-        for call, holders in owners.items()
-        if len(holders) == 1
-    }
-    if (
-        MediaCall.LATENT_PREPARATION in routes
-        and MediaCall.DENOISING in routes
-        and routes[MediaCall.LATENT_PREPARATION] != routes[MediaCall.DENOISING]
-    ):
-        raise unsupported_setup(
-            "latent preparation must participate in the denoiser component"
-        )
-    return routes
-
-
-def validate_components(
-    model: nn.Module,
-    components: Mapping[str, ComponentConfig],
-    *,
-    entries: Mapping[str, ComponentEntry] | None = None,
-    declarations: dict[str, tuple[Call, ...]] | None = None,
-) -> dict[str, tuple[Call, ...]]:
-    """Validate a component placement against the model's declarations.
-
-    ``prepare_worker_model`` calls this on a meta-device skeleton before
-    loading weights or creating process groups; ``bind_components`` repeats
-    it for the loaded model's bindings. Passing ``declarations`` reuses an
-    earlier ``describe_components`` result instead of resolving it again.
-
-    Returns:
-        The declarations the placement was validated against.
-
-    Raises:
-        WorkerError: With ``UNSUPPORTED_SETUP`` when ``describe_components``
-            refuses the model, the placement names an undeclared component, a
-            non-host component has no calls, or a component's
-            ``distribution`` does not fit its calls. The muxer and the
-            media reader are never distributed; the video codec and a
-            component with a ``VideoDecoder`` call require ``temporal_units``
-            with one unit per rank; a component with an ``AudioDecoder`` or
-            ``VideoEncoder`` call and no ``VideoDecoder`` call accepts no
-            distribution or ``temporal_units`` with at least one unit per
-            rank; every other component accepts no distribution.
-    """
-    declared = (
-        describe_components(model, entries=entries)
-        if declarations is None
-        else declarations
-    )
-    unknown = components.keys() - declared.keys()
-    if unknown:
-        raise unsupported_setup(f"unknown components {sorted(unknown)}")
-    for name, component in components.items():
-        calls = declared[name]
-        if not calls:
-            if name not in HOST_COMPONENTS:
-                raise unsupported_setup(
-                    f"component {name!r} has no numerical methods"
-                )
-            if name == MUXER_COMPONENT and component.distribution is not None:
-                raise unsupported_setup(
-                    "the muxer assembles one artifact and is not distributed"
-                )
-            if (
-                name == MEDIA_READER_COMPONENT
-                and component.distribution is not None
-            ):
-                raise unsupported_setup(
-                    "the media reader reads one request's conditions on one "
-                    "rank and is not distributed"
-                )
-            if name == VIDEO_CODEC_COMPONENT and (
-                component.distribution != "temporal_units"
-                or component.units_per_rank != 1
-            ):
-                raise unsupported_setup(
-                    "video encoding distributes by temporal_units with one "
-                    "media unit per rank, each rank one codec slot"
-                )
-            continue
-        if any(isinstance(call.module, VideoDecoder) for call in calls):
-            if (
-                component.distribution != "temporal_units"
-                or component.units_per_rank != 1
-            ):
-                raise unsupported_setup(
-                    "video decoding requires temporal_units with one native "
-                    "unit per rank"
-                )
-        elif any(
-            isinstance(call.module, (AudioDecoder, VideoEncoder))
-            for call in calls
-        ):
-            # An audio media unit is a span of the latent timeline rather than
-            # a native window, and a condition's encoding unit is one of its
-            # encoder windows, so a rank may take several of them, but the
-            # division is still by media unit.
-            if component.distribution not in (None, "temporal_units") or (
-                component.distribution is not None
-                and component.units_per_rank < 1
-            ):
-                raise unsupported_setup(
-                    f"{name} distributes by temporal_units with at least one "
-                    "media unit per rank"
-                )
-        elif component.distribution is not None:
-            raise unsupported_setup(
-                f"entry {name!r} requires model-parallel membership"
-            )
-    return declared
-
-
-def bind_components(
-    model: nn.Module,
-    bindings: Mapping[str, ComponentBinding],
-    *,
-    entries: Mapping[str, ComponentEntry] | None = None,
-    declarations: dict[str, tuple[Call, ...]] | None = None,
-) -> None:
-    """Borrow methods and communicator views for each local component.
-
-    Placement is validated first (see ``validate_components``). Every binding's
-    ``calls`` is then reset; a binding this rank owns and has a mesh for
-    receives the calls its pipeline stage runs and their call kinds. Each call
-    carries the communicator groups it exchanges tensors in, deduplicated by
-    backend handle. A temporally distributed ``VideoPostprocessor`` also has
-    its ``units`` ring assigned on the module itself.
-    """
-    declared = validate_components(
-        model,
-        {name: binding.config for name, binding in bindings.items()},
-        entries=entries,
-        declarations=declarations,
-    )
-    for name, binding in bindings.items():
-        binding.calls = ()
-        if not binding.owns or binding.mesh is None:
-            continue
-
-        mesh = binding.mesh
-        pipeline = mesh.get_group("pp")
-        calls = []
-        for call in declared[name]:
-            stage = call.entry_point.stage
-            if stage == "first" and pipeline.rank != 0:
-                continue
-            if stage == "last" and pipeline.rank != pipeline.size - 1:
-                continue
-
-            # Only an all-stage method keeps the module's communicators whose
-            # axes include ``pp``; a first- or last-stage method runs on one
-            # stage. Entry-point axes added below are not filtered.
-            groups = {
-                group._require(): group
-                for group in communicators(call.module)
-                if stage == "all" or "pp" not in group.name.split(".")
-            }
-            # Temporal components have a rank-local numerical mesh, but their
-            # reconstruction still exchanges overlaps with adjacent ranks.
-            # Bind that ring to both the model and its prepared call scope.
-            if binding.units is not None and isinstance(
-                call.module, VideoPostprocessor
-            ):
-                call.module.units = binding.units
-                if binding.units.size > 1:
-                    groups[binding.units._require()] = binding.units
-            for axes in call.entry_point.communication_axes(mesh):
-                group = mesh.get_group(axes)
-                if group.size > 1:
-                    groups[group._require()] = group
-            calls.append(replace(call, groups=tuple(groups.values())))
-
-        binding.calls = tuple(calls)
-        binding.call_kinds = tuple(
-            MUXER_CALL_KINDS if name == MUXER_COMPONENT else call_kinds(calls)
-        )

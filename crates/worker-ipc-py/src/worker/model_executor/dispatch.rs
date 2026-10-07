@@ -11,6 +11,7 @@ use crate::worker::execution::GraphBucket;
 use crate::worker::expert_exchange::ExpertExchange;
 use crate::worker::host::with_context;
 use crate::worker::microbatches::Microbatches;
+use crate::worker::model_inputs::InputBatch;
 use crate::worker::model_results::ExecutionOutput;
 
 use super::{context, execution, graphs};
@@ -164,8 +165,20 @@ fn forward(
             .borrow()
             .record_layers(bucket.borrow().layers.clone());
     }
-    let live: u64 = batch.getattr("query_tokens")?.extract()?;
-    let padded: u64 = shape.inputs.bind(py).getattr("query_tokens")?.extract()?;
+    let live = batch
+        .cast::<InputBatch>()?
+        .borrow()
+        .query_tokens
+        .ok_or_else(|| PyValueError::new_err("graph input has no token extent"))?
+        as u64;
+    let padded = shape
+        .inputs
+        .bind(py)
+        .cast::<InputBatch>()?
+        .borrow()
+        .query_tokens
+        .ok_or_else(|| PyValueError::new_err("graph input has no token extent"))?
+        as u64;
     let kwargs = PyDict::new(py);
     kwargs.set_item("borrow", borrow)?;
     let result = runner
@@ -222,7 +235,11 @@ fn single(
                 py,
                 &format!(
                     "uniserve.expert.step tokens={} capacity={capacity} local_tokens={tokens}",
-                    batch.getattr("query_tokens")?
+                    batch
+                        .cast::<InputBatch>()?
+                        .borrow()
+                        .query_tokens
+                        .map_or_else(|| "None".to_owned(), |count| count.to_string())
                 ),
             )?,
             || {
@@ -360,7 +377,11 @@ pub(super) fn run(
         let mut tokens = Some(0);
         for batch in batches {
             if !batch.is_none() {
-                let count = batch.getattr("query_tokens")?.extract::<Option<u64>>()?;
+                let count = batch
+                    .cast::<InputBatch>()?
+                    .borrow()
+                    .query_tokens
+                    .map(|count| count as u64);
                 tokens = tokens.zip(count).map(|(total, count)| total + count);
             }
         }

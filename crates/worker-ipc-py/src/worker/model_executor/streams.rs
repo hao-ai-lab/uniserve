@@ -11,7 +11,7 @@ use pyo3::types::{PyDict, PyTuple};
 use std::sync::Arc;
 use uniserve_worker_ipc::CallKind;
 
-use super::modules::input_error;
+use crate::worker::error::input_error;
 use crate::worker::execution::close_all;
 
 struct Lane {

@@ -10,6 +10,7 @@ use pyo3::types::{PyDict, PyTuple};
 use uniserve_worker_ipc::CallKind;
 
 use super::{ModelExecutor, context};
+use crate::worker::error::input_error;
 use crate::worker::host::with_context;
 
 /// A declared method and the contexts that borrow its stream and scratch.
@@ -253,17 +254,5 @@ impl ModelExecutor {
                 format!("component {name:?} requires an unambiguous numerical method"),
             )),
         }
-    }
-}
-
-/// Numerical library callers distinguish invalid inputs from worker failures.
-pub(super) fn input_error(py: Python<'_>, message: impl Into<String>) -> PyErr {
-    match py
-        .import("uniserve_worker.errors")
-        .and_then(|module| module.getattr("InputError"))
-        .and_then(|class| class.call1((message.into(),)))
-    {
-        Ok(error) => PyErr::from_value(error),
-        Err(error) => error,
     }
 }

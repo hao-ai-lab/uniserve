@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import socket
 from contextlib import contextmanager
-from dataclasses import replace
 
 import pytest
 import torch
@@ -432,8 +431,7 @@ def _expert_reads(rank, root, port):
 
                 # Repeated slot reads can make the final expert layer's
                 # sender larger than the compact canvas that produced it.
-                repeated = replace(
-                    readout[2],
+                repeated = readout[2].replace(
                     slot_tokens=(0,) * 96,
                     candidate_offsets=tuple(range(0, 193, 2)),
                     candidate_ids=readout[2].candidate_ids[:2] * 96,
@@ -504,8 +502,7 @@ def _canvas_observations(runner, manager, slots):
                 )
             )
         )
-    repeated = replace(
-        readout[2],
+    repeated = readout[2].replace(
         slot_tokens=(0,) * 96,
         candidate_offsets=tuple(range(0, 193, 2)),
         candidate_ids=readout[2].candidate_ids[:2] * 96,
@@ -659,8 +656,7 @@ def test_a_readout_answers_every_slot_of_many_canvases(tmp_path):
             offsets = [0]
             for token in range(tokens):
                 offsets.append(offsets[-1] + 1 + token % 3)
-            return replace(
-                row,
+            return row.replace(
                 slot_tokens=tuple(range(tokens)),
                 candidate_offsets=tuple(offsets),
                 candidate_ids=tuple(

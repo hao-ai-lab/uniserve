@@ -9,6 +9,7 @@ use pyo3::types::{PyDict, PySlice, PyTuple};
 use std::sync::Arc;
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
+use super::kernel_records::{self, KernelRecords};
 use super::{ModelExecutor, context, execution, experts, graphs, resources};
 
 /// Seal captured capacities only after budget checks and startup reporting.
@@ -16,15 +17,14 @@ pub(super) fn complete(owner: &Bound<'_, ModelExecutor>) -> PyResult<()> {
     let py = owner.py();
     let storage = owner.borrow().graph_storage(py)?;
     storage.borrow().check(py)?;
-    py.import("uniserve_worker.execution.kernel_table")?
-        .call_method1("log_startup_memory", (storage,))?;
+    kernel_records::log_memory(&storage)?;
 
     owner.borrow_mut().kernel_choices = py
         .import("uniserve.runtime.backends")?
         .call_method0("kernel_choices")?
         .extract()?;
-    let kernels = owner.borrow().kernels.bind(py).clone();
-    kernels.call_method1("add", (ModelExecutor::all(owner)?,))?;
+    let kernels = KernelRecords::gather(&ModelExecutor::all(owner)?)?;
+    owner.borrow_mut().kernels.merge(kernels);
     log_kernels(owner, "startup")?;
     seal(owner)
 }
@@ -47,11 +47,9 @@ impl ModelExecutor {
             }
             owner.kernel_choices = choices;
         }
-        let kernels = owner.borrow().kernels.bind(py).clone();
-        if kernels
-            .call_method1("add", (Self::all(owner)?,))?
-            .is_truthy()?
-        {
+        let kernels = KernelRecords::gather(&Self::all(owner)?)?;
+        let changed = owner.borrow_mut().kernels.merge(kernels);
+        if changed {
             log_kernels(owner, "serving")?;
         }
         Ok(())
@@ -59,24 +57,12 @@ impl ModelExecutor {
 }
 
 fn log_kernels(owner: &Bound<'_, ModelExecutor>, stage: &str) -> PyResult<()> {
-    let py = owner.py();
-    let (config, kernels) = {
-        let owner = owner.borrow();
-        (Arc::clone(&owner.config), owner.kernels.bind(py).clone())
-    };
-    let options = PyDict::new(py);
-    options.set_item("stage", stage)?;
-    options.set_item("rank", config.rank)?;
-    options.set_item("device", &config.device)?;
-    let table = kernels.call_method("table", (), Some(&options))?;
-    let text = py
-        .import("uniserve_worker.execution.kernel_table")?
-        .call_method1("format_kernel_table", (table,))?;
-    py.import("logging")?
-        .call_method1("getLogger", ("uniserve_worker.execution.model_executor",))?
-        .call_method1("info", ("%s", text))?;
-    Ok(())
+    let model = owner.borrow();
+    model
+        .kernels
+        .log(owner.py(), stage, model.config.rank, &model.config.device)
 }
+
 use crate::worker::block_tables::{GroupShape, GroupTable};
 use crate::worker::execution::{Execution, on_stream};
 use crate::worker::expert_exchange::ExpertExchange;

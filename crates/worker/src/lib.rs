@@ -56,7 +56,7 @@ pub use kv_cache::KVCacheManager;
 pub use kv_import::{ImportBackend, ImportCopy, KVImport, KVImporter};
 pub use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
 pub use microbatches::{Microbatches, yield_microbatch};
-pub use model_runners::{ModelBatch, ModelRunners};
+pub use model_runners::{ModelBatch, ModelRunners, TokenSelection};
 pub use output::{LogprobLayout, OutputBuffer, OutputPool, OutputStorage};
 pub use pending::{BatchResult, PendingOutput, request_output};
 pub use registry::{BufferRegistry, RegisteredBuffer};

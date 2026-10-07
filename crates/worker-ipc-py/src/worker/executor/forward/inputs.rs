@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
 use super::{BatchState, DiffusionStep, ForwardRow, PythonBackend, Trajectories};
+use crate::worker::model_inputs::{DecodeRow, InputRow, VisionRow};
 
 impl PythonBackend {
     pub(super) fn prepare_forward_rows(
@@ -18,7 +18,6 @@ impl PythonBackend {
         step_inputs: &HashMap<usize, DiffusionStep>,
         trajectories: &Trajectories,
     ) -> PyResult<Vec<ForwardRow>> {
-        let image = py.import("uniserve_worker.execution.image")?;
         let mut forward = Vec::new();
 
         for &(index, _) in steps {
@@ -47,9 +46,19 @@ impl PythonBackend {
                 plan.code,
                 CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
             ) {
-                let call = batch.call(py, index)?;
                 let prepared = self.prepare_features(py, batch, index)?;
-                let task = image.call_method1("encode_row", (call.getattr("kind")?, &prepared))?;
+                let pixels = prepared.bind(py);
+                let row = VisionRow {
+                    encode_pixels: pixels.getattr("pixels")?.unbind(),
+                    encode_grid: pixels.getattr("grid")?.extract()?,
+                    encode_grid_shape: pixels.getattr("grid_shape")?.extract()?,
+                };
+                let input = InputRow {
+                    kind: plan.code,
+                    request_pool_idx: 0,
+                };
+                let task =
+                    Bound::new(py, PyClassInitializer::from(input).add_subclass(row))?.into_any();
                 forward.push(ForwardRow {
                     index,
                     task: task.unbind(),
@@ -59,18 +68,19 @@ impl PythonBackend {
                 // A resident decoded image needs only encoding, with no model row.
                 self.finalize_image(py, batch, index)?;
             } else {
-                let call = batch.call(py, index)?;
                 let latent = self.image_latent(py, batch, index)?;
                 let params = batch.latent_params(py, index)?;
-                let row = PyDict::new(py);
-                row.set_item("forward_mode", call.getattr("kind")?)?;
-                row.set_item("latent", latent)?;
-                row.set_item("image_height", params.height)?;
-                row.set_item("image_width", params.width)?;
-                let task = py
-                    .import("uniserve_worker.model_executor.image_inputs")?
-                    .getattr("DecodeRow")?
-                    .call((), Some(&row))?;
+                let row = DecodeRow {
+                    latent,
+                    image_height: params.height as usize,
+                    image_width: params.width as usize,
+                };
+                let input = InputRow {
+                    kind: plan.code,
+                    request_pool_idx: 0,
+                };
+                let task =
+                    Bound::new(py, PyClassInitializer::from(input).add_subclass(row))?.into_any();
                 forward.push(ForwardRow::new(index, task.unbind()));
             }
         }

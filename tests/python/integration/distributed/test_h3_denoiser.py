@@ -503,7 +503,11 @@ def _diffusion(model, factory, latents, *, device, stream, bank=None):
 
 @torch.inference_mode()
 def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
-    from uniserve_worker.model_executor.media_inputs import MediaBuilder
+    from tests.python.fixtures.h3 import DenoisingModel
+    from uniserve_worker.bootstrap.distributed import initialize_components
+    from uniserve_worker.config.deployment import ComponentConfig
+    from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.execution.model_executor import ModelExecutor
 
     source = _checkpoint(tmp_path)
     device = torch.device("cuda", 0)
@@ -511,7 +515,19 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         rank=0, local_rank=0, world_size=1, device=device
     ) as groups:
         model = _load(groups, tmp_path, device)
-        factory = MediaBuilder(model, max_frames=22, max_text_tokens=65)
+        executor = ModelExecutor(
+            DenoisingModel(model),
+            WorkerConfig(
+                device=str(device),
+                max_video_seconds=22 / 24,
+                max_sequence_tokens=65,
+                max_request_pool_size=2,
+            ),
+            bindings=initialize_components(
+                groups, {"denoiser": ComponentConfig((0,))}
+            ),
+        )
+        factory = executor.media_builder
         size = factory.size(22, 63, WIDE)
         layout = factory.layout(size)
         matrices = {name: value.to(device) for name, value in source.items()}
@@ -521,7 +537,6 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
             dtype=torch.bfloat16,
             device=device,
         )
-        stream = CUDAStream.external(torch.cuda.Stream(device=device))
         # Slot storage is the request pool's bank, whose rows the captured
         # ladder reaches through the device slot index; the samples live in
         # the slot's pages of the latent pool.
@@ -529,15 +544,10 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
             2, state_buffers=factory.capacity_buffers(), device=device
         )
         latents = _latents(factory, device=device)
-        runner = _diffusion(
-            model,
-            factory,
-            latents,
-            device=device,
-            stream=stream,
-            bank=pool.storage.bank,
-        )
         try:
+            executor.bind_diffusion_storage(pool.storage.bank, latents)
+            executor.prepare_denoising(pool.storage.tensor_slots)
+            runner = executor.diffusion
             context = runner.layout(layout)
             with pool.storage.tensors(1) as storage:
                 views = storage.view(factory.buffers(size))
@@ -565,10 +575,8 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                         torch.testing.assert_close(
                             samples[name], initial[name], rtol=0, atol=0
                         )
-                    # Startup captures the first request's ladder; the second
-                    # request, with its own schedules, replays it.
-                    if seed == 31:
-                        runner.capture(ladder)
+                    # Both requests replay the graph prepared with startup
+                    # placeholder state, using their own schedules and noise.
                     bank = 1
                     for index in range(4):
                         state = _committed(factory, latents, size, 1, bank)
@@ -613,10 +621,9 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                         schedule.timesteps.fill_(float("nan"))
                         schedule.sigmas.fill_(float("nan"))
         finally:
-            runner.close()
+            executor.close()
             latents.close()
             pool.close()
-            stream.close()
 
 
 @torch.inference_mode()

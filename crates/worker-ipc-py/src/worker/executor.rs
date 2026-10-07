@@ -24,7 +24,6 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyBaseException, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
-use pythonize::depythonize;
 use uniserve_core::CallId;
 use uniserve_worker::{
     Backend, Batch, BatchResult, Executor as NativeExecutor, Service, ServiceBackend,
@@ -77,7 +76,7 @@ struct PythonBackend {
     tensors: Py<TensorStore>,
     output_pool: Py<OutputPool>,
     host_tasks: Py<HostLane>,
-    decode_state: Option<Py<PyAny>>,
+    decode_state: Option<Py<super::decode_state::DecodeState>>,
     indexed_decode: bool,
     sampling_columns: usize,
     latents: Option<Py<LatentPool>>,
@@ -205,11 +204,8 @@ impl Backend for PythonBackend {
         Python::attach(|py| {
             let classify = || -> PyResult<_> {
                 let kwargs = PyDict::new(py);
-                kwargs.set_item("context", context)?;
                 kwargs.set_item("route", batch.numerical.borrow(py).route())?;
-                py.import("uniserve_worker.errors")?
-                    .getattr("classify")?
-                    .call((error,), Some(&kwargs))?
+                super::error::classify(error.bind(py), Some(context), Some(&kwargs))?
                     .cast_into::<PyBaseException>()
                     .map(Bound::unbind)
                     .map_err(Into::into)
@@ -406,18 +402,12 @@ impl ServiceBackend for PythonBackend {
                     .bind(py)
                     .is_instance(&errors.getattr("WorkerError")?)?;
                 let classified = if unexpected {
-                    let kwargs = PyDict::new(py);
-                    kwargs.set_item("context", kind.as_str())?;
-                    errors.getattr("classify")?.call((error,), Some(&kwargs))?
+                    super::error::classify(error.bind(py), Some(kind.as_str()), None)?
                 } else {
                     error.into_bound(py).into_any()
                 };
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("unexpected", unexpected)?;
-                py.import("uniserve_worker.profiling")?
-                    .getattr("record_failure")?
-                    .call((kind.as_str(), &classified), Some(&kwargs))?;
-                depythonize(&classified.call_method0("to_mapping")?).map_err(Into::into)
+                super::error::record_failure(kind.as_str(), &classified, unexpected)?;
+                super::error::response(&classified)
             };
             report().map_err(|error| error.into_value(py))
         })
@@ -552,12 +542,13 @@ impl Executor {
             })
             .collect();
 
-        let decode_state: Option<Py<PyAny>> = worker.getattr("decode_state")?.extract()?;
+        let decode_state: Option<Py<super::decode_state::DecodeState>> =
+            worker.getattr("decode_state")?.extract()?;
         let block_tables = worker.getattr("block_tables")?;
         // Placement is fixed for this executor. Only the continuation tag
         // varies per call; indexed inputs require collocated CUDA storage.
         let indexed_decode = if let Some(state) = &decode_state {
-            let device = state.bind(py).getattr("device")?;
+            let device = state.borrow(py).device.bind(py).clone();
             !block_tables.is_none()
                 && device.getattr("type")?.extract::<String>()? == "cuda"
                 && block_tables

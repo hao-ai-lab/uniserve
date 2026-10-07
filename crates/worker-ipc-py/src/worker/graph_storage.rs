@@ -158,7 +158,7 @@ impl GraphStorage {
     }
 
     /// Reserved pool bytes include reusable graph workspace.
-    fn pool_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    pub(super) fn pool_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let result = PyDict::new(py);
         for (device, used) in self.inner.pool_bytes(&self.segments(py)?) {
             result.set_item(torch_device(py, device)?, used)?;
@@ -167,7 +167,7 @@ impl GraphStorage {
     }
 
     /// Attribute a shared pool once, to its first remaining owner.
-    fn owner_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    pub(super) fn owner_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let result = PyDict::new(py);
         for ((owner, device), used) in self.inner.owner_bytes(&self.segments(py)?) {
             result.set_item(

@@ -5,12 +5,16 @@ use pyo3::prelude::*;
 mod batch;
 mod block_tables;
 mod buffer;
+mod canvas_slots;
 mod capacity;
 mod communication;
 mod completion;
+mod component_binding;
 mod config;
 mod cuda_graph;
+mod decode_state;
 mod descriptor_grants;
+mod diffusion_state;
 pub(crate) mod error;
 mod events;
 mod execution;
@@ -30,14 +34,22 @@ mod kv_import;
 mod latent;
 pub(crate) mod locator;
 mod media;
+mod media_inputs;
 mod microbatches;
 mod model_executor;
+mod model_inputs;
 mod model_results;
+mod model_runner;
 mod output;
+mod peer_storage;
 mod pending;
+mod placement;
+mod process_groups;
+mod profiling;
 pub(crate) mod protocol;
 mod registry;
 mod request;
+mod request_slots;
 mod runtime;
 mod sampling;
 mod shared_buffer;
@@ -52,6 +64,42 @@ mod weight_prefetch;
 /// Register the worker objects in the common native extension.
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     capacity::register(module)?;
+    runtime::launch::register(module)?;
+    component_binding::calls::register(module)?;
+    module.add_function(wrap_pyfunction!(
+        config::deployment::prepare_worker_launch,
+        module
+    )?)?;
+    model_executor::discovery::inputs::register(module)?;
+    module.add_function(wrap_pyfunction!(error::classify, module)?)?;
+    module.add_function(wrap_pyfunction!(error::worker_error_mapping, module)?)?;
+    module.add_function(wrap_pyfunction!(error::should_capture_trace, module)?)?;
+    peer_storage::register(module)?;
+    module.add_class::<profiling::WorkerProfiler>()?;
+    module.add_function(wrap_pyfunction!(profiling::timing_events_enabled, module)?)?;
+    module.add_class::<process_groups::Rendezvous>()?;
+    module.add_class::<process_groups::ProcessGroups>()?;
+    module.add_function(wrap_pyfunction!(
+        process_groups::initialize_components,
+        module
+    )?)?;
+    module.add_class::<placement::SequenceConfig>()?;
+    module.add_class::<placement::ParallelConfig>()?;
+    module.add_class::<placement::ComponentConfig>()?;
+    module.add_class::<component_binding::ComponentBinding>()?;
+    module.add_function(wrap_pyfunction!(
+        component_binding::bind_components,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        component_binding::validate_components,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(placement::parse_components, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        process_groups::initialize_process_groups,
+        module
+    )?)?;
     module.add_class::<config::WorkerConfig>()?;
     module.add_class::<config::LaneConfig>()?;
     module.add_function(wrap_pyfunction!(config::graph_padding_block_count, module)?)?;
@@ -95,6 +143,9 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<graph_storage::GraphStorage>()?;
     module.add_class::<cuda_graph::CUDAGraph>()?;
     module.add_class::<cuda_graph::CUDAGraphRunner>()?;
+    module.add_class::<cuda_graph::GraphInputs>()?;
+    module.add_function(wrap_pyfunction!(cuda_graph::input_signature, module)?)?;
+    cuda_graph::batch::register(module)?;
     module.add(
         "CUDAGraphError",
         module.py().get_type::<cuda_graph::CUDAGraphError>(),
@@ -102,10 +153,18 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<execution_context::ExecutionContext>()?;
     module.add_class::<tensor_buffers::Scratch>()?;
     module.add_class::<tensor_buffers::TensorBuffers>()?;
+    module.add_function(wrap_pyfunction!(tensor_buffers::buffer_envelope, module)?)?;
+    module.add_class::<media::MuxSession>()?;
+    module.add_function(wrap_pyfunction!(media::frame_encoded_unit, module)?)?;
+    module.add_function(wrap_pyfunction!(media::read_encoded_unit, module)?)?;
+    module.add_class::<media_inputs::MediaBuilder>()?;
+    module.add_class::<media_inputs::SamplePages>()?;
     module.add_class::<execution::Execution>()?;
     module.add_class::<execution::GraphBucket>()?;
     module.add_class::<execution::JoinGraphs>()?;
-    module.add_class::<execution::DenoisingBuffers>()?;
+    module.add_class::<model_runner::DenoisingBuffers>()?;
+    module.add_class::<model_runner::DenoisingSequence>()?;
+    module.add_class::<model_runner::DiffusionRunner>()?;
     module.add_class::<graph_shapes::PrefillShape>()?;
     module.add_class::<graph_shapes::TextShapes>()?;
     module.add_function(wrap_pyfunction!(graph_shapes::prefill_units, module)?)?;
@@ -113,8 +172,26 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(microbatches::yield_microbatch, module)?)?;
     module.add_class::<microbatches::Microbatches>()?;
     module.add_class::<model_executor::ModelExecutor>()?;
+    module.add_class::<model_runner::ModelRunner>()?;
+    module.add_class::<model_runner::TextRunner>()?;
+    module.add_class::<model_runner::EncoderRunner>()?;
+    module.add_class::<model_runner::CanvasRunner>()?;
+    module.add(
+        "SLOT_BUCKETS",
+        pyo3::types::PyTuple::new(module.py(), model_runner::SLOT_BUCKETS)?,
+    )?;
+    module.add_function(wrap_pyfunction!(model_runner::joining_experts, module)?)?;
     module.add_class::<crate::stats::ForwardStats>()?;
     module.add_class::<model_results::ExecutionOutput>()?;
+    module.add_class::<model_inputs::InputRow>()?;
+    module.add_class::<model_inputs::AttentionRow>()?;
+    module.add_class::<model_inputs::TokenRow>()?;
+    module.add_class::<model_inputs::CanvasRow>()?;
+    module.add_class::<model_inputs::CanvasStepRow>()?;
+    module.add_class::<model_inputs::DiffusionRow>()?;
+    module.add_class::<model_inputs::VisionRow>()?;
+    module.add_class::<model_inputs::DecodeRow>()?;
+    module.add_class::<model_inputs::InputBatch>()?;
     module.add_class::<weight_prefetch::WeightPrefetch>()?;
     module.add_class::<expert_exchange::ExpertExchange>()?;
     module.add_class::<batch::BatchState>()?;
@@ -170,6 +247,10 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<request::Request>()?;
     module.add_class::<request::RequestProgress>()?;
     module.add_class::<request::RequestPool>()?;
+    module.add_class::<request_slots::RequestSlots>()?;
+    module.add_class::<canvas_slots::CanvasSlots>()?;
+    module.add_class::<diffusion_state::DiffusionState>()?;
+    module.add_class::<decode_state::DecodeState>()?;
     module.add_class::<storage::Buffer>()?;
     module.add_class::<storage::TensorRead>()?;
     module.add_class::<storage::TensorImport>()?;

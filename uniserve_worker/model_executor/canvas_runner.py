@@ -49,207 +49,70 @@ the sentinel slot zero.
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import cast
 
 import torch
 
 from uniserve.diffusion import canvas as sampler
 from uniserve.diffusion.tokens import candidate_logprobs
-from uniserve.model import CanvasInput
+from uniserve.model import CanvasInput, Logits
 from uniserve.nn.attention import (
     AttentionBatch,
     BlockTable,
     SegmentedInput,
     SequenceLengths,
 )
+from uniserve.nn.linear import VocabParallelEmbedding
 from uniserve.nn.moe import FusedMoE
-from uniserve.runtime.cuda_graph import CUDAGraphError
+from uniserve_worker._uniserve_ipc import SLOT_BUCKETS
+from uniserve_worker._uniserve_ipc import CanvasRunner as _CanvasRunner
 from uniserve_worker.storage.canvas_slots import (
     STEP_CONTINUED,
     STEP_SKIPPED,
-    denoiser_fields,
-    step_rows,
+    CanvasSlots,
 )
 
-from .cuda_graph import CUDAGraphRunner, GraphBucket
 from .graph_inputs import (
     _copy_offsets,
     _fixed_view,
-    capture_hidden,
-    replay_hidden,
 )
 from .input_batch import CanvasStepInput, InputBatch, ReadoutInput
 from .input_buffers import clear_padding, sampler_buffers
-from .model_runner import ModelRunner, joining_experts
 from .output import ExecutionOutput
 
-# Canvas rows a captured graph holds: every count up to four, then steps of
-# at most half the previous count, so padding stays under a third of a
-# call's rows. ``CanvasRunner.canvas_rows`` keeps the counts a call can
-# stage and adds that limit itself.
-CANVAS_ROW_BUCKETS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128)
 
-# Slot rows a readout tail graph holds. Each keeps its FP32 log-probabilities
-# over the vocabulary, one row per slot; a call reading more slots than the
-# largest bucket replays it in chunks, since slots complete independently.
-SLOT_BUCKETS = (64, 128, 256)
-
-
-class CanvasRunner(ModelRunner):
+class CanvasRunner(_CanvasRunner):
     """Run token-denoising passes, their slot readout, and canvas steps.
 
     Calls replay the graphs startup captures per row bucket (see the module
     description); without graph pools every call runs eagerly.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        mesh = self.model.backbone.mesh
-        self.pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
-        self.canvas_slots = None
-        self.sampler_workspace = None
-        self.step_rows = 0
-        # Rows of one page of every cache group the KV unit pool holds, set
-        # by ``ModelExecutor.bind``; None leaves canvases unbounded by it.
-        self.pool_rows: int | None = None
-        # Whether the readout tail computes on this rank alone. A tail that
-        # exchanges tokens (``tail_exchanges``) runs eagerly after the attend
-        # graph, once over every slot of the call, so each rank joins its
-        # expert exchange once per step at the step's agreed capacity; a
-        # rank-local tail replays graphs per slot bucket. Experts are
-        # partitioned at loading, before the runner is built.
-        self.local_tail = not tail_exchanges(
-            self.model, self.execution.context.experts
-        )
-        # All readout graphs on this runner execute serially. The largest
-        # capture owns their common per-token output, including EP variants.
-        self._readout_state: tuple[torch.Tensor, ...] | None = None
-
-    @property
-    def canvas_length(self) -> int:
-        """Tokens of one canvas the model declares."""
-        return self.model.canvas.length
-
-    @property
-    def max_canvases(self) -> int:
-        """The most canvases one call holds.
-
-        With graph pools a readout bucket holds up to twice its canvases
-        as sequences, so the input buffers hold twice the canvases (see
-        ``canvas_buffer_rows``). The scheduler reuses cached prompt pages
-        only up to a whole page before a prompt's last token, which the
-        request computes into a page of every cache group of its own, so no
-        call reads more canvases than the KV unit pool has ``pool_rows``.
-        """
-        buffers = self.input_buffers
-        rows = (
-            buffers.max_rows // 2 if self.execution.pools else buffers.max_rows
-        )
-        if self.pool_rows is not None:
-            rows = min(rows, self.pool_rows)
-        return min(rows, buffers.max_tokens // self.canvas_length)
-
-    @property
-    def canvas_rows(self) -> tuple[int, ...]:
-        """Row buckets of the canvas graphs, in increasing order.
-
-        A bucket holds at most ``max_canvases`` canvases, and a canvas
-        step's rows fit the bound canvas state; the largest bucket is that
-        limit.
-        """
-        limit = self.max_canvases
-        if self.canvas_slots is not None:
-            limit = min(
-                limit,
-                self.canvas_slots.request_pool_size,
-            )
-        return tuple(rows for rows in CANVAS_ROW_BUCKETS if rows < limit) + (
-            (limit,) if limit > 0 else ()
-        )
-
-    @property
-    def readout_lengths(self) -> tuple[int, ...]:
-        """Captured readout lengths, bounded by the model's canvas.
-
-        Readouts keep their local canvas length even when an expert peer
-        computes a full generating canvas. The exchange capacity selects
-        a separate graph variant without adding local canvas tokens.
-        """
-        length = self.canvas_length
-        buckets = []
-        value = 16
-        while value < length:
-            buckets.append(value)
-            value *= 2
-        return (*buckets, length)
-
-    def capture_plan(self):
-        return (
-            super().capture_plan(),
-            self.canvas_rows,
-            self.readout_lengths,
-            None if self.canvas_slots is None else self.canvas_slots.constants,
-        )
-
-    def close_graphs(self):
-        try:
-            super().close_graphs()
-        finally:
-            self._readout_state = None
-
-    def bind_canvas_slots(self, slots) -> None:
-        """Borrow the resident sampler state of generating canvases.
-
-        The runner's denoiser must generate canvases on this rank
-        (``storage.canvas_slots.generating_denoiser``).
-        """
-        self.canvas_slots = slots
-        self.input_buffers.bind_canvas_slots(slots)
-        # Banks persist by request; writable sampler scratch belongs to this
-        # runner so concurrent microbatches cannot overwrite one another.
-        self.step_rows = step_rows(
-            canvas_length=slots.canvas_length,
-            vocab_size=slots.vocab_size,
-            max_rows=min(self.max_canvases, slots.request_pool_size),
-        )
-        self.sampler_workspace = sampler.CanvasWorkspace.empty(
-            self.step_rows,
-            slots.canvas_length,
-            slots.vocab_size,
-            slots.hidden_size,
-            dtype=slots.banks["self_conditioning"].dtype,
-            device=self.device,
-        )
-
     @staticmethod
     def sampler_bytes(denoiser, *, max_rows, history_depth, device_type):
         """Per-execution canvas input and sampler workspace bytes."""
-        fields = denoiser_fields(denoiser)
-        length = fields.pop("tokens").length
-        vocab = fields.pop("vocab_size")
+        length = denoiser.canvas.length
+        vocab = denoiser.lm_head.vocab.size
+        embedding = denoiser.backbone.embedding
         buffers = sampler_buffers(
             max_rows=max_rows,
             canvas_length=length,
             history_depth=history_depth,
-            **fields,
+            hidden_size=embedding.embedding_dim,
+            dtype=embedding.weight.dtype,
         )
         return sum(
             config.nbytes for config in buffers.values()
         ) + sampler.CanvasWorkspace.nbytes(
-            step_rows(
+            CanvasSlots.step_rows(
                 canvas_length=length, vocab_size=vocab, max_rows=max_rows
             ),
             length,
             vocab,
-            fields["hidden_size"],
-            dtype=fields["dtype"],
+            embedding.embedding_dim,
+            dtype=embedding.weight.dtype,
             device_type=device_type,
         )
-
-    def close(self):
-        try:
-            super().close()
-        finally:
-            self.sampler_workspace = None
 
     def batch_forward(self, batch, *, padded=False):
         """Denoise the input canvases once and read or step them.
@@ -283,7 +146,9 @@ class CanvasRunner(ModelRunner):
             )
             # The softmax normalizes over the whole vocabulary, so tensor
             # shards gather their columns for the slot rows alone.
-            values = candidate_logprobs(logits.gather(), inputs.candidates)
+            values = candidate_logprobs(
+                cast(Logits, logits).gather(), inputs.candidates
+            )
         return self._broadcast_readout(values, state, inputs)
 
     def _broadcast_readout(self, values, state, inputs: ReadoutInput):
@@ -326,7 +191,9 @@ class CanvasRunner(ModelRunner):
         state = inputs.state
         rows, length = state.canvas.shape
         vocab = slots.vocab_size
-        embedding = self.model.backbone.embedding.weight
+        embedding = cast(
+            VocabParallelEmbedding, self.model.backbone.embedding
+        ).weight
         scale = self.model.backbone.embedding_scale
 
         # A queued step runs only while its block continues; step zero
@@ -352,7 +219,7 @@ class CanvasRunner(ModelRunner):
             count = stop - start
             positions = count * length
             # The full canvases of this run, FP32 [count * canvas, vocab].
-            logits = self.model.compute_logits(
+            projection = self.model.compute_logits(
                 hidden,
                 token_indices=torch.arange(
                     start * length,
@@ -360,7 +227,8 @@ class CanvasRunner(ModelRunner):
                     dtype=torch.int64,
                     device=hidden.device,
                 ),
-            ).gather()
+            )
+            logits = cast(Logits, projection).gather()
             decision = sampler.CanvasDecision.empty(
                 count, length, device=hidden.device
             )
@@ -436,7 +304,8 @@ class CanvasRunner(ModelRunner):
 
         from uniserve_kernels.diffusion import canvas as kernels
 
-        table = self.model.backbone.embedding.weight[: slots.vocab_size]
+        embedding = cast(VocabParallelEmbedding, self.model.backbone.embedding)
+        table = embedding.weight[: slots.vocab_size]
         for rows in range(1, self.step_rows + 1):
             positions = rows * slots.canvas_length
             chunk = _chunk_workspace(workspace, positions)
@@ -457,189 +326,6 @@ class CanvasRunner(ModelRunner):
                 )
         return records
 
-    def graph_tokens(self, key) -> int:
-        """The local bucket's canvas tokens, including row padding."""
-        length = key[2] if key[0] == "canvas" else self.canvas_length
-        return key[1] * length
-
-    def expert_tokens(self, batch) -> int:
-        """Largest sender in the canvas pass and its selected-slot tail.
-
-        Readout slots may select the same canvas position more than once,
-        so a tail's expert layer can send more rows than the canvas pass.
-        """
-        tokens = super().expert_tokens(batch)
-        if isinstance(batch.inputs, ReadoutInput) and not self.local_tail:
-            tokens = max(tokens, batch.inputs.slot_tokens.numel())
-        return tokens
-
-    def select_graph_shape(self, batch, *, eligible):
-        """Choose the canvas graph bucket of a call and pad the call to it.
-
-        Returns ``None`` for eager execution, without graph pools or for an
-        ineligible call. Otherwise returns ``(key, padded_batch, True)``: a
-        readout key is ``("canvas", rows, length)`` and its padded batch holds
-        the canvas pass's input alone; a step key is ``("canvas_step", rows,
-        sampling, first)``, where ``first`` is whether every row starts its
-        canvas; padding rows start one too. In an expert step of per-rank
-        ``capacity`` tokens, a separate graph variant exchanges at that
-        capacity while this local bucket keeps its own canvas shape.
-
-        Raises:
-            CUDAGraphError: The call holds more canvases than every bucket,
-                or a canvas longer than the model's.
-        """
-        if not eligible or not self.execution.pools:
-            return None
-        inputs = batch.inputs
-        length = self.canvas_length
-        maximum = max(inputs.attention.queries.host)
-        if not isinstance(inputs, CanvasStepInput):
-            length = next(
-                (value for value in self.readout_lengths if value >= maximum),
-                length,
-            )
-        buckets = self.canvas_rows
-        rows = next(
-            (value for value in buckets if value >= batch.row_count),
-            None,
-        )
-        if rows is None or maximum > length:
-            raise CUDAGraphError(
-                f"{self.name} has no canvas graph for a call of "
-                f"{batch.row_count} canvases of up to "
-                f"{max(inputs.attention.queries.host)} tokens; its canvas "
-                f"graphs hold up to {buckets[-1] if buckets else 0} canvases "
-                f"of {length} tokens"
-            )
-
-        widths = self.input_buffers.table_widths
-        if isinstance(inputs, CanvasStepInput):
-            padded = _pad_steps(batch, rows, length, widths, self.input_buffers)
-            key: tuple[object, ...] = (
-                "canvas_step",
-                rows,
-                padded.inputs.sampling[0],
-                padded.inputs.first,
-            )
-        else:
-            padded = _pad_readout(
-                batch, rows, length, widths, self.input_buffers
-            )
-            key = ("canvas", rows, length)
-        return key, padded, True
-
-    def _attend_state(self, batch):
-        """Copy a readout's per-token state into shared graph output backing.
-
-        The first, largest graph retains its own output allocations. Later
-        captures reuse those addresses, so neither local shapes nor transfer
-        variants retain another complete canvas state. Warmup before the first
-        capture returns temporary state without retaining it in the graph pool.
-        """
-        state = self.model.attend(batch.inputs)
-        backing = self._readout_state
-        if backing is None:
-            if torch.cuda.is_current_stream_capturing():
-                self._readout_state = state
-            return state
-        if len(state) != len(backing) or any(
-            value.shape[0] > target.shape[0]
-            or value.shape[1:] != target.shape[1:]
-            or value.dtype != target.dtype
-            or value.device != target.device
-            for value, target in zip(state, backing, strict=True)
-        ):
-            raise CUDAGraphError(
-                "readout graphs capture largest first; state exceeds "
-                "the shared output backing"
-            )
-        output = tuple(
-            target[: value.shape[0]]
-            for value, target in zip(state, backing, strict=True)
-        )
-        for value, target in zip(state, output, strict=True):
-            target.copy_(value)
-        return output
-
-    def capture_graph(self, key, execution, forward):
-        """Capture a readout bucket's pass, or a whole canvas step.
-
-        A readout graph's output is ``TokenDenoiser.attend``'s state of its
-        bucket's canvas tokens, which the graph retains.
-        """
-        if key[0] != "canvas":
-            return super().capture_graph(key, execution, forward)
-
-        def attend(batch):
-            exchange = self.execution.context.experts
-            if exchange is not None:
-                exchange.reset_layers()
-            return self._attend_state(batch)
-
-        graph = capture_hidden(
-            self.execution.context,
-            execution,
-            attend,
-            pools=self.execution.pools,
-            cache=self.cache,
-            # Expert-only peers execute a complete layer sequence during
-            # startup. Complete the eager warmup's tail, while the captured
-            # graph stops at attention for the live readout's selected slots.
-            warmup=lambda value: self.execution.warm_experts(
-                joining_experts(attend, self.execution.context), value
-            ),
-        )
-        # The tails read attend states of every readout bucket alike, so the
-        # first readout bucket captured supplies their state layout.
-        if (
-            self.pipeline.rank == self.pipeline.size - 1
-            and self.local_tail
-            and any(
-                ("canvas_tail", slots) not in self.execution.buckets
-                for slots in SLOT_BUCKETS
-            )
-        ):
-            try:
-                self._capture_tails(replay_hidden(graph, execution))
-            except BaseException:
-                graph.close()
-                raise
-        return graph
-
-    def _capture_tails(self, state: tuple[torch.Tensor, ...]) -> None:
-        """Capture the readout tail of every slot bucket.
-
-        ``state`` is a replayed attend state, whose per-token layout the
-        tails' fixed slot rows copy. Each tail is keyed ``("canvas_tail",
-        slots)`` among the runner's graph buckets.
-        """
-        for slots in SLOT_BUCKETS:
-            key = ("canvas_tail", slots)
-            if key in self.execution.buckets:
-                continue
-            # The fixed rows come from the ordinary allocator: the graph pool
-            # already backs the readout graphs, whose replays reuse its free
-            # blocks as intermediates, so a block allocated there now could
-            # be overwritten by a replay.
-            static = (
-                tuple(
-                    value.new_zeros((slots, *value.shape[1:]))
-                    for value in state
-                ),
-                torch.arange(slots, dtype=torch.int64, device=self.device),
-            )
-            self.execution.buckets[key] = GraphBucket(
-                {
-                    None: CUDAGraphRunner.capture(
-                        self.execution.context,
-                        static,
-                        self._tail,
-                        pools=self.execution.pools,
-                    )
-                }
-            )
-
     def _tail(self, inputs):
         """Full-vocabulary log-probabilities of a tail's fixed slot rows.
 
@@ -650,59 +336,27 @@ class CanvasRunner(ModelRunner):
         state, rows = inputs
         hidden = self.model.finish(state, rows)
         logits = self.model.compute_logits(hidden, token_indices=rows)
-        return torch.log_softmax(logits.gather().float(), dim=-1)
+        return torch.log_softmax(cast(Logits, logits).gather().float(), dim=-1)
 
-    def replay_graph(self, key, execution, batch, *, borrow):
-        """Replay a canvas graph; a readout then reads the live slots.
 
-        The readout's values are new tensors, so the result owns them
-        whether or not ``borrow`` is set.
-        """
-        if key[0] != "canvas":
-            return super().replay_graph(key, execution, batch, borrow=borrow)
-        state = replay_hidden(self.batch_graph(key), execution)
-        with self.execution.context.activate():
-            if self.local_tail:
-                return self._replay_tails(state, batch.inputs)
-            return self.readout(state, batch.inputs)
+def tail_inputs(state, slots, device):
+    """Allocate fixed slot rows outside other graphs' transient pools."""
+    return (
+        tuple(value.new_zeros((slots, *value.shape[1:])) for value in state),
+        torch.arange(slots, dtype=torch.int64, device=device),
+    )
 
-    def _replay_tails(self, state, inputs: ReadoutInput) -> ExecutionOutput:
-        """Read the slots of ``inputs`` through the readout tail graphs.
 
-        Each chunk of at most the largest bucket's slots gathers its rows of
-        ``state`` into the smallest tail that holds them, replays it and
-        gathers the chunk's candidates from its log-probabilities; the
-        values equal ``readout``'s for the same rows.
+def gather_tail(state, static, inputs, start, live):
+    """Gather this chunk's selected attend rows into the tail's fixed inputs."""
+    rows = inputs.slot_tokens[start : start + live]
+    for value, buffer in zip(state, static[0], strict=True):
+        torch.index_select(value, 0, rows, out=buffer[:live])
 
-        Raises:
-            CUDAGraphError: A tail graph is not resident.
-        """
-        if self.pipeline.rank != self.pipeline.size - 1:
-            return self._broadcast_readout(None, state, inputs)
 
-        total = int(inputs.slot_tokens.numel())
-        largest = SLOT_BUCKETS[-1]
-        parts = []
-        for start in range(0, total, largest):
-            live = min(largest, total - start)
-            slots = next(size for size in SLOT_BUCKETS if size >= live)
-            bucket = self.execution.buckets.get(("canvas_tail", slots))
-            if bucket is None:
-                raise CUDAGraphError(
-                    f"{self.name} has no readout tail graph of {slots} slots"
-                )
-            tail = bucket[None]
-            rows = inputs.slot_tokens[start : start + live]
-            for value, buffer in zip(state, tail.inputs.value[0], strict=True):
-                torch.index_select(value, 0, rows, out=buffer[:live])
-            normalized = tail.replay()
-            parts.append(
-                normalized[:live].gather(
-                    -1, inputs.candidates[start : start + live]
-                )
-            )
-        values = parts[0] if len(parts) == 1 else torch.cat(parts)
-        return self._broadcast_readout(values, state, inputs)
+def tail_candidates(normalized, inputs, start, live):
+    """Read candidate log probabilities from a replayed tail chunk."""
+    return normalized[:live].gather(-1, inputs.candidates[start : start + live])
 
 
 def tail_exchanges(model, exchange) -> bool:
@@ -816,16 +470,6 @@ def _pad_rows(tensor: torch.Tensor, rows: int, live: int) -> torch.Tensor:
     return padded
 
 
-def canvas_buffer_rows(max_rows: int) -> int:
-    """Input buffer rows required for at most ``max_rows`` canvases.
-
-    A readout graph of ``rows`` canvases holds up to ``2 * rows``
-    sequences (``CanvasRunner.select_graph_shape``); the extra rows consume
-    buffers, but no scheduler request slot.
-    """
-    return 2 * max_rows
-
-
 def _pad_readout(
     batch: InputBatch,
     rows: int,
@@ -902,8 +546,7 @@ def _pad_steps(
         history=views["history"],
         self_conditioning=self_conditioning,
     )
-    return replace(
-        batch,
+    return batch.replace(
         inputs=CanvasStepInput(
             CanvasInput(
                 views["canvas"].view(-1),

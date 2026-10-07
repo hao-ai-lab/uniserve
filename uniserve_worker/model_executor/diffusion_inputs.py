@@ -17,7 +17,7 @@ from uniserve.diffusion import Branch, normal_noise
 from uniserve.media import image
 from uniserve.model import ImageDenoiser, LatentInput
 from uniserve.processing import BranchSource
-from uniserve_worker.model_executor.input_batch import AttentionRow
+from uniserve_worker._uniserve_ipc import DiffusionRow as DiffusionRow
 
 
 class ImageBuilder:
@@ -150,18 +150,3 @@ class DecodeInput:
 
     latents: tuple[torch.Tensor, ...]
     sizes: tuple[image.Config, ...]
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class DiffusionRow(AttentionRow):
-    """Latent sample, solver time and spatial extent of an image sequence."""
-
-    timestep: torch.Tensor
-    latent: torch.Tensor
-    image_tokens: int
-    image_height: int
-    image_width: int
-
-    @property
-    def query_tokens(self) -> int:
-        return self.image_tokens

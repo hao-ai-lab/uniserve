@@ -8,61 +8,35 @@ from uniserve.runtime.device import async_tensor_h2d
 from uniserve.sampling import SamplingParams
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.model_executor.input_batch import TokenRow
-from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.sampling import sampler as sampling
-from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.sampling.result import LogprobValues, SamplerRow
 
 
-def token_row(
-    mode: ForwardMode,
+def token_values(
     tokens: tuple[int, ...],
     position: int,
-    slot: int,
-    visible: int,
-    selection: TokenSelection,
     *,
     current: torch.Tensor | None = None,
-    indexed: bool = False,
-    predicate: tuple[torch.Tensor, bool] | None = None,
-    force_finish: bool = False,
-) -> TokenRow:
-    """Build numerical views from executor-selected tokens and coordinates.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build token and position views from executor-selected coordinates.
 
     A device continuation stays on device, including when concatenated with
-    verification drafts. Indexed decode borrows its inputs from DecodeState
-    during batch packing and requires no per-row token or position tensor.
+    verification drafts. Positions are host inputs for batch preparation.
     """
-    token_values = position_values = None
-    if not indexed:
-        if current is None:
-            token_values = torch.tensor(tokens, dtype=torch.long)
-        elif tokens:
-            drafts = async_tensor_h2d(
-                tokens, dtype=torch.long, device=current.device
-            )
-            token_values = torch.cat((current.reshape(1), drafts))
-        else:
-            token_values = current.reshape(1)
-
-        position_values = torch.arange(
-            position, position + token_values.numel(), dtype=torch.long
+    if current is None:
+        values = torch.tensor(tokens, dtype=torch.long, device="cpu")
+    elif tokens:
+        drafts = async_tensor_h2d(
+            tokens, dtype=torch.long, device=current.device
         )
+        values = torch.cat((current.reshape(1), drafts))
+    else:
+        values = current.reshape(1)
 
-    return TokenRow(
-        forward_mode=mode,
-        token_ids=token_values,
-        positions=position_values,
-        selection=selection,
-        request_pool_idx=slot,
-        seq_len=visible,
-        write_kv=True,
-        causal=True,
-        request_indexed_decode=indexed,
-        decode_predicate=None if predicate is None else predicate[0],
-        decode_predicate_tagged=False if predicate is None else predicate[1],
-        decode_force_finish=force_finish,
+    positions = torch.arange(
+        position, position + values.numel(), dtype=torch.long, device="cpu"
     )
+    return values, positions
 
 
 def next_position(row: TokenRow) -> int:

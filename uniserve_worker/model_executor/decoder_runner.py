@@ -1,6 +1,8 @@
 """Decoder numerical calls and public output layouts."""
 
-from uniserve.model import AudioDecoder, VideoPostprocessor
+from typing import cast
+
+from uniserve.model import AudioDecoder, ImageDecoder, VideoPostprocessor
 from uniserve.tensors import OutputLayout
 
 from .model_runner import ModelRunner
@@ -24,9 +26,8 @@ class DecoderRunner(ModelRunner):
         return {}
 
     def batch_forward(self, batch, *, padded=False):
-        values = self.model.decode(
-            batch.inputs.latents, sizes=batch.inputs.sizes
-        )
+        decoder = cast(ImageDecoder, self.model)
+        values = decoder.decode(batch.inputs.latents, sizes=batch.inputs.sizes)
         return ExecutionOutput(
             values,
             layouts=tuple(
@@ -34,7 +35,7 @@ class DecoderRunner(ModelRunner):
                     tuple(value.shape),
                     value.dtype,
                     tuple(slice(0, extent) for extent in value.shape),
-                    value_range=self.model.decoder.value_range,
+                    value_range=decoder.decoder.value_range,
                 )
                 for value in values
             ),

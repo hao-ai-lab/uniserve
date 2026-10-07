@@ -4,9 +4,6 @@ mod attention;
 mod canvas;
 mod prepare;
 
-use std::cell::Cell;
-
-use pyo3::buffer::{Element, PyBuffer};
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -14,7 +11,7 @@ use pyo3::types::{PyDict, PySlice, PyTuple};
 use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
 use super::execution::close_all;
-use super::host_buffers::HostBuffers;
+use super::host_buffers::{HostBuffers, fill, with_host};
 use super::tensor_buffers::{TensorBuffers, mapping};
 
 pub(super) const ROW_SECTIONS: usize = 6;
@@ -29,17 +26,16 @@ pub(crate) struct InputBuffers {
     #[pyo3(get)]
     device: Py<PyAny>,
     #[pyo3(get)]
-    max_rows: usize,
+    pub(super) max_rows: usize,
     #[pyo3(get)]
-    max_tokens: usize,
+    pub(super) max_tokens: usize,
     #[pyo3(get)]
     max_text_tokens: usize,
     #[pyo3(get)]
     hidden_size: usize,
-    table_widths: Vec<usize>,
+    pub(super) table_widths: Vec<usize>,
     #[pyo3(get)]
     image_builder: Py<PyAny>,
-    row_types: Py<PyAny>,
     backing: Py<TensorBuffers>,
     columns: Py<PyDict>,
     requests: Py<HostBuffers>,
@@ -47,7 +43,7 @@ pub(crate) struct InputBuffers {
     finish: Option<Py<HostBuffers>>,
     steps: Option<Py<HostBuffers>>,
     #[pyo3(get)]
-    canvas_slots: Py<PyAny>,
+    canvas_slots: Option<Py<super::canvas_slots::CanvasSlots>>,
     canvas_backing: Option<Py<TensorBuffers>>,
     #[pyo3(get)]
     candidate_storage: Py<PyAny>,
@@ -70,32 +66,20 @@ impl InputBuffers {
         let token = matches!(kind, CallKind::Forward(mode) if mode != ForwardMode::TokenDenoising);
         let canvas = kind == CallKind::Forward(ForwardMode::TokenDenoising);
         let attention = token || canvas || kind == CallKind::Media(MediaCall::Denoising);
-        let model_inputs = py.import("uniserve_worker.model_executor.input_batch")?;
-        let row_types = match kind {
-            CallKind::Forward(ForwardMode::TokenDenoising) => PyTuple::new(
-                py,
-                [
-                    model_inputs.getattr("CanvasRow")?,
-                    model_inputs.getattr("CanvasStepRow")?,
-                ],
-            )?
-            .into_any(),
-            CallKind::Forward(_) => model_inputs.getattr("TokenRow")?,
-            CallKind::Media(MediaCall::Denoising) => py
-                .import("uniserve_worker.model_executor.diffusion_inputs")?
-                .getattr("DiffusionRow")?,
-            CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => py
-                .import("uniserve_worker.model_executor.image_inputs")?
-                .getattr("VisionRow")?,
-            CallKind::Media(MediaCall::ImageDecoding) => py
-                .import("uniserve_worker.model_executor.image_inputs")?
-                .getattr("DecodeRow")?,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "computation has no fixed input buffers",
-                ));
-            }
-        };
+        if !matches!(
+            kind,
+            CallKind::Forward(_)
+                | CallKind::Media(
+                    MediaCall::Denoising
+                        | MediaCall::VisionEncoding
+                        | MediaCall::LatentEncoding
+                        | MediaCall::ImageDecoding
+                )
+        ) {
+            return Err(PyValueError::new_err(
+                "computation has no fixed input buffers",
+            ));
+        }
         let cfg = config.bind(py);
         let max_rows = cfg.getattr("max_rows")?.extract()?;
         let max_tokens = if attention {
@@ -178,14 +162,13 @@ impl InputBuffers {
             hidden_size,
             table_widths,
             image_builder: image_builder.unwrap_or_else(|| py.None()),
-            row_types: row_types.unbind(),
             backing: Py::new(py, backing)?,
             columns: columns.unbind(),
             requests,
             rows,
             finish,
             steps,
-            canvas_slots: py.None(),
+            canvas_slots: None,
             canvas_backing: None,
             candidate_storage,
             closed: false,
@@ -224,15 +207,26 @@ impl InputBuffers {
         tables: Option<&Bound<'_, PyAny>>,
         states: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        Self::prepare(slf, rows, forward_mode, attention, cache, tables, states)
+        Self::prepare(
+            slf,
+            rows,
+            pythonize::depythonize(forward_mode)?,
+            attention,
+            cache,
+            tables,
+            states,
+        )
     }
 
     /// Bind resident canvas state and allocate this lane's gathered input views.
-    fn bind_canvas_slots(slf: &Bound<'_, Self>, slots: Py<PyAny>) -> PyResult<()> {
+    fn bind_canvas_slots(
+        slf: &Bound<'_, Self>,
+        slots: Py<super::canvas_slots::CanvasSlots>,
+    ) -> PyResult<()> {
         Self::bind_canvas(slf, slots)
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if self.closed {
             return Ok(());
         }
@@ -248,7 +242,7 @@ impl InputBuffers {
         }
         self.columns.bind(py).clear();
         self.candidate_storage = py.None();
-        self.canvas_slots = py.None();
+        self.canvas_slots = None;
         self.image_builder = py.None();
         self.closed = true;
         Ok(())
@@ -259,12 +253,11 @@ impl InputBuffers {
             &self.config,
             &self.device,
             &self.image_builder,
-            &self.row_types,
-            &self.canvas_slots,
             &self.candidate_storage,
         ] {
             visit.call(value)?;
         }
+        visit.call(&self.canvas_slots)?;
         visit.call(&self.backing)?;
         visit.call(&self.columns)?;
         visit.call(&self.requests)?;
@@ -295,32 +288,6 @@ fn numerical(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
 
 fn prefix<'py>(value: &Bound<'py, PyAny>, count: usize) -> PyResult<Bound<'py, PyAny>> {
     value.get_item(PySlice::new(value.py(), 0, count as isize, 1))
-}
-
-/// The ring has retired its previous DMA reader before these CPU writes.
-/// Buffer exports keep the allocation alive and check the element representation.
-fn with_host<T: Element>(
-    tensor: &Bound<'_, PyAny>,
-    count: usize,
-    write: impl FnOnce(&[Cell<T>]) -> PyResult<()>,
-) -> PyResult<()> {
-    let py = tensor.py();
-    let array = tensor.call_method0("numpy")?;
-    let buffer = PyBuffer::<T>::get(&array)?;
-    let destination = buffer
-        .as_mut_slice(py)
-        .and_then(|slice| slice.get(..count))
-        .ok_or_else(|| PyValueError::new_err("host input column exceeds contiguous backing"))?;
-    write(destination)
-}
-
-fn fill<T: Element + Copy>(tensor: &Bound<'_, PyAny>, values: &[T]) -> PyResult<()> {
-    with_host(tensor, values.len(), |destination| {
-        for (cell, value) in destination.iter().zip(values) {
-            cell.set(*value);
-        }
-        Ok(())
-    })
 }
 
 fn copy(destination: &Bound<'_, PyAny>, source: &Bound<'_, PyAny>) -> PyResult<()> {

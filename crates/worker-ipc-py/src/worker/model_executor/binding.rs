@@ -222,9 +222,7 @@ pub(super) fn configure(
                 && capture
                 && kinds.contains(&CallKind::Forward(ForwardMode::TokenDenoising))
             {
-                canvas
-                    .call_method1("canvas_buffer_rows", (input_rows,))?
-                    .extract()?
+                crate::worker::model_runner::CanvasRunner::input_rows(input_rows)
             } else {
                 input_rows
             };

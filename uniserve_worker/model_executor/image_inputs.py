@@ -37,8 +37,9 @@ from uniserve.processing import (
     StrideResize,
     TowerTransform,
 )
+from uniserve_worker._uniserve_ipc import DecodeRow as DecodeRow
+from uniserve_worker._uniserve_ipc import VisionRow as VisionRow
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.model_executor.input_batch import InputRow
 from uniserve_worker.protocol.call import MediaCall
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -530,21 +531,3 @@ __all__ = [
     "prepare_image",
     "prepare_tensor_image",
 ]
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class VisionRow(InputRow):
-    """Prepared pixels and optional patch-grid coordinates."""
-
-    encode_pixels: torch.Tensor
-    encode_grid: torch.Tensor | None = None
-    encode_grid_shape: tuple[int, int] | None = None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class DecodeRow(InputRow):
-    """Latent sample and the image dimensions requested from its decoder."""
-
-    latent: torch.Tensor
-    image_height: int
-    image_width: int

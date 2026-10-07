@@ -1,9 +1,7 @@
 //! Prepared numerical resources and graph retirement.
 
-mod denoising;
 mod images;
 mod joins;
-pub(super) use denoising::DenoisingBuffers;
 pub(super) use joins::JoinGraphs;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,7 +20,7 @@ use super::microbatches::Microbatches;
 /// Independent numerical calls use None. Every variant retains its backing.
 #[pyclass(module = "uniserve_worker._uniserve_ipc")]
 pub(crate) struct GraphBucket {
-    graphs: BTreeMap<Option<usize>, Py<PyAny>>,
+    pub(super) graphs: BTreeMap<Option<usize>, Py<PyAny>>,
     pub(super) layers: BTreeSet<usize>,
 }
 
@@ -30,7 +28,7 @@ pub(crate) struct GraphBucket {
 impl GraphBucket {
     #[new]
     #[pyo3(signature = (graphs=None))]
-    fn new(graphs: Option<BTreeMap<Option<usize>, Py<PyAny>>>) -> Self {
+    pub(super) fn new(graphs: Option<BTreeMap<Option<usize>, Py<PyAny>>>) -> Self {
         Self {
             graphs: graphs.unwrap_or_default(),
             layers: BTreeSet::new(),
@@ -51,7 +49,7 @@ impl GraphBucket {
     }
 
     #[pyo3(signature = (capacity=None))]
-    fn get(&self, py: Python<'_>, capacity: Option<usize>) -> Option<Py<PyAny>> {
+    pub(super) fn get(&self, py: Python<'_>, capacity: Option<usize>) -> Option<Py<PyAny>> {
         self.graphs.get(&capacity).map(|graph| graph.clone_ref(py))
     }
 
@@ -111,7 +109,6 @@ pub(crate) struct Execution {
     pub(super) expert_order: Option<i64>,
     pub(super) joins: Option<Py<JoinGraphs>>,
     pub(super) microbatch_joins: Option<Py<JoinGraphs>>,
-    denoising: Option<denoising::Denoising>,
     pub(super) image_capacity: usize,
     closed: bool,
 }
@@ -120,7 +117,7 @@ pub(crate) struct Execution {
 impl Execution {
     #[new]
     #[pyo3(signature = (name, context, *, devices, storage=None, share=None))]
-    fn new(
+    pub(super) fn new(
         py: Python<'_>,
         name: String,
         context: Py<PyAny>,
@@ -146,7 +143,6 @@ impl Execution {
                 expert_order: None,
                 joins: None,
                 microbatch_joins: None,
-                denoising: None,
                 image_capacity: 0,
                 closed: false,
             },
@@ -167,67 +163,6 @@ impl Execution {
         inputs: &Bound<'_, PyAny>,
     ) -> PyResult<Py<super::model_results::ExecutionOutput>> {
         images::encode(slf, runner, inputs)
-    }
-
-    fn configure_denoising(&mut self, py: Python<'_>, maximum: Py<PyAny>) {
-        self.denoising = Some(denoising::Denoising::new(py, maximum));
-    }
-
-    pub(super) fn prepare_denoising<'py>(
-        slf: &Bound<'py, Self>,
-        runner: &Bound<'py, PyAny>,
-        layout: &Bound<'py, PyAny>,
-        pages: usize,
-    ) -> PyResult<Bound<'py, DenoisingBuffers>> {
-        denoising::prepare(slf, runner, layout, pages)
-    }
-
-    pub(super) fn denoising_layout<'py>(
-        slf: &Bound<'py, Self>,
-        layout: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, DenoisingBuffers>> {
-        denoising::layout(slf, layout)
-    }
-
-    pub(super) fn retire_denoising(
-        slf: &Bound<'_, Self>,
-        layout: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        denoising::retire(slf, layout)
-    }
-
-    pub(super) fn binds_denoising(
-        slf: &Bound<'_, Self>,
-        runner: &Bound<'_, PyAny>,
-        ladder: &Bound<'_, PyAny>,
-    ) -> PyResult<bool> {
-        denoising::binds(slf, runner, ladder)
-    }
-
-    pub(super) fn warm_denoising(
-        slf: &Bound<'_, Self>,
-        runner: &Bound<'_, PyAny>,
-        ladder: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        denoising::warm(slf, runner, ladder)
-    }
-
-    pub(super) fn capture_denoising(
-        slf: &Bound<'_, Self>,
-        runner: &Bound<'_, PyAny>,
-        ladder: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        denoising::capture(slf, runner, ladder)
-    }
-
-    pub(super) fn step_denoising(
-        slf: &Bound<'_, Self>,
-        runner: &Bound<'_, PyAny>,
-        ladder: &Bound<'_, PyAny>,
-        index: usize,
-        bank: i64,
-    ) -> PyResult<(Py<PyAny>, &'static str)> {
-        denoising::step(slf, runner, ladder, index, bank)
     }
 
     fn seal(&mut self) {
@@ -343,7 +278,7 @@ impl Execution {
         )
     }
 
-    fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
+    pub(super) fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let (context, storage, rotation, first) = {
             let mut owner = slf.borrow_mut();
@@ -364,13 +299,11 @@ impl Execution {
             None => Ok(()),
         };
         let context = context.call_method0(py, "close").map(drop);
-        let denoising = slf.borrow_mut().denoising.take();
-        let buffers = denoising.map_or(Ok(()), |value| value.close(py));
         let storage = storage.map_or(Ok(()), |storage| {
             storage.bind(py).call_method1("release", (slf,)).map(drop)
         });
         slf.borrow().pools.bind(py).clear();
-        close_all(py, [graphs, rotated, context, buffers, storage])
+        close_all(py, [graphs, rotated, context, storage])
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
@@ -381,9 +314,6 @@ impl Execution {
         visit.call(&self.microbatches)?;
         visit.call(&self.joins)?;
         visit.call(&self.microbatch_joins)?;
-        if let Some(denoising) = &self.denoising {
-            denoising.traverse(&visit)?;
-        }
         Ok(())
     }
 
@@ -395,7 +325,6 @@ impl Execution {
         self.microbatches = None;
         self.joins = None;
         self.microbatch_joins = None;
-        self.denoising = None;
         self.image_capacity = 0;
     }
 }
@@ -409,16 +338,6 @@ impl Execution {
         dtype: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         images::capture(slf, runner, max_images, dtype)
-    }
-
-    pub(super) fn has_denoising_layout(
-        &self,
-        py: Python<'_>,
-        layout: &Bound<'_, PyAny>,
-    ) -> PyResult<bool> {
-        self.denoising
-            .as_ref()
-            .map_or(Ok(false), |value| value.contains(py, layout))
     }
 
     fn contexts<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyAny>> {

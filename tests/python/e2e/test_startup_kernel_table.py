@@ -1,7 +1,7 @@
 """A served model's startup kernel table names the kernel of every call.
 
 ``uniserve serve`` logs one ``uniserve-kernel-table`` line when startup
-completes (see ``uniserve_worker.execution.kernel_table``). Startup runs
+completes. Startup runs
 every call kind, image encoders and decoders included, so for an
 image-understanding model the table already names the kernels that serve
 image inputs: here BAGEL's SigLIP vision tower, its autoencoder's encoder

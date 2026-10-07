@@ -667,8 +667,7 @@ def _indexed(buffers, rows, pages, tables, states, widths):
 def _resident_rows(rows, states):
     """Borrow current device continuations without a host readback."""
     return tuple(
-        replace(
-            row,
+        row.replace(
             token_ids=states.future_input_tokens[row.request_pool_idx, :1],
             positions=states.logical_lengths[
                 row.request_pool_idx : row.request_pool_idx + 1

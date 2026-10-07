@@ -18,7 +18,6 @@ numerical callers using the same native page selection.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -33,33 +32,6 @@ from uniserve.nn.attention import (
 )
 from uniserve_worker._uniserve_ipc import TablePages as TablePages
 from uniserve_worker._uniserve_ipc import table_pages as table_pages
-from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.model_executor.input_batch import AttentionRow
-
-if TYPE_CHECKING:
-    from uniserve_worker.storage.kv_cache import KVCacheManager
-
-
-def prepare_attention(
-    tasks: tuple[AttentionRow, ...],
-    *,
-    cache: KVCacheManager | None,
-) -> tuple[TablePages, ...]:
-    """Borrow selected KV pages after native capacity and write checks.
-
-    A writing row extends its prefix by the query length. A read-only row
-    consumes only its existing prefix. Windowed reads must remain within
-    installed pages; writes must not overlap a transfer's retained range.
-    """
-    if cache is None:
-        raise invalid_descriptor("paged attention requires resident KV storage")
-
-    return cache.prepare_attention(
-        tuple(
-            (row.request_pool_idx, row.seq_len, row.query_tokens, row.write_kv)
-            for row in tasks
-        )
-    )
 
 
 def from_tables(

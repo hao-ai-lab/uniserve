@@ -3,11 +3,14 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use uniserve_worker::TokenSelection;
+use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
-use super::token::{next_position, scores_prompt, token_options};
+use super::token::{next_position, scores_prompt};
 use super::{BatchState, ForwardRow, ForwardValue, PythonBackend, SampleCandidate};
 use crate::sampling::SamplingParams;
 use crate::worker::error::{invalid, unsupported};
+use crate::worker::model_inputs::{AttentionRow, DiffusionRow, InputRow, Row, TokenRow};
 use crate::worker::pending::PendingOutput;
 use crate::worker::sampling::SamplingMetadata;
 
@@ -25,7 +28,6 @@ impl PythonBackend {
         let mut position = output.lock(py)?.progress.logical_position;
         let mut visible = self.visible_length(py, &output)?;
         let slot = output.request.borrow(py).request.slot();
-        let token = py.import("uniserve_worker.execution.token")?;
         let mut rows = Vec::new();
         let mut begin = 0;
 
@@ -49,25 +51,35 @@ impl PythonBackend {
 
             if end > begin {
                 let selection = if scores {
-                    "ALL_LOGITS"
+                    TokenSelection::AllLogits
                 } else if block.is_none() && call.token_output.is_some() {
-                    "LAST_LOGITS"
+                    TokenSelection::LastLogits
                 } else {
-                    "CACHE"
+                    TokenSelection::Cache
                 };
-                let options = token_options(
+                let row = TokenRow {
+                    selection: Some(selection),
+                    ..TokenRow::default()
+                }
+                .with_tokens(
                     py,
-                    call.code,
+                    InputRow {
+                        kind: call.code,
+                        request_pool_idx: slot as u32,
+                    },
+                    AttentionRow {
+                        positions: None,
+                        seq_len: visible as i64,
+                        write_kv: true,
+                        causal: Some(true),
+                    },
                     &call.input_token_ids[begin..end],
                     position,
-                    slot,
-                    visible,
-                    selection,
+                    None,
                 )?;
-                let row = token.call_method("token_row", (), Some(&options))?;
                 position += (end - begin) as u64;
                 visible += (end - begin) as u64;
-                rows.push(ForwardRow::new(index, row.unbind()));
+                rows.push(ForwardRow::new(index, row.into_any()));
             }
 
             if block.is_some() {
@@ -89,7 +101,7 @@ impl PythonBackend {
                     scores || (last && call.token_output.is_some()),
                 )?;
                 position = next_position(py, row.bind(py))?;
-                visible += row.bind(py).getattr("query_tokens")?.extract::<u64>()?;
+                visible += Row::borrow(row.bind(py))?.query_tokens(py)? as u64;
                 rows.push(ForwardRow::new(index, row));
             }
 
@@ -102,12 +114,8 @@ impl PythonBackend {
         let mut count = 0;
         let mut aligned = descriptors.len() == rows.len();
         for (&descriptor, row) in descriptors.iter().zip(&rows) {
-            let query = row
-                .task
-                .bind(py)
-                .getattr("query_tokens")?
-                .extract::<u64>()?;
-            let prefix = row.task.bind(py).getattr("seq_len")?.extract::<u64>()?;
+            let query = Row::borrow(row.task.bind(py))?.query_tokens(py)? as u64;
+            let prefix = row.task.bind(py).cast::<AttentionRow>()?.borrow().seq_len as u64;
             count += query;
             aligned &= inputs.request_pool_indices[descriptor] as usize == slot
                 && u64::from(inputs.query_lens[descriptor]) == query
@@ -158,9 +166,7 @@ impl PythonBackend {
             true,
             plan.token_output.is_some(),
         )?;
-        if row.bind(py).getattr("query_tokens")?.extract::<u64>()?
-            > u64::from(plan.bounds.max_tokens)
-        {
+        if Row::borrow(row.bind(py))?.query_tokens(py)? as u64 > u64::from(plan.bounds.max_tokens) {
             return Err(invalid(
                 py,
                 "image state query span exceeds the call token bound",
@@ -215,9 +221,6 @@ impl PythonBackend {
 
         let request = output.request.borrow(py);
         let options = PyDict::new(py);
-        options.set_item("slot", request.request.slot())?;
-        options.set_item("seq_len", visible)?;
-        options.set_item("model_runner", model)?;
         let vision = batch.plan.calls[index].latent_feature_input.is_none();
         if vision {
             let tables = self
@@ -240,25 +243,73 @@ impl PythonBackend {
             }
             options.set_item("input_images", (!close_image).then_some(images))?;
             options.set_item("close_image", close_image)?;
-            options.set_item("logits", logits)?;
+            let processor = model.call_method0("image_processor")?;
+            let injection = processor.getattr("feature_injection")?;
+            if injection.is_none() {
+                return Err(invalid(
+                    py,
+                    "vision state preparation requires declared feature injection",
+                ));
+            }
+            options.set_item("injection", injection)?;
+            options.set_item("transform", processor.getattr("vit")?)?;
         }
 
-        py.import("uniserve_worker.execution.image")?
-            .call_method(
-                if vision {
-                    "vision_state_row"
-                } else {
-                    "latent_state_row"
-                },
-                (
-                    &read.tensor,
-                    metadata.getattr("height")?,
-                    metadata.getattr("width")?,
-                    position,
-                ),
-                Some(&options),
-            )
-            .map(Bound::unbind)
+        let height = metadata.getattr("height")?.extract()?;
+        let width = metadata.getattr("width")?.extract()?;
+        let mut input = InputRow {
+            kind: CallKind::Forward(ForwardMode::Prefill),
+            request_pool_idx: request.request.slot() as u32,
+        };
+        let mut attention = AttentionRow {
+            positions: None,
+            seq_len: visible as i64,
+            write_kv: true,
+            causal: Some(false),
+        };
+        let numerical = py.import("uniserve_worker.execution.image")?;
+        if vision {
+            let (tokens, embeddings, mask, positions) = numerical
+                .call_method(
+                    "vision_values",
+                    (&read.tensor, height, width, position),
+                    Some(&options),
+                )?
+                .extract::<(Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>)>()?;
+            attention.positions = Some(positions);
+            let selection = if logits {
+                TokenSelection::LastLogits
+            } else {
+                TokenSelection::Cache
+            };
+            let row = TokenRow {
+                token_ids: Some(tokens),
+                token_embeddings: Some(embeddings),
+                token_embedding_mask: Some(mask),
+                selection: Some(selection),
+                ..TokenRow::default()
+            };
+            Ok(Py::new(py, attention.initializer(input).add_subclass(row))?.into_any())
+        } else {
+            options.set_item("builder", &model.borrow().image_builder)?;
+            let (positions, timestep, query) = numerical
+                .call_method(
+                    "latent_values",
+                    (&read.tensor, height, width, position),
+                    Some(&options),
+                )?
+                .extract::<(Py<PyAny>, Py<PyAny>, usize)>()?;
+            input.kind = CallKind::Media(MediaCall::Denoising);
+            attention.positions = Some(positions);
+            let row = DiffusionRow {
+                latent: read.tensor.clone_ref(py),
+                timestep,
+                image_tokens: query,
+                image_height: height,
+                image_width: width,
+            };
+            Ok(Py::new(py, attention.initializer(input).add_subclass(row))?.into_any())
+        }
     }
 
     pub(super) fn score_prompt(
@@ -292,8 +343,9 @@ impl PythonBackend {
                 None => {
                     let slot = output.request.borrow(py).request.slot();
                     state
+                        .borrow(py)
+                        .prompt_logits(py)?
                         .bind(py)
-                        .getattr("prompt_logits")?
                         .get_item(slot)?
                         .unbind()
                 }
@@ -349,17 +401,26 @@ impl PythonBackend {
         let pending = batch.pending(py, index);
         let mut output = pending.borrow_mut(py);
         let task = last.task.bind(py);
-        let query = task.getattr("query_tokens")?.extract()?;
+        let query = Row::borrow(task)?.query_tokens(py)? as u64;
         self.record_token_kv(py, &mut output, task, query, true)?;
 
         let samples = call.token_output.is_some();
-        let causal: bool = task.getattr("causal")?.extract()?;
+        let causal: bool = task
+            .cast::<AttentionRow>()?
+            .borrow()
+            .causal
+            .unwrap_or(false);
         if scores_prompt(py, &output)? {
             let scored = if samples && causal { preceding } else { rows };
             for (row, value) in scored {
                 let task = row.task.bind(py);
                 let logits = value.value.bind(py);
-                if task.getattr("causal")?.extract::<bool>()? {
+                if task
+                    .cast::<AttentionRow>()?
+                    .borrow()
+                    .causal
+                    .unwrap_or(false)
+                {
                     let start = task.getattr("positions")?.get_item(0)?.extract()?;
                     self.score_prompt(py, batch, &mut output, start, task, logits)?;
                 } else {
@@ -375,7 +436,7 @@ impl PythonBackend {
         let position = next_position(py, task)?;
         if !samples {
             self.visible_length(py, &output)?;
-            let fallback = task.getattr("seq_len")?.extract::<u64>()? + query;
+            let fallback = task.cast::<AttentionRow>()?.borrow().seq_len as u64 + query;
             let length = self.token_length(py, &output, fallback)?;
             output
                 .lock(py)?
@@ -386,10 +447,10 @@ impl PythonBackend {
             let start = task.getattr("positions")?.get_item(0)?.extract()?;
             output.lock(py)?.advance_tokens(0, None, Some(start), false);
         }
-        let state = self
-            .decode_state
-            .as_ref()
-            .map_or_else(|| py.None().into_bound(py), |state| state.bind(py).clone());
+        let state = self.decode_state.as_ref().map_or_else(
+            || py.None().into_bound(py),
+            |state| state.bind(py).as_any().clone(),
+        );
         let metadata = SamplingMetadata::for_call(
             py,
             &batch.call(py, index)?.borrow(),

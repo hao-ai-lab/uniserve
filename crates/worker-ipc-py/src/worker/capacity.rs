@@ -120,9 +120,9 @@ fn value_error(error: uniserve_worker::Error) -> PyErr {
 
 fn capability<'py>(model: &Bound<'py, PyAny>, name: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = model.py();
-    py.import("uniserve_worker.bootstrap.inputs")?.call_method1(
-        "capability",
-        (model, py.import("uniserve.model")?.getattr(name)?),
+    super::model_executor::discovery::inputs::capability(
+        model,
+        &py.import("uniserve.model")?.getattr(name)?,
     )
 }
 

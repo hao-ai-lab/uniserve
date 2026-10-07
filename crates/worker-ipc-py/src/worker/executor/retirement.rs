@@ -267,9 +267,8 @@ impl PythonBackend {
         if slots.is_empty() {
             return Ok(());
         }
-        let slots = PyTuple::new(py, slots)?;
         if let Some(state) = &self.decode_state {
-            state.bind(py).call_method1("reset", (&slots,))?;
+            state.borrow(py).reset_slots(py, slots)?;
         }
         Ok(())
     }

@@ -86,22 +86,21 @@ pub(in crate::worker) fn build_worker_layout(
         .try_iter()?
         .map(|item| item?.get_item(0)?.extract())
         .collect::<PyResult<_>>()?;
-    let declarations = py.import("uniserve_worker.bootstrap.components")?;
     let dedicated = config_native.role == "experts";
     let supported: Vec<CallKind> = if dedicated {
         Vec::new()
     } else {
-        let supported = declarations.call_method1("supported_calls", (model, &held))?;
+        let supported = crate::worker::component_binding::calls::supported(model, &held)?;
         CallKind::ALL
             .into_iter()
             .filter_map(|kind| {
-                let selected = supported.contains(kind.as_str()).and_then(|present| {
-                    Ok(present
+                let selected = (|| {
+                    Ok(supported.contains(&kind)
                         && allowed_calls
                             .map(|calls| calls.contains(kind.as_str()))
                             .transpose()?
                             .unwrap_or(true))
-                });
+                })();
                 match selected {
                     Ok(true) => Some(Ok(kind)),
                     Ok(false) => None,
@@ -148,12 +147,9 @@ pub(in crate::worker) fn build_worker_layout(
     let latent_plan = latent_pool_plan(model, config)?;
     let mut media = BTreeMap::new();
     if !dedicated {
-        let routes = declarations.call_method1("media_components", (model, &held))?;
-        for item in routes.call_method0("items")?.try_iter()? {
-            let item = item?;
-            let call = mapping_from_py(&item.get_item(0)?)?;
+        for (call, component) in crate::worker::component_binding::calls::routes(model, &held)? {
             if supported.contains(&CallKind::Media(call)) {
-                media.insert(call, item.get_item(1)?.extract()?);
+                media.insert(call, component);
             }
         }
     }
@@ -352,10 +348,7 @@ fn request_layout(
         latent_bytes,
     )
     .map_err(value_error)?;
-    let host = py
-        .import("uniserve_worker.bootstrap.components")?
-        .call_method1("holds_host_components", (bindings,))?
-        .is_truthy()?;
+    let host = crate::worker::component_binding::calls::holds_host_components(bindings)?;
     info.host_lane_capacity = if host {
         1
     } else {

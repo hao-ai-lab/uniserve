@@ -443,10 +443,7 @@ impl OutputPool {
                 normalized.push(device);
             }
         }
-        let timing = py
-            .import("uniserve_worker.profiling")?
-            .call_method0("timing_events_enabled")?
-            .extract()?;
+        let timing = super::profiling::timing_events_enabled();
 
         let mut pool = self.lock(py)?;
         let storage = pool

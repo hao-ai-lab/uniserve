@@ -1,9 +1,8 @@
-"""Numerical image encoder rows and visual/latent KV input construction."""
+"""Numerical vision features and latent conditioning inputs."""
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -15,71 +14,25 @@ from uniserve.processing import (
     PositionLayout,
 )
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow
-from uniserve_worker.model_executor.image_inputs import (
-    PreparedImage,
-    VisionRow,
-    patch_grid_shape,
-)
-from uniserve_worker.model_executor.input_batch import TokenRow
-from uniserve_worker.protocol.call import (
-    ForwardMode,
-    MediaCall,
-)
-from uniserve_worker.sampling.metadata import TokenSelection
-
-if TYPE_CHECKING:
-    from uniserve_worker.execution.model_executor import ModelExecutor
+from uniserve_worker.model_executor.image_inputs import patch_grid_shape
 
 
-def encode_row(
-    mode: MediaCall,
-    prepared: PreparedImage,
-) -> VisionRow:
-    """Build a vision- or latent-encoder row from prepared image tensors."""
-    return VisionRow(
-        forward_mode=mode,
-        encode_pixels=prepared.pixels,
-        encode_grid=prepared.grid,
-        encode_grid_shape=prepared.grid_shape,
-    )
-
-
-def vision_state_row(
+def vision_values(
     features: torch.Tensor,
     height: int,
     width: int,
     conditioning_position: int,
     *,
-    seq_len: int,
-    slot: int,
     input_images: int | None,
     close_image: bool,
-    logits: bool,
-    model_runner: ModelExecutor,
-) -> TokenRow:
-    """Build the prefill row that writes one image's vision features into KV.
+    injection: FeatureInjection,
+    transform: PatchTransform | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Lay out feature embeddings, framing tokens, masks and position axes.
 
-    ``features`` are ``[tokens, hidden]`` (or with a leading singleton batch
-    axis). The row is non-causal: its features attend to each other in both
-    directions and to the ``seq_len`` KV tokens before it in the request's
-    slot, which are the request's visible KV and, in a context prefill, the
-    rows of its call before this one. It writes its KV after them and
-    selects last logits when ``logits`` is set (only the K/V cache
-    otherwise). A framed layout adds start and end marker tokens;
-    ``close_image`` adds the end marker in any layout.
-
-    Raises:
-        WorkerError: When the model declares no feature injection, the
-            features are not ``[tokens, hidden]``, or the positional layout
-            cannot represent their patch grid.
+    Features attend bidirectionally; the executor supplies their cache
+    coordinates and output selection independently of this numerical layout.
     """
-    injection = model_runner.image_processor().feature_injection
-    if injection is None:
-        raise invalid_descriptor(
-            "vision state preparation requires declared feature injection"
-        )
-
     # Accept a leading singleton batch axis; the row layout is [tokens, hidden].
     embeddings = (
         features.squeeze(0)
@@ -96,7 +49,9 @@ def vision_state_row(
     leading = injection.layout is FeatureLayout.FRAMED
     trailing = leading or close_image
     query = int(leading) + int(embeddings.shape[0]) + int(trailing)
-    token_ids = torch.ones(query, dtype=torch.long)
+    # Token ids and positions feed host packing and logical progress.
+    # Their placement must not inherit a surrounding CUDA device context.
+    token_ids = torch.ones(query, dtype=torch.long, device="cpu")
     token_embeddings = embeddings.new_zeros((query, int(embeddings.shape[1])))
     embedding_mask = torch.zeros(
         query, dtype=torch.bool, device=embeddings.device
@@ -122,24 +77,9 @@ def vision_state_row(
         trailing=trailing,
         close_image=close_image,
         input_images=input_images,
-        model_runner=model_runner,
+        transform=transform,
     )
-    return TokenRow(
-        forward_mode=ForwardMode.PREFILL,
-        token_ids=token_ids,
-        token_embeddings=token_embeddings,
-        token_embedding_mask=embedding_mask,
-        positions=positions,
-        # A row that samples no token only writes the K/V cache; its
-        # outcome reads no output.
-        selection=TokenSelection.LAST_LOGITS
-        if logits
-        else TokenSelection.CACHE,
-        request_pool_idx=slot,
-        seq_len=seq_len,
-        write_kv=True,
-        causal=False,
-    )
+    return token_ids, token_embeddings, embedding_mask, positions
 
 
 def _feature_token_id(injection: FeatureInjection, *, start: bool) -> int:
@@ -163,7 +103,7 @@ def _vision_positions(
     trailing: bool,
     close_image: bool,
     input_images: int | None,
-    model_runner: ModelExecutor,
+    transform: PatchTransform | None,
 ) -> torch.Tensor:
     """Build position ids for a vision row's marker and feature slots.
 
@@ -179,13 +119,14 @@ def _vision_positions(
     query = int(leading) + feature_tokens + int(trailing)
     if layout is PositionLayout.TEMPORAL:
         return torch.full(
-            (query,), int(conditioning_position), dtype=torch.long
+            (query,), int(conditioning_position), dtype=torch.long, device="cpu"
         )
     if layout is PositionLayout.SEQUENTIAL:
         start = int(conditioning_position)
-        return torch.arange(start, start + query, dtype=torch.long)
+        return torch.arange(
+            start, start + query, dtype=torch.long, device="cpu"
+        )
 
-    transform = model_runner.image_processor().vit
     if not isinstance(transform, PatchTransform):
         raise invalid_descriptor(
             "temporal-spatial feature injection requires a patch image "
@@ -211,14 +152,17 @@ def _vision_positions(
         (query,),
         int(conditioning_position + (1 if close_image else 0)),
         dtype=torch.long,
+        device="cpu",
     )
     # Raster-order [feature_tokens] grid coordinates for the feature slots.
-    y = torch.arange(grid_height, dtype=torch.long).repeat_interleave(
-        grid_width
+    y = torch.arange(
+        grid_height, dtype=torch.long, device="cpu"
+    ).repeat_interleave(grid_width)
+    x = torch.arange(grid_width, dtype=torch.long, device="cpu").repeat(
+        grid_height
     )
-    x = torch.arange(grid_width, dtype=torch.long).repeat(grid_height)
-    spatial_y = torch.zeros(query, dtype=torch.long)
-    spatial_x = torch.zeros(query, dtype=torch.long)
+    spatial_y = torch.zeros(query, dtype=torch.long, device="cpu")
+    spatial_x = torch.zeros(query, dtype=torch.long, device="cpu")
     begin = int(leading)
     spatial_y[begin : begin + feature_tokens] = y
     spatial_x[begin : begin + feature_tokens] = x
@@ -228,24 +172,21 @@ def _vision_positions(
     return torch.stack((temporal, spatial_y, spatial_x))
 
 
-def latent_state_row(
+def latent_values(
     latent: torch.Tensor,
     height: int,
     width: int,
     conditioning_position: int,
     *,
-    slot: int,
-    seq_len: int,
-    model_runner: ModelExecutor,
-) -> DiffusionRow:
-    """Build the denoiser row that writes an image latent into KV.
+    builder,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Build positions and timestep zero for latent image conditioning.
 
     The row runs the latent at timestep zero between the builder's two
     framing tokens, non-causally, at the request's cache coordinates. It
     requires an image builder with two framing tokens and a latent whose
     token count matches the declared image size.
     """
-    builder = model_runner.image_builder
     if builder is None or builder.framing != 2:
         raise invalid_descriptor(
             "latent feature export requires framed image conditioning"
@@ -267,19 +208,4 @@ def latent_state_row(
     positions[0, 0] = conditioning_position
     positions[0, -1] = conditioning_position + builder.rope_advance
 
-    return DiffusionRow(
-        forward_mode=MediaCall.DENOISING,
-        positions=positions,
-        timestep=latent.new_zeros(1),
-        latent=latent,
-        image_tokens=query,
-        image_height=height,
-        image_width=width,
-        request_pool_idx=slot,
-        seq_len=seq_len,
-        write_kv=True,
-        causal=False,
-    )
-
-
-__all__ = ["encode_row", "vision_state_row", "latent_state_row"]
+    return positions, latent.new_zeros(1), query

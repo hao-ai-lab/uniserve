@@ -80,17 +80,30 @@ def test_endpoint_scope_closes_and_preserves_body_error(failing_scope):
         assert replacement.try_recv() is None
 
 
-def test_model_loading_failure_releases_the_reported_endpoint(tmp_path):
+@pytest.mark.parametrize("transport", ("iceoryx2", "tcp"))
+def test_model_loading_failure_releases_the_reported_endpoint(
+    tmp_path, transport
+):
     # A rank reports the endpoint it created before it loads anything, so the
     # endpoint has to survive the report and be released by the failure.
     listener, address = _registration_listener()
-    config = _model_config(tmp_path / "launch", registration_address=address)
+    config = _model_config(
+        tmp_path / "launch",
+        registration_address=address,
+        channel_transport=transport,
+    )
     with listener:
         with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
             run_worker(config)
         service = _reported_endpoint(listener)
-    with WorkerIpcEndpoint(service, max_payload=65536) as endpoint:
-        assert endpoint.try_recv() is None
+    if transport == "tcp":
+        host, port = service.rsplit(":", 1)
+        assert host == "127.0.0.1"
+        with socket.create_server((host, int(port))):
+            pass
+    else:
+        with WorkerIpcEndpoint(service, max_payload=65536) as endpoint:
+            assert endpoint.try_recv() is None
 
 
 def _stub_config(

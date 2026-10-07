@@ -3,7 +3,12 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
+use uniserve_worker::TokenSelection;
 use uniserve_worker::{PrefillShape as NativePrefillShape, TextShapes as NativeTextShapes};
+use uniserve_worker_ipc::{CallKind, ForwardMode};
+
+use super::cuda_graph::CUDAGraphError;
+use super::model_inputs::InputBatch;
 
 #[pyclass(
     frozen,
@@ -94,6 +99,85 @@ pub(crate) struct TextShapes {
     pub(super) inner: NativeTextShapes,
 }
 
+impl TextShapes {
+    /// Choose a bucket from host sequence lengths and native output selections.
+    /// Table widths may exceed the live view because graphs borrow fixed buffers.
+    pub(super) fn select_batch(
+        &self,
+        py: Python<'_>,
+        batch: &InputBatch,
+        table_widths: &[usize],
+    ) -> PyResult<Option<(Py<PyTuple>, bool)>> {
+        let inputs = batch.inputs.bind(py);
+        let entries = inputs.getattr("attention")?.getattr("entries")?;
+        let paged = py.import("uniserve.nn.attention")?.getattr("PagedInput")?;
+        let first = entries.get_item(0)?;
+        let causal = if first.getattr("causal_values")?.is_none() {
+            Some(first.getattr("causal")?.get_item(0)?.extract::<bool>()?)
+        } else {
+            None
+        };
+        let queries: Option<Vec<usize>> = first.getattr("queries")?.getattr("host")?.extract()?;
+        let queries = queries.ok_or_else(|| {
+            PyValueError::new_err("graph shape selection requires host query lengths")
+        })?;
+        let mut widths = Vec::with_capacity(entries.len()?);
+        for table in 0..entries.len()? {
+            let entry = entries.get_item(table).map_err(|_| {
+                CUDAGraphError::new_err("text graph tables must use contiguous indices")
+            })?;
+            if !entry.is_instance(&paged)? {
+                return Err(CUDAGraphError::new_err(
+                    "text graphs require paged text inputs",
+                ));
+            }
+            if let Some(causal) = causal {
+                let values: Vec<bool> = entry.getattr("causal")?.extract()?;
+                if values.iter().any(|&value| value != causal) {
+                    return Err(CUDAGraphError::new_err(
+                        "no prefill graph for mixed causality without device flags",
+                    ));
+                }
+            }
+            let width = entry
+                .getattr("block_table")?
+                .getattr("indices")?
+                .getattr("shape")?
+                .get_item(1)?
+                .extract::<usize>()?;
+            widths.push(width.max(table_widths.get(table).copied().unwrap_or(1)));
+        }
+
+        let selected = self
+            .inner
+            .select(
+                &queries,
+                inputs
+                    .getattr("input_ids")?
+                    .call_method0("numel")?
+                    .extract()?,
+                batch.kind == CallKind::Forward(ForwardMode::Decode),
+                causal,
+                !inputs.getattr("embeddings")?.is_none(),
+                batch
+                    .token_selections
+                    .iter()
+                    .all(|&value| value == TokenSelection::LastLogits),
+                batch
+                    .token_selections
+                    .iter()
+                    .all(|&value| value == TokenSelection::Cache),
+            )
+            .map_err(|error| CUDAGraphError::new_err(error.to_string()))?;
+        selected
+            .map(|(rows, tokens, decode, outputs)| {
+                let shape = (rows, tokens, PyTuple::new(py, widths)?, decode).into_pyobject(py)?;
+                Ok((shape.unbind(), outputs))
+            })
+            .transpose()
+    }
+}
+
 #[pymethods]
 impl TextShapes {
     #[new]
@@ -117,7 +201,6 @@ impl TextShapes {
     #[allow(clippy::too_many_arguments)]
     fn select(
         &self,
-        py: Python<'_>,
         queries: Vec<usize>,
         tokens: usize,
         decode: bool,
@@ -136,16 +219,7 @@ impl TextShapes {
                 last_logits,
                 cache_only,
             )
-            .map_err(|error| {
-                match py.import("uniserve.runtime.cuda_graph").and_then(|module| {
-                    module
-                        .getattr("CUDAGraphError")?
-                        .call1((error.to_string(),))
-                }) {
-                    Ok(error) => PyErr::from_value(error),
-                    Err(error) => error,
-                }
-            })
+            .map_err(|error| CUDAGraphError::new_err(error.to_string()))
     }
 }
 

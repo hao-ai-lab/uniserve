@@ -136,8 +136,11 @@ def test_packed_images_encode_as_they_do_alone(tmp_path):
             graph.close()
 
 
+@pytest.mark.parametrize("default_device", ("cpu", "cuda:0"))
 @torch.inference_mode()
-def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
+def test_worker_packed_vision_preserves_rows_and_reports_replay(
+    tmp_path, default_device
+):
     diffusion_gemma_checkpoint(tmp_path, vision=VISION)
     source = models.read_config(tmp_path)
     model = models.load_model(
@@ -227,9 +230,15 @@ def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
                 )
                 for slot in range(len(rows))
             )
-            result = forward_batch(
-                runner, rows, calls=calls, cache=None, tables=None, states=None
-            )
+            with torch.device(default_device):
+                result = forward_batch(
+                    runner,
+                    rows,
+                    calls=calls,
+                    cache=None,
+                    tables=None,
+                    states=None,
+                )
             assert result.stats.cuda_graph_replays == replays
             assert result.stats.cuda_graph_runtime_mode_counts == {
                 "graph_replay": replays
