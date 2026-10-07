@@ -1,7 +1,8 @@
 """UniServe device kernels.
 
 Modules and subpackages group kernels by domain: norm, activation,
-reduction, rope, patch, quantization, cache, attention and peer_storage.
+reduction, rope, patch, frame, quantization, cache, attention and
+peer_storage.
 Launchers consume device tensors. Many write caller-supplied outputs and pair
 with a separate eligibility check such as ``activation.can_run``; callers
 such as the numerical entry points in ``uniserve.nn.functional`` run that

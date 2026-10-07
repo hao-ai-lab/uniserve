@@ -1,4 +1,4 @@
-"""Windowed media reconstruction over borrowed numerical tensors."""
+"""Windowed media encoding and reconstruction over borrowed tensors."""
 
 from __future__ import annotations
 
@@ -9,8 +9,251 @@ from torch import nn
 
 from uniserve.distributed import Communicator
 from uniserve.media import image, video
-from uniserve.nn.vae import LatentDecoder
+from uniserve.nn.vae import LatentDecoder, LatentEncoder
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
+
+
+class VideoEncoder(nn.Module):
+    """Encode temporal units of RGB24 frames into latent rows.
+
+    A unit is a contiguous run of a video's frames whose latents depend on no
+    frame outside it. ``frame_slices`` lists a video's units in order and
+    ``latent_slices`` the contiguous latent frames each one produces, so the
+    units of one video may be encoded by different ranks, in any order, and
+    their rows assemble the whole-video encoding exactly.
+
+    Subclasses define both partitions; ``output_layout``, which describes a
+    video's complete latent as frame-major rows along its leading axis, each
+    latent frame owning the same number of consecutive rows;
+    ``unpack_pixels``, the conversion of one unit's frames into the native
+    encoder input; and ``pack_latents``, the conversion of that unit's native
+    NCTHW latents into its output rows. An encoder whose posterior is sampled
+    defines ``posterior_noise``: the draw spans the video's complete latent
+    and each unit takes the share of its own latent frames, which reproduces
+    the draw of a whole-video encoding. Inputs remain borrowed; results are
+    new tensors.
+    """
+
+    def __init__(self, encoder: LatentEncoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
+        """Partition a video of ``num_frames`` frames into its units."""
+        raise NotImplementedError
+
+    def latent_slices(self, num_frames: int) -> tuple[slice, ...]:
+        """Return the latent frames each unit produces, in unit order."""
+        raise NotImplementedError
+
+    def output_layout(
+        self, num_frames: int, frame_size: image.Config
+    ) -> Mapping[str, OutputLayout]:
+        """Describe the complete latent rows of one video under ``video``."""
+        raise NotImplementedError
+
+    def posterior_noise(
+        self, num_frames: int, frame_size: image.Config
+    ) -> torch.Tensor | None:
+        """Return one video's complete NCTHW posterior draw, or None.
+
+        None leaves the latent to the latent encoder's own posterior: its
+        mean, a draw of its own, or no posterior at all.
+        """
+        return None
+
+    def unpack_pixels(
+        self, pixels: torch.Tensor, frames: slice, num_frames: int
+    ) -> torch.Tensor:
+        """Return the native encoder input of one unit's frames.
+
+        ``pixels`` holds exactly the frames ``frames`` selects, as
+        ``[frames, height, width, 3]`` uint8 RGB.
+        """
+        raise NotImplementedError
+
+    def pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Return the output rows of one unit's native NCTHW latents."""
+        raise NotImplementedError
+
+    @torch.inference_mode()
+    def encode(
+        self,
+        pixels: tuple[torch.Tensor, ...],
+        *,
+        frames: tuple[slice, ...],
+        num_frames: tuple[int, ...],
+    ) -> tuple[TensorOutput, ...]:
+        """Encode units of RGB24 videos into their latent rows.
+
+        ``pixels[i]`` holds exactly the frames that ``frames[i]`` selects from
+        a video of ``num_frames[i]`` frames, as ``[frames, height, width, 3]``
+        uint8, and ``frames[i]`` must be one of that video's units. Each
+        result holds its unit's rows at their place in the video's complete
+        latent.
+        """
+        if (
+            not pixels
+            or len(pixels) != len(frames)
+            or len(pixels) != len(num_frames)
+        ):
+            raise ValueError(
+                "video frames, unit slices and durations must align"
+            )
+
+        units = []
+        for value, interval, count in zip(
+            pixels, frames, num_frames, strict=True
+        ):
+            legal = self.frame_slices(count)
+            if interval not in legal:
+                raise ValueError(
+                    "video frame slice must select one complete encoding unit"
+                )
+            if (
+                value.ndim != 4
+                or value.dtype != torch.uint8
+                or value.shape[-1] != 3
+                or value.shape[0] != interval.stop - interval.start
+            ):
+                raise ValueError(
+                    "video units must be uint8 RGB frames "
+                    "[frames, height, width, 3] covering their frame slice"
+                )
+            units.append(legal.index(interval))
+
+        # One posterior draw per video size serves every unit of this call
+        # that belongs to a video of that size.
+        draws: dict[tuple[int, image.Config], torch.Tensor | None] = {}
+        outputs = []
+        for value, interval, count, unit in zip(
+            pixels, frames, num_frames, units, strict=True
+        ):
+            frame_size = image.Config(int(value.shape[1]), int(value.shape[2]))
+            layout = self.output_layout(count, frame_size)["video"]
+            windows = self.latent_slices(count)
+            window = windows[unit]
+            extent = window.stop - window.start
+            if layout.shape[0] % windows[-1].stop:
+                raise ValueError(
+                    "video latent rows must divide evenly among latent frames"
+                )
+            rows_per_frame = layout.shape[0] // windows[-1].stop
+
+            key = (count, frame_size)
+            if key not in draws:
+                draws[key] = self.posterior_noise(count, frame_size)
+            noise = draws[key]
+            if noise is not None:
+                noise = noise[:, :, window].to(value.device)
+
+            # A unit whose input was padded to the encoder's temporal extent
+            # yields trailing latent frames beyond its own; the window keeps
+            # the leading ones, so the posterior never samples the others.
+            latents = self.encoder(
+                self.unpack_pixels(value, interval, count),
+                window=(slice(None), slice(None), slice(0, extent)),
+                noise=noise,
+            )
+            rows = self.pack_latents(latents)
+            if (
+                rows.shape != (extent * rows_per_frame, *layout.shape[1:])
+                or rows.dtype != layout.dtype
+            ):
+                raise ValueError(
+                    "packed video latents must match the declared output rows"
+                )
+            outputs.append(
+                TensorOutput(
+                    rows,
+                    OutputLayout(
+                        layout.shape,
+                        layout.dtype,
+                        (
+                            slice(
+                                window.start * rows_per_frame,
+                                window.stop * rows_per_frame,
+                            ),
+                            *layout.local_slice[1:],
+                        ),
+                        variable_axes=layout.variable_axes,
+                        value_range=layout.value_range,
+                    ),
+                )
+            )
+        return tuple(outputs)
+
+
+class AudioEncoder(nn.Module):
+    """Encode sample-major PCM tracks into latent rows.
+
+    Tracks are encoded whole rather than by media unit. Subclasses define
+    ``latent_frames`` and ``latent_rate`` from their codec's compression;
+    ``output_layout``; ``unpack_samples``, the conversion of one track's
+    ``[samples, channels]`` PCM into the native encoder input; and
+    ``pack_latents``, the conversion of the track's native latents into its
+    output rows. Inputs carry ``sample_rate`` samples per second and remain
+    borrowed; results are new tensors.
+    """
+
+    def __init__(self, encoder: LatentEncoder, *, sample_rate: int):
+        super().__init__()
+        if type(sample_rate) is not int or sample_rate < 1:
+            raise ValueError("audio sample rate must be a positive integer")
+        self.encoder, self.sample_rate = encoder, sample_rate
+
+    def latent_frames(self, num_samples: int) -> int:
+        """Return the latent frames that encode ``num_samples`` samples."""
+        raise NotImplementedError
+
+    @property
+    def latent_rate(self) -> int:
+        """Input samples one latent frame encodes."""
+        raise NotImplementedError
+
+    def output_layout(self, num_samples: int) -> Mapping[str, OutputLayout]:
+        """Describe the latent rows of one track under ``audio``."""
+        raise NotImplementedError
+
+    def unpack_samples(self, samples: torch.Tensor) -> torch.Tensor:
+        """Return the native encoder input of one PCM track."""
+        raise NotImplementedError
+
+    def pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Return the output rows of one track's native latents."""
+        raise NotImplementedError
+
+    @torch.inference_mode()
+    def encode(
+        self, samples: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, ...]:
+        """Encode ``[samples, channels]`` floating-point PCM tracks.
+
+        Values lie in ``[-1, 1]``. Each result holds one track's complete
+        latent rows as ``output_layout`` describes them.
+        """
+        if not samples:
+            raise ValueError("audio encoding requires at least one track")
+        outputs = []
+        for track in samples:
+            if (
+                track.ndim != 2
+                or track.shape[0] < 1
+                or track.shape[1] < 1
+                or not track.is_floating_point()
+            ):
+                raise ValueError(
+                    "audio tracks must be nonempty floating-point PCM "
+                    "[samples, channels]"
+                )
+            layout = self.output_layout(int(track.shape[0]))["audio"]
+            rows = self.pack_latents(self.encoder(self.unpack_samples(track)))
+            if rows.shape != layout.shape or rows.dtype != layout.dtype:
+                raise ValueError(
+                    "packed audio latents must match the declared output rows"
+                )
+            outputs.append(rows)
+        return tuple(outputs)
 
 
 class VideoDecoder(nn.Module):

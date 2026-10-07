@@ -8,11 +8,14 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve.loading import checkpoint, weights
-from uniserve.nn.vae.layers import (
+from uniserve.nn.vae import (
     AttentionBlock,
     DiagonalGaussian,
     Downsample,
+    LatentDecoder,
+    LatentEncoder,
     ResidualBlock,
+    ScaleShift,
     Upsample,
 )
 
@@ -173,30 +176,40 @@ class Decoder(nn.Module):
         return self.output(F.silu(self.norm(hidden)))
 
 
-# ``uniserve_models.bagel.model.Model`` borrows only this model's encoder,
-# decoder and posterior, and ``PatchAutoencoder`` applies the same scale and
-# shift. The ``encode`` and ``decode`` methods here serve direct use of the
-# codec.
 class Model(nn.Module):
-    """Encode normalized posterior samples and decode their inverse transform."""  # noqa: E501
+    """FLUX latent codec: sample and normalize latents and decode them back.
+
+    ``encoder`` and ``decoder`` wrap this codec's networks in the shared
+    latent encoding and decoding with the checkpoint's scale and shift;
+    ``uniserve_models.bagel.model.Model`` composes the same two modules into
+    its ``PatchAutoencoder``. ``encode`` and ``decode`` serve direct use of
+    the codec.
+    """
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.encoder = Encoder(config)
-        self.posterior = DiagonalGaussian()
-        self.decoder = Decoder(config)
+        normalization = ScaleShift(
+            scale=config.scale_factor, shift=config.shift_factor
+        )
+        self.encoder = LatentEncoder(
+            Encoder(config),
+            normalization=normalization,
+            posterior=DiagonalGaussian(),
+        )
+        self.decoder = LatentDecoder(
+            Decoder(config),
+            normalization=normalization,
+            latent_shape=(None, config.latent_channels, None, None),
+        )
 
     def encode(
         self, pixels: torch.Tensor, *, generator: torch.Generator | None = None
     ) -> torch.Tensor:
-        latent = self.posterior(self.encoder(pixels), generator=generator)
-        return self.config.scale_factor * (latent - self.config.shift_factor)
+        return self.encoder(pixels, generator=generator)
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
-        return self.decoder(
-            latents / self.config.scale_factor + self.config.shift_factor
-        )
+        return self.decoder(latents)
 
     def forward(
         self, pixels: torch.Tensor, *, generator: torch.Generator | None = None
@@ -209,7 +222,8 @@ def assignments(
 ) -> tuple[weights.Assignment, ...]:
     """Map FLUX tensors into encoder/decoder composition, packing spatial QKV.
 
-    Both Model and PatchAutoencoder expose the same encoder/decoder modules.
+    Both Model and PatchAutoencoder expose the same latent encoder and
+    decoder, whose ``encoder`` and ``decoder`` networks hold the parameters.
     Checkpoint decoder levels count from the pixel end; module levels execute
     from the latent end. Q/K/V fragments cover disjoint output channels.
 
@@ -221,7 +235,7 @@ def assignments(
     available = frozenset(reader.names())
 
     for tower_name in ("encoder", "decoder"):
-        tower = getattr(module, tower_name)
+        tower = getattr(getattr(module, tower_name), tower_name)
         parameters = dict(tower.named_parameters())
         names = {"input": "conv_in", "norm": "norm_out", "output": "conv_out"}
 
