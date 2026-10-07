@@ -17,6 +17,7 @@ from safetensors.torch import save_file
 
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
+from uniserve.media import image
 from uniserve_models.minimax_h3 import video_vae
 from uniserve_models.minimax_h3.encoding import VideoEncoder
 
