@@ -84,7 +84,7 @@ def _sources(encoder: Encoder) -> dict[str, tuple[str, _Region]]:
         if target.startswith("backbone.")
     }
     tower = encoder.vision.network
-    result = {}
+    result: dict[str, tuple[str, _Region]] = {}
     for name, _ in encoder.named_parameters():
         if name.startswith("network."):
             result[name] = (language[name], None)

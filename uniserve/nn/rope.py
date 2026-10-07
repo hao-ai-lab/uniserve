@@ -139,6 +139,8 @@ class RotaryEmbedding(nn.Module):
     so separate contexts can evaluate different lengths on shared weights.
     """
 
+    inv_freq: torch.Tensor
+
     def __init__(
         self,
         dim: int,
@@ -361,6 +363,8 @@ class MRotaryEmbedding(nn.Module):
     receive exactly ``rotary``'s one-dimensional factors, since selecting
     among equal per-axis factors copies them.
     """
+
+    frequency_axes: torch.Tensor
 
     def __init__(self, rotary: RotaryEmbedding, sections: tuple[int, ...]):
         super().__init__()

@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from typing import Any
 
 # Activations a non-gated vision MLP may name; ``get_act_fn`` builds them.
 _ACTIVATIONS = frozenset({"gelu_pytorch_tanh", "gelu", "silu", "relu"})
@@ -159,7 +160,9 @@ def read_vision_config(metadata: Mapping[str, object]) -> VisionConfig:
         raise ValueError(
             f"Qwen3-VL vision_config is missing fields: {', '.join(missing)}"
         )
-    values = {
+    # Checkpoint JSON values are unchecked here: ``VisionConfig`` validates
+    # each field's type and range on construction.
+    values: dict[str, Any] = {
         field.name: metadata[field.name] for field in fields(VisionConfig)
     }
     indexes = values["deepstack_visual_indexes"]

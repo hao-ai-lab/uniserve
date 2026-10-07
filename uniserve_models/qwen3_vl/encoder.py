@@ -36,6 +36,8 @@ class VisionEncoder(TubeletEncoder):
     processors do on the host.
     """
 
+    network: VisionTower
+
     def __init__(
         self, config: VisionConfig, pixels: PixelConfig, *, dtype: torch.dtype
     ):
