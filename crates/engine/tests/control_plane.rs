@@ -1134,6 +1134,16 @@ fn hybrid_groups_share_one_unit_pool() {
         "reused {reused} tokens"
     );
 
+    // Every unit returns to the pool once both requests retire. A request's
+    // last pipelined step may still be in flight when its final event
+    // arrives, so the pool is read once the engine has applied it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stats.kv_cache.free_units.load(Ordering::Relaxed)
+        != stats.kv_cache.num_units.load(Ordering::Relaxed)
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
     handle.shutdown();
     let _ = jh.join();
     assert_eq!(
