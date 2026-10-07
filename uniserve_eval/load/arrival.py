@@ -167,9 +167,13 @@ async def run_load(
         raise
     # Every attempted request, including errors and deadlines, contributes to
     # the window. Coroutine cleanup and subsequent inspection do not.
-    duration = max(output.final_event_time for output in outputs) - min(
-        output.start_time for output in outputs
-    )
+    # Request dispatch closes every record on each path, failures included.
+    ends = []
+    for output in outputs:
+        if output.final_event_time is None:
+            raise RuntimeError("request dispatch returned an unclosed record")
+        ends.append(output.final_event_time)
+    duration = max(ends) - min(output.start_time for output in outputs)
     return LoadResult(
         tuple(warmup_outputs),
         tuple(outputs),
