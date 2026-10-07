@@ -115,7 +115,7 @@ class _TokenPlan:
 class _Queries:
     """Independent query windows over the same complete key domain."""
 
-    plans: tuple[_TokenPlan, ...]
+    plans: tuple[_SparsePlan | _TokenPlan, ...]
     heads: int
     owners: int
     rows: int
@@ -488,8 +488,9 @@ def _plan_for(
                 begin, capacity = tile, 0
             capacity += cost
         windows.append((begin, interval_tiles))
-        plans = tuple(
-            _plan_for(
+        plans = []
+        for begin, end in windows:
+            window = _plan_for(
                 state,
                 query,
                 key,
@@ -500,17 +501,21 @@ def _plan_for(
                 row_start=row_start + begin * _TILE,
                 row_count=(end - begin) * _TILE,
             )
-            for begin, end in windows
+            # Each window fits the offset bound, so it is planned directly.
+            if isinstance(window, _Queries):
+                raise RuntimeError("a VSA query window was split again")
+            plans.append(window)
+        queries = _Queries(
+            tuple(plans), heads, owners, row_count, row_start // _TILE
         )
-        plan = _Queries(plans, heads, owners, row_count, row_start // _TILE)
-        state.plans[cache_key] = plan
-        return plan
+        state.plans[cache_key] = queries
+        return queries
 
     indptr_host = torch.empty(counts.numel() + 1, dtype=torch.int32)
     indptr_host[0] = 0
     torch.cumsum(counts, dim=0, out=indptr_host[1:])
     if hopper:
-        plan = _token_plan(
+        token_plan = _token_plan(
             state,
             query,
             indptr_host,
@@ -521,8 +526,8 @@ def _plan_for(
             row_count=row_count,
             scale=scale,
         )
-        state.plans[cache_key] = plan
-        return plan
+        state.plans[cache_key] = token_plan
+        return token_plan
     indptr = indptr_host.to(query.device)
     index_count = int(indptr_host[-1])
     requirements = {
@@ -683,7 +688,7 @@ def _token_plan(
     # 64-row, one-head requests schedules exactly one 128-row query tile;
     # keep that immutable work order and refresh only its live key domain.
     info = wrapper._plan_info
-    if len(info) != 9:
+    if info is None or len(info) != 9:
         raise RuntimeError("FlashInfer returned an unsupported FA3 plan layout")
 
     def work_field(index: int) -> torch.Tensor:
@@ -933,8 +938,8 @@ def dense_prefix(
 
     # Preserve the vector's inner stride and alignment when CuTe converts
     # the auxiliary tensor. This changes metadata, not the borrowed counts.
-    valid_sizes.__leading_dim__ = 0
-    valid_sizes.__assumed_align__ = 4
+    valid_sizes.__leading_dim__ = 0  # type: ignore[attr-defined]
+    valid_sizes.__assumed_align__ = 4  # type: ignore[attr-defined]
     return _flash_attn_forward()(
         query.transpose(0, 1).unsqueeze(0),
         key.transpose(0, 1).unsqueeze(0),

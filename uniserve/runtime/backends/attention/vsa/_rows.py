@@ -143,6 +143,7 @@ class _Rows:
                 ),
                 "counts": BufferConfig((heads, rows // _TILE), torch.int32),
             }
+            maps: Mapping[str, torch.Tensor]
             if self.transient is None:
                 maps = {
                     name: torch.empty(

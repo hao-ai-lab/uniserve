@@ -172,7 +172,9 @@ class GraphStorage:
         Owners without pooled segments on a device are omitted.
         """
         # A pool several owners share is attributed to the first of them.
-        ids = {}
+        ids: dict[
+            tuple[int | None, tuple[int, ...]], tuple[object, torch.device]
+        ] = {}
         for owner, pools in self._pools.items():
             for device, pool in pools.items():
                 ids.setdefault((device.index, tuple(pool.id)), (owner, device))

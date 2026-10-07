@@ -7,7 +7,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from functools import partial
 from types import MappingProxyType
-from typing import Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 import torch
 from torch import nn
@@ -39,6 +39,9 @@ from .bindings.vsa import VsaBinding
 from .resources import streams_idle
 from .stream import CUDAStream
 from .tensor_buffers import TensorBuffers
+
+if TYPE_CHECKING:
+    from .backends.attention.vsa import Operator as VsaOperator
 
 SizeT = TypeVar("SizeT")
 ValueT = TypeVar("ValueT")
@@ -207,7 +210,7 @@ class ExecutionContext(Generic[SizeT]):
         self._vsa: dict[int, VsaBinding] = {}
         # VSA plans depend on numerical shapes, not on layer weights. Keep
         # one operator per signature across this context's serialized layers.
-        self._vsa_operators = {}
+        self._vsa_operators: dict[tuple[object, ...], VsaOperator] = {}
         self._vsa_output: dict[ParallelAttention, OutputBuffers] = {}
         self._vsa_context: dict[ParallelAttention, AttentionBuffers] = {}
         self._context_backing: dict[tuple[object, ...], AttentionBuffers] = {}
