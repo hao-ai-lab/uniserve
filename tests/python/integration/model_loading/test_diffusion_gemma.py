@@ -54,6 +54,10 @@ from uniserve_models import loading as models
 
 pytestmark = pytest.mark.integration
 
+# Both implementations evaluate the same FP32 equations with different kernels,
+# whose accumulation order depends on the platform's CPU kernels, so their
+# results agree to torch's default FP32 tolerances (rtol 1.3e-6, atol 1e-5).
+
 # Every cache group's table holds eight pages of the unit pool; the groups'
 # tables name disjoint units.
 BLOCK_SIZE, PAGES = 4, 8
@@ -218,9 +222,7 @@ def test_prompt_cache_and_canvas_match_transformers(tmp_path, prompt_length):
             prompt,
             ((0, middle, True), (middle, prompt_length, True)),
         )
-        torch.testing.assert_close(
-            prompt_logits, expected_prompt, rtol=1e-5, atol=1e-6
-        )
+        torch.testing.assert_close(prompt_logits, expected_prompt)
 
         # Transformers keeps the last six sliding-layer tokens plus the
         # query's own; the full layer keeps the prompt. Full-layer values
@@ -235,15 +237,11 @@ def test_prompt_cache_and_canvas_match_transformers(tmp_path, prompt_length):
                 length=stored,
             )
             for actual, wanted in ((key, layer.keys), (value, layer.values)):
-                torch.testing.assert_close(
-                    actual, wanted[0].transpose(0, 1), rtol=1e-5, atol=1e-6
-                )
+                torch.testing.assert_close(actual, wanted[0].transpose(0, 1))
 
         torch.testing.assert_close(
             _canvas(model, context, canvas, prompt_length),
             expected.logits[0],
-            rtol=1e-5,
-            atol=1e-6,
         )
 
 
@@ -278,8 +276,6 @@ def test_self_conditioning_matches_transformers(tmp_path):
         torch.testing.assert_close(
             _canvas(model, context, canvas, 12, soft),
             expected,
-            rtol=1e-5,
-            atol=1e-6,
         )
         assert torch.equal(
             _canvas(model, context, canvas, 12),
@@ -359,9 +355,7 @@ def test_image_features_and_blocks_match_transformers(tmp_path):
             encoder.network(torch.cat(rows), torch.cat(grid_tensors), grids)
         )
         encoded = encoder.encode(VisionInput(rows, grid_tensors, grids))
-    torch.testing.assert_close(
-        features, expected_features, rtol=1e-5, atol=1e-6
-    )
+    torch.testing.assert_close(features, expected_features)
     # The encoder publishes BF16 features, one tensor per image.
     for actual, wanted in zip(encoded, features.split((4, 2)), strict=True):
         assert torch.equal(actual, wanted.to(torch.bfloat16))
@@ -382,14 +376,10 @@ def test_image_features_and_blocks_match_transformers(tmp_path):
             ),
             features={4: features[:4], 12: features[4:]},
         )
-        torch.testing.assert_close(
-            prompt_logits, expected_prompt, rtol=1e-5, atol=1e-6
-        )
+        torch.testing.assert_close(prompt_logits, expected_prompt)
         torch.testing.assert_close(
             _canvas(model, context, canvas, 17),
             expected.logits[0],
-            rtol=1e-5,
-            atol=1e-6,
         )
 
 
@@ -584,14 +574,10 @@ def _pipeline_stage(rank, rendezvous, root):
                 assert model.denoiser.lm_head is None
                 assert _canvas_stage(model, context, canvas, count) is None
                 return
-            torch.testing.assert_close(
-                prompt_logits.gather(), expected_prompt, rtol=1e-5, atol=1e-6
-            )
+            torch.testing.assert_close(prompt_logits.gather(), expected_prompt)
             torch.testing.assert_close(
                 _canvas_stage(model, context, canvas, count).gather(),
                 expected_canvas,
-                rtol=1e-5,
-                atol=1e-6,
             )
 
 
