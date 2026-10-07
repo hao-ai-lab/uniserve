@@ -1,132 +1,338 @@
-"""Describe a rank's paged K/V cache to the engine scheduler.
+"""Describe a rank's paged K/V unit pool to the engine scheduler.
 
-The worker reports a ``KVCacheInfo`` in its ``WorkerInfo``: one rectangular
-region of the model's logical cache, a consecutive interval of layers times a
-consecutive interval of K/V heads, together with page geometry and the bytes
-one token occupies. The token-worker path of ``build_worker_layout`` in
-``uniserve_worker.bootstrap.report`` calls ``cache_info`` with a one-page
-pool to learn the per-token size, sizes the pool, and attaches the granted
-page count with ``resize_cache``. When the engine assembles a worker group
-from its ranks' startup reports, it requires their regions to cover every
-layer's K/V heads without a gap.
+The worker reports a ``KVCacheInfo`` in its ``WorkerInfo``: the unit pool's
+size and unit bytes, and one group per history window and K/V page shape.
+Each group places this rank's layers by global cache-layer id and its K/V
+heads by interval. The token-worker path of ``build_worker_layout`` in
+``uniserve_worker.bootstrap.report`` calls ``cache_info`` with a minimal
+pool to learn the unit size, sizes the pool, and attaches the granted unit
+count with ``resize_cache``. When the engine assembles a worker group from
+its ranks' startup reports, it requires every logical layer to belong to one
+group and its K/V heads to be covered without a gap.
 """
 
 from dataclasses import replace
 
 import torch
+from torch import nn
 
-from uniserve.cache import mha
+from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.model import CausalLM
+from uniserve.nn.attention import Attention
 from uniserve.quantization import Quantizer
+from uniserve.runtime.backends.attention import Backend, CachePages
+from uniserve.runtime.prefix_cache import Planes, plan_units
+from uniserve_worker.bootstrap.inputs import capability
 from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.protocol.worker_info import (
     KVCacheInfo,
     KvGroup,
     KvGroupKind,
 )
 
+# The largest base page size, in tokens, a worker chooses when the operator
+# sets none. A smaller one is chosen only when an attention kernel cannot
+# read the pages the larger one gives some cache group.
+DEFAULT_BLOCK_SIZE = 64
+
+
+def storage(config: WorkerConfig) -> tuple[torch.dtype | None, bool]:
+    """Resolve the configured K/V storage as ``(dtype, fp8)``.
+
+    ``dtype`` is the logical storage dtype passed to the unit pool, or
+    ``None`` for each layer's compute dtype. FP8 storage is expressed as the
+    compute dtype plus a per-block FP8 quantizer.
+    """
+    if config.kv_cache_dtype is None:
+        return None, False
+    dtype = getattr(torch, config.kv_cache_dtype.removeprefix("torch."))
+    if dtype is torch.float8_e4m3fn:
+        return None, True
+    return dtype, False
+
+
+def plan_cache(model: CausalLM, config: WorkerConfig) -> Planes:
+    """Plan the rank's unit pool from its resident cache layers.
+
+    The page size of the group with the widest token rows is the configured
+    ``block_size``, which ``resolve_page_size`` sets when the operator left
+    it unset; every other group's page holds as many tokens as fit the same
+    plane.
+
+    Raises:
+        ValueError: As ``plan_units``, when the model has no resident cache
+            layer, or when the page size is unresolved.
+    """
+    return _plan(model, config, page_size(config))
+
+
+def page_size(config: WorkerConfig) -> int:
+    """Return the worker's resolved base KV page size in tokens.
+
+    Raises:
+        ValueError: ``block_size`` is unset; ``resolve_page_size`` sets it
+            before anything is planned from it.
+    """
+    if config.block_size is None:
+        raise ValueError("the worker's KV page size is unresolved")
+    return config.block_size
+
+
+def _plan(model: CausalLM, config: WorkerConfig, block_size: int) -> Planes:
+    """Plan the unit pool with ``block_size``-token pages of the widest rows."""
+    layers = model.cache_config.layers
+    if not layers:
+        raise ValueError(
+            "the worker K/V protocol requires resident cache layers"
+        )
+    dtype, fp8 = storage(config)
+    return plan_units(
+        model.cache_config,
+        block_size=block_size,
+        dtype=dtype,
+        quantization={name: Quantizer("fp8", axis=0) for name in layers}
+        if fp8
+        else None,
+    )
+
+
+def resolve_page_size(
+    model: nn.Module,
+    config: WorkerConfig,
+    attention: Backend,
+    *,
+    group: Communicator | None = None,
+) -> WorkerConfig:
+    """Resolve the KV page size of a worker whose operator set none.
+
+    An explicit ``block_size`` is kept: a cache group whose pages its
+    attention cannot read then fails when the layer is prepared, naming the
+    layer and its pages. Unset, the base page size is the largest power of
+    two up to ``DEFAULT_BLOCK_SIZE`` at which ``attention`` serves every
+    resident cache layer on the pages its group then holds; a model without
+    a paged cache takes ``DEFAULT_BLOCK_SIZE``. The ranks of ``group`` take
+    the smallest of their sizes, so the ranks of one worker share one page
+    shape.
+
+    Returns:
+        ``config`` with ``block_size`` set.
+
+    Raises:
+        WorkerError: ``unsupported_setup`` when no page size up to
+            ``DEFAULT_BLOCK_SIZE`` serves every resident cache layer.
+    """
+    if config.block_size is not None:
+        return config
+
+    text = capability(model, CausalLM)
+    size = (
+        DEFAULT_BLOCK_SIZE
+        if text is None
+        else _largest_page_size(text, config, attention)
+    )
+    if group is not None and group.size > 1:
+        agreed = torch.tensor(size, dtype=torch.int64, device=group.device)
+        group.all_reduce(agreed, op="min")
+        size = int(agreed.item())
+    return replace(config, block_size=size)
+
+
+def _largest_page_size(
+    model: CausalLM, config: WorkerConfig, attention: Backend
+) -> int:
+    """Return the largest base page size ``attention`` reads for every layer.
+
+    Candidates halve from ``DEFAULT_BLOCK_SIZE``; each plans the unit pool
+    and asks the backend whether it serves every resident cache layer, with
+    that layer's attention shape, on its group's pages.
+    """
+    readers = {
+        module.cache_name: module
+        for module in model.modules()
+        if isinstance(module, Attention) and module.cache_name is not None
+    }
+    layouts = model.cache_config.layers
+    if not set(layouts) <= set(readers):
+        raise unsupported_setup(
+            "every resident cache layer requires an attention layer reading it"
+        )
+
+    size = DEFAULT_BLOCK_SIZE
+    while size >= 1:
+        planes = _plan(model, config, size)
+        if all(
+            attention.reads_pages(
+                num_heads=readers[name].local_heads,
+                num_kv_heads=readers[name].local_kv_heads,
+                head_dim=readers[name].head_dim,
+                dtype=layouts[name].compute_dtype,
+                window=readers[name].window,
+                pages=CachePages(
+                    group.page_tokens, group.dtype, planes.quantized
+                ),
+            )
+            for group in planes.groups
+            for name in group.layers
+        ):
+            return size
+        size //= 2
+    raise unsupported_setup(
+        f"no KV page size of at most {DEFAULT_BLOCK_SIZE} tokens is read by "
+        "the attention of every resident cache layer"
+    )
+
+
+def table_widths(
+    planes: Planes, *, max_sequence_tokens: int, max_query_tokens: int
+) -> tuple[int, ...]:
+    """Bound the columns one call stages per numerical block table.
+
+    A full-attention table spans the longest sequence. A sliding-window
+    table spans only the pages a reader's window of history and one call's
+    queries intersect, at most ``ceil((window + queries) / page_tokens) +
+    1``. Tables are in table order, one per unit position of every group.
+    """
+    widths: list[int] = []
+    for group in planes.groups:
+        width = ceil_div(max(1, max_sequence_tokens), group.page_tokens)
+        if group.window is not None:
+            width = min(
+                width,
+                ceil_div(
+                    group.window + max(1, max_query_tokens), group.page_tokens
+                )
+                + 1,
+            )
+        widths.extend((max(1, width),) * group.units_per_page)
+    return tuple(widths)
+
+
+def resident_width(planes: Planes, *, max_sequence_tokens: int) -> int:
+    """Return the most pages one slot's installed group table may hold.
+
+    A table may cover the longest sequence in any group, including a
+    sliding-window group whose worst-case reservation holds every page.
+    """
+    return max(
+        1,
+        *(
+            ceil_div(max(1, max_sequence_tokens), group.page_tokens)
+            for group in planes.groups
+        ),
+    )
+
+
+def group_layers(
+    model: CausalLM, planes: Planes
+) -> tuple[tuple[int, ...], ...]:
+    """Return every group's global cache-layer ids across pipeline stages.
+
+    A logical cache layer joins the group whose history window, logical K/V
+    heads and head width it shares; the decoder records these for every
+    layer, including those resident on other stages. A group's layers in
+    ascending global order form its publication layer axis.
+
+    Raises:
+        ValueError: A resident group's layers are not the logical layers of
+            one shape.
+    """
+    backbone = model.backbone
+    names = backbone.cache_names
+    layouts = model.cache_config.layers
+    result = []
+    for group in planes.groups:
+        layout = layouts[group.layers[0]]
+        key = (layout.window, layout.num_kv_heads, layout.head_dim)
+        members = tuple(
+            index
+            for index, layer in enumerate(backbone.cache_layers)
+            if (layer.window, layer.num_kv_heads, layer.head_dim) == key
+        )
+        local = tuple(names.index(name) for name in group.layers)
+        if not set(local).issubset(members):
+            raise ValueError(
+                "resident cache layers disagree with their logical geometry"
+            )
+        result.append(members)
+    if len({layer for members in result for layer in members}) != sum(
+        map(len, result)
+    ):
+        raise ValueError(
+            "logical cache layers belong to several resident groups"
+        )
+    return tuple(result)
+
 
 def cache_info(
-    model: CausalLM, config: WorkerConfig, *, num_blocks: int
+    model: CausalLM, config: WorkerConfig, *, num_units: int
 ) -> KVCacheInfo:
-    """Map resident named MHA layers to the global token/layer/head axes.
-
-    The wire protocol describes contiguous homogeneous layer/head intervals.
-    Library caches remain free to use other state layouts; unsupported wire
-    layouts fail here before any scheduler grants or transfers are advertised.
+    """Map resident MHA layers to the unit pool's groups and global axes.
 
     Args:
         model: The causal LM whose ``cache_config`` lists this rank's resident
             cache layers and whose backbone orders all logical layers.
         config: Supplies ``block_size`` and the optional ``kv_cache_dtype``
             override of the layers' compute dtype.
-        num_blocks: Physical pages to advertise.
+        num_units: Units to advertise, including the unit-zero sentinel.
 
     Returns:
-        The cache description with one full-context group of ``num_blocks``
-        pages.
+        The unit pool description with one group per history window and page
+        shape; a history window becomes a sliding-window group.
 
     Raises:
-        ValueError: There are no resident layers; they are not all MHA
-            layouts, not consecutive in ``cache_names`` order, not one
-            identical layout, or hold non-consecutive heads; a layer is not
-            named in ``cache_names``; ``block_size`` is below one; or the
-            configured dtype cannot store K/V values.
+        ValueError: As ``plan_cache``; or a group's layers hold
+            non-consecutive heads.
     """
-    layers = model.cache_config.layers
-    if not layers or any(
-        not isinstance(value, mha.Config) for value in layers.values()
-    ):
-        raise ValueError(
-            "the worker K/V protocol requires resident MHA state layers"
-        )
-
+    planes = plan_cache(model, config)
     names = model.backbone.cache_names
-    indexes = tuple(names.index(name) for name in layers)
-    if indexes != tuple(range(indexes[0], indexes[0] + len(indexes))):
-        raise ValueError(
-            "the worker K/V protocol requires consecutive logical cache layers"
+    layouts = model.cache_config.layers
+    dtype, fp8 = storage(config)
+
+    groups = []
+    for group in planes.groups:
+        layout = layouts[group.layers[0]]
+        heads = layout.head_indices
+        if heads != tuple(range(heads[0], heads[0] + len(heads))):
+            raise ValueError(
+                "the worker K/V protocol requires consecutive logical cache "
+                "heads"
+            )
+        groups.append(
+            KvGroup(
+                kind=KvGroupKind.FULL
+                if group.window is None
+                else KvGroupKind.SLIDING_WINDOW,
+                window=0 if group.window is None else group.window,
+                sink=0,
+                page_tokens=group.page_tokens,
+                units_per_page=group.units_per_page,
+                layer_ids=tuple(names.index(name) for name in group.layers),
+                num_kv_heads=len(heads),
+                total_kv_heads=layout.num_kv_heads,
+                kv_head_offset=heads[0],
+                head_dim=group.head_dim,
+            )
         )
 
-    layout = next(iter(layers.values()))
-    if any(value != layout for value in layers.values()):
-        raise ValueError(
-            "the worker K/V protocol requires matching per-layer head layouts"
-        )
-
-    heads = layout.head_indices
-    if heads != tuple(range(heads[0], heads[0] + len(heads))):
-        raise ValueError(
-            "the worker K/V protocol requires consecutive logical cache heads"
-        )
-
-    # FP8 storage is expressed to the layout as its compute dtype plus a
-    # per-block FP8 quantizer; the published dtype names the stored FP8 type.
-    dtype = (
-        layout.compute_dtype
-        if config.kv_cache_dtype is None
-        else getattr(torch, config.kv_cache_dtype.removeprefix("torch."))
+    # The published dtype names the stored element type: FP8 for encoded
+    # storage, otherwise the configured or compute dtype.
+    stored = (
+        torch.float8_e4m3fn
+        if fp8
+        else dtype
+        if dtype is not None
+        else layouts[planes.groups[0].layers[0]].compute_dtype
     )
-    quantizer = (
-        Quantizer("fp8", axis=0) if dtype is torch.float8_e4m3fn else None
-    )
-    fields = layout.buffers(
-        num_blocks=1,
-        block_size=config.block_size,
-        dtype=layout.compute_dtype if quantizer is not None else dtype,
-        quantizer=quantizer,
-    )
-    # One block's fields include per-block metadata (initialized flags and,
-    # with FP8, scales), so the per-token figure amortizes it and rounds up.
-    bytes_per_token = ceil_div(
-        len(layers) * sum(field.nbytes for field in fields.values()),
-        config.block_size,
-    )
-
     return KVCacheInfo(
-        block_size=config.block_size,
-        num_blocks=num_blocks,
-        num_layers=len(layers),
-        total_layers=len(names),
-        layer_offset=indexes[0],
-        num_kv_heads=len(heads),
-        total_kv_heads=layout.num_kv_heads,
-        kv_head_offset=heads[0],
-        head_dim=layout.head_dim,
-        bytes_per_token=bytes_per_token,
-        groups=(KvGroup(num_blocks, KvGroupKind.FULL, 0, 0),),
-        dtype=str(dtype).removeprefix("torch."),
+        num_units=num_units,
+        unit_bytes=planes.unit_bytes,
+        dtype=str(stored).removeprefix("torch."),
+        groups=tuple(groups),
     )
 
 
-def resize_cache(info: KVCacheInfo, num_blocks: int) -> KVCacheInfo:
-    """Attach the granted capacity to one complete physical page group.
-
-    ``info`` must carry the single group ``cache_info`` produces.
-    """
-    return replace(
-        info,
-        num_blocks=num_blocks,
-        groups=(replace(info.groups[0], num_blocks=num_blocks),),
-    )
+def resize_cache(info: KVCacheInfo, num_units: int) -> KVCacheInfo:
+    """Attach the granted unit count to a cache description."""
+    return replace(info, num_units=num_units)

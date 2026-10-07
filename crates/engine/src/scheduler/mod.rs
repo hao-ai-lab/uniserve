@@ -82,21 +82,20 @@ use crate::scheduler::generation::{
 };
 
 use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx};
-use crate::kv::{BlockPool, BlockTable, KvCacheCoordinator};
+use crate::kv::{BlockPool, BlockTable, KvAllocation, KvCacheCoordinator};
 use crate::storage::{
-    BufferPool, BufferSpan, KVCacheManager, KvAllocation, LatentPages, LatentPool, RequestPool,
-    RequestSlot,
+    BufferPool, BufferSpan, KVCacheManager, LatentPages, LatentPool, RequestPool, RequestSlot,
 };
 use crossbeam_channel::Receiver;
 use uniserve_core::{
     ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest, MediaKind,
     PositionLogprobs, Request, SharedMedia, TokenLogprob,
 };
-use uniserve_core::{BlockId, ImageIngestStep, RejectionKind, encoder_cache_key};
 use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
+use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
-    CachePageAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
+    CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
     DimBound, ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState,
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
@@ -227,9 +226,9 @@ impl TerminalIntent {
 /// or the request finishes.
 struct FlowPrefixState {
     allocations: RequestAllocations,
-    /// Pages per KV group, as `(group_id, page_ids)`, not yet declared to the
-    /// worker; the next denoising call drains them as fresh-page allocations.
-    new_pages: Vec<(u32, Vec<BlockId>)>,
+    /// Units per KV group, as `(group_id, unit_ids)`, not yet declared to the
+    /// worker; the next denoising call drains them as fresh-unit allocations.
+    new_units: Vec<(u32, Vec<UnitId>)>,
     /// Set by the first successful denoising completion. Until then every
     /// denoising call carries the prefix's block tables and, when the negative
     /// prompt is not empty, prefills it.

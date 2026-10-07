@@ -131,13 +131,13 @@ def prepare_forward(
     elif mode is ForwardMode.DECODE:
         # Indexed decode reads its token and position directly from
         # request-indexed device state instead of host-supplied values. It
-        # requires CUDA decode state beside the page tables and a tagged (I64
+        # requires CUDA decode state beside the unit tables and a tagged (I64
         # relay) predicate carrying the predecessor's device decision.
         indexed = (
             decode_state is not None
             and request_tables is not None
             and decode_state.device.type == "cuda"
-            and request_tables.page_tables.device == decode_state.device
+            and request_tables.unit_tables.device == decode_state.device
             and request.predicate is not None
             and request.predicate[1]
         )
@@ -826,16 +826,16 @@ def token_outcome(
     if request is None:
         request = state.pending_output(call.request_key.request_id)
 
-    # (request slot, cache group, accepted visible length, capacity).
+    # (request slot, accepted visible length, capacity).
     cache = calls.cache_coordinates(request, tables=request_tables)
-    initialized = cache[2]
+    initialized = cache[1]
     if request.token.draft_tokens is None:
         published_length = request.token.runtime_cache_length
         if published_length is None:
             published_length = (
                 int(task.seq_len) + int(tokens)
                 if task is not None
-                else cache[2]
+                else cache[1]
             )
         if isinstance(published_length, torch.Tensor):
             raise RuntimeError(
@@ -934,10 +934,10 @@ def token_task(
     predicate_value = request.predicate
     sampling_state = call.sampling_state or SamplingState()
 
-    # (request slot, cache group, accepted visible length, capacity).
+    # (request slot, accepted visible length, capacity).
     cache = calls.cache_coordinates(request, tables=request_tables)
-    visible = cache[2] if seq_len is None else int(seq_len)
-    if visible != cache[2]:
+    visible = cache[1] if seq_len is None else int(seq_len)
+    if visible != cache[1]:
         raise invalid_descriptor(
             "token row visibility disagrees with call metadata"
         )
@@ -948,7 +948,6 @@ def token_task(
         selection=selection,
         request_pool_idx=cache[0],
         seq_len=visible,
-        group_id=cache[1],
         write_kv=True,
         causal=True,
         request_indexed_decode=request_indexed_decode,

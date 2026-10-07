@@ -585,67 +585,48 @@ class DeviceProductTransferValue:
 
 
 @dataclass(frozen=True, slots=True)
-class KvTransfer:
-    """A published KV extent and the physical tensors that install its suffix.
+class KvGroupTransfer:
+    """One cache group's share of a KV publication.
 
-    The publication is incremental: the destination already holds `base`,
-    when set, up to `base_extent` tokens, and `tensors` carry only the tokens
-    in ``[base_extent, published_extent)``. With ``T`` those suffix tokens:
+    The tensors carry the group's tokens ``[start, published_extent)`` of the
+    enclosing `KvTransfer`: a full-attention group starts at the
+    publication's base extent, and a sliding-window group no earlier than
+    the first token its readers need. With ``T`` those tokens:
 
-    - keys and values are ``[T, layers, kv heads, head dim]`` with one dtype
-      shared by both;
-    - with ``float8_e4m3fn`` storage only, a third ``float32`` scale tensor is
-      ``[pages, 2, layers, head groups]``, where ``pages`` counts the source
-      pages of `page_size` tokens the suffix touches, the second axis selects
-      K or V, and the kv-head count is a multiple of ``head groups``.
+    - keys and values are ``[T, layers, kv heads, head dim]`` over the
+      group's layers, with one dtype shared by both;
+    - with ``float8_e4m3fn`` storage only, a third ``float32`` scale tensor
+      is ``[pages, 2, layers, head groups]``, where ``pages`` counts the
+      source pages of `page_tokens` tokens the carried tokens touch (the
+      first one holds ``start``), the second axis selects K or V, and the
+      kv-head count is a multiple of ``head groups``.
 
-    An unchanged extent carries no tensors. `compute_dtype` is the precision
-    used when reading quantized source pages. `__post_init__` does not check
-    the descriptor size bound; the output commit in
-    `uniserve_worker.execution.commit` and `Batch.validate` run
-    `encoded_size_bound`. The worker-ipc crate's `KvTransfer::validate`
-    checks the same relations and the size bound in the crate's codec.
+    A group that carries no token has no tensors.
     """
 
+    start: int
+    page_tokens: int
     tensors: tuple[TensorTransfer, ...]
-    source: identity.BufferId
-    destination: str
-    base: identity.BufferId | None
-    base_extent: int
-    published_extent: int
-    group_id: int
-    compute_dtype: str
-    page_size: int
 
-    def __post_init__(self) -> None:
-        """Validate the extent, base identity, dtypes, and tensor layout."""
-        if (
-            not self.destination
-            or self.base_extent < 0
-            or self.published_extent < self.base_extent
-        ):
-            raise invalid_descriptor(
-                "KV publication extent or destination is invalid"
-            )
-        if self.base is None and self.base_extent != 0:
-            raise invalid_descriptor(
-                "KV publication base identity disagrees with its extent"
-            )
-        if (
-            self.group_id < 0
-            or self.page_size < 1
-            or self.compute_dtype
-            not in {"float16", "bfloat16", "float32", "float64"}
-        ):
-            raise invalid_descriptor(
-                "KV publication storage identity is invalid"
-            )
+    def validate(self, base_extent: int, published_extent: int) -> None:
+        """Validate the carried interval and tensor layout.
 
-        suffix = self.published_extent - self.base_extent
-        if not suffix:
+        Raises:
+            WorkerError: `invalid_descriptor` when the interval lies outside
+                ``[base_extent, published_extent]``, the tensors disagree
+                with it, or the K/V/scale geometry is invalid.
+        """
+        if (
+            self.page_tokens < 1
+            or not base_extent <= self.start <= published_extent
+        ):
+            raise invalid_descriptor("KV group transfer interval is invalid")
+
+        carried = published_extent - self.start
+        if not carried:
             if self.tensors:
                 raise invalid_descriptor(
-                    "empty KV suffix carries physical tensors"
+                    "empty KV group interval carries physical tensors"
                 )
             return
 
@@ -654,11 +635,11 @@ class KvTransfer:
                 "KV publication requires raw keys, values and optional scales"
             )
 
-        # Key and value tensors are [suffix tokens, layers, heads, head dim].
+        # Key and value tensors are [carried tokens, layers, heads, head dim].
         key, value = self.tensors[:2]
         if (
             len(key.shape) != 4
-            or key.shape[0] != suffix
+            or key.shape[0] != carried
             or value.shape != key.shape
             or value.dtype != key.dtype
             or key.dtype
@@ -683,12 +664,12 @@ class KvTransfer:
         if quantized:
             scales = self.tensors[2]
             # Scale rows cover whole source pages, from the page holding
-            # base_extent through the page holding the last suffix token, so
+            # ``start`` through the page holding the last carried token, so
             # tokens already installed on a partially filled boundary page
             # count toward the page total.
             pages = (
-                self.base_extent % self.page_size + suffix + self.page_size - 1
-            ) // self.page_size
+                self.start % self.page_tokens + carried + self.page_tokens - 1
+            ) // self.page_tokens
             if (
                 scales.dtype != "float32"
                 or len(scales.shape) != 4
@@ -715,20 +696,106 @@ class KvTransfer:
 
     @classmethod
     def from_mapping(
-        cls, value: object, where: str = "kv_transfer"
-    ) -> KvTransfer:
-        """Decode source identity and physical cache representation.
-
-        Absent ``base_extent``, ``published_extent``, and ``group_id`` decode
-        as zero.
-        """
+        cls, value: object, where: str = "kv_group_transfer"
+    ) -> KvGroupTransfer:
+        """Decode one group's carried interval and tensors."""
         data = _map(value, where)
-        raw_base = data.get("base")
         return cls(
+            start=_uint(data.get("start"), f"{where}.start"),
+            page_tokens=_uint(data.get("page_tokens"), f"{where}.page_tokens"),
             tensors=tuple(
                 TensorTransfer.from_mapping(item, f"{where}.tensors[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("tensors"), f"{where}.tensors")
+                )
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Encode one group's carried interval and tensors."""
+        return {
+            "start": self.start,
+            "page_tokens": self.page_tokens,
+            "tensors": [tensor.to_mapping() for tensor in self.tensors],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class KvTransfer:
+    """A published KV extent and the physical tensors that install its suffix.
+
+    The publication is incremental: the destination already holds `base`,
+    when set, up to `base_extent` tokens, and each of `groups` carries only
+    its tokens from its `KvGroupTransfer.start` on. An unchanged extent
+    carries no groups; otherwise there is one entry per cache group, in
+    table order. `compute_dtype` is the precision used when reading
+    quantized source pages. `__post_init__` does not check the descriptor
+    size bound; the output commit in `uniserve_worker.execution.commit` and
+    `Batch.validate` run `encoded_size_bound`. The worker-ipc crate's
+    `KvTransfer::validate` checks the same relations and the size bound in
+    the crate's codec.
+    """
+
+    groups: tuple[KvGroupTransfer, ...]
+    source: identity.BufferId
+    destination: str
+    base: identity.BufferId | None
+    base_extent: int
+    published_extent: int
+    compute_dtype: str
+
+    def __post_init__(self) -> None:
+        """Validate the extent, base identity, dtype, and every group."""
+        if (
+            not self.destination
+            or self.base_extent < 0
+            or self.published_extent < self.base_extent
+        ):
+            raise invalid_descriptor(
+                "KV publication extent or destination is invalid"
+            )
+        if self.base is None and self.base_extent != 0:
+            raise invalid_descriptor(
+                "KV publication base identity disagrees with its extent"
+            )
+        if self.compute_dtype not in {
+            "float16",
+            "bfloat16",
+            "float32",
+            "float64",
+        }:
+            raise invalid_descriptor(
+                "KV publication storage identity is invalid"
+            )
+        if bool(self.groups) != (self.published_extent > self.base_extent):
+            raise invalid_descriptor(
+                "KV group presence disagrees with its incremental extent"
+            )
+        for group in self.groups:
+            group.validate(self.base_extent, self.published_extent)
+
+    @property
+    def tensors(self) -> tuple[TensorTransfer, ...]:
+        """Every group's published tensors, in group order."""
+        return tuple(
+            tensor for group in self.groups for tensor in group.tensors
+        )
+
+    @classmethod
+    def from_mapping(
+        cls, value: object, where: str = "kv_transfer"
+    ) -> KvTransfer:
+        """Decode source identity and every group's physical representation.
+
+        Absent ``base_extent`` and ``published_extent`` decode as zero.
+        """
+        data = _map(value, where)
+        raw_base = data.get("base")
+        return cls(
+            groups=tuple(
+                KvGroupTransfer.from_mapping(item, f"{where}.groups[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("groups"), f"{where}.groups")
                 )
             ),
             source=identity.BufferId.from_mapping(
@@ -747,32 +814,28 @@ class KvTransfer:
                 data.get("published_extent", 0),
                 f"{where}.published_extent",
             ),
-            group_id=_uint(data.get("group_id", 0), f"{where}.group_id"),
             compute_dtype=_str(
                 data.get("compute_dtype"), f"{where}.compute_dtype"
             ),
-            page_size=_uint(data.get("page_size"), f"{where}.page_size"),
         )
 
     def to_mapping(self) -> dict[str, object]:
         """Encode the cache publication without a generic product envelope."""
         return {
-            "tensors": [tensor.to_mapping() for tensor in self.tensors],
+            "groups": [group.to_mapping() for group in self.groups],
             "source": self.source.to_mapping(),
             "destination": self.destination,
             "base": None if self.base is None else self.base.to_mapping(),
             "base_extent": self.base_extent,
             "published_extent": self.published_extent,
-            "group_id": self.group_id,
             "compute_dtype": self.compute_dtype,
-            "page_size": self.page_size,
         }
 
     def encoded_size_bound(self) -> int:
         """Return the estimated descriptor size, enforcing the handle bound.
 
-        The estimate covers every page and scale locator plus the publication
-        metadata, and parallels the worker-ipc crate's
+        The estimate covers every page and scale locator of every group plus
+        the publication metadata, and parallels the worker-ipc crate's
         `KvTransfer::encoded_size_bound`.
 
         Raises:
@@ -782,6 +845,7 @@ class KvTransfer:
         """
         size = (
             _tensor_transfers_size(self.tensors)
+            + 32 * len(self.groups)
             + len(self.destination.encode())
             + len(self.compute_dtype.encode())
         )

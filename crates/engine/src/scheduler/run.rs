@@ -233,8 +233,8 @@ impl Scheduler {
         // Storage and scheduler statistics share the resolved worker capacities.
         let cache = KVCacheManager::from_worker_info(&info);
         let stats = Arc::new(SchedulerStats::default());
-        stats.kv_cache.num_blocks.store(
-            cache.as_ref().map_or(0, |state| state.usable_blocks),
+        stats.kv_cache.num_units.store(
+            cache.as_ref().map_or(0, KVCacheManager::usable_units),
             Ordering::Relaxed,
         );
 
@@ -256,7 +256,7 @@ impl Scheduler {
                 reserved_encoder_entries: 0,
                 request_pool: RequestPool::new(info.request_slots as usize),
                 latent_pool: LatentPool::new(info.latent_pages, info.latent_page_units),
-                reserved_blocks: 0,
+                reserved_units: 0,
                 buffer_pool: BufferPool::new(info.buffer_pool_bytes),
                 media_storage,
                 encoder_buffers: HashMap::new(),

@@ -220,9 +220,12 @@ pub(crate) struct SharedRuntimeArgs {
     /// or both joined by `+` with the device mechanism first (`cuda_vmm+shm`).
     #[arg(long)]
     pub transfer: Option<TransferConfig>,
-    /// KV block size in tokens (the page size).
-    #[arg(long = "page-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
-    pub block_size: u32,
+    /// Tokens per KV page of the cache group with the widest token rows, a
+    /// power of two; every other group's page holds as many tokens as fit
+    /// the same unit plane. Unset, the worker chooses the largest size, at
+    /// most 64, whose pages its attention kernels read in every cache group.
+    #[arg(long = "page-size", value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
+    pub block_size: Option<u32>,
     /// This instance's host identity. Ranks are placed on it by name, and the
     /// engine owns exactly the ranks whose node matches it.
     #[arg(long = "host-identity", default_value = "localhost")]

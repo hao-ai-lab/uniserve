@@ -42,9 +42,14 @@ def test_worker_info_reports_schedulable_work_and_bounds(
         "kv_publish",
         "kv_install",
     }
-    assert info["kv_cache"]["num_layers"] > 0
-    assert info["kv_cache"]["num_kv_heads"] > 0
-    assert info["kv_cache"]["head_dim"] > 0
+    assert info["kv_cache"]["num_units"] > 1
+    assert info["kv_cache"]["unit_bytes"] > 0
+    assert all(
+        group["layer_ids"]
+        and group["num_kv_heads"] > 0
+        and group["head_dim"] > 0
+        for group in info["kv_cache"]["groups"]
+    )
     assert info["max_batch_calls"] > 0
     assert info["max_unresolved_calls"] > 0
     assert info["request_slots"] > 0

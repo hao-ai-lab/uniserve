@@ -411,27 +411,125 @@ fn tensor_elements(shape: &[u64]) -> ValidationResult<u64> {
     })
 }
 
-/// A published KV extent and the physical tensors needed to install its suffix.
+/// One cache group's share of a KV publication.
 ///
-/// The publication is incremental: the destination already holds `base`, when
-/// set, up to `base_extent` tokens, and the tensors carry only the tokens in
-/// `[base_extent, published_extent)`. With `T = published_extent -
-/// base_extent` tokens, the tensors use this layout, whose shape relations
-/// [`KvTransfer::validate`] checks:
+/// The tensors carry the group's tokens `[start, published_extent)` of the
+/// enclosing [`KvTransfer`]. A full-attention group starts at the
+/// publication's `base_extent`; a sliding-window group starts no earlier than
+/// the first token its readers need, so it never carries retired history.
+/// With `T = published_extent - start`, the tensors use this layout, whose
+/// shape relations [`KvTransfer::validate`] checks:
 ///
-/// - keys and values: `[T, layers, kv heads, head dim]`, one dtype shared by
-///   both (`float16`, `bfloat16`, `float32`, `float64`, or `float8_e4m3fn`);
+/// - keys and values: `[T, layers, kv heads, head dim]` over the group's
+///   layers, one dtype shared by both (`float16`, `bfloat16`, `float32`,
+///   `float64`, or `float8_e4m3fn`);
 /// - with `float8_e4m3fn` only, a third `float32` scale tensor
 ///   `[pages, 2, layers, head groups]`, where `pages` counts the source pages
-///   the suffix touches (the first one holds `base_extent`), the second axis
+///   the carried tokens touch (the first one holds `start`), the second axis
 ///   selects K or V, and the kv-head count is a multiple of `head groups`.
 ///
-/// An unchanged extent (`published_extent == base_extent`) carries no tensors.
+/// A group that carries no token (`start == published_extent`) has no
+/// tensors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvTransfer {
+pub struct KvGroupTransfer {
+    /// First absolute token the tensors carry.
+    pub start: u32,
+    /// Tokens per source page. With quantized storage it also determines how
+    /// many scale rows the carried tokens span.
+    pub page_tokens: u32,
     /// Published KV tensors: keys, values, and scales when the storage is
     /// quantized, in that order.
     pub tensors: Vec<TensorTransfer>,
+}
+
+impl KvGroupTransfer {
+    /// Validates the carried interval and the raw K/V/scale geometry.
+    fn validate(&self, base_extent: u32, published_extent: u32) -> ValidationResult<()> {
+        let Self {
+            start,
+            page_tokens,
+            tensors,
+        } = self;
+        ensure_valid!(
+            *page_tokens > 0 && base_extent <= *start && *start <= published_extent,
+            "KV group transfer interval is invalid"
+        );
+        ensure_valid!(
+            tensors.is_empty() == (*start == published_extent),
+            "KV group tensor presence disagrees with its carried interval"
+        );
+        if tensors.is_empty() {
+            return Ok(());
+        }
+
+        ensure_valid!(
+            matches!(tensors.len(), 2 | 3),
+            "KV transfer requires raw keys, values and optional scales"
+        );
+        let key = &tensors[0];
+        let value = &tensors[1];
+        let dtype = key
+            .locations
+            .first()
+            .map(|location| location.dtype.as_str());
+        ensure_valid!(
+            key.shape.len() == 4
+                && key.shape[0] == u64::from(published_extent - start)
+                && value.shape == key.shape
+                && value
+                    .locations
+                    .first()
+                    .map(|location| location.dtype.as_str())
+                    == dtype
+                && matches!(
+                    dtype,
+                    Some("float16" | "bfloat16" | "float32" | "float64" | "float8_e4m3fn")
+                ),
+            "KV transfer has invalid raw token/layer/head geometry"
+        );
+        let quantized = dtype == Some("float8_e4m3fn");
+        ensure_valid!(
+            (tensors.len() == 3) == quantized,
+            "KV transfer scale presence disagrees with its storage"
+        );
+        if quantized {
+            // Scale rows cover whole source pages, starting at the page that
+            // holds `start`, so a partially filled boundary page contributes
+            // its already installed tokens to the count.
+            let scales = &tensors[2];
+            let tokens = u64::from(start % page_tokens) + u64::from(published_extent - start);
+            let pages = tokens.div_ceil(u64::from(*page_tokens));
+            ensure_valid!(
+                scales.shape.len() == 4
+                    && scales.shape[..3] == [pages, 2, key.shape[1]]
+                    && scales.shape[3] > 0
+                    && key.shape[2] % scales.shape[3] == 0
+                    && scales
+                        .locations
+                        .first()
+                        .map(|location| location.dtype.as_str())
+                        == Some("float32"),
+                "KV transfer scales disagree with its source pages"
+            );
+        }
+        for tensor in tensors {
+            tensor.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// A published KV extent and the physical tensors needed to install its suffix.
+///
+/// The publication is incremental: the destination already holds `base`, when
+/// set, up to `base_extent` tokens, and each group carries only its tokens
+/// from its [`KvGroupTransfer::start`] on. An unchanged extent
+/// (`published_extent == base_extent`) carries no groups; otherwise there is
+/// one entry per cache group, in table order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvTransfer {
+    /// Published tensors of every cache group, in group order.
+    pub groups: Vec<KvGroupTransfer>,
     /// Published buffer identity represented by the publication.
     pub source: BufferId,
     /// Destination worker or pool identity.
@@ -442,36 +540,26 @@ pub struct KvTransfer {
     pub base_extent: u32,
     /// Total KV token extent represented by this publication.
     pub published_extent: u32,
-    /// KV cache group identity.
-    pub group_id: u32,
     /// Compute precision used when reading quantized source pages.
     pub compute_dtype: String,
-    /// Tokens per source page. With quantized storage it also determines how
-    /// many scale rows the suffix spans.
-    pub page_size: u32,
 }
 
 impl KvTransfer {
-    /// Validate source/base identities and raw K/V/scale geometry, including rank shards.
+    /// Validate source/base identities and every group's raw K/V/scale
+    /// geometry, including rank shards.
     ///
     /// Also bounds the descriptor by [`MAX_TRANSFER_HANDLE_BYTES`] as
     /// estimated by [`KvTransfer::encoded_size_bound`].
     pub fn validate(&self) -> ValidationResult<()> {
         let Self {
-            tensors,
+            groups,
             source,
             destination,
             base,
             base_extent,
             published_extent,
             compute_dtype,
-            page_size,
-            ..
         } = self;
-        ensure_valid!(
-            tensors.is_empty() == (published_extent == base_extent),
-            "KV tensor presence disagrees with its incremental extent"
-        );
         source.validate()?;
         if let Some(base) = base {
             base.validate()?;
@@ -482,66 +570,16 @@ impl KvTransfer {
                     compute_dtype.as_str(),
                     "float16" | "bfloat16" | "float32" | "float64"
                 )
-                && *page_size > 0
                 && *base_extent <= *published_extent
                 && (base.is_some() || *base_extent == 0),
             "KV transfer publication metadata is invalid"
         );
-        if published_extent > base_extent {
-            ensure_valid!(
-                matches!(tensors.len(), 2 | 3),
-                "KV transfer requires raw keys, values and optional scales"
-            );
-            let key = &tensors[0];
-            let value = &tensors[1];
-            let dtype = key
-                .locations
-                .first()
-                .map(|location| location.dtype.as_str());
-            ensure_valid!(
-                key.shape.len() == 4
-                    && key.shape[0] == u64::from(published_extent - base_extent)
-                    && value.shape == key.shape
-                    && value
-                        .locations
-                        .first()
-                        .map(|location| location.dtype.as_str())
-                        == dtype
-                    && matches!(
-                        dtype,
-                        Some("float16" | "bfloat16" | "float32" | "float64" | "float8_e4m3fn")
-                    ),
-                "KV transfer has invalid raw token/layer/head geometry"
-            );
-            let quantized = dtype == Some("float8_e4m3fn");
-            ensure_valid!(
-                (tensors.len() == 3) == quantized,
-                "KV transfer scale presence disagrees with its storage"
-            );
-            if quantized {
-                // Scale rows cover whole source pages, starting at the page
-                // that holds `base_extent`, so a partially filled boundary page
-                // contributes its already installed tokens to the count.
-                let scales = &tensors[2];
-                let tokens =
-                    u64::from(base_extent % page_size) + u64::from(published_extent - base_extent);
-                let pages = tokens.div_ceil(u64::from(*page_size));
-                ensure_valid!(
-                    scales.shape.len() == 4
-                        && scales.shape[..3] == [pages, 2, key.shape[1]]
-                        && scales.shape[3] > 0
-                        && key.shape[2] % scales.shape[3] == 0
-                        && scales
-                            .locations
-                            .first()
-                            .map(|location| location.dtype.as_str())
-                            == Some("float32"),
-                    "KV transfer scales disagree with its source pages"
-                );
-            }
-        }
-        for tensor in tensors {
-            tensor.validate()?;
+        ensure_valid!(
+            groups.is_empty() == (published_extent == base_extent),
+            "KV group presence disagrees with its incremental extent"
+        );
+        for group in groups {
+            group.validate(*base_extent, *published_extent)?;
         }
         ensure_valid!(
             self.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
@@ -550,11 +588,24 @@ impl KvTransfer {
         Ok(())
     }
 
+    /// Iterates over every group's published tensors in group order.
+    pub fn tensors(&self) -> impl Iterator<Item = &TensorTransfer> {
+        self.groups.iter().flat_map(|group| &group.tensors)
+    }
+
+    /// Iterates mutably over every group's published tensors in group order,
+    /// for rebinding or pruning their locators.
+    pub fn tensors_mut(&mut self) -> impl Iterator<Item = &mut TensorTransfer> {
+        self.groups.iter_mut().flat_map(|group| &mut group.tensors)
+    }
+
     /// Conservative wire size, including every shard and replica locator.
     /// The Python worker's `KvTransfer.encoded_size_bound` computes a
     /// parallel estimate.
     pub fn encoded_size_bound(&self) -> usize {
-        transfer_encoded_size(&self.tensors)
+        // Each group record adds its interval and page size to the envelope.
+        transfer_encoded_size(self.tensors())
+            .saturating_add(32usize.saturating_mul(self.groups.len()))
             .saturating_add(self.destination.len())
             .saturating_add(self.compute_dtype.len())
     }
@@ -572,13 +623,17 @@ impl KvTransfer {
                 && self.base == other.base
                 && self.base_extent == other.base_extent
                 && self.published_extent == other.published_extent
-                && self.group_id == other.group_id
                 && self.compute_dtype == other.compute_dtype
-                && self.page_size == other.page_size,
+                && self.groups.len() == other.groups.len()
+                && self.groups.iter().zip(&other.groups).all(|(left, right)| {
+                    left.start == right.start && left.page_tokens == right.page_tokens
+                }),
             "KV locations disagree on publication metadata"
         );
         let mut candidate = self.clone();
-        merge_tensor_locations(&mut candidate.tensors, &other.tensors)?;
+        for (destination, source) in candidate.groups.iter_mut().zip(&other.groups) {
+            merge_tensor_locations(&mut destination.tensors, &source.tensors)?;
+        }
         candidate.validate()?;
         *self = candidate;
         Ok(())
@@ -684,7 +739,7 @@ impl TransferHandle {
 /// worker checks its own estimate, `_tensor_transfers_size`, when it commits a
 /// call's outputs; a Python estimate below this one lets the worker emit a
 /// descriptor that this side rejects.
-fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
+fn transfer_encoded_size<'a>(tensors: impl IntoIterator<Item = &'a TensorTransfer>) -> usize {
     let mut size = 512usize;
     for tensor in tensors {
         size = size

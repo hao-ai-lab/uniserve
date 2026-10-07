@@ -397,15 +397,14 @@ def prepare_diffusion_step(
             request_tables=request_tables,
             decode_state=decode_state,
         )
-        # An entry is (pool slot, KV group, materialized prefix length, token
+        # An entry is (pool slot, materialized prefix length, token
         # capacity); the branch's prefix now extends over the committed rows.
         kv = diffusion.kv_conditioning(trajectories[index])
         entry = kv.entries[branch]
         kv.entries[branch] = (
             entry[0],
-            entry[1],
-            entry[2] + task.query_tokens,
-            entry[3],
+            entry[1] + task.query_tokens,
+            entry[2],
         )
 
     return step_inputs
