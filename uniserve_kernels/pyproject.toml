@@ -33,7 +33,7 @@ where = ["src"]
 include = ["uniserve_kernels*"]
 
 [tool.setuptools.package-data]
-uniserve_kernels = ["py.typed", "attention/vsa_native/LICENSE", "megamoe/LICENSE", "diffusion/*.json"]
+uniserve_kernels = ["py.typed", "attention/vsa_native/LICENSE", "megamoe/LICENSE", "diffusion/*.json", "deepgemm/csrc/**/*", "deepgemm/NOTICE", "deepep/csrc/**/*", "deepep/NOTICE"]
 
 [tool.uv]
 # Rebuild the compiled extensions when their sources or build target change.
@@ -44,6 +44,8 @@ cache-keys = [
   { file = "src/**/*.cu" },
   { file = "src/**/*.cuh" },
   { file = "src/**/*.h" },
+  { file = "src/**/*.hpp" },
+  { file = "src/**/*.inl" },
   { env = "UNISERVE_KERNELS_DEVICE" },
   { env = "TORCH_CUDA_ARCH_LIST" },
 ]

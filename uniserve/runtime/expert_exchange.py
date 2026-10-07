@@ -1,4 +1,4 @@
-"""Token exchange of expert-parallel layers over NVLink all-to-all.
+"""Step coordination and token exchange for distributed expert layers.
 
 An expert-parallel ``FusedMoE`` keeps a contiguous share of every layer's
 routed experts on each rank of its expert group (see
@@ -18,14 +18,17 @@ symmetric staging of the fused MegaMoE kernel
 experts and combines in one launch per layer; the step protocol below is the
 same, since that kernel pairs the ranks' launches too.
 
-``ExpertExchange`` owns one ``MoeAlltoAll`` workspace for one worker and
-expert group, shared by every expert layer and execution context of the
-worker, which run their expert layers on one stream, one after another; the
-workspace's dispatch/combine alternation serializes them. Its ranks must
-also agree on
-the order and the token capacity of every exchange, since ``MoeAlltoAll``
-pairs the ranks' calls by position and lays out its receive buffers by the
-capacity. Every forward that reaches expert layers is therefore one step:
+DeepEP provides elastic dispatch/combine with the same numerical contract.
+Its union group can separate source-only attention ranks from expert-only
+ranks. It compacts received rows, masks unused capacity and carries BF16 or
+calibrated NVFP4 states. Each microbatch owns its communication stream and
+buffer.
+
+``ExpertExchange`` owns the resources for one sequence of expert calls,
+shared by the layers and contexts running on that sequence's stream. Its
+dispatch/combine alternation serializes buffer reuse. Participating ranks
+agree on layer order and transfer capacity because the transports pair
+calls by position. Every forward reaching expert layers is therefore a step:
 ``agree`` gathers each rank's token count and capability ordinal over the
 group's host backend, selects a ready capability in cyclic order, and
 returns one transfer capacity every rank computes alike. Other capabilities
@@ -46,7 +49,7 @@ agreement vLLM makes with ``coordinate_batch_across_dp``
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -55,11 +58,14 @@ from uniserve.distributed import Communicator
 from uniserve.nn.moe import Activation
 from uniserve.quantization import QuantizedTensor, ScaleLayout
 
+if TYPE_CHECKING:
+    from .backends.moe import deepgemm, megamoe
+
 __all__ = ["ExpertExchange", "JoinGraphs"]
 
 
 class ExpertExchange:
-    """One worker's all-to-all workspace for an expert group.
+    """One invocation domain's transport resources for an expert group.
 
     Construction is collective over ``group``: every rank constructs its
     exchange at the same point of its startup, because the workspace maps
@@ -68,7 +74,18 @@ class ExpertExchange:
     process-wide. ``transport`` selects the NVLink all-to-all (``alltoall``)
     or the fused MegaMoE kernel (``megamoe``, NVFP4 experts), which also
     needs the experts' gated width ``intermediate_size`` and gate
-    ``activation``.
+    ``activation``. ``deepep`` uses elastic dispatch/combine and supports
+    symmetric or disaggregated placement; ``attention_ranks`` counts the
+    leading source-only members, or zero for symmetric expert parallelism.
+    DeepEP transports BF16 or calibrated NVFP4 states without requantization.
+    Each microbatch owns a separate exchange,
+    including its communication stream and buffer.
+
+    ``source_group`` lists the global ranks executing each local forward
+    together (for example a tensor-parallel worker). Its members must all
+    submit work before any may start that forward. Omission makes each
+    source independent; expert-only ranks have no source group. All ranks
+    must declare consistent, disjoint memberships at construction.
     """
 
     def __init__(
@@ -80,9 +97,11 @@ class ExpertExchange:
         num_experts: int,
         hidden_size: int,
         device: torch.device,
-        transport: Literal["alltoall", "megamoe"] = "alltoall",
+        transport: Literal["alltoall", "megamoe", "deepep"] = "alltoall",
         intermediate_size: int | None = None,
         activation: Activation | None = None,
+        attention_ranks: int = 0,
+        source_group: tuple[int, ...] | None = None,
     ) -> None:
         if group.size < 2 or max_tokens < 1:
             raise ValueError(
@@ -92,15 +111,65 @@ class ExpertExchange:
         self.max_tokens = max_tokens
         self.device = device
         self.transport = transport
-        self.fused = None
+        self.attention_ranks = attention_ranks
+        # The fused MegaMoE staging: the split buffer with attention ranks,
+        # otherwise the symmetric buffer; None for the other transports.
+        self.fused: deepgemm.Buffer | megamoe.MegaMoEBuffer | None = None
+        self._elastic = None
+        self.source_only = 0 <= group.rank < attention_ranks
+        # A tensor/pipeline group submits one forward together. IPC delivery
+        # can reach its members on different host turns; a partial group must
+        # join with no tokens until every member has that forward available.
+        # Membership uses global ranks, just like Communicator.ranks.
+        source_count = attention_ranks or group.size
+        if source_group is None:
+            source_group = (
+                (group.ranks[group.rank],) if group.rank < source_count else ()
+            )
+        memberships: list[tuple[int, ...] | None] = [None] * group.size
+        dist.all_gather_object(
+            memberships, tuple(source_group), group=group._require()
+        )
+        sources = set(group.ranks[:source_count])
+        for index, members in enumerate(memberships):
+            expected_source = index < source_count
+            if (
+                members is None
+                or bool(members) != expected_source
+                or len(set(members)) != len(members)
+                or not set(members) <= sources
+                or (expected_source and group.ranks[index] not in members)
+                or any(
+                    memberships[group.ranks.index(member)] != members
+                    for member in members
+                )
+            ):
+                raise ValueError(
+                    "expert sources must declare disjoint, consistent "
+                    "groups of ranks that execute each forward together"
+                )
+        self._source_groups = tuple(
+            tuple(group.ranks.index(member) for member in members)
+            for members in dict.fromkeys(memberships)
+            if members
+        )
+        if attention_ranks and transport not in {"deepep", "megamoe"}:
+            raise ValueError("disaggregated experts require a split transport")
         if transport == "megamoe":
             if intermediate_size is None or activation is None:
                 raise ValueError(
                     "the MegaMoE transport needs the experts' width and gate"
                 )
-            from uniserve.runtime.backends.moe.megamoe import MegaMoEBuffer
+            buffer_type: type[deepgemm.Buffer] | type[megamoe.MegaMoEBuffer]
+            if attention_ranks:
+                from .backends.moe.deepgemm import Buffer
 
-            self.fused = MegaMoEBuffer(
+                buffer_type = Buffer
+            else:
+                from .backends.moe.megamoe import MegaMoEBuffer
+
+                buffer_type = MegaMoEBuffer
+            self.fused = buffer_type(
                 group,
                 max_tokens=max_tokens,
                 num_experts=num_experts,
@@ -109,6 +178,22 @@ class ExpertExchange:
                 intermediate=intermediate_size,
                 activation=activation,
                 device=device,
+                **(
+                    {"attention_ranks": attention_ranks}
+                    if attention_ranks
+                    else {}
+                ),
+            )
+        elif transport == "deepep":
+            from .backends.deepep import DeepEP
+
+            self._elastic = DeepEP(
+                group,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                max_tokens=max_tokens,
+                attention_ranks=attention_ranks,
             )
         elif transport != "alltoall":
             raise ValueError(f"unknown expert transport {transport!r}")
@@ -136,8 +221,28 @@ class ExpertExchange:
         # Capabilities take turns among the ranks that currently have work.
         # All ranks derive the same ordinal from the common runner catalog.
         self.kind = -1
+        self.active = False
         # Whether the last agreement found every rank leaving the group.
         self.released = False
+        self._ready = False
+
+    def bind_microbatches(self, exchanges):
+        """Bind a shared native plan when the transport needs one."""
+        if len({id(exchange) for exchange in exchanges}) != len(exchanges):
+            raise ValueError("each microbatch requires its own expert exchange")
+        if self.transport == "megamoe" and self.attention_ranks:
+            if any(
+                exchange.transport != self.transport
+                or exchange.attention_ranks != self.attention_ranks
+                for exchange in exchanges
+            ):
+                raise ValueError(
+                    "microbatches must use the same expert transport"
+                )
+            # Attention ranks construct the split buffer, which the exchange
+            # holds until ``close``.
+            split = cast("deepgemm.Buffer", self.fused)
+            split.bind_microbatches([exchange.fused for exchange in exchanges])
 
     @staticmethod
     def _build_alltoall(group, max_tokens, top_k, num_experts, hidden, device):
@@ -170,6 +275,22 @@ class ExpertExchange:
                 ),
             )
 
+    def warmup(self, capacity: int = 0) -> int:
+        """Publish one source warmup call, or receive it on expert ranks.
+
+        All source ranks call this before each eager graph warmup. Expert
+        ranks receive the capacity and execute the same layer sequence with
+        no source tokens. Zero closes startup publication. This host control
+        operation stays outside CUDA capture and the serving step protocol.
+        """
+        if not self.attention_ranks:
+            return capacity
+        value = torch.tensor(capacity, dtype=torch.int64)
+        dist.broadcast(
+            value, src=self.group.ranks[0], group=self.group._require()
+        )
+        return int(value.item())
+
     def agree(
         self, tokens: int, *, kind: int = 0, leaving: bool = False
     ) -> int:
@@ -178,7 +299,10 @@ class ExpertExchange:
         Every rank contributes the tokens its local graph or eager forward
         sends, or zero tokens when it has no forward, over
         the group's Gloo backend; every rank then computes the same result.
-        Ready capability ordinals take turns in ascending cyclic order;
+        Only source groups whose members all have the same capability ready
+        may submit tokens. ``active`` reports whether this rank's pending
+        forward was selected; otherwise it must retain its input and join
+        with zero tokens. Ready capability ordinals take turns in cyclic order;
         ``self.kind`` identifies the selected capability after agreement. A rank
         with another capability joins with no tokens, then agrees again
         with its still-pending input. Returns zero when no rank has tokens,
@@ -195,13 +319,27 @@ class ExpertExchange:
             list(self._records.split(1)), local, group=self.group._require()
         )
         records = self._records.tolist()
-        ready = sorted({tag for count, _, tag in records if count})
-        self.released = not ready and all(left for _, left, _ in records)
+        eligible = [
+            members
+            for members in self._source_groups
+            if all(records[rank][0] for rank in members)
+            and len({records[rank][2] for rank in members}) == 1
+        ]
+        ready = sorted({records[members[0]][2] for members in eligible})
+        self.active = False
+        self.released = all(not count and left for count, left, _ in records)
         if not ready:
             return 0
 
         self.kind = next((tag for tag in ready if tag > self.kind), ready[0])
-        most = max(count for count, _, tag in records if tag == self.kind)
+        selected = {
+            rank
+            for members in eligible
+            if records[members[0]][2] == self.kind
+            for rank in members
+        }
+        self.active = self.group.rank in selected
+        most = max(records[rank][0] for rank in selected)
 
         capacity = next(
             (value for value in self.capacities if value >= most), None
@@ -214,7 +352,13 @@ class ExpertExchange:
         return capacity
 
     def begin(self, capacity: int) -> None:
-        """Open a step carrying at most ``capacity`` tokens from each rank."""
+        """Open a step carrying at most ``capacity`` tokens from each rank.
+
+        Callers prepare their numerical contexts before the first step.
+        The first expert call also waits for peers to reach that numerical
+        boundary, so preceding attention compilation cannot consume a device
+        protocol timeout. Subsequent steps require no preparation collective.
+        """
         if not 0 < capacity <= self.max_tokens:
             raise ValueError(
                 f"step capacity {capacity} is outside the exchange's "
@@ -236,6 +380,17 @@ class ExpertExchange:
         """
         if not self.capacity:
             raise RuntimeError("an expert exchange runs inside an open step")
+        if (
+            self._elastic is not None or self.attention_ranks
+        ) and not self._ready:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("warm the expert exchange before capture")
+            # Host readiness belongs immediately before communication: source
+            # ranks may compile attention before reaching their first expert.
+            dist.all_reduce(
+                torch.zeros((), dtype=torch.int32), group=self.group._require()
+            )
+            self._ready = True
         self.invoked.add(module)
 
     def dispatch(
@@ -251,18 +406,21 @@ class ExpertExchange:
 
         Returns this rank's received ``hidden [P * C, H]``, ``topk_ids
         [P * C, K]`` and ``topk_weights [P * C, K]``, where ``C`` is the step
-        capacity: row ``p * C + i`` is the ``i``-th token rank ``p`` sent
-        here. Ids of experts this rank does not hold, and of unused rows,
+        capacity. Row order is transport-owned and preserved through the
+        matching ``combine``. Ids of experts this rank does not hold, and of
+        unused rows,
         read ``invalid_expert``, which the local expert kernel skips. The
         views are workspace-backed and valid until ``combine``.
 
-        ``hidden`` is a dense ``[T, H]`` tensor or, as the NVFP4 expert
-        kernels read it, a calibrated NVFP4 ``QuantizedTensor`` with linear
+        With all-to-all, ``hidden`` is a dense ``[T, H]`` tensor or a calibrated
+        NVFP4 ``QuantizedTensor`` with linear
         block scales. An encoded row travels as its packed E2M1 values
         (``H / 2`` bytes) and E4M3 block scales (``H / 16`` bytes), 9/32 of
         its BF16 bytes, and arrives as a ``QuantizedTensor`` of the same
         quantizer and layout; its tensor scale is the static calibration
-        every rank shares, so it stays local. Every rank of a step must send
+        every rank shares, so it stays local. DeepEP carries the same encoded
+        fields through byte-valued data and packed scale channels.
+        Every rank of a step must send
         a layer's rows in one representation, since the all-to-all pairs
         the ranks' payload lists.
 
@@ -274,6 +432,12 @@ class ExpertExchange:
         self.enter(module)
         if hidden.shape[0] > self.capacity:
             raise ValueError("a rank's tokens exceed the step capacity")
+        if self._elastic is not None:
+            states, ids, weights = self._elastic.dispatch(
+                hidden, topk_ids, topk_weights, capacity=self.capacity
+            )
+            # Each numerical provider declares the sentinel its kernel skips.
+            return states, torch.where(ids < 0, invalid_expert, ids), weights
         if isinstance(hidden, QuantizedTensor):
             quantizer = hidden.quantizer
             if (
@@ -323,21 +487,39 @@ class ExpertExchange:
     def combine(self, partial: torch.Tensor, tokens: int) -> torch.Tensor:
         """Return the summed expert outputs of this rank's ``tokens`` tokens.
 
-        ``partial`` is ``[P * C, H]``: row ``p * C + i`` holds this rank's
-        experts' weighted sum for the ``i``-th token rank ``p`` sent. Each
-        token's partial sums from every rank add in FP32 and round to BF16
-        once.
+        ``partial`` is ``[P * C, H]`` in dispatch's returned row order,
+        containing this rank's weighted expert sums. The transport combines
+        them and restores the original source token order.
         """
-        output = self._alltoall.combine(
-            partial.view(self.group.size, self.capacity, partial.shape[-1]),
-            self.capacity,
-            payload_in_workspace=False,
-            output_dtype=partial.dtype,
-            use_low_precision=False,
-        )
+        if self._elastic is not None:
+            output = self._elastic.combine(partial)
+        else:
+            output = self._alltoall.combine(
+                partial.view(self.group.size, self.capacity, partial.shape[-1]),
+                self.capacity,
+                payload_in_workspace=False,
+                output_dtype=partial.dtype,
+                use_low_precision=False,
+            )
         if output.shape[0] != tokens:
             raise RuntimeError("the combine returned another token count")
         return output
+
+    def close(self) -> None:
+        """Release owned transport resources after contexts and graphs retire.
+
+        DeepEP teardown is collective. The caller drains outstanding work
+        first and leaves collective resources alive on distributed failure.
+        FlashInfer's all-to-all allocation is cached by that provider.
+        """
+        if self._elastic is not None:
+            self._elastic.close()
+            self._elastic = None
+        if self.fused is not None and self.attention_ranks:
+            # Attention ranks construct the split buffer; the symmetric
+            # buffer has no collective retirement of its own.
+            cast("deepgemm.Buffer", self.fused).close()
+            self.fused = None
 
 
 class JoinGraphs:
@@ -368,6 +550,7 @@ class JoinGraphs:
         capacities,
         *,
         pools=None,
+        step=None,
     ) -> None:
         from .cuda_graph import CUDAGraph
 
@@ -376,6 +559,8 @@ class JoinGraphs:
             for capacity in sorted(frozenset(capacities), reverse=True):
 
                 def join(capacity=capacity):
+                    if step is not None:
+                        return step(capacity)
                     exchange.begin(capacity)
                     try:
                         context.join_expert_layers()
