@@ -99,12 +99,12 @@ def freeze_corpus(source: Path, output: Path, *, seed: int = 20260925) -> dict:
     }
     if any(len(cell) != 16 for cell in cells.values()):
         raise ValueError("throughput requires 16 unique requests per shape")
-    for cell in cells.values():
-        rng.shuffle(cell)
+    for requests in cells.values():
+        rng.shuffle(requests)
     for repetition in range(3):
         selected = []
-        for index, shape in enumerate(SHAPES):
-            count = 6 if index // 2 == repetition else 5
+        for position, shape in enumerate(SHAPES):
+            count = 6 if position // 2 == repetition else 5
             selected.extend(cells[shape][:count])
             del cells[shape][:count]
         rng.shuffle(selected)
@@ -137,7 +137,8 @@ def freeze_corpus(source: Path, output: Path, *, seed: int = 20260925) -> dict:
         raise ValueError("unassigned corpus rows")
 
     output.mkdir(parents=True, exist_ok=False)
-    index = {"seed": seed, "manifests": {}}
+    manifests: dict[str, dict[str, object]] = {}
+    index = {"seed": seed, "manifests": manifests}
     for name, selected in groups.items():
         for order, row in enumerate(selected):
             row["metadata"]["execution_order"] = order
@@ -146,7 +147,7 @@ def freeze_corpus(source: Path, output: Path, *, seed: int = 20260925) -> dict:
         ).encode()
         path = output / f"{name}.jsonl"
         path.write_bytes(data)
-        index["manifests"][name] = {
+        manifests[name] = {
             "path": str(path.resolve()),
             "count": len(selected),
             "sha256": hashlib.sha256(data).hexdigest(),

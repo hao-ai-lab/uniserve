@@ -1166,10 +1166,8 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     // Fields of the other response kinds must carry no data: `info` and the
     // error fields below must be absent or `None`, and `calls` may also be an
     // empty list.
-    for key in [intern!(py, "info")] {
-        if !absent_or_none(dict, key)? {
-            return None;
-        }
+    if !absent_or_none(dict, intern!(py, "info"))? {
+        return None;
     }
     let report = run_result_from_py(&get(dict, intern!(py, "result"))?)?;
     let identities = error_calls_from_py(dict)?;

@@ -601,7 +601,8 @@ class DiffusionRunner(ModelRunner):
         Staging views the runner's shared staging: a replay gathers the
         slot's banked state into it before any read.
         """
-        bucket = self.buckets.get(ladder.layout)
+        # This runner stores only ladder buckets, created here.
+        bucket = cast(LadderBucket | None, self.buckets.get(ladder.layout))
         if bucket is None:
             staging = cast(TensorBuffers, self._staging)
             stages = staging.view(
@@ -631,7 +632,7 @@ class DiffusionRunner(ModelRunner):
             raise ValueError(
                 "a ladder's structure differs from its layout's captured steps"
             )
-        return cast(LadderBucket, bucket)
+        return bucket
 
     def _row_value(self, bank: int, pages: tuple[int, ...]) -> torch.Tensor:
         """Return the pool rows one step reads and writes, [2, pages] int64.
@@ -797,7 +798,7 @@ class DiffusionRunner(ModelRunner):
             raise ValueError("the ladder was bound by another runner")
         entry = self.layout(ladder.layout)
         live = ladder.inputs[index]
-        bucket = self.buckets.get(ladder.layout)
+        bucket = cast(LadderBucket | None, self.buckets.get(ladder.layout))
         graph = None if bucket is None else bucket.graphs.get(None)
         if self.captures and graph is None:
             raise RuntimeError(
