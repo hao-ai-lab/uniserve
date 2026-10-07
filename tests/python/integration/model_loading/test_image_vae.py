@@ -33,6 +33,8 @@ def _checkpoint(root):
         use_quant_conv=False,
         use_post_quant_conv=False,
     ).eval()
+    # The test compares both autoencoders in float64.
+    reference.double()
     # Serialize the independently initialized model in the FLUX source format.
     tensors = {}
     for name, value in reference.state_dict().items():
@@ -92,9 +94,16 @@ def test_posterior_and_reconstruction_match_flux_checkpoint(tmp_path):
             ),
         ),
         device="cpu",
-        weights=weights.Config(dtype=torch.float32),
+        weights=weights.Config(dtype=torch.float64),
     ).model
-    pixels = torch.randn(2, 3, 8, 12)
+
+    # Both autoencoders evaluate the same equations with different kernels
+    # (a fused 1x1 QKV convolution here, separate linear projections in
+    # diffusers), so their float32 results differ by accumulation-order
+    # roundoff that depends on the platform's CPU kernels. Comparing in float64
+    # keeps that roundoff far below the default float64 tolerances, so the
+    # comparison checks the equations rather than the kernels.
+    pixels = torch.randn(2, 3, 8, 12, dtype=torch.float64)
     with torch.no_grad():
         posterior = reference.encode(pixels).latent_dist
         expected = 0.5 * (
@@ -103,16 +112,12 @@ def test_posterior_and_reconstruction_match_flux_checkpoint(tmp_path):
         latents = model.encode(
             pixels, generator=torch.Generator().manual_seed(8)
         )
-        torch.testing.assert_close(latents, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(latents, expected)
         reconstructed = reference.decode(latents / 0.5 + 0.25).sample
-        torch.testing.assert_close(
-            model.decode(latents), reconstructed, rtol=1e-5, atol=1e-6
-        )
+        torch.testing.assert_close(model.decode(latents), reconstructed)
         torch.testing.assert_close(
             model(pixels, generator=torch.Generator().manual_seed(8)),
             reconstructed,
-            rtol=1e-5,
-            atol=1e-6,
         )
 
         codec = PatchAutoencoder(
@@ -132,11 +137,9 @@ def test_posterior_and_reconstruction_match_flux_checkpoint(tmp_path):
         restored = codec.unpatchify(patches, image.Config(8, 12))
         torch.testing.assert_close(restored, latents.bfloat16(), rtol=0, atol=0)
         expected_pixels = (
-            reference.decode(restored.float() / 0.5 + 0.25).sample * 0.5 + 0.5
+            reference.decode(restored.double() / 0.5 + 0.25).sample * 0.5 + 0.5
         ).clamp(0, 1)
         torch.testing.assert_close(
             codec.decode(patches, image.Config(8, 12)),
             expected_pixels,
-            rtol=1e-5,
-            atol=1e-6,
         )
