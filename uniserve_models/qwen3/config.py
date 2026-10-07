@@ -28,6 +28,9 @@ class Config:
     dense ``GatedMLP`` of width ``intermediate_size`` in every layer; a
     positive value builds an ``MoE`` in every layer, routing each token to
     ``num_experts_per_tok`` experts of width ``moe_intermediate_size``.
+    ``mrope_sections`` gives the interleaved multimodal rotary widths of a
+    Qwen3-VL language model (``MRotaryEmbedding``'s ``sections``); Qwen3
+    checkpoints rotate one position axis and leave it None.
 
     Raises:
         ValueError: From ``__post_init__`` when a field has the wrong type or
@@ -52,6 +55,7 @@ class Config:
     num_experts: int
     num_experts_per_tok: int
     moe_intermediate_size: int
+    mrope_sections: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -105,6 +109,17 @@ class Config:
         for name in ("attention_bias", "tie_word_embeddings"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"Qwen3 {name} must be boolean")
+
+        sections = self.mrope_sections
+        if sections is not None and (
+            not isinstance(sections, tuple)
+            or any(type(width) is not int or width < 1 for width in sections)
+            or sum(sections) != self.head_dim // 2
+        ):
+            raise ValueError(
+                "Qwen3 mrope_sections must be positive widths summing to "
+                "half the head dimension"
+            )
 
         # These are the aliases ``transformer._activation`` maps onto the
         # gated MLP's activation kernels.

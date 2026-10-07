@@ -328,3 +328,96 @@ class RotaryEmbedding(nn.Module):
         )
         for name, value in zip(("cos", "sin"), values, strict=True):
             _result(value, out[name])
+
+
+def _interleaved_axes(sections: tuple[int, ...]) -> tuple[int, ...]:
+    """Assign each compact frequency to its multimodal position axis.
+
+    Interleaved M-RoPE (Qwen3-VL) cycles the axes over the frequencies:
+    frequency ``j`` rotates by axis ``a = j % len(sections)`` while
+    ``j < sections[a] * len(sections)``; axis 0 takes every remaining
+    frequency. Each axis therefore receives exactly its section width, and
+    every axis keeps frequencies from the whole spectrum.
+    """
+    count = len(sections)
+    axes = []
+    for frequency in range(sum(sections)):
+        axis = frequency % count
+        axes.append(axis if frequency < sections[axis] * count else 0)
+    return tuple(axes)
+
+
+class MRotaryEmbedding(nn.Module):
+    """Produce multimodal rotary (M-RoPE) factors from per-axis coordinates.
+
+    A token carries one coordinate per position axis, such as (temporal,
+    height, width). ``rotary`` defines the frequency recipe; each of its
+    compact frequencies rotates by the coordinate of the axis that Qwen3-VL's
+    interleaved assignment gives it (``_interleaved_axes``), so axis ``a``
+    owns ``sections[a]`` frequencies drawn from the whole spectrum.
+
+    ``forward`` takes ``[axes, tokens]`` coordinates, or ``[tokens]`` for
+    tokens whose axes share one coordinate, as text tokens do. Such tokens
+    receive exactly ``rotary``'s one-dimensional factors, since selecting
+    among equal per-axis factors copies them.
+    """
+
+    def __init__(self, rotary: RotaryEmbedding, sections: tuple[int, ...]):
+        super().__init__()
+        if (
+            not isinstance(sections, tuple)
+            or len(sections) < 2
+            or any(type(width) is not int or width < 1 for width in sections)
+            or sum(sections) != rotary.dim // 2
+            or tuple(
+                _interleaved_axes(sections).count(axis)
+                for axis in range(len(sections))
+            )
+            != sections
+        ):
+            raise ValueError(
+                "M-RoPE sections must be positive widths partitioning every "
+                "interleaved rotary frequency"
+            )
+        self.rotary = rotary
+        self.sections = sections
+        # [dim / 2] position axis of each compact frequency. Like the
+        # recipe's frequencies, it stays a real tensor under meta model
+        # construction and moves with the module when loading.
+        self.register_buffer(
+            "frequency_axes",
+            torch.tensor(
+                _interleaved_axes(sections),
+                dtype=torch.int64,
+                device=rotary.inv_freq.device,
+            ),
+            persistent=False,
+        )
+
+    @torch.no_grad()
+    def forward(self, positions, *, dtype: torch.dtype, sequence_length: int):
+        """Return ``(cos, sin)`` factors of shape [tokens, dim / 2].
+
+        Raises:
+            ValueError: ``positions`` is neither ``[tokens]`` nor
+                ``[len(sections), tokens]``.
+        """
+        if positions.ndim == 1:
+            return self.rotary(
+                positions, dtype=dtype, sequence_length=sequence_length
+            )
+        if positions.ndim != 2 or positions.shape[0] != len(self.sections):
+            raise ValueError(
+                "M-RoPE positions are [tokens] or one row of [tokens] "
+                "coordinates per section"
+            )
+
+        # [axes, tokens, dim / 2] factors of every axis's coordinates; each
+        # frequency then copies the factors of the axis it rotates by.
+        cosine, sine = self.rotary(
+            positions, dtype=dtype, sequence_length=sequence_length
+        )
+        index = self.frequency_axes.to(positions.device).expand(
+            1, positions.shape[1], -1
+        )
+        return cosine.gather(0, index)[0], sine.gather(0, index)[0]

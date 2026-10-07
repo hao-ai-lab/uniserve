@@ -8,6 +8,7 @@ import torch.nn as nn
 __all__ = [
     "build_abs_positions_from_grid_hw",
     "get_flattened_position_ids_extrapolate",
+    "merged_grid_coordinates",
     "PositionEmbedding",
 ]
 
@@ -67,6 +68,37 @@ def get_flattened_position_ids_extrapolate(
     ).flatten()
 
 
+def merged_grid_coordinates(
+    height: int,
+    width: int,
+    merge: int,
+    *,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the ``(rows, columns)`` of a patch grid in merge-block order.
+
+    Encoders that merge ``merge x merge`` neighbouring patches into one output
+    token (Qwen-VL) serialize a ``height x width`` patch grid block by block:
+    blocks in raster order, and the ``merge x merge`` patches of each block in
+    raster order within it, so every merged token reads ``merge**2``
+    consecutive rows. Both results are int64 ``[height * width]`` tensors.
+
+    Raises:
+        ValueError: ``merge`` does not divide both grid sides.
+    """
+    if min(height, width, merge) < 1 or height % merge or width % merge:
+        raise ValueError("merged patch grids require whole merge blocks")
+    rows = torch.arange(height, device=device)[:, None].expand(height, width)
+    columns = torch.arange(width, device=device)[None, :].expand(height, width)
+
+    # [blocks_h, merge, blocks_w, merge] -> [blocks_h, blocks_w, merge, merge]
+    shape = (height // merge, merge, width // merge, merge)
+    return (
+        rows.reshape(shape).transpose(1, 2).flatten(),
+        columns.reshape(shape).transpose(1, 2).flatten(),
+    )
+
+
 class PositionEmbedding(nn.Module):
     """Learned position rows indexed on a fixed two-dimensional grid."""
 
@@ -85,3 +117,60 @@ class PositionEmbedding(nn.Module):
 
     def forward(self, positions: torch.Tensor) -> torch.Tensor:
         return self.weight[positions]
+
+    def interpolate(
+        self, height: int, width: int, *, merge: int = 1
+    ) -> torch.Tensor:
+        """Resample the learned grid onto a ``height x width`` patch grid.
+
+        Grid corners align with the patch grid's corners: patch row ``i``
+        samples table row ``i * (rows - 1) / (height - 1)`` (``linspace``),
+        and likewise for columns. Each patch blends its four neighbouring
+        table entries bilinearly with FP32 weights, so the result is FP32
+        ``[height * width, hidden]`` in ``merged_grid_coordinates`` order.
+        Coordinates are evaluated on the table's device, where the
+        fractional weights are taken as ``linspace`` rounds them there.
+
+        Raises:
+            ValueError: ``merge`` does not divide both grid sides.
+        """
+        device = self.weight.device
+        table_rows, table_columns = self.grid_size
+
+        # Corner-aligned sample coordinates, truncated to their lower table
+        # neighbour; the upper neighbour clamps at the last table entry.
+        sampled = []
+        for size, extent in ((height, table_rows), (width, table_columns)):
+            coordinate = torch.linspace(0, extent - 1, size, device=device)
+            lower = coordinate.int()
+            upper = (lower + 1).clamp(max=extent - 1)
+            sampled.append((lower, upper, coordinate - lower))
+        (top, bottom, vertical), (left, right, horizontal) = sampled
+
+        # [4, height, width] table indices and bilinear weights of the
+        # top-left, top-right, bottom-left and bottom-right neighbours.
+        indices = torch.stack(
+            (
+                top[:, None] * table_columns + left[None, :],
+                top[:, None] * table_columns + right[None, :],
+                bottom[:, None] * table_columns + left[None, :],
+                bottom[:, None] * table_columns + right[None, :],
+            )
+        )
+        weights = torch.stack(
+            (
+                (1 - vertical)[:, None] * (1 - horizontal)[None, :],
+                (1 - vertical)[:, None] * horizontal[None, :],
+                vertical[:, None] * (1 - horizontal)[None, :],
+                vertical[:, None] * horizontal[None, :],
+            )
+        )
+
+        rows, columns = merged_grid_coordinates(
+            height, width, merge, device=device
+        )
+        order = rows * width + columns
+        indices, weights = indices.flatten(1)[:, order], weights.flatten(1)
+        # Table rows promote to FP32 against the weights; the four
+        # neighbours are summed in FP32.
+        return (self.weight[indices] * weights[:, order, None]).sum(0)

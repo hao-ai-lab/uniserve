@@ -20,7 +20,7 @@ from torch.nn import functional as F
 
 from uniserve.loading import checkpoint, weights
 from uniserve.nn import Modulation
-from uniserve_models.qwen3.weights import parameter_sources
+from uniserve_models import qwen3_vl
 
 from . import audio_vae, video_vae
 from .conditioning import assignments as conditioning_assignments
@@ -69,15 +69,19 @@ def _transformer_names(config: TransformerConfig) -> frozenset[str]:
 def _text_names(config) -> frozenset[str]:
     from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
-    # Only tensor names matter here. The vision depth and deepstack indexes
-    # determine the vision tower's tensor names and match the H3 checkpoint's
-    # text_encoder config, so every vision tensor is declared nonresident.
+    # Only tensor names matter here; the language depth and the vision
+    # tower's depth and DeepStack blocks determine them.
     native_config = Qwen3VLConfig(
         text_config={
             source: getattr(config, target)
             for source, target in TEXT_FIELDS.items()
         },
-        vision_config={"depth": 27, "deepstack_visual_indexes": [8, 16, 24]},
+        vision_config={
+            "depth": config.vision.depth,
+            "deepstack_visual_indexes": list(
+                config.vision.deepstack_visual_indexes
+            ),
+        },
     )
     with torch.device("meta"):
         native = Qwen3VLForConditionalGeneration(native_config)
@@ -314,34 +318,17 @@ def transformer_component(model, diffusion):
     )
 
 
-def _text_component(model):
-    # The text encoder checkpoint is a Qwen3-VL model whose language model
-    # lives under ``model.language_model.``; the resident Qwen3 backbone
-    # loads from there and every other native tensor is nonresident.
-    names = {
-        "network." + target.removeprefix("backbone."): source.replace(
-            "model.", "model.language_model.", 1
-        )
-        for target, source in parameter_sources(model.network.config).items()
-        if target.startswith("backbone.")
-    }
-    parameters = dict(model.named_parameters())
-    used = {names[name] for name in parameters}
-
-    def assign(reader):
-        available = frozenset(reader.names())
-        return tuple(
-            weights.Assignment(parameter, reader.get(names[name]))
-            for name, parameter in parameters.items()
-            if names[name] in available
-        )
-
+def _text_component(model, config):
+    # The text encoder checkpoint is a whole Qwen3-VL model: the resident
+    # language-model layers and the vision tower load from it, and every
+    # other native tensor (the language head, layers past the retained
+    # depth) is nonresident.
     return weights.ModuleMapping(
         model,
         "text_encoder",
-        assign,
-        frozenset(parameters),
-        nonresident=_text_names(model.config) - used,
+        lambda reader: qwen3_vl.weights.assignments(model, reader),
+        frozenset(name for name, _ in model.named_parameters()),
+        nonresident=_text_names(config) - qwen3_vl.weights.sources(model),
     )
 
 
@@ -383,7 +370,9 @@ def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
         )
     else:
         denoiser.conditioner = None
-    components.append(_text_component(model.text_encoder))
+    components.append(
+        _text_component(model.text_encoder, model.config.text_encoder)
+    )
 
     # Only the decoder halves of both VAEs are resident.
     video, audio = model.video_decoder.decoder, model.audio_decoder.decoder

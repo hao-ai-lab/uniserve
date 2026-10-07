@@ -49,7 +49,8 @@ def weight_config(
             keyword overrides leave as None.
         attention: Denoiser attention projections: bf16, fp8 or nvfp4.
         mlp: Denoiser feed-forward projections: bf16, fp8, mxfp8 or nvfp4.
-        text_encoder: Text encoder linear layers: bf16, fp8 or nvfp4.
+        text_encoder: Text encoder language-layer linear layers: bf16, fp8
+            or nvfp4. The vision tower keeps the checkpoint's BF16.
         video_vae: Video VAE decoder projections: fp16, bf16 or nvfp4.
 
     Returns:
@@ -124,6 +125,9 @@ def weight_config(
         quantization[f"{path}.attention.output"] = encoded(attention)
         quantization[f"{path}.mlp"] = encoded(mlp)
     quantization["text_encoder"] = encoded(text_encoder)
+    # The text encoder representations were chosen for its language layers;
+    # its vision tower has no quantized representation and keeps BF16.
+    quantization["text_encoder.vision"] = None
 
     # This path names video_vae.Decoder; its ``decoder`` child is the VAE
     # transformer whose ``input`` weight dtype video_vae.Model.compute_dtype
