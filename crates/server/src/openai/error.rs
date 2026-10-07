@@ -173,22 +173,33 @@ impl IntoResponse for ApiError {
 /// Maps one canonical serving error into the OpenAI error vocabulary.
 ///
 /// Unsupported output counts or features, context limits, duplicate request
-/// IDs, and tokenization failures become invalid requests; model-resolution,
-/// engine, and output-processing failures become server errors. A
-/// tokenization failure's message appends its cause (the violated field or
-/// limit), which `ServeError::Tokenize` carries as its error source rather
-/// than in its own `Display`.
+/// IDs, input images that cannot be fetched or decoded, and tokenization
+/// failures become invalid requests; model-resolution, engine, and
+/// output-processing failures become server errors. An input-image or
+/// tokenization failure's message appends its cause (the failing image and
+/// rule, or the violated field or limit), which `ServeError::ImageInput` and
+/// `ServeError::Tokenize` carry as their error source rather than in their
+/// own `Display`.
 pub fn serve_error_to_api(error: ServeError) -> ApiError {
     match error {
         ServeError::UnsupportedOutputCount { requested, .. } => ApiError::invalid_request(
             format!("Only one output is supported, got {requested}."),
             Some("n"),
         ),
+        ServeError::UnsupportedSamplingControl {
+            control, reason, ..
+        } => ApiError::invalid_request(
+            format!("`{control}` is not supported by this model: {reason}."),
+            Some(control),
+        ),
         error @ (ServeError::UnsupportedFeature { .. }
         | ServeError::ContextLengthExceeded { .. }
         | ServeError::ContextCapacityExceeded { .. }
         | ServeError::DuplicateRequestId { .. }) => {
             ApiError::invalid_request(error.to_string(), None)
+        }
+        ServeError::ImageInput { ref source, .. } => {
+            ApiError::invalid_request(format!("{error}: {source}"), None)
         }
         ServeError::Tokenize { ref source, .. } => {
             ApiError::invalid_request(format!("{error}: {source}"), None)

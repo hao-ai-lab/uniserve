@@ -13,6 +13,7 @@ use uniserve_server::engine_client::EngineClient;
 use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
+use uniserve_server::serving::media::{ImageFetchPolicy, ImageFetcher};
 use uniserve_server::serving::{
     FinishStatus, InputProcessor, RequestLifecycleState, RequestOutput, ServedSamplingControl,
     ServingRuntime, StopCause, TextPromptRequest,
@@ -88,7 +89,8 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
     )
     .unwrap();
 
-    ServingRuntime::new(processor, client, false)
+    let images = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+    ServingRuntime::new(processor, client, images, false)
 }
 
 /// Greedy text request that may sample only `a`, so it deterministically

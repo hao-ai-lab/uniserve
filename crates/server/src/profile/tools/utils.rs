@@ -9,6 +9,14 @@ use winnow::stream::{Offset, Partial, Stream};
 
 use super::Result;
 
+/// Upper bound on a tool parser's per-stream pending buffer, in bytes.
+///
+/// A streaming parser retains the input that has not yet formed a complete
+/// event, such as an unterminated tool call. Exceeding the cap fails
+/// `ToolParser::parse_into` with a parse error instead of growing memory
+/// without bound.
+pub(super) const MAX_BUFFER_BYTES: usize = 1 << 20;
+
 /// Returns the byte length of the longest proper prefix of `token` that is also
 /// a suffix of `buffer`.
 ///

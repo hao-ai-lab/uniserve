@@ -8,7 +8,8 @@
 //!
 //! [`ServingRuntime`] owns each request from identity reservation to its terminal event. It
 //! reserves the external identifier and an engine `RequestId` in the engine client's
-//! `RequestRegistry` before preprocessing, runs model preprocessing on the blocking pool,
+//! `RequestRegistry` before preprocessing, resolves the request's image references on the
+//! async runtime ([`media::ImageFetcher`]), runs model preprocessing on the blocking pool,
 //! submits the prepared request, and wraps the engine receiver in the assembler and in
 //! lifecycle tracking (`LifecycleGuard`, `LifecycleTrackedStream`).
 //!
@@ -24,11 +25,17 @@
 mod assembly;
 /// Chat request rendering and structured output processing.
 pub mod chat;
+mod diffusion_gemma;
+pub(crate) use self::diffusion_gemma::canvas_sampling;
 mod input;
+/// Image reference resolution shared by every request path that accepts images.
+pub mod media;
 mod model;
 mod omni;
 mod preprocessing;
 mod sampling;
+/// TypeSafe System One decision readout for DiffusionGemma.
+pub mod systemone;
 #[cfg(test)]
 pub(crate) mod test_support;
 /// Text tokenization, decoding, and sampling utilities.
@@ -55,18 +62,20 @@ use thiserror::Error;
 use uniserve_core::EngineCoreOutput;
 
 pub use input::{
-    DecodeControls, ImageGenControls, ImageInput, ModalitySelection, ModelEventIdentity,
-    OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions, SamplingConfig, StopConfig,
+    DecodeControls, ImageGenControls, ModalitySelection, ModelEventIdentity, OutputDetail,
+    OutputProcessorPolicy, PromptInput, ResponseOptions, SamplingConfig, StopConfig,
     TextPromptRequest,
 };
+pub use media::ImageInput;
 pub(crate) use model::LoadedModel;
 pub use model::{
     InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ModelSupport, ServedEndpoint,
     ServedFeature, ServedModality, ServedSamplingControl, VIDEO_FPS, WorkerCapabilities,
     validate_video_capacity, video_frame_count,
 };
+pub use preprocessing::chat_image_urls;
 
-use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Qwen3ChatOutputProcessor};
+use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
 use crate::serving::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 use crate::serving::text::output::stop_string_holdback_bytes;
 use crate::serving::text::{
@@ -242,6 +251,17 @@ pub enum ServeError {
         /// Stable feature name.
         feature: &'static str,
     },
+    /// A request sets a sampling control the model's generation does not
+    /// define.
+    #[error("request `{request_id}` sets `{control}`, but {reason}")]
+    UnsupportedSamplingControl {
+        /// Identifier of the rejected request.
+        request_id: ServeRequestId,
+        /// Wire name of the control.
+        control: &'static str,
+        /// Why the model's generation has no such control.
+        reason: &'static str,
+    },
     /// The prompt exceeds the profile context limit.
     #[error(
         "request `{request_id}` has {prompt_tokens} prompt tokens, exceeding the {max_tokens}-token profile limit"
@@ -278,6 +298,15 @@ pub enum ServeError {
     /// Engine submission or streaming fails.
     #[error(transparent)]
     Engine(#[from] crate::engine_client::Error),
+    /// An input image reference cannot be fetched or decoded.
+    #[error("request `{request_id}` has an invalid input image")]
+    ImageInput {
+        /// Identifier of the rejected request.
+        request_id: ServeRequestId,
+        /// The failing reference and its cause.
+        #[source]
+        source: media::ImageListError,
+    },
     /// Request tokenization fails before engine submission.
     #[error("request `{request_id}` cannot be tokenized")]
     Tokenize {
@@ -348,6 +377,9 @@ impl From<(uniserve_core::GenerationRequest, ResponseOptions)> for Prepared {
 pub struct ServingRuntime {
     model: Arc<InputProcessor>,
     engine: Arc<EngineClient>,
+    images: media::ImageFetcher,
+    // The System One readout encoder of a model that serves the endpoint.
+    readout: Option<Arc<systemone::ReadoutEncoder>>,
     // Held only to keep the periodic logging task alive; dropping the logger aborts the task.
     _stats_logger: Option<Arc<crate::engine_client::generation::log_stats::StatsLogger>>,
     // Cumulative lifecycle counters shared with every request's lifecycle guard and assembler.
@@ -356,7 +388,14 @@ pub struct ServingRuntime {
 
 impl ServingRuntime {
     /// Creates a serving runtime for one resolved model and engine client.
-    pub fn new(model: InputProcessor, engine: Arc<EngineClient>, log_stats: bool) -> Self {
+    ///
+    /// `images` resolves the image references of every request this runtime serves.
+    pub fn new(
+        model: InputProcessor,
+        engine: Arc<EngineClient>,
+        images: media::ImageFetcher,
+        log_stats: bool,
+    ) -> Self {
         let stats_logger = log_stats.then(|| {
             Arc::new(
                 crate::engine_client::generation::log_stats::StatsLogger::start(
@@ -368,9 +407,18 @@ impl ServingRuntime {
         Self {
             model: Arc::new(model),
             engine,
+            images,
+            readout: None,
             _stats_logger: stats_logger,
             metrics: Arc::new(RuntimeLifecycleMetrics::default()),
         }
+    }
+
+    /// Serves `POST /v1/systemone` with `encoder`, prepared for this model.
+    #[must_use]
+    pub fn with_readout(mut self, encoder: systemone::ReadoutEncoder) -> Self {
+        self.readout = Some(Arc::new(encoder));
+        self
     }
 
     /// Returns the resolved model owned by this runtime.
@@ -386,6 +434,11 @@ impl ServingRuntime {
     /// Returns the engine client backing this runtime.
     pub fn engine(&self) -> &EngineClient {
         &self.engine
+    }
+
+    /// Returns the fetcher that resolves request image references.
+    pub fn image_fetcher(&self) -> &media::ImageFetcher {
+        &self.images
     }
 
     /// Returns an aggregate point-in-time metrics snapshot.
@@ -414,6 +467,9 @@ impl ServingRuntime {
     }
 
     /// Preprocesses a chat request while retaining cancellation and identity ownership.
+    ///
+    /// The `image_url` parts are fetched only for a model that accepts image input; for any
+    /// other model, preprocessing rejects them without network access.
     pub async fn generate_chat(
         &self,
         request_id: ServeRequestId,
@@ -423,15 +479,26 @@ impl ServingRuntime {
             &request,
             self.served_model_name(),
         )?;
+        let image_urls = if self.model.supports_image_input() {
+            chat_image_urls(&request)
+        } else {
+            Vec::new()
+        };
         let input_id = request_id.clone();
-        self.generate_with(
-            request_id.clone(),
+        self.generate_with(request_id.clone(), move |model| async move {
+            let images = self.images.fetch_all(image_urls).await.map_err(|source| {
+                crate::openai::serve_error_to_api(ServeError::ImageInput {
+                    request_id: input_id.clone(),
+                    source,
+                })
+            })?;
             blocking(request_id, move |model| {
                 model
-                    .preprocess_chat_request(input_id, request)
+                    .preprocess_chat_request(input_id, request, images)
                     .map(Prepared::from)
-            }),
-        )
+            })(model)
+            .await
+        })
         .await
     }
 
@@ -499,7 +566,11 @@ impl ServingRuntime {
         Ok((outline.await.ok(), stream))
     }
 
-    /// Owns the request across blocking preprocessing, submission, and public output.
+    /// Owns the request across image resolution, blocking preprocessing, submission, and
+    /// public output.
+    ///
+    /// Preprocessing resolves media on the async runtime and moves synchronous
+    /// tokenization to the blocking pool through `blocking`.
     ///
     /// Registration precedes preprocessing, so a duplicate identifier is refused before any
     /// tokenization work and a cancel or abort can target a request that is still compiling.
@@ -514,7 +585,8 @@ impl ServingRuntime {
         Preprocess: std::future::Future<Output = crate::openai::Result<Prepared>> + Send,
     {
         // `compile_us` and the lifecycle's elapsed times are measured from this instant, so
-        // time spent queued for the blocking pool counts toward compilation.
+        // image fetching and time spent queued for the blocking pool count toward
+        // compilation.
         let compile_started = Instant::now();
         let identity = self.model.event_identity();
 
@@ -646,7 +718,7 @@ impl ServingRuntime {
                             stream,
                         };
                         let output: RequestOutputStream = match output_processor {
-                            OutputProcessorPolicy::Qwen3(processor) => {
+                            OutputProcessorPolicy::Chat(processor) => {
                                 Box::pin(assemble_chat_event_stream(assembly, processor))
                             }
                             // `assemble_event_stream` applies the remaining policies as its
@@ -1881,9 +1953,12 @@ mod tests {
                     .unwrap();
                     // Boxed like the runtime boxes it, since the chat pipeline
                     // is a large future.
-                    Box::pin(assemble_chat_event_stream(input, processor))
-                        .collect::<Vec<_>>()
-                        .await
+                    Box::pin(assemble_chat_event_stream(
+                        input,
+                        crate::serving::chat::ChatOutputProcessor::Qwen3(processor),
+                    ))
+                    .collect::<Vec<_>>()
+                    .await
                 } else {
                     assemble_event_stream(input, OutputProcessorPolicy::None)
                         .collect::<Vec<_>>()
@@ -1906,6 +1981,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Tokens committed together reach the chat stream as one text delta per block, and a
+    /// stop string inside a block ends the output at the match with the tokens through the
+    /// one that completed it.
+    #[tokio::test]
+    async fn chat_output_publishes_each_committed_block_as_one_delta() {
+        let block = |text: &str| EngineCoreOutput::TextTokens {
+            ids: text.bytes().map(u32::from).collect(),
+        };
+        let tokenizer = crate::serving::test_support::configured_tokenizer();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.try_send(EngineCoreOutput::Scheduled {
+            queued_at: 1.0,
+            scheduled_at: 2.0,
+        })
+        .unwrap();
+        tx.try_send(block("first block, ")).unwrap();
+        tx.try_send(block("second one. END and more")).unwrap();
+        tx.try_send(block("never decoded")).unwrap();
+        drop(tx);
+
+        let mut request = crate::serving::chat::ChatRequest::for_test();
+        request.decode_options.stop_strings = Some(vec!["END".to_string()]);
+        let decode_options = request.decode_options.clone();
+        let processor = crate::serving::chat::Qwen3ChatOutputProcessor::new(
+            &mut request,
+            Arc::clone(&tokenizer),
+            true,
+        )
+        .unwrap();
+        let input = StreamInput {
+            request_id: "canvas-blocks".into(),
+            event_context: event_context(),
+            prompt_token_ids: vec![b'p' as u32],
+            tokenizer,
+            prompt_logprobs_requested: false,
+            generated_logprobs_requested: false,
+            emit_token_ids: false,
+            decode_options,
+            stream: EventRx::from_receiver(rx),
+        };
+        let events = Box::pin(assemble_chat_event_stream(
+            input,
+            crate::serving::chat::ChatOutputProcessor::Qwen3(processor),
+        ))
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(events.iter().all(std::result::Result::is_ok), "{events:?}");
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(RequestOutput::TextDelta { text, .. }) if !text.is_empty() => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        // The decoder holds back two bytes, one less than the stop string,
+        // until the next block rules a match in or out.
+        assert_eq!(texts, vec!["first block", ", second one. "]);
+        let usage = events.iter().find_map(|event| match event {
+            Ok(RequestOutput::Usage {
+                visible_output_tokens,
+                ..
+            }) => Some(*visible_output_tokens),
+            _ => None,
+        });
+        // The first block and the second through the `D` that completes `END`.
+        assert_eq!(usage, Some(13 + 15));
+        assert!(
+            matches!(
+                events.last(),
+                Some(Ok(RequestOutput::Finished {
+                    reason: FinishStatus::Stop { .. },
+                    ..
+                }))
+            ),
+            "{:?}",
+            events.last()
+        );
     }
 
     /// Committed image events are held back and published immediately before the next text

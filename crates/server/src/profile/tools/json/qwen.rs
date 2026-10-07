@@ -1,7 +1,7 @@
 //! Qwen XML marker configuration for the JSON tool-call parser.
 
 use super::{JsonToolCallConfig, JsonToolCallParser};
-use crate::profile::tools::{Result, Tool, ToolParserOutput};
+use crate::profile::tools::{Result, Tool, ToolParser, ToolParserOutput};
 
 /// The newlines belong to the delimiters, as in the format the Qwen3 chat
 /// template instructs and SGLang's Qwen detector matches, so a bare
@@ -43,14 +43,16 @@ impl Qwen3XmlToolParser {
             inner: JsonToolCallParser::new(QWEN_XML_CONFIG),
         }
     }
+}
 
+impl ToolParser for Qwen3XmlToolParser {
     /// Parses one text chunk into an existing output accumulator.
     ///
     /// Fails with `ToolParserError::ParsingFailed` on input outside the
     /// grammar or when the pending buffer exceeds its size cap. Events parsed
     /// before the failure remain in `output`, and `reset` returns the input
     /// that `output` does not represent.
-    pub fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
+    fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
         self.inner.parse_into(chunk, output)
     }
 
@@ -61,7 +63,7 @@ impl Qwen3XmlToolParser {
     /// and the parser resets. Fails with `ToolParserError::ParsingFailed`,
     /// leaving the state unchanged, while a published call is still open; its
     /// arguments have already been emitted.
-    pub fn finish(&mut self) -> Result<ToolParserOutput> {
+    fn finish(&mut self) -> Result<ToolParserOutput> {
         self.inner.finish()
     }
 
@@ -71,24 +73,8 @@ impl Qwen3XmlToolParser {
     /// When a call header fails to parse, this is the whole attempted call,
     /// `<tool_call>` line included. When a published call later fails, it is
     /// the input after the arguments already emitted for that call.
-    pub fn reset(&mut self) -> String {
+    fn reset(&mut self) -> String {
         self.inner.reset()
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    /// Parses one incremental text chunk.
-    pub fn parse_chunk(&mut self, chunk: &str) -> Result<ToolParserOutput> {
-        let mut output = ToolParserOutput::default();
-        self.parse_into(chunk, &mut output)?;
-        Ok(output)
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    /// Parses a complete assistant response and flushes all state.
-    pub fn parse_complete(&mut self, text: &str) -> Result<ToolParserOutput> {
-        let mut output = self.parse_chunk(text)?;
-        output.append(self.finish()?);
-        Ok(output.coalesce_calls())
     }
 }
 
@@ -99,7 +85,7 @@ mod tests {
 
     use super::Qwen3XmlToolParser;
     use crate::profile::tools::test_utils::{collect_stream, split_by_chars, test_tools};
-    use crate::profile::tools::{ToolCallDelta, ToolParserItem, ToolParserOutput};
+    use crate::profile::tools::{ToolCallDelta, ToolParser, ToolParserItem, ToolParserOutput};
 
     /// Collects the tool-call updates of `output` in order.
     fn calls(output: &ToolParserOutput) -> Vec<&ToolCallDelta> {

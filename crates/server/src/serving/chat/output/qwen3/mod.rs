@@ -5,16 +5,49 @@
 //! Qwen3 XML tool calls from the remaining visible text. A stage without a
 //! parser forwards text unchanged.
 
-mod reasoning;
-mod tool;
-
-use self::reasoning::reasoning_event_stream;
-use self::tool::tool_event_stream;
+use super::reasoning::reasoning_event_stream;
+use super::tool::tool_event_stream;
 use crate::profile::reasoning::Qwen3ReasoningParser;
 use crate::profile::tools::Qwen3XmlToolParser;
-use crate::serving::chat::{ChatRequest, ChatToolChoice};
+use crate::profile::tools::Tool;
+use crate::serving::chat::{
+    ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice, HfChatRenderer,
+};
 use crate::serving::chat::{Error, Result as ChatResult};
 use crate::serving::text::tokenizer::DynTokenizer;
+
+/// The tool-call instruction of Qwen3 chat templates: one JSON object with
+/// `name` and `arguments` inside `<tool_call>` lines, the format
+/// `Qwen3XmlToolParser` reads.
+const JSON_CALL_INSTRUCTION: &str =
+    "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
+
+/// Returns whether `renderer`'s template instructs the model to write tool
+/// calls in the format `Qwen3XmlToolParser` reads.
+///
+/// Checkpoints of the Qwen3 families share a chat-template contract but not
+/// always its tool-call format: Qwen3-Coder templates instruct XML
+/// `<function=...>` calls. Rendering one request that declares a tool
+/// observes the instruction the model actually receives, independent of how
+/// the template source escapes it. A template that cannot render tools
+/// instructs no format.
+pub fn template_instructs_json_tool_calls(renderer: &HfChatRenderer) -> bool {
+    let probe = ChatRequest {
+        messages: vec![ChatMessage::text(ChatRole::User, "probe")],
+        tools: vec![Tool {
+            name: "probe".to_owned(),
+            description: None,
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            strict: None,
+        }],
+        tool_choice: ChatToolChoice::Auto,
+        chat_options: ChatOptions::default(),
+        decode_options: crate::serving::text::TextDecodeOptions::default(),
+    };
+    renderer
+        .render(&probe)
+        .is_ok_and(|prompt| prompt.contains(JSON_CALL_INSTRUCTION))
+}
 
 /// Request-scoped Qwen3 reasoning and tool-call processor.
 pub struct Qwen3ChatOutputProcessor {

@@ -1,0 +1,195 @@
+{
+ "source": "transformers 5.14.1 / tokenizers 0.22.2, tokenizer.json SHA256 cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+ "cases": [
+  {
+   "text": "Hello, world!",
+   "token_ids": [
+    9259,
+    236764,
+    1902,
+    236888
+   ],
+   "decoded": "Hello, world!",
+   "decoded_without_special": "Hello, world!"
+  },
+  {
+   "text": "  leading and trailing spaces  ",
+   "token_ids": [
+    138,
+    26016,
+    532,
+    45330,
+    9952,
+    138
+   ],
+   "decoded": "  leading and trailing spaces  ",
+   "decoded_without_special": "  leading and trailing spaces  "
+  },
+  {
+   "text": "multiple   spaces\n\nand\tnewlines\r\n",
+   "token_ids": [
+    43819,
+    139,
+    35220,
+    108,
+    624,
+    255968,
+    208697,
+    251,
+    107
+   ],
+   "decoded": "multiple   spaces\n\nand\tnewlines\r\n",
+   "decoded_without_special": "multiple   spaces\n\nand\tnewlines\r\n"
+  },
+  {
+   "text": "Grüße aus München — naïve café",
+   "token_ids": [
+    9322,
+    236959,
+    16756,
+    5581,
+    67772,
+    2192,
+    120362,
+    33443
+   ],
+   "decoded": "Grüße aus München — naïve café",
+   "decoded_without_special": "Grüße aus München — naïve café"
+  },
+  {
+   "text": "日本語のテキストと中文混合",
+   "token_ids": [
+    94951,
+    236945,
+    95830,
+    237032,
+    55041,
+    60478
+   ],
+   "decoded": "日本語のテキストと中文混合",
+   "decoded_without_special": "日本語のテキストと中文混合"
+  },
+  {
+   "text": "emoji 🦀🔥 and rare ꙮ glyphs",
+   "token_ids": [
+    67906,
+    236743,
+    248714,
+    240785,
+    532,
+    8401,
+    236743,
+    472,
+    391,
+    412,
+    53179,
+    236751
+   ],
+   "decoded": "emoji 🦀🔥 and rare ꙮ glyphs",
+   "decoded_without_special": "emoji 🦀🔥 and rare ꙮ glyphs"
+  },
+  {
+   "text": "digits 1234567890 and 3.14159",
+   "token_ids": [
+    67161,
+    236743,
+    236770,
+    236778,
+    236800,
+    236812,
+    236810,
+    236825,
+    236832,
+    236828,
+    236819,
+    236771,
+    532,
+    236743,
+    236800,
+    236761,
+    236770,
+    236812,
+    236770,
+    236810,
+    236819
+   ],
+   "decoded": "digits 1234567890 and 3.14159",
+   "decoded_without_special": "digits 1234567890 and 3.14159"
+  },
+  {
+   "text": "1: A\n2: no\n<turn|>",
+   "token_ids": [
+    236770,
+    236787,
+    562,
+    107,
+    236778,
+    236787,
+    951,
+    107,
+    106
+   ],
+   "decoded": "1: A\n2: no\n<turn|>",
+   "decoded_without_special": "1: A\n2: no\n"
+  },
+  {
+   "text": "literal <mask> and <|image|> tokens",
+   "token_ids": [
+    82951,
+    236743,
+    4,
+    532,
+    236743,
+    258880,
+    21739
+   ],
+   "decoded": "literal <mask> and <|image|> tokens",
+   "decoded_without_special": "literal  and  tokens"
+  },
+  {
+   "text": "<|channel>thought\n<channel|>",
+   "token_ids": [
+    100,
+    45518,
+    107,
+    101
+   ],
+   "decoded": "<|channel>thought\n<channel|>",
+   "decoded_without_special": "thought\n"
+  },
+  {
+   "text": "<bos><|turn>system\n<|think|>\nBe brief.<turn|>\n<|turn>user\nHi there!\tHow are you?<turn|>\n<|turn>model\n",
+   "token_ids": [
+    2,
+    105,
+    9731,
+    107,
+    98,
+    107,
+    3912,
+    8652,
+    236761,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    993,
+    236888,
+    255968,
+    3910,
+    659,
+    611,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ],
+   "decoded": "<bos><|turn>system\n<|think|>\nBe brief.<turn|>\n<|turn>user\nHi there!\tHow are you?<turn|>\n<|turn>model\n",
+   "decoded_without_special": "system\n\nBe brief.\nuser\nHi there!\tHow are you?\nmodel\n"
+  }
+ ]
+}

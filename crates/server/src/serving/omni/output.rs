@@ -11,7 +11,7 @@
 //! it.
 
 use crate::profile::omni::{DelimitedTextPolicy, OutputFilterPolicy};
-use crate::profile::reasoning::DelimitedReasoningParser;
+use crate::profile::reasoning::{DelimitedReasoningParser, ReasoningParser as _};
 use crate::serving::text::tokenizer::DynTokenizer;
 
 /// Stateful SenseNova reasoning and visible-wrapper filter for one request.

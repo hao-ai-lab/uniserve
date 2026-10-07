@@ -1,4 +1,4 @@
-//! Converts decoded Qwen3 text into reasoning-aware assistant deltas.
+//! Converts decoded text into reasoning-aware assistant deltas.
 //!
 //! This is the first chat output stage. It maps decoded-text events onto
 //! [`AssistantEvent`]s: text becomes `Reasoning` or `Text` deltas, token
@@ -9,19 +9,19 @@ use crate::serving::text::output::DecodedTextEvent;
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
 
-use crate::profile::reasoning::{Qwen3ReasoningParser, ReasoningDelta};
+use crate::profile::reasoning::{ReasoningDelta, ReasoningParser};
 use crate::serving::chat::AssistantBlockKind;
 use crate::serving::chat::output::processor::AssistantEvent;
 use crate::serving::chat::{Error, Result};
 
 /// Reasoning-stage state; a `None` parser disables reasoning parsing.
-struct ReasoningState {
-    parser: Option<Qwen3ReasoningParser>,
+struct ReasoningState<P> {
+    parser: Option<P>,
 }
 
-impl ReasoningState {
-    /// Creates a Qwen reasoning-stream parser.
-    fn new(parser: Option<Qwen3ReasoningParser>) -> Self {
+impl<P: ReasoningParser> ReasoningState<P> {
+    /// Creates the stage state around an optional parser.
+    fn new(parser: Option<P>) -> Self {
         Self { parser }
     }
 
@@ -41,9 +41,9 @@ impl ReasoningState {
 
     /// Initializes reasoning state from the prompt token sequence.
     ///
-    /// A `<think>` or `</think>` token in the prompt suffix after the last
-    /// other special token decides whether generation starts inside a
-    /// reasoning section; without one, generation starts outside it.
+    /// A reasoning delimiter token in the prompt suffix after the last other
+    /// special token decides whether generation starts inside a reasoning
+    /// section; without one, generation starts outside it.
     fn initialize(&mut self, prompt_token_ids: &[u32]) {
         let Some(parser) = self.parser.as_mut() else {
             return;
@@ -82,9 +82,13 @@ fn push_reasoning_delta(events: &mut Vec<AssistantEvent>, delta: ReasoningDelta)
 
 #[try_stream]
 /// Converts decoded text events into a reasoning-aware event stream.
-pub async fn reasoning_event_stream(
+///
+/// One decoded delta may span several delimiters, as when a block-diffusion
+/// model commits a whole block of tokens at once; its reasoning text is
+/// emitted before its visible text.
+pub(super) async fn reasoning_event_stream(
     decoded_stream: impl futures::Stream<Item = crate::serving::text::Result<DecodedTextEvent>> + Send,
-    parser: Option<Qwen3ReasoningParser>,
+    parser: Option<impl ReasoningParser>,
     mut y: TryYielder<AssistantEvent, Error>,
 ) -> Result<()> {
     pin_mut!(decoded_stream);

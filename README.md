@@ -4,6 +4,8 @@ UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blac
 
 UniServe is a Python computation library and a Rust server. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, scheduling, request state and response assembly.
 
+The configured model descriptions are `qwen3`, `sensenova`, `bagel`, `minimax-h3`, and `diffusion-gemma`. A server process loads exactly one description and exposes one served-model identity.
+
 ## Requirements
 
 | Component | Requirement |
@@ -84,6 +86,13 @@ One replica spanning every GPU gives the lowest latency; replicas serve more req
 | `GET /v1/videos`, `GET /v1/videos/{id}` | List jobs, or read one job's state and progress |
 | `GET /v1/videos/{id}/content` | Download a completed job's MP4 |
 | `DELETE /v1/videos/{id}` | Cancel or delete a job |
+| `POST /v1/chat/completions` | Streaming and non-streaming text, image-input, image-output, and interleaved generation |
+| `POST /v1/images/generations` | Single-image generation adapter for configured omni descriptions |
+| `POST /v1/systemone` | TypeSafe System One decision readout (DiffusionGemma) |
+
+DiffusionGemma readout settings are fixed when the server starts. `--readout-canvas full` uses the checkpoint's full canvas; `compact` rounds each answer scaffold up to a multiple of 16. A numeric value, such as `--readout-canvas 64`, fixes every canvas to that length and splits larger question sets across complete canvases. Numeric lengths must be positive multiples of 16 no greater than the checkpoint's canvas length. `--readout-candidates variants` sums the supported token spellings of each answer; `primary` reads only the space-prefixed spelling (` A`, ` B`, ` yes`, ` no`, and so on). Defaults are `full` and `variants`. Canvas length and candidate selection change the returned distribution and must match between systems in a numerical or performance comparison.
+
+See the [DiffusionGemma serving guide](docs/diffusion_gemma/serving.md) for checkpoint setup, four-GPU serving, decision and chat examples, precision choices, and measurement contracts.
 
 A video request is the MiniMax-H3 request body: `model`, `prompt`, `task` (`t2va`), `target` with `short_edge` 768, `aspect_ratio` `16:9` and `duration_seconds` (4 to 15), and an optional `seed` (default 42). The [FastH3 guide](docs/fast_h3/fast_h3.md#generate-a-video) lists every field. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
 
@@ -99,17 +108,36 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--host`, `--port` | `127.0.0.1`, `8000` | TCP listener |
 | `--uds` | Unset | Unix-domain listener instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
 | `--host-identity` | `localhost` | This host's name in a multi-host deployment file |
+| `--device` | `cuda` | Worker device |
+| `--worker-ranks` | `1` | Tensor-parallel ranks in each replica when `--workers` is omitted |
+| `--data-parallel-size` | `1` | Independent replicas, each with its own scheduler, KV cache and ranks |
+| `--expert-parallel` | Off | Shard routed experts across one-rank data-parallel replicas |
+| `--expert-exchange` | `alltoall` | FlashInfer NVLink token exchange, `megamoe` fused NVFP4 dispatch/compute/combine, or `dwdp` asynchronous expert-weight prefetch |
 | `--max-video-seconds` | `15` | Longest admitted clip, from 4 to 15 seconds |
-| `--max-model-len` | `16384` | Longest admitted prompt, in tokens |
-| `--page-size` | Chosen by the worker | Base KV page size; the largest power of two up to 64 supported by every cache group's attention readers. See [paged KV ownership](docs/cache.md). |
-| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities that startup prepares |
-| `--max-running-requests` | `128`, clamped to the deployment's request slots | Concurrently resident requests |
-| `--mem-fraction-static` | `0.70` | Each worker rank's share of its device's storage |
-| `--graph-policy` | `auto` | CUDA graph capture: `auto`, `full`, or `off` |
+| `--max-model-len` | Model configuration | Context-length ceiling |
+| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities prepared at startup |
+| `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
+| `--max-total-tokens` | Runtime sizing | KV token-capacity override |
+| `--page-size` | Chosen by the worker | Base KV page size supported by every cache group's attention readers. See [paged KV ownership](docs/cache.md). |
+| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
+| `--chunked-prefill-size` | `8192` | Per-request prefill bound |
+| `--mem-fraction-static` | `0.70` | Each rank's share of device storage |
+| `--graph-policy` | `auto` | CUDA graph policy: `auto`, `full`, or `off` |
 | `--quantization-config` | `{}`, the `quality` preset | Precision preset or per-component overrides |
+| `--attention-backend` | `auto` | Attention provider selection; explicit provider names select that implementation |
 | `--api-key` | Unset | Bearer token for public routes |
-| `--request-timeout` | Unset | Seconds until a response head is sent; streamed bodies, such as video downloads, are not bounded |
+| `--request-timeout` | Unset | Seconds until response headers; streamed bodies are not bounded |
+| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation and System One requests; video requests use video job slots |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
+| `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
+| `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |
+| `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |
+| `--readout-layout` | `joint` | System One question grouping: `joint` packs questions in request order into shared canvases; `independent` gives each question its own prompt and canvas |
+| `--readout-canvas` | `full` | System One canvas length: `full` is the checkpoint's canvas length; `compact` is the smallest multiple of 16 holding the scaffold; a positive multiple of 16 fixes the length, bounded by the checkpoint's canvas |
+| `--readout-candidates` | `variants` | Sum supported answer-token spellings, or use `primary` for only the space-prefixed spelling |
+| `--diffusion-generation-config` | Checkpoint `generation_config.json` | DiffusionGemma block-diffusion sampling for every reply, as a JSON object that replaces any of `max_denoising_steps`, `entropy_bound`, `t_min`, `t_max`, `confidence_threshold`, and `stability_threshold` |
+
+On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Graphs cover every step the scheduler forms. Prefill graphs hold up to `--max-num-batched-tokens` prompt tokens (plus one image's feature tokens for models that read images) and up to 31 prompts; decode graphs hold up to 128 requests. Both hold at most `--max-running-requests` and at most as many requests as the KV pool holds a page of every cache group for. The worker reports these bounds, and the scheduler never places more requests in one prefill or decode step. A prefill or decode step that no captured graph holds fails instead of running eagerly. Larger token budgets capture more graphs, so startup takes longer. Startup also runs every image encoder and decoder once, so the `uniserve-kernel-table` line it logs names the kernel of every call the server makes. `--graph-policy off` serves every call without graphs.
 
 Run `uniserve serve --help` for the complete option set.
 
@@ -125,6 +153,20 @@ export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 ```
 
 The [FastH3 guide](docs/fast_h3/fast_h3.md#reproduce-the-measurements) lists every suite and the two-host procedure.
+
+## Text and expert parallelism
+
+For data-parallel serving, run one full replica per GPU; a model that tensor parallelism cannot split, such as DiffusionGemma, serves four GPUs this way:
+
+```bash
+uniserve serve /models/diffusiongemma-26B-A4B-it \
+  --served-model-name diffusiongemma \
+  --data-parallel-size 4
+```
+
+Adding `--expert-parallel` keeps the four replicas' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the replicas exchange tokens at each expert layer. Every expert layer then runs in steps the replicas take together: a replica without work joins each step another replica starts, and all replicas pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `--expert-exchange megamoe` fuses each expert layer's exchange and expert computation into one kernel.
+
+For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).
 
 ## Development and verification
 
@@ -147,6 +189,8 @@ UNISERVE_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2 \
   tests/python/integration/model_loading/test_h3_parallel_latents.py \
   tests/python/e2e/test_h3_parallel_http.py
 ```
+
+The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
 ## Repository layout
 

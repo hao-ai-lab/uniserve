@@ -4,11 +4,11 @@
 //! for each submitted request:
 //!
 //! - [`assemble_chat_event_stream`] serves generation requests whose output
-//!   policy is `OutputProcessorPolicy::Qwen3`, which Qwen3 models select for
-//!   chat prompts. It pulls decoded text from `decoded_text_event_stream`, runs
-//!   it through the request's `Qwen3ChatOutputProcessor` (reasoning and
-//!   tool-call parsing), and turns the resulting assistant events into
-//!   content-block and tool-call events.
+//!   policy is `OutputProcessorPolicy::Chat`, which Qwen3 and DiffusionGemma
+//!   models select for chat prompts. It pulls decoded text from
+//!   `decoded_text_event_stream`, runs it through the request's
+//!   `ChatOutputProcessor` (reasoning and tool-call parsing), and turns the
+//!   resulting assistant events into content-block and tool-call events.
 //! - [`assemble_event_stream`] serves every other generation policy (raw text
 //!   and SenseNova filtering). It decodes engine events itself, applies stop
 //!   strings, and forwards the image lifecycle of image-generating models.
@@ -22,6 +22,7 @@
 //! `EventContext::started`. The queue wait is the difference of the engine's
 //! `Scheduled` Unix timestamps, converted to microseconds and clamped at zero.
 
+use super::chat::ChatOutputProcessor;
 use super::chat::output::AssistantEvent;
 use super::chat::output::structured::OutputProcessor;
 use super::*;
@@ -37,7 +38,7 @@ enum OutputSink {
 
 /// Constructs the model-selected semantic output processor for one request.
 ///
-/// `OutputProcessorPolicy::Qwen3` never reaches this function: the dispatch in
+/// `OutputProcessorPolicy::Chat` never reaches this function: the dispatch in
 /// `submit_and_stream` routes it to [`assemble_chat_event_stream`] instead.
 ///
 /// # Errors
@@ -52,7 +53,9 @@ fn build_output_sink(
 ) -> Result<OutputSink> {
     match policy {
         OutputProcessorPolicy::None => Ok(OutputSink::Raw),
-        OutputProcessorPolicy::Qwen3(_) => unreachable!("Qwen3 uses the pull chat pipeline"),
+        OutputProcessorPolicy::Chat(_) => {
+            unreachable!("chat processors use the pull chat pipeline")
+        }
         OutputProcessorPolicy::SenseNova(output_filter) => {
             let processor = SenseNovaOutputProcessor::new(
                 output_filter,
@@ -225,7 +228,7 @@ async fn emit_terminal(
 /// stream with `ServeError::OutputProcessing`.
 pub(super) async fn assemble_chat_event_stream(
     assembly: StreamInput,
-    processor: Qwen3ChatOutputProcessor,
+    processor: ChatOutputProcessor,
     mut y: TryYielder<RequestOutput, ServeError>,
 ) -> Result<()> {
     let StreamInput {
