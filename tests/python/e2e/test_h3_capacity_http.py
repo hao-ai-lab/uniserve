@@ -98,13 +98,13 @@ def test_every_admitted_duration_and_prompt_length_replays(
     if not model or not Path(model).is_dir():
         pytest.fail(
             "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/fast_h3/fast_h3.md lists them"
+            "directory; docs/minimax_h3/minimax_h3.md lists them"
         )
     deployment = (
         Path(__file__).resolve().parents[3]
         / "configs"
-        / "fast_h3"
-        / "ulysses4.json"
+        / "minimax_h3"
+        / "fasth3-ulysses4.json"
     )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
