@@ -10,7 +10,7 @@ from typing import Generic, Literal, TypeVar
 import torch
 
 from uniserve.distributed import DeviceMesh
-from uniserve.nn.attention import AttentionInput, DenseInput
+from uniserve.nn.attention import AttentionBatch
 from uniserve.nn.routing import RouteSpan
 
 SizeT = TypeVar("SizeT")
@@ -112,13 +112,13 @@ class TextInput:
 
     input_ids: torch.Tensor
     positions: torch.Tensor
-    attention: AttentionInput
+    attention: AttentionBatch
     embeddings: EmbeddingReplacement | None = None
     routes: tuple[RouteSpan, ...] = ()
 
     @property
     def batch_size(self) -> int:
-        if isinstance(self.attention, DenseInput):
+        if self.attention.queries is None:
             return self.input_ids.shape[0] if self.input_ids.ndim == 2 else 1
         return self.attention.queries.batch_size
 

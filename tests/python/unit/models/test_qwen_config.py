@@ -12,7 +12,7 @@ from transformers import Qwen3Config, Qwen3MoeConfig
 
 from uniserve import loading
 from uniserve.model import EmbeddingReplacement, TextInput
-from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
 from uniserve_models import qwen3
 
 pytestmark = pytest.mark.unit
@@ -215,7 +215,7 @@ def test_replacement_embeddings_preserve_tokens_and_independent_head_width():
                 torch.randn(parameter.shape, generator=generator) / 8
             )
     lengths = SequenceLengths.from_lengths((3,), device="cpu")
-    attention = VarlenInput(lengths, lengths, (True,))
+    attention = AttentionBatch.single(VarlenInput(lengths, lengths, (True,)))
     ids = torch.tensor([1, 2, 3])
     positions = torch.arange(3)
     expected = model(TextInput(torch.tensor([1, 7, 3]), positions, attention))

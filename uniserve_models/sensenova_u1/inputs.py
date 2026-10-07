@@ -14,7 +14,7 @@ import torch
 
 from uniserve.media import image
 from uniserve.model import DenoiserInput as NumericalDenoiserInput
-from uniserve.nn.attention import AttentionInput, DenseInput
+from uniserve.nn.attention import AttentionBatch
 
 
 @dataclass(frozen=True)
@@ -71,7 +71,7 @@ class DenoiserInput(NumericalDenoiserInput[image.Config]):
     images: tuple[ImageConditioning, ...]
     positions: tuple[torch.Tensor, ...]
     sequence_lengths: tuple[int, ...]
-    attention: AttentionInput
+    attention: AttentionBatch
 
     def __post_init__(self):
         super().__post_init__()
@@ -93,10 +93,11 @@ class DenoiserInput(NumericalDenoiserInput[image.Config]):
                 "SenseNova image positions must cover three axes "
                 "per image token"
             )
+        queries = self.attention.queries
         if (
-            not isinstance(self.attention, DenseInput)
-            and self.attention.queries.host is not None
-            and self.attention.queries.host != self.sequence_lengths
+            queries is not None
+            and queries.host is not None
+            and queries.host != self.sequence_lengths
         ):
             raise ValueError(
                 "SenseNova attention lengths must match its image sequences"

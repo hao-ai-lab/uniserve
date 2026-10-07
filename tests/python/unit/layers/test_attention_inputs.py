@@ -6,8 +6,11 @@ import pytest
 import torch
 
 from uniserve.nn.attention import (
+    AttentionBatch,
     AttentionParallelConfig,
+    BlockTable,
     ContextParallelConfig,
+    DenseInput,
     PagedInput,
     SequenceLengths,
     Ulysses,
@@ -88,3 +91,39 @@ def test_attention_axes_are_distinct_and_context_names_its_axis():
         )
     with pytest.raises(ValueError, match="nonempty"):
         ContextParallelConfig(gather_axis="")
+
+
+def test_attention_batch_entries_share_one_query_domain():
+    queries = SequenceLengths.from_lengths((2, 1), device="cpu")
+
+    def paged(blocks):
+        return PagedInput(
+            queries,
+            SequenceLengths.from_lengths((3, 0), device="cpu"),
+            BlockTable(torch.tensor(blocks, dtype=torch.int32), 4),
+            None,
+            (True, True),
+        )
+
+    first, second = paged([[1], [2]]), paged([[5], [6]])
+    batch = AttentionBatch({0: first, 3: second}, queries)
+    assert batch.entry(3) is second
+    assert batch.batch_size == 2
+    with pytest.raises(ValueError, match="single-entry"):
+        batch.entry(None)
+    with pytest.raises(ValueError, match="no entry for cache table 1"):
+        batch.entry(1)
+
+    # Another lengths object with equal values is a different query domain.
+    other = SequenceLengths.from_lengths((2, 1), device="cpu")
+    with pytest.raises(ValueError, match="share one packed query domain"):
+        AttentionBatch({0: first}, other)
+
+
+def test_dense_attention_forms_a_singleton_batch():
+    dense = DenseInput(causal=True, mask=None)
+    batch = AttentionBatch.single(dense)
+    assert batch.entry(None) is dense
+    assert batch.queries is None and batch.batch_size is None
+    with pytest.raises(ValueError, match="singleton"):
+        AttentionBatch({0: dense, 1: dense}, None)

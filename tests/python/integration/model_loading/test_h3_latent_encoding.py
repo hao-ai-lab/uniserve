@@ -32,6 +32,7 @@ from torch.nn import functional as F
 from uniserve import loading
 from uniserve.loading import checkpoint, weights
 from uniserve.media import image, video
+from uniserve.runtime import ExecutionContext
 from uniserve_models.minimax_h3 import audio_vae, video_vae
 from uniserve_models.minimax_h3.encoding import AudioEncoder, VideoEncoder
 
@@ -267,7 +268,12 @@ def test_audio_conditioning_matches_native_posterior_mean(
         / torch.tensor(config.latents_std).view(1, 1, -1)
     ).reshape(-1, config.latent_channels)
 
-    (actual,) = encoder.encode((track,))
+    with (
+        torch.inference_mode(),
+        ExecutionContext(encoder, attention="auto") as context,
+    ):
+        context.prepare(None)
+        (actual,) = encoder.encode((track,))
     assert actual.shape == (2 * 201, 32)
     # The audio latent stays FP32 end to end; this is the FP32 tolerance of
     # the VAE loading parity tests.

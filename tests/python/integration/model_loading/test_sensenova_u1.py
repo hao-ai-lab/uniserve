@@ -10,7 +10,12 @@ from uniserve import loading
 from uniserve.loading import checkpoint, weights
 from uniserve.media import image
 from uniserve.model import LatentInput, TextInput, TextSize, VisionInput
-from uniserve.nn.attention import PagedInput, SequenceLengths, VarlenInput
+from uniserve.nn.attention import (
+    AttentionBatch,
+    PagedInput,
+    SequenceLengths,
+    VarlenInput,
+)
 from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve_models import sensenova_u1 as u1
 
@@ -174,13 +179,15 @@ def test_cached_text_matches_axial_attention_equations(tmp_path, dtype):
         ) as context:
             context.prepare(TextSize(4, 1))
             for start, stop in ((0, 3), (3, 4), (4, 4)):
-                attention = PagedInput.from_blocks(
-                    blocks=((0,),),
-                    query_lengths=(stop - start,),
-                    prefix_lengths=(start,),
-                    block_size=4,
-                    causal=True,
-                    device="cpu",
+                attention = AttentionBatch.single(
+                    PagedInput.from_blocks(
+                        blocks=((0,),),
+                        query_lengths=(stop - start,),
+                        prefix_lengths=(start,),
+                        block_size=4,
+                        causal=True,
+                        device="cpu",
+                    )
                 )
                 context.bind_attention(attention)
                 hidden = model.text(
@@ -256,7 +263,7 @@ def test_images_and_velocity_follow_independent_equations(
         (u1.ImageConditioning(pixels, grid, scale),),
         (torch.tensor([[9, 9, 9, 9], [0, 0, 1, 1], [0, 1, 0, 1]]),),
         (4,),
-        VarlenInput(lengths, lengths, (False,)),
+        AttentionBatch.single(VarlenInput(lengths, lengths, (False,))),
     )
     if worker_inputs:
         inputs = factory.bind(
@@ -264,7 +271,9 @@ def test_images_and_velocity_follow_independent_equations(
             sizes=(size,),
             timesteps=(timestep,),
             positions=(factory.positions(size, 9, device="cpu"),),
-            attention=VarlenInput(lengths, lengths, (False,)),
+            attention=AttentionBatch.single(
+                VarlenInput(lengths, lengths, (False,))
+            ),
             step=torch.zeros(1, dtype=torch.int64),
         )
     with torch.no_grad():

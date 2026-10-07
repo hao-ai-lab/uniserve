@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
 from uniserve_models.qwen3 import Config, Transformer
 
 pytestmark = pytest.mark.unit
@@ -55,7 +55,9 @@ def _forward(model, embeddings, positions):
     lengths = SequenceLengths.from_lengths(
         (length,) * batch, device=embeddings.device
     )
-    attention = VarlenInput(lengths, lengths, (True,) * batch)
+    attention = AttentionBatch.single(
+        VarlenInput(lengths, lengths, (True,) * batch)
+    )
     result = model(
         embeddings.reshape(-1, width),
         positions.expand(batch, -1).flatten(),

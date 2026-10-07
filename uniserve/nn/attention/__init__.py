@@ -4,6 +4,7 @@ configuration.
 
 from .config import AttentionParallelConfig, ContextParallelConfig, Ulysses
 from .inputs import (
+    AttentionBatch,
     AttentionInput,
     BlockTable,
     DenseInput,
@@ -17,6 +18,7 @@ from .layer import Attention
 from .projection import AxialQKVProjection, QKVProjection, RotaryQKVProjection
 
 __all__ = [
+    "AttentionBatch",
     "AttentionInput",
     "BlockTable",
     "DenseInput",

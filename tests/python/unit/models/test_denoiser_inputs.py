@@ -16,7 +16,7 @@ from tests.python.fixtures.model_metadata import neo_metadata
 from uniserve.loading import Config as IOConfig
 from uniserve.media import image
 from uniserve.model import LatentInput
-from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
 
 pytestmark = pytest.mark.unit
 
@@ -56,7 +56,9 @@ def _bind(denoiser):
         step=step,
         positions=(torch.zeros((3, length), dtype=torch.int64),),
         sequence_lengths=(length,),
-        attention=VarlenInput(lengths, lengths, (False,)),
+        attention=AttentionBatch.single(
+            VarlenInput(lengths, lengths, (False,))
+        ),
     )
     return bound, sample, size, step
 

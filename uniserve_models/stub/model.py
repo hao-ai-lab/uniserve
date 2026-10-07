@@ -26,7 +26,7 @@ from uniserve.model import (
     TransformerDecoder,
     VocabShard,
 )
-from uniserve.nn.attention import Attention, PagedInput, SegmentedInput
+from uniserve.nn.attention import Attention
 from uniserve.nn.functional import patchify
 from uniserve.nn.vae import (
     DiagonalGaussian,
@@ -131,14 +131,10 @@ class _Layer(nn.Module):
         )
 
     def forward(self, hidden, residual, positions, attention):
+        # The layer's table entry supplies the write addresses; an entry
+        # without them publishes nothing.
         values = hidden.new_zeros((hidden.shape[0], 1, 1)) + self.scale
-        if (
-            isinstance(attention, (PagedInput, SegmentedInput))
-            and attention.write_indices is not None
-        ):
-            self.attention.update_cache(
-                values, values, indices=attention.write_indices
-            )
+        self.attention.update_cache(values, values, attention)
 
         # A zero residual keeps the decoder's final ``norm(hidden +
         # residual)`` equal to the embedding digits ``_Head`` decodes.

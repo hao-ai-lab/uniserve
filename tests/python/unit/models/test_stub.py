@@ -7,7 +7,7 @@ import torch
 
 from uniserve.media import image
 from uniserve.model import LatentInput, TextInput, TextSize, VisionInput
-from uniserve.nn.attention import PagedInput
+from uniserve.nn.attention import AttentionBatch, PagedInput
 from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve_models.stub import DenoiserInput, Model
 
@@ -28,7 +28,7 @@ def test_token_cycle_projects_selected_rows_and_writes_only_supplied_slots():
         causal=True,
         device="cpu",
     )
-    inputs = TextInput(tokens, torch.arange(10), batch)
+    inputs = TextInput(tokens, torch.arange(10), AttentionBatch.single(batch))
     with PrefixCache(
         model.cache_config, num_blocks=1, block_size=16, device="cpu"
     ) as cache:
@@ -64,7 +64,14 @@ def test_token_cycle_projects_selected_rows_and_writes_only_supplied_slots():
                     value[0, 10:], torch.full_like(value[0, 10:], 7)
                 )
             state.key.fill_(3)
-            model(replace(inputs, attention=replace(batch, write_indices=None)))
+            model(
+                replace(
+                    inputs,
+                    attention=AttentionBatch.single(
+                        replace(batch, write_indices=None)
+                    ),
+                )
+            )
             torch.testing.assert_close(state.key, torch.full_like(state.key, 3))
 
 
@@ -91,7 +98,7 @@ def test_zero_velocity_preserves_each_raster_through_solver_and_decoder():
         causal=False,
         device="cpu",
     )
-    batch = replace(batch, write_indices=None)
+    batch = AttentionBatch.single(replace(batch, write_indices=None))
     for index in range(schedule.num_steps):
         inputs = DenoiserInput(
             {

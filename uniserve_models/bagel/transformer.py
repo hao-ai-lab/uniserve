@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from uniserve.model import TransformerDecoder
-from uniserve.nn.attention import Attention, AttentionInput, RotaryQKVProjection
+from uniserve.nn.attention import Attention, AttentionBatch, RotaryQKVProjection
 from uniserve.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
@@ -76,7 +76,7 @@ class TransformerLayer(nn.Module):
         hidden: RoutedTensor,
         residual: RoutedTensor | None,
         positions: torch.Tensor,
-        attention: AttentionInput,
+        attention: AttentionBatch,
         *,
         routes: tuple[RouteSpan, ...],
     ):

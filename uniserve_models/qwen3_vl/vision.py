@@ -19,7 +19,7 @@ from torch import nn
 
 from uniserve.nn.activation import get_act_fn
 from uniserve.nn.attention import Attention as ScaledAttention
-from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
 from uniserve.nn.functional import apply_rotary
 from uniserve.nn.linear import (
     ColumnParallelLinear,
@@ -61,7 +61,7 @@ class Attention(nn.Module):
         hidden: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attention: VarlenInput,
+        attention: AttentionBatch,
     ) -> torch.Tensor:
         # hidden: [patches, hidden]; q/k/v: [patches, local heads, head_dim].
         # cos/sin: compact [patches, head_dim / 2] factors rotating each head
@@ -256,7 +256,9 @@ class VisionTower(nn.Module):
             ),
             device=device,
         )
-        attention = VarlenInput(lengths, lengths, (False,) * lengths.batch_size)
+        attention = AttentionBatch.single(
+            VarlenInput(lengths, lengths, (False,) * lengths.batch_size)
+        )
 
         deepstack = []
         for index, layer in enumerate(self.layers):

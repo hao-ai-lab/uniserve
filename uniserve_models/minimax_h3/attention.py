@@ -37,7 +37,7 @@ from uniserve.nn import (
     RowParallelLinear,
     functional,
 )
-from uniserve.nn.attention import Attention, vsa
+from uniserve.nn.attention import Attention, AttentionBatch, vsa
 from uniserve.tensors import BufferConfig
 
 from .config import TransformerConfig
@@ -119,7 +119,9 @@ class Dense(nn.Module):
             axis_dims=(self.head_dim,),
             rounding=self.rounding,
         )
-        attended = self.attention(q, k, v, inputs.visible)
+        attended = self.attention(
+            q, k, v, AttentionBatch.single(inputs.visible)
+        )
         yield inputs.token_slice, self.output(attended.flatten(1))
 
     def forward(self, hidden, cos, sin, inputs, *, workspace):

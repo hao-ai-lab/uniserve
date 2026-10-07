@@ -5,11 +5,14 @@ from __future__ import annotations
 import torch
 
 
-def attention(q, k, v, batch, *, scale: float, out=None):
+def attention(
+    q, k, v, batch, *, scale: float, window: int | None = None, out=None
+):
     """Apply local attention without implicit cache allocation or collectives.
 
     Paged read-only calls pass physical K/V tensors and write_indices=None.
     Persistent cache writes use Attention bound through ExecutionContext.
+    ``window`` bounds the visible history as documented on ``Attention``.
     """
     from uniserve.model.inputs import TextSize
     from uniserve.nn.attention.inputs import DenseInput
@@ -36,6 +39,7 @@ def attention(q, k, v, batch, *, scale: float, out=None):
         "dtype": q.dtype,
         "size": size,
         "cache": None,
+        "window": window,
     }
 
     provider = resolve("auto", device=q.device)

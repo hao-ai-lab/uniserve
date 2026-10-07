@@ -12,6 +12,7 @@ from uniserve.distributed import DeviceMesh, parallelize_
 from uniserve.model import TextSize
 from uniserve.nn.attention import (
     Attention,
+    AttentionBatch,
     AttentionParallelConfig,
     PagedInput,
     Ulysses,
@@ -75,13 +76,15 @@ def _run(rank, rendezvous):
                     layer, cache=cache, attention="torch"
                 ) as context:
                     context.prepare(TextSize(count, 1))
-                    batch = PagedInput.from_blocks(
-                        blocks=((0,),),
-                        query_lengths=(count,),
-                        prefix_lengths=(0,),
-                        block_size=16,
-                        causal=True,
-                        device="cpu",
+                    batch = AttentionBatch.single(
+                        PagedInput.from_blocks(
+                            blocks=((0,),),
+                            query_lengths=(count,),
+                            prefix_lengths=(0,),
+                            block_size=16,
+                            causal=True,
+                            device="cpu",
+                        )
                     )
                     context.bind_attention(batch)
                     out = torch.empty_like(q[start:stop])
@@ -215,8 +218,8 @@ def _context(rank, rendezvous, gpu):
                         lengths = SequenceLengths.from_lengths(
                             counts, device=device
                         )
-                        batch = VarlenInput(
-                            lengths, lengths, (True, False, False)
+                        batch = AttentionBatch.single(
+                            VarlenInput(lengths, lengths, (True, False, False))
                         )
                         expected = []
                         for index, (query, key, value) in enumerate(
@@ -243,13 +246,15 @@ def _context(rank, rendezvous, gpu):
                             q[interval], k[interval], v[interval], batch
                         )
                         torch.testing.assert_close(actual, expected)
-                        cached = PagedInput.from_blocks(
-                            blocks=((0,), (1,), (2,)),
-                            query_lengths=counts,
-                            prefix_lengths=(0, 0, 0),
-                            block_size=16,
-                            causal=(True, False, False),
-                            device=device,
+                        cached = AttentionBatch.single(
+                            PagedInput.from_blocks(
+                                blocks=((0,), (1,), (2,)),
+                                query_lengths=counts,
+                                prefix_lengths=(0, 0, 0),
+                                block_size=16,
+                                causal=(True, False, False),
+                                device=device,
+                            )
                         )
                         actual = layer(
                             q[interval], k[interval], v[interval], cached
@@ -281,11 +286,20 @@ def _context(rank, rendezvous, gpu):
                         prefix_interval = slice(
                             min(3, tokens.rank), min(3, tokens.rank + 1)
                         )
+                        # Two prefix tokens land in block 0 and one in block
+                        # 2, at physical addresses 0, 1 and 32.
                         layer.update_cache(
                             prefix_k[prefix_interval],
                             prefix_v[prefix_interval],
-                            indices=torch.tensor(
-                                [0, 1, 32], dtype=torch.long, device=device
+                            AttentionBatch.single(
+                                PagedInput.from_blocks(
+                                    blocks=((0,), (1,), (2,)),
+                                    query_lengths=(2, 0, 1),
+                                    prefix_lengths=(0, 0, 0),
+                                    block_size=16,
+                                    causal=True,
+                                    device=device,
+                                )
                             ),
                         )
                         ends = torch.zeros(
@@ -300,7 +314,7 @@ def _context(rank, rendezvous, gpu):
                             SequenceLengths.from_lengths(
                                 prefix_counts, device=device
                             ),
-                            cached.block_table,
+                            cached.entry(None).block_table,
                             None,
                             ends,
                             False,
@@ -354,7 +368,10 @@ def _context(rank, rendezvous, gpu):
 
                         def invoke():
                             return layer(
-                                q[interval], k[interval], v[interval], segmented
+                                q[interval],
+                                k[interval],
+                                v[interval],
+                                AttentionBatch.single(segmented),
                             )
 
                         torch.testing.assert_close(
@@ -387,13 +404,15 @@ def _context(rank, rendezvous, gpu):
                                 from dataclasses import replace
 
                                 context.bind_attention(
-                                    replace(
-                                        segmented,
-                                        prefixes=SequenceLengths(
-                                            host=prefix_counts,
-                                            values=segmented.prefixes.values,
-                                            offsets=segmented.prefixes.offsets,
-                                        ),
+                                    AttentionBatch.single(
+                                        replace(
+                                            segmented,
+                                            prefixes=SequenceLengths(
+                                                host=prefix_counts,
+                                                values=segmented.prefixes.values,
+                                                offsets=segmented.prefixes.offsets,
+                                            ),
+                                        )
                                     )
                                 )
                                 torch.testing.assert_close(

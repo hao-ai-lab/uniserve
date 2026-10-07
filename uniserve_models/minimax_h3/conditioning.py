@@ -28,6 +28,7 @@ from uniserve.nn import (
 )
 from uniserve.nn.attention import (
     Attention,
+    AttentionBatch,
     DenseInput,
     SequenceLengths,
     VisibleInput,
@@ -94,13 +95,16 @@ class RefinerBlock(nn.Module):
                 q.transpose(1, 2),  # [batch, heads, tokens, head_dim]
                 k.transpose(1, 2),
                 v.transpose(1, 2),
-                DenseInput(causal=False, mask=None),
+                AttentionBatch.single(DenseInput(causal=False, mask=None)),
             ).transpose(1, 2)
         else:
             # Packed [batch * tokens, heads, head_dim] rows, each document's
             # queries seeing only its text keys.
             attended = self.attention(
-                q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1), visible
+                q.flatten(0, 1),
+                k.flatten(0, 1),
+                v.flatten(0, 1),
+                AttentionBatch.single(visible),
             )
         hidden = hidden + self.output(attended.reshape(batch, tokens, -1))
         return hidden + self.mlp(self.norms[1](hidden))

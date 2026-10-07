@@ -158,6 +158,16 @@ class PrefixCache:
         """
         return self._states[name]
 
+    def table(self, name: str) -> int:
+        """Return the ID of the block table addressing one layer's pages.
+
+        Every layer of this cache shares one page space and therefore one
+        block table, whose ID is 0. ``AttentionBatch`` entries are keyed by
+        these IDs.
+        """
+        self.state(name)
+        return 0
+
     def layer_stacks(
         self, buffer: str
     ) -> tuple[tuple[tuple[str, ...], torch.Tensor], ...]:

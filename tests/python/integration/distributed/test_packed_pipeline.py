@@ -19,6 +19,7 @@ from uniserve.loading import checkpoint, weights
 from uniserve.media import image
 from uniserve.model import TextInput, TextSize
 from uniserve.nn.attention import (
+    AttentionBatch,
     AttentionParallelConfig,
     PagedInput,
     SequenceLengths,
@@ -104,13 +105,15 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
                 ((1, 3, 5, 7, 9), (0, 1, 2, 0, 1), (3, 2)),
                 ((11, 13), (3, 2), (1, 1)),
             ):
-                batch = PagedInput.from_blocks(
-                    blocks=((0,), (1,)),
-                    query_lengths=queries,
-                    prefix_lengths=prefixes,
-                    block_size=4,
-                    causal=True,
-                    device="cpu",
+                batch = AttentionBatch.single(
+                    PagedInput.from_blocks(
+                        blocks=((0,), (1,)),
+                        query_lengths=queries,
+                        prefix_lengths=prefixes,
+                        block_size=4,
+                        causal=True,
+                        device="cpu",
+                    )
                 )
                 inputs = TextInput(
                     torch.tensor(tokens),
@@ -172,7 +175,9 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
         positions = factory.positions(size, 9, device="cpu")
         count = positions.shape[-1]
         lengths = SequenceLengths.from_lengths((count,), device="cpu")
-        attention = VarlenInput(lengths, lengths, (False,))
+        attention = AttentionBatch.single(
+            VarlenInput(lengths, lengths, (False,))
+        )
         inputs = factory.bind(
             samples=(sample,),
             sizes=(size,),

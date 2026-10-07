@@ -132,3 +132,33 @@ def test_encoded_kv_locations_preserve_unwritten_rows(device, cast):
 
     torch.testing.assert_close(keys, expected_keys, rtol=0, atol=0)
     torch.testing.assert_close(values, expected_values, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
+)
+def test_kv_sources_of_another_dtype_require_a_cast(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    keys = torch.zeros((2, 4, 2, 8), dtype=torch.bfloat16, device=device)
+    values = torch.zeros_like(keys)
+    sources = torch.ones((3, 2, 8), dtype=torch.float32, device=device)
+    slots = torch.tensor([0, 1, 2], device=device)
+
+    with pytest.raises(ValueError, match="unless cast"):
+        paged_kv_write(keys, values, slots, sources, sources)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_conversion_into_an_fp8_cache_raises():
+    keys = torch.zeros((2, 4, 2, 8), dtype=torch.float8_e4m3fn, device="cuda")
+    values = torch.zeros_like(keys)
+    sources = torch.ones((3, 2, 8), dtype=torch.bfloat16, device="cuda")
+    slots = torch.tensor([0, 1, 2], device="cuda")
+
+    with (
+        torch.inference_mode(),
+        pytest.raises(ValueError, match="paged_kv_write.*float8_e4m3fn cache"),
+    ):
+        paged_kv_write(keys, values, slots, sources, sources, cast=True)

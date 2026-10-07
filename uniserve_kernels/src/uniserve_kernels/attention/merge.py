@@ -1,17 +1,20 @@
 """Stable online-softmax combination of independently computed KV segments.
 
 An attention state is a normalized output together with its log-sum-exp
-(LSE, natural log) over one KV segment. Merging two states over disjoint
-segments reproduces attention over their union. The FlashAttention-4 provider
-in ``uniserve.runtime.backends.attention.flash_attn_4`` merges its current
-window with its paged prefix this way.
+(LSE) over one KV segment. Merging two states over disjoint segments
+reproduces attention over their union. Providers report the LSE in different
+bases: FlashAttention-4 and the portable SDPA path use the natural logarithm,
+while TensorRT-LLM and FlashInfer kernels report base-2 values. Callers state
+the base of the states they pass; both states share it. The FlashAttention-4
+provider in ``uniserve.runtime.backends.attention.flash_attn_4`` merges its
+current window with its paged prefix this way.
 """
 
 from __future__ import annotations
 
 import torch
 
-from uniserve_kernels.triton import launchable
+from uniserve_kernels.triton import require_kernel, unsupported_operands
 
 try:  # pragma: no cover - availability depends on the serving environment.
     import triton
@@ -34,6 +37,7 @@ if triton is not None:
         head_dim: tl.constexpr,
         block_rows: tl.constexpr,
         block_dim: tl.constexpr,
+        base2: tl.constexpr,
     ):
         """Merge two independently normalized attention states.
 
@@ -60,14 +64,22 @@ if triton is not None:
         both_empty = (first_lse == -float("inf")) & (
             second_lse == -float("inf")
         )
-        first_scale = tl.exp(first_lse - maximum)
-        second_scale = tl.exp(second_lse - maximum)
+        # Base-2 states weight each side by 2^(lse - max) and add log2 of the
+        # denominator; natural-log states use e and ln identically.
+        if base2:
+            first_scale = tl.exp2(first_lse - maximum)
+            second_scale = tl.exp2(second_lse - maximum)
+        else:
+            first_scale = tl.exp(first_lse - maximum)
+            second_scale = tl.exp(second_lse - maximum)
         denominator = first_scale + second_scale
         first_weight = tl.where(both_empty, 0.0, first_scale / denominator)
         second_weight = tl.where(both_empty, 0.0, second_scale / denominator)
-        merged_lse = tl.where(
-            both_empty, -float("inf"), maximum + tl.log(denominator)
-        )
+        if base2:
+            total = tl.log2(denominator)
+        else:
+            total = tl.log(denominator)
+        merged_lse = tl.where(both_empty, -float("inf"), maximum + total)
 
         offsets = rows[:, None] * head_dim + columns[None, :]
         mask = row_mask[:, None] & (columns[None, :] < head_dim)
@@ -88,18 +100,23 @@ def merge_attention_states(
     first_lse: torch.Tensor,
     second_output: torch.Tensor,
     second_lse: torch.Tensor,
+    *,
+    base2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge independently evaluated KV segments with stable online softmax.
 
     Each state is an (output [..., head_dim], lse [...]) pair; returns the
     merged pair in the same layouts, with the output in ``first_output``'s
-    dtype. Empty segments carry an LSE of -inf; when both segments are empty
-    the merged output is zero and the merged LSE is -inf. Contiguous CUDA
-    states that fit the fused kernel run it; other inputs evaluate the same
-    formula with tensor operations. Both paths allocate new result tensors.
+    dtype. ``base2`` states that both LSEs, and the merged result, are base-2
+    logarithms; otherwise they are natural logarithms. Empty segments carry
+    an LSE of -inf; when both segments are empty the merged output is zero
+    and the merged LSE is -inf. CUDA states run the fused kernel; other
+    devices evaluate the same formula with tensor operations. Both paths
+    allocate new result tensors.
 
     Raises:
-        ValueError: If the two outputs or the two LSE tensors differ in shape.
+        ValueError: If the two outputs or the two LSE tensors differ in shape,
+            or CUDA states do not fit the kernel (see :func:`unsupported`).
     """
     if (
         first_output.shape != second_output.shape
@@ -107,13 +124,21 @@ def merge_attention_states(
     ):
         raise ValueError("attention states must have matching shapes")
 
-    if _triton_merge_eligible(
-        first_output, first_lse, second_output, second_lse
-    ):
+    if first_output.is_cuda:
+        require_kernel(
+            "merge_attention_states",
+            unsupported(first_output, first_lse, second_output, second_lse),
+            first_output=first_output,
+            first_lse=first_lse,
+            second_output=second_output,
+            second_lse=second_lse,
+        )
         output = torch.empty_like(first_output)
         merged_lse = torch.empty_like(first_lse)
 
         state_count = int(first_lse.numel())
+        if state_count == 0:
+            return output, merged_lse
         head_dim = int(first_output.shape[-1])
         block_dim = triton.next_power_of_2(head_dim)
         block_rows = max(1, min(8, 1024 // block_dim))
@@ -128,15 +153,21 @@ def merge_attention_states(
             head_dim,
             block_rows,
             block_dim,
+            base2,
             num_warps=8,
         )
         return output, merged_lse
 
     # nan_to_num zeroes the NaN weights that both-empty rows produce, matching
     # the fused kernel.
-    merged_lse = torch.logaddexp(first_lse, second_lse)
-    first_weight = torch.exp(first_lse - merged_lse).nan_to_num(0.0)
-    second_weight = torch.exp(second_lse - merged_lse).nan_to_num(0.0)
+    if base2:
+        merged_lse = torch.logaddexp2(first_lse, second_lse)
+        first_weight = torch.exp2(first_lse - merged_lse).nan_to_num(0.0)
+        second_weight = torch.exp2(second_lse - merged_lse).nan_to_num(0.0)
+    else:
+        merged_lse = torch.logaddexp(first_lse, second_lse)
+        first_weight = torch.exp(first_lse - merged_lse).nan_to_num(0.0)
+        second_weight = torch.exp(second_lse - merged_lse).nan_to_num(0.0)
 
     output = (
         first_output.float() * first_weight.unsqueeze(-1)
@@ -145,31 +176,40 @@ def merge_attention_states(
     return output, merged_lse
 
 
-def _triton_merge_eligible(
+def unsupported(
     first_output: torch.Tensor,
     first_lse: torch.Tensor,
     second_output: torch.Tensor,
     second_lse: torch.Tensor,
-) -> bool:
-    """Return whether two attention states fit the fused merge kernel.
+) -> str | None:
+    """Return why the fused merge cannot take two states, or ``None``.
 
     The kernel addresses rows as ``row * head_dim``, so every tensor must be
     contiguous and the LSE shape must equal the output's leading dimensions.
-    Autograd must be disabled: the launch registers no autograd function.
+    Outputs share a floating dtype, as do the LSEs.
     """
-    tensors = (first_output, first_lse, second_output, second_lse)
-    return bool(
-        triton is not None
-        and not torch.is_grad_enabled()
-        and first_output.ndim == first_lse.ndim + 1
-        and tuple(first_output.shape[:-1]) == tuple(first_lse.shape)
-        and int(first_output.shape[-1]) > 0
-        and int(first_lse.numel()) > 0
-        and all(tensor.is_cuda and tensor.is_contiguous() for tensor in tensors)
-        and len({tensor.device for tensor in tensors}) == 1
-        and first_output.dtype == second_output.dtype
-        and first_lse.dtype == second_lse.dtype
-        and first_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and first_lse.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and launchable(first_output.device)
+    reason = unsupported_operands(
+        first_output, first_lse, second_output, second_lse
     )
+    if reason is not None:
+        return reason
+    floating = (torch.float16, torch.bfloat16, torch.float32)
+    if (
+        first_output.ndim != first_lse.ndim + 1
+        or tuple(first_output.shape[:-1]) != tuple(first_lse.shape)
+        or int(first_output.shape[-1]) == 0
+    ):
+        return "outputs are not [..., head_dim] rows over the LSE shape"
+    if not all(
+        tensor.is_contiguous()
+        for tensor in (first_output, first_lse, second_output, second_lse)
+    ):
+        return "a state tensor is not contiguous"
+    if (
+        first_output.dtype != second_output.dtype
+        or first_lse.dtype != second_lse.dtype
+        or first_output.dtype not in floating
+        or first_lse.dtype not in floating
+    ):
+        return "states do not share float16, bfloat16 or float32 dtypes"
+    return None

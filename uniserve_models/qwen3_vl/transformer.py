@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from uniserve.nn.attention import AttentionInput
+from uniserve.nn.attention import AttentionBatch
 from uniserve.nn.routing import RouteSpan
 from uniserve_models import qwen3
 
@@ -28,7 +28,7 @@ class Transformer(qwen3.Transformer):
         self,
         embeddings: torch.Tensor | None,
         positions: torch.Tensor,
-        attention: AttentionInput,
+        attention: AttentionBatch,
         *,
         routes: tuple[RouteSpan, ...] = (),
         deepstack: torch.Tensor | None = None,

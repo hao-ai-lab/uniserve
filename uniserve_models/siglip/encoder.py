@@ -16,7 +16,11 @@ from torch import nn
 
 from uniserve.model import TransformerEncoder
 from uniserve.nn.attention import Attention as ScaledAttention
-from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve.nn.attention import (
+    AttentionBatch,
+    SequenceLengths,
+    VarlenInput,
+)
 from uniserve.nn.functional import patchify
 from uniserve.nn.linear import (
     ColumnParallelLinear,
@@ -45,7 +49,7 @@ class Attention(nn.Module):
         )
 
     def forward(
-        self, patches: torch.Tensor, attention: VarlenInput
+        self, patches: torch.Tensor, attention: AttentionBatch
     ) -> torch.Tensor:
         projections = self.qkv(patches)
 
@@ -84,7 +88,7 @@ class TransformerLayer(nn.Module):
         )
 
     def forward(
-        self, patches: torch.Tensor, attention: VarlenInput
+        self, patches: torch.Tensor, attention: AttentionBatch
     ) -> torch.Tensor:
         patches = patches + self.attention(self.input_norm(patches), attention)
         return patches + self.mlp(self.output_norm(patches))
@@ -190,5 +194,8 @@ class Encoder(nn.Module):
         )
         lengths = SequenceLengths(host=counts, values=values, offsets=offsets)
         return self.encoder(
-            features, VarlenInput(lengths, lengths, (False,) * len(counts))
+            features,
+            AttentionBatch.single(
+                VarlenInput(lengths, lengths, (False,) * len(counts))
+            ),
         )

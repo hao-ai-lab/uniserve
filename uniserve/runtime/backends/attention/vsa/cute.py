@@ -18,4 +18,5 @@ class _Operator(BaseOperator):
 
 
 class Backend(BaseBackend):
+    name = "cute"
     operator_class = _Operator

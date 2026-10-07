@@ -24,15 +24,44 @@ def _head_major(value):
     return result
 
 
+def _require_windowed_causal(window, batch):
+    """Reject windows the context kernels cannot evaluate exactly.
+
+    The TensorRT-LLM context kernels implement a history window only with
+    the causal mask; a non-causal windowed query would silently read keys
+    outside its window.
+    """
+    if window is not None and not all(batch.causal):
+        raise ValueError(
+            "TensorRT-LLM MHA supports history windows only for causal queries"
+        )
+
+
 class _TRTLLM(_Operator):
+    # A table with start pages is read from its first column: the prepared
+    # key lengths count each row's keys from its table origin, and the
+    # kernels align queries to the end of their keys, so causal positions
+    # and the history window keep their relative meaning while retired
+    # pages, which no query of the row may read, are never addressed.
+    reads_retired_tables = True
+    # The kernels read every length, offset and table origin on the
+    # device; ``bind`` only checks the batch.
+    builds_launch_plan = False
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
         from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
-        if self.head_dim not in {64, 128, 256}:
+        if self.head_dim not in {64, 128, 256, 512}:
             raise ValueError(
-                "TensorRT-LLM MHA requires head dimension 64, 128 or 256"
+                "TensorRT-LLM MHA requires head dimension 64, 128, 256 or 512"
+            )
+        if self.head_dim == 512 and self.window is not None:
+            # The pinned SM100 cubins provide head dimension 512 context
+            # kernels only for causal and dense masks, not sliding windows.
+            raise ValueError(
+                "TensorRT-LLM MHA has no windowed head dimension 512 kernels"
             )
         if self.dtype not in {torch.float16, torch.bfloat16}:
             raise ValueError("TensorRT-LLM MHA requires FP16 or BF16 queries")
@@ -50,6 +79,11 @@ class _TRTLLM(_Operator):
         super().bind(batch)
         if not isinstance(batch, PagedInput):
             raise ValueError("TensorRT-LLM MHA requires paged attention input")
+        if batch.causal_values is not None:
+            raise ValueError(
+                "TensorRT-LLM MHA does not implement device causality flags"
+            )
+        _require_windowed_causal(self.window, batch)
 
     def requires_host_lengths(self, batch):
         return isinstance(batch, PagedInput) and len(set(batch.causal)) > 1
@@ -59,6 +93,7 @@ class _TRTLLM(_Operator):
 
         if not isinstance(batch, PagedInput):
             raise ValueError("TensorRT-LLM MHA requires paged attention input")
+        _require_windowed_causal(self.window, batch)
         if not q.is_cuda or torch.cuda.get_device_capability(q.device)[0] != 10:
             raise ValueError("TensorRT-LLM MHA requires an SM100 family GPU")
         self._validate(q, k, v, batch, out)
@@ -131,7 +166,8 @@ class _TRTLLM(_Operator):
                 "seq_lens": lengths,
                 "bmm1_scale": float(scale),
                 "bmm2_scale": 1.0,
-                "window_left": -1,
+                # Keys from query position - window_left on stay visible.
+                "window_left": -1 if self.window is None else self.window,
                 "out_dtype": q.dtype,
                 "out": destination[query_slice],
                 "kv_layout": "HND",
@@ -167,7 +203,15 @@ class Backend(_Backend):
         self.workspace_size = workspace_size
 
     def workspace_buffers(
-        self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache
+        self,
+        *,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        size,
+        cache,
+        window=None,
     ):
         return {
             "scratch": BufferConfig((self.workspace_size,), torch.uint8),
