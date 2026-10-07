@@ -168,9 +168,6 @@ class CudaVmmTransport(Transport):
         acknowledgment_slot: int = 0,
         cross_host_consumers: bool = False,
     ) -> None:
-        from uniserve_kernels import peer_storage
-
-        peer_storage.load()
         self.source = source or WorkerEndpoint.local()
         self._events = event_pool
         # A failed publication whose device work could not be drained. The

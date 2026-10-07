@@ -2,8 +2,8 @@
 
 // CUDA driver virtual memory primitives for sharing tensor storage across
 // processes, plus strided asynchronous copies between pinned host and device
-// memory. The Python package uniserve_kernels.peer_storage compiles this file
-// on first use and wraps each binding.
+// memory. It compiles with the package into uniserve_kernels.peer_storage._C,
+// which the Python package wraps binding by binding.
 //
 // PeerAllocation owns one physical allocation created with cuMemCreate and
 // exports its shareable handle. PeerMapping owns one reserved virtual address

@@ -1,24 +1,16 @@
 """SM100a CUDA block-64 attention with independent query and key extents.
 
-The kernel sources live in ``csrc/`` and build through
-:mod:`uniserve_kernels.extension`: the first :func:`load` with a given source
-and toolchain compiles them, later processes import the finished module, and
-support queries never compile.
-``uniserve.runtime.backends.attention.vsa.sm100`` calls :func:`load` while
-preparing its operator and routes complete calls here when
-``vsa_cute.should_use`` declines a shape.
+The kernel sources live in ``csrc/`` and compile with the package into
+:mod:`uniserve_kernels.attention.vsa_native._block64`.
+``uniserve.runtime.backends.attention.vsa.sm100`` routes complete calls here
+when ``vsa_cute.should_use`` declines a shape.
 """
-
-from functools import lru_cache
-from pathlib import Path
 
 import torch
 
-from uniserve_kernels import extension
-
 
 def supported(device: torch.device | None = None) -> bool:
-    """Report whether ``device`` can run the extension, without compiling it.
+    """Report whether ``device`` can run the extension.
 
     The extension contains sm_100a code, whose architecture-conditional
     instructions do not carry the major-version cubin compatibility promise.
@@ -28,33 +20,11 @@ def supported(device: torch.device | None = None) -> bool:
     ) == (10, 0)
 
 
-def load() -> None:
-    """Compile or load the cached extension before serving or CUDA capture."""
-    _extension()
-
-
-@lru_cache(maxsize=1)
 def _extension():
-    # One build or cache lookup per process. The explicit -gencode flag pins
-    # the sm_100a target; torch adds no TORCH_CUDA_ARCH_LIST targets when the
-    # CUDA flags already name an architecture. -lcuda links the driver API
-    # that the launcher uses to encode TMA tensor maps.
-    return extension.load(
-        "uniserve_sparse_attention_sm100",
-        Path(__file__).parent / "csrc",
-        ["attention.cu"],
-        extra_cflags=["-O3", "-std=c++20"],
-        extra_cuda_cflags=[
-            "-O3",
-            "-std=c++20",
-            "--use_fast_math",
-            "--expt-extended-lambda",
-            "--expt-relaxed-constexpr",
-            "-Xcompiler=-fno-strict-aliasing",
-            "-gencode=arch=compute_100a,code=sm_100a",
-        ],
-        extra_ldflags=["-lcuda"],
-    )
+    # Imported on first use: a CPU build of the package has no native module.
+    from uniserve_kernels.attention.vsa_native import _block64
+
+    return _block64
 
 
 def block_sparse_attention(
@@ -76,8 +46,7 @@ def block_sparse_attention(
     K row counts are independent multiples of 64. Metadata uses global key-block
     indices ``[heads, query tiles, selected]``, counts ``[heads, query
     tiles]`` and per-key-block valid sizes in ``[0, 64]``; these device values
-    are consumed without a host synchronization. Call :func:`load` before
-    CUDA capture.
+    are consumed without a host synchronization.
 
     Only the first ``counts[h, t]`` indices of each query tile are read. The
     kernel does not range-check metadata values: counts must not exceed the

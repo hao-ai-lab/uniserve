@@ -4,8 +4,9 @@
 // validates tensor geometry on the host, translates the tensors into
 // BlockSparseVsaArgs and launches on the current CUDA stream. Metadata values
 // (block indices, counts, valid sizes) stay on the device and are not read or
-// range-checked here. vsa_native._extension compiles this file as the only
-// translation unit, in the default block-64 configuration.
+// range-checked here. The package build compiles this file as the only
+// translation unit of uniserve_kernels.attention.vsa_native._block64, in the
+// default block-64 configuration.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
