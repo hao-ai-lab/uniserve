@@ -2,8 +2,9 @@
 # measurements in docs/fast_h3/fast_h3.md. UNISERVE_FAST_H3_MODEL names a
 # local copy of FastVideo/FastVideo-FastH3-8-Step-V2. BF16 servers select the
 # quality tier (BF16 transformer and text, FP16 video projections); FP8
-# servers override only the denoiser MLPs. Run points serially, one server at
-# a time.
+# servers override only the denoiser MLPs. Every request is a t2va request
+# whose target is the 16:9 canvas (1344x768) and the point's duration, under
+# the checkpoint's own schedule. Run points serially, one server at a time.
 root = ".."
 artifact_root = "artifacts/fast_h3/h200"
 
