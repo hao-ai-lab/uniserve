@@ -126,6 +126,13 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_video_seconds: config.engine.max_video_seconds,
         // Video workers provision only the frame counts the API admits.
         min_video_seconds: Some(crate::serving::MIN_VIDEO_SECONDS),
+        // Video workers prepare exactly the rasters requests may select.
+        video_frame_sizes: match &model_config.parameters {
+            crate::profile::ModelParameters::MiniMaxH3 { video_rasters, .. } => {
+                Some(video_rasters.worker_frame_sizes())
+            }
+            _ => None,
+        },
         ..config.engine.worker_process.clone()
     };
     let engine_config = EngineConfig {

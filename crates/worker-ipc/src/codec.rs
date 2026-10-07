@@ -474,13 +474,15 @@ fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRe
 }
 
 /// Decodes diffusion admission parameters; `NewRequest::validate` checks the
-/// frame, unit, and step counts.
+/// frame, unit, and step counts and the output raster.
 fn diffusion_params_from_table(
     admission: fbs::DiffusionSamplingParams<'_>,
 ) -> CodecResult<DiffusionSamplingParams> {
     Ok(DiffusionSamplingParams {
         num_frames: admission.num_frames(),
         video_units: admission.video_units(),
+        height: admission.height(),
+        width: admission.width(),
         num_inference_steps: admission.num_inference_steps(),
         seed: admission.seed(),
     })

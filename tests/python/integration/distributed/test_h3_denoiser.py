@@ -18,6 +18,7 @@ from uniserve import loading
 from uniserve.diffusion import DenoisingStep, normal_noise
 from uniserve.distributed import DeviceMesh, communication_axes
 from uniserve.loading import checkpoint, weights
+from uniserve.media import image
 from uniserve.model import LatentInput
 from uniserve.nn.attention import (
     AttentionParallelConfig,
@@ -47,6 +48,9 @@ from uniserve_worker.execution.request import RequestPool
 from uniserve_worker.storage.latent_pool import LatentPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+# The landscape output raster.
+FRAME = image.Config(768, 1344)
 
 
 def _config():
@@ -181,7 +185,7 @@ def _run(rank, rendezvous, directory, source):
         ).model
         # The prompt fills 63 rows of one text tile; the call evaluates the
         # tile's layout with the prompt's own tables.
-        size = DenoiserSize(22, 63)
+        size = DenoiserSize(22, FRAME, 63)
         layout = model.layout_size(size)
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
         stream.wait(torch.cuda.current_stream(device))
@@ -509,8 +513,10 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         rank=0, local_rank=0, world_size=1, device=device
     ) as groups:
         model = _load(groups, tmp_path, device)
-        factory = MediaBuilder(model, max_frames=22, max_text_tokens=65)
-        size = factory.size(22, 63)
+        factory = MediaBuilder(
+            model, frame_sizes=(FRAME,), max_frames=22, max_text_tokens=65
+        )
+        size = factory.size(22, FRAME, 63)
         layout = factory.layout(size)
         matrices = {name: value.to(device) for name, value in source.items()}
         features = torch.zeros(
@@ -646,9 +652,14 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
         rank=0, local_rank=0, world_size=1, device=device
     ) as groups:
         model = _load(groups, tmp_path, device)
-        factory = MediaBuilder(model, max_frames=22, max_text_tokens=128)
-        placeholder = factory.size(22, 1)
-        requests = {1: factory.size(22, 40), 2: factory.size(22, 63)}
+        factory = MediaBuilder(
+            model, frame_sizes=(FRAME,), max_frames=22, max_text_tokens=128
+        )
+        placeholder = factory.size(22, FRAME, 1)
+        requests = {
+            1: factory.size(22, FRAME, 40),
+            2: factory.size(22, FRAME, 63),
+        }
         layout = factory.layout(placeholder)
         assert {factory.layout(size) for size in requests.values()} == {layout}
         generator = torch.Generator().manual_seed(5)
@@ -792,20 +803,25 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
         model = _load(groups, tmp_path, device)
         exact = MediaBuilder(
             model,
+            frame_sizes=(FRAME,),
             max_frames=22,
             max_text_tokens=256,
             text_capacities=(64, 128, 256),
         )
         padded = MediaBuilder(
-            model, max_frames=22, max_text_tokens=256, text_capacities=(256,)
+            model,
+            frame_sizes=(FRAME,),
+            max_frames=22,
+            max_text_tokens=256,
+            text_capacities=(256,),
         )
-        requests = {1: exact.size(22, 40), 2: exact.size(22, 100)}
+        requests = {1: exact.size(22, FRAME, 40), 2: exact.size(22, FRAME, 100)}
         assert [exact.layout(size) for size in requests.values()] == [
-            DenoiserSize(22, 64),
-            DenoiserSize(22, 128),
+            DenoiserSize(22, FRAME, 64),
+            DenoiserSize(22, FRAME, 128),
         ]
         assert {padded.layout(size) for size in requests.values()} == {
-            DenoiserSize(22, 256)
+            DenoiserSize(22, FRAME, 256)
         }
         generator = torch.Generator().manual_seed(11)
         features = {
@@ -870,7 +886,7 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                 bank=pool.storage.bank,
             )
             try:
-                placeholder = padded.size(22, 256)
+                placeholder = padded.size(22, FRAME, 256)
                 layout = padded.layout(placeholder)
                 views = pool.storage.tensors(1).view(
                     padded.buffers(placeholder)
@@ -965,14 +981,14 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
     )
     schedules = model.make_schedules(4, shift=None, device=device)
     for index, (frames, tokens, capacity) in enumerate(cases):
-        size = DenoiserSize(frames, tokens)
+        size = DenoiserSize(frames, FRAME, tokens)
         generator = torch.Generator().manual_seed(60 + index)
         features = torch.randn(
             tokens, model.config.hidden_size, generator=generator
         ).to(device, torch.bfloat16)
         for name, layout in (
             ("smallest", model.layout_size(size)),
-            ("capacity", DenoiserSize(frames, capacity)),
+            ("capacity", DenoiserSize(frames, FRAME, capacity)),
         ):
             assert model.holds(layout, size)
             requirements = model.state_buffers(layout)

@@ -25,14 +25,13 @@ class Model(nn.Module):
         self.text_encoder = TextEncoder(config.text_encoder)
         self.denoiser = Denoiser(config.denoiser, config.diffusion)
         self.video_decoder = VideoDecoder(
-            config.video_decoder, frame_size=config.output.frame_size
+            config.video_decoder, frame_sizes=config.output.frame_sizes
         )
         self.audio_decoder = AudioDecoder(
             config.audio_decoder, sample_rate=config.output.sample_rate
         )
         self.video_postprocessor = VideoPostprocessor(
-            frame_size=config.output.frame_size,
-            frame_rate=config.output.frame_rate,
+            frame_rate=config.output.frame_rate
         )
 
 

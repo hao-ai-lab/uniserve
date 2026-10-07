@@ -7,12 +7,15 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.model import VideoPostprocessor
 from uniserve.nn.vae.spatial import SpatialDecoder
 from uniserve.tensors import OutputLayout, TensorOutput
 
 pytestmark = pytest.mark.unit
+
+# Eleven 2x3 frames.
+SIZE = video.Config(11, image.Config(2, 3))
 
 
 def test_video_windows_preserve_pixels_across_separate_calls():
@@ -22,7 +25,6 @@ def test_video_windows_preserve_pixels_across_separate_calls():
 
     model = ThreeFrameVideo(
         torch.tensor([0.0, 0.5], dtype=torch.float16),
-        frame_size=image.Config(2, 3),
         frame_rate=24,
     )
     frames = (
@@ -73,7 +75,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         result = model(
             (segment,),
             frames=(window,),
-            num_frames=(11,),
+            sizes=(SIZE,),
             state=state,
             constants=constants,
             workspace=scratch,
@@ -93,7 +95,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
     together = model(
         outputs,
         frames=windows,
-        num_frames=(11, 11, 11),
+        sizes=(SIZE,) * 3,
         state=state,
         constants=constants,
         workspace=scratch,
@@ -116,7 +118,7 @@ def test_video_windows_preserve_pixels_across_separate_calls():
         model(
             outputs[:2],
             frames=(windows[0], slice(4, 7)),
-            num_frames=(11, 11),
+            sizes=(SIZE,) * 2,
             state=state,
             constants=constants,
             workspace=scratch,

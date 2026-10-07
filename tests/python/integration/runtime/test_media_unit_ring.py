@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.model import VideoPostprocessor
 from uniserve.tensors import OutputLayout, TensorOutput
 
@@ -22,6 +22,7 @@ EXTENT = 2
 BODY = 3
 WINDOW = 6
 HEIGHT, WIDTH = 2, 3
+FRAME = image.Config(HEIGHT, WIDTH)
 
 
 class _Blend(VideoPostprocessor):
@@ -34,7 +35,6 @@ class _Blend(VideoPostprocessor):
 def _postprocessor() -> _Blend:
     return _Blend(
         torch.tensor([0.0, 0.5], dtype=torch.float16),
-        frame_size=image.Config(HEIGHT, WIDTH),
         frame_rate=24,
     )
 
@@ -102,7 +102,7 @@ def _serial() -> list[torch.Tensor]:
         model(
             (_output(unit, total),),
             frames=(frames[unit],),
-            num_frames=(total,),
+            sizes=(video.Config(total, FRAME),),
             state=state,
             constants=constants,
             workspace=workspace,
@@ -148,7 +148,7 @@ def _ring(rank: int, expected_bytes: bytes, device: torch.device) -> None:
                 model, stream=stream, groups=(model.units,)
             )
             scope.callback(context.close)
-            context.prepare(total)
+            context.prepare(video.Config(total, FRAME))
             scope.enter_context(context.activate())
         cursor = 0
         while cursor < UNITS:
@@ -160,7 +160,7 @@ def _ring(rank: int, expected_bytes: bytes, device: torch.device) -> None:
                 produced = model(
                     (output,),
                     frames=(frames[unit],),
-                    num_frames=(total,),
+                    sizes=(video.Config(total, FRAME),),
                     state=state,
                     constants=constants,
                     workspace=workspace,

@@ -8,6 +8,7 @@ import torch
 
 from uniserve.diffusion import normal_noise
 from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.media import image
 from uniserve.nn.attention import AttentionParallelConfig, Ulysses
 from uniserve.runtime import TensorBuffers
 from uniserve_models.minimax_h3.config import DiffusionConfig, TransformerConfig
@@ -16,20 +17,28 @@ from uniserve_models.minimax_h3.inputs import DenoiserSize
 
 pytestmark = pytest.mark.unit
 
+LANDSCAPE = image.Config(768, 1344)
+PORTRAIT = image.Config(1344, 768)
+
 
 @pytest.mark.parametrize(
-    "frames,seed,tokens",
+    "frames,frame,seed,tokens",
     [
-        (22, 0, 63),
-        (22, 0, 64),
-        (22, 0, 65),
-        (39, 1000, 128),
-        (124, 19, 10000),
-        (362, 23, 1000),
+        (22, LANDSCAPE, 0, 63),
+        (22, LANDSCAPE, 0, 64),
+        (22, LANDSCAPE, 0, 65),
+        (39, LANDSCAPE, 1000, 128),
+        (124, LANDSCAPE, 19, 10000),
+        (362, LANDSCAPE, 23, 1000),
+        (22, PORTRAIT, 0, 64),
+        (39, PORTRAIT, 1000, 128),
     ],
 )
-def test_native_draws_and_canonical_shards(frames, seed, tokens):
-    size = DenoiserSize(frames, tokens)
+def test_native_draws_and_canonical_shards(frames, frame, seed, tokens):
+    size = DenoiserSize(frames, frame, tokens)
+    # Latent patch rows and columns per frame: 24x42 landscape, 42x24
+    # portrait.
+    rows, columns = frame.height // 32, frame.width // 32
     ranks = (7, 3, 5, 1, 6, 2, 4, 0)
     outputs = {"video": [], "audio": []}
     noise = None
@@ -71,14 +80,14 @@ def test_native_draws_and_canonical_shards(frames, seed, tokens):
                 # each tile in temporal, height, width order. Patch channels
                 # retain native channel, patch-height, patch-width order.
                 patches = video.reshape(
-                    24, video.shape[2], 24, 2, 42, 2
+                    24, video.shape[2], rows, 2, columns, 2
                 ).permute(1, 2, 4, 0, 3, 5)
                 expected_video = torch.cat(
                     [
                         patches[t : t + 4, h : h + 4, w : w + 4].reshape(-1, 96)
                         for t in range(0, video.shape[2], 4)
-                        for h in range(0, 24, 4)
-                        for w in range(0, 42, 4)
+                        for h in range(0, rows, 4)
+                        for w in range(0, columns, 4)
                     ]
                 )
             buffers = model.state_buffers(size)

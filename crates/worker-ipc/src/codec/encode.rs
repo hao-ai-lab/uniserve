@@ -256,6 +256,8 @@ fn diffusion<'a>(
             video_units: v.video_units,
             num_inference_steps: v.num_inference_steps,
             seed: v.seed,
+            height: v.height,
+            width: v.width,
         },
     )
 }

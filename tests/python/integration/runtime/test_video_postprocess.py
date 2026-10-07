@@ -6,7 +6,7 @@ The overlap is consumed on every replay.
 import pytest
 import torch
 
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.model.video import VideoPostprocessor
 from uniserve.runtime import CUDAGraph, ExecutionContext
 from uniserve.tensors import OutputLayout, TensorOutput
@@ -23,7 +23,6 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
     device = torch.device("cuda", 0)
     model = Reconstruction(
         torch.tensor([0, 0.5], dtype=torch.float16, device=device),
-        frame_size=image.Config(2, 3),
         frame_rate=24,
     )
     frames = torch.tensor(
@@ -54,7 +53,7 @@ def test_video_postprocess_replay_uses_current_overlap_and_pixels():
                 ),
             ),
             frames=(slice(3, 8),),
-            num_frames=(8,),
+            sizes=(video.Config(8, image.Config(2, 3)),),
             state={"video_overlap": overlap},
             constants=constants,
             workspace={

@@ -140,6 +140,9 @@ pub struct WorkerProcessArgs {
     /// Optional text capacities, in prompt tokens, of a video denoiser's
     /// layouts, as a comma-separated increasing list.
     pub video_text_capacities: Option<String>,
+    /// Optional video output rasters a video worker prepares, as
+    /// comma-separated `HEIGHTxWIDTH`; `None` keeps the model's defaults.
+    pub video_frame_sizes: Option<String>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
     /// Optional FlashInfer tensor-core selection forwarded to the worker.

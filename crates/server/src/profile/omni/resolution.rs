@@ -42,6 +42,9 @@ pub enum ResolutionName {
     /// Landscape 3:1 canvas.
     #[serde(rename = "3:1")]
     Landscape3x1,
+    /// Landscape 21:9 canvas.
+    #[serde(rename = "21:9")]
+    Landscape21x9,
 }
 
 impl ResolutionName {
@@ -60,6 +63,7 @@ impl ResolutionName {
             Self::Landscape2x1 => "2:1",
             Self::Portrait1x3 => "1:3",
             Self::Landscape3x1 => "3:1",
+            Self::Landscape21x9 => "21:9",
         }
     }
 }
@@ -83,6 +87,7 @@ impl std::str::FromStr for ResolutionName {
             "2:1" => Ok(Self::Landscape2x1),
             "1:3" => Ok(Self::Portrait1x3),
             "3:1" => Ok(Self::Landscape3x1),
+            "21:9" => Ok(Self::Landscape21x9),
             _ => Err(ResolutionError::UnsupportedName(value.to_owned())),
         }
     }

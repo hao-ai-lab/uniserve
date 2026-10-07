@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from uniserve.diffusion import DenoisingStep, Schedule
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.model import (
     AudioDecoder,
     CausalLM,
@@ -236,7 +236,7 @@ class AudioRunner(ModelRunner[AudioDecoder, int]):
         )
 
 
-class VideoRunner(ModelRunner[VideoDecoder, int]):
+class VideoRunner(ModelRunner[VideoDecoder, video.Config]):
     """Decode video latent windows using prepared constants and workspace."""
 
     def decode(
@@ -244,19 +244,19 @@ class VideoRunner(ModelRunner[VideoDecoder, int]):
         latents: tuple[torch.Tensor, ...],
         *,
         frames: tuple[slice, ...],
-        num_frames: tuple[int, ...],
+        sizes: tuple[video.Config, ...],
     ) -> tuple[TensorOutput | None, ...]:
         return self._run(
             self.model.decode,
             latents,
             frames=frames,
-            num_frames=num_frames,
+            sizes=sizes,
             constants=self.context.constants,
             workspace=self.context.workspace,
         )
 
 
-class VideoProcessor(ModelRunner[VideoPostprocessor, int]):
+class VideoProcessor(ModelRunner[VideoPostprocessor, video.Config]):
     """Postprocess decoded video windows using caller-owned temporal state."""
 
     def forward(
@@ -264,14 +264,14 @@ class VideoProcessor(ModelRunner[VideoPostprocessor, int]):
         segments: tuple[TensorOutput, ...],
         *,
         frames: tuple[slice, ...],
-        num_frames: tuple[int, ...],
+        sizes: tuple[video.Config, ...],
         state: Mapping[str, torch.Tensor],
     ) -> tuple[TensorOutput, ...]:
         return self._run(
             self.model,
             segments,
             frames=frames,
-            num_frames=num_frames,
+            sizes=sizes,
             state=state,
             constants=self.context.constants,
             workspace=self.context.workspace,

@@ -5,7 +5,7 @@ turns them into one typed ``Config`` before any module is constructed. The
 architecture is fixed: ``Config`` rejects any network or output field that
 differs from its default. Only the DMD ladder, the scheduler shifts, the VSA
 sparsity and the latent normalization statistics may differ between
-supported exports.
+supported exports, and only the served output rasters between deployments.
 """
 
 from __future__ import annotations
@@ -256,7 +256,9 @@ class Config:
         # Packing, sparse attention, native reconstruction and checkpoint
         # identity implement this architecture. Typed configs do not imply
         # arbitrary variants. The latent statistics and VSA sparsity come
-        # from each checkpoint and are exempt, as is ``diffusion``.
+        # from each checkpoint and are exempt, as is ``diffusion``; the served
+        # rasters are a deployment choice that ``output.Config`` bounds to the
+        # training buckets.
         for name, expected in (
             ("text_encoder", TextEncoderConfig()),
             ("denoiser", TransformerConfig()),
@@ -270,6 +272,7 @@ class Config:
                     "latents_mean",
                     "latents_std",
                     "vsa_sparsity",
+                    "frame_sizes",
                 }:
                     continue
                 value = getattr(actual, field.name)

@@ -8,7 +8,12 @@ builder: ``ImageBuilder`` for image denoising and ``MediaBuilder`` for video.
 
 from torch import nn
 
-from uniserve.model import ImageDenoiser, VideoDenoiser, VideoPostprocessor
+from uniserve.model import (
+    ImageDenoiser,
+    VideoDecoder,
+    VideoDenoiser,
+    VideoPostprocessor,
+)
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.model_executor.diffusion_inputs import ImageBuilder
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
@@ -49,17 +54,18 @@ def media_builder(model: nn.Module, config: WorkerConfig):
 
     The frame budget is ``max_video_seconds`` at the post-processor's output
     frame rate, rounded half to even to whole frames, and admitted frame
-    counts start at ``min_video_seconds`` converted the same way; the text
-    budget is ``max_sequence_tokens``, divided into
-    ``video_text_capacities``.
+    counts start at ``min_video_seconds`` converted the same way; the rasters
+    are the ``VideoDecoder``'s; the text budget is ``max_sequence_tokens``,
+    divided into ``video_text_capacities``.
 
     Returns:
         The builder, or ``None`` for a model without a ``VideoDenoiser``.
 
     Raises:
         ValueError: The model has a ``VideoDenoiser`` but no
-            ``VideoPostprocessor`` to supply its frame rate, or either
-            capability is ambiguous.
+            ``VideoPostprocessor`` to supply its frame rate or
+            ``VideoDecoder`` to supply its rasters, or a capability is
+            ambiguous.
     """
     denoiser = capability(model, VideoDenoiser)
     if denoiser is None:
@@ -70,12 +76,16 @@ def media_builder(model: nn.Module, config: WorkerConfig):
         raise ValueError(
             "media input construction requires its output sampling clock"
         )
+    decoder = capability(model, VideoDecoder)
+    if decoder is None:
+        raise ValueError("media input construction requires its output rasters")
 
     # The server counts a duration's frames rounded half to even at the
     # output clock, so the capacity provisions exactly the frame count its
     # longest admitted request resolves to.
     return MediaBuilder(
         denoiser,
+        frame_sizes=decoder.frame_sizes,
         max_frames=round(config.max_video_seconds * output.frame_rate),
         max_text_tokens=config.max_sequence_tokens,
         min_frames=1

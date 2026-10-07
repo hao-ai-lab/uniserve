@@ -507,38 +507,13 @@ impl Scheduler {
         )
     }
 
-    /// Returns the `(height, width)` raster of the video the denoiser's samples
-    /// decode to.
-    ///
-    /// Reads dimensions 2 and 3 of the first declared output of the component
-    /// serving video decoding. The worker declares that product as RGB media
-    /// units (`decoded_units_layout`): units, frames, height, width and
-    /// channels. An extent that is missing or not static reads as zero.
-    fn video_raster(&self) -> (u32, u32) {
-        let component = self.media_component(MediaCall::VideoDecoding);
-        let dims = self
-            .executor
-            .info()
-            .workers
-            .iter()
-            .flat_map(|(_, info)| &info.components)
-            .find(|binding| Some(&binding.name) == component.as_ref())
-            .and_then(|binding| binding.outputs.first())
-            .map(|output| output.shape_bound.dims.clone())
-            .unwrap_or_default();
-        let fixed = |index: usize| match dims.get(index) {
-            Some(DimBound::Static(value)) => *value,
-            _ => 0,
-        };
-        (fixed(2), fixed(3))
-    }
-
     /// Returns where a video request's samples live on its denoiser worker.
     ///
     /// A standalone denoiser's latent pool gives every request slot the same
     /// run of consecutive pages after its sentinel page, so the worker's
     /// advertised pool and slot count name the pages of `slot`. The raster is
-    /// the video the samples decode to.
+    /// the request's sampled video frame, `sampling.height` by
+    /// `sampling.width`.
     ///
     /// Page zero is the sentinel and request slots are numbered from one
     /// (`RequestPool::new`), so slot `s` owns the
@@ -546,7 +521,12 @@ impl Scheduler {
     /// `1 + (s - 1) * pages`.
     ///
     /// Returns `None` when `worker` is not a loaded worker.
-    fn sample_placement(&self, worker: &crate::WorkerId, slot: u32) -> Option<LatentPlacement> {
+    fn sample_placement(
+        &self,
+        worker: &crate::WorkerId,
+        slot: u32,
+        sampling: uniserve_core::DiffusionSamplingParams,
+    ) -> Option<LatentPlacement> {
         let (_, info) = self
             .executor
             .info()
@@ -555,12 +535,11 @@ impl Scheduler {
             .find(|(id, _)| id == worker)?;
         let pages = info.latent_pages.saturating_sub(1) / info.request_slots.max(1);
         let first = 1 + slot.saturating_sub(1) * pages;
-        let (height, width) = self.video_raster();
         Some(LatentPlacement {
             page_table: (first..first + pages).collect(),
             latent_units: pages * info.latent_page_units,
-            height,
-            width,
+            height: sampling.height,
+            width: sampling.width,
         })
     }
 
@@ -1124,15 +1103,15 @@ impl Scheduler {
 
         // Request slots are allocated per worker, so the slot and the latent
         // pages it owns are those of the selected worker.
-        let request_pool_idx = self
+        let state = self
             .media_state(id)
-            .ok_or("a selected media request is running")?
-            .allocations
-            .request_slot(&worker);
+            .ok_or("a selected media request is running")?;
+        let request_pool_idx = state.allocations.request_slot(&worker);
+        let sampling = state.request.sampling;
         let latent = match interval {
             Some((start_step, step_count)) => {
                 let samples = self
-                    .sample_placement(&worker, request_pool_idx)
+                    .sample_placement(&worker, request_pool_idx, sampling)
                     .ok_or("a placed call's worker is loaded")?;
                 Some(Denoising::params(
                     request_key,

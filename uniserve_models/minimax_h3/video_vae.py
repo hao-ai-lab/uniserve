@@ -24,7 +24,6 @@ from typing import cast
 import torch
 from torch import nn
 
-from uniserve.media import image
 from uniserve.nn import functional
 from uniserve.nn.attention import Attention, DenseInput
 from uniserve.nn.functional import (
@@ -684,13 +683,7 @@ class Model(LatentDecoder):
 
     decoder: Decoder
 
-    def __init__(self, config: Config, *, frame_size: image.Config):
-        if (
-            frame_size.height % config.spatial_compression
-            or frame_size.width % config.spatial_compression
-        ):
-            raise ValueError("video raster must align with spatial compression")
-        self.frame_size = frame_size
+    def __init__(self, config: Config):
         # A clip covers `span` latent frames; cropping `token_drop` frames
         # per clip leaves consecutive native windows sharing `overlap`
         # latent frames.
@@ -702,8 +695,10 @@ class Model(LatentDecoder):
                 1,
                 config.latent_channels,
                 span + overlap,
-                frame_size.height // config.spatial_compression,
-                frame_size.width // config.spatial_compression,
+                # The raster is the decoded video's; convolution and tiling
+                # follow the input extent.
+                None,
+                None,
             ),
             mean=torch.tensor(
                 config.latents_mean, dtype=torch.float32, device="cpu"

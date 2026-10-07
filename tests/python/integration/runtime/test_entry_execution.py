@@ -17,6 +17,7 @@ from tests.python.fixtures.depth_one import finalized_report
 from tests.python.fixtures.encoding import Model as EncodedModel
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve.distributed import Communicator, DeviceMesh
+from uniserve.media import image, video
 from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
 from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.errors import InputError
@@ -54,6 +55,9 @@ from uniserve_worker.protocol.worker_info import WorkerInfo
 from uniserve_worker.transport.fetch import fetch_tensor
 
 pytestmark = pytest.mark.integration
+
+# One four-frame window of the default one-pixel decoder fixture.
+UNIT = video.Config(4, image.Config(1, 1))
 
 
 def _encoder_bindings(model, components, device="cpu"):
@@ -109,7 +113,11 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
             RequestKey(1, 0, 0), CallId(1, 0), cursor=2, max_units=units
         )
         result = runner.output_layout(
-            "reconstruction", 0, SimpleNamespace(num_frames=50), interval, 1
+            "reconstruction",
+            0,
+            SimpleNamespace(num_frames=50, height=8, width=12),
+            interval,
+            1,
         )
         if rank == 0 or (rank == 1 and units == 1):
             assert result is None
@@ -243,9 +251,9 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(
                 "reconstruction",
                 (source,),
                 method="decode",
-                size=4,
+                size=UNIT,
                 frames=(slice(0, 4),),
-                num_frames=(4,),
+                sizes=(UNIT,),
             ).values[0]
 
         reference = expected(source)
@@ -288,9 +296,9 @@ def test_module_call_statistics_count_the_call_without_tokens():
             "reconstruction",
             (torch.zeros(4, 3),),
             method="decode",
-            size=4,
+            size=UNIT,
             frames=(slice(0, 4),),
-            num_frames=(4,),
+            sizes=(UNIT,),
         )
     finally:
         runner.close()
@@ -397,7 +405,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
                 NewRequest(
                     key,
                     request_pool_idx=1,
-                    diffusion=DiffusionParams(22, 3, 4, 1000),
+                    diffusion=DiffusionParams(22, 3, 4, 1000, 768, 1344),
                     prompt_token_ids=prompt,
                 )
             ),
@@ -596,7 +604,7 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         admission = NewRequest(
             key,
             request_pool_idx=1,
-            diffusion=DiffusionParams(22, 3, 4, 1000),
+            diffusion=DiffusionParams(22, 3, 4, 1000, 768, 1344),
             prompt_token_ids=(3, 8, 1),
         )
         run = Batch(
@@ -637,13 +645,14 @@ def test_decoder_graphs_share_backing_and_match_eager_decoding():
     )
 
     def decode(runner, frames, window, source):
+        size = video.Config(frames, UNIT.frame)
         return runner.run_module(
             "reconstruction",
             (source,),
             method="decode",
-            size=frames,
+            size=size,
             frames=(slice(4 * window, 4 * window + 4),),
-            num_frames=(frames,),
+            sizes=(size,),
         ).values[0]
 
     calls = [

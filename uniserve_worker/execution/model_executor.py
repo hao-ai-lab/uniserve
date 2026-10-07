@@ -41,6 +41,7 @@ import torch
 from torch import nn
 
 from uniserve.distributed import Communicator, DeviceMesh
+from uniserve.media import image
 from uniserve.model import (
     AudioDecoder,
     CausalLM,
@@ -955,11 +956,11 @@ class ModelExecutor:
     ):
         """Resolve the published layout of one call output on this rank.
 
-        ``media`` supplies the request's frame count (the builder's maximum
-        when ``None``), ``decode`` the media units of a scheduled decode round
-        (every unit when ``None``), and ``num_prompt_tokens`` the prompt
-        length. A distributed component's layout is narrowed to the units
-        this rank publishes.
+        ``media`` supplies the request's frame count and raster (the builder's
+        maxima when ``None``), ``decode`` the media units of a scheduled decode
+        round (every unit when ``None``), and ``num_prompt_tokens`` the prompt
+        length. A distributed component's layout is narrowed to the units this
+        rank publishes.
 
         Returns None for outputs this rank does not publish: non-output ranks,
         degenerate denoiser slices, and empty temporal-unit shares of a
@@ -973,6 +974,9 @@ class ModelExecutor:
             return None
 
         frames = None if media is None else media.num_frames
+        frame = (
+            None if media is None else image.Config(media.height, media.width)
+        )
         results: tuple[tuple[nn.Module | None, str, OutputLayout], ...] = tuple(
             (call.module, name, layout)
             for call in self._declarations[entry]
@@ -982,6 +986,7 @@ class ModelExecutor:
                 builder=self.media_builder,
                 clock=self.video_postprocessor,
                 frames=frames,
+                frame=frame,
                 prompt_tokens=num_prompt_tokens,
             ).items()
         )
@@ -992,11 +997,7 @@ class ModelExecutor:
                 encoded_units_layout,
             )
 
-            count = (
-                self.media_builder.maximum.num_frames
-                if frames is None
-                else frames
-            )
+            count = self.media_builder.max_frames if frames is None else frames
             results = (
                 (
                     None,

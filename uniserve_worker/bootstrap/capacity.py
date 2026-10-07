@@ -658,7 +658,7 @@ def artifact_import_regions(
     if binding is None or decoder is None or builder is None:
         return 0
     ranks = len(binding.config.ranks)
-    units = len(decoder.frame_slices(builder.maximum.num_frames))
+    units = len(decoder.frame_slices(builder.max_frames))
     return ceil_div(units, ranks) * max(0, ranks - 1)
 
 

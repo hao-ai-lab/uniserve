@@ -246,6 +246,10 @@ pub struct DiffusionSamplingParams {
     pub num_frames: u32,
     /// Video media units the decoder reconstructs, independent of GPU rank count.
     pub video_units: u32,
+    /// Output frame height in pixels.
+    pub height: u32,
+    /// Output frame width in pixels.
+    pub width: u32,
     /// Number of denoising steps in the trajectory.
     pub num_inference_steps: u32,
     /// Deterministic request-level noise seed.
@@ -267,7 +271,8 @@ pub struct DiffusionRequest {
 
 impl DiffusionRequest {
     /// Checks that the prompt is nonempty, that the frame, media-unit, and
-    /// step counts are positive, and that the prompt token count fits in `u32`.
+    /// step counts and the output raster are positive, and that the prompt
+    /// token count fits in `u32`.
     ///
     /// The engine's media admission rejects a failing request with
     /// `RejectionKind::Invalid`.
@@ -278,6 +283,8 @@ impl DiffusionRequest {
 
         if self.sampling.num_frames == 0
             || self.sampling.video_units == 0
+            || self.sampling.height == 0
+            || self.sampling.width == 0
             || self.sampling.num_inference_steps == 0
             || self.prompt_token_ids.len() > u32::MAX as usize
         {
@@ -294,7 +301,8 @@ pub enum DiffusionRequestError {
     /// The tokenized prompt contains no tokens.
     #[error("media prompt tokens must not be empty")]
     EmptyPromptTokens,
-    /// A frame, media-unit, or step count is zero, or the prompt token count
+    /// A frame, media-unit, or step count or a raster extent is zero, or the
+    /// prompt token count
     /// exceeds `u32::MAX`.
     #[error("diffusion parameters are invalid")]
     InvalidSampling,

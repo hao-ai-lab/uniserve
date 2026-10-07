@@ -237,6 +237,7 @@ impl Default for WorkerProcessArgs {
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,
+            video_frame_sizes: None,
             flashinfer_workspace_size: 512 * 1024 * 1024,
             flashinfer_use_tensor_core: None,
             flashinfer_decode_backend: FlashInferBackend::Fa2,
@@ -472,6 +473,7 @@ impl WorkerProcessArgs {
             "video_text_capacities".into(),
             json!(self.video_text_capacities),
         );
+        fields.insert("video_frame_sizes".into(), json!(self.video_frame_sizes));
         fields.insert(
             "flashinfer_workspace_size".into(),
             json!(self.flashinfer_workspace_size),

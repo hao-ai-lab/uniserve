@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 
 from uniserve.diffusion import DenoisingStep, normal_noise
 from uniserve.distributed import DeviceMesh, communication_axes
+from uniserve.media import image
 from uniserve.model import LatentInput, TextSize
 from uniserve.nn.attention import (
     AttentionParallelConfig,
@@ -199,7 +200,7 @@ def _generate(
             mesh = meshes["denoiser"]
             pipeline = mesh.get_group("pp" if "pp" in axes else ())
             tensor = mesh.get_group("tp" if "tp" in axes else ())
-            size = DenoiserSize(frames, len(token_ids))
+            size = DenoiserSize(frames, image.Config(768, 1344), len(token_ids))
             # Calls evaluate the prompt's layout: its conditioning fills the
             # leading text rows, and its own tables are request state.
             layout = denoiser.layout_size(size)
@@ -355,7 +356,10 @@ def _collect(checkpoint, requests, kind, directory, *, encoder_tp, precision):
             for name in ("video", "audio")
         }
         packing = build_packing(
-            num_text_tokens=len(token_ids), num_frames=frames
+            num_text_tokens=len(token_ids),
+            num_frames=frames,
+            height=768,
+            width=1344,
         )
         raster = torch.empty_like(joined["video"])
         raster[packing.video_raster_indices] = joined["video"]

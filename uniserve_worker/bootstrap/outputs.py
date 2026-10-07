@@ -119,7 +119,7 @@ def resolve_outputs(
                 (
                     None,
                     "encoded_units",
-                    encoded_units_layout(decoder, builder.maximum.num_frames),
+                    encoded_units_layout(decoder, builder.max_frames),
                 )
             )
         for module, name, layout in layouts:

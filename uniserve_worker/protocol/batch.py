@@ -272,10 +272,19 @@ class DiffusionParams:
     num_inference_steps: int
     # Deterministic noise seed; nonnegative.
     seed: int
+    # Output frame raster in pixels.
+    height: int
+    width: int
 
     def __post_init__(self) -> None:
-        """Require positive work bounds and a nonnegative deterministic seed."""
-        for name in ("num_frames", "video_units", "num_inference_steps"):
+        """Require positive work bounds and raster and a nonnegative seed."""
+        for name in (
+            "num_frames",
+            "video_units",
+            "num_inference_steps",
+            "height",
+            "width",
+        ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"diffusion {name} must be positive")
         _nonnegative(self.seed, "diffusion seed")
@@ -293,6 +302,8 @@ class DiffusionParams:
                 data.get("num_inference_steps"), f"{where}.num_inference_steps"
             ),
             seed=_uint(data.get("seed"), f"{where}.seed"),
+            height=_uint(data.get("height"), f"{where}.height"),
+            width=_uint(data.get("width"), f"{where}.width"),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -302,6 +313,8 @@ class DiffusionParams:
             "video_units": self.video_units,
             "num_inference_steps": self.num_inference_steps,
             "seed": self.seed,
+            "height": self.height,
+            "width": self.width,
         }
 
 

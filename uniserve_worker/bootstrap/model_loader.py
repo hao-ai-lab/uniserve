@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from uniserve.loading import weights
+from uniserve.media import image
 from uniserve.model import (
     CausalLM,
     ComponentEntry,
@@ -151,6 +152,7 @@ def prepare_worker_model(
     metadata = models.read_config(
         launch.path, io=config.load, modules=frozenset()
     )
+    metadata = _serve_frame_sizes(metadata, config.execution)
     with torch.device("meta"):
         model = metadata.model_class(metadata.model)
     declared = validate_components(
@@ -165,7 +167,10 @@ def prepare_worker_model(
         if config.execution.rank in component.ranks
         for call in declared[name]
     )
-    source = models.read_config(launch.path, io=config.load, modules=resident)
+    source = _serve_frame_sizes(
+        models.read_config(launch.path, io=config.load, modules=resident),
+        config.execution,
+    )
 
     # The host name is the ``node`` the rank's ``WorkerEndpoint`` reports, so
     # the refusal and the engine's own report name one host.
@@ -186,6 +191,42 @@ def prepare_worker_model(
         model,
         declared,
     )
+
+
+def _serve_frame_sizes(source, execution: WorkerConfig):
+    """Replace a video model's served output rasters with the deployment's.
+
+    ``execution.video_frame_sizes`` lists ``(height, width)`` rasters; empty
+    keeps the checkpoint configuration's own. The model's output
+    configuration validates the rasters it is given.
+
+    Raises:
+        WorkerError: With the invalid-descriptor code, when rasters are
+            given for a model without configurable output rasters or the
+            model refuses them.
+    """
+    if not execution.video_frame_sizes:
+        return source
+    output = getattr(source.model, "output", None)
+    if output is None or not hasattr(output, "frame_sizes"):
+        raise invalid_descriptor(
+            "video frame sizes require a model with configurable rasters"
+        )
+
+    try:
+        model = replace(
+            source.model,
+            output=replace(
+                output,
+                frame_sizes=tuple(
+                    image.Config(height, width)
+                    for height, width in execution.video_frame_sizes
+                ),
+            ),
+        )
+    except ValueError as error:
+        raise invalid_descriptor(str(error)) from error
+    return replace(source, model=model)
 
 
 def _weight_config(source, options, execution) -> weights.Config:
