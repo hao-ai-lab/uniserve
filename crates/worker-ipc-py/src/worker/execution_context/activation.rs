@@ -5,6 +5,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use super::ExecutionContext;
+use super::transfers::DeviceTransfers;
 
 #[pyclass]
 pub(super) struct Activation {
@@ -46,10 +47,9 @@ impl Activation {
                 (py.import("uniserve.runtime.communication")?
                     .call_method1("stream_collective_scope", (collectives,))?,),
             )?;
-            scope.call_method1(
-                "enter_context",
-                (state.transfers.call_method0(py, "activate")?,),
-            )?;
+            if let Some(transfers) = DeviceTransfers::scope(state.transfers.bind(py)) {
+                scope.call_method1("enter_context", (Py::new(py, transfers)?,))?;
+            }
 
             let parallel = py.import("uniserve.nn.attention._parallel")?;
             scope.call_method1(
