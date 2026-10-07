@@ -46,3 +46,13 @@ def test_padding_reads_each_source_pixel_exactly(mode, padding, layout):
         actual = frame_pad(values, padding, mode=mode)
 
     assert torch.equal(actual, _padded(values, padding, mode))
+
+
+@pytest.mark.parametrize("padding", [(0, 23, 0, 0, 0), (0, 0, 19, 0, 1)])
+def test_reflection_beyond_the_extent_is_refused(padding):
+    # A reflected side as long as its extent would mirror past the opposite
+    # edge; F.pad refuses it, and so must the kernel's single reflection.
+    values = _source("contiguous")
+
+    with torch.inference_mode(), pytest.raises(ValueError, match="shorter"):
+        frame_pad(values, padding, mode="reflect")

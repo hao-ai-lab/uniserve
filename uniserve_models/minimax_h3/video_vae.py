@@ -49,7 +49,9 @@ from uniserve.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
 from uniserve.nn.mlp import GatedMLP
 from uniserve.nn.rope import RotaryEmbedding
 from uniserve.nn.vae import (
+    CausalConv3d,
     ChannelStatistics,
+    FrameGroupNorm,
     LatentDecoder,
     LatentEncoder,
     SpatialDecoder,
@@ -809,72 +811,6 @@ def assignments(model: Decoder | Model, reader):
             weights.Assignment(parameter, value, source_slice=region)
         )
     return tuple(assignments)
-
-
-class CausalConv3d(nn.Conv3d):
-    """Convolve NCTHW values with symmetric spatial, causal temporal padding.
-
-    ``spatial_padding`` pixels pad both sides of height and width in
-    ``spatial_padding_mode``. ``temporal_padding`` zero frames precede the
-    input and none follow it, so no output frame reads a later input frame.
-    ``forward`` pads (``functional.frame_pad``) and convolves; ``convolve``
-    takes input already padded by ``padding_extents``.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        *,
-        stride: int | tuple[int, int, int] = 1,
-        spatial_padding: int = 0,
-        temporal_padding: int = 0,
-        spatial_padding_mode: str = "reflect",
-    ):
-        super().__init__(
-            in_channels, out_channels, kernel_size, stride=stride, padding=0
-        )
-        self.spatial_padding = spatial_padding
-        self.temporal_padding = temporal_padding
-        self.spatial_padding_mode = spatial_padding_mode
-
-    @property
-    def padding_extents(self) -> tuple[int, int, int, int, int]:
-        """``(left, right, top, bottom, front)`` padding of the input."""
-        extent = self.spatial_padding
-        return (extent, extent, extent, extent, self.temporal_padding)
-
-    def convolve(self, padded: torch.Tensor) -> torch.Tensor:
-        """Convolve input that already carries this convolution's padding."""
-        return F.conv3d(padded, self.weight, self.bias, stride=self.stride)
-
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
-        if self.spatial_padding or self.temporal_padding:
-            values = functional.frame_pad(
-                values, self.padding_extents, mode=self.spatial_padding_mode
-            )
-        return self.convolve(values)
-
-
-class FrameGroupNorm(nn.GroupNorm):
-    """Group-normalize every NCTHW frame on its own; frames never mix.
-
-    Returns the normalized values as a permuted view of the frame-folded
-    result; the causal convolution's padding (``functional.frame_pad``)
-    reads that view directly instead of a contiguous copy.
-    """
-
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
-        batch, channels, frames, height, width = values.shape
-        # Fold time into the batch: [batch * frames, channels, height, width].
-        folded = values.permute(0, 2, 1, 3, 4).reshape(
-            batch * frames, channels, height, width
-        )
-        normalized = super().forward(folded)
-        return normalized.view(batch, frames, channels, height, width).permute(
-            0, 2, 1, 3, 4
-        )
 
 
 class CausalBlock(nn.Module):

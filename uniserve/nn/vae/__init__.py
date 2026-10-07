@@ -4,8 +4,10 @@ from .decoder import LatentDecoder
 from .encoder import LatentEncoder
 from .layers import (
     AttentionBlock,
+    CausalConv3d,
     DiagonalGaussian,
     Downsample,
+    FrameGroupNorm,
     ResidualBlock,
     Upsample,
 )
@@ -22,8 +24,10 @@ __all__ = [
     "SpatialDecoder",
     "SpatialEncoder",
     "AttentionBlock",
+    "CausalConv3d",
     "DiagonalGaussian",
     "Downsample",
+    "FrameGroupNorm",
     "ResidualBlock",
     "Upsample",
     "PatchAutoencoder",

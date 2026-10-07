@@ -24,8 +24,9 @@ def frame_pad(
 
     ``padding`` is ``(left, right, top, bottom, front)``: columns and rows
     padded on each side in ``mode`` (``reflect`` or ``replicate``), then
-    ``front`` zero frames before the first frame. Returns a new contiguous
-    tensor.
+    ``front`` zero frames before the first frame. Reflection mirrors once,
+    so each reflected side must be shorter than its extent. Returns a new
+    contiguous tensor.
     """
     if len(padding) != 5 or any(
         type(value) is not int or value < 0 for value in padding
@@ -41,10 +42,16 @@ def frame_pad(
             "frame padding takes [batch, channels, frames, height, width]"
         )
 
-    from uniserve_kernels.norm import frame as kernels
-
     left, right, top, bottom, front = padding
     batch, channels, frames, height, width = values.shape
+    # The kernel mirrors each coordinate once, the extent F.pad accepts.
+    if mode == "reflect" and (
+        max(left, right) >= width or max(top, bottom) >= height
+    ):
+        raise ValueError("reflected padding must be shorter than its extent")
+
+    from uniserve_kernels import frame as kernels
+
     out = torch.empty(
         (
             batch,
