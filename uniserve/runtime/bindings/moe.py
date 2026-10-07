@@ -92,6 +92,8 @@ class MoEBinding:
                 max(size.num_tokens, self.size.num_tokens),
                 max(size.batch_size, self.size.batch_size),
             )
+        # Any expert ``Backend``; the MegaMoE branch prepares its fused one.
+        provider: moe_backend.Backend
         if self.exchange is not None and self.exchange.transport == "megamoe":
             # The fused kernel exchanges, computes and combines in one launch
             # over the exchange's symmetric staging.

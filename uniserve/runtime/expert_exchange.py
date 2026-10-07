@@ -52,6 +52,7 @@ import torch
 import torch.distributed as dist
 
 from uniserve.distributed import Communicator
+from uniserve.nn.moe import Activation
 from uniserve.quantization import QuantizedTensor, ScaleLayout
 
 __all__ = ["ExpertExchange", "JoinGraphs"]
@@ -81,7 +82,7 @@ class ExpertExchange:
         device: torch.device,
         transport: Literal["alltoall", "megamoe"] = "alltoall",
         intermediate_size: int | None = None,
-        activation: str | None = None,
+        activation: Activation | None = None,
     ) -> None:
         if group.size < 2 or max_tokens < 1:
             raise ValueError(
@@ -273,8 +274,7 @@ class ExpertExchange:
         self.enter(module)
         if hidden.shape[0] > self.capacity:
             raise ValueError("a rank's tokens exceed the step capacity")
-        encoded = isinstance(hidden, QuantizedTensor)
-        if encoded:
+        if isinstance(hidden, QuantizedTensor):
             quantizer = hidden.quantizer
             if (
                 quantizer.format != "nvfp4"
@@ -304,7 +304,7 @@ class ExpertExchange:
             )
         ]
         ids, weights = received[-2:]
-        if not encoded:
+        if not isinstance(hidden, QuantizedTensor):
             return received[0], ids, weights
         return (
             quantizer.from_tensors(
@@ -371,7 +371,7 @@ class JoinGraphs:
     ) -> None:
         from .cuda_graph import CUDAGraph
 
-        self._graphs: dict[int, CUDAGraph] = {}
+        self._graphs: dict[int, CUDAGraph[None]] = {}
         try:
             for capacity in sorted(frozenset(capacities), reverse=True):
 
@@ -384,7 +384,8 @@ class JoinGraphs:
 
                 with context.activate():
                     join()
-                graph = CUDAGraph(context=context, pools=pools)
+                # A join returns nothing; its graph retains no outputs.
+                graph: CUDAGraph[None] = CUDAGraph(context=context, pools=pools)
                 self._graphs[capacity] = graph
                 graph.capture(join)
         except BaseException:

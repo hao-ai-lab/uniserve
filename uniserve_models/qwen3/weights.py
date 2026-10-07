@@ -191,7 +191,7 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
                 source = source.removeprefix("model.")
             return reader.get(source) if source in available else None
 
-        result = []
+        result: list[weights.Assignment] = []
         for path, prefix in experts.items():
             module = modules.get(path)
             if module is None:

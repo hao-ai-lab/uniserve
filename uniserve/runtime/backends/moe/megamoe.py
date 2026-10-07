@@ -37,6 +37,7 @@ import os
 import torch
 
 from uniserve.distributed import Communicator
+from uniserve.nn.moe import Activation
 from uniserve.quantization import RowOrder
 
 from . import NVFP4Backend, NVFP4Operator
@@ -106,7 +107,7 @@ class MegaMoEBuffer:
         top_k: int,
         hidden: int,
         intermediate: int,
-        activation: str,
+        activation: Activation,
         device: torch.device,
     ) -> None:
         _initialize_nvshmem(group, device)
@@ -163,7 +164,8 @@ class _MegaMoE(NVFP4Operator):
 
     def __init__(self, *, module, size, workspace, buffer: MegaMoEBuffer):
         super().__init__(module=module, size=size, workspace=workspace)
-        self.buffer = buffer
+        # ``close`` releases the staging, weight views and scales.
+        self.buffer: MegaMoEBuffer | None = buffer
         up_gate, down = module.up_gate.weight, module.down.weight
         experts = up_gate.shape[0]
         fields13, fields2 = up_gate.buffers(), down.buffers()
@@ -172,13 +174,13 @@ class _MegaMoE(NVFP4Operator):
         # Packed E2M1 bytes [E, rows, K / 2] read through K-major transposed
         # [E, K / 2, rows] views; each expert's 128x4-swizzled scales are a
         # contiguous run of its rows' blocks.
-        self._fc1 = (
+        self._fc1: tuple[torch.Tensor, torch.Tensor] | None = (
             fields13["values"].transpose(1, 2).view(fp4),
             fields13["block_scale"]
             .view(torch.float8_e4m3fn)
             .reshape(experts, -1),
         )
-        self._fc2 = (
+        self._fc2: tuple[torch.Tensor, torch.Tensor] | None = (
             fields2["values"].transpose(1, 2).view(fp4),
             fields2["block_scale"]
             .view(torch.float8_e4m3fn)
@@ -191,9 +193,13 @@ class _MegaMoE(NVFP4Operator):
         # tensor_scale2 * s2.
         input13 = module.up_gate.input_quantizer.calibrated_scale
         input2 = module.down.input_quantizer.calibrated_scale
-        self._fc1_alpha = (fields13["tensor_scale"] * input13).float()
-        self._fc2_alpha = (fields2["tensor_scale"] * input2).float()
-        self._fc1_norm = torch.full(
+        self._fc1_alpha: torch.Tensor | None = (
+            fields13["tensor_scale"] * input13
+        ).float()
+        self._fc2_alpha: torch.Tensor | None = (
+            fields2["tensor_scale"] * input2
+        ).float()
+        self._fc1_norm: torch.Tensor | None = torch.full(
             (experts,), 1.0 / input2, dtype=torch.float32, device=up_gate.device
         )
 
@@ -204,7 +210,13 @@ class _MegaMoE(NVFP4Operator):
                 "their routes"
             )
         self._validate(hidden, topk_ids, topk_weights)
-        if hidden.shape[0] > self.buffer.max_tokens:
+        # ``_validate`` rejects a closed operator, and only ``close``
+        # releases the staging and scales.
+        buffer = self.buffer
+        assert buffer is not None
+        assert self._fc1_alpha is not None and self._fc2_alpha is not None
+        assert self._fc1_norm is not None
+        if hidden.shape[0] > buffer.max_tokens:
             raise ValueError("routed tokens exceed the MegaMoE staging")
         from uniserve_kernels.megamoe import note_staged_tokens
 
@@ -215,7 +227,7 @@ class _MegaMoE(NVFP4Operator):
         # staged extent. Rows stored in that encoding stage as they are; BF16
         # rows encode with the operator's fp4_quantize, so both give the bytes
         # the other NVFP4 providers read.
-        symmetric = self.buffer.symmetric
+        symmetric = buffer.symmetric
         tokens = hidden.shape[0]
         fields = self.encode(hidden).buffers()
         staged_scales = symmetric.x_sf.view(torch.uint8)
@@ -238,7 +250,7 @@ class _MegaMoE(NVFP4Operator):
         symmetric.fc1_norm_const.copy_(self._fc1_norm)
         # A rank with no tokens still launches, serving the tokens the other
         # ranks route to its experts.
-        self.buffer.launch(id(self), self._fc1, self._fc2, active_tokens)()
+        buffer.launch(id(self), self._fc1, self._fc2, active_tokens)()
         return symmetric.output_activation[:tokens].clone()
 
     def close(self) -> None:
