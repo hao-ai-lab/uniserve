@@ -147,7 +147,8 @@ def condition_segments(
         ValueError: A keyframe off the target canvas, or a raster or frame
             count the VAE does not encode.
     """
-    keyframes, references = [], []
+    keyframes: list[Segment] = []
+    references: list[Segment] = []
     for index, condition in enumerate(conditions):
         pixels = condition.video
         height = width = frames = 0
@@ -681,15 +682,16 @@ def _frame_grid(
 
 def _place_audio(
     positions: torch.Tensor,
-    rows: slice,
+    rows: slice | torch.Tensor,
     frames: int,
     origin: float,
     width_grid: torch.Tensor,
 ) -> None:
     """Place one channel-major stereo block from ``origin``.
 
-    Audio advances one unit per latent; it has no height coordinate, and the
-    two channels sit at the two ends of ``width_grid``.
+    ``rows`` selects the block's packed rows, as a slice or an int64 index
+    tensor. Audio advances one unit per latent; it has no height coordinate,
+    and the two channels sit at the two ends of ``width_grid``.
     """
     positions[rows, 0] = (
         origin + torch.arange(frames, dtype=torch.float64, device="cpu")
@@ -1162,7 +1164,7 @@ def region_tables(
     prefix_index = torch.full((rows,), packing.zero_row, dtype=torch.int64)
     valid_sizes = torch.zeros(tiles, dtype=torch.int32)
     tile_regions = torch.full((tiles,), -1, dtype=torch.int32)
-    region_tile_counts = []
+    region_tile_counts: list[int] = []
 
     def dense_rows(first_tile: int, count: int) -> torch.Tensor:
         # Packed rows of a dense segment of ``count`` rows filling tiles from

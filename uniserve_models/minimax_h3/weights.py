@@ -19,7 +19,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.diffusion import BlockGrid, fuse_heads
+from uniserve.diffusion import BlockGrid, FixedGrid, fuse_heads
 from uniserve.loading import checkpoint, weights
 from uniserve.nn import Modulation
 from uniserve_models import qwen3_vl
@@ -301,7 +301,7 @@ def _prepare_modulation(model, config: DenoiserConfig, reader):
 
 
 @torch.inference_mode()
-def _prepare_heads(model, grids: Mapping[str, BlockGrid], reader):
+def _prepare_heads(model, grids: Mapping[str, FixedGrid], reader):
     """Fuse a PDD student's output heads once per evaluation block.
 
     Runs in the transformer mapping's post-load hook, which materializes the
@@ -312,12 +312,17 @@ def _prepare_heads(model, grids: Mapping[str, BlockGrid], reader):
     integration weights in FP32. The output projections are FP32 parameters,
     as in the released DiTs and the reference inference, so the checkpoint's
     heads widen to FP32 before fusing and the fused head keeps FP32.
+
+    Raises:
+        ValueError: A modality's grid is not a PDD block grid.
     """
     device = next(model.parameters()).device
     for projection, source, grid in (
         (model.video_output, "proj_out", grids["video"]),
         (model.audio_output, "audio_proj_out", grids["audio"]),
     ):
+        if not isinstance(grid, BlockGrid):
+            raise ValueError("fused H3 output heads need PDD block grids")
         for field in ("weight", "bias"):
             heads = (
                 reader.get(f"{source}.{field}")

@@ -90,8 +90,9 @@ def generate(
 
     Raises:
         ValueError: The denoiser rejects the size (a canvas it does not
-            generate, a frame count it does not produce), or ``layout`` does
-            not hold it.
+            generate, a frame count it does not produce), ``layout`` does
+            not hold it, or this rank is not the text encoder's final
+            pipeline stage.
     """
     denoiser = getattr(model, component)
     device = next(denoiser.parameters()).device
@@ -111,9 +112,17 @@ def generate(
     with ExecutionContext(model.text_encoder) as context:
         context.prepare(TextSize(capacity, 1))
         with context.activate():
-            features = model.text_encoder.encode(
+            encoded = model.text_encoder.encode(
                 (torch.tensor(padded, device=device),)
-            )[0][:tokens]
+            )
+            # ``encode`` returns None on a non-final pipeline stage, which
+            # holds no features to condition on.
+            if encoded is None:
+                raise ValueError(
+                    "eager H3 generation needs the text encoder's final "
+                    "pipeline stage"
+                )
+            features = encoded[0][:tokens]
 
     conditioning = torch.zeros(
         denoiser.text_condition_rows(layout),
@@ -191,7 +200,7 @@ def generate(
 
     output = video.Config(num_frames, canvas)
     decoder, postprocessor = model.video_decoder, model.video_postprocessor
-    frames = []
+    frames: list[torch.Tensor] = []
     with (
         ExecutionContext(decoder) as decoding,
         ExecutionContext(postprocessor) as processing,
@@ -210,12 +219,16 @@ def generate(
                 decoding.prepare(segment)
                 prepared = segment
             config = decoder.window_input(segment)
-            inputs = torch.empty(
+            window_latents = torch.empty(
                 config.shape, dtype=config.dtype, device=device
             )
-            decoder.unpack_latents(latents["video"], window, output, out=inputs)
+            decoder.unpack_latents(
+                latents["video"], window, output, out=window_latents
+            )
             with decoding.activate():
-                (decoded,) = decoder.decode((inputs,), segments=(segment,))
+                (decoded,) = decoder.decode(
+                    (window_latents,), segments=(segment,)
+                )
             with processing.activate():
                 rgb = postprocessor(
                     (decoder.place(decoded, window, output),),

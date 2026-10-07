@@ -15,7 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from uniserve.media import image, video
+# ``VideoCondition``'s ``video`` field shadows the module name in its body.
+from uniserve.media import image
+from uniserve.media import video as media_video
 from uniserve.model import ConditionRole
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.validation import _map, _seq, _str, _uint, _uints
@@ -209,12 +211,12 @@ class VideoCondition:
                 )
 
     @property
-    def pixels(self) -> video.Config | None:
+    def pixels(self) -> media_video.Config | None:
         """The frames and raster the video encoder encodes, if any."""
         if self.image is not None:
-            return video.Config(1, self.image.size)
+            return media_video.Config(1, self.image.size)
         if self.video is not None:
-            return video.Config(self.video.vae_frames, self.video.canvas)
+            return media_video.Config(self.video.vae_frames, self.video.canvas)
         return None
 
     @property

@@ -28,6 +28,7 @@ import io
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import torch
@@ -142,15 +143,18 @@ def read_video(path: Path, clip: VideoClip, *, ffmpeg: str) -> np.ndarray:
         ) as process,
     ):
         assert process.stdout is not None
+        # A binary pipe at the default buffering is an ``io.BufferedReader``
+        # (``subprocess.Popen.stdout``), which ``IO[bytes]`` does not spell.
+        stdout = cast(io.BufferedReader, process.stdout)
         target = memoryview(frames).cast("B")
         filled = 0
         while filled < len(target):
-            count = process.stdout.readinto(target[filled:])
+            count = stdout.readinto(target[filled:])
             if not count:
                 break
             filled += count
         # ``-frames:v`` stops the output at the planned count.
-        trailing = process.stdout.read()
+        trailing = stdout.read()
         code = process.wait()
         errors.seek(0)
         message = errors.read().decode(errors="replace").strip()
@@ -184,7 +188,8 @@ def read_audio(source: bytes | Path, clip: AudioClip, *, rate: int):
     import av
 
     container = av.open(
-        io.BytesIO(source) if isinstance(source, bytes) else str(source)
+        io.BytesIO(source) if isinstance(source, bytes) else str(source),
+        mode="r",
     )
     with container:
         if not container.streams.audio:
@@ -201,7 +206,7 @@ def read_audio(source: bytes | Path, clip: AudioClip, *, rate: int):
         resampler = av.audio.resampler.AudioResampler(
             format="fltp", layout=stream.layout, rate=native
         )
-        chunks = []
+        chunks: list[torch.Tensor] = []
         for frame in container.decode(stream):
             chunks.extend(
                 torch.from_numpy(part.to_ndarray())

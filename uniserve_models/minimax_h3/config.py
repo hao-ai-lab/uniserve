@@ -19,7 +19,7 @@ from dataclasses import dataclass, fields, replace
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, cast
 
 from uniserve.diffusion import BlockGrid, FixedGrid, RungGrid, UniformGrid
 from uniserve.media import image
@@ -36,6 +36,9 @@ from .checkpoint import (
 )
 from .encoder import TextEncoderConfig
 from .packing import CANVAS_MULTIPLE
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 # DMD rungs are unshifted noise levels on the 1000-step training clock.
 TRAINING_CLOCK = 1000.0
@@ -111,11 +114,11 @@ DMD_CANVASES = (
 PDD_MAX_SEQUENCE_ROWS = 131_072
 
 
-def _is_integer(value: object) -> bool:
+def _is_integer(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _is_positive_number(value: object) -> bool:
+def _is_positive_number(value: object) -> TypeGuard[int | float]:
     return (
         isinstance(value, int | float)
         and not isinstance(value, bool)
@@ -309,7 +312,11 @@ class DenoiserConfig:
             or any(
                 not isinstance(grid, FixedGrid) for grid in self.grids.values()
             )
-            or replace(self.grids["audio"], shift=self.grids["video"].shift)
+            # Every concrete fixed grid is a frozen dataclass.
+            or replace(
+                cast("DataclassInstance", self.grids["audio"]),
+                shift=self.grids["video"].shift,
+            )
             != self.grids["video"]
         ):
             raise ValueError(
@@ -318,7 +325,9 @@ class DenoiserConfig:
         heads = self.transformer.output_heads
         grid = self.grids["video"]
         pdd = isinstance(grid, BlockGrid)
-        if pdd != (heads > 1) or (pdd and heads != grid.intervals):
+        if pdd != (heads > 1) or (
+            isinstance(grid, BlockGrid) and heads != grid.intervals
+        ):
             raise ValueError(
                 "H3 output heads must equal the PDD interval count, and only "
                 "a PDD student has more than one"
@@ -868,9 +877,9 @@ def read_config(root: Path, io, *, sources, base: Path | None = None) -> Config:
         metadata[name] = json.loads(
             (directory / relative).read_text(encoding="utf-8")
         )
-    for component, directory in layout.denoisers.items():
+    for component, subdirectory in layout.denoisers.items():
         metadata[component] = json.loads(
-            (root / directory / "config.json").read_text(encoding="utf-8")
+            (root / subdirectory / "config.json").read_text(encoding="utf-8")
         )
     return normalize(layout, metadata)
 

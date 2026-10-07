@@ -1334,11 +1334,13 @@ def read_config(
         # Packed weights and their calibrated scales form one immutable
         # checkpoint contract. Runtime precision presets apply only to dense
         # checkpoints and must not be offered for this source.
-        base = package.checkpoint_precision(model_config)
+        checkpoint_precision: weight_options.Config = (
+            package.checkpoint_precision(model_config)
+        )
         precision = replace(
-            base,
+            checkpoint_precision,
             quantization={
-                **base.quantization,
+                **checkpoint_precision.quantization,
                 **_calibrated_quantization(
                     model, declarations, sources, modelopt, io, manifest_scales
                 ),

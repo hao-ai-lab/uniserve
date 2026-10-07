@@ -25,7 +25,7 @@ the text features and every condition latent (``condition_latents``).
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import torch
 
@@ -40,6 +40,7 @@ from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls, transfer
 from uniserve_worker.protocol.call import CallStatus, MediaCall
 from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.protocol.tensor import StaticDim
 from uniserve_worker.protocol.video import VideoAdmission
 from uniserve_worker.storage.tensor_store import device_product_storage
 
@@ -188,7 +189,8 @@ def condition_layout(
 
     Raises:
         WorkerError: ``invalid_descriptor`` when a visual latent round names
-            no units, or units outside the request's.
+            no units, or units outside the request's, or the product varies
+            along a trailing axis.
     """
     conditions = video.conditions
     name = info.name
@@ -242,7 +244,12 @@ def condition_layout(
             return None
         local = slice(sum(units[: run.start]), sum(units[: run.stop]))
 
-    trailing = tuple(int(dim.extent) for dim in info.shape_bound.dims[1:])
+    # A condition product varies along its leading axis alone.
+    trailing: tuple[int, ...] = ()
+    for dim in info.shape_bound.dims[1:]:
+        if not isinstance(dim, StaticDim):
+            raise invalid_descriptor(f"{name} varies along a trailing axis")
+        trailing += (int(dim.extent),)
     shape = (rows, *trailing)
     return OutputLayout(
         shape,
@@ -385,9 +392,25 @@ def vision_features(
     return features, result
 
 
-def vision_grids(
-    video: VideoAdmission,
-) -> dict[str, tuple[tuple[int, int, int], ...]]:
+class VisionGrids(TypedDict):
+    """The patch grids of a request's vision blocks by modality."""
+
+    image_grids: tuple[tuple[int, int, int], ...]
+    video_grids: tuple[tuple[int, int, int], ...]
+
+
+class VisionInputs(TypedDict, total=False):
+    """The vision keywords ``ModelExecutor.encode_text`` takes.
+
+    Empty for a prompt without vision blocks.
+    """
+
+    visual: torch.Tensor
+    image_grids: tuple[tuple[int, int, int], ...]
+    video_grids: tuple[tuple[int, int, int], ...]
+
+
+def vision_grids(video: VideoAdmission) -> VisionGrids:
     """Return the patch grids of a request's vision blocks by modality.
 
     The result holds ``image_grids`` and ``video_grids`` in request order,
@@ -411,7 +434,7 @@ def vision_inputs(
     state: BatchState,
     tensor_store: TensorStore,
     model_runner: ModelExecutor,
-) -> dict[str, object]:
+) -> VisionInputs:
     """Return text encoding's vision inputs for a conditioned prompt.
 
     A text encoding call of a request with vision blocks reads their
@@ -533,7 +556,11 @@ def encode_tracks(
         for condition in video.conditions
         if condition.audio is not None
     )
-    lengths = [track.audio.samples for track in tracks]
+    lengths = [
+        condition.audio.samples
+        for condition in video.conditions
+        if condition.audio is not None
+    ]
     if samples.shape != (sum(lengths), 2):
         raise invalid_descriptor(
             "condition samples disagree with the request's audio tracks"
@@ -656,6 +683,8 @@ __all__ = [
     "CONDITION_VIDEO_LATENTS",
     "VISION_FEATURES",
     "VISION_PIXELS",
+    "VisionGrids",
+    "VisionInputs",
     "condition_encoder",
     "condition_latents",
     "condition_layout",

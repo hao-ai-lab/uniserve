@@ -317,7 +317,11 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     @property
     def schedule_shifts(self) -> Mapping[str, float]:
         """Each modality's trained schedule shift."""
-        return {name: grid.shift for name, grid in self.grids.items()}
+        # ``__init__`` admits only fixed grids, which carry a trained shift.
+        return {
+            name: cast(FixedGrid, grid).shift
+            for name, grid in self.grids.items()
+        }
 
     @property
     def fixed_canvases(self) -> tuple[image.Config, ...] | None:

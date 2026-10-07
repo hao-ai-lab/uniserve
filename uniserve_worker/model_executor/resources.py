@@ -10,6 +10,7 @@ Worker bootstrap (``bootstrap.capacity``, ``bootstrap.report`` and
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import cast
 
 import torch
 
@@ -308,7 +309,10 @@ def output_layouts(
                     (config.max_condition_rows, sample.shape[1]), sample.dtype
                 )
             }
-        sample = component.output_layout(component.latent_rate)["audio"]
+        # Past the vision and video encoders, ``condition_encoder`` leaves
+        # the audio encoder.
+        audio = cast(AudioEncoder, component)
+        sample = audio.output_layout(audio.latent_rate)["audio"]
         return {
             "audio": _rows(
                 (config.max_condition_rows, sample.shape[1]), sample.dtype
@@ -324,7 +328,7 @@ def output_layouts(
         return {}
     if (frames is None) != (canvas is None):
         raise ValueError("a request's layout names its frames and canvas")
-    if frames is None:
+    if frames is None or canvas is None:
         if builder is None:
             # Standalone decoders have no serving timeline bound, and image
             # execution returns its features and decoded raster through the

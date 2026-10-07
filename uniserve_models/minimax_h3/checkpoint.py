@@ -140,7 +140,10 @@ def detect(root: Path) -> Layout:
             )
         if "pdd_steps" in contract:
             component = contract.get("transformer_component")
-            if component not in DENOISER_DIRECTORIES.values():
+            if (
+                not isinstance(component, str)
+                or component not in DENOISER_DIRECTORIES.values()
+            ):
                 raise ValueError(
                     "unsupported MiniMax-H3 checkpoint: transformer_component "
                     f"must name a DiT partition, got {component!r}"
