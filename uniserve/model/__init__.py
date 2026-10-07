@@ -5,7 +5,14 @@ Also shared computation capabilities.
 
 from .decoder import ImageDecoder
 from .denoiser import Denoiser, ImageDenoiser, VideoDenoiser, VideoSize
-from .encoder import Encoder, PatchEncoder, TextConditioner, TextEncoder
+from .encoder import (
+    Encoder,
+    MultimodalEncoder,
+    PatchEncoder,
+    TextConditioner,
+    TextEncoder,
+    TubeletEncoder,
+)
 from .inputs import (
     DEFAULT_COMPONENT,
     ComponentEntry,
@@ -54,7 +61,9 @@ __all__ = [
     "VideoEncoder",
     "VideoPostprocessor",
     "Encoder",
+    "MultimodalEncoder",
     "PatchEncoder",
     "TextConditioner",
     "TextEncoder",
+    "TubeletEncoder",
 ]

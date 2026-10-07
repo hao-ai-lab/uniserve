@@ -19,7 +19,7 @@ from .config import (
 )
 from .decoding import AudioDecoder, VideoDecoder
 from .denoiser import Denoiser
-from .encoder import TextEncoder, TextEncoderConfig
+from .encoder import TextEncoderConfig, text_encoder
 from .encoding import AudioEncoder, VideoEncoder
 from .inputs import AttentionInput, DenoiserInput, DenoiserSize
 from .model import Model, entry_points
@@ -53,7 +53,6 @@ __all__ = [
     "VideoDecoder",
     "VideoEncoder",
     "Denoiser",
-    "TextEncoder",
     "TextEncoderConfig",
     "AttentionInput",
     "DenoiserInput",
@@ -70,5 +69,6 @@ __all__ = [
     "entry_points",
     "precisions",
     "checkpoint_precision",
+    "text_encoder",
     "weight_config",
 ]

@@ -1,8 +1,8 @@
 """Qwen3 attention, experts and decoder layer composition.
 
 ``Transformer`` is the Qwen3 backbone: ``Model`` places it under a vocabulary
-head, and the MiniMax H3 text encoder uses it without the head. Traversal,
-pipeline exchange and the final norm belong to the shared
+head, and ``qwen3_vl.Transformer`` extends it into the Qwen3-VL language
+model. Traversal, pipeline exchange and the final norm belong to the shared
 ``TransformerDecoder``; this module supplies the Qwen3 layer equations.
 """
 
@@ -27,7 +27,7 @@ from uniserve.nn.linear import (
 from uniserve.nn.mlp import GatedMLP
 from uniserve.nn.moe import FusedMoE
 from uniserve.nn.norm import RMSNorm
-from uniserve.nn.rope import RotaryEmbedding
+from uniserve.nn.rope import MRotaryEmbedding, RotaryEmbedding
 
 from .config import Config
 
@@ -69,7 +69,13 @@ class Attention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.rotary = RotaryEmbedding(config.head_dim, theta=config.rope_theta)
+        rotary = RotaryEmbedding(config.head_dim, theta=config.rope_theta)
+        # A Qwen3-VL language model rotates by multimodal coordinates.
+        self.rotary = (
+            rotary
+            if config.mrope_sections is None
+            else MRotaryEmbedding(rotary, config.mrope_sections)
+        )
 
     def forward(
         self,
@@ -77,12 +83,17 @@ class Attention(nn.Module):
         positions: torch.Tensor,
         attention: AttentionInput,
     ):
+        """Attend over packed tokens at their rotary ``positions``.
+
+        Positions are ``[tokens]``; a model with ``mrope_sections`` also
+        accepts ``[axes, tokens]`` multimodal coordinates.
+        """
         # This unscaled recipe depends only on positions, so computing factors
         # does not require a host mirror of the attention lengths.
         cos, sin = self.rotary(
-            positions.reshape(-1),
+            positions,
             dtype=torch.float32,
-            sequence_length=positions.numel(),
+            sequence_length=positions.shape[-1],
         )
 
         # hidden: [tokens, hidden_size]; q/k/v: [tokens, TP-local heads,
