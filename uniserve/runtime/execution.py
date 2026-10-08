@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from functools import partial
@@ -160,6 +160,12 @@ class ExecutionContext(Generic[SizeT]):
     ``FusedMoE`` layers of ``module`` exchange tokens through; its owner
     opens a step around every forward that reaches them (see
     ``uniserve.runtime.expert_exchange``) and retires it after this context.
+
+    ``tiles`` maps ``SpatialEncoder`` modules to borrowed operators, each
+    returning exactly that encoder's ``encode_tile`` of any tile, such as the
+    replay of a graph captured at the tile shape; the encoders' calls within
+    this context encode their tiles through them. Their owner keeps them
+    valid for this context's lifetime.
     """
 
     def __init__(
@@ -177,6 +183,8 @@ class ExecutionContext(Generic[SizeT]):
         derive_host_lengths: bool = True,
         experts=None,
         weights=None,
+        tiles: Mapping[nn.Module, Callable[[torch.Tensor], torch.Tensor]]
+        | None = None,
     ):
         # Close releases the module; a closed context never executes again.
         self.module: nn.Module | None = module
@@ -258,6 +266,10 @@ class ExecutionContext(Generic[SizeT]):
         self._exchange: dict[int, ExchangeBuffers] = {}
         self._chunks: dict[int, _binding.ChunkStorage] = {}
         self._gather_pools: dict[Communicator, GatherPool] = {}
+        # Borrowed tile operators by encoder id, the key the encoders read.
+        self._tiles = {
+            id(encoder): operator for encoder, operator in (tiles or {}).items()
+        }
 
         from ._transfers import _Transfers
 
@@ -855,6 +867,7 @@ class ExecutionContext(Generic[SizeT]):
             _install(scope, _binding.moe, self._moe)
             _install(scope, _binding.attention_storage, self._exchange)
             _install(scope, _binding.linear_chunks, self._chunks)
+            _install(scope, _binding.spatial_tiles, self._tiles)
             if self.weights is not None:
                 scope.enter_context(self.weights.activate())
             yield

@@ -9,7 +9,7 @@ from torch import nn
 
 from uniserve.distributed import Communicator
 from uniserve.media import image, video
-from uniserve.nn.vae import LatentDecoder, LatentEncoder
+from uniserve.nn.vae import LatentDecoder, LatentEncoder, SpatialEncoder
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 
@@ -94,6 +94,28 @@ class VideoEncoder(nn.Module):
             )
             for band in range(count)
         )
+
+    def still_tile(
+        self, device: torch.device
+    ) -> tuple[SpatialEncoder, torch.Tensor] | None:
+        """Return the tiled encoder of still frames and one tile's input.
+
+        A latent encoder over a ``SpatialEncoder`` encodes every still frame
+        at least a tile high and wide in tiles of one shape: the native input
+        of a tile-sized frame, which ``unpack_pixels`` returns with the
+        frame's raster as its trailing axes. Returns that encoder and a zero
+        tile of its native input on ``device``, or None when the latent
+        encoder does not tile.
+        """
+        spatial = self.encoder.encoder
+        if not isinstance(spatial, SpatialEncoder):
+            return None
+        frame = torch.zeros(
+            (1, spatial.tile_height, spatial.tile_width, 3),
+            dtype=torch.uint8,
+            device=device,
+        )
+        return spatial, self.unpack_pixels(frame, slice(0, 1), 1)
 
     def posterior_noise(self, size: video.Config) -> torch.Tensor | None:
         """Return one video's complete NCTHW posterior draw, or None.
