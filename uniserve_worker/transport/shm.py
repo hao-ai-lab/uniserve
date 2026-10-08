@@ -528,13 +528,16 @@ class ShmTransport(Transport):
     ) -> None:
         """Copy the payload out of the segment, then acknowledge it.
 
-        The segment is mapped and claimed only until the payload has been
-        copied into a private buffer, and it is acknowledged as soon as that
-        copy ends. The private buffer, staged in pinned memory for a CUDA
-        destination, then feeds the possibly asynchronous destination copy.
+        A CUDA destination is copied straight from the segment, which stays
+        claimed until the copy has completed on the device. A host
+        destination copies the payload into a private buffer while the
+        segment is claimed and acknowledges it as soon as that copy ends.
         """
         import torch
 
+        if device.type == "cuda":
+            self._read_to_device(ticket, locator, device, destination, region)
+            return
         try:
             ticket._require_active()
             with _shared_read(
@@ -550,19 +553,60 @@ class ShmTransport(Transport):
         source = torch.frombuffer(
             buf, dtype=resolve_dtype(locator.dtype)
         ).reshape(locator.shape)
-        if device.type == "cuda":
-            # The read ticket retains this bounded pinned buffer until DMA
-            # retires.
-            pinned = torch.empty(
-                source.shape, dtype=source.dtype, pin_memory=True
-            )
-            pinned.copy_(source)
-            source = pinned
 
         target = read_destination(locator, device, destination, region)
         if region is not None:
             source = source[region]
         self._reads.copy(ticket, source, target)
+
+    def _read_to_device(
+        self,
+        ticket: TransferTicket,
+        locator: Locator,
+        device: torch.device,
+        destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
+        region: tuple[slice, ...] | None,
+    ) -> None:
+        """Copy the payload from the claimed segment into a CUDA destination.
+
+        The copy reads the mapping as pageable host memory, so it needs no
+        driver registration or staging copy, and `TransferPool.copy` drains
+        the read stream before it returns; only then does leaving the claim
+        acknowledge the segment. Every view of the mapping is dropped before
+        the claim closes it.
+        """
+        import torch
+
+        try:
+            ticket._require_active()
+            with _shared_read(
+                locator,
+                self._acknowledgment_slot,
+                check=ticket._require_active,
+            ) as shm:
+                mapping = memoryview(shm)
+                source: torch.Tensor | None = None
+                target: torch.Tensor | tuple[torch.Tensor, ...] | None = None
+                try:
+                    dtype = resolve_dtype(locator.dtype)
+                    source = torch.frombuffer(
+                        mapping,
+                        dtype=dtype,
+                        count=locator.nbytes // dtype.itemsize,
+                        offset=segment.HEADER_BYTES,
+                    ).reshape(locator.shape)
+                    target = read_destination(
+                        locator, device, destination, region
+                    )
+                    if region is not None:
+                        source = source[region]
+                    self._reads.copy(ticket, source, target)
+                finally:
+                    source = target = None
+                    mapping.release()
+        except BaseException as error:
+            ticket._fail(error)
+            raise
 
     def fetch(
         self,

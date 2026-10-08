@@ -352,6 +352,83 @@ def _receive_non_peer_cuda_product(channel, destination_device: str) -> None:
         channel.close()
 
 
+def _receive_cuda_products(channel, count: int) -> None:
+    """Read ``count`` CUDA VMM products through one consumer endpoint."""
+    events = EventPool()
+    consumer = make_transport(
+        "cuda_vmm",
+        byte_capacity=16384,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local("consumer"),
+    )
+    try:
+        for _ in range(count):
+            tensor = TensorTransfer.from_mapping(channel.recv())
+            destination = torch.empty(tensor.shape, device="cuda:1")
+            _consume(
+                fetch_tensor(
+                    tensor,
+                    destination,
+                    bindings={
+                        (tensor.locations[0].source, "cuda_vmm"): consumer
+                    },
+                )
+            )
+            channel.send(destination.cpu().tolist())
+    finally:
+        consumer.close()
+        events.close()
+        channel.close()
+
+
+def test_cuda_vmm_rereads_rewritten_storage_with_its_current_values() -> None:
+    """Successive products of one exported storage arrive as last written.
+
+    A producer publishes the same long-lived storage, rewrites it once the
+    first read has completed and publishes it again; the consumer, reading
+    both through one endpoint, receives each publication's own values.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("cross-device VMM reads need two CUDA devices")
+    from uniserve_kernels.peer_storage import empty
+
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    events = EventPool()
+    producer = make_transport(
+        "cuda_vmm",
+        byte_capacity=16384,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local("producer"),
+    )
+    storage = empty((6, 8), dtype=torch.float32, device=torch.device("cuda:0"))
+    process = context.Process(target=_receive_cuda_products, args=(child, 2))
+    try:
+        process.start()
+        child.close()
+        for scale in (1.0, -3.0):
+            values = scale * torch.arange(48, device="cuda:0").view(6, 8)
+            storage.copy_(values)
+            location = producer.publish(storage)
+            parent.send(
+                TensorTransfer(shape=(6, 8), locations=(location,)).to_mapping()
+            )
+            assert parent.poll(45), "CUDA VMM product did not arrive"
+            assert parent.recv() == values.cpu().tolist()
+            producer.release(location)
+        process.join(30)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(30)
+        producer.close()
+        events.close()
+        parent.close()
+
+
 def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
     """A same-host VMM product remains deliverable across PCIe islands."""
     devices = range(torch.cuda.device_count())
