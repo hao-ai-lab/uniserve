@@ -18,11 +18,14 @@ Conditions follow each other in request order in every product. Decoding
 runs as one task on the rank's host lane; ``execute`` reserves the products
 and configures that task, whose completion publishes them as host products
 for the vision and latent encoders, which read them on their own hosts.
+Within the task every condition's frames and every audio track decode
+concurrently, since nothing reads the products until all of them are filled.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -96,50 +99,71 @@ def read_conditions(
         target[start : start + value.shape[0]].copy_(value)
         rows[name] = start + value.shape[0]
 
-    for condition in conditions:
+    def visual(condition: VideoCondition):
+        # A condition's decoded frames and, for one the conditioner reads,
+        # its packed patch rows.
         source = condition.source
-        frames = None
         if condition.image is not None:
             frames = read_image(read_bytes(source), condition.image)
-        elif condition.video is not None:
+        else:
+            assert condition.video is not None
             frames = read_video(
                 media_path(source), condition.video, ffmpeg=ffmpeg
             )
+        view = condition.vision
+        if view is None:
+            return frames, None
+        # The conditioner reads an image's one frame and a video's sampled
+        # frames; indexing copies them.
+        sampled = (
+            frames
+            if condition.video is None
+            else frames[list(view.frame_indices)]
+        )
+        return frames, vision.pack_pixels(torch.from_numpy(sampled), view.grid)
 
-        if frames is not None:
-            # The video encoder encodes a video's leading frames.
-            encoded = condition.pixels
-            assert encoded is not None
-            fill(
-                "pixels",
-                pixels,
-                torch.from_numpy(frames[: encoded.num_frames]).reshape(-1, 3),
+    def track(condition: VideoCondition):
+        # An audio reference's track is its file's; a video's soundtrack is
+        # its container's first audio stream.
+        assert condition.audio is not None
+        return read_audio(
+            media_path(condition.source), condition.audio, rate=sample_rate
+        )
+
+    # Decoding releases the interpreter lock (image codecs and resampling,
+    # the FFmpeg pipe, tensor operations), so the conditions' decodes overlap;
+    # the products are then filled in request order.
+    with ThreadPoolExecutor(max_workers=max(1, 2 * len(conditions))) as pool:
+        decoded = [
+            (
+                pool.submit(visual, condition)
+                if condition.image is not None or condition.video is not None
+                else None,
+                pool.submit(track, condition)
+                if condition.audio is not None
+                else None,
             )
-            if condition.vision is not None:
-                view = condition.vision
-                # The conditioner reads an image's one frame and a video's
-                # sampled frames; indexing copies them.
-                sampled = (
-                    frames
-                    if condition.video is None
-                    else frames[list(view.frame_indices)]
-                )
+            for condition in conditions
+        ]
+        for condition, (frames_task, track_task) in zip(
+            conditions, decoded, strict=True
+        ):
+            if frames_task is not None:
+                frames, packed = frames_task.result()
+                # The video encoder encodes a video's leading frames.
+                encoded = condition.pixels
+                assert encoded is not None
                 fill(
-                    "patches",
-                    patches,
-                    vision.pack_pixels(torch.from_numpy(sampled), view.grid),
+                    "pixels",
+                    pixels,
+                    torch.from_numpy(frames[: encoded.num_frames]).reshape(
+                        -1, 3
+                    ),
                 )
-
-        if condition.audio is not None:
-            # An audio reference's track is its file's; a video's
-            # soundtrack is its container's first audio stream.
-            fill(
-                "samples",
-                samples,
-                read_audio(
-                    media_path(source), condition.audio, rate=sample_rate
-                ),
-            )
+                if packed is not None:
+                    fill("patches", patches, packed)
+            if track_task is not None:
+                fill("samples", samples, track_task.result())
 
     for name, target in (
         ("pixels", pixels),
