@@ -9,6 +9,7 @@ reproduce the conditioning recipe of the diffusers MiniMax-H3 pipeline.
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Mapping
 
@@ -32,6 +33,28 @@ POSTERIOR_SEED = 42
 
 # Latent rows are the denoiser's (1, 2, 2) patches of the latent raster.
 _PATCH = 2
+
+
+@functools.lru_cache(maxsize=16)
+def _posterior_draw(
+    channels: int, frames: int, height: int, width: int
+) -> torch.Tensor:
+    """Return the host FP32 posterior draw of one latent shape.
+
+    One standard normal draw of ``[1, channels, frames, height, width]``
+    from a fresh generator seeded with ``POSTERIOR_SEED``: the draw is a
+    function of the shape alone, so every encoding round and request of a
+    condition size shares it instead of drawing it again on the host. The
+    shared tensor is read-only; callers copy the slices they use. Sixteen
+    shapes bound the cache at about 230 MB for five-second 16:9 videos.
+    """
+    draw = torch.empty(
+        (1, 1, channels, frames, height, width),
+        dtype=torch.float32,
+        device="cpu",
+    )
+    normal_noise((POSTERIOR_SEED,), out=(draw,))
+    return draw[0]
 
 
 class VideoEncoder(BaseVideoEncoder):
@@ -160,20 +183,12 @@ class VideoEncoder(BaseVideoEncoder):
         # host generator, which is the reference's draw; the shape fixes how
         # the generator's stream maps onto latent positions.
         height, width = self.latent_size(size.frame)
-        draw = torch.empty(
-            (
-                1,
-                1,
-                self.config.latent_channels,
-                self._latent_frames(size.num_frames),
-                height,
-                width,
-            ),
-            dtype=torch.float32,
-            device="cpu",
+        return _posterior_draw(
+            self.config.latent_channels,
+            self._latent_frames(size.num_frames),
+            height,
+            width,
         )
-        normal_noise((POSTERIOR_SEED,), out=(draw,))
-        return draw[0]
 
     def unpack_pixels(
         self, pixels: torch.Tensor, frames: slice, num_frames: int
