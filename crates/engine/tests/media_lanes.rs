@@ -931,9 +931,9 @@ fn leading(product: &uniserve_worker_ipc::TensorRef) -> u32 {
 
 /// A reference request reads its media first, then encodes its vision blocks
 /// before the text that splices them in, encodes its visual condition units
-/// in rounds across the latent encoder's ranks and its audio tracks in one
-/// further call, and prepares its latents from the text features and every
-/// condition's rows, in order. Each product carries the request's exact
+/// in rounds across the latent encoder's ranks, after the text, and its audio
+/// tracks in one further call, and prepares its latents from the text
+/// features and every condition's rows, in order. Each product carries the request's exact
 /// size, and each call names the components its graph reads it with.
 #[test]
 fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
@@ -972,6 +972,12 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     assert!(
         vision[0] < text[0],
         "the vision tokens precede the text encoding"
+    );
+    // Ranks holding both encoders run the prompt's encoding before the
+    // condition units.
+    assert!(
+        text[0] < latents[0],
+        "the text encoding precedes the latent encoding"
     );
 
     // The vision encoding reads the patches and writes one row per token;
