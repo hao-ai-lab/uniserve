@@ -785,20 +785,42 @@ impl RequestPlan {
             .sum()
     }
 
-    /// The units each reference image is encoded in when one latent
-    /// encoding round covers `lane` units: the lane divided evenly among the
-    /// request's reference images, at least one each.
+    /// The units each condition's reference image is encoded in when one
+    /// latent encoding round covers `lane` units, one entry per condition
+    /// (other conditions' entries are unread).
     ///
     /// A lone reference image is the largest visual condition and is a
     /// single rank's work as one unit; its bands spread its encoder tiles
-    /// over the ranks of one round. Several images share the round instead.
-    pub fn image_bands(&self, lane: u32) -> u32 {
-        let images = self
+    /// over the ranks of one round. Fewer images than the lane divide it
+    /// evenly, at least one unit each. More images than the lane encode
+    /// whole, a lane's worth per round, except that when every visual unit
+    /// is an image, the `k` images of a final partial round take `lane / k`
+    /// bands each whenever `k` divides the lane, so that round is full
+    /// rather than leaving ranks idle behind its whole images.
+    pub fn image_bands(&self, lane: u32) -> Vec<u32> {
+        let is_image = |plan: &ConditionPlan| matches!(plan.prepared, Prepared::Image(_));
+        let images = self.conditions.iter().filter(|plan| is_image(plan)).count() as u32;
+        let mut bands = vec![(lane / images.max(1)).max(1); self.conditions.len()];
+        let only_images = self
             .conditions
             .iter()
-            .filter(|plan| matches!(plan.prepared, Prepared::Image(_)))
-            .count() as u32;
-        (lane / images.max(1)).max(1)
+            .all(|plan| is_image(plan) || matches!(plan.prepared, Prepared::Audio(_)));
+        let partial = images % lane.max(1);
+        if only_images && images > lane && partial > 0 && lane.is_multiple_of(partial) {
+            // The last `partial` images, in request order, form the final
+            // round.
+            let mut remaining = partial;
+            for (entry, plan) in bands.iter_mut().zip(&self.conditions).rev() {
+                if remaining == 0 {
+                    break;
+                }
+                if is_image(plan) {
+                    *entry = lane / partial;
+                    remaining -= 1;
+                }
+            }
+        }
+        bands
     }
 }
 

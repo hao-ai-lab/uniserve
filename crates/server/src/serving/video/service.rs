@@ -294,14 +294,16 @@ impl VideoService {
         let image_bands = plan.image_bands(self.latent_encoding_lane);
         let mut media = Vec::with_capacity(prepared.media.len());
         let mut conditions = Vec::with_capacity(prepared.media.len());
-        for (condition, fetched) in plan.conditions.iter().zip(&prepared.media) {
+        for ((condition, fetched), bands) in
+            plan.conditions.iter().zip(&prepared.media).zip(image_bands)
+        {
             let source = MediaSource::publish(fetched.bytes()).map_err(|error| {
                 ApiError::server_error(format!(
                     "publishing conditions[{}] for the worker failed: {error}",
                     condition.index
                 ))
             })?;
-            conditions.push(condition.describe(plan.canvas, source.locator(), image_bands));
+            conditions.push(condition.describe(plan.canvas, source.locator(), bands));
             media.push(Arc::new(source));
         }
         Ok(PreparedVideo {
@@ -754,6 +756,49 @@ mod tests {
             published(&condition.source.name, condition.source.bytes),
             image
         );
+    }
+
+    /// Reference images beyond one latent encoding round encode whole, a
+    /// round's worth at a time, and the images of a final partial round
+    /// split into bands that fill it: on a four-unit lane nine square images
+    /// take 1 x 8 + 4 units and six take 1 x 4 + 2 x 2, while seven, whose
+    /// final three cannot share four units evenly, stay whole. A square
+    /// reference is 64 patch rows of 64 patches.
+    #[tokio::test]
+    async fn reference_images_fill_their_final_latent_round() {
+        let image = data_uri(&png(90, 90));
+        // (images, images of the final round that split, their bands)
+        for (count, split, bands) in [(9, 1, 4), (6, 2, 2), (7, 0, 1)] {
+            let conditions = vec![
+                serde_json::json!({"type": "image", "uri": image, "role": "reference"});
+                count
+            ];
+            let prepared = encoding_service(1 << 17, None, None, 4)
+                .prepare(
+                    &ServeRequestId::new("images"),
+                    &request(serde_json::json!({
+                        "model": "minimax_h3",
+                        "prompt": "a fox",
+                        "task": "ref2va",
+                        "conditions": conditions,
+                        "target": {"short_edge": 768, "aspect_ratio": "1:1", "duration_seconds": 5.0},
+                    })),
+                    1 << 17,
+                )
+                .await
+                .unwrap();
+            for (index, condition) in prepared.request.conditions.iter().enumerate() {
+                let expected = if index < count - split {
+                    vec![64 * 64]
+                } else {
+                    vec![64 / bands * 64; bands as usize]
+                };
+                assert_eq!(
+                    condition.latent_units, expected,
+                    "{count} images, image {index}"
+                );
+            }
+        }
     }
 
     /// The first keyframe is stretched onto the canvas its own aspect sets
