@@ -3,13 +3,13 @@
 A causal 3D convolution over ``[batch, channels, frames, height, width]``
 reads its input padded on both sides of height and width (reflected or
 replicated) and preceded by zero frames. :func:`pad` writes that padded input
-into contiguous storage in one pass, reading the source through its own
-strides, so channel-first, channels-last and permuted views all work. The
-output equals the two-step ``F.pad`` result bit for bit: every element is a
-copy of one source element or zero.
+in one pass into channel-first or channels-last storage, reading the source
+through its own strides, so channel-first, channels-last and permuted views
+all work. The output equals the two-step ``F.pad`` result bit for bit: every
+element is a copy of one source element or zero.
 
 The kernel backs ``uniserve.nn.functional.frame_pad``, which validates the
-padding, allocates the contiguous output and raises on CUDA whenever
+padding, allocates the output in its storage order and raises on CUDA whenever
 :func:`unsupported` reports a reason; the launcher does not revalidate.
 """
 
@@ -35,6 +35,11 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
         stride_frame,
         stride_height,
         stride_width,
+        out_batch,
+        out_channel,
+        out_frame_stride,
+        out_height_stride,
+        out_width_stride,
         height,
         width,
         out_frames,
@@ -48,7 +53,7 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
         block_pixels: tl.constexpr,
         block_channels: tl.constexpr,
     ):
-        """Write one row segment of the padded contiguous output.
+        """Write one row segment of the padded output through its strides.
 
         Grid: (samples * out_frames * out_height, width blocks, channel
         blocks). Output frames before ``pad_front`` are zero; every other
@@ -64,14 +69,16 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
         )
         valid = (columns < out_width)[:, None] & (channel < channels)[None, :]
 
-        # Contiguous storage: [sample, channel, frame, row, column]; the
-        # columns of one row are adjacent, so the stores coalesce.
-        plane = out_frames.to(tl.int64) * out_height * out_width
+        # The block's columns are adjacent in channel-first storage and its
+        # channels in channels-last storage, so either layout's stores
+        # coalesce.
         destination = (
             out
-            + (sample.to(tl.int64) * channels + channel[None, :]) * plane
-            + (out_frame.to(tl.int64) * out_height + out_row) * out_width
-            + columns[:, None]
+            + sample.to(tl.int64) * out_batch
+            + out_frame.to(tl.int64) * out_frame_stride
+            + out_row.to(tl.int64) * out_height_stride
+            + columns[:, None].to(tl.int64) * out_width_stride
+            + channel[None, :].to(tl.int64) * out_channel
         )
 
         frame = out_frame - pad_front
@@ -121,9 +128,10 @@ if triton is not None:  # pragma: no cover - depends on the accelerator stack.
 def unsupported(values: torch.Tensor, out: torch.Tensor) -> str | None:
     """Return why the kernel cannot pad ``values`` into ``out``, or ``None``.
 
-    The input may use any strides. The output must be contiguous storage of
-    the input's dtype, batch and channels; the caller sizes its frames, rows
-    and columns from the padding. The launch records no autograd graph.
+    The input may use any strides. The output must be contiguous or
+    channels-last storage of the input's dtype, batch and channels; the
+    caller sizes its frames, rows and columns from the padding. The launch
+    records no autograd graph.
     """
     reason = unsupported_operands(values, out)
     if reason is not None:
@@ -132,8 +140,11 @@ def unsupported(values: torch.Tensor, out: torch.Tensor) -> str | None:
         return "values and output are not [batch, channels, frames, h, w]"
     if out.dtype != values.dtype:
         return f"output dtype {out.dtype} differs from {values.dtype}"
-    if not out.is_contiguous():
-        return "the output is not contiguous"
+    if not (
+        out.is_contiguous()
+        or out.is_contiguous(memory_format=torch.channels_last_3d)
+    ):
+        return "the output is neither contiguous nor channels-last"
     if out.shape[:2] != values.shape[:2]:
         return "the output's batch and channels differ from the input's"
     return None
@@ -164,6 +175,7 @@ def pad(
         values,
         out,
         *(int(stride) for stride in values.stride()),
+        *(int(stride) for stride in out.stride()),
         height,
         width,
         out_frames,

@@ -39,13 +39,21 @@ def _source(layout):
 @pytest.mark.parametrize(
     "layout", ["contiguous", "channels_last", "frame_major"]
 )
-def test_padding_reads_each_source_pixel_exactly(mode, padding, layout):
+@pytest.mark.parametrize(
+    "memory_format", [torch.contiguous_format, torch.channels_last_3d]
+)
+def test_padding_reads_each_source_pixel_exactly(
+    mode, padding, layout, memory_format
+):
     values = _source(layout)
 
     with torch.inference_mode():
-        actual = frame_pad(values, padding, mode=mode)
+        actual = frame_pad(
+            values, padding, mode=mode, memory_format=memory_format
+        )
 
     assert torch.equal(actual, _padded(values, padding, mode))
+    assert actual.is_contiguous(memory_format=memory_format)
 
 
 @pytest.mark.parametrize("padding", [(0, 23, 0, 0, 0), (0, 0, 19, 0, 1)])

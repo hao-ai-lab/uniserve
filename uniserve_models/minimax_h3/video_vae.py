@@ -815,6 +815,15 @@ def assignments(model: Decoder | Model, reader):
     return tuple(assignments)
 
 
+# The encoder's stride-1 convolutions pad into channels-last storage. cuDNN
+# computes them channels-last, so channel-first input costs a transposition
+# into and out of every one, and it selects the same algorithm for either
+# order, which leaves the encoding unchanged. For the strided downsampling it
+# selects another algorithm under channels-last, whose rounding differs, so
+# that convolution keeps channel-first input.
+_PADDED_INPUT = torch.channels_last_3d
+
+
 class CausalBlock(nn.Module):
     """Add two normalized causal convolutions to the projected input."""
 
@@ -832,6 +841,7 @@ class CausalBlock(nn.Module):
                 spatial_padding=1,
                 temporal_padding=2,
                 spatial_padding_mode=config.spatial_padding_mode,
+                memory_format=_PADDED_INPUT,
             )
             for width in (in_channels, out_channels)
         )
@@ -945,6 +955,7 @@ class CausalCNN(nn.Module):
             spatial_padding=1,
             temporal_padding=2,
             spatial_padding_mode=mode,
+            memory_format=_PADDED_INPUT,
         )
         self.stages = nn.ModuleList(
             EncoderStage(
@@ -973,6 +984,7 @@ class CausalCNN(nn.Module):
             spatial_padding=1,
             temporal_padding=2,
             spatial_padding_mode=mode,
+            memory_format=_PADDED_INPUT,
         )
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
