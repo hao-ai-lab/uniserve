@@ -706,6 +706,385 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
+# The same workloads across two four-GB200 hosts, one eight-way Ulysses
+# replica for latency and throughput. The media reader and the condition
+# encoders stay on the head's host: decoded references are host data, which
+# reach the other host only through the bounded rank channel.
+[servers.gb200-8-omniref-refs]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--base-model", "${UNISERVE_MINIMAX_H3_OMNIREF_BASE}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-reference-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "38912", "--video-text-capacities", "8192,16384,24576,38912", "--max-video-seconds", "5", "--max-condition-rows", "54400", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[servers.gb200-8-omniref-refs.environment]
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.gb200-8-omniref-w7]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w7.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w7.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w7.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w7-warmup.jsonl"
+
+[benchmarks.gb200-8-omniref-w7.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w8]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w8.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w8.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w8.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w8-warmup.jsonl"
+
+[benchmarks.gb200-8-omniref-w8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w9]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w9.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w9.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w9.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w9-warmup.jsonl"
+
+[benchmarks.gb200-8-omniref-w9.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w10]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w10.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w10.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w10.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w10-warmup.jsonl"
+
+[benchmarks.gb200-8-omniref-w10.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w11]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w11.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w11.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w11.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w11-warmup.jsonl"
+
+[benchmarks.gb200-8-omniref-w11.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w12]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w12.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w12.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w12.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w12-warmup.jsonl"
+
+[benchmarks.gb200-8-omniref-w12.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w7-c8]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w7-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w7-c8.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w7-c8.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w7-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w7-priming-c8.jsonl"
+
+[benchmarks.gb200-8-omniref-w7-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w8-c8]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w8-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w8-c8.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w8-c8.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w8-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w8-priming-c8.jsonl"
+
+[benchmarks.gb200-8-omniref-w8-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w9-c8]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w9-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w9-c8.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w9-c8.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w9-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w9-priming-c8.jsonl"
+
+[benchmarks.gb200-8-omniref-w9-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w10-c8]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w10-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w10-c8.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w10-c8.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w10-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w10-priming-c8.jsonl"
+
+[benchmarks.gb200-8-omniref-w10-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w11-c8]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w11-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w11-c8.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w11-c8.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w11-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w11-priming-c8.jsonl"
+
+[benchmarks.gb200-8-omniref-w11-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-8-omniref-w12-c8]
+server = "gb200-8-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w12-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-omniref-w12-c8.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-8-omniref-w12-c8.load]
+num_prompts = 32
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w12-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w12-priming-c8.jsonl"
+
+[benchmarks.gb200-8-omniref-w12-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
 # FastH3 8-Step V2 (UNISERVE_FAST_H3_MODEL, a local copy of
 # FastVideo/FastVideo-FastH3-8-Step-V2) on W1 and W2, with the deployment and
 # options of uniserve_eval/fast_h3.toml's gb200-4-bf16 server, which measures
@@ -1556,6 +1935,12 @@ points = ["gb200-4-omniref-w7", "gb200-4-omniref-w8", "gb200-4-omniref-w9", "gb2
 
 [suites.gb200-4-omniref-refs-throughput]
 points = ["gb200-4-omniref-w7-c4", "gb200-4-omniref-w8-c4", "gb200-4-omniref-w9-c4", "gb200-4-omniref-w10-c4", "gb200-4-omniref-w11-c4", "gb200-4-omniref-w12-c4"]
+
+[suites.gb200-8-omniref-refs]
+points = ["gb200-8-omniref-w7", "gb200-8-omniref-w8", "gb200-8-omniref-w9", "gb200-8-omniref-w10", "gb200-8-omniref-w11", "gb200-8-omniref-w12"]
+
+[suites.gb200-8-omniref-refs-throughput]
+points = ["gb200-8-omniref-w7-c8", "gb200-8-omniref-w8-c8", "gb200-8-omniref-w9-c8", "gb200-8-omniref-w10-c8", "gb200-8-omniref-w11-c8", "gb200-8-omniref-w12-c8"]
 
 [suites.fast-h3-gb200-4]
 points = ["fast-h3-gb200-4-w1", "fast-h3-gb200-4-w2"]

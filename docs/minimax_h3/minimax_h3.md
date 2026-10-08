@@ -118,8 +118,10 @@ The deployment files are in `configs/minimax_h3/`; the `fasth3-` files place Fas
 | `fasth3-ulysses4x2-two-node.json` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
 | `fasth3-dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
 | `fasth3-gather8.json` | Eight on one host | Eight-way all-gather | TP8 |
+| `ulysses4-reference.json` | Four on one host | Ulysses4 reference denoiser | TP4 |
+| `ulysses8-reference-two-node.json` | Four on each of two hosts | Ulysses8 reference denoiser | TP4 on `rank-0` |
 
-One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The validated FastH3 settings:
+One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The two-host reference file keeps the media reader and the condition encoders on the head's host: the head hands the media reader its requests' references through shared storage, and the decoded pixels are host data, which reach another host only through the head's rank channel, whose frames are bounded far below a reference video's pixels. One eight-way reference replica therefore serves both latency and throughput across two hosts. The validated FastH3 settings:
 
 | Hardware | Goal | Deployment | Options |
 | --- | --- | --- | --- |
