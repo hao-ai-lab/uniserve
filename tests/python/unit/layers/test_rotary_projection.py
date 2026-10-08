@@ -796,6 +796,63 @@ def test_stepwise_qk_rotation_rounds_each_eager_operation(device, axes, packed):
 @pytest.mark.parametrize(
     "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
 )
+@pytest.mark.parametrize("rounding", [Rounding.ONCE, Rounding.STEPWISE])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_partial_rotation_declarations_store_identical_bits(
+    device, rounding, dtype
+):
+    """Equivalent declarations of a partial rotation agree bit for bit.
+
+    96 of the 128 channels rotate split-half, declared as one axis whose
+    factors cover a prefix or as a rotated axis followed by an unrotated
+    one. Both declare one normalization domain and the same arithmetic, so
+    general Q/K values, normalized and rotated in place within strided
+    views of one fused projection, store the same bits either way.
+    """
+    generator = torch.Generator().manual_seed(29)
+    rows, dim, rotated = 67, 128, 96
+    projection = (torch.randn(rows, 10, dim, generator=generator) * 3).to(
+        device=device, dtype=dtype
+    )
+    weights = tuple(
+        (torch.rand(dim, generator=generator) + 0.5).to(
+            device=device, dtype=dtype
+        )
+        for _ in range(2)
+    )
+    angles = torch.rand(rows, rotated // 2, generator=generator) * 40
+    cos, sin = angles.cos().to(device), angles.sin().to(device)
+    declarations = (
+        (((cos,), (sin,)), (dim,)),
+        (
+            ((cos, cos[..., :0]), (sin, sin[..., :0])),
+            (rotated, dim - rotated),
+        ),
+    )
+
+    results = []
+    for factors, axis_dims in declarations:
+        packed = projection.clone()
+        q, k, _ = packed.split((6, 2, 2), dim=1)
+        qk_norm_rope(
+            q,
+            k,
+            weights[:1],
+            weights[1:],
+            *factors,
+            eps=1e-6,
+            axis_dims=axis_dims,
+            out=(q, k),
+            rounding=rounding,
+        )
+        results.append(packed)
+
+    assert torch.equal(results[0], results[1])
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
 @pytest.mark.parametrize(
     ("heads", "axis_dims", "rotated"),
     (
