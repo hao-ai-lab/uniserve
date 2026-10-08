@@ -3,12 +3,16 @@
 Tile padding zeroes exactly the rows past each tile's valid size, and the
 gated tile compression rounds its product and sum as the two eager BF16
 operations do, so both leave region attention's results bit for bit as the
-eager expressions compute them.
+eager expressions compute them. Tile selection keeps, per region, the
+best-scoring key tiles in the order a stable descending sort ranks them.
 """
 
 import pytest
 import torch
 from uniserve_kernels.attention import vsa_regions
+
+from uniserve.nn.attention.vsa.inputs import Regions
+from uniserve.nn.attention.vsa.regions import select
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 
@@ -61,3 +65,96 @@ def test_gated_tiles_round_as_the_eager_product_and_sum(scale):
     vsa_regions.add_gated_tiles(output, compressed, gate, TILE)
 
     assert torch.equal(output, expected)
+
+
+def _regions(tile_regions, valid_sizes, keep):
+    """Region tables over ``tile_regions`` (-1 dense or empty) on the host."""
+    regions = torch.tensor(tile_regions, dtype=torch.int32)
+    starts = torch.zeros_like(regions)
+    keeps = torch.ones_like(regions)
+    for region, count in enumerate(keep):
+        starts[region] = int((regions < region).sum())
+        keeps[region] = count
+    valid = torch.tensor(valid_sizes, dtype=torch.int32)
+    return Regions(TILE, regions.numel() * TILE, valid, regions, starts, keeps)
+
+
+def _on_device(regions):
+    return Regions(
+        regions.tile,
+        regions.padded_tokens,
+        *(
+            table.cuda()
+            for table in (
+                regions.valid_sizes,
+                regions.tile_regions,
+                regions.region_starts,
+                regions.region_keep,
+            )
+        ),
+    )
+
+
+def test_tile_selection_keeps_each_regions_best_scores_in_stable_order():
+    # Tile 0 dense, tile 1 empty, tiles 2-4 region 0 (keep 2), tile 5
+    # region 1 (keep 1).
+    regions = _regions([-1, -1, 0, 0, 0, 1], [5, 0, 9, 128, 1, 64], [2, 1])
+    nan = float("nan")
+    scores = torch.zeros(1, 6, 6)
+    # A video query: NaN ranks first and equal scores keep tile order.
+    scores[0, 2] = torch.tensor([0.5, 9.0, 1.0, nan, 1.0, -3.0])
+    # Signed zeros are equal scores.
+    scores[0, 3] = torch.tensor([0.0, 0.0, -0.0, 0.0, -0.0, 2.0])
+    scores[0, 4] = torch.tensor([0.0, 0.0, -1.0, 2.0, 3.0, 0.0])
+
+    indices, counts = select(scores.cuda(), _on_device(regions))
+
+    # Dense query: every live tile; empty query: none, every tile unkept.
+    assert counts[0, :2].tolist() == [5, 0]
+    assert indices[0, 0].tolist() == [0, 2, 3, 4, 5, 1]
+    assert indices[0, 1].tolist() == [0, 1, 2, 3, 4, 5]
+    # Video queries: the dense tile, two of region 0, the one of region 1.
+    assert counts[0, 2:5].tolist() == [4, 4, 4]
+    assert indices[0, 2].tolist() == [0, 2, 3, 5, 1, 4]
+    assert indices[0, 3].tolist() == [0, 2, 3, 5, 1, 4]
+    assert indices[0, 4].tolist() == [0, 3, 4, 5, 1, 2]
+
+
+@pytest.mark.parametrize(
+    ("layout", "empty", "keep"),
+    [
+        # Dense tiles first, as a prompt precedes the latents.
+        (
+            [-1] * 40 + [0] * 120 + [-1] * 6 + [1] * 120 + [2] * 30,
+            (3, 7, 39),
+            [12, 12, 3],
+        ),
+        # A video region first, its first tile empty.
+        ([0] * 70 + [-1] * 9 + [1] * 50, (0, 7, 75), [12, 5]),
+    ],
+    ids=["dense_first", "region_first"],
+)
+@pytest.mark.parametrize("ties", [False, True])
+def test_tile_selection_matches_the_eager_sort_composition(
+    layout, empty, keep, ties
+):
+    torch.manual_seed(5)
+    valid = [int(v) for v in torch.randint(1, TILE + 1, (len(layout),))]
+    for tile in empty:
+        valid[tile] = 0
+    regions = _regions(layout, valid, keep)
+    scores = torch.randn(HEADS, len(layout), len(layout))
+    if ties:
+        scores = torch.round(scores * 2) / 2
+        zeros = scores == 0
+        scores[zeros] = torch.where(
+            torch.rand(int(zeros.sum())) < 0.5, -0.0, 0.0
+        )
+        scores[torch.rand(scores.shape) < 0.01] = float("nan")
+        scores[torch.rand(scores.shape) < 0.01] = float("-inf")
+
+    expected = select(scores, regions)
+    indices, counts = select(scores.cuda(), _on_device(regions))
+
+    assert torch.equal(counts.cpu(), expected[1])
+    assert torch.equal(indices.cpu(), expected[0])

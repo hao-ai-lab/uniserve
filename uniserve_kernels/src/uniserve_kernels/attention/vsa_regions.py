@@ -11,6 +11,9 @@ eager results bit for bit:
 - ``add_gated_tiles`` adds each tile's gated compression to its rows,
   ``out + compressed[tile] * gate`` with the product and the sum each rounded
   to the tensors' dtype, as two eager element-wise operations round them.
+- ``select_tiles`` chooses every query tile's key tiles from its pooled
+  scores in one pass, the result of the stable sorts, cumulative sums and
+  scatters of ``uniserve.nn.attention.vsa.regions.select``.
 
 Tensors are ``[rows, heads, width]`` with any row and head strides and a unit
 column stride; compressed tiles are ``[heads, tiles, width]``.
@@ -133,6 +136,92 @@ if triton is not None:
             total.to(output.dtype.element_ty, fp_downcast_rounding="rtne"),
         )
 
+    @triton.jit
+    def _select_tiles_kernel(
+        scores,
+        tile_regions,
+        valid_sizes,
+        region_starts,
+        region_keep,
+        kept,
+        indices,
+        counts,
+        tiles,
+        block: tl.constexpr,
+    ):
+        """Choose one query tile's key tiles for one head.
+
+        A video query tile ranks the key tiles of every region by descending
+        score, ties by ascending tile, and keeps each region's leading
+        ``region_keep`` tiles besides every live dense tile; a dense query
+        tile keeps every live tile and an empty one none. The kept tiles are
+        stored first in ascending order, then the others in ascending order.
+        """
+        query = tl.program_id(0)
+        head = tl.program_id(1)
+        row = (head * tiles + query).to(tl.int64)
+        keys = tl.arange(0, block)
+        present = keys < tiles
+        regions = tl.load(tile_regions + keys, mask=present, other=-1)
+        live = tl.load(valid_sizes + keys, mask=present, other=0) > 0
+        query_region = tl.load(tile_regions + query)
+        query_live = tl.load(valid_sizes + query) > 0
+
+        mask = live & query_live
+        if query_live & (query_region >= 0):
+            values = tl.load(
+                scores + row * tiles + keys, mask=present, other=0.0
+            )
+            # Ascending order key of the FP32 score: the sign-flipped bits,
+            # with -0 as +0 and every NaN above +inf, as the stable sort
+            # orders them. Descending order is its complement.
+            bits = (values + 0.0).to(tl.int32, bitcast=True).to(tl.int64)
+            bits = bits & 0xFFFFFFFF
+            ascending = tl.where(
+                bits >= 0x80000000, 0xFFFFFFFF - bits, bits | 0x80000000
+            )
+            ascending = tl.where(values != values, 0xFFFFFFFF, ascending)
+            # One packed key orders the key tiles by region (dense and empty
+            # tiles first), then descending score, then ascending tile.
+            packed = (
+                ((regions + 1).to(tl.int64) << 43)
+                | ((0xFFFFFFFF - ascending) << 11)
+                | keys.to(tl.int64)
+            )
+            # Lanes past the last tile sort after every key tile, so the
+            # first ``tiles`` positions of the order hold the key tiles and
+            # ``present`` marks them by position as well as by tile.
+            packed = tl.where(present, packed, 1 << 62)
+            ordered = tl.sort(packed)
+
+            # A key's rank within its region is its position in that order
+            # less the region's first position. The trailing lanes decode to
+            # tile 0 of a region past every table, so they neither read the
+            # region tables nor store a choice.
+            ordered_regions = (ordered >> 43).to(tl.int32) - 1
+            ordered_keys = (ordered & 0x7FF).to(tl.int32)
+            ranked = present & (ordered_regions >= 0)
+            region = tl.maximum(ordered_regions, 0)
+            first = tl.load(region_starts + region, mask=ranked, other=0)
+            keep = tl.load(region_keep + region, mask=ranked, other=0)
+            chosen = ranked & (keys - first < keep)
+
+            # Return the choice to tile order through this program's row of
+            # scratch; the barrier publishes the stores to the whole program.
+            scratch = kept + row * block
+            tl.store(scratch + ordered_keys, chosen.to(tl.int8), mask=present)
+            tl.debug_barrier()
+            chosen = tl.load(scratch + keys, mask=present, other=0) != 0
+            mask = (live & (regions < 0)) | chosen
+        mask = mask & present
+
+        count = tl.sum(mask.to(tl.int32), axis=0)
+        kept_before = tl.cumsum(mask.to(tl.int32), axis=0) - 1
+        others_before = tl.cumsum((present & ~mask).to(tl.int32), axis=0) - 1
+        slots = tl.where(mask, kept_before, count + others_before)
+        tl.store(indices + row * tiles + slots, keys, mask=present)
+        tl.store(counts + row, count)
+
 
 def _rows_layout(value: torch.Tensor, name: str) -> None:
     if value.ndim != 3 or value.stride(2) != 1:
@@ -240,4 +329,80 @@ def add_gated_tiles(
     )
 
 
-__all__ = ["add_gated_tiles", "zero_tile_padding"]
+def select_tiles(
+    scores: torch.Tensor,
+    tile_regions: torch.Tensor,
+    valid_sizes: torch.Tensor,
+    region_starts: torch.Tensor,
+    region_keep: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Choose every query tile's key tiles from its pooled scores.
+
+    ``scores`` is the contiguous FP32 ``[heads, tiles, tiles]`` (query tile,
+    key tile) matrix and the tables are the int32 per-tile vectors of
+    ``uniserve.nn.attention.vsa.Regions``. A dense query tile keeps every
+    live key tile; a video query tile keeps every live dense tile and, of
+    each region ``r``, the ``region_keep[r]`` tiles of that region with the
+    highest scores, equal scores in ascending tile order, NaN above every
+    number and -0 equal to +0; an empty query tile keeps none.
+
+    Returns ``[heads, tiles, tiles]`` int32 key-tile indices, each query
+    tile's kept tiles first in ascending order followed by the unkept tiles
+    in ascending order, and ``[heads, tiles]`` int32 counts.
+
+    Raises:
+        RuntimeError: Triton cannot launch on the scores' device.
+        ValueError: The scores or tables do not describe one tile set, or
+            there are more tiles than the packed key's 11 tile bits hold.
+    """
+    if not launchable(scores.device):
+        raise RuntimeError("tile selection requires Triton")
+    heads, tiles = int(scores.shape[0]), int(scores.shape[-1])
+    tables = (tile_regions, valid_sizes, region_starts, region_keep)
+    if (
+        scores.ndim != 3
+        or scores.shape[1] != tiles
+        or scores.dtype != torch.float32
+        or not scores.is_contiguous()
+        or any(
+            table.shape != (tiles,)
+            or table.dtype != torch.int32
+            or table.device != scores.device
+            for table in tables
+        )
+        or tiles > 2048
+    ):
+        raise ValueError(
+            "tile selection needs [heads, tiles, tiles] FP32 scores, int32 "
+            "tables of the same tiles and at most 2048 tiles"
+        )
+    indices = torch.empty(
+        (heads, tiles, tiles), dtype=torch.int32, device=scores.device
+    )
+    counts = torch.empty(
+        (heads, tiles), dtype=torch.int32, device=scores.device
+    )
+    if heads == 0 or tiles == 0:
+        return indices, counts
+    block = triton.next_power_of_2(tiles)
+    # Each program returns its region choice to tile order through one row.
+    kept = torch.empty(
+        (heads * tiles, block), dtype=torch.int8, device=scores.device
+    )
+    _select_tiles_kernel[(tiles, heads)](
+        scores,
+        tile_regions,
+        valid_sizes,
+        region_starts,
+        region_keep,
+        kept,
+        indices,
+        counts,
+        tiles,
+        block,
+        num_warps=8 if block >= 1024 else 4,
+    )
+    return indices, counts
+
+
+__all__ = ["add_gated_tiles", "select_tiles", "zero_tile_padding"]
