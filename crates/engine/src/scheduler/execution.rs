@@ -5,7 +5,8 @@
 //! - Refill and dispatch: `refill_executor` admits requests, asks the
 //!   generation assembler (`assemble`) and the video media planner
 //!   (`prepare_media_batches`) for batches while a rank queue has room, and
-//!   `dispatch_submissions` hands them to the executor in order per worker.
+//!   `dispatch_submissions` hands them to the executor in order per worker,
+//!   each after the batches producing its inputs.
 //! - Video media scheduling: a video request runs the calls of its graph
 //!   (`graph::VideoGraph`, built at admission from its task and conditions),
 //!   offered by `ready_calls` as their inputs become available. Calls occupy
@@ -30,8 +31,17 @@
 use super::*;
 use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
 
+/// The products a batch's calls publish.
+fn batch_products(batch: &ExecutionBatch) -> impl Iterator<Item = BufferId> + '_ {
+    batch
+        .requests
+        .iter()
+        .flat_map(|(call, _)| call.output_buffers())
+}
+
 impl Scheduler {
-    /// Dispatches queued work while preserving order at every shared destination.
+    /// Dispatches queued work while preserving order at every shared destination
+    /// and after every product it reads.
     /// The caller retains blocked destinations for the whole scheduling tick, so
     /// assembling more work cannot repeatedly retry an unavailable worker.
     ///
@@ -41,16 +51,29 @@ impl Scheduler {
     /// handed to `on_executor_error` and stops dispatching.
     fn dispatch_submissions(&mut self, blocked_workers: &mut HashSet<crate::WorkerId>) -> bool {
         let mut progressed = false;
+        // Products of the batches held back in this pass. A call may be
+        // submitted before its inputs' producers complete, since its worker
+        // waits on them, but not before they are submitted, which is when the
+        // executor learns where each product is published. A consumer is
+        // queued after its producer and held batches keep their order, so the
+        // producer is always tried first.
+        let mut held_products = HashSet::new();
         let pending_count = self.inflight.pending_submissions.len();
         for _ in 0..pending_count {
             let Some(batch) = self.inflight.pending_submissions.pop_front() else {
                 break;
             };
             let targets = self.placement.batch_workers(&batch);
-            if !targets.is_disjoint(blocked_workers) {
+            let reads_held = batch.requests.iter().any(|(call, _)| {
+                call.input_buffers()
+                    .any(|input| held_products.contains(&input))
+            });
+            if reads_held || !targets.is_disjoint(blocked_workers) {
                 // A batch waiting on one destination also orders later work at
-                // its other destinations; independent destinations can proceed.
+                // its other destinations and the work reading its products;
+                // independent work can proceed.
                 blocked_workers.extend(targets);
+                held_products.extend(batch_products(&batch));
                 self.inflight.pending_submissions.push_back(batch);
                 continue;
             }
@@ -58,6 +81,7 @@ impl Scheduler {
                 Ok(()) => progressed = true,
                 Err(ExecutorSubmitError::WouldBlock(batch)) => {
                     blocked_workers.extend(targets);
+                    held_products.extend(batch_products(&batch));
                     self.inflight.pending_submissions.push_back(batch);
                 }
                 Err(ExecutorSubmitError::Failed(error)) => {
