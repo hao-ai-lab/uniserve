@@ -4,8 +4,9 @@ A causal 3D convolution over ``[batch, channels, frames, height, width]``
 values reads them padded on both sides of height and width and preceded by
 zero frames, so no output frame depends on a later input frame.
 ``frame_pad`` produces that padded input in one pass on CUDA, reading any
-strided view of the source; other devices compute it with ``F.pad``. Both
-give the same values bit for bit.
+strided view of the source and writing channel-first or channels-last
+storage; other devices compute it with ``F.pad``. Both give the same values
+bit for bit.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ def frame_pad(
     padding: tuple[int, int, int, int, int],
     *,
     mode: str = "reflect",
+    memory_format: torch.memory_format = torch.contiguous_format,
 ) -> torch.Tensor:
     """Pad ``[batch, channels, frames, height, width]`` values causally.
 
@@ -27,7 +29,8 @@ def frame_pad(
     padded on each side in ``mode`` (``reflect`` or ``replicate``), then
     ``front`` zero frames before the first frame. Reflection mirrors once,
     so each reflected side must be shorter than its extent. Returns a new
-    contiguous tensor.
+    tensor stored in ``memory_format``: ``torch.contiguous_format`` or
+    ``torch.channels_last_3d``.
 
     Raises:
         ValueError: when the padding or values are malformed, or on CUDA
@@ -42,6 +45,10 @@ def frame_pad(
         )
     if mode not in ("reflect", "replicate"):
         raise ValueError("frame padding mode must be reflect or replicate")
+    if memory_format not in (torch.contiguous_format, torch.channels_last_3d):
+        raise ValueError(
+            "frame padding stores channel-first or channels-last values"
+        )
     if values.ndim != 5:
         raise ValueError(
             "frame padding takes [batch, channels, frames, height, width]"
@@ -65,6 +72,7 @@ def frame_pad(
         ),
         dtype=values.dtype,
         device=values.device,
+        memory_format=memory_format,
     )
     if values.is_cuda:
         from uniserve_kernels import frame

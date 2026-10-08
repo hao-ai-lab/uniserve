@@ -186,6 +186,23 @@ def _source_identity(weight):
     return id(weight)
 
 
+def _stored_like(value, placeholder):
+    """Return ``value`` in its placeholder's channels-last storage order.
+
+    A module that declares a channels-last weight, such as a convolution
+    reading channels-last input, keeps that storage once loaded; any other
+    value is returned unchanged.
+    """
+    if isinstance(value, QuantizedTensor) or placeholder.is_contiguous():
+        return value
+    for memory_format in (torch.channels_last, torch.channels_last_3d):
+        if placeholder.dim() == (
+            4 if memory_format is torch.channels_last else 5
+        ) and placeholder.is_contiguous(memory_format=memory_format):
+            return value.contiguous(memory_format=memory_format)
+    return value
+
+
 def _fp8_fragments(shape, fragments, *, device, dtype):
     """Assemble source encodings.
 
@@ -929,7 +946,10 @@ class _Loader:
 
         # One resident Parameter object serves every module that shared the
         # original placeholder, preserving alias identity after the swap.
-        resident = nn.Parameter(value, requires_grad=parameter.requires_grad)
+        resident = nn.Parameter(
+            _stored_like(value, parameter),
+            requires_grad=parameter.requires_grad,
+        )
         for owner, name in self._aliases[key]:
             owner._parameters[name] = resident
         self._loaded.add(key)
@@ -1017,7 +1037,8 @@ class _Loader:
                         )
 
                     resident = nn.Parameter(
-                        value, requires_grad=parameter.requires_grad
+                        _stored_like(value, parameter),
+                        requires_grad=parameter.requires_grad,
                     )
                     for owner, field in self._aliases[key]:
                         owner._parameters[field] = resident

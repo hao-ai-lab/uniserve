@@ -125,8 +125,12 @@ class CausalConv3d(nn.Conv3d):
     ``spatial_padding`` pixels pad both sides of height and width in
     ``spatial_padding_mode``. ``temporal_padding`` zero frames precede the
     input and none follow it, so no output frame reads a later input frame.
-    ``forward`` pads (``uniserve.nn.functional.frame_pad``) and convolves;
-    ``convolve`` takes input already padded by ``padding_extents``.
+    ``forward`` pads (``uniserve.nn.functional.frame_pad``) into
+    ``memory_format`` storage and convolves; ``convolve`` takes input already
+    padded by ``padding_extents``. The storage order changes only how the
+    convolution reads its input: a channels-last input reaches convolution
+    kernels that compute channels-last without a transposition, and the
+    result follows that order.
     """
 
     def __init__(
@@ -139,6 +143,7 @@ class CausalConv3d(nn.Conv3d):
         spatial_padding: int = 0,
         temporal_padding: int = 0,
         spatial_padding_mode: str = "reflect",
+        memory_format: torch.memory_format = torch.contiguous_format,
     ):
         super().__init__(
             in_channels, out_channels, kernel_size, stride=stride, padding=0
@@ -146,6 +151,12 @@ class CausalConv3d(nn.Conv3d):
         self.spatial_padding = spatial_padding
         self.temporal_padding = temporal_padding
         self.spatial_padding_mode = spatial_padding_mode
+        self.memory_format = memory_format
+        # The weight is stored in the input's order, which the convolution
+        # would otherwise convert it to on every call.
+        self.weight = nn.Parameter(
+            self.weight.detach().contiguous(memory_format=memory_format)
+        )
 
     @property
     def padding_extents(self) -> tuple[int, int, int, int, int]:
@@ -160,7 +171,10 @@ class CausalConv3d(nn.Conv3d):
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         if self.spatial_padding or self.temporal_padding:
             values = frame_pad(
-                values, self.padding_extents, mode=self.spatial_padding_mode
+                values,
+                self.padding_extents,
+                mode=self.spatial_padding_mode,
+                memory_format=self.memory_format,
             )
         return self.convolve(values)
 
