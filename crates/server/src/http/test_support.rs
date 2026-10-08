@@ -122,6 +122,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
         },
         max_video_seconds,
         crate::EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
+        1,
         &crate::VideoMediaSettings::default(),
         configured_tokenizer(),
     )

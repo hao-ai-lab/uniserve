@@ -235,6 +235,27 @@ def test_video_conditioning_matches_native_encoding(
     )
 
 
+def test_reference_image_bands_match_the_whole_encoding(video_encoders):
+    """A reference image encoded in bands equals its whole encoding exactly.
+
+    A 16:9 reference at its 2048-pixel short edge is split into four bands,
+    as a four-rank latent encoder takes it, each encoded in its own call; the
+    assembled rows are the single call's bit for bit.
+    """
+    encoder, _ = video_encoders
+    frame = image.Config(2048, 3648)
+    pixels = _frames(1, frame.height, frame.width, seed=2048)
+    (whole,) = encoder.encode((pixels,), frames=(slice(0, 1),), num_frames=(1,))
+
+    assembled = torch.full_like(whole.tensor, torch.nan)
+    for band in encoder.row_bands(frame, 4):
+        (result,) = encoder.encode(
+            (pixels,), frames=(slice(0, 1),), num_frames=(1,), rows=(band,)
+        )
+        assembled[result.layout.local_slice] = result.tensor
+    assert torch.equal(assembled, whole.tensor)
+
+
 def _track(num_samples: int, channels: int, seed: int):
     """Return ``[samples, channels]`` float32 PCM on the GPU.
 

@@ -34,20 +34,28 @@ class LatentEncoder(nn.Module):
         self,
         inputs: torch.Tensor,
         *,
+        rows: slice | None = None,
         window: tuple[slice, ...] | None = None,
         noise: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Return the normalized latent of ``inputs``.
 
-        ``window`` indexes the encoder output in native latent coordinates
-        and keeps only that region, such as the latent frames of an input
-        that was padded to the encoder's temporal extent; the posterior then
-        samples the kept region alone. ``noise`` is the standard normal draw
-        a sampling posterior adds, with the kept mean's shape; without it the
-        posterior draws its own from ``generator``.
+        ``rows`` asks the encoder for a band of latent rows along its
+        height axis alone, which a ``SpatialEncoder`` computes from the tiles
+        the band depends on; None encodes every row. ``window`` then indexes
+        the encoder output in native latent coordinates and keeps only that
+        region, such as the latent frames of an input that was padded to the
+        encoder's temporal extent; the posterior samples the kept region
+        alone. ``noise`` is the standard normal draw a sampling posterior
+        adds, with the kept mean's shape; without it the posterior draws its
+        own from ``generator``.
         """
-        values = self.encoder(inputs)
+        values = (
+            self.encoder(inputs)
+            if rows is None
+            else self.encoder(inputs, rows=rows)
+        )
         if window is not None:
             values = values[window]
         if self.posterior is not None:

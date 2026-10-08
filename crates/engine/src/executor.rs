@@ -142,6 +142,31 @@ impl ExecutorInfo {
             .collect())
     }
 
+    /// Returns the media units one call of `call` covers at once: the ranks
+    /// of a distributed serving component times its `units_per_rank`, or one
+    /// for any other component, on the narrowest worker serving the call.
+    ///
+    /// Returns `None` when no worker serves `call`, or the width does not
+    /// fit in `u32`.
+    pub fn media_lane_units(&self, call: MediaCall) -> Option<u32> {
+        self.workers
+            .iter()
+            .filter_map(|(_, info)| {
+                let component = info.media_components.get(&call)?;
+                let binding = info
+                    .components
+                    .iter()
+                    .find(|binding| &binding.name == component)?;
+                let units = if binding.config.distribution.is_some() {
+                    binding.config.ranks.len() * binding.config.units_per_rank.max(1)
+                } else {
+                    1
+                };
+                u32::try_from(units).ok()
+            })
+            .min()
+    }
+
     /// Returns the sole worker capability record.
     ///
     /// # Panics
@@ -1446,6 +1471,45 @@ mod tests {
         assert_eq!(routing.len(), 8);
         assert_eq!(routing[&MediaCall::VideoEncoding], "video_codec");
         assert_eq!(routing[&MediaCall::VideoDecoding], "video_decoder");
+    }
+
+    /// A distributed component's lane is its ranks times its units per rank,
+    /// an undistributed one's a single unit, and the narrowest replica binds;
+    /// a call no worker serves has no lane.
+    #[test]
+    fn media_lanes_count_the_units_one_call_covers() {
+        let encoder = |id: &str, ranks: usize, units_per_rank: usize| {
+            let (id, mut info) =
+                media_pool(id, &[(MediaCall::LatentEncoding, "latent_encoder")], 0, 1);
+            let config = &mut info.components[0].config;
+            config.ranks = (0..ranks).collect();
+            config.distribution = Some(uniserve_core::ComponentDistribution::TemporalUnits);
+            config.units_per_rank = units_per_rank;
+            (id, info)
+        };
+        let lanes = |workers| {
+            ExecutorInfo {
+                workers,
+                video_codecs: BTreeMap::new(),
+            }
+            .media_lane_units(MediaCall::LatentEncoding)
+        };
+
+        assert_eq!(lanes(vec![encoder("a", 4, 1)]), Some(4));
+        assert_eq!(lanes(vec![encoder("a", 4, 2)]), Some(8));
+        assert_eq!(lanes(vec![encoder("a", 4, 1), encoder("b", 2, 1)]), Some(2));
+        let (id, mut single) = encoder("a", 4, 1);
+        single.components[0].config.distribution = None;
+        assert_eq!(lanes(vec![(id, single)]), Some(1));
+        assert_eq!(
+            lanes(vec![media_pool(
+                "a",
+                &[(MediaCall::Denoising, "denoiser")],
+                4,
+                1
+            )]),
+            None
+        );
     }
 
     /// A deployment whose denoiser serves a conditioned task must place the

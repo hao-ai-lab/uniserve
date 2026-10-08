@@ -84,6 +84,55 @@ def test_video_encoding_rejects_inputs_outside_the_unit_contract():
             num_frames=(1,),
         )
 
+    # Bands are runs of whole two-row patch rows of a still frame.
+    still = torch.zeros((1, 64, 64, 3), dtype=torch.uint8)
+    for band in (slice(1, 3), slice(0, 5), slice(2, 2)):
+        with pytest.raises(ValueError, match="whole latent row groups"):
+            encoder.encode(
+                (still,), frames=(slice(0, 1),), num_frames=(1,), rows=(band,)
+            )
+    with pytest.raises(ValueError, match="whole latent row groups"):
+        encoder.encode(
+            (frames,),
+            frames=(slice(0, 17),),
+            num_frames=(39,),
+            rows=(slice(0, 2),),
+        )
+
+
+@pytest.mark.parametrize("count", (1, 2, 3, 7, 20))
+def test_still_frame_bands_assemble_the_whole_encoding(count):
+    """Bands of a still frame encoded separately give its encoding exactly.
+
+    The 640x320 frame spans three tile rows and two tile columns, so bands
+    start inside the tiles' cross-fades and before and after their seams;
+    every band's rows land where the layout places them.
+    """
+    torch.manual_seed(0)
+    encoder = VideoEncoder(
+        video_vae.Config(block_out_channels=(32,) * 6, layers_per_block=1)
+    )
+    for parameter in encoder.parameters():
+        torch.nn.init.normal_(parameter, std=0.05)
+    frame = image.Config(640, 320)
+    pixels = torch.randint(0, 256, (1, 640, 320, 3), dtype=torch.uint8)
+
+    (whole,) = encoder.encode((pixels,), frames=(slice(0, 1),), num_frames=(1,))
+    bands = encoder.row_bands(frame, count)
+    banded = encoder.encode(
+        (pixels,) * count,
+        frames=(slice(0, 1),) * count,
+        num_frames=(1,) * count,
+        rows=bands,
+    )
+
+    assert len(bands) == count
+    assert bands[0].start == 0 and bands[-1].stop == 640 // 16
+    assembled = torch.full_like(whole.tensor, torch.nan)
+    for result in banded:
+        assembled[result.layout.local_slice] = result.tensor
+    assert torch.equal(assembled, whole.tensor)
+
 
 @pytest.mark.parametrize(
     ("num_samples", "frames"), ((160000, 200), (160001, 201), (799, 1))
