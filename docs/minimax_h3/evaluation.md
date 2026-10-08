@@ -89,7 +89,7 @@ W7–W12 measure FastH3 OmniRef on the reference mixes of MiniMax-H3's ref2va in
 
 The checkpoint bounds a request's packed sequence at 131,072 rows: its prompt, which carries every reference's vision tokens, its condition rows and the 37,710 generated rows. A reference image is 7,296 prompt tokens and 7,296 condition rows at 16:9 and 4,096 of each when square, so nine images fit only when they are close to square (nine 16:9 images need about 169,000 rows), three five-second reference videos need about 164,000, and nine images with three videos exceed the bound at any size; the last mix is not measured. The square images of W9 are centred crops and the clips of W11 the leading two seconds of their sources, cut without re-encoding; each row's `metadata.condition_media` names the source and the derivation.
 
-A latency point sends one warmup at seed 42 and eight measured requests one at a time; a throughput point sends two priming requests per concurrency slot, then measures 16 requests at concurrency 4. One deployment serves all six: `--max-model-len 38912 --video-text-capacities 8192,16384,24576,38912 --max-condition-rows 54400`, whose largest layout, 38,912 text and 54,400 condition rows, holds 131,022 rows.
+A latency point sends one warmup at seed 42 and eight measured requests one at a time; a throughput point sends two priming requests per concurrency slot, then measures 16 requests at concurrency 4 on four GPUs, or 32 at concurrency 8 across two hosts. One deployment serves all six: `--max-model-len 38912 --video-text-capacities 8192,16384,24576,38912 --max-condition-rows 54400`, whose largest layout, 38,912 text and 54,400 condition rows, holds 131,022 rows.
 
 ```bash
 export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastH3-OmniRef-v5-DMPDD8-w03-cfg2-step3500
@@ -97,6 +97,6 @@ export UNISERVE_MINIMAX_H3_OMNIREF_BASE=/workspace/models/MiniMax-H3-9bfb6693
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-omniref-refs --reuse-deployment
 ```
 
-The suites are `gb200-4-omniref-refs` and `gb200-4-omniref-refs-throughput` on four GB200.
+The suites are `gb200-4-omniref-refs` and `gb200-4-omniref-refs-throughput` on four GB200, and `gb200-8-omniref-refs` and `gb200-8-omniref-refs-throughput` across two, both on one eight-way Ulysses replica (`ulysses8-reference-two-node.json`); start `uniserve-host` on `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts).
 
 Cross-engine results are not equal-work ratios: the engines differ in reference-image resizing, noise generators, media codecs and distributed attention. vLLM-Omni's W4 image processing keeps a smaller condition layout than the others, and its diffusion worker does not implement the two-host placement.
