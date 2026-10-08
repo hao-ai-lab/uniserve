@@ -22,6 +22,7 @@ unrotated), attends, and projects back. The attention itself is one of:
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Iterator, Mapping
 from typing import cast
@@ -362,43 +363,47 @@ class RegionSparse(nn.Module):
         covering the shard.
         """
         rows = inputs.regions.padded_tokens
-        # Projected intervals of the gathered sequence arrive in any order.
-        # Each normalizes and rotates in place of its rows, so the per-row
+        # Every projected interval of the gathered sequence lands in its rows
+        # of one [rows, q | k | v | gate] matrix, whose branches attention
+        # reads as strided views. Intervals arrive in any order; each
+        # normalizes and rotates its Q/K rows in place, so the per-row
         # recipe's temporaries stay the size of one interval.
-        rotated: dict[str, torch.Tensor] = {}
+        if isinstance(hidden, torch.Tensor):
+            source = hidden
+        else:
+            first = next(hidden)
+            source = first[1]
+            hidden = itertools.chain((first,), hidden)
+        projected = self.projection.output_buffers(
+            rows, dtype=source.dtype, device=source.device
+        )
+        heads = {
+            name: value.view(rows, -1, self.head_dim)
+            for name, value in projected.items()
+        }
         covered = []
-        for interval, values in self.projection.forward_chunks(
-            hidden, token_slice=inputs.token_slice, num_tokens=rows
+        for interval, _ in self.projection.forward_chunks(
+            hidden,
+            token_slice=inputs.token_slice,
+            num_tokens=rows,
+            out=projected,
         ):
-            branches = {
-                name: values[name].view(
-                    -1, values[name].shape[-1] // self.head_dim, self.head_dim
-                )
-                for name in ("q", "k", "v", "gate")
-            }
-            if not rotated:
-                rotated = {
-                    name: value.new_empty((rows, *value.shape[1:]))
-                    for name, value in branches.items()
-                }
-            rotated["q"][interval], rotated["k"][interval] = (
-                # One RMS domain and one rotary axis span each whole head;
-                # the compact factors rotate its leading 96 channels
-                # split-half and the trailing 32 channels pass through.
-                functional.qk_norm_rope(
-                    branches["q"],
-                    branches["k"],
-                    (self.query_norm.weight,),
-                    (self.key_norm.weight,),
-                    (cos[interval],),
-                    (sin[interval],),
-                    eps=self.query_norm.eps,
-                    axis_dims=(self.head_dim,),
-                    rounding=self.rounding,
-                )
+            query, key = heads["q"][interval], heads["k"][interval]
+            # One RMS domain and one rotary axis span each whole head; the
+            # compact factors rotate its leading 96 channels split-half and
+            # the trailing 32 channels pass through.
+            functional.qk_norm_rope(
+                query,
+                key,
+                (self.query_norm.weight,),
+                (self.key_norm.weight,),
+                (cos[interval],),
+                (sin[interval],),
+                eps=self.query_norm.eps,
+                axis_dims=(self.head_dim,),
+                out=(query, key),
+                rounding=self.rounding,
             )
-            for name in ("v", "gate"):
-                rotated[name][interval].copy_(branches[name])
             covered.append((interval.start, interval.stop))
         covered.sort()
         if (
@@ -409,15 +414,11 @@ class RegionSparse(nn.Module):
         ):
             raise ValueError("H3 region projections must cover every row")
         attended = self.vsa(
-            rotated["q"],
-            rotated["k"],
-            rotated["v"],
-            rotated["gate"],
-            inputs.regions,
+            heads["q"], heads["k"], heads["v"], heads["gate"], inputs.regions
         )
         # The caller runs the feed-forward update while this generator waits
         # at its yield; release the projections and attended rows first.
-        del rotated
+        del projected, heads
         output = self.output(attended.flatten(1))
         del attended
         yield inputs.token_slice, output
