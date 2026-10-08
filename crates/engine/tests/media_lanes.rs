@@ -9,10 +9,13 @@
 //! flight until the scheduler blocks for a completion, and the record of
 //! submissions and resolutions is a function of scheduling decisions alone.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crossbeam_channel::Receiver;
 
 use uniserve_core::{
     AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, DiffusionRequest,
@@ -20,12 +23,13 @@ use uniserve_core::{
     Request, RequestId, VideoClip, VideoCondition, VideoTask, VisionGrid,
 };
 use uniserve_engine::{
-    BatchEvent, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
-    RequestPlacement, Scheduler, SimEngine, SimExecutor, SpecialTokenIds, VideoDenoiserInfo,
-    WorkerId,
+    BatchEvent, BatchResult, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
+    Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, RequestPlacement, Scheduler,
+    SimEngine, SimExecutor, SpecialTokenIds, VideoDenoiserInfo, WorkerId,
 };
 use uniserve_worker_ipc::{
-    Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes, ShapeBound,
+    BufferId, Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes,
+    ShapeBound,
 };
 
 /// Denoising steps the simulated model advertises and every request follows.
@@ -480,7 +484,18 @@ fn serve(sim: SimEngine, requests: Vec<Request>) -> Served {
 fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option<usize>) -> Served {
     let mut executor = SimExecutor::new(sim);
     let boundary = executor.observe();
-    let mut scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
+    serve_through(Box::new(executor), boundary, requests, max_num_waiting)
+}
+
+/// Serves the requests through `executor`, whose accepted batches and
+/// resolved results `boundary` reports.
+fn serve_through(
+    executor: Box<dyn Executor>,
+    boundary: Receiver<BatchEvent>,
+    requests: Vec<Request>,
+    max_num_waiting: Option<usize>,
+) -> Served {
+    let mut scheduler = Scheduler::new(executor, SpecialTokenIds::default(), 32).unwrap();
     if let Some(bound) = max_num_waiting {
         scheduler.set_max_num_waiting(bound);
     }
@@ -1156,4 +1171,199 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
         ),
         events => panic!("the oversized canvas was not refused: {events:?}"),
     }
+}
+
+/// The simulator's components served from two worker pools: the condition
+/// encoders on one, and the denoiser, decoders and muxer on the other, as a
+/// deployment that places its encoders apart from its denoiser serves them.
+///
+/// Submission keeps the two rules a `WorkerExecutor` applies across pools. A
+/// pool without a free slot hands a batch back, as the encoder pool does
+/// once, for the first batch carrying the `hand_back` call. A call is
+/// accepted only after the call producing each of its inputs has been, since
+/// the executor learns where a product is published when its producer is
+/// submitted; a batch reading any other product fails, as it fails the
+/// engine there. Accepted batches run on the one simulator.
+struct PooledExecutor {
+    inner: SimExecutor,
+    info: ExecutorInfo,
+    /// The worker the simulator itself reports.
+    simulator: WorkerId,
+    /// The media call whose first batch is handed back, until it has been.
+    hand_back: Option<MediaCall>,
+    handed_back: Arc<AtomicBool>,
+    /// Products of every call accepted so far.
+    published: HashSet<BufferId>,
+}
+
+impl PooledExecutor {
+    /// Splits the simulator's components into the two pools. Returns the
+    /// executor, its submission record and whether it has handed back the
+    /// `hand_back` batch.
+    fn new(sim: SimEngine, hand_back: MediaCall) -> (Self, Receiver<BatchEvent>, Arc<AtomicBool>) {
+        let mut inner = SimExecutor::new(sim);
+        let boundary = inner.observe();
+        let simulator = inner.info().workers[0].0.clone();
+        let worker = inner.info().single_worker().clone();
+
+        // Each pool serves its components' media calls and nothing else.
+        let pool = |components: &[&str]| {
+            let mut info = worker.clone();
+            info.components
+                .retain(|component| components.contains(&component.name.as_str()));
+            info.media_components
+                .retain(|_, component| components.contains(&component.as_str()));
+            info.supported_calls = info
+                .media_components
+                .keys()
+                .map(|call| CallKind::Media(*call))
+                .collect();
+            info
+        };
+        let info = ExecutorInfo::from_workers(vec![
+            (
+                WorkerId("encoders".to_owned()),
+                pool(&["media_reader", "text_encoder", "latent_encoder"]),
+            ),
+            (
+                WorkerId("generator".to_owned()),
+                pool(&[
+                    "denoiser",
+                    "video_decoder",
+                    "video_codec",
+                    "audio_decoder",
+                    "muxer",
+                ]),
+            ),
+        ])
+        .unwrap();
+
+        let handed_back = Arc::new(AtomicBool::new(false));
+        let executor = Self {
+            inner,
+            info,
+            simulator,
+            hand_back: Some(hand_back),
+            handed_back: Arc::clone(&handed_back),
+            published: HashSet::new(),
+        };
+        (executor, boundary, handed_back)
+    }
+}
+
+impl Executor for PooledExecutor {
+    fn info(&self) -> &ExecutorInfo {
+        &self.info
+    }
+
+    fn is_ready(&self, worker: &WorkerId) -> bool {
+        self.info.workers.iter().any(|(id, _)| id == worker) && self.inner.is_ready(&self.simulator)
+    }
+
+    fn has_capacity(&self, worker: &WorkerId) -> bool {
+        self.is_ready(worker) && self.inner.has_capacity(&self.simulator)
+    }
+
+    fn command_has_capacity(&self, command: &uniserve_worker_ipc::BatchCommand) -> bool {
+        self.inner.command_has_capacity(command)
+    }
+
+    fn submit(&mut self, mut batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+        let hands_back = self.hand_back.is_some_and(|media_call| {
+            batch
+                .requests
+                .iter()
+                .any(|(call, _)| call.code == CallKind::Media(media_call))
+        });
+        if hands_back {
+            self.hand_back = None;
+            self.handed_back.store(true, Ordering::SeqCst);
+            return Err(ExecutorSubmitError::WouldBlock(batch));
+        }
+
+        // Every input is a product of an accepted call or supplied with the
+        // batch.
+        for (call, _) in &batch.requests {
+            for input in call.input_buffers() {
+                let supplied = batch
+                    .input_transfers
+                    .iter()
+                    .any(|payload| payload.product.buffer_id() == input)
+                    || batch
+                        .kv_inputs
+                        .iter()
+                        .any(|publication| publication.source == input);
+                if !supplied && !self.published.contains(&input) {
+                    return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
+                        "input {input:?} of {:?} has no registered producer",
+                        call.code
+                    )));
+                }
+            }
+        }
+
+        // The simulator runs every pool's calls, so it receives them placed
+        // on itself; a batch it hands back returns with its pools.
+        let products = batch
+            .requests
+            .iter()
+            .flat_map(|(call, _)| call.output_buffers())
+            .collect::<Vec<_>>();
+        let pools = batch
+            .requests
+            .iter_mut()
+            .map(|(_, placement)| std::mem::replace(&mut placement.worker, self.simulator.clone()))
+            .collect::<Vec<_>>();
+        match self.inner.submit(batch) {
+            Ok(()) => {
+                self.published.extend(products);
+                Ok(())
+            }
+            Err(ExecutorSubmitError::WouldBlock(mut batch)) => {
+                for ((_, placement), pool) in batch.requests.iter_mut().zip(pools) {
+                    placement.worker = pool;
+                }
+                Err(ExecutorSubmitError::WouldBlock(batch))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError> {
+        self.inner.poll(timeout)
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        self.inner.close()
+    }
+}
+
+/// A call waits for the submission of every call producing its inputs, even
+/// when that producer is bound for another pool. With the condition encoders
+/// on their own pool, the first latent encoding is handed back for capacity
+/// while the latent preparation reading its rows is bound for the generator
+/// pool; the preparation is submitted only after every latent encoding, and
+/// the request completes.
+#[test]
+fn a_call_reading_a_held_back_product_waits_for_its_producer_on_another_pool() {
+    let request = RequestId(5);
+    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
+    let (executor, boundary, handed_back) =
+        PooledExecutor::new(video_worker(2, 2), MediaCall::LatentEncoding);
+    let served = serve_through(
+        Box::new(executor),
+        boundary,
+        vec![reference_request(5, &media)],
+        None,
+    );
+
+    served.assert_completed(request);
+    assert!(
+        handed_back.load(Ordering::SeqCst),
+        "the encoder pool handed back a latent encoding"
+    );
+    let latents = call_indices(&served, request, MediaCall::LatentEncoding);
+    let preparation = call_indices(&served, request, MediaCall::LatentPreparation);
+    assert_eq!(preparation.len(), 1);
+    assert!(latents.iter().all(|index| *index < preparation[0]));
 }
