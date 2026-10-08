@@ -126,9 +126,11 @@ def _runner(checkpoint: Path, modules, placed) -> ModelExecutor:
         for name, distribution in placed
     }
     runner = ModelExecutor(model, config, bindings=bindings)
-    # A worker seals startup before it admits requests, so request calls
-    # without a graph captured at startup, as condition encodings are, run
-    # eagerly.
+    # A worker captures the video encoder's still-frame tile before it seals
+    # startup and admits requests (``ModelExecutor.warmup``), so keyframes
+    # and reference images encode through its replay; the other condition
+    # encodings have no graph captured at startup and run eagerly.
+    runner.capture_tiles()
     runner.complete_startup()
     return runner
 
