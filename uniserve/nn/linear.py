@@ -485,6 +485,22 @@ class MergedColumnParallelLinear(nn.Module):
             return out
         return result
 
+    def output_buffers(
+        self, rows: int, *, dtype: torch.dtype, device: torch.device
+    ) -> Mapping[str, torch.Tensor]:
+        """Allocate ``[rows, width]`` outputs of every branch in one storage.
+
+        The branches are adjacent channel views of one row-major matrix, so
+        one fused GEMM can write any row interval of all of them.
+        """
+        widths = tuple(
+            int(branch.weight.shape[0]) for _, branch in self._branches()
+        )
+        packed = torch.empty((rows, sum(widths)), dtype=dtype, device=device)
+        return dict(
+            zip(self.projections, packed.split(widths, dim=-1), strict=True)
+        )
+
     def forward_chunks(
         self,
         x: torch.Tensor | Iterator[tuple[slice, torch.Tensor]],
@@ -492,9 +508,14 @@ class MergedColumnParallelLinear(nn.Module):
         token_slice: slice,
         num_tokens: int,
         output_dtype: torch.dtype | None = None,
+        out: Mapping[str, torch.Tensor] | None = None,
     ) -> Iterator[tuple[slice, Mapping[str, torch.Tensor]]]:
         """Project gathered token intervals, fusing branches that share
         quantization.
+
+        With ``out``, ``[num_tokens, width]`` storage of every branch such
+        as ``output_buffers`` allocates, each interval is projected into its
+        rows and the yielded values are those rows.
         """  # noqa: D205
         from ._chunks import (
             _assemble,
@@ -502,6 +523,11 @@ class MergedColumnParallelLinear(nn.Module):
             materialize_input,
             projection_inputs,
         )
+
+        def rows(interval: slice) -> Mapping[str, torch.Tensor] | None:
+            if out is None:
+                return None
+            return {name: value[interval] for name, value in out.items()}
 
         branches = tuple(branch for _, branch in self._branches())
         if len({branch.input_quantizer for branch in branches}) != 1:
@@ -516,13 +542,19 @@ class MergedColumnParallelLinear(nn.Module):
             with materialize_input(
                 branches[0], x, token_slice, num_tokens
             ) as values:
-                yield domain, self(values, output_dtype=output_dtype)
+                yield (
+                    domain,
+                    self(values, output_dtype=output_dtype, out=rows(domain)),
+                )
             return
 
         for interval, values in projection_inputs(
             branches[0], x, token_slice, num_tokens
         ):
-            yield interval, self(values, output_dtype=output_dtype)
+            yield (
+                interval,
+                self(values, output_dtype=output_dtype, out=rows(interval)),
+            )
 
 
 class QKVParallelLinear(MergedColumnParallelLinear):
