@@ -482,9 +482,16 @@ impl Scheduler {
         } else if !state.text_encoding_scheduled {
             ready.push(MediaCall::TextEncoding);
         }
+        // Latent encoding is offered once the text encoding has been placed.
+        // Ranks that hold both encoders run their calls in submission order,
+        // and the prompt's encoding, whose ranks synchronize in its
+        // collectives, then precedes the condition units instead of waiting
+        // for every rank's units to finish. Placement does not wait for the
+        // vision features, so a latent encoder on other ranks loses nothing.
         let visual_units = graph.condition_units().len() as u32;
-        if state.scheduled_condition_units < visual_units
-            || (graph.encodes_condition_audio() && state.condition_audio_latents.is_none())
+        if state.text_encoding_scheduled
+            && (state.scheduled_condition_units < visual_units
+                || (graph.encodes_condition_audio() && state.condition_audio_latents.is_none()))
         {
             ready.push(MediaCall::LatentEncoding);
         }
