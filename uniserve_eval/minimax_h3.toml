@@ -29,6 +29,12 @@
 #   reference, auto canvas (16:9), 5 s.
 # - W5: the official ref2va request: its reference video, whose soundtrack
 #   conditions too, and its audio reference, auto canvas (16:9), 5 s.
+# - W7 to W12: FastH3 OmniRef reference compositions, each ref2va at 16:9,
+#   5 s: one subject image (W7), three images (W8), nine square images (W9),
+#   one reference video with its soundtrack (W10), three 2-second clips with
+#   their soundtracks (W11), and an image, a reference video and an audio
+#   reference together (W12). Nine images with three videos exceed the
+#   checkpoint's 131,072-row sequence at any image size and are not measured.
 # The base checkpoint's schedule is 50 sigma points (49 denoiser
 # evaluations) with video shift 12 and audio shift 3; OmniRef's is 9 points,
 # its 8 fused-block forwards, with the same shifts. Every base and OmniRef
@@ -311,6 +317,391 @@ request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
 [benchmarks.gb200-4-omniref-w5.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# FastH3 OmniRef on the reference-composition workloads W7 to W12, one
+# deployment for all of them. The checkpoint bounds a request's packed
+# sequence at 131,072 rows: its 8192-token prompt bucket plus 37,710
+# generated rows leave the largest text capacity (38,912 tokens, W9's nine
+# square images and their prompt) and the condition capacity (54,400 rows,
+# W12's image, reference video with soundtrack and audio track) 131,022 rows.
+# The smaller text capacities keep W7 and W10 at 8192 tokens, W11 and W12 at
+# 16,384 and W8 at 24,576. A latency point measures eight requests one at a
+# time; a throughput point measures the leading 16 of its throughput rows
+# at concurrency 4 after eight priming requests.
+[servers.gb200-4-omniref-refs]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--base-model", "${UNISERVE_MINIMAX_H3_OMNIREF_BASE}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "38912", "--video-text-capacities", "8192,16384,24576,38912", "--max-video-seconds", "5", "--max-condition-rows", "54400", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+
+[servers.gb200-4-omniref-refs.environment]
+NCCL_NVLS_ENABLE = "0"
+
+[benchmarks.gb200-4-omniref-w7]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w7.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w7.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w7.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w7-warmup.jsonl"
+
+[benchmarks.gb200-4-omniref-w7.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w7-c4]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w7-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w7-c4.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w7-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w7-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w7-priming-c4.jsonl"
+
+[benchmarks.gb200-4-omniref-w7-c4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w8]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w8.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w8.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w8.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w8-warmup.jsonl"
+
+[benchmarks.gb200-4-omniref-w8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w8-c4]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w8-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w8-c4.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w8-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w8-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w8-priming-c4.jsonl"
+
+[benchmarks.gb200-4-omniref-w8-c4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w9]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w9.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w9.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w9.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w9-warmup.jsonl"
+
+[benchmarks.gb200-4-omniref-w9.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w9-c4]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w9-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w9-c4.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w9-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w9-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w9-priming-c4.jsonl"
+
+[benchmarks.gb200-4-omniref-w9-c4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w10]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w10.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w10.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w10.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w10-warmup.jsonl"
+
+[benchmarks.gb200-4-omniref-w10.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w10-c4]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w10-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w10-c4.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w10-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w10-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w10-priming-c4.jsonl"
+
+[benchmarks.gb200-4-omniref-w10-c4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w11]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w11.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w11.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w11.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w11-warmup.jsonl"
+
+[benchmarks.gb200-4-omniref-w11.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w11-c4]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w11-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w11-c4.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w11-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w11-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w11-priming-c4.jsonl"
+
+[benchmarks.gb200-4-omniref-w11-c4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w12]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w12.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w12.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w12.load]
+num_prompts = 8
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w12-warmup.jsonl"
+
+[benchmarks.gb200-4-omniref-w12.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.gb200-4-omniref-w12-c4]
+server = "gb200-4-omniref-refs"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/w12-throughput.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-omniref-w12-c4.video]
+task = "ref2va"
+aspect_ratio = "auto"
+seconds = 5.0
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+num_inference_steps = 9
+flow_shift = 12.0
+audio_flow_shift = 3.0
+
+[benchmarks.gb200-4-omniref-w12-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 0
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/w12-warmup.jsonl"
+priming_manifest = "uniserve_eval/workloads/minimax_h3/w12-priming-c4.jsonl"
+
+[benchmarks.gb200-4-omniref-w12-c4.metrics]
 videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
@@ -1159,6 +1550,12 @@ points = ["gb200-4-reference-w4", "gb200-4-reference-w5"]
 
 [suites.gb200-4-omniref]
 points = ["gb200-4-omniref-w4", "gb200-4-omniref-w5"]
+
+[suites.gb200-4-omniref-refs]
+points = ["gb200-4-omniref-w7", "gb200-4-omniref-w8", "gb200-4-omniref-w9", "gb200-4-omniref-w10", "gb200-4-omniref-w11", "gb200-4-omniref-w12"]
+
+[suites.gb200-4-omniref-refs-throughput]
+points = ["gb200-4-omniref-w7-c4", "gb200-4-omniref-w8-c4", "gb200-4-omniref-w9-c4", "gb200-4-omniref-w10-c4", "gb200-4-omniref-w11-c4", "gb200-4-omniref-w12-c4"]
 
 [suites.fast-h3-gb200-4]
 points = ["fast-h3-gb200-4-w1", "fast-h3-gb200-4-w2"]

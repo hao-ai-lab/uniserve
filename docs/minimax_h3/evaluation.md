@@ -10,7 +10,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
 | --- | --- |
 | `uniserve_eval/fast_h3.toml` | The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) measurements |
 | `uniserve_eval/fast_h3_h200.toml` | The H200 measurements below |
-| `uniserve_eval/minimax_h3.toml` | The W1–W5 workloads across checkpoints and engines |
+| `uniserve_eval/minimax_h3.toml` | The W1–W5 workloads across checkpoints and engines, and the OmniRef reference compositions W7–W12 |
 
 ## FastH3 post
 
@@ -73,5 +73,30 @@ export UNISERVE_MINIMAX_H3_FFMPEG=/workspace/tools/ffmpeg-8.1.2/bin
 ```
 
 The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF` and its pinned base copy `UNISERVE_MINIMAX_H3_OMNIREF_BASE`; two-host points need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`.
+
+## OmniRef reference compositions
+
+W7–W12 measure FastH3 OmniRef on the reference mixes of MiniMax-H3's ref2va interface, every target 16:9 (1344×768) and 5 seconds:
+
+| Workload | References | Prompt tokens with vision | Condition rows |
+| --- | --- | --- | --- |
+| W7 | One 16:9 subject image | about 7,500 | 7,296 |
+| W8 | Three images: a 16:9 subject, a product sheet and a 16:9 scene | about 22,400 | 22,016 |
+| W9 | Nine square images | about 37,400 | 36,864 |
+| W10 | One reference video (6 s, with its soundtrack) | about 6,450 | 46,592 |
+| W11 | Three 2-second reference clips, each with its soundtrack | about 9,500 | 42,240 |
+| W12 | One 16:9 image, one reference video with its soundtrack and a reference voice | about 13,850 | 54,400 |
+
+The checkpoint bounds a request's packed sequence at 131,072 rows: its prompt, which carries every reference's vision tokens, its condition rows and the 37,710 generated rows. A reference image is 7,296 prompt tokens and 7,296 condition rows at 16:9 and 4,096 of each when square, so nine images fit only when they are close to square (nine 16:9 images need about 169,000 rows), three five-second reference videos need about 164,000, and nine images with three videos exceed the bound at any size; the last mix is not measured. The square images of W9 are centred crops and the clips of W11 the leading two seconds of their sources, cut without re-encoding; each row's `metadata.condition_media` names the source and the derivation.
+
+A latency point sends one warmup at seed 42 and eight measured requests one at a time; a throughput point sends two priming requests per concurrency slot, then measures 16 requests at concurrency 4. One deployment serves all six: `--max-model-len 38912 --video-text-capacities 8192,16384,24576,38912 --max-condition-rows 54400`, whose largest layout, 38,912 text and 54,400 condition rows, holds 131,022 rows.
+
+```bash
+export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastH3-OmniRef-v5-DMPDD8-w03-cfg2-step3500
+export UNISERVE_MINIMAX_H3_OMNIREF_BASE=/workspace/models/MiniMax-H3-9bfb6693
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-omniref-refs --reuse-deployment
+```
+
+The suites are `gb200-4-omniref-refs` and `gb200-4-omniref-refs-throughput` on four GB200.
 
 Cross-engine results are not equal-work ratios: the engines differ in reference-image resizing, noise generators, media codecs and distributed attention. vLLM-Omni's W4 image processing keeps a smaller condition layout than the others, and its diffusion worker does not implement the two-host placement.
