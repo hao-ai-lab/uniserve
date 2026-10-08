@@ -823,8 +823,22 @@ def assignments(model: Decoder | Model, reader):
 _PADDED_INPUT = torch.channels_last_3d
 
 
+def _bias(convolution: CausalConv3d) -> torch.Tensor:
+    """Return a video encoder convolution's bias, which every one carries."""
+    if convolution.bias is None:
+        raise ValueError("H3 video encoder convolutions carry biases")
+    return convolution.bias
+
+
 class CausalBlock(nn.Module):
-    """Add two normalized causal convolutions to the projected input."""
+    """Add two normalized causal convolutions to the projected input.
+
+    Both convolutions compute channels-last results without their biases;
+    ``functional.bias_add`` adds each bias as it stores the result
+    channel-first, the second together with the residual sum. The block's
+    channel-first output is what the next normalization, residual, 1x1
+    projection and downsampling padding read, without a copy.
+    """
 
     def __init__(self, in_channels: int, out_channels: int, config: Config):
         super().__init__()
@@ -844,20 +858,30 @@ class CausalBlock(nn.Module):
             )
             for width in (in_channels, out_channels)
         )
-        self.shortcut = (
-            nn.Identity()
+        # A 1x1 projection when the width changes, otherwise the identity.
+        self.shortcut: CausalConv3d | None = (
+            None
             if in_channels == out_channels
             else CausalConv3d(in_channels, out_channels, 1)
         )
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
-        hidden = values
-        for norm, convolution in zip(
-            self.norms, self.convolutions, strict=True
-        ):
-            # The convolution reads silu(norm(hidden)), padded with it.
-            hidden = convolution(hidden, norm=norm)
-        return self.shortcut(values) + hidden
+        first, second = (cast(CausalConv3d, item) for item in self.convolutions)
+        # Each convolution reads silu(norm(hidden)), padded with it.
+        hidden = functional.bias_add(
+            first(values, norm=self.norms[0], add_bias=False), _bias(first)
+        )
+        hidden = second(hidden, norm=self.norms[1], add_bias=False)
+
+        # shortcut(values) + hidden, each convolution's bias added first.
+        if self.shortcut is None:
+            return functional.bias_add(hidden, _bias(second), residual=values)
+        return functional.bias_add(
+            hidden,
+            _bias(second),
+            residual=self.shortcut(values, add_bias=False),
+            residual_bias=_bias(self.shortcut),
+        )
 
 
 class CausalDownsample(nn.Module):
@@ -988,7 +1012,10 @@ class CausalCNN(nn.Module):
         )
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
-        hidden = self.input(pixels)
+        # Stored channel-first, as the first block's normalization reads it.
+        hidden = functional.bias_add(
+            self.input(pixels, add_bias=False), _bias(self.input)
+        )
         for stage in self.stages:
             hidden = stage(hidden)
         return self.output(hidden, norm=self.norm)

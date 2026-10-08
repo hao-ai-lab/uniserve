@@ -23,6 +23,13 @@ from uniserve_kernels.triton import tl, triton, unsupported_operands
 _PAD_PIXELS = 32
 _PAD_CHANNELS = 64
 
+# Channel-first sources and outputs store each channel's rows contiguously.
+# A program then copies a run of up to _ROW_PIXELS pixels from each of
+# _ROW_ELEMENTS // run channels, moving every channel's row in few large
+# transfers rather than the default tile's 32-pixel runs of 64 channels.
+_ROW_PIXELS = 512
+_ROW_ELEMENTS = 2048
+
 
 if triton is not None:  # pragma: no cover - depends on the accelerator stack.
 
@@ -165,11 +172,16 @@ def pad(
     """
     batch, channels, _, height, width = (int(size) for size in values.shape)
     _, _, out_frames, out_height, out_width = (int(size) for size in out.shape)
+    pixels, block_channels = _PAD_PIXELS, _PAD_CHANNELS
+    if values.stride(4) == 1 and out.is_contiguous():
+        # A run never exceeds the output row, which bounds a program.
+        pixels = min(_ROW_PIXELS, triton.next_power_of_2(out_width))
+        block_channels = _ROW_ELEMENTS // pixels
     _frame_pad_kernel[
         (
             batch * out_frames * out_height,
-            triton.cdiv(out_width, _PAD_PIXELS),
-            triton.cdiv(channels, _PAD_CHANNELS),
+            triton.cdiv(out_width, pixels),
+            triton.cdiv(channels, block_channels),
         )
     ](
         values,
@@ -184,7 +196,7 @@ def pad(
         channels,
         *padding,
         reflect,
-        _PAD_PIXELS,
-        _PAD_CHANNELS,
+        pixels,
+        block_channels,
         num_warps=4,
     )

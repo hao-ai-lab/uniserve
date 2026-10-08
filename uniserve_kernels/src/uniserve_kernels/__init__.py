@@ -1,6 +1,6 @@
 """UniServe device kernels.
 
-Modules and subpackages group kernels by domain: norm, activation,
+Modules and subpackages group kernels by domain: norm, activation, bias,
 reduction, rope, routing, patch, frame, quantization, cache, attention,
 diffusion and peer_storage.
 Launchers consume device tensors. Many write caller-supplied outputs and pair

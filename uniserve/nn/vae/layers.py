@@ -136,6 +136,13 @@ class CausalConv3d(nn.Conv3d):
     ``silu(norm(values))`` of a ``FrameGroupNorm``, which
     ``uniserve.nn.functional.frame_norm_pad`` normalizes, activates and pads
     together, bit for bit as the three operations compute it.
+
+    ``add_bias=False`` returns the convolution without its bias, for a
+    caller that adds it with ``uniserve.nn.functional.bias_add``. PyTorch
+    adds the bias of a cuDNN convolution in a separate pass after it, so the
+    sum equals the biased convolution bit for bit, and ``bias_add`` also
+    stores a channels-last result channel-first and adds a residual in that
+    pass.
     """
 
     def __init__(
@@ -169,12 +176,19 @@ class CausalConv3d(nn.Conv3d):
         extent = self.spatial_padding
         return (extent, extent, extent, extent, self.temporal_padding)
 
-    def convolve(self, padded: torch.Tensor) -> torch.Tensor:
+    def convolve(
+        self, padded: torch.Tensor, *, add_bias: bool = True
+    ) -> torch.Tensor:
         """Convolve input that already carries this convolution's padding."""
-        return F.conv3d(padded, self.weight, self.bias, stride=self.stride)
+        bias = self.bias if add_bias else None
+        return F.conv3d(padded, self.weight, bias, stride=self.stride)
 
     def forward(
-        self, values: torch.Tensor, norm: "FrameGroupNorm | None" = None
+        self,
+        values: torch.Tensor,
+        norm: "FrameGroupNorm | None" = None,
+        *,
+        add_bias: bool = True,
     ) -> torch.Tensor:
         if norm is not None:
             return self.convolve(
@@ -187,7 +201,8 @@ class CausalConv3d(nn.Conv3d):
                     eps=norm.eps,
                     mode=self.spatial_padding_mode,
                     memory_format=self.memory_format,
-                )
+                ),
+                add_bias=add_bias,
             )
         if self.spatial_padding or self.temporal_padding:
             values = frame_pad(
@@ -196,7 +211,7 @@ class CausalConv3d(nn.Conv3d):
                 mode=self.spatial_padding_mode,
                 memory_format=self.memory_format,
             )
-        return self.convolve(values)
+        return self.convolve(values, add_bias=add_bias)
 
 
 class FrameGroupNorm(nn.GroupNorm):
