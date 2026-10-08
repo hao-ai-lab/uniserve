@@ -13,6 +13,9 @@ stored into caller-supplied outputs or operands updated in place.
   updates added to the residual, scaled, and further normalizations of the
   result) in one launch, bit-identical to ``rms`` launches and tensor
   operations.
+- ``frame``: per-frame group normalization, SiLU and causal padding of video
+  frames in two passes, bit-identical to PyTorch's normalization, SiLU and
+  padding.
 
 Each module pairs an ``unsupported`` eligibility check with its launches;
 ``uniserve.nn.functional`` validates inputs, allocates outputs, raises on

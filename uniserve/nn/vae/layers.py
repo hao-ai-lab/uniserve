@@ -7,7 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
-from uniserve.nn.functional import frame_pad
+from uniserve.nn.functional import frame_norm_pad, frame_pad
 
 
 class ResidualBlock(nn.Module):
@@ -131,6 +131,11 @@ class CausalConv3d(nn.Conv3d):
     convolution reads its input: a channels-last input reaches convolution
     kernels that compute channels-last without a transposition, and the
     result follows that order.
+
+    ``forward(values, norm=norm)`` convolves the pre-activation
+    ``silu(norm(values))`` of a ``FrameGroupNorm``, which
+    ``uniserve.nn.functional.frame_norm_pad`` normalizes, activates and pads
+    together, bit for bit as the three operations compute it.
     """
 
     def __init__(
@@ -168,7 +173,22 @@ class CausalConv3d(nn.Conv3d):
         """Convolve input that already carries this convolution's padding."""
         return F.conv3d(padded, self.weight, self.bias, stride=self.stride)
 
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, values: torch.Tensor, norm: "FrameGroupNorm | None" = None
+    ) -> torch.Tensor:
+        if norm is not None:
+            return self.convolve(
+                frame_norm_pad(
+                    values,
+                    self.padding_extents,
+                    groups=norm.num_groups,
+                    weight=norm.weight,
+                    bias=norm.bias,
+                    eps=norm.eps,
+                    mode=self.spatial_padding_mode,
+                    memory_format=self.memory_format,
+                )
+            )
         if self.spatial_padding or self.temporal_padding:
             values = frame_pad(
                 values,
