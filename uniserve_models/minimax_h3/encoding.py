@@ -45,7 +45,9 @@ class VideoEncoder(BaseVideoEncoder):
     ``5 * n + 2`` latent frames. A single frame (an image or a keyframe) runs
     through the same network alone and yields one latent frame. Clips share
     no state, because causal padding restarts at every clip and
-    normalization never mixes frames, so every clip is one unit.
+    normalization never mixes frames, so every clip is one unit. A still
+    frame's row groups are its rows of 2x2 patches, so its bands are runs of
+    whole patch rows, which its tiled encoder encodes on their own.
 
     The posterior is sampled with a host FP32 draw seeded with
     ``POSTERIOR_SEED`` over the condition's complete ``[1, channels, frames,
@@ -56,6 +58,9 @@ class VideoEncoder(BaseVideoEncoder):
 
     pixel_mean: torch.Tensor
     pixel_std: torch.Tensor
+
+    # A row of 2x2 patches spans two latent rows.
+    row_group = _PATCH
 
     def __init__(self, config: video_vae.Config):
         # Each causal stride maps T frames to ceil(T / stride).
@@ -104,17 +109,17 @@ class VideoEncoder(BaseVideoEncoder):
         clips = math.ceil(num_frames / self.config.clip_length)
         return clips * self.clip_latents - self.config.token_drop
 
-    def _latent_size(self, frame_size: image.Config) -> tuple[int, int]:
+    def latent_size(self, frame: image.Config) -> tuple[int, int]:
         # Latent rows are whole 2x2 patches of the latent raster.
         alignment = self.config.spatial_compression * _PATCH
-        if frame_size.height % alignment or frame_size.width % alignment:
+        if frame.height % alignment or frame.width % alignment:
             raise ValueError(
                 f"H3 condition frames must align with {alignment}-pixel "
                 "latent patches"
             )
         return (
-            frame_size.height // self.config.spatial_compression,
-            frame_size.width // self.config.spatial_compression,
+            frame.height // self.config.spatial_compression,
+            frame.width // self.config.spatial_compression,
         )
 
     def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
@@ -134,7 +139,7 @@ class VideoEncoder(BaseVideoEncoder):
         )
 
     def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
-        height, width = self._latent_size(size.frame)
+        height, width = self.latent_size(size.frame)
         rows = (
             self._latent_frames(size.num_frames)
             * (height // _PATCH)
@@ -154,7 +159,7 @@ class VideoEncoder(BaseVideoEncoder):
         # One standard normal FP32 draw of the complete latent from a fresh
         # host generator, which is the reference's draw; the shape fixes how
         # the generator's stream maps onto latent positions.
-        height, width = self._latent_size(size.frame)
+        height, width = self.latent_size(size.frame)
         draw = torch.empty(
             (
                 1,

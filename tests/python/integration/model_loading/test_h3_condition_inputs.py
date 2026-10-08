@@ -133,14 +133,17 @@ def _runner(checkpoint: Path, modules, placed) -> ModelExecutor:
     return runner
 
 
-def _request(root: Path, case: str, ffmpeg: str):
+def _request(root: Path, case: str, ffmpeg: str, image_bands: int = 1):
     """Read a recorded request's conditions as the media reader does.
 
     Returns the run directory, the recorded presentation, the request's
-    video admission and its condition products.
+    video admission and its condition products. Reference images are
+    admitted in ``image_bands`` bands.
     """
     with published() as publish:
-        run, plan, _, conditions = recorded_request(root, case, ffmpeg, publish)
+        run, plan, _, conditions = recorded_request(
+            root, case, ffmpeg, publish, image_bands
+        )
         products = read(conditions, vision_encoder(), ffmpeg)
     presentation = json.loads((run / "presentation.json").read_text())
     video = VideoAdmission(
@@ -165,7 +168,10 @@ def test_condition_latents_match_the_recorded_encoding(
         (("latent_encoder", "temporal_units"),),
     )
     try:
-        run, _, video, (pixels, samples, _) = _request(root, case, ffmpeg)
+        # A four-rank latent encoder bands a reference image into four units.
+        run, _, video, (pixels, samples, _) = _request(
+            root, case, ffmpeg, image_bands=4
+        )
         recorded = load_file(run / "conditions.safetensors")
 
         # Every unit in its own call, in reverse, as separate ranks encode

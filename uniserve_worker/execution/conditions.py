@@ -12,9 +12,11 @@ admission with the request's exact leading extents:
   ``vision_features``, one row per vision placeholder of the presentation,
   which text encoding splices into the prompt (``vision_inputs``).
 - ``LatentEncoding`` (``encode_latents``) turns the pixels into
-  ``condition_video_latents`` in rounds of temporal units, each round
+  ``condition_video_latents`` in rounds of encoding units, each round
   covering the next units its component's ranks encode together, and the
-  PCM into ``condition_audio_latents`` in one call.
+  PCM into ``condition_audio_latents`` in one call. A video's units are its
+  encoder windows; a still frame is one unit or, as planned, several bands
+  of its latent rows (``VideoEncoder.row_bands``).
 
 Every product concatenates its conditions in request order. The server
 presents the vision blocks in request order too, so the vision features are
@@ -498,15 +500,25 @@ def encode_units(
         MediaCall.LATENT_ENCODING, capability_type=VideoEncoder
     )
     units = condition_units(video)
-    values, frames, counts, planned = [], [], [], []
+    values, frames, counts, bands, planned = [], [], [], [], []
     for index, unit in (units[position] for position in run):
         condition = video.conditions[index]
         size = condition.pixels
         if size is None:
             raise invalid_descriptor("a visual unit belongs to no pixels")
-        # A unit's frames are whole [height, width, 3] rasters of its
-        # condition's pixels, frame-major.
-        window = encoder.frame_slices(size.num_frames)[unit]
+        # A still frame planned as several units is encoded in bands of its
+        # latent rows, one band per unit, each reading the whole frame; any
+        # other condition's units are its encoder windows. A unit's frames
+        # are whole [height, width, 3] rasters of its condition's pixels,
+        # frame-major.
+        if size.num_frames == 1 and len(condition.latent_units) > 1:
+            window = slice(0, 1)
+            band = encoder.row_bands(size.frame, len(condition.latent_units))[
+                unit
+            ]
+        else:
+            window = encoder.frame_slices(size.num_frames)[unit]
+            band = None
         area = size.frame.height * size.frame.width
         values.append(
             pixels[
@@ -521,6 +533,7 @@ def encode_units(
         )
         frames.append(window)
         counts.append(size.num_frames)
+        bands.append(band)
         planned.append(condition.latent_units[unit])
 
     result = model_runner.run_encoder(
@@ -528,6 +541,7 @@ def encode_units(
         *values,
         frames=tuple(frames),
         num_frames=tuple(counts),
+        rows=tuple(bands),
     )
     if [value.shape[0] for value in result.values] != planned:
         raise invalid_descriptor(

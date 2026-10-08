@@ -66,8 +66,8 @@ fn base_denoiser() -> VideoDenoiserInfo {
 }
 
 /// The video service of `denoiser` with a `max_video_seconds` capacity, the
-/// released checkpoint's Qwen3-VL processor geometry and the default media
-/// policy.
+/// released checkpoint's Qwen3-VL processor geometry, a one-rank latent
+/// encoder and the default media policy.
 fn video_service(
     denoiser: VideoDenoiserInfo,
     max_video_seconds: f64,
@@ -86,6 +86,7 @@ fn video_service(
         },
         max_video_seconds,
         uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
+        1,
         &VideoMediaSettings::default(),
         Arc::clone(tokenizer),
     )

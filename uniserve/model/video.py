@@ -14,25 +14,37 @@ from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 
 class VideoEncoder(nn.Module):
-    """Encode temporal units of RGB24 frames into latent rows.
+    """Encode units of RGB24 frames into latent rows.
 
     A unit is a contiguous run of a video's frames whose latents depend on no
     frame outside it. ``frame_slices`` lists a video's units in order and
     ``latent_slices`` the contiguous latent frames each one produces, so the
     units of one video may be encoded by different ranks, in any order, and
-    their rows assemble the whole-video encoding exactly.
+    their rows assemble the whole-video encoding exactly. A still frame (a
+    one-frame video) may further be encoded in bands of its latent rows:
+    ``row_bands`` partitions its latent raster into bands of whole row
+    groups, each band's rows are a contiguous run of the frame's rows, and
+    the bands' rows assemble the frame's encoding exactly. Banding needs a
+    latent encoder that encodes a band on its own, such as one over a
+    ``SpatialEncoder``.
 
-    Subclasses define both partitions; ``output_layout``, which describes a
-    video's complete latent as frame-major rows along its leading axis, each
-    latent frame owning the same number of consecutive rows;
+    Subclasses define both temporal partitions; ``output_layout``, which
+    describes a video's complete latent as frame-major rows along its leading
+    axis, each latent frame owning the same number of consecutive rows;
+    ``latent_size``, a frame's native latent raster; ``row_group``, the
+    latent rows of one row group, a frame's rows being row-major over its
+    row groups, each group owning the same number of consecutive rows;
     ``unpack_pixels``, the conversion of one unit's frames into the native
     encoder input; and ``pack_latents``, the conversion of that unit's native
     NCTHW latents into its output rows. An encoder whose posterior is sampled
     defines ``posterior_noise``: the draw spans the video's complete latent
-    and each unit takes the share of its own latent frames, which reproduces
-    the draw of a whole-video encoding. Inputs remain borrowed; results are
-    new tensors.
+    and each unit takes the share of its own latent frames and rows, which
+    reproduces the draw of a whole-video encoding. Inputs remain borrowed;
+    results are new tensors.
     """
+
+    #: Latent rows of one row group, the unit of a still frame's bands.
+    row_group: int = 1
 
     def __init__(self, encoder: LatentEncoder):
         super().__init__()
@@ -49,6 +61,39 @@ class VideoEncoder(nn.Module):
     def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
         """Describe the complete latent rows of one video under ``video``."""
         raise NotImplementedError
+
+    def latent_size(self, frame: image.Config) -> tuple[int, int]:
+        """Return the native ``(height, width)`` latent raster of a frame.
+
+        The height is a whole number of row groups.
+        """
+        raise NotImplementedError
+
+    def row_bands(self, frame: image.Config, count: int) -> tuple[slice, ...]:
+        """Partition a still frame's latent rows into ``count`` bands.
+
+        The frame's ``g`` row groups are dealt in order as evenly as
+        possible: band ``b`` holds groups ``b * g // count`` to
+        ``(b + 1) * g // count``. Returns each band's latent rows.
+
+        Raises:
+            ValueError: ``count`` is not an integer from one to the frame's
+                row groups.
+        """
+        height, _ = self.latent_size(frame)
+        groups = height // self.row_group
+        if type(count) is not int or not 1 <= count <= groups:
+            raise ValueError(
+                f"a frame of {groups} latent row groups splits into 1 to "
+                f"{groups} bands, got {count}"
+            )
+        return tuple(
+            slice(
+                band * groups // count * self.row_group,
+                (band + 1) * groups // count * self.row_group,
+            )
+            for band in range(count)
+        )
 
     def posterior_noise(self, size: video.Config) -> torch.Tensor | None:
         """Return one video's complete NCTHW posterior draw, or None.
@@ -79,27 +124,36 @@ class VideoEncoder(nn.Module):
         *,
         frames: tuple[slice, ...],
         num_frames: tuple[int, ...],
+        rows: tuple[slice | None, ...] | None = None,
     ) -> tuple[TensorOutput, ...]:
         """Encode units of RGB24 videos into their latent rows.
 
         ``pixels[i]`` holds exactly the frames that ``frames[i]`` selects from
         a video of ``num_frames[i]`` frames, as ``[frames, height, width, 3]``
-        uint8, and ``frames[i]`` must be one of that video's units. Each
-        result holds its unit's rows at their place in the video's complete
-        latent.
+        uint8, and ``frames[i]`` must be one of that video's units. ``rows[i]``
+        is None for the unit's whole raster, or, for a still frame, a band of
+        whole latent row groups, such as one of ``row_bands``. Each result
+        holds its unit's rows at their place in the video's complete latent.
+
+        Raises:
+            ValueError: The inputs break the unit contract above, or the
+                encoded rows disagree with the declared layout.
         """
+        if rows is None:
+            rows = (None,) * len(pixels)
         if (
             not pixels
             or len(pixels) != len(frames)
             or len(pixels) != len(num_frames)
+            or len(pixels) != len(rows)
         ):
             raise ValueError(
-                "video frames, unit slices and durations must align"
+                "video frames, unit slices, durations and bands must align"
             )
 
         units = []
-        for value, interval, count in zip(
-            pixels, frames, num_frames, strict=True
+        for value, interval, count, band in zip(
+            pixels, frames, num_frames, rows, strict=True
         ):
             legal = self.frame_slices(count)
             if interval not in legal:
@@ -116,14 +170,32 @@ class VideoEncoder(nn.Module):
                     "video units must be uint8 RGB frames "
                     "[frames, height, width, 3] covering their frame slice"
                 )
+            if band is not None:
+                height, _ = self.latent_size(
+                    image.Config(int(value.shape[1]), int(value.shape[2]))
+                )
+                group = self.row_group
+                if (
+                    count != 1
+                    or band.step not in (None, 1)
+                    or band.start is None
+                    or band.stop is None
+                    or not 0 <= band.start < band.stop <= height
+                    or band.start % group
+                    or band.stop % group
+                ):
+                    raise ValueError(
+                        "a band must be whole latent row groups of a still "
+                        "frame"
+                    )
             units.append(legal.index(interval))
 
         # One posterior draw per video size serves every unit of this call
         # that belongs to a video of that size.
         draws: dict[video.Config, torch.Tensor | None] = {}
         outputs = []
-        for value, interval, count, unit in zip(
-            pixels, frames, num_frames, units, strict=True
+        for value, interval, count, unit, band in zip(
+            pixels, frames, num_frames, units, rows, strict=True
         ):
             size = video.Config(
                 count, image.Config(int(value.shape[1]), int(value.shape[2]))
@@ -138,41 +210,56 @@ class VideoEncoder(nn.Module):
                 )
             rows_per_frame = layout.shape[0] // windows[-1].stop
 
+            # A band keeps a run of its frame's row groups, whose rows follow
+            # each other within the frame.
+            first, stop = (
+                window.start * rows_per_frame,
+                window.stop * rows_per_frame,
+            )
+            if band is not None:
+                groups = self.latent_size(size.frame)[0] // self.row_group
+                if rows_per_frame % groups:
+                    raise ValueError(
+                        "a frame's latent rows must divide evenly among its "
+                        "row groups"
+                    )
+                rows_per_group = rows_per_frame // groups
+                first = band.start // self.row_group * rows_per_group
+                stop = band.stop // self.row_group * rows_per_group
+
             if size not in draws:
                 draws[size] = self.posterior_noise(size)
             noise = draws[size]
             if noise is not None:
-                noise = noise[:, :, window].to(value.device)
+                noise = noise[:, :, window]
+                if band is not None:
+                    noise = noise[..., band, :]
+                noise = noise.to(value.device)
 
             # A unit whose input was padded to the encoder's temporal extent
             # yields trailing latent frames beyond its own; the window keeps
             # the leading ones, so the posterior never samples the others.
             latents = self.encoder(
                 self.unpack_pixels(value, interval, count),
+                rows=band,
                 window=(slice(None), slice(None), slice(0, extent)),
                 noise=noise,
             )
-            rows = self.pack_latents(latents)
+            values = self.pack_latents(latents)
             if (
-                rows.shape != (extent * rows_per_frame, *layout.shape[1:])
-                or rows.dtype != layout.dtype
+                values.shape != (stop - first, *layout.shape[1:])
+                or values.dtype != layout.dtype
             ):
                 raise ValueError(
                     "packed video latents must match the declared output rows"
                 )
             outputs.append(
                 TensorOutput(
-                    rows,
+                    values,
                     OutputLayout(
                         layout.shape,
                         layout.dtype,
-                        (
-                            slice(
-                                window.start * rows_per_frame,
-                                window.stop * rows_per_frame,
-                            ),
-                            *layout.local_slice[1:],
-                        ),
+                        (slice(first, stop), *layout.local_slice[1:]),
                         variable_axes=layout.variable_axes,
                         value_range=layout.value_range,
                     ),

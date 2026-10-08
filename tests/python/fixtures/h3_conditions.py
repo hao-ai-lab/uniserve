@@ -175,8 +175,13 @@ def describe(
     plan: processing.ConditionPlan,
     canvas: image.Config,
     source: MediaLocator,
+    image_bands: int = 1,
 ) -> VideoCondition:
-    """Describe one planned condition as admission carries it."""
+    """Describe one planned condition as admission carries it.
+
+    A reference image is encoded in ``image_bands`` bands of its patch rows,
+    as the server bands it for a latent encoder of that many units a round.
+    """
     with torch.device("meta"):
         encoder = VideoEncoder(video_vae.Config())
     prepared, seen = plan.prepared, plan.vision
@@ -214,8 +219,17 @@ def describe(
         audio = _audio(prepared)
 
     # Each temporal unit of the encoded pixels yields its latent frames'
-    # rows; an image is one unit of one latent frame.
-    if fit is not None:
+    # rows; a keyframe is one unit of one latent frame and a reference image
+    # one unit per band of its patch rows.
+    if isinstance(prepared, image.Config):
+        per_group = processing.rows_per_frame(prepared) // (
+            prepared.height // processing.CANVAS_MULTIPLE
+        )
+        units = tuple(
+            (band.stop - band.start) // encoder.row_group * per_group
+            for band in encoder.row_bands(prepared, image_bands)
+        )
+    elif fit is not None:
         units = (processing.rows_per_frame(fit.size),)
     elif video is not None:
         units = tuple(
@@ -286,18 +300,21 @@ def read(conditions, vision, ffmpeg):
     return pixels, samples, patches
 
 
-def recorded_request(root: Path, case: str, ffmpeg: str, publish):
+def recorded_request(
+    root: Path, case: str, ffmpeg: str, publish, image_bands: int = 1
+):
     """Plan a recorded run's request and describe its conditions.
 
     Returns the run directory, the plan, each condition's media file and
-    the conditions as admission carries them, published with ``publish``.
+    the conditions as admission carries them, published with ``publish``,
+    reference images in ``image_bands`` bands.
     """
     run = root / "reference" / "diffusers" / case / "seed42"
     request = json.loads((run / "request.json").read_text())
     planned = plan(request, root, ffmpeg)
     paths = [media_file(root, item["uri"]) for item in request["conditions"]]
     conditions = tuple(
-        describe(condition, planned.canvas, publish(path))
+        describe(condition, planned.canvas, publish(path), image_bands)
         for condition, path in zip(planned.conditions, paths, strict=True)
     )
     return run, planned, paths, conditions

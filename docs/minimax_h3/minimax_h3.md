@@ -162,6 +162,8 @@ Startup prepares, and with graphs captures, every layout an admitted request rea
 
 A base denoiser counts one condition row per token: a five-second reference video with its soundtrack occupies about 38,000 rows, a 16:9 reference image about 7,300. OmniRef packs each condition into whole 128-row tiles: an image or audio track takes `ceil(rows / 128)` tiles, and a video's token grid of latent frames × height/32 × width/32 takes `ceil(frames / 4) × ceil(height / 32 / 4) × ceil(width / 32 / 8)`. The official video-plus-audio request therefore occupies 38,124 rows on the base reference denoiser and 47,104 on OmniRef. OmniRef also bounds a request's packed sequence (prompt, conditions and generated rows) at 131,072 rows.
 
+The latent encoder's ranks (`temporal_units`) encode a request's condition units in rounds. A reference image is split into bands of whole 32-pixel patch rows that fill one round, the round's units divided among the request's reference images, so a lone image's tiles are encoded on every rank; the bands assemble the single-rank encoding exactly. Keyframes and reference-video windows remain one unit each.
+
 ## Build and run with Docker
 
 ```bash
