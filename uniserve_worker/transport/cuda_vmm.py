@@ -22,8 +22,10 @@ import concurrent.futures
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cache
@@ -142,6 +144,10 @@ class _CudaSource:
             self.retirement.set_result(None)
 
 
+# Fabric-exported allocations one transport keeps mapped for its reads.
+_FABRIC_IMPORTS = 256
+
+
 class CudaVmmTransport(Transport):
     """Device publications a consumer imports by their shareable handle.
 
@@ -230,12 +236,62 @@ class CudaVmmTransport(Transport):
             name="uniserve-cuda-read",
             event_pool=event_pool,
         )
+        # Byte mappings of fabric-exported allocations this rank has read,
+        # least recently read first (`_fabric_import`).
+        self._fabric_imports: OrderedDict[
+            tuple[str, str, bytes, int], torch.Tensor
+        ] = OrderedDict()
+        self._fabric_import_lock = threading.Lock()
 
         with _endpoint_lock:
             _endpoints[self.endpoint()] = self
 
     def endpoint(self) -> str:
         return self._publications.name
+
+    def _fabric_import(
+        self, handle: CudaVmmTransfer, device: torch.device
+    ) -> torch.Tensor:
+        """Return a byte mapping on ``device`` of a fabric-exported allocation.
+
+        Importing and mapping an allocation costs a fixed tens of
+        milliseconds whatever its size, and the driver serializes these
+        operations across processes, while producers publish from long-lived
+        storage: their product arenas and device pools. A mapping is
+        therefore kept for later reads of the same allocation. A fabric
+        handle names one physical allocation for as long as any import holds
+        it, so a kept mapping never aliases another allocation; it does keep
+        an allocation its producer has released alive until it is dropped.
+        At most `_FABRIC_IMPORTS` are kept, the least recently read dropped
+        first, and a read's views retain their mapping beyond that.
+        """
+        import torch
+        from uniserve_kernels.peer_storage import import_handle
+
+        key = (
+            handle.endpoint,
+            str(device),
+            handle.allocation_handle,
+            handle.storage_size_bytes,
+        )
+        with self._fabric_import_lock:
+            mapped = self._fabric_imports.get(key)
+            if mapped is not None:
+                self._fabric_imports.move_to_end(key)
+                return mapped
+        imported = import_handle(
+            torch.empty(0, dtype=torch.uint8, device=device),
+            handle.allocation_handle,
+            handle.storage_size_bytes,
+        )
+        with self._fabric_import_lock:
+            # Another read thread may have imported the same allocation
+            # meanwhile; the first mapping kept serves both.
+            mapped = self._fabric_imports.setdefault(key, imported)
+            self._fabric_imports.move_to_end(key)
+            while len(self._fabric_imports) > _FABRIC_IMPORTS:
+                self._fabric_imports.popitem(last=False)
+        return mapped
 
     def _descriptor_grants(self) -> DescriptorGrants:
         """Bind this address space's grant socket on first use."""
@@ -696,28 +752,28 @@ class CudaVmmTransport(Transport):
                             device=import_device,
                         )
                     )
-                    # A fabric handle is importable as published. A descriptor
-                    # names an open file of the producing process, so the
-                    # usable one is received from that rank over its grant
-                    # socket and closed once the allocation, which holds its
-                    # own reference, has been imported.
-                    granted = None
+                    # A fabric handle is importable as published, and its
+                    # mapping is kept for later reads (`_fabric_import`). A
+                    # descriptor names an open file of the producing process,
+                    # so the usable one is received from that rank over its
+                    # grant socket and closed once the allocation, which holds
+                    # its own reference, has been imported.
                     if len(handle.allocation_handle) == DESCRIPTOR_HANDLE_BYTES:
                         granted = descriptor_grants.fetch(
                             handle.endpoint, handle.publication_id
                         )
-                        exported = descriptor_grants.descriptor_bytes(granted)
-                    else:
-                        exported = handle.allocation_handle
-                    try:
-                        allocation = import_handle(
-                            prototype,
-                            exported,
-                            handle.storage_size_bytes,
-                        )
-                    finally:
-                        if granted is not None:
+                        try:
+                            allocation = import_handle(
+                                prototype,
+                                descriptor_grants.descriptor_bytes(granted),
+                                handle.storage_size_bytes,
+                            )
+                        finally:
                             os.close(granted)
+                    else:
+                        allocation = self._fabric_import(
+                            handle, import_device
+                        ).view(prototype.dtype)
 
                     # One mapping owns every span; tensor views share its
                     # deleter.
@@ -839,6 +895,8 @@ class CudaVmmTransport(Transport):
             # whole, which is what closing the transport means for them.
             self._unacknowledged.clear()
             self._pools.clear()
+            with self._fabric_import_lock:
+                self._fabric_imports.clear()
             if self._grants is not None:
                 self._grants.close()
                 self._grants = None
