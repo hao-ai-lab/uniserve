@@ -96,6 +96,17 @@ def _cuda_extensions():
                 "nvcc": ["-O3", "-std=c++20"],
             },
         ),
+        # Per-frame group normalization, SiLU and causal padding. The sources
+        # compile without fast math, as PyTorch's normalization and SiLU
+        # kernels do, whose arithmetic they reproduce bit for bit.
+        CUDAExtension(
+            "uniserve_kernels.norm._frame",
+            [_source("norm", "csrc", "frame.cu")],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20"],
+                "nvcc": ["-O3", "-std=c++20", "--expt-relaxed-constexpr"],
+            },
+        ),
         # SM100a block-diffusion canvas steps and their cuBLASLt
         # self-conditioning product. The sources compile without fast math:
         # the Gumbel scores use the accurate logf, and the divisions and

@@ -28,7 +28,6 @@ from typing import cast
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from uniserve.nn import functional
 from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
@@ -856,7 +855,8 @@ class CausalBlock(nn.Module):
         for norm, convolution in zip(
             self.norms, self.convolutions, strict=True
         ):
-            hidden = convolution(F.silu(norm(hidden)))
+            # The convolution reads silu(norm(hidden)), padded with it.
+            hidden = convolution(hidden, norm=norm)
         return self.shortcut(values) + hidden
 
 
@@ -991,7 +991,7 @@ class CausalCNN(nn.Module):
         hidden = self.input(pixels)
         for stage in self.stages:
             hidden = stage(hidden)
-        return self.output(F.silu(self.norm(hidden)))
+        return self.output(hidden, norm=self.norm)
 
 
 class Encoder(SpatialEncoder):

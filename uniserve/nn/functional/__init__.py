@@ -18,7 +18,7 @@ from ._activation import (
     value_first_swiglu_fp8,
 )
 from ._attention import attention
-from ._frame import frame_pad
+from ._frame import frame_norm_pad, frame_pad
 from ._linear import linear, merged_linear
 from ._moe import Routes, fused_moe, topk_softmax
 from ._norm import (
@@ -47,6 +47,7 @@ __all__ = [
     "add_rms_norm",
     "apply_rotary",
     "attention",
+    "frame_norm_pad",
     "frame_pad",
     "gated_residual",
     "gated_residual_rms_norm",
