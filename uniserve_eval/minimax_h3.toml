@@ -10,9 +10,10 @@
 # - UNISERVE_MINIMAX_H3_INPUTS names the protocol inputs directory, whose
 #   media/ holds the condition media the W3, W4, W5 and reference matrix
 #   rows name.
-# - UNISERVE_MINIMAX_H3_OMNIREF names FastVideo/FastH3-OmniRef-DMPDD8-step1900
-#   and UNISERVE_MINIMAX_H3_OMNIREF_BASE a local copy of the MiniMax-H3
-#   revision it pins (9bfb6693f2cf6de171db46d1aa586f67d773a1da).
+# - UNISERVE_MINIMAX_H3_OMNIREF names FastVideo/FastH3-OmniRef-DMPDD8-step1900;
+#   the Hugging Face cache holds the MiniMax-H3 revision it pins
+#   (9bfb6693f2cf6de171db46d1aa586f67d773a1da), from which UniServe reads the
+#   components the export omits.
 # - UNISERVE_FAST_H3_MODEL names a local copy of
 #   FastVideo/FastVideo-FastH3-8-Step-V2, as in uniserve_eval/fast_h3.toml.
 # - UNISERVE_MINIMAX_H3_FFMPEG names the bin directory of the FFmpeg 8.1.2
@@ -93,9 +94,6 @@ endpoint = "/v1/videos/sync"
 task = "t2va"
 aspect_ratio = "16:9"
 seconds = 5.0
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-w1.load]
 num_prompts = 8
@@ -122,9 +120,6 @@ endpoint = "/v1/videos/sync"
 task = "t2va"
 aspect_ratio = "16:9"
 seconds = 15.0
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-w2.load]
 num_prompts = 4
@@ -164,9 +159,6 @@ task = "fl2va"
 aspect_ratio = "auto"
 seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-w3.load]
 num_prompts = 8
@@ -207,9 +199,6 @@ task = "ref2va"
 aspect_ratio = "auto"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-reference-w4.load]
 num_prompts = 8
@@ -237,9 +226,6 @@ task = "ref2va"
 aspect_ratio = "auto"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-reference-w5.load]
 num_prompts = 8
@@ -262,7 +248,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--base-model", "${UNISERVE_MINIMAX_H3_OMNIREF_BASE}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "49152", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "49152", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-4-omniref.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -280,9 +266,6 @@ task = "ref2va"
 aspect_ratio = "auto"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-omniref-w4.load]
 num_prompts = 8
@@ -310,9 +293,6 @@ task = "ref2va"
 aspect_ratio = "auto"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-omniref-w5.load]
 num_prompts = 8
@@ -343,7 +323,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--base-model", "${UNISERVE_MINIMAX_H3_OMNIREF_BASE}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-reference-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "48128", "--video-text-capacities", "4096,7168,8192,10240,14336,15360,22528,37888,48128", "--max-video-seconds", "15", "--max-condition-rows", "79104", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses8-reference-two-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "48128", "--video-text-capacities", "4096,7168,8192,10240,14336,15360,22528,37888,48128", "--max-video-seconds", "15", "--max-condition-rows", "79104", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--host-identity", "rank-0", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.gb200-8-omniref-refs.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -361,9 +341,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-image-5s.load]
 num_prompts = 3
@@ -391,9 +368,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-image-voice-5s.load]
 num_prompts = 3
@@ -421,9 +395,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-images3-5s.load]
 num_prompts = 3
@@ -451,9 +422,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-images9-5s.load]
 num_prompts = 3
@@ -481,9 +449,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-clip-5s.load]
 num_prompts = 3
@@ -511,9 +476,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-video-5s.load]
 num_prompts = 3
@@ -541,9 +503,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-clips3-5s.load]
 num_prompts = 3
@@ -571,9 +530,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-mixed-5s.load]
 num_prompts = 3
@@ -601,9 +557,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-full-5s.load]
 num_prompts = 3
@@ -631,9 +584,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-image-10s.load]
 num_prompts = 3
@@ -661,9 +611,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-image-voice-10s.load]
 num_prompts = 3
@@ -691,9 +638,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-images3-10s.load]
 num_prompts = 3
@@ -721,9 +665,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-images9-10s.load]
 num_prompts = 3
@@ -751,9 +692,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-clip-10s.load]
 num_prompts = 3
@@ -781,9 +719,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-video-10s.load]
 num_prompts = 3
@@ -811,9 +746,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-clips3-10s.load]
 num_prompts = 3
@@ -841,9 +773,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-mixed-10s.load]
 num_prompts = 3
@@ -871,9 +800,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 10.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-full-10s.load]
 num_prompts = 3
@@ -901,9 +827,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-image-15s.load]
 num_prompts = 3
@@ -931,9 +854,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-image-voice-15s.load]
 num_prompts = 3
@@ -961,9 +881,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-images3-15s.load]
 num_prompts = 3
@@ -991,9 +908,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-images9-15s.load]
 num_prompts = 3
@@ -1021,9 +935,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-clip-15s.load]
 num_prompts = 3
@@ -1051,9 +962,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-video-15s.load]
 num_prompts = 3
@@ -1081,9 +989,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-clips3-15s.load]
 num_prompts = 3
@@ -1111,9 +1016,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-mixed-15s.load]
 num_prompts = 3
@@ -1141,9 +1043,6 @@ task = "ref2va"
 aspect_ratio = "16:9"
 seconds = 15.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-omniref-ref-full-15s.load]
 num_prompts = 3
@@ -1246,9 +1145,6 @@ endpoint = "/v1/videos/sync"
 task = "t2va"
 aspect_ratio = "16:9"
 seconds = 5.0
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-w1.load]
 num_prompts = 8
@@ -1275,9 +1171,6 @@ endpoint = "/v1/videos/sync"
 task = "t2va"
 aspect_ratio = "16:9"
 seconds = 15.0
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-w2.load]
 num_prompts = 4
@@ -1834,9 +1727,6 @@ task = "fl2va"
 aspect_ratio = "auto"
 seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 
 [benchmarks.gb200-8-w3.load]

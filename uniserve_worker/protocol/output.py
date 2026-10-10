@@ -233,6 +233,9 @@ class RequestOutput:
     # Natural-log probability of every candidate of a token-denoising
     # readout, in the call's `Readout.candidate_ids` order.
     candidate_logprobs: tuple[float, ...] = ()
+    # Why the worker refused the request; set exactly when error_code is
+    # INVALID_REQUEST.
+    error_message: str | None = None
 
     def validate(self) -> None:
         """Check that identity, status, coordinates, and outputs agree.
@@ -246,8 +249,9 @@ class RequestOutput:
                 attached to anything but a successful KV_PUBLISH of this
                 call; the visible KV extent exceeds the computed one; a
                 coordinate is negative; the error code does not match the
-                status; a completion other than a successful token
-                denoising carries candidate log-probabilities; or a
+                status; a refused request's completion states no reason, or
+                another completion does; a completion other than a successful
+                token denoising carries candidate log-probabilities; or a
                 predicated completion carries tokens, logprobs, products, or
                 finish flags.
         """
@@ -298,6 +302,12 @@ class RequestOutput:
             raise invalid_descriptor(
                 "a non-error completion must not carry an error code"
             )
+        if (self.error_message is not None) != (
+            self.error_code is ErrorCode.INVALID_REQUEST
+        ):
+            raise invalid_descriptor(
+                "a refused request's completion, and only one, states why"
+            )
         if self.status is CallStatus.PREDICATED and (
             self.committed_tokens
             or self.sampled_logprob is not None
@@ -336,6 +346,9 @@ class RequestOutput:
                 if data.get("error_code") is None
                 else _enum(ErrorCode, data["error_code"], f"{where}.error_code")
             ),
+            error_message=None
+            if data.get("error_message") is None
+            else _str(data["error_message"], f"{where}.error_message"),
             timing_counters=TimingCounters.from_mapping(
                 data.get("timing_counters"), f"{where}.timing_counters"
             ),
@@ -441,6 +454,7 @@ class RequestOutput:
             else self.kv_output.to_mapping(),
             "product_generations": list(self.product_generations),
             "error_code": None if error_code is None else error_code.value,
+            "error_message": self.error_message,
             "timing_counters": {
                 "queued_us": timing.queued_us,
                 "device_us": timing.device_us,

@@ -169,15 +169,13 @@ def build_worker_layout(
     attention_backend: str = "",
     bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
-    checkpoint_identity: str = "",
 ) -> WorkerLayout:
     """Resolve resource dimensions and the capacity report used by the worker.
 
     Model dimensions determine storage reservations. Admission additionally
     obeys the configured call set and every lane's bounds; these
     restrictions do not shrink the storage needed by warmup and graph
-    capture. ``checkpoint_identity`` is reported as loaded; a model built
-    without a checkpoint reports none.
+    capture.
 
     ``state_buffers`` defaults to the media request state derived from
     ``bindings``; a non-empty value, or a ``VideoPostprocessor`` in the model,
@@ -236,7 +234,6 @@ def build_worker_layout(
             queue_depth=queue_depth,
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
-            checkpoint_identity=checkpoint_identity,
         )
     else:
         layout = _token_worker_layout(
@@ -249,7 +246,6 @@ def build_worker_layout(
             endpoint=endpoint,
             capacity_group=capacity_group,
             bindings=bindings,
-            checkpoint_identity=checkpoint_identity,
         )
 
     # A shared admission limit must be safe on every eligible lane. Keep it
@@ -336,7 +332,6 @@ def _token_worker_layout(
     endpoint: WorkerEndpoint,
     capacity_group: Communicator | None,
     bindings: Mapping[str, ComponentBinding] | None,
-    checkpoint_identity: str,
 ) -> WorkerLayout:
     """Size token inputs, paged KV, and latent storage before admission.
 
@@ -719,7 +714,6 @@ def _token_worker_layout(
     )
     info = WorkerInfo(
         model_name=model_name,
-        checkpoint_identity=checkpoint_identity,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
@@ -771,10 +765,7 @@ def _token_worker_layout(
 
 
 def video_denoiser_info(
-    denoiser: VideoDenoiser,
-    *,
-    canvases: tuple[image.Config, ...] = (),
-    max_condition_rows: int = 0,
+    denoiser: VideoDenoiser, *, canvases: tuple[image.Config, ...] = ()
 ) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
 
@@ -783,8 +774,6 @@ def video_denoiser_info(
     the clean endpoint the network never evaluates. The canvases are
     ``canvases``, those the deployment prepares and admits, or without any
     every canvas the denoiser offers (``VideoDenoiser.canvases``).
-    ``max_condition_rows`` is the packed condition rows the deployment
-    provisioned for one request.
 
     Raises:
         WorkerError: ``UnsupportedSetup`` when the worker executes none of
@@ -804,9 +793,6 @@ def video_denoiser_info(
         video_shift=float(shifts["video"]),
         audio_shift=float(shifts["audio"]),
         canvases=tuple((canvas.width, canvas.height) for canvas in served),
-        max_sequence_rows=denoiser.max_sequence_rows,
-        condition_tiles=denoiser.condition_tiles,
-        max_condition_rows=max_condition_rows,
     )
 
 
@@ -820,7 +806,6 @@ def _request_tensor_worker_layout(
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
     bindings: Mapping[str, ComponentBinding] | None,
-    checkpoint_identity: str,
 ) -> WorkerLayout:
     """Describe request tensors, products, and persistent capacity.
 
@@ -840,7 +825,6 @@ def _request_tensor_worker_layout(
 
     info = WorkerInfo(
         model_name=model_name,
-        checkpoint_identity=checkpoint_identity,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
@@ -862,9 +846,7 @@ def _request_tensor_worker_layout(
         ),
         num_inference_steps=builder.num_steps,
         video_denoiser=video_denoiser_info(
-            builder.denoiser,
-            canvases=builder.canvases,
-            max_condition_rows=builder.condition_rows,
+            builder.denoiser, canvases=builder.canvases
         ),
         host_lane_capacity=1,
     )

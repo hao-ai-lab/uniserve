@@ -8,7 +8,7 @@
       { "node": "localhost", "device": "cuda:3" }
     ],
     "components": {
-      "reference_denoiser": {
+      "transformer_ref": {
         "ranks": [0, 1, 2, 3],
         "parallel_config": {
           "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 4 }

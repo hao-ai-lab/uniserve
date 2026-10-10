@@ -96,12 +96,11 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         assert video["canvas"]["short_edges"] == [768]
         assert video["canvas"]["aspect_ratios"] == list(CANVASES)
 
-        legacy = client.post(
-            "/v1/videos/sync",
-            json={"model": "MiniMax-H3", "prompt": prompt, "seconds": 5},
+        untasked = client.post(
+            "/v1/videos/sync", json={"model": "MiniMax-H3", "prompt": prompt}
         )
-        assert legacy.status_code == 400
-        assert "task" in legacy.json()["error"]["message"]
+        assert untasked.status_code == 400
+        assert "task" in untasked.json()["error"]["message"]
 
         for ratio, (width, height) in CANVASES.items():
             response = client.post(

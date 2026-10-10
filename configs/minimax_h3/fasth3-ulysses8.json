@@ -12,7 +12,7 @@
       { "node": "localhost", "device": "cuda:7" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0, 1, 2, 3, 4, 5, 6, 7],
         "parallel_config": {
           "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 8 }

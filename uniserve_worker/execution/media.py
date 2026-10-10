@@ -772,7 +772,16 @@ def video_state(runner: ModelExecutor, request: RequestState) -> DiffusionState:
 def begin_noise(
     runner: ModelExecutor, request: RequestState, request_pool: RequestPool
 ) -> None:
-    """Stage an admitted video request's host inputs off the service thread.
+    """Admit a video request's size and stage its host inputs.
+
+    A rank holding the denoiser first admits the request's exact size into
+    the capacities it provisioned (``MediaBuilder.size``). A size it does not
+    serve, such as conditions beyond the condition capacity or keyframes a
+    reference-only denoiser packs no rows for, refuses the request: its
+    reason is recorded on the request, whose calls on this rank then report
+    it (``schedule.refused_output``). Every rank holding the denoiser
+    decides the same refusal from the same admission, so the ranks of a
+    collective call skip it together.
 
     The seeded draw and the request's state tables depend only on the seed
     and the admitted size, so they are prepared on the rank's noise thread
@@ -780,8 +789,26 @@ def begin_noise(
     encoding or another request's denoising steps, and latent preparation
     waits for them. A rank that does not denoise stages none.
     """
-    media = request.admission.diffusion
-    if media is None or runner.noise_draws is None or not runner.state_buffers:
+    from uniserve_worker.execution.conditions import library_conditions
+
+    media, video = request.admission.diffusion, request.admission.video
+    builder = runner.media_builder
+    if media is None or video is None or builder is None:
+        return
+    try:
+        builder.size(
+            media.num_frames,
+            len(request.admission.prompt_token_ids),
+            media.canvas,
+            conditions=library_conditions(video),
+            vision_spans=video.vision_spans(),
+        )
+    except ValueError as error:
+        request.refusal = str(error)
+        logger.info("refused video request %s: %s", request.request_key, error)
+        return
+
+    if runner.noise_draws is None or not runner.state_buffers:
         return
     trajectory = video_state(runner, request)
     slot = slot_ladder(trajectory)

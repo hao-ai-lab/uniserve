@@ -363,10 +363,7 @@ pub(super) mod tests {
             eprintln!("UNISERVE_MINIMAX_H3_MODEL is not set; skipping the tokenizer parity test");
             return;
         };
-        let pipeline = PipelineCheckpoint::resolve(&root, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let pipeline = PipelineCheckpoint::resolve(&root).await.unwrap().unwrap();
         let tokenizer = pipeline_tokenizer(&pipeline).await.unwrap();
         let fixture = fixture();
         let vision = vision(&fixture);

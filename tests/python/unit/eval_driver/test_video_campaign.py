@@ -67,6 +67,9 @@ FAST_H3_SCHEDULE = {
 
 def stated_schedule(backend, schedule=FAST_H3_SCHEDULE):
     """The schedule fields a point measuring ``backend`` states."""
+    if backend == "uniserve":
+        # UniServe's checkpoint fixes its schedule.
+        return {}
     if backend == "fastvideo":
         # FastVideo takes its shifts from the checkpoint.
         return {"num_inference_steps": schedule["num_inference_steps"]}
@@ -241,7 +244,7 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
     width, height = canvas
     points = schedule["num_inference_steps"]
     if backend in ("uniserve", "sglang"):
-        # Both take the official body; the stated schedule restates points.
+        # Both take the official body; SGLang also runs the stated schedule.
         assert json.loads(sent[0][1]) == {
             "model": "h3",
             "prompt": "precise prompt",
@@ -253,7 +256,7 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
                 "duration_seconds": seconds,
             },
             "seed": 11,
-            **schedule,
+            **stated_schedule(backend, schedule),
         }
     elif backend == "vllm-omni":
         fields = form_fields(sent[0])

@@ -292,13 +292,10 @@ impl ModelConfig {
         // A diffusers pipeline declares its class and component folders in a
         // root index rather than a root `config.json`, so the index selects the
         // profile and locates the tokenizer component before any other asset
-        // is resolved. A component export reads the components its pinned
-        // base supplies from `base_model`, or from the Hub cache at the
-        // pinned revision, as its workers do; `base_model` is refused for
-        // any other checkpoint.
+        // is resolved. A component folder the checkpoint omits is read from
+        // the base revision it pins, as its workers read it.
         let mut indexed_description = None;
-        let base_model = config.base_model.as_deref();
-        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model, base_model).await? {
+        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model).await? {
             let description = ModelDescription::from_pipeline_class(pipeline.class_name())
                 .ok_or_else(|| crate::profile::assets::Error::UnsupportedPipeline {
                     class_name: pipeline.class_name().to_owned(),
@@ -313,35 +310,11 @@ impl ModelConfig {
                 }
                 let vision = VisionConfig::read(&processor[0], &processor[1])
                     .map_err(|error| ModelResolutionError::MediaContract(format!("{error:#}")))?;
-                // A deployment that places the reference denoiser presents
-                // its references' vision tokens in the prompt, which the
-                // text encoder's context bounds; the checkpoint states it.
-                let references = if config
-                    .engine
-                    .workers
-                    .iter()
-                    .any(|worker| worker.components.contains_key(Self::REFERENCE_DENOISER))
-                {
-                    let text_encoder = pipeline
-                        .component_file("text_encoder", "config.json")
-                        .await?;
-                    let context = crate::profile::assets::load_model_config(Some(&text_encoder))?
-                        .max_position_embeddings()
-                        .ok_or_else(|| {
-                            ModelResolutionError::MediaContract(
-                                "the text encoder states no max_position_embeddings".to_owned(),
-                            )
-                        })?;
-                    Some(context)
-                } else {
-                    None
-                };
                 let model = Self::from_pipeline(
                     &served_name,
                     description,
                     config.engine.max_video_seconds,
                     config.engine.max_model_len,
-                    references,
                 )?;
                 return Ok(LoadedModel {
                     config: model,

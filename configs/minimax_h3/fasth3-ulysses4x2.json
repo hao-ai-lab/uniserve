@@ -43,7 +43,7 @@
       { "node": "localhost", "device": "cuda:3" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0, 1, 2, 3],
         "parallel_config": {
           "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 4 }
@@ -74,7 +74,7 @@
       { "node": "localhost", "device": "cuda:7" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0, 1, 2, 3],
         "parallel_config": {
           "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 4 }

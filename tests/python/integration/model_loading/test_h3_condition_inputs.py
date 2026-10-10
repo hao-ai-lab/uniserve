@@ -106,7 +106,7 @@ def _runner(checkpoint: Path, modules, placed) -> ModelExecutor:
         device=DEVICE,
         max_sequence_tokens=8192,
         max_video_seconds=15.0,
-        deployment_components=(*(name for name, _ in placed), "denoiser"),
+        deployment_components=(*(name for name, _ in placed), "transformer"),
     )
     dimensions = ParallelConfig().dimensions
     group = Communicator((0,), 0, device=torch.device(DEVICE))

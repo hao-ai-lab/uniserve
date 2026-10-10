@@ -225,16 +225,6 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    /// Default prompt bound, in tokens, of a video deployment whose prompts
-    /// are text and keyframes alone. Startup prepares a layout for every
-    /// text capacity up to the bound, so it holds the prompts those requests
-    /// present (the official ones stay under 7,000 tokens) rather than the
-    /// text encoder's whole context; `--max-model-len` states another.
-    pub const VIDEO_TEXT_PROMPT_TOKENS: u32 = 16_384;
-
-    /// Component a MiniMax H3 deployment places to serve references.
-    pub const REFERENCE_DENOISER: &'static str = "reference_denoiser";
-
     /// Resolves vocabulary, checkpoint defaults, and model-specific settings once.
     ///
     /// The family comes from the `model_type` of `files.config_path`, which
@@ -319,12 +309,8 @@ impl ModelConfig {
     /// A pipeline checkpoint has no root generation or tokenizer metadata, so
     /// the result carries no sampling defaults and no EOS tokens. Its
     /// denoising step count belongs to the loaded numerical plan, which the
-    /// worker handshake binds. `max_model_tokens` overrides the family's
-    /// prompt bound, which follows from what the deployment presents:
-    /// `text_context`, the positions the checkpoint's text encoder states,
-    /// when it serves references, whose vision tokens are prompt tokens, and
-    /// [`ModelConfig::VIDEO_TEXT_PROMPT_TOKENS`] for prompts of text and
-    /// keyframes alone.
+    /// worker handshake binds. `max_model_tokens` overrides the family's prompt
+    /// bound.
     ///
     /// # Errors
     ///
@@ -335,13 +321,12 @@ impl ModelConfig {
         description: ModelDescription,
         max_video_seconds: f64,
         max_model_tokens: Option<u32>,
-        references: Option<u32>,
     ) -> assets::Result<Self> {
         let (parameters, default_max_model_tokens) = match description {
-            ModelDescription::MiniMaxH3 => (
-                ModelParameters::MiniMaxH3 { max_video_seconds },
-                references.unwrap_or(Self::VIDEO_TEXT_PROMPT_TOKENS),
-            ),
+            // MiniMax H3's text encoder serves prompts of up to 16,384 tokens.
+            ModelDescription::MiniMaxH3 => {
+                (ModelParameters::MiniMaxH3 { max_video_seconds }, 16_384)
+            }
             ModelDescription::Qwen3
             | ModelDescription::SenseNova
             | ModelDescription::Bagel
@@ -593,27 +578,9 @@ mod tests {
         assert_eq!(ModelDescription::from_model_type("minimax_h3"), None);
 
         let profile =
-            ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, 15.0, None, None)
-                .unwrap();
+            ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, 15.0, None).unwrap();
         assert_eq!(profile.description(), ModelDescription::MiniMaxH3);
         assert_eq!(profile.max_model_tokens, Some(16_384));
-
-        // A deployment that serves references presents their vision tokens,
-        // so its prompts are bounded by the text encoder's context unless
-        // the deployment states a bound.
-        let pipeline = |stated| {
-            ModelConfig::from_pipeline(
-                "h3",
-                ModelDescription::MiniMaxH3,
-                15.0,
-                stated,
-                Some(262_144),
-            )
-            .unwrap()
-            .max_model_tokens
-        };
-        assert_eq!(pipeline(None), Some(262_144));
-        assert_eq!(pipeline(Some(8192)), Some(8192));
     }
 
     /// A Bagel latent position table whose rows do not form a square grid

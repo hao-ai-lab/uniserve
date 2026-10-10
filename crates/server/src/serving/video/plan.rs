@@ -36,8 +36,6 @@ use uniserve_core::{
     Canvas, ConditionMedia, ConditionVision, ImageFit, MediaLocator, VideoCondition, VideoTask,
 };
 
-use uniserve_engine::ConditionTiles;
-
 use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
 use super::{RequestField, VideoInputError};
 use crate::profile::video::{VideoRaster, VideoResolution};
@@ -567,31 +565,6 @@ pub struct ConditionPlan {
 }
 
 impl ConditionPlan {
-    /// Denoiser rows the condition takes, packed as `tiles` prescribes: its
-    /// video and audio rows without tiles, or the rows of the whole tiles
-    /// they fill, a video's in tiles of its `(latent frames, height / 32,
-    /// width / 32)` token grid. `None` for a keyframe under tiles, which a
-    /// region packing does not hold.
-    pub fn packed_rows(&self, tiles: Option<ConditionTiles>) -> Option<u64> {
-        let Some(tiles) = tiles else {
-            return Some(u64::from(self.video_rows) + u64::from(self.audio_rows));
-        };
-        match &self.prepared {
-            Prepared::Keyframe(_) => None,
-            Prepared::Image(_) => Some(tiles.rows(self.audio_rows, self.video_rows, None)),
-            Prepared::Video(clip) => Some(tiles.rows(
-                self.audio_rows,
-                0,
-                Some([
-                    clip.latent_frames,
-                    clip.canvas.height / CANVAS_MULTIPLE,
-                    clip.canvas.width / CANVAS_MULTIPLE,
-                ]),
-            )),
-            Prepared::Audio(_) => Some(tiles.rows(self.audio_rows, 0, None)),
-        }
-    }
-
     /// Denoiser video rows of each unit the video encoder encodes, in unit
     /// order.
     ///
@@ -756,35 +729,6 @@ pub struct RequestPlan {
 }
 
 impl RequestPlan {
-    /// Denoiser rows of the generated video.
-    pub fn target_video_rows(&self) -> u32 {
-        self.latent_frames * rows_per_frame(self.canvas)
-    }
-
-    /// Denoiser rows of the generated stereo audio.
-    pub fn target_audio_rows(&self) -> u32 {
-        AUDIO_CHANNELS * self.audio_latents
-    }
-
-    /// Denoiser video rows of all conditions.
-    pub fn condition_video_rows(&self) -> u32 {
-        self.conditions.iter().map(|plan| plan.video_rows).sum()
-    }
-
-    /// Denoiser audio rows of all conditions.
-    pub fn condition_audio_rows(&self) -> u32 {
-        self.conditions.iter().map(|plan| plan.audio_rows).sum()
-    }
-
-    /// Denoiser rows of all conditions, packed as `tiles` prescribes (see
-    /// [`ConditionPlan::packed_rows`]); `None` when a keyframe meets tiles.
-    pub fn condition_rows(&self, tiles: Option<ConditionTiles>) -> Option<u64> {
-        self.conditions
-            .iter()
-            .map(|plan| plan.packed_rows(tiles))
-            .sum()
-    }
-
     /// The units each condition's reference image is encoded in when one
     /// latent encoding round covers `lane` units, one entry per condition
     /// (other conditions' entries are unread).
@@ -2049,23 +1993,6 @@ pub(super) mod tests {
             assert_eq!(
                 u64::from(plan.audio_latents),
                 expected["audio_latents"],
-                "{name}"
-            );
-            let rows = [
-                ("target_video_rows", plan.target_video_rows()),
-                ("target_audio_rows", plan.target_audio_rows()),
-                ("condition_video_rows", plan.condition_video_rows()),
-                ("condition_audio_rows", plan.condition_audio_rows()),
-            ];
-            for (key, value) in rows {
-                assert_eq!(u64::from(value), expected[key], "{name} {key}");
-            }
-            // Together with the presentation's rows, the planned rows fill
-            // the reference's packed sequence exactly.
-            let planned = rows.iter().map(|&(_, value)| u64::from(value)).sum::<u64>();
-            assert_eq!(
-                planned + expected["text_rows"].as_u64().unwrap(),
-                expected["sequence_rows"],
                 "{name}"
             );
             let conditions: Vec<Value> = plan.conditions.iter().map(condition_json).collect();

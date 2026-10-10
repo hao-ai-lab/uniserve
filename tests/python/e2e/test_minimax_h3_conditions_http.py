@@ -2,13 +2,13 @@
 
 Serves the published Ulysses-4 deployments and sends the seed-42 requests
 of the packaged conditioned workloads (``uniserve_eval/workloads/minimax_h3``):
-the official first-frame request (W3) on the diffusers root's ``denoiser``
+the official first-frame request (W3) on the base release's ``transformer``
 deployment, and the image-plus-audio (W4) and official video-plus-audio (W5)
-reference requests on the ``reference_denoiser`` deployment, with the
-diffusers root's reference DiT and with a FastH3 OmniRef component export.
-The OmniRef export also serves a request that fills its deployment's text
-and condition capacities and refuses one whose conditions exceed the
-condition capacity before admission. Condition media are read from
+reference requests on the ``transformer_ref`` deployment, with the base
+release's reference DiT and with a FastH3 OmniRef export. The OmniRef export
+also serves a request that fills its deployment's text and condition
+capacities and refuses one whose conditions exceed the condition capacity,
+naming its rows. Condition media are read from
 ``file://`` URIs under ``--media-directory``. Every response is a complete
 MP4 at the canvas and frame count the request resolves to.
 """
@@ -219,22 +219,22 @@ OMNIREF_OPTIONS = [
 ]
 
 
-def _omniref() -> tuple[str, str]:
-    """The OmniRef export and the local base copy the environment names."""
+def _omniref() -> str:
+    """The OmniRef export the environment names.
+
+    The Hugging Face cache supplies the base revision it pins.
+    """
     export = os.environ.get("UNISERVE_MINIMAX_H3_OMNIREF")
-    base_copy = os.environ.get("UNISERVE_MINIMAX_H3_OMNIREF_BASE")
-    if not export or not base_copy:
+    if not export:
         pytest.fail(
-            "UNISERVE_MINIMAX_H3_OMNIREF must name a FastH3 OmniRef export "
-            "and UNISERVE_MINIMAX_H3_OMNIREF_BASE a local copy of the base "
-            "revision it pins"
+            "UNISERVE_MINIMAX_H3_OMNIREF must name a FastH3 OmniRef export"
         )
-    return export, base_copy
+    return export
 
 
 def test_omniref_reference_requests(tmp_path: Path) -> None:
     inputs = _inputs()
-    export, base_copy = _omniref()
+    export = _omniref()
     port = find_free_port()
     _reference_requests(
         _command(
@@ -242,7 +242,7 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
             "ulysses4-reference.json",
             port,
             inputs,
-            [*OMNIREF_OPTIONS, "--base-model", base_copy],
+            OMNIREF_OPTIONS,
         ),
         f"http://127.0.0.1:{port}",
         tmp_path,
@@ -318,9 +318,10 @@ def _bound_request(inputs: Path, *, audio: bool) -> dict:
 
 def test_omniref_condition_capacity(tmp_path: Path) -> None:
     # A request that fills the deployment's capacities is served; one over
-    # the condition capacity is refused before admission, naming its rows.
+    # the condition capacity is refused by the worker that packs it, naming
+    # its rows.
     inputs = _inputs()
-    export, base_copy = _omniref()
+    export = _omniref()
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     command = _command(
@@ -328,7 +329,7 @@ def test_omniref_condition_capacity(tmp_path: Path) -> None:
         "ulysses4-reference.json",
         port,
         inputs,
-        [*BOUND_OPTIONS, "--base-model", base_copy],
+        BOUND_OPTIONS,
     )
     with (
         server_process(command, base, tmp_path / "server.log", timeout_s=3600),

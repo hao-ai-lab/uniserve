@@ -13,7 +13,6 @@
 //! rank channel's death wake when a rank process this engine spawned exits.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-mod checkpoint;
 mod death_watch;
 mod executor;
 mod instance;
@@ -49,16 +48,6 @@ pub struct WorkerProcessArgs {
     pub python: std::path::PathBuf,
     /// Model identifier or local model path.
     pub model: String,
-    /// Identity of the checkpoint at `model`, derived by the head when the
-    /// model is a local directory of a non-stub launch and left unset
-    /// otherwise. Every rank verifies the checkpoint it loads against it and
-    /// reports what it loaded; a launch fills it once before any rank starts.
-    pub checkpoint_identity: Option<String>,
-    /// Local copy of the base checkpoint a component export at `model` pins,
-    /// passed to every rank, which verifies its revision from its Hugging
-    /// Face download records. Unset, ranks read the base from the Hugging
-    /// Face cache; a checkpoint that pins no base refuses one.
-    pub base_model: Option<std::path::PathBuf>,
     /// Ordered physical members of this WorkerGroup instance.
     pub ranks: Vec<crate::WorkerRank>,
     /// This process's own host identity. The engine owns exactly the ranks

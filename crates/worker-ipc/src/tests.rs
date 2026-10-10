@@ -173,6 +173,7 @@ fn completion_record() -> RequestOutput {
 
         product_generations: vec![3, 4],
         error_code: None,
+        error_message: None,
         timing_counters: TimingCounters::default(),
         code: CallKind::Forward(ForwardMode::Decode),
         position: 5,
@@ -2058,6 +2059,7 @@ fn full_run_result() -> BatchOutput {
 
         product_generations: vec![3, 5],
         error_code: None,
+        error_message: None,
         timing_counters: TimingCounters {
             queued_us: 41,
             device_us: 42,

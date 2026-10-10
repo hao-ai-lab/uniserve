@@ -54,7 +54,7 @@ BUCKETS = tuple(
 @pytest.fixture(scope="module")
 def denoiser():
     with torch.device("meta"):
-        return Model(fasth3_config()).denoiser
+        return Model(fasth3_config()).transformer
 
 
 def test_capacity_layouts_cover_every_admitted_size(denoiser):
@@ -198,7 +198,7 @@ def test_every_named_canvas_has_layouts_that_fit_the_slot_storage():
     and the slot storage holds every layout's buffers dimension by dimension.
     """
     with torch.device("meta"):
-        denoiser = Model(base_config()).denoiser
+        denoiser = Model(base_config()).transformer
     builder = MediaBuilder(
         denoiser,
         max_frames=360,
@@ -250,7 +250,7 @@ def test_a_condition_capacity_bounds_each_conditioned_layout():
     and text-only requests keep the prepared ladder.
     """
     with torch.device("meta"):
-        denoiser = Model(base_config()).denoiser
+        denoiser = Model(base_config()).transformer
     first = Condition(ConditionRole.FIRST_FRAME, video.Config(1, WIDE))
     plain = MediaBuilder(
         denoiser, max_frames=124, max_text_tokens=4096, min_frames=96
@@ -303,10 +303,14 @@ def test_a_condition_capacity_bounds_each_conditioned_layout():
     )
     assert plain.capacity_buffers()["condition_noise"].shape == (0,)
 
-    # Three keyframe rows sets exceed the 2048-row capacity.
-    with pytest.raises(ValueError, match="condition capacity"):
+    # Three keyframes' 3024 rows exceed the 2048-row capacity, and the refusal
+    # names both and the option that raises it.
+    with pytest.raises(
+        ValueError,
+        match="3024 denoiser rows, more than the 2048 .*--max-condition-rows",
+    ):
         builder.size(124, 100, WIDE, conditions=(first, first, first))
-    with pytest.raises(ValueError, match="condition capacity"):
+    with pytest.raises(ValueError, match="more than the 0 "):
         plain.size(124, 100, WIDE, conditions=(first,))
 
 
@@ -317,7 +321,7 @@ def test_reference_denoiser_has_no_text_only_layout():
     its own, which the widened maximum still bounds.
     """
     with torch.device("meta"):
-        denoiser = Model(base_config()).reference_denoiser
+        denoiser = Model(base_config()).transformer_ref
     builder = MediaBuilder(
         denoiser,
         max_frames=124,
@@ -355,22 +359,22 @@ def test_the_largest_condition_set_follows_the_served_tasks():
     """
     with torch.device("meta"):
         base = Model(base_config())
-        text_only = Model(fasth3_config()).denoiser
+        text_only = Model(fasth3_config()).transformer
         regional = Model(
             replace(
                 base_config(),
-                denoisers={"reference_denoiser": omniref_denoiser()},
+                denoisers={"transformer_ref": omniref_denoiser()},
             )
-        ).reference_denoiser
+        ).transformer_ref
     keyframes = (
         Condition(ConditionRole.FIRST_FRAME, video.Config(1, WIDE)),
         Condition(ConditionRole.LAST_FRAME, video.Config(1, WIDE)),
     )
     assert text_only.max_conditions(124, WIDE) == ()
-    assert base.denoiser.max_conditions(124, WIDE) == keyframes
+    assert base.transformer.max_conditions(124, WIDE) == keyframes
 
     for denoiser, leading in (
-        (base.reference_denoiser, keyframes),
+        (base.transformer_ref, keyframes),
         (regional, ()),
     ):
         conditions = denoiser.max_conditions(124, WIDE)

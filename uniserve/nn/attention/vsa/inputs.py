@@ -9,11 +9,6 @@ import torch
 # Rows of one query tile and of one key block that block attention serves.
 TILE_SIZES = (64, 128)
 
-# Tiles a region layout holds at most. Region selection orders a query tile's
-# key tiles with one packed sort key whose low 13 bits carry the tile, so this
-# is the capacity of every selection provider, not a tuning default.
-MAX_REGION_TILES = 1 << 13
-
 
 @dataclass(frozen=True, slots=True)
 class Pattern:
@@ -273,11 +268,6 @@ class Regions:
         ):
             raise ValueError("VSA regions require whole tiles of a VSA tile")
         tiles = self.padded_tokens // self.tile
-        if tiles > MAX_REGION_TILES:
-            raise ValueError(
-                f"VSA regions hold at most {MAX_REGION_TILES} tiles, "
-                f"got {tiles}"
-            )
         if any(
             value.shape != (tiles,) or value.dtype != torch.int32
             for value in (

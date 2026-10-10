@@ -1,10 +1,10 @@
 # FastH3 and MiniMax-H3 guide
 
-UniServe serves the MiniMax-H3 video-and-audio models: the FastH3 DMD students for text-to-video (`t2va`), FastH3 OmniRef students for reference-conditioned video (`ref2va`), and the base MiniMax-H3 checkpoint for `t2va`, keyframe-conditioned video (`fl2va`) and `ref2va`. Every response is an H.264/AAC MP4 at 24 fps with stereo 32-kHz audio.
+UniServe serves the MiniMax-H3 video-and-audio models: the base MiniMax-H3 checkpoint for text-to-video (`t2va`), keyframe-conditioned video (`fl2va`) and reference-conditioned video (`ref2va`), and FastH3, its fast variant: a distilled student of one of the base checkpoint's DiT partitions. The FastH3 DMD students serve `t2va` and the FastH3 OmniRef students `ref2va`. Every response is an H.264/AAC MP4 at 24 fps with stereo 32-kHz audio.
 
 ## Requirements
 
-- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. Four local GPUs are the standard setup. FastH3 is validated on H200, GB200 and RTX PRO 6000 Blackwell Server Edition; the base checkpoint and OmniRef on four GB200. OmniRef needs a data-center Blackwell (SM100) GPU, and the server refuses it elsewhere at startup.
+- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. Four local GPUs are the standard setup. FastH3 is validated on H200, GB200 and RTX PRO 6000 Blackwell Server Edition; the base checkpoint and OmniRef on four GB200. OmniRef's 128-row sparse-attention tiles currently have a kernel on data-center Blackwell (SM100) GPUs only.
 - FFmpeg for keyframe and reference requests: the server probes condition media with `ffprobe` and the worker decodes reference videos with `ffmpeg`, both from `PATH` unless `--ffprobe` and `--ffmpeg` name them.
 - Shared storage and pinned-storage access for worker IPC, as the container command below provisions.
 
@@ -35,13 +35,13 @@ The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the Cu
 | --- | --- | --- | --- |
 | [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4) | `t2va` | 768p, 480p | 8 |
 | [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | `t2va` | 768p, 480p | 4 |
-| FastH3 OmniRef component exports | `ref2va` | 768p | The export's schedule |
-| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `denoiser` | `t2va`, `fl2va` | 768p | 49 |
-| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `reference_denoiser` | `ref2va` | 768p | 49 |
+| FastH3 OmniRef exports | `ref2va` | 768p | The export's schedule |
+| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer` | `t2va`, `fl2va` | 768p | 49 |
+| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer_ref` | `ref2va` | 768p | 49 |
 
-The NVFP4 repositories are ModelOpt PTQ checkpoints and need Blackwell. A checkpoint's schedule comes from its `fastvideo_inference.json` and schedulers, or for the base checkpoint 50 sigma points with video shift 12 and audio shift 3. A server places one denoiser, so a base deployment serves either `t2va` and `fl2va` or `ref2va`.
+The NVFP4 repositories are ModelOpt PTQ checkpoints and need Blackwell. A FastH3 export's `fastvideo_inference.json` states its task, which selects the base partition it replaces (`transformer` for `t2va`, `transformer_ref` for `ref2va`), its schedule (DMD rungs or parallel-decoding blocks) and its sparse attention; the base checkpoint evaluates 50 sigma points with video shift 12 and audio shift 3. Each checkpoint's schedulers state its shifts. A server places one DiT partition, so a base deployment serves either `t2va` and `fl2va` or `ref2va`.
 
-An OmniRef export holds only its reference denoiser and schedulers. Its `fastvideo_inference.json` pins the base revision (`base_model_revision`) whose text encoder, tokenizer, processor and VAEs it uses; the server reads them from the Hugging Face cache at that revision, or from the local copy `--base-model` names, which must hold every file at the pinned revision.
+An OmniRef export holds only its DiT partition and schedulers. Its `fastvideo_inference.json` pins the base revision (`base_model_revision`) whose text encoder, tokenizer, processor and VAEs it uses, and the server and workers read every directory the export omits from the Hugging Face cache at that revision, downloading what the cache lacks.
 
 ```bash
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
@@ -50,8 +50,8 @@ hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 export H3_ROOT=/workspace/models/MiniMax-H3
 hf download MiniMaxAI/MiniMax-H3 --local-dir "$H3_ROOT"
 
-# The base components an OmniRef export pins.
-hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> --local-dir "$OMNIREF_BASE" \
+# The base components an OmniRef export pins, into the Hugging Face cache.
+hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> \
   --include 'text_encoder/*' --include 'tokenizer/*' --include 'processor/*' \
   --include 'vae/*' --include 'audio_vae/*'
 ```
@@ -88,7 +88,7 @@ uniserve serve "$H3_ROOT" \
   --max-video-seconds 5 --max-model-len 8192 --video-text-capacities 8192 \
   --max-condition-rows 40960 --media-directory /srv/media
 
-uniserve serve "$OMNIREF_EXPORT" --base-model "$OMNIREF_BASE" \
+uniserve serve "$OMNIREF_EXPORT" \
   --workers configs/minimax_h3/ulysses4-reference.json \
   --served-model-name MiniMax-H3-OmniRef \
   --host 0.0.0.0 \
@@ -118,8 +118,8 @@ The deployment files are in `configs/minimax_h3/`; the `fasth3-` files place Fas
 | `fasth3-ulysses4x2-two-node.json` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
 | `fasth3-dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
 | `fasth3-gather8.json` | Eight on one host | Eight-way all-gather | TP8 |
-| `ulysses4-reference.json` | Four on one host | Ulysses4 reference denoiser | TP4 |
-| `ulysses8-reference-two-node.json` | Four on each of two hosts | Ulysses8 reference denoiser | TP4 on `rank-0` |
+| `ulysses4-reference.json` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
+| `ulysses8-reference-two-node.json` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
 
 One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The two-host reference file spreads a request's condition encoding over both hosts. The media reader runs in a `reader` worker on a GPU of the head's host, where the head hands it the request's references through shared storage, and publishes the decoded pixels from device storage, which the encoder ranks of both hosts read. The text encoder then encodes the prompt on `rank-0`'s four GPUs while the latent encoder, which deals a request's condition units to `rank-1`'s GPUs first and to `rank-0`'s after them, encodes its references. One eight-way reference replica serves both latency and throughput across two hosts. The validated FastH3 settings:
 
@@ -150,10 +150,10 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | --- | --- |
 | `--max-video-seconds` | Longest admitted duration, 4 to 15 seconds; 15 by default. |
 | `--video-resolutions`, `--video-aspect-ratios` | The canvases startup prepares: each resolution with each aspect ratio, `768p` and `16:9,9:16` by default. FastH3 serves `768p` and `480p`, the others `768p`. A request for any other canvas is refused. |
-| `--max-model-len` | Longest prompt presentation in tokens, vision tokens included. By default 16384 for a deployment whose prompts are text and keyframes alone, and the text encoder's context, 262,144 tokens, for one that places `reference_denoiser`, whose references' vision tokens are prompt tokens. The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
+| `--max-model-len` | Longest prompt presentation in tokens, vision tokens included; 16384 by default. A reference deployment states the bound its references' vision tokens need. The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
 | `--video-text-capacities` | Prompt capacities startup prepares; each prompt runs in the smallest that holds it. By default 1024, then steps of 2048 up to `--max-model-len`. |
 | `--max-running-requests` | Concurrently resident requests, up to the workers' request slots. |
-| `--max-condition-rows` | Denoiser rows one request's conditions may occupy. Without it the deployment provisions the largest condition set its denoiser admits, so no request is refused for its conditions: two keyframes for keyframe generation, and nine images at 4:1 with three videos of the generated length and their soundtracks for references. A machine that cannot hold that set fails at startup, and a deployment that serves less states the rows, as below. |
+| `--max-condition-rows` | Denoiser rows one request's conditions may occupy, counted as the placed denoiser packs them. Without it the deployment provisions the largest condition set its denoiser admits: two keyframes for keyframe generation, and nine images at 4:1 with three videos of the generated length and their soundtracks for references. A machine that cannot hold that set fails at startup, and a deployment that serves less states the rows, as below. The worker that denoises a request refuses conditions beyond the capacity with `invalid_request`, naming their rows. |
 | `--media-directory` | Directory under which `file://` condition URIs resolve; `file://` is refused without it. |
 | `--remote-media` | Whether `http(s)://` condition URIs are fetched; on by default. |
 | `--max-request-bytes` | Largest request body and fetched media in total; 256 MiB by default. |
@@ -162,7 +162,7 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 
 Startup prepares, and with graphs captures, every layout a request without conditions reaches: each frame count up to `--max-video-seconds` at each canvas and text capacity. Fewer canvases, capacities and seconds start faster and hold less storage. A request with conditions evaluates in a layout of its own, prepared when it arrives, so a reference denoiser, whose every request brings a reference, prepares only its largest layout at startup: its text capacities and seconds add no startup work. Until then the log reports `worker still busy during Worker startup`. On four GB200 with `ulysses4.json` and the defaults, FastH3 is ready in about 17 minutes from warm kernel caches and holds about 105 GiB per model worker; the first startup also compiles kernels. Serving all 12 FastH3 canvases needs fewer text capacities, such as `--video-text-capacities 1024,10240,16384`. 768p 21:9 needs more request storage than the other canvases. A deployment that does not fit fails before it reports ready and logs what each component holds.
 
-A base denoiser counts one condition row per token: a five-second reference video with its soundtrack occupies about 38,000 rows, a 16:9 reference image about 7,300. OmniRef packs each condition into whole 128-row tiles: an image or audio track takes `ceil(rows / 128)` tiles, and a video's token grid of latent frames × height/32 × width/32 takes `ceil(frames / 4) × ceil(height / 32 / 4) × ceil(width / 32 / 8)`. The official video-plus-audio request therefore occupies 38,124 rows on the base reference denoiser and 47,104 on OmniRef. OmniRef's region packing addresses 8,192 tiles, so a request's packed sequence (prompt, conditions and generated rows) holds up to 1,048,576 rows; the deployment's text capacity, condition capacity and seconds, and the storage they need, bound a request before that. The prompt carries every visual reference's vision tokens: a reference image, resized to a 2048-pixel short edge, is (height / 32) × (width / 32) prompt tokens and as many condition rows, 7,296 each at 16:9 and 4,096 each when square, and a five-second 16:9 reference video is about 6,100 prompt tokens. A 16:9 target generates 37,710 rows at five seconds and 109,062 at fifteen. Nine square images with three 2-second clips and their soundtracks, 47,160 prompt tokens and 79,104 condition rows, pack 236,294 rows at a fifteen-second target. One eight-GB200 deployment serves that request and every smaller mix with `--max-video-seconds 15 --max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888,48128 --max-condition-rows 79104`: startup sizes the denoiser for the largest text capacity and the condition capacity together, and a request evaluates in the smallest text capacity that holds its prompt. A reference deployment that states neither capacity provisions the checkpoint's whole range: at fifteen seconds OmniRef's largest condition set packs 648,960 rows beside 262,144 prompt tokens, which needs more device storage than eight GB200 GPUs hold, so such a deployment states the capacities it serves.
+A base denoiser counts one condition row per token: a five-second reference video with its soundtrack occupies about 38,000 rows, a 16:9 reference image about 7,300. OmniRef packs each condition into whole 128-row tiles: an image or audio track takes `ceil(rows / 128)` tiles, and a video's token grid of latent frames × height/32 × width/32 takes `ceil(frames / 4) × ceil(height / 32 / 4) × ceil(width / 32 / 8)`. The official video-plus-audio request therefore occupies 38,124 rows on the base reference denoiser and 47,104 on OmniRef. The deployment's text capacity, condition capacity and seconds, and the storage they need, bound a request's packed sequence (prompt, conditions and generated rows); OmniRef's tile selection kernel currently addresses at most 8,192 tiles, 1,048,576 rows. The prompt carries every visual reference's vision tokens: a reference image, resized to a 2048-pixel short edge, is (height / 32) × (width / 32) prompt tokens and as many condition rows, 7,296 each at 16:9 and 4,096 each when square, and a five-second 16:9 reference video is about 6,100 prompt tokens. A 16:9 target generates 37,710 rows at five seconds and 109,062 at fifteen. Nine square images with three 2-second clips and their soundtracks, 47,160 prompt tokens and 79,104 condition rows, pack 236,294 rows at a fifteen-second target. One eight-GB200 deployment serves that request and every smaller mix with `--max-video-seconds 15 --max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888,48128 --max-condition-rows 79104`: startup sizes the denoiser for the largest text capacity and the condition capacity together, and a request evaluates in the smallest text capacity that holds its prompt. A reference deployment that states neither capacity provisions the checkpoint's whole range: at fifteen seconds OmniRef's largest condition set packs 648,960 rows beside 262,144 prompt tokens, which needs more device storage than eight GB200 GPUs hold, so such a deployment states the capacities it serves.
 
 The latent encoder's ranks (`temporal_units`) encode a request's condition units in rounds. Each round goes to the ranks that hold none of the request's calls: while the text encoder's ranks encode the prompt, the latent encoder's other ranks take the units round after round from the moment the media is read, and the text encoder's ranks join once the prompt is encoded. The text encoding is submitted when its vision features exist, so it never waits in a worker's queue ahead of those rounds. A reference image is split into bands of whole 32-pixel patch rows that fill one round, the round's units divided among the request's reference images, so a lone image's tiles are encoded on every rank of the round; a round here is what the latent encoder covers while the prompt is encoded, the ranks it does not share with the text encoder, or all of its ranks when it shares every one; more images than one round holds encode whole, and when only images remain for a final partial round that can share it evenly, they split into the bands that fill it (nine images on four ranks: two rounds of whole images, then the ninth in four bands). The bands assemble the single-rank encoding exactly. Keyframes and reference-video windows remain one unit each. With graphs, startup captures the encoding of one 256-pixel still-frame tile, which keyframe and reference-image tiles replay; reference-video windows encode eagerly.
 
@@ -220,11 +220,8 @@ A keyframe request anchors the first (`frame_index` 0) or last (`-1`) frame to a
 | `conditions` | In request order. `t2va` takes none; `fl2va` one or two image keyframes; `ref2va` up to 9 images, 3 videos and 3 audio tracks, 12 in total, plus keyframes on the base reference denoiser. Each has `type` (`image`, `video`, `video_audio` for a video that must have a soundtrack, or `audio`), `uri` (`data:`, `http(s)://` or `file://`), `role` (`keyframe` or `reference`), and optionally `frame_index` or `start_time_seconds`, an offset into a video reference. |
 | `target` | Required: `short_edge`, `aspect_ratio` (a served ratio, or `auto`: the keyframe's aspect for `fl2va`, 16:9 otherwise) and `duration_seconds` (4 to the served maximum; a reference request whose only audio-bearing reference sets the duration may omit it). |
 | `seed` | Default 42. |
-| `num_inference_steps`, `flow_shift`, `audio_flow_shift` | Optional; only the served schedule `/v1/capabilities` reports. |
-| `n`, `num_outputs_per_prompt`, `quality` | Optional; only 1, 1 and `lossless`. |
-| `seconds`, `size`, `width`, `height` | Optional; only values that agree with the target. |
 
-Any other field is refused, naming it. A video has `duration_seconds × 24` frames, rounded half to even and extended to the next count of the form 17n + 5: 4 seconds give 107 frames, 5 give 124, 8 give 192 and 15 give 362.
+Any other field is refused, naming it. The served checkpoint fixes the schedule, which `/v1/capabilities` reports, and every request generates one video. A video has `duration_seconds × 24` frames, rounded half to even and extended to the next count of the form 17n + 5: 4 seconds give 107 frames, 5 give 124, 8 give 192 and 15 give 362.
 
 `POST /v1/videos` creates an asynchronous job instead; `GET /v1/videos/{id}` reports its state (`queued`, `in_progress`, `completed`, `failed`) and progress, `GET /v1/videos/{id}/content` returns the MP4, `GET /v1/videos` lists jobs and `DELETE` cancels one. Jobs live in the server process for one hour, within 1 GiB of retained MP4s and 128 job slots shared with synchronous requests; a full server answers 429 `video_job_capacity_exceeded`.
 
@@ -253,7 +250,7 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 | --- | --- |
 | `_uniserve_ipc` import or protocol error | Run the `uv sync` above again and use the resulting `uniserve`. |
 | CUDA or sparse-attention compile error during `uv sync` | Check CUDA 13 `nvcc`, `CUDA_HOME`, the C++ build tools, and a `TORCH_CUDA_ARCH_LIST` naming the target GPUs when none is visible. |
-| `unsupported FastH3 checkpoint` | Use a complete checkpoint from the table above; the message names the expected model and revision. |
+| `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the `fastvideo_inference.json` field it cannot serve. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config` for a packed NVFP4 checkpoint. |
 | `nvfp4 conversion requires an SM100-class CUDA device` | Use `quality` or FP8 overrides on Hopper. |
 | `NVML reports no device storage for process` | Run the container in the host's process ID namespace (`--pid=host`). |
@@ -262,4 +259,4 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 | `invalid_request` naming the prompt length | Raise `--max-model-len` together with `--video-text-capacities`. |
 | A refused `file://` condition | Set `--media-directory` to a directory that holds the path. |
 | `server_error` naming `cannot run ffprobe` | Put FFmpeg on `PATH` or name it with `--ffprobe`. |
-| An OmniRef start refusing a base file by name | Download the base at the revision the export pins. |
+| An OmniRef start that cannot find a base file | Let the server download the pinned revision, or download it into the Hugging Face cache as above. |

@@ -2,7 +2,6 @@
 
 from .inputs import (
     DENSE_TILE,
-    MAX_REGION_TILES,
     TILE_SIZES,
     BlockInput,
     Input,
@@ -14,7 +13,6 @@ from .inputs import (
 
 __all__ = [
     "DENSE_TILE",
-    "MAX_REGION_TILES",
     "TILE_SIZES",
     "BlockInput",
     "Input",

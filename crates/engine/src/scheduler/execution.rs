@@ -28,7 +28,7 @@
 //! single-tick driver for tests and examples.
 
 use super::*;
-use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
+use uniserve_worker_ipc::{CallCoordinates, ErrorCode, ForwardMode, MediaCall, TransferMode};
 
 impl Scheduler {
     /// Dispatches queued work while preserving order at every shared destination.
@@ -2583,7 +2583,10 @@ impl Scheduler {
             return;
         };
         let mut consumed_products = Vec::new();
-        let already_failed = matches!(state.terminal_intent, TerminalIntent::Failure(_));
+        let already_failed = matches!(
+            state.terminal_intent,
+            TerminalIntent::Failure(_) | TerminalIntent::Rejected(_)
+        );
 
         // Only the final muxing call, the one that carries no media units,
         // returns the artifact; every other call returns none.
@@ -2608,12 +2611,18 @@ impl Scheduler {
             state.admission_state = WorkerRegistration::Registered;
         }
 
-        // A request that already failed only drains its remaining calls.
+        // A request that already failed only drains its remaining calls. A
+        // worker that refuses the request states why, and the client is told.
         if !already_failed {
             if !valid {
+                let refusal = (record.error_code == Some(ErrorCode::InvalidRequest))
+                    .then(|| record.error_message.clone())
+                    .flatten();
                 if let Some(state) = self.media_state_mut(id) {
-                    state.terminal_intent =
-                        TerminalIntent::Failure("media worker call failed".to_string());
+                    state.terminal_intent = match refusal {
+                        Some(reason) => TerminalIntent::Rejected(reason),
+                        None => TerminalIntent::Failure("media worker call failed".to_string()),
+                    };
                 }
             } else if let Some(state) = self.media_state_mut(id) {
                 // A condition product retires once the calls reading it have
@@ -2751,6 +2760,8 @@ impl Scheduler {
             }
             if let TerminalIntent::Failure(message) = &state.terminal_intent {
                 Some(DiffusionTerminal::Failed(message.clone()))
+            } else if let TerminalIntent::Rejected(message) = &state.terminal_intent {
+                Some(DiffusionTerminal::Rejected(message.clone()))
             } else if let TerminalIntent::Finish(reason) = &state.terminal_intent {
                 Some(DiffusionTerminal::Finished(reason.clone()))
             } else if state.output.is_closed() {
@@ -2794,6 +2805,12 @@ impl Scheduler {
             }
             DiffusionTerminal::Failed(message) => {
                 let _ = state.output.enqueue(EngineCoreOutput::Error { message });
+            }
+            DiffusionTerminal::Rejected(message) => {
+                let _ = state.output.enqueue(EngineCoreOutput::Rejected {
+                    kind: RejectionKind::Invalid,
+                    message,
+                });
             }
             DiffusionTerminal::Finished(reason) => {
                 let _ = state.output.enqueue(EngineCoreOutput::Finished {

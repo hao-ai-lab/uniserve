@@ -32,6 +32,8 @@ _BLOCK_ROWS = 16
 # above them carry the score and the bits above those the region, below bit
 # 62, which marks a lane past the last tile: 13 tile bits order 8192 tiles
 # and leave 17 bits for the regions, which number at most the tiles.
+# FIXME: the packed key bounds selection at 8192 tiles (1,048,576 rows of
+# 128); a longer sequence needs a wider key or a multi-pass sort.
 _TILE_BITS = 13
 
 if triton is not None:

@@ -137,8 +137,8 @@ def test_h3_worker_advertises_bounded_media_products():
         MediaCall.VISION_ENCODING: "text_encoder",
         MediaCall.LATENT_ENCODING: "latent_encoder",
         MediaCall.TEXT_ENCODING: "text_encoder",
-        MediaCall.LATENT_PREPARATION: "denoiser",
-        MediaCall.DENOISING: "denoiser",
+        MediaCall.LATENT_PREPARATION: "transformer",
+        MediaCall.DENOISING: "transformer",
         MediaCall.VIDEO_DECODING: "video_decoder",
         MediaCall.AUDIO_DECODING: "audio_decoder",
         # The host components own no numerical method: the media reader
@@ -388,7 +388,7 @@ def test_h3_media_units_follow_each_request_canvas():
         device="cpu",
         max_sequence_tokens=65,
         max_video_seconds=5.0,
-        deployment_components=("denoiser", "video_decoder", "video_codec"),
+        deployment_components=("transformer", "video_decoder", "video_codec"),
     )
     products = {
         value.name: value
@@ -535,7 +535,7 @@ def test_a_deployment_without_condition_capacity_serves_the_largest_set():
         max_request_pool_size=2,
         min_request_pool_size=2,
         video_frame_sizes=((768, 1344),),
-        deployment_components=("reference_denoiser",),
+        deployment_components=("transformer_ref",),
     )
     assert config.max_condition_rows is None
 
@@ -550,8 +550,8 @@ def test_a_deployment_without_condition_capacity_serves_the_largest_set():
         model, replace(config, max_condition_rows=2048), 6
     )
     assert stated.max_condition_rows == 2048
-    with pytest.raises(ValueError, match="condition capacity"):
+    with pytest.raises(ValueError, match="more than the 2048 this deployment"):
         media_builder(model, stated).size(frames, 100, WIDE, conditions=largest)
 
-    plain = replace(config, deployment_components=("denoiser",))
+    plain = replace(config, deployment_components=("transformer",))
     assert loaded_worker_config(text_only, plain, 6).max_condition_rows == 0

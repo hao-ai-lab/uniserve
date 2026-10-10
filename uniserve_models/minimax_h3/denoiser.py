@@ -42,7 +42,6 @@ from uniserve.media import image, video
 from uniserve.model import (
     Condition,
     ConditionRole,
-    ConditionTiles,
     LatentInput,
     VideoDenoiser,
 )
@@ -69,7 +68,6 @@ from .inputs import (
 from .packing import (
     AUDIO_TAG,
     FPS,
-    VIDEO_TILE_SHAPES,
     DensePacking,
     RegionPacking,
     TilePacking,
@@ -219,23 +217,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     @property
     def fixed_canvases(self) -> tuple[image.Config, ...] | None:
         return self.config.canvases
-
-    @property
-    def max_sequence_rows(self) -> int | None:
-        return self.config.max_sequence_rows
-
-    @property
-    def condition_tiles(self) -> ConditionTiles | None:
-        """The region packing's tiles under multi-region sparse attention.
-
-        ``make_size`` counts a condition's rows as ``region_tiles`` of
-        ``VIDEO_TILE_SHAPES[tile]`` video tiles; dense attention and
-        single-region sparse attention, which takes no conditions, count
-        densely.
-        """
-        if not self.regional:
-            return None
-        return ConditionTiles(self._tile, VIDEO_TILE_SHAPES[self._tile])
 
     def max_conditions(
         self, num_frames: int, canvas: image.Config
@@ -483,13 +464,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
         Conditions occupy whole tiles (64 rows, or the region packing's
         tile), as ``layout_size`` rounds them, and a larger region is kept.
-        ``max_sequence_rows`` bounds the widened layout's generated, text and
-        condition rows.
 
         Raises:
             ValueError: Single-region sparse attention, which takes no
-                conditions, a negative row count, or a widened layout beyond
-                ``max_sequence_rows``.
+                conditions, or a negative row count.
         """
         if not (self.dense or self.regional):
             raise ValueError(
@@ -498,26 +476,12 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         if type(condition_rows) is not int or condition_rows < 0:
             raise ValueError("H3 condition rows must be a nonnegative count")
         tile = self._tile
-        widened = replace(
+        return replace(
             layout,
             condition_rows=max(
                 layout.condition_rows, math.ceil(condition_rows / tile) * tile
             ),
         )
-        limit = self.max_sequence_rows
-        if limit is not None:
-            rows = (
-                self.latent_shape("video", widened)[0]
-                + self.latent_shape("audio", widened)[0]
-                + widened.num_text_tokens
-                + widened.condition_rows
-            )
-            if rows > limit:
-                raise ValueError(
-                    f"an H3 layout of {rows} rows exceeds the denoiser's "
-                    f"{limit} sequence rows"
-                )
-        return widened
 
     @torch.inference_mode()
     def encode_conditions(

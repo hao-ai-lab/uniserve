@@ -70,7 +70,7 @@ def generate(
     num_frames: int,
     canvas: image.Config,
     seed: int,
-    component: str = "denoiser",
+    component: str = "transformer",
     layout: DenoiserSize | None = None,
 ) -> Generation:
     """Generate a text-conditioned video and audio track eagerly.
