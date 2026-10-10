@@ -243,11 +243,10 @@ class SparseAttention:
 
     Each video query tile keeps ``ceil((1 - sparsity) n)`` of the ``n`` key
     tiles of the generated video. Without ``reference_keep`` the generated
-    video is the only region, packed in 64-row tiles (``packing.TilePacking``,
-    the FastH3 DMD students). With it, every reference video is a region of
-    its own, of which a query keeps the fraction ``reference_keep``
-    (``packing.RegionPacking``, the ``p2_multi_region`` policy of
-    reference-conditioned students).
+    video is the only selected segment, packed in 64-row tiles
+    (``packing.TilePacking``, the t2va students). With it, every reference
+    video is a segment of its own, of which a query keeps the fraction
+    ``reference_keep`` (``packing.SegmentPacking``, the ref2va students).
     """
 
     tile: int
@@ -272,7 +271,7 @@ class SparseAttention:
         if self.reference_keep is not None and not 0 < self.reference_keep <= 1:
             raise ValueError("H3 reference keep rate must lie in (0, 1]")
         if self.reference_keep is None and self.tile != 64:
-            raise ValueError("single-region H3 sparse attention tiles 64 rows")
+            raise ValueError("single-segment H3 sparse attention tiles 64 rows")
 
 
 Attention: TypeAlias = DenseAttention | SparseAttention

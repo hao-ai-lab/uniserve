@@ -7,7 +7,7 @@ from .inputs import (
     Input,
     NormRope,
     Pattern,
-    Regions,
+    Segments,
     Workspace,
 )
 
@@ -18,11 +18,11 @@ __all__ = [
     "Input",
     "NormRope",
     "Pattern",
-    "Regions",
+    "Segments",
     "Workspace",
 ]
 
 from .layer import Attention, BlockAttention
-from .regions import RegionAttention
+from .segments import SegmentAttention
 
-__all__ += ["Attention", "BlockAttention", "RegionAttention"]
+__all__ += ["Attention", "BlockAttention", "SegmentAttention"]

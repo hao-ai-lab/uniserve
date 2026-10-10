@@ -34,9 +34,9 @@ from uniserve.nn import (
 from uniserve.quantization import Quantizer
 
 from . import config as configs
-from .attention import Dense, RegionSparse, Sparse
+from .attention import Dense, SegmentSparse, Sparse
 from .config import TransformerConfig
-from .inputs import AttentionInput, RegionInput, SequenceInput
+from .inputs import AttentionInput, SegmentInput, SequenceInput
 from .modulation import OutputNorm
 
 
@@ -46,7 +46,7 @@ class TransformerLayer(nn.Module):
     def __init__(
         self,
         config: TransformerConfig,
-        attention: Dense | Sparse | RegionSparse,
+        attention: Dense | Sparse | SegmentSparse,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -69,7 +69,7 @@ class TransformerLayer(nn.Module):
         self,
         hidden,
         modulation,
-        inputs: AttentionInput | SequenceInput | RegionInput,
+        inputs: AttentionInput | SequenceInput | SegmentInput,
         *,
         workspace,
     ):
@@ -169,8 +169,8 @@ class TransformerLayer(nn.Module):
             attended = attention.forward_chunks(
                 normalize(), cos, sin, inputs, workspace=workspace
             )
-        elif isinstance(attention, RegionSparse) and isinstance(
-            inputs, RegionInput
+        elif isinstance(attention, SegmentSparse) and isinstance(
+            inputs, SegmentInput
         ):
             attended = attention.forward_chunks(
                 normalize(), cos, sin, inputs, workspace=workspace
@@ -258,7 +258,7 @@ class TransformerLayer(nn.Module):
         self,
         hidden,
         modulation,
-        inputs: AttentionInput | SequenceInput | RegionInput,
+        inputs: AttentionInput | SequenceInput | SegmentInput,
         *,
         workspace,
     ):
@@ -356,14 +356,14 @@ class Transformer(nn.Module):
             config.audio_channels, config.hidden_size, dtype=torch.float32
         )
 
-        def kind() -> Dense | Sparse | RegionSparse:
+        def kind() -> Dense | Sparse | SegmentSparse:
             if isinstance(attention, configs.DenseAttention):
                 return Dense(config)
             if attention.reference_keep is None:
                 return Sparse(config, sparsity=attention.sparsity)
             # The sparsity and reference keep rate are request tables of the
-            # region packing (``packing.region_tables``).
-            return RegionSparse(config, tile=attention.tile)
+            # segment packing (``packing.segment_tables``).
+            return SegmentSparse(config, tile=attention.tile)
 
         self.layers = nn.ModuleDict(
             {
@@ -411,7 +411,7 @@ class Transformer(nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
-        inputs: AttentionInput | SequenceInput | RegionInput,
+        inputs: AttentionInput | SequenceInput | SegmentInput,
         *,
         step: torch.Tensor,
         tables: Mapping[str, torch.Tensor],

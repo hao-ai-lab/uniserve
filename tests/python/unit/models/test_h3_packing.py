@@ -294,7 +294,7 @@ def test_conditions_must_fit_the_layout():
         condition_rows=64,
         token_multiple=512,
     )
-    with pytest.raises(ValueError, match="prefix region"):
+    with pytest.raises(ValueError, match="prefix segment"):
         dense_tables(
             packing,
             num_frames=124,

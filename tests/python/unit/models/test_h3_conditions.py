@@ -167,7 +167,7 @@ def test_encoded_conditions_fill_the_rows_past_the_prompt():
         )
 
 
-def test_reference_regions_take_whole_tiles():
+def test_reference_segments_take_whole_tiles():
     model = _meta(omniref_denoiser())
     voice = Condition(ConditionRole.REFERENCE, None, 32_000)
     size = model.make_size(
@@ -183,12 +183,12 @@ def test_reference_regions_take_whole_tiles():
     # The retained conditioning holds the prompt capacity, the conditions'
     # rows and one zero row.
     assert model.text_condition_rows(layout) == 384 + 7168 + 1
-    # Region packing holds no keyframe rows.
+    # Segment packing holds no keyframe rows.
     with pytest.raises(ValueError, match="keyframe"):
         model.make_size(124, 300, canvas=WIDE, conditions=(CLIP, FIRST))
 
 
-def test_reference_region_state_follows_its_layout():
+def test_reference_segment_state_follows_its_layout():
     model = Denoiser(
         omniref_denoiser(
             TransformerConfig(
@@ -223,8 +223,8 @@ def test_reference_region_state_follows_its_layout():
     # 207 audio rows and 37 x 24 x 42 video patches fill the tiles.
     prefix = 300 + 120 + 4032
     assert int(out["valid_sizes"].sum()) == prefix + 2 * 207 + 37 * 24 * 42
-    # The clip's video forms region 0 and the generated video region 1.
-    assert set(out["tile_regions"].tolist()) == {-1, 0, 1}
+    # The clip's video forms segment 0 and the generated video segment 1.
+    assert set(out["tile_segments"].tolist()) == {-1, 0, 1}
     # Only the request's prefix rows gather the prefix source; every other
     # row takes its zero row.
     zero = model.text_condition_rows(layout) - 1
@@ -247,18 +247,18 @@ def test_a_condition_layout_holds_its_condition_rows():
     # The widened layout holds the request; the text-only one does not.
     assert model.holds(widened, size)
     assert not model.holds(layout, size)
-    # A layout whose region already holds the rows is kept as it is.
+    # A layout whose segment already holds the rows is kept as it is.
     assert model.condition_layout(widened, 64) == widened
 
 
 def test_a_condition_layout_respects_the_attention_kind():
-    with pytest.raises(ValueError, match="single-region sparse"):
+    with pytest.raises(ValueError, match="single-segment sparse"):
         model = _meta(dmd_denoiser())
         model.condition_layout(
             model.layout_size(model.make_size(124, 64, canvas=WIDE)), 64
         )
 
-    # Region packing takes conditions in its own 128-row tiles.
+    # Segment packing takes conditions in its own 128-row tiles.
     model = _meta(omniref_denoiser())
     layout = model.layout_size(model.make_size(124, 300, canvas=WIDE))
     widened = model.condition_layout(layout, 7000)

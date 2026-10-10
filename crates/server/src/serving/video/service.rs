@@ -3,7 +3,7 @@
 //! [`VideoService`] binds what the deployment's denoiser serves, as the
 //! worker reports it in its startup handshake ([`VideoDenoiserInfo`]), to the
 //! server's media policy and the checkpoint's vision processor. It prepares
-//! every video request for the engine: ingestion ([`VideoIngest`]) plans and
+//! every video request for the engine: the processor ([`VideoProcessor`]) plans and
 //! presents the request, each condition's fetched media is published to
 //! shared memory for the worker's media reader, and the result becomes one
 //! `DiffusionRequest` describing every condition. The worker that denoises
@@ -26,7 +26,7 @@ use super::plan::{
 };
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
-use super::{ConditionInput, VideoIngest, VideoRequestInput};
+use super::{ConditionInput, VideoInputs, VideoProcessor};
 use crate::config::VideoMediaSettings;
 use crate::openai::{ApiError, VideoCondition, VideoGenerationRequest};
 use crate::profile::tokenizer::DynTokenizer;
@@ -38,7 +38,7 @@ pub(crate) const REQUEST_FIELDS: [&str; 6] =
 
 /// A video request ready for submission.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PreparedVideo {
+pub struct ProcessedVideo {
     /// The engine request; its identifier is a placeholder the runtime
     /// replaces with the one it reserves.
     pub request: DiffusionRequest,
@@ -58,7 +58,7 @@ pub struct VideoService {
     /// (`RequestPlan::image_bands`).
     latent_encoding_lane: u32,
     media: VideoMediaSettings,
-    ingest: VideoIngest,
+    processor: VideoProcessor,
 }
 
 impl VideoService {
@@ -107,7 +107,7 @@ impl VideoService {
             canvases: (!denoiser.canvases.is_empty()).then(|| denoiser.canvases.clone()),
         };
         Ok(Self {
-            ingest: VideoIngest::new(fetcher, prober, vision, limits, tokenizer),
+            processor: VideoProcessor::new(fetcher, prober, vision, limits, tokenizer),
             denoiser,
             tasks,
             max_video_seconds,
@@ -133,7 +133,7 @@ impl VideoService {
         // The named ratios served at any short edge, in their canonical
         // order, and each served pair's canvas; `auto` is 16:9 for t2va and
         // ref2va.
-        let served = plan::named_canvases(self.ingest.limits());
+        let served = plan::named_canvases(self.processor.limits());
         let named: Vec<String> = NAMED_ASPECT_RATIOS
             .iter()
             .map(|(width, height)| format!("{width}:{height}"))
@@ -172,7 +172,7 @@ impl VideoService {
             "tasks": self.denoiser.tasks,
             "task_conditions": conditions,
             "canvas": {
-                "short_edges": self.ingest.limits().short_edges(),
+                "short_edges": self.processor.limits().short_edges(),
                 "multiple": CANVAS_MULTIPLE,
                 "max_pixels": CANVAS_MAX_PIXELS,
                 "aspect_ratios": named,
@@ -203,7 +203,7 @@ impl VideoService {
         })
     }
 
-    /// Validates, ingests and sizes one video request.
+    /// Validates, processes and sizes one video request.
     ///
     /// The presentation must fit the prompt capacity (`--max-model-len`).
     /// Each condition's fetched media is then published to shared memory,
@@ -212,19 +212,19 @@ impl VideoService {
     /// # Errors
     ///
     /// Returns `invalid_request` naming the field at fault or the prompt
-    /// tokens the request needs, and a server error when ingestion's own
+    /// tokens the request needs, and a server error when processing's own
     /// resources or the media publication fail.
-    pub async fn prepare(
+    pub async fn process(
         &self,
         request_id: &ServeRequestId,
         request: &VideoGenerationRequest,
         max_prompt_tokens: u32,
-    ) -> Result<PreparedVideo, ApiError> {
+    ) -> Result<ProcessedVideo, ApiError> {
         let conditions: Vec<ConditionInput<'_>> =
             request.conditions.iter().map(condition_input).collect();
-        let prepared = self
-            .ingest
-            .prepare(&VideoRequestInput {
+        let processed = self
+            .processor
+            .process(&VideoInputs {
                 task: request.task,
                 prompt: &request.prompt,
                 target: Target {
@@ -235,8 +235,8 @@ impl VideoService {
                 conditions,
             })
             .await?;
-        let plan = &prepared.plan;
-        let prompt_token_ids = prepared.presentation.token_ids;
+        let plan = &processed.plan;
+        let prompt_token_ids = processed.presentation.token_ids;
         if prompt_token_ids.len() > max_prompt_tokens as usize {
             return Err(crate::openai::serve_error_to_api(
                 ServeError::ContextLengthExceeded {
@@ -250,10 +250,13 @@ impl VideoService {
         // Each condition's media reaches the worker's media reader through
         // shared memory on this host.
         let image_bands = plan.image_bands(self.latent_encoding_lane);
-        let mut media = Vec::with_capacity(prepared.media.len());
-        let mut conditions = Vec::with_capacity(prepared.media.len());
-        for ((condition, fetched), bands) in
-            plan.conditions.iter().zip(&prepared.media).zip(image_bands)
+        let mut media = Vec::with_capacity(processed.media.len());
+        let mut conditions = Vec::with_capacity(processed.media.len());
+        for ((condition, fetched), bands) in plan
+            .conditions
+            .iter()
+            .zip(&processed.media)
+            .zip(image_bands)
         {
             let source = MediaSource::publish(fetched.bytes()).map_err(|error| {
                 ApiError::server_error(format!(
@@ -264,12 +267,12 @@ impl VideoService {
             conditions.push(condition.describe(plan.canvas, source.locator(), bands));
             media.push(Arc::new(source));
         }
-        Ok(PreparedVideo {
+        Ok(ProcessedVideo {
             request: DiffusionRequest {
                 request_id: RequestId(0),
                 task: plan.task,
                 prompt_token_ids,
-                text_tags: prepared.presentation.tags,
+                text_tags: processed.presentation.tags,
                 conditions,
                 media,
                 priority: 0,
@@ -290,7 +293,7 @@ impl VideoService {
     }
 }
 
-/// The ingestion input of one request condition.
+/// The processing input of one request condition.
 fn condition_input(condition: &VideoCondition) -> ConditionInput<'_> {
     ConditionInput {
         spec: ConditionSpec {
@@ -389,8 +392,8 @@ mod tests {
     #[tokio::test]
     async fn a_reference_image_is_described_for_the_worker() {
         let image = png(160, 90);
-        let prepared = service(4)
-            .prepare(
+        let processed = service(4)
+            .process(
                 &ServeRequestId::new("reference"),
                 &request(serde_json::json!({
                     "model": "minimax_h3",
@@ -403,7 +406,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let request = &prepared.request;
+        let request = &processed.request;
         assert_eq!(request.task, VideoTask::Ref2va);
         assert_eq!(request.text_tags.len(), request.prompt_token_ids.len());
         assert_eq!(request.validate(), Ok(()));
@@ -461,8 +464,8 @@ mod tests {
                 serde_json::json!({"type": "image", "uri": image, "role": "reference"});
                 count
             ];
-            let prepared = service(4)
-                .prepare(
+            let processed = service(4)
+                .process(
                     &ServeRequestId::new("images"),
                     &request(serde_json::json!({
                         "model": "minimax_h3",
@@ -475,7 +478,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for (index, condition) in prepared.request.conditions.iter().enumerate() {
+            for (index, condition) in processed.request.conditions.iter().enumerate() {
                 let expected = if index < count - split {
                     vec![64 * 64]
                 } else {
@@ -495,8 +498,8 @@ mod tests {
     /// latent encoder.
     #[tokio::test]
     async fn keyframes_are_fitted_to_the_canvas() {
-        let prepared = service(4)
-            .prepare(
+        let processed = service(4)
+            .process(
                 &ServeRequestId::new("keyframes"),
                 &request(serde_json::json!({
                     "model": "minimax_h3",
@@ -512,8 +515,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let canvas = prepared.canvas;
-        let [first, last] = prepared.request.conditions.as_slice() else {
+        let canvas = processed.canvas;
+        let [first, last] = processed.request.conditions.as_slice() else {
             panic!("two keyframes");
         };
         assert_eq!(first.role, ConditionRole::FirstFrame);

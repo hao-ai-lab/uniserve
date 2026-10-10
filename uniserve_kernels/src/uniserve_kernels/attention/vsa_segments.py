@@ -1,6 +1,6 @@
-"""Row kernels of region-wise video sparse attention over 128-row tiles.
+"""Row kernels of segment-wise video sparse attention over 128-row tiles.
 
-Region attention (``uniserve.nn.attention.vsa.RegionAttention``) keeps the
+Segment attention (``uniserve.nn.attention.vsa.SegmentAttention``) keeps the
 eager arithmetic of its checkpoint's recipe; these kernels perform two of its
 row passes without materializing full-sequence temporaries and reproduce the
 eager results bit for bit:
@@ -13,7 +13,7 @@ eager results bit for bit:
   to the tensors' dtype, as two eager element-wise operations round them.
 - ``select_tiles`` chooses every query tile's key tiles from its pooled
   scores in one pass, the result of the stable sorts, cumulative sums and
-  scatters of ``uniserve.nn.attention.vsa.regions.select``.
+  scatters of ``uniserve.nn.attention.vsa.segments.select``.
 
 Tensors are ``[rows, heads, width]`` with any row and head strides and a unit
 column stride; compressed tiles are ``[heads, tiles, width]``.
@@ -29,9 +29,9 @@ from uniserve_kernels.triton import launchable, tl, triton
 _BLOCK_ROWS = 16
 
 # Bits of a selection's packed sort key that carry the key tile. The 32 bits
-# above them carry the score and the bits above those the region, below bit
+# above them carry the score and the bits above those the segment, below bit
 # 62, which marks a lane past the last tile: 13 tile bits order 8192 tiles
-# and leave 17 bits for the regions, which number at most the tiles.
+# and leave 17 bits for the segments, which number at most the tiles.
 # FIXME: the packed key bounds selection at 8192 tiles (1,048,576 rows of
 # 128); a longer sequence needs a wider key or a multi-pass sort.
 _TILE_BITS = 13
@@ -147,10 +147,10 @@ if triton is not None:
     @triton.jit
     def _select_tiles_kernel(
         scores,
-        tile_regions,
+        tile_segments,
         valid_sizes,
-        region_starts,
-        region_keep,
+        segment_starts,
+        segment_keep,
         kept,
         indices,
         counts,
@@ -160,9 +160,9 @@ if triton is not None:
     ):
         """Choose one query tile's key tiles for one head.
 
-        A video query tile ranks the key tiles of every region by descending
-        score, ties by ascending tile, and keeps each region's leading
-        ``region_keep`` tiles besides every live dense tile; a dense query
+        A video query tile ranks the key tiles of every segment by descending
+        score, ties by ascending tile, and keeps each segment's leading
+        ``segment_keep`` tiles besides every live dense tile; a dense query
         tile keeps every live tile and an empty one none. The kept tiles are
         stored first in ascending order, then the others in ascending order.
         """
@@ -171,13 +171,13 @@ if triton is not None:
         row = (head * tiles + query).to(tl.int64)
         keys = tl.arange(0, block)
         present = keys < tiles
-        regions = tl.load(tile_regions + keys, mask=present, other=-1)
+        segments = tl.load(tile_segments + keys, mask=present, other=-1)
         live = tl.load(valid_sizes + keys, mask=present, other=0) > 0
-        query_region = tl.load(tile_regions + query)
+        query_segment = tl.load(tile_segments + query)
         query_live = tl.load(valid_sizes + query) > 0
 
         mask = live & query_live
-        if query_live & (query_region >= 0):
+        if query_live & (query_segment >= 0):
             values = tl.load(
                 scores + row * tiles + keys, mask=present, other=0.0
             )
@@ -190,10 +190,10 @@ if triton is not None:
                 bits >= 0x80000000, 0xFFFFFFFF - bits, bits | 0x80000000
             )
             ascending = tl.where(values != values, 0xFFFFFFFF, ascending)
-            # One packed key orders the key tiles by region (dense and empty
+            # One packed key orders the key tiles by segment (dense and empty
             # tiles first), then descending score, then ascending tile.
             packed = (
-                ((regions + 1).to(tl.int64) << (32 + tile_bits))
+                ((segments + 1).to(tl.int64) << (32 + tile_bits))
                 | ((0xFFFFFFFF - ascending) << tile_bits)
                 | keys.to(tl.int64)
             )
@@ -203,16 +203,16 @@ if triton is not None:
             packed = tl.where(present, packed, 1 << 62)
             ordered = tl.sort(packed)
 
-            # A key's rank within its region is its position in that order
-            # less the region's first position. The trailing lanes decode to
-            # tile 0 of a region past every table, so they neither read the
-            # region tables nor store a choice.
-            ordered_regions = (ordered >> (32 + tile_bits)).to(tl.int32) - 1
+            # A key's rank within its segment is its position in that order
+            # less the segment's first position. The trailing lanes decode to
+            # tile 0 of a segment past every table, so they neither read the
+            # segment tables nor store a choice.
+            ordered_segments = (ordered >> (32 + tile_bits)).to(tl.int32) - 1
             ordered_keys = (ordered & ((1 << tile_bits) - 1)).to(tl.int32)
-            ranked = present & (ordered_regions >= 0)
-            region = tl.maximum(ordered_regions, 0)
-            first = tl.load(region_starts + region, mask=ranked, other=0)
-            keep = tl.load(region_keep + region, mask=ranked, other=0)
+            ranked = present & (ordered_segments >= 0)
+            segment = tl.maximum(ordered_segments, 0)
+            first = tl.load(segment_starts + segment, mask=ranked, other=0)
+            keep = tl.load(segment_keep + segment, mask=ranked, other=0)
             chosen = ranked & (keys - first < keep)
 
             # Return the choice to tile order through this program's row of
@@ -221,7 +221,7 @@ if triton is not None:
             tl.store(scratch + ordered_keys, chosen.to(tl.int8), mask=present)
             tl.debug_barrier()
             chosen = tl.load(scratch + keys, mask=present, other=0) != 0
-            mask = (live & (regions < 0)) | chosen
+            mask = (live & (segments < 0)) | chosen
         mask = mask & present
 
         count = tl.sum(mask.to(tl.int32), axis=0)
@@ -340,18 +340,18 @@ def add_gated_tiles(
 
 def select_tiles(
     scores: torch.Tensor,
-    tile_regions: torch.Tensor,
+    tile_segments: torch.Tensor,
     valid_sizes: torch.Tensor,
-    region_starts: torch.Tensor,
-    region_keep: torch.Tensor,
+    segment_starts: torch.Tensor,
+    segment_keep: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Choose every query tile's key tiles from its pooled scores.
 
     ``scores`` is the contiguous FP32 ``[heads, tiles, tiles]`` (query tile,
     key tile) matrix and the tables are the int32 per-tile vectors of
-    ``uniserve.nn.attention.vsa.Regions``. A dense query tile keeps every
+    ``uniserve.nn.attention.vsa.Segments``. A dense query tile keeps every
     live key tile; a video query tile keeps every live dense tile and, of
-    each region ``r``, the ``region_keep[r]`` tiles of that region with the
+    each segment ``r``, the ``segment_keep[r]`` tiles of that segment with the
     highest scores, equal scores in ascending tile order, NaN above every
     number and -0 equal to +0; an empty query tile keeps none.
 
@@ -367,7 +367,7 @@ def select_tiles(
     if not launchable(scores.device):
         raise RuntimeError("tile selection requires Triton")
     heads, tiles = int(scores.shape[0]), int(scores.shape[-1])
-    tables = (tile_regions, valid_sizes, region_starts, region_keep)
+    tables = (tile_segments, valid_sizes, segment_starts, segment_keep)
     if (
         scores.ndim != 3
         or scores.shape[1] != tiles
@@ -394,16 +394,16 @@ def select_tiles(
     if heads == 0 or tiles == 0:
         return indices, counts
     block = triton.next_power_of_2(tiles)
-    # Each program returns its region choice to tile order through one row.
+    # Each program returns its segment choice to tile order through one row.
     kept = torch.empty(
         (heads * tiles, block), dtype=torch.int8, device=scores.device
     )
     _select_tiles_kernel[(tiles, heads)](
         scores,
-        tile_regions,
+        tile_segments,
         valid_sizes,
-        region_starts,
-        region_keep,
+        segment_starts,
+        segment_keep,
         kept,
         indices,
         counts,
