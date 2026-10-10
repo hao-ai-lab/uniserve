@@ -41,7 +41,7 @@ def test_serving_tiers_expand_to_the_public_precision_contract(
 ):
     attention, mlp, text_encoder, video_vae = expected
     config = weight_config(preset=preset)
-    layer = "denoiser.transformer.layers.0"
+    layer = "transformer.transformer.layers.0"
     decoder = "video_decoder.decoder.decoder"
 
     assert _format(config, f"{layer}.attention.projection") == attention
@@ -75,15 +75,15 @@ def test_unsupported_component_formats(choices):
 
 def test_every_denoiser_a_checkpoint_holds_takes_the_preset():
     config = _weight_config(base_config(), preset="performance")
-    for component in ("denoiser", "reference_denoiser"):
+    for component in ("transformer", "transformer_ref"):
         layer = f"{component}.transformer.layers.0"
         assert _format(config, f"{layer}.mlp") == "fp8"
         assert (
             config.dtypes[f"{component}.transformer.video_output"]
             is torch.float32
         )
-    # A text-only export names only the denoiser it holds.
+    # A text-only export names only the partition it holds.
     assert not any(
-        path.startswith("reference_denoiser")
+        path.startswith("transformer_ref")
         for path in _weight_config(fasth3_config()).dtypes
     )

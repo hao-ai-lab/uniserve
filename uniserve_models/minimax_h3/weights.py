@@ -25,7 +25,7 @@ from uniserve.nn import Modulation
 from uniserve_models import qwen3_vl
 
 from . import audio_vae, video_vae
-from .checkpoint import DENOISER_DIRECTORIES
+from .checkpoint import TASK_PARTITIONS
 from .conditioning import assignments as conditioning_assignments
 from .config import (
     TEXT_FIELDS,
@@ -40,8 +40,8 @@ from .transformer import StepProjection
 
 checkpoint_sources = (
     *(
-        checkpoint.Config(name, directory, module_path=name)
-        for name, directory in DENOISER_DIRECTORIES.items()
+        checkpoint.Config(name, name, module_path=name)
+        for name in dict.fromkeys(TASK_PARTITIONS.values())
     ),
     checkpoint.Config(
         "text_encoder", "text_encoder", module_path="text_encoder"
@@ -462,7 +462,7 @@ def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
     first.
     """
     components = []
-    for name in DENOISER_DIRECTORIES:
+    for name in dict.fromkeys(TASK_PARTITIONS.values()):
         denoiser = getattr(model, name, None)
         if denoiser is not None:
             components.extend(_denoiser_components(name, denoiser))

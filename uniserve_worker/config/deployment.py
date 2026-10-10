@@ -417,14 +417,6 @@ class ModelLaunchConfig:
 
     path: str
     quantization_config: dict[str, object]
-    # Identity the launching side derived for the checkpoint it names, when
-    # it could read that checkpoint locally. A rank whose loaded checkpoint
-    # has another identity refuses to start.
-    checkpoint_identity: str | None = None
-    # A local copy of the base checkpoint a component export pins, verified
-    # against the pinned revision when the model loads; without it the base
-    # comes from the Hugging Face cache.
-    base_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -559,16 +551,6 @@ class WorkerProcessArgs:
                 ModelLaunchConfig(
                     path=model_path,
                     quantization_config=dict(namespace.quantization_config),
-                    # The descriptor carries the key only when the launching
-                    # side could derive the identity from a local directory.
-                    checkpoint_identity=_optional_text(
-                        getattr(namespace, "checkpoint_identity", None)
-                    ),
-                    # The descriptor carries the key only when the operator
-                    # named a local base checkpoint.
-                    base_model=_optional_text(
-                        getattr(namespace, "base_model", None)
-                    ),
                 )
                 if model_path
                 else None

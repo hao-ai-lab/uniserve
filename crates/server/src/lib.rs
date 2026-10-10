@@ -135,7 +135,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     // `resp_slot_cap` only when it is larger.
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
-        base_model: config.base_model.clone(),
         req_slot_cap: channel_payload_capacity,
         resp_slot_cap: config
             .engine

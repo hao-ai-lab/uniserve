@@ -60,9 +60,6 @@ fn base_denoiser() -> VideoDenoiserInfo {
         video_shift: 12.0,
         audio_shift: 3.0,
         canvases: Vec::new(),
-        max_sequence_rows: None,
-        condition_tiles: None,
-        max_condition_rows: 0,
     }
 }
 
@@ -215,8 +212,7 @@ fn try_resolved_model(
     // 15-second maximum video duration.
     let config = match description {
         ModelDescription::MiniMaxH3 => {
-            ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096), None)
-                .unwrap()
+            ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096)).unwrap()
         }
         _ => tokio::runtime::Builder::new_current_thread()
             .build()
@@ -640,39 +636,9 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
         );
     }
 
-    // Fields that restate the served contract are accepted when they agree:
-    // the schedule's 50 sigma points and shifts, one output, the lossless
-    // quality, and the SGLang client's duration and canvas.
-    let restated = prepare(serde_json::json!({
-        "num_inference_steps": 50, "flow_shift": 12.0, "audio_flow_shift": 3.0,
-        "num_outputs_per_prompt": 1, "n": 1, "quality": "lossless",
-        "seconds": 5, "size": "1344x768", "width": 1344, "height": 768,
-    }))
-    .await
-    .unwrap();
-    assert_eq!(restated.request, accepted.request);
-
-    // Each disagreement is refused and names its field.
+    // A blank prompt, and a task the served denoiser does not serve, are
+    // refused naming their field.
     for (fields, param) in [
-        (
-            serde_json::json!({"num_inference_steps": 9}),
-            "num_inference_steps",
-        ),
-        (serde_json::json!({"flow_shift": 10.0}), "flow_shift"),
-        (
-            serde_json::json!({"audio_flow_shift": 1.0}),
-            "audio_flow_shift",
-        ),
-        (
-            serde_json::json!({"num_outputs_per_prompt": 2}),
-            "num_outputs_per_prompt",
-        ),
-        (serde_json::json!({"n": 4}), "n"),
-        (serde_json::json!({"quality": "fast"}), "quality"),
-        (serde_json::json!({"seconds": 10}), "seconds"),
-        (serde_json::json!({"size": "768x1344"}), "size"),
-        (serde_json::json!({"width": 768}), "width"),
-        (serde_json::json!({"height": 1344}), "height"),
         (serde_json::json!({"prompt": "  "}), "prompt"),
         (serde_json::json!({"task": "fl2va"}), "task"),
     ] {
@@ -734,9 +700,6 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         video_shift: 10.0,
         audio_shift: 3.0,
         canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
-        max_sequence_rows: None,
-        condition_tiles: None,
-        max_condition_rows: 0,
     };
     let processor = |max_video_seconds: f64| {
         let mut config = loaded.config().clone();

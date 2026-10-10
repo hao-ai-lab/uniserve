@@ -32,6 +32,7 @@ from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
+    ErrorCode,
     ForwardMode,
     MediaCall,
     TransferMode,
@@ -75,9 +76,11 @@ def dispatch_batch(
     """Execute the batch's active calls and align outcomes with its call order.
 
     Calls whose output ``reserve_outputs`` marked ``CallStatus.PREDICATED``
-    are not executed; ``_predicated_outcome`` stages their outcome. The
-    returned tuple holds one outcome per call of ``state.batch.calls``, in
-    that order.
+    are not executed; ``_predicated_outcome`` stages their outcome. A call
+    of a request this rank refused (``RequestState.refusal``) is not
+    executed either; ``refused_output`` reports the refusal. The returned
+    tuple holds one outcome per call of ``state.batch.calls``, in that
+    order.
 
     A failure raises and aborts the homogeneous batch; its owner discards all
     provisional outputs before reporting the error.
@@ -104,11 +107,12 @@ def dispatch_batch(
     locations: list[int] = []
 
     for call_index, call in enumerate(batch_calls):
-        if (
-            state.pending_output(call.request_key.request_id).status
-            is CallStatus.PREDICATED
-        ):
+        pending = state.pending_output(call.request_key.request_id)
+        if pending.status is CallStatus.PREDICATED:
             outcomes[call_index] = _predicated_outcome(call, state=state)
+            continue
+        if pending.request.refusal is not None:
+            outcomes[call_index] = refused_output(pending, tensor_store)
             continue
         locations.append(call_index)
         scheduled.append(call)
@@ -139,6 +143,23 @@ def dispatch_batch(
     if any(outcome is None for outcome in outcomes):
         raise RuntimeError("successful batch did not resolve every call")
     return tuple(cast(PendingOutput, outcome) for outcome in outcomes)
+
+
+def refused_output(
+    pending: PendingOutput, tensor_store: TensorStore
+) -> PendingOutput:
+    """Report a call of a refused request without running it.
+
+    The call fills none of its reserved writes, so they are abandoned, and
+    its output reports ``ErrorCode.INVALID_REQUEST`` with the refusal's
+    reason, which the engine returns to the client.
+    """
+    tensor_store.abandon_writes(tuple(pending.writes))
+    pending.writes.clear()
+    pending.status = CallStatus.ERROR
+    pending.error_code = ErrorCode.INVALID_REQUEST
+    pending.error_message = pending.request.refusal
+    return pending
 
 
 def _execute_ready_actions(

@@ -1,6 +1,6 @@
 # MiniMax-H3 computation library
 
-The model package loads base MiniMax-H3, FastH3 DMD and FastH3 OmniRef checkpoints through the public model catalog. Each checkpoint determines its denoising components, attention layout, schedule, output heads and elementwise rounding. Component exports resolve their missing text encoder, processor and VAE components at the base revision recorded in the export.
+The model package loads the base MiniMax-H3 checkpoint and FastH3, its fast variant, through the public model catalog. The base checkpoint holds two DiT partitions, `transformer` (`t2va`, `fl2va`) and `transformer_ref` (`ref2va`); a FastH3 student replaces the partition its task selects (DMD students `t2va`, OmniRef students `ref2va`), and its `fastvideo_inference.json` determines its schedule, sparse attention and output heads. An export reads the components it omits, such as the text encoder, processor and VAEs, at the base revision it records.
 
 Models are ordinary PyTorch modules. Text and latent encoders, denoisers, video and audio decoders compose the shared numerical capabilities. Execution contexts own kernel workspaces and communication backing; callers own request state and advance the solver. Serving workers use these same modules and numerical calls.
 
@@ -23,7 +23,7 @@ config = loading.read_config(
     modules=frozenset(
         {
             "text_encoder",
-            "denoiser",
+            "transformer",
             "video_decoder",
             "video_postprocessor",
             "audio_decoder",

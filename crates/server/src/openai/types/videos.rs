@@ -55,13 +55,8 @@ pub struct VideoTarget {
 }
 
 /// MiniMax-H3 video-and-audio generation request for the `/v1/videos`
-/// routes.
-///
-/// The schedule fields may only restate the served checkpoint's fixed
-/// schedule. The SGLang client also sends `seconds`, `size`, `width` and
-/// `height`; they are accepted only when they agree with the duration and
-/// canvas the `target` resolves to. `num_outputs_per_prompt` and `n` accept
-/// only 1, and `quality` only `lossless`.
+/// routes. The served checkpoint fixes the schedule, and every request
+/// generates one video.
 #[derive(Debug, Clone, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct VideoGenerationRequest {
@@ -79,36 +74,6 @@ pub struct VideoGenerationRequest {
     /// Video-generation random seed.
     #[serde(default = "default_seed")]
     pub seed: u64,
-    /// Sigma points of the schedule, the clean endpoint included.
-    #[serde(default)]
-    pub num_inference_steps: Option<u32>,
-    /// Video schedule shift.
-    #[serde(default)]
-    pub flow_shift: Option<f64>,
-    /// Audio schedule shift.
-    #[serde(default)]
-    pub audio_flow_shift: Option<f64>,
-    /// Videos per prompt; only 1.
-    #[serde(default)]
-    pub num_outputs_per_prompt: Option<u32>,
-    /// Videos per prompt, OpenAI spelling; only 1.
-    #[serde(default)]
-    pub n: Option<u32>,
-    /// Numerical quality; only `lossless`.
-    #[serde(default)]
-    pub quality: Option<String>,
-    /// Duration restated by the SGLang client.
-    #[serde(default)]
-    pub seconds: Option<f64>,
-    /// Canvas restated by the SGLang client, as `WxH`.
-    #[serde(default)]
-    pub size: Option<String>,
-    /// Canvas width restated by the SGLang client.
-    #[serde(default)]
-    pub width: Option<u32>,
-    /// Canvas height restated by the SGLang client.
-    #[serde(default)]
-    pub height: Option<u32>,
 }
 
 const fn default_seed() -> u64 {

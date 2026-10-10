@@ -4,7 +4,6 @@ from dataclasses import replace
 
 from uniserve.diffusion import BlockGrid, RungGrid, UniformGrid
 from uniserve.media import image
-from uniserve.nn.attention import vsa
 from uniserve.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     Config,
@@ -35,7 +34,8 @@ def dmd_denoiser(
 
     It generates the export's training buckets (``DMD_CANVASES``).
 
-    Its transformer rounds once, as normalization assigns FastH3 exports.
+    Its transformer rounds once, as normalization assigns single-segment
+    sparse attention.
     """
     return DenoiserConfig(
         transformer=replace(transformer, rounding=Rounding.ONCE),
@@ -46,7 +46,6 @@ def dmd_denoiser(
         attention=SparseAttention(tile=64, sparsity=sparsity),
         tasks=("t2va",),
         canvases=DMD_CANVASES,
-        max_sequence_rows=None,
     )
 
 
@@ -66,7 +65,6 @@ def base_denoiser(
         attention=DenseAttention(),
         tasks=tasks,
         canvases=None,
-        max_sequence_rows=None,
     )
 
 
@@ -85,27 +83,26 @@ def omniref_denoiser(
         attention=SparseAttention(tile=128, sparsity=0.9, reference_keep=0.1),
         tasks=("ref2va",),
         canvases=None,
-        max_sequence_rows=vsa.MAX_REGION_TILES * 128,
     )
 
 
 def fasth3_config() -> Config:
-    """A FastH3 export: one DMD denoiser."""
+    """A FastH3 t2va export: one DMD denoiser."""
     return Config(
         text_encoder=TextEncoderConfig(),
-        denoisers={"denoiser": dmd_denoiser()},
+        denoisers={"transformer": dmd_denoiser()},
         video_vae=video_vae.Config(),
         audio_vae=audio_vae.Config(),
     )
 
 
 def base_config() -> Config:
-    """A diffusers root: both released DiTs."""
+    """The base release: both DiT partitions."""
     return Config(
         text_encoder=TextEncoderConfig(),
         denoisers={
-            "denoiser": base_denoiser(),
-            "reference_denoiser": base_denoiser(tasks=("ref2va",)),
+            "transformer": base_denoiser(),
+            "transformer_ref": base_denoiser(tasks=("ref2va",)),
         },
         video_vae=video_vae.Config(),
         audio_vae=audio_vae.Config(),

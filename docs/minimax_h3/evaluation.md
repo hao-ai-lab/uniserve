@@ -72,7 +72,7 @@ export UNISERVE_MINIMAX_H3_FFMPEG=/workspace/tools/ffmpeg-8.1.2/bin
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-w3
 ```
 
-The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF` and its pinned base copy `UNISERVE_MINIMAX_H3_OMNIREF_BASE`; two-host points need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`.
+The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, and the Hugging Face cache supplies the base revision it pins; two-host points need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`.
 
 ## OmniRef reference compositions
 
@@ -96,7 +96,6 @@ A point sends one warmup at seed 42 and three measured requests one at a time, s
 
 ```bash
 export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastH3-OmniRef-v5-DMPDD8-w03-cfg2-step3500
-export UNISERVE_MINIMAX_H3_OMNIREF_BASE=/workspace/models/MiniMax-H3-9bfb6693
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs --reuse-deployment
 ```
 

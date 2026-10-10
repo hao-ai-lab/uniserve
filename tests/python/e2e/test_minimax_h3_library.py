@@ -35,7 +35,7 @@ def test_library_generates_a_portrait_clip() -> None:
         modules=frozenset(
             {
                 "text_encoder",
-                "denoiser",
+                "transformer",
                 "video_decoder",
                 "video_postprocessor",
                 "audio_decoder",

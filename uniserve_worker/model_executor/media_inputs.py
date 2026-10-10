@@ -289,8 +289,9 @@ class MediaBuilder:
 
         Raises:
             ValueError: The frame count or canvas is not one the worker
-                admits, the prompt exceeds its conditioning capacity, or the
-                denoiser refuses the conditions.
+                admits, the prompt exceeds its conditioning capacity, the
+                conditions take more rows than the condition capacity, naming
+                both, or the denoiser refuses the conditions.
         """
         size = self._size(
             num_frames,
@@ -303,11 +304,16 @@ class MediaBuilder:
             size.num_frames not in self.frame_counts
             or size.canvas not in self.canvases
             or size.num_text_tokens > self.max_text_tokens
-            or size.condition_rows > self.condition_rows
         ):
             raise ValueError(
-                "media input exceeds the worker frame, canvas, conditioning "
-                "or condition capacity"
+                "media input exceeds the worker frame, canvas or conditioning "
+                "capacity"
+            )
+        if size.condition_rows > self.condition_rows:
+            raise ValueError(
+                f"conditions: the conditions take {size.condition_rows} "
+                f"denoiser rows, more than the {self.condition_rows} this "
+                "deployment serves; serve with a larger --max-condition-rows"
             )
         return size
 

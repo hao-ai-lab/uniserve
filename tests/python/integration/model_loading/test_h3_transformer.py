@@ -198,12 +198,12 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
         # The FastH3 student's transformer, which rounds once.
         denoiser.transformer,
         checkpoint=(
-            checkpoint.Config("denoiser").resolve(
+            checkpoint.Config("transformer").resolve(
                 tmp_path, io=loading.Config()
             ),
         ),
         mapping=lambda model: (
-            transformer_component(model, denoiser, "denoiser"),
+            transformer_component(model, denoiser, "transformer"),
         ),
         device="cuda",
         weights=weights.Config(

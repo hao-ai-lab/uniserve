@@ -66,7 +66,7 @@ def _config():
 
 def _mapping(model):
     component = transformer_component(
-        model.transformer, model.config, "denoiser"
+        model.transformer, model.config, "transformer"
     )
     pipeline = model.mesh.get_group("pp")
     if pipeline.rank:
@@ -77,7 +77,7 @@ def _mapping(model):
         component,
         weights.ModuleMapping(
             conditioner,
-            "denoiser",
+            "transformer",
             lambda reader: tuple(conditioning_assignments(conditioner, reader)),
             frozenset(name for name, _ in conditioner.named_parameters()),
         ),
@@ -159,7 +159,7 @@ def _run(rank, rendezvous, directory, source):
             Denoiser,
             dmd_denoiser(_config()),
             checkpoint=(
-                checkpoint.Config("denoiser").resolve(
+                checkpoint.Config("transformer").resolve(
                     directory, io=loading.Config()
                 ),
             ),
@@ -395,7 +395,7 @@ def _load(groups, directory, device, topology=None, attention=None):
         Denoiser,
         dmd_denoiser(_config()),
         checkpoint=(
-            checkpoint.Config("denoiser").resolve(
+            checkpoint.Config("transformer").resolve(
                 directory, io=loading.Config()
             ),
         ),
@@ -482,8 +482,8 @@ def _diffusion(model, factory, latents, *, device, stream, bank=None):
 
     layouts = factory.layouts()
     runner = DiffusionRunner.for_layouts(
-        "denoiser",
-        Call("denoiser", model, EntryPoint("forward")),
+        "transformer",
+        Call("transformer", model, EntryPoint("forward")),
         layouts[0],
         device=device,
         stream=stream,

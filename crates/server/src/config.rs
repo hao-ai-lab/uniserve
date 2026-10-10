@@ -73,8 +73,8 @@ pub struct EngineSettings {
     /// Maximum model context length override. `None` derives the limit from
     /// the loaded model: its `max_position_embeddings` for a model with a root
     /// `config.json` (falling back to
-    /// [`EngineSettings::DEFAULT_MAX_MODEL_LEN`]), or the prompt bound of a
-    /// diffusers pipeline (`ModelConfig::from_pipeline`).
+    /// [`EngineSettings::DEFAULT_MAX_MODEL_LEN`]), or the default prompt limit
+    /// of a diffusers pipeline.
     pub max_model_len: Option<u32>,
     /// Largest request duration, in seconds, resident media state is sized to
     /// serve. The video service rejects longer video requests.
@@ -157,12 +157,6 @@ pub struct Config {
     /// repository ID or a local model directory. Empty by default; callers
     /// must set it.
     pub model: String,
-    /// Local copy of the base checkpoint that a component export (such as
-    /// FastH3 OmniRef) pins for its other components, verified against the
-    /// pinned revision by its Hugging Face download records. Without it the
-    /// server and the workers read the pinned revision from the Hugging Face
-    /// cache. Only a component export takes a base.
-    pub base_model: Option<PathBuf>,
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
@@ -265,7 +259,6 @@ impl Default for Config {
         Self {
             engine: EngineSettings::default(),
             model: String::new(),
-            base_model: None,
             served_model_name: None,
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),

@@ -143,7 +143,9 @@ def _generate(
     ranks, shape, axes, parallel = _LAYOUTS[kind]
     encoder_ranks = (0, 2, 1, 3)[:encoder_tp]
     topologies = {
-        "denoiser": DeviceMesh(ranks=ranks, shape=shape, axes=axes, rank=rank),
+        "transformer": DeviceMesh(
+            ranks=ranks, shape=shape, axes=axes, rank=rank
+        ),
         "text_encoder": DeviceMesh(
             ranks=encoder_ranks,
             shape=(encoder_tp,),
@@ -151,7 +153,7 @@ def _generate(
             rank=rank,
         ),
     }
-    attention = {"denoiser": parallel}
+    attention = {"transformer": parallel}
     config = models.read_config(checkpoint, modules=frozenset(topologies))
 
     # Numerical partitions can communicate over multi-axis fibers, such as
@@ -196,8 +198,8 @@ def _generate(
                 features.copy_(encoded)
         world.broadcast(features, src=0, out=features)
         if rank in ranks:
-            denoiser = model.denoiser
-            mesh = meshes["denoiser"]
+            denoiser = model.transformer
+            mesh = meshes["transformer"]
             pipeline = mesh.get_group("pp" if "pp" in axes else ())
             tensor = mesh.get_group("tp" if "tp" in axes else ())
             size = denoiser.make_size(frames, len(token_ids), canvas=WIDE)

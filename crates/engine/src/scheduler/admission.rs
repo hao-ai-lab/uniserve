@@ -841,7 +841,7 @@ impl Scheduler {
         for (id, intent) in cancelled {
             let reason = match intent {
                 TerminalIntent::Finish(reason) => reason,
-                TerminalIntent::Failure(_) => FinishReason::Error,
+                TerminalIntent::Failure(_) | TerminalIntent::Rejected(_) => FinishReason::Error,
                 TerminalIntent::None => continue,
             };
             self.finish(id, reason);
@@ -861,6 +861,7 @@ impl Scheduler {
         for (id, intent) in media {
             let event = match intent {
                 TerminalIntent::Failure(message) => DiffusionTerminal::Failed(message),
+                TerminalIntent::Rejected(message) => DiffusionTerminal::Rejected(message),
                 TerminalIntent::Finish(reason) => DiffusionTerminal::Finished(reason),
                 TerminalIntent::None => continue,
             };

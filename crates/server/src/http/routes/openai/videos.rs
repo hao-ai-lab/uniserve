@@ -172,13 +172,11 @@ pub(crate) async fn videos_sync(
 /// Both content types deserialize into the same `VideoGenerationRequest`, whose
 /// `deny_unknown_fields` rejects unknown fields at every level. A multipart
 /// body carries every field as a text part of the same name: `conditions` and
-/// `target` as JSON text, the counts and seed as unsigned integers, and the
-/// durations and shifts as finite numbers. File parts, repeated fields and
-/// fields outside the schema are rejected. Every rejection is
-/// `400 Bad Request` except an unsupported content type, which is
+/// `target` as JSON text and the seed as an unsigned integer. File parts,
+/// repeated fields and fields outside the schema are rejected. Every rejection
+/// is `400 Bad Request` except an unsupported content type, which is
 /// `415 Unsupported Media Type`. Semantic checks (served model, task,
-/// conditions, target and the restated fields) happen in
-/// `InputProcessor::preprocess_video_request`.
+/// conditions and target) happen in `InputProcessor::preprocess_video_request`.
 pub(crate) struct VideoBody(pub VideoGenerationRequest);
 
 /// How a multipart text part of the video request becomes a JSON value.
@@ -190,19 +188,14 @@ enum PartKind {
     Json,
     /// An unsigned integer.
     Unsigned,
-    /// A finite number.
-    Number,
 }
 
 /// The multipart part of each request field.
 fn part_kind(name: &str) -> Option<PartKind> {
     Some(match name {
-        "model" | "prompt" | "task" | "quality" | "size" => PartKind::Text,
+        "model" | "prompt" | "task" => PartKind::Text,
         "conditions" | "target" => PartKind::Json,
-        "seed" | "num_inference_steps" | "num_outputs_per_prompt" | "n" | "width" | "height" => {
-            PartKind::Unsigned
-        }
-        "seconds" | "flow_shift" | "audio_flow_shift" => PartKind::Number,
+        "seed" => PartKind::Unsigned,
         _ => return None,
     })
 }
@@ -224,15 +217,6 @@ fn part_value(
             .parse::<u64>()
             .map(serde_json::Value::from)
             .map_err(|_| invalid("must be an unsigned integer")),
-        // `f64` parsing also accepts `inf`, `NaN`, and overflowing literals,
-        // which a JSON number cannot represent. They are refused here, as the
-        // JSON body parser refuses them.
-        PartKind::Number => text
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| invalid("must be a finite number")),
     }
 }
 
@@ -793,12 +777,6 @@ mod tests {
             "conditions": serde_json::from_str::<serde_json::Value>(conditions).unwrap(),
             "target": serde_json::from_str::<serde_json::Value>(target).unwrap(),
             "seed": 7,
-            "num_inference_steps": 50,
-            "flow_shift": 12.0,
-            "n": 1,
-            "quality": "lossless",
-            "seconds": 5.5,
-            "size": "1344x768",
         }));
         let multipart = multipart(&[
             ("model", "FastH3"),
@@ -807,12 +785,6 @@ mod tests {
             ("conditions", conditions),
             ("target", target),
             ("seed", "7"),
-            ("num_inference_steps", "50"),
-            ("flow_shift", "12"),
-            ("n", "1"),
-            ("quality", "lossless"),
-            ("seconds", "5.5"),
-            ("size", "1344x768"),
         ]);
 
         let left = VideoBody::from_request(json, &()).await.unwrap().0;
@@ -832,35 +804,13 @@ mod tests {
         assert_eq!(defaulted.seed, crate::openai::DEFAULT_VIDEO_SEED);
     }
 
-    /// A number Rust parses as a float but JSON cannot carry (infinite, NaN,
-    /// or overflowing) is a bad request, as it is for a JSON body.
-    #[tokio::test]
-    async fn a_non_finite_multipart_number_is_rejected() {
-        for seconds in ["inf", "-infinity", "NaN", "1e400"] {
-            let request = multipart(&[
-                ("model", "FastH3"),
-                ("prompt", "A river"),
-                ("task", "t2va"),
-                (
-                    "target",
-                    r#"{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5}"#,
-                ),
-                ("seconds", seconds),
-            ]);
-            match VideoBody::from_request(request, &()).await {
-                Ok(VideoBody(body)) => panic!("seconds={seconds} was accepted as {body:?}"),
-                Err(response) => assert_eq!(response.status(), StatusCode::BAD_REQUEST),
-            }
-        }
-    }
-
-    /// Fields outside the schema, file parts and the former duration-only
-    /// body are refused in both formats; the former body names the missing
-    /// `task`.
+    /// Fields outside the schema, a schedule field included, and file parts
+    /// are refused in both formats, and a body without a task names the
+    /// missing `task`.
     #[tokio::test]
     async fn fields_outside_the_schema_are_rejected_in_both_formats() {
         let mut extra = video_request();
-        extra["guidance_scale"] = serde_json::json!(5.0);
+        extra["num_inference_steps"] = serde_json::json!(50);
         let mut nested = video_request();
         nested["target"]["fps"] = serde_json::json!(24);
         let file = axum::extract::Request::builder()
@@ -883,10 +833,8 @@ mod tests {
         }
 
         for request in [
-            json_request(
-                &serde_json::json!({"model": "FastH3", "prompt": "A river", "seconds": 5}),
-            ),
-            multipart(&[("model", "FastH3"), ("prompt", "A river"), ("seconds", "5")]),
+            json_request(&serde_json::json!({"model": "FastH3", "prompt": "A river"})),
+            multipart(&[("model", "FastH3"), ("prompt", "A river")]),
         ] {
             let response = match VideoBody::from_request(request, &()).await {
                 Ok(VideoBody(body)) => panic!("{body:?} was accepted"),

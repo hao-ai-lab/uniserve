@@ -132,7 +132,7 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
     ranks = list(range(8))
     return {
         "devices": ranks,
-        "denoiser": {
+        "transformer": {
             "ranks": EIGHT_RANK_DENOISER_RANKS,
             "parallel_config": EIGHT_RANK_PARALLEL_CONFIGS[parallel_kind],
         },
@@ -204,7 +204,7 @@ def test_component_bindings_release_cancelled_requests(
     base_url = f"http://127.0.0.1:{port}"
     worker_config = {
         "devices": [0, 1, 2, 3],
-        "denoiser": {
+        "transformer": {
             "ranks": [3, 1],
             "parallel_config": {"tensor_parallel_size": 2},
         },
@@ -226,7 +226,7 @@ def test_component_bindings_release_cancelled_requests(
         )
         worker_config = {
             "devices": [3, 1, 2, 0][:degree],
-            "denoiser": {
+            "transformer": {
                 "ranks": ranks,
                 "parallel_config": {"sequence_parallel": sequence},
             },
@@ -243,21 +243,21 @@ def test_component_bindings_release_cancelled_requests(
         }
     elif parallel_kind in ("pipeline2", "pipeline4"):
         degree = 2 if parallel_kind == "pipeline2" else 4
-        worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        worker_config["denoiser"]["parallel_config"] = {
+        worker_config["transformer"]["ranks"] = [3, 1, 2, 0][:degree]
+        worker_config["transformer"]["parallel_config"] = {
             "pipeline_parallel_size": degree
         }
     elif parallel_kind in ("gather2", "gather4"):
         degree = 2 if parallel_kind == "gather2" else 4
-        worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        worker_config["denoiser"]["parallel_config"] = {
+        worker_config["transformer"]["ranks"] = [3, 1, 2, 0][:degree]
+        worker_config["transformer"]["parallel_config"] = {
             "sequence_parallel": {
                 "kind": "allgather",
                 "allgather_degree": degree,
             }
         }
     elif parallel_kind == "hybrid":
-        worker_config["denoiser"] = {
+        worker_config["transformer"] = {
             "ranks": [3, 1, 2, 0],
             "parallel_config": {
                 "sequence_parallel": {
@@ -268,7 +268,7 @@ def test_component_bindings_release_cancelled_requests(
             },
         }
     elif parallel_kind == "tensor2_ulysses2":
-        worker_config["denoiser"] = {
+        worker_config["transformer"] = {
             "ranks": [3, 1, 2, 0],
             "parallel_config": {
                 "tensor_parallel_size": 2,
@@ -277,8 +277,8 @@ def test_component_bindings_release_cancelled_requests(
         }
     elif parallel_kind in ("tensor2", "tensor4"):
         degree = 2 if parallel_kind == "tensor2" else 4
-        worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        worker_config["denoiser"]["parallel_config"] = {
+        worker_config["transformer"]["ranks"] = [3, 1, 2, 0][:degree]
+        worker_config["transformer"]["parallel_config"] = {
             "tensor_parallel_size": degree
         }
     elif parallel_kind in EIGHT_RANK_PARALLEL_CONFIGS:
@@ -305,7 +305,7 @@ def test_component_bindings_release_cancelled_requests(
         "whole": [tuple(worker_config)],
         "split": [(name,) for name in worker_config],
         "mixed": [
-            ("denoiser", "text_encoder"),
+            ("transformer", "text_encoder"),
             ("video_decoder", "audio_decoder"),
         ],
     }[grouping]
@@ -361,9 +361,9 @@ def test_component_bindings_release_cancelled_requests(
     edges = {
         (owners[source], owners[destination])
         for source, destination in (
-            ("text_encoder", "denoiser"),
-            ("denoiser", "video_decoder"),
-            ("denoiser", "audio_decoder"),
+            ("text_encoder", "transformer"),
+            ("transformer", "video_decoder"),
+            ("transformer", "audio_decoder"),
             ("video_decoder", "video_codec"),
             ("video_codec", "muxer"),
             ("audio_decoder", "muxer"),

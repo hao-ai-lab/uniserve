@@ -204,6 +204,10 @@ pub(crate) enum TerminalIntent {
     None,
     Finish(FinishReason),
     Failure(String),
+    /// A worker refused the request itself (`ErrorCode::InvalidRequest`),
+    /// for the reason it stated; the client receives an invalid-request
+    /// rejection.
+    Rejected(String),
 }
 
 impl TerminalIntent {
@@ -212,8 +216,8 @@ impl TerminalIntent {
         !matches!(self, Self::None)
     }
 
-    /// Records a finish reason unless a terminal intent (finish or failure)
-    /// is already recorded; the first recorded intent wins.
+    /// Records a finish reason unless a terminal intent (finish, failure or
+    /// rejection) is already recorded; the first recorded intent wins.
     fn finish(&mut self, reason: FinishReason) {
         if matches!(self, Self::None) {
             *self = Self::Finish(reason);
@@ -336,6 +340,7 @@ enum WorkerRegistration {
 enum DiffusionTerminal {
     Completed(ArtifactEvent),
     Failed(String),
+    Rejected(String),
     Finished(FinishReason),
 }
 
