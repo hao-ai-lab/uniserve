@@ -187,7 +187,7 @@ def test_a_layout_holds_only_prompts_that_fit_at_its_frame_count(denoiser):
     assert denoiser.holds(layout, make(124, 2048))
     assert not denoiser.holds(layout, make(124, 2049))
     assert not denoiser.holds(layout, make(141, 64))
-    # A text region that is not whole tiles is not a layout.
+    # A text segment that is not whole tiles is not a layout.
     assert not denoiser.holds(make(124, 100), make(124, 64))
 
 
@@ -355,12 +355,12 @@ def test_the_largest_condition_set_follows_the_served_tasks():
     three videos: images of the widest reference raster, 4:1 at the
     2048-pixel short edge, and videos of the generated 124 frames with their
     124 / 24 seconds of 32 kHz sound. A dense network packs the keyframes
-    beside them; the region packing holds none.
+    beside them; the segment packing holds none.
     """
     with torch.device("meta"):
         base = Model(base_config())
         text_only = Model(fasth3_config()).transformer
-        regional = Model(
+        segmented = Model(
             replace(
                 base_config(),
                 denoisers={"transformer_ref": omniref_denoiser()},
@@ -375,7 +375,7 @@ def test_the_largest_condition_set_follows_the_served_tasks():
 
     for denoiser, leading in (
         (base.transformer_ref, keyframes),
-        (regional, ()),
+        (segmented, ()),
     ):
         conditions = denoiser.max_conditions(124, WIDE)
         references = conditions[len(leading) :]

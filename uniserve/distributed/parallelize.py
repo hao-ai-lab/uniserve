@@ -12,7 +12,7 @@ from uniserve.nn.attention._parallel import ParallelAttention
 from uniserve.nn.attention.config import AttentionParallelConfig
 from uniserve.nn.attention.layer import Attention
 from uniserve.nn.attention.vsa import Attention as VsaAttention
-from uniserve.nn.attention.vsa import RegionAttention
+from uniserve.nn.attention.vsa import SegmentAttention
 from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
@@ -78,7 +78,7 @@ def _communication_axes(module, mesh, attention):
         if isinstance(child, (Denoiser, TransformerDecoder)):
             add("pp")
             add(*tokens)
-        if isinstance(child, (Attention, VsaAttention, RegionAttention)):
+        if isinstance(child, (Attention, VsaAttention, SegmentAttention)):
             add(head)
             add(context)
         if isinstance(child, FusedMoE):
@@ -457,7 +457,7 @@ def parallelize_(
                 )
 
     for child in modules:
-        if isinstance(child, RegionAttention):
+        if isinstance(child, SegmentAttention):
             bound = getattr(child, "_parallel_mesh", None)
             if bound is not None:
                 if bound != mesh or child._attention_parallel != attention:
@@ -465,11 +465,11 @@ def parallelize_(
                         "VSA cannot change its mathematical partition"
                     )
                 continue
-            # Region VSA attends the complete sequence for this rank's head
+            # Segment VSA attends the complete sequence for this rank's head
             # shard and returns rows to their Ulysses owners; it has no
             # context partition of its keys.
             if attention.context is not None:
-                raise ValueError("region VSA has no context partition")
+                raise ValueError("segment VSA has no context partition")
             child.exchange = HeadExchange(
                 mesh.get_group(
                     () if attention.heads is None else attention.heads.axis

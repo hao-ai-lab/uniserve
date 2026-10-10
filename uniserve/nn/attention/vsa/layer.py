@@ -202,7 +202,7 @@ class Attention(nn.Module):
     ):
         super().__init__()
         # The pooling, block-map and compression kernels of this composition
-        # address 64-row tiles (``RegionAttention`` serves other tiles).
+        # address 64-row tiles (``SegmentAttention`` serves other tiles).
         if tile_size != 64 or tile_size != attention.tile_size:
             raise ValueError(
                 "VSA selection and block attention must share 64-row tiles"

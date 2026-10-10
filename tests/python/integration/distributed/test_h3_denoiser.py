@@ -769,7 +769,7 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
     """A prompt replayed in a larger text capacity follows its own trajectory.
 
     Each prompt is denoised eagerly in its smallest layout, then replayed from
-    graphs captured in a layout whose text region has capacity for four
+    graphs captured in a layout whose text segment has capacity for four
     times as many tokens, so most of its text tiles are empty. Empty tiles
     are masked out of every attention and never listed as keys, so the final
     samples agree within the denoiser's numerical contract: the larger
@@ -1018,7 +1018,7 @@ def _capacity_prediction(rank, rendezvous, directory, cases, output):
                 )
                 for field, value in request.items():
                     value.copy_(staged[field])
-                # The prompt's features lead a text region of the layout's
+                # The prompt's features lead a text segment of the layout's
                 # capacity; the rows past it are padding.
                 conditioning = torch.zeros(
                     model.text_condition_rows(layout),
@@ -1070,8 +1070,8 @@ def test_capacity_layouts_predict_like_the_smallest_layout_across_ranks(
     """A text capacity changes no real row of a Ulysses-4 prediction.
 
     Each prompt's first velocity is predicted in its smallest layout and in a
-    layout whose text region holds many more tokens. The larger region moves
-    every rank's shard boundary, and a 3072-row region leaves the first rank
+    layout whose text segment holds many more tokens. The larger segment moves
+    every rank's shard boundary, and a 3072-row segment leaves the first rank
     of the mesh with text rows only. Padding rows are invalid in every tile
     they occupy, so the canonical predictions agree within the denoiser's
     numerical contract. The prediction, not the solver's successor, is
@@ -1111,7 +1111,7 @@ def test_capacity_layouts_predict_like_the_smallest_layout_across_ranks(
                 for modality in ("video", "audio")
             }
         if index == 0:
-            # The long text region holds the first rank's whole shard.
+            # The long text segment holds the first rank's whole shard.
             assert 0 in rows["capacity"] and 0 not in rows["smallest"]
         for modality in ("video", "audio"):
             actual = joined["capacity"][modality]

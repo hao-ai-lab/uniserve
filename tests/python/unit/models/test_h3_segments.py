@@ -1,15 +1,15 @@
-"""Multi-region sparse layouts reproduce FastVideo's OmniRef packing.
+"""Multi-segment sparse layouts reproduce FastVideo's OmniRef packing.
 
 FastVideo's FastH3 OmniRef path packs ``[text | references | target audio |
-target video]`` and tiles it by its ``p2_multi_region`` policy: text, every
+target video]`` and tiles it per segment: text, every
 audio track, images and the target audio form dense tiles of their own
-segment, and each reference video and the target video form a region of
+segment, and each reference video and the target video form a segment of
 4x4x8 token tiles whose tiles every video query selects independently. The
-region layout holds the same rows in another physical order with spare text
+segment layout holds the same rows in another physical order with spare text
 and condition tiles. Every row's rotary coordinates, tag and timestep group
 must equal the reference's, every tile must hold the same rows in the same
 order, and selection must keep the reference's key tiles. The vectors,
-``minimax_h3_regions.json``, are FastVideo's packing of these cases.
+``minimax_h3_segments.json``, are FastVideo's packing of these cases.
 """
 
 import json
@@ -22,23 +22,23 @@ import torch
 from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
 from uniserve.nn.attention import vsa
-from uniserve.nn.attention.vsa.regions import select
+from uniserve.nn.attention.vsa.segments import select
 from uniserve_models.minimax_h3.packing import (
     AUDIO_CONDITION_GROUP,
     AUDIO_GROUP,
     VIDEO_GROUP,
     VISUAL_CONDITION_GROUP,
     condition_segments,
-    region_packing,
-    region_tables,
-    region_tiles,
+    segment_packing,
+    segment_tables,
+    segment_tiles,
 )
 
 pytestmark = pytest.mark.unit
 
 FIXTURE = json.loads(
     (
-        Path(__file__).parents[2] / "fixtures" / "minimax_h3_regions.json"
+        Path(__file__).parents[2] / "fixtures" / "minimax_h3_segments.json"
     ).read_text()
 )
 CASES = {case["name"]: case for case in FIXTURE["cases"]}
@@ -67,22 +67,22 @@ def _conditions(case) -> tuple[Condition, ...]:
 
 
 def _layout(case):
-    """The case's region layout, with one spare text and condition tile."""
+    """The case's segment layout, with one spare text and condition tile."""
     tile = FIXTURE["tile"]
     canvas = image.Config(case["height"], case["width"])
     segments = condition_segments(_conditions(case), canvas)
-    packing = region_packing(
+    packing = segment_packing(
         num_frames=case["frames"],
         canvas=canvas,
         text_rows=(math.ceil(case["text_tokens"] / tile) + 1) * tile,
         condition_rows=(
-            sum(region_tiles(segment, tile) for segment in segments) + 1
+            sum(segment_tiles(segment, tile) for segment in segments) + 1
         )
         * tile,
         tile=tile,
         token_multiple=4 * tile,
     )
-    tables = region_tables(
+    tables = segment_tables(
         packing,
         num_frames=case["frames"],
         canvas=canvas,
@@ -155,7 +155,7 @@ def test_rows_follow_the_reference_packing(name):
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_tiles_follow_the_reference_regions(name):
+def test_tiles_follow_the_reference_segments(name):
     case = CASES[name]
     packing, tables, segments = _layout(case)
     pairs = _tile_pairs(
@@ -165,14 +165,14 @@ def test_tiles_follow_the_reference_regions(name):
     for reference, ours in pairs.items():
         assert int(tables.valid_sizes[ours]) == reference_sizes[reference]
         if reference < case["prefix_tiles"]:
-            assert int(tables.tile_regions[ours]) == vsa.DENSE_TILE
+            assert int(tables.tile_segments[ours]) == vsa.DENSE_TILE
         else:
-            region = next(
+            segment = next(
                 index
-                for index, (start, stop) in enumerate(case["region_spans"])
+                for index, (start, stop) in enumerate(case["segment_spans"])
                 if start <= reference < stop
             )
-            assert int(tables.tile_regions[ours]) == region
+            assert int(tables.tile_segments[ours]) == segment
     # Every other tile, spare capacity and alignment alike, is empty.
     empty = torch.ones(tables.valid_sizes.numel(), dtype=torch.bool)
     empty[list(pairs.values())] = False
@@ -192,16 +192,16 @@ def test_selection_keeps_the_reference_key_tiles(name):
     # Empty tiles score highest, so selection must exclude them by state.
     scores = torch.full((heads, tiles, tiles), 1e4)
     scores[:, ours[:, None], ours[None, :]] = reference_scores
-    regions = vsa.Regions(
+    segments = vsa.Segments(
         packing.tile,
         packing.padded_tokens,
         tables.valid_sizes,
-        tables.tile_regions,
-        tables.region_starts,
-        tables.region_keep,
+        tables.tile_segments,
+        tables.segment_starts,
+        tables.segment_keep,
     )
 
-    indices, counts = select(scores, regions)
+    indices, counts = select(scores, segments)
 
     expected = torch.zeros((heads, tiles, tiles), dtype=torch.bool)
     for head, rows in enumerate(case["mask"]):

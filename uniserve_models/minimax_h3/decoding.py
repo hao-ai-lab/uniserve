@@ -107,7 +107,7 @@ class VideoDecoder(BaseVideoDecoder):
             # Dense packing keeps the raster order.
             tokens = latent[start:stop]
         else:
-            # Tile and region packing order the rows tile-major, which
+            # Tile and segment packing order the rows tile-major, which
             # depends on the frame count; the argsort maps each raster row to
             # its position among the packed rows.
             positions = torch.argsort(

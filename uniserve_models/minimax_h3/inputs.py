@@ -24,7 +24,7 @@ class DenoiserSize:
     multiples of 32. ``num_text_tokens`` and ``condition_rows`` are either a
     request's exact presented prompt length and condition rows or, for a
     layout (see ``Denoiser.layout_size``), the capacities of its text and
-    condition regions. A request also carries its ``conditions`` in request
+    condition segments. A request also carries its ``conditions`` in request
     order and the ``vision_spans`` of its presented prompt
     (``Denoiser.make_size`` derives ``condition_rows`` from them); a layout
     carries neither.
@@ -179,14 +179,14 @@ class SequenceInput:
 
 
 @dataclass(frozen=True, slots=True)
-class RegionInput:
-    """Address one token shard of a multi-region tile layout.
+class SegmentInput:
+    """Address one token shard of a multi-segment tile layout.
 
     Attributes:
         token_slice: Global packed rows this sequence rank holds, its equal
             share of the padded rows.
         group: Sequence-parallel group whose rank selects ``token_slice``.
-        regions: The tiles and region tables every layer's attention reads.
+        segments: The tiles and segment tables every layer's attention reads.
         local_video_indices: Int64 shard rows that hold generated video
             rows, ascending.
         local_audio_indices: Int64 shard rows that hold generated audio
@@ -195,14 +195,14 @@ class RegionInput:
 
     token_slice: slice
     group: Communicator
-    regions: vsa.Regions
+    segments: vsa.Segments
     local_video_indices: torch.Tensor
     local_audio_indices: torch.Tensor
 
     def __post_init__(self):
-        tokens = self.regions.padded_tokens
+        tokens = self.segments.padded_tokens
         count = tokens // self.group.size
-        if tokens % (self.group.size * self.regions.tile) or (
+        if tokens % (self.group.size * self.segments.tile) or (
             self.token_slice
             != slice(self.group.rank * count, (self.group.rank + 1) * count)
         ):

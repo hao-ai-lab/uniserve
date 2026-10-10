@@ -1,12 +1,12 @@
-"""Region-wise video sparse attention over a tile-major packed sequence.
+"""Segment-wise video sparse attention over a tile-major packed sequence.
 
-``RegionAttention`` evaluates VSA over ``Regions``: dense tiles (text, audio,
+``SegmentAttention`` evaluates VSA over ``Segments``: dense tiles (text, audio,
 images) attend and are attended densely, and every video query tile keeps,
-of each video region independently, the key tiles whose pooled scores rank
+of each video segment independently, the key tiles whose pooled scores rank
 highest. A compression branch adds, to every row of a tile, the gated
 softmax-weighted mean of every live tile's mean value under the pooled
 scores. Selection is computed from device tables alone, so one call serves
-every assignment of tiles to regions within a padded sequence.
+every assignment of tiles to segments within a padded sequence.
 """
 
 from __future__ import annotations
@@ -20,28 +20,30 @@ from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.distributed.tokens import HeadExchange
 
 from ..config import AttentionParallelConfig
-from .inputs import BlockInput, Pattern, Regions
+from .inputs import BlockInput, Pattern, Segments
 from .layer import BlockAttention
 
 
-def zero_padding(rows: torch.Tensor, regions: Regions) -> None:
+def zero_padding(rows: torch.Tensor, segments: Segments) -> None:
     """Store zeros to the rows past each tile's valid size, in place.
 
     ``rows`` is ``[padded_tokens, heads, width]`` with any row and head
     strides; rows within a tile's valid size are not touched.
     """
     if rows.is_cuda:
-        from uniserve_kernels.attention import vsa_regions
+        from uniserve_kernels.attention import vsa_segments
 
-        vsa_regions.zero_tile_padding(rows, regions.valid_sizes, regions.tile)
+        vsa_segments.zero_tile_padding(
+            rows, segments.valid_sizes, segments.tile
+        )
         return
-    live = torch.arange(regions.tile) < regions.valid_sizes[:, None]
-    rows.view(regions.tiles, regions.tile, *rows.shape[1:]).masked_fill_(
+    live = torch.arange(segments.tile) < segments.valid_sizes[:, None]
+    rows.view(segments.tiles, segments.tile, *rows.shape[1:]).masked_fill_(
         ~live[:, :, None, None], 0
     )
 
 
-def pool(rows: torch.Tensor, regions: Regions) -> torch.Tensor:
+def pool(rows: torch.Tensor, segments: Segments) -> torch.Tensor:
     """Average each tile's valid rows of every head in FP32.
 
     ``rows`` is ``[padded_tokens, heads, width]`` whose rows past each tile's
@@ -49,57 +51,59 @@ def pool(rows: torch.Tensor, regions: Regions) -> torch.Tensor:
     width]`` FP32, zero for an empty tile. The zeros add nothing, so the sum
     is the valid rows' sum in the order of a masked copy's.
     """
-    values = rows.view(regions.tiles, regions.tile, *rows.shape[1:])
+    values = rows.view(segments.tiles, segments.tile, *rows.shape[1:])
     total = values.sum(1, dtype=torch.float32)
-    return total / regions.valid_sizes.clamp_min(1).view(-1, 1, 1)
+    return total / segments.valid_sizes.clamp_min(1).view(-1, 1, 1)
 
 
 def select(
-    scores: torch.Tensor, regions: Regions
+    scores: torch.Tensor, segments: Segments
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Choose every query tile's key tiles from its pooled scores.
 
     ``scores`` is ``[heads, tiles, tiles]`` (query tile, key tile). A dense
     query tile keeps every live key tile; a video query tile keeps every live
-    dense tile and, of each region ``r``, the ``region_keep[r]`` key tiles of
-    that region with the highest scores; an empty query tile keeps none.
+    dense tile and, of each segment ``r``, the ``segment_keep[r]`` key tiles of
+    that segment with the highest scores; an empty query tile keeps none.
 
     Returns ``[heads, tiles, tiles]`` int32 key-tile indices, each query
     tile's kept tiles first in ascending order, and ``[heads, tiles]`` int32
     counts. Entries past a count are unread; they hold the unkept tiles.
     """
     if scores.is_cuda:
-        from uniserve_kernels.attention import vsa_regions
+        from uniserve_kernels.attention import vsa_segments
 
-        return vsa_regions.select_tiles(
+        return vsa_segments.select_tiles(
             scores.contiguous(),
-            regions.tile_regions,
-            regions.valid_sizes,
-            regions.region_starts,
-            regions.region_keep,
+            segments.tile_segments,
+            segments.valid_sizes,
+            segments.segment_starts,
+            segments.segment_keep,
         )
-    tiles = regions.tiles
+    tiles = segments.tiles
     device = scores.device
-    tile_regions = regions.tile_regions.long()
-    live = regions.valid_sizes > 0
-    dense = live & (tile_regions < 0)
-    video = live & (tile_regions >= 0)
+    tile_segments = segments.tile_segments.long()
+    live = segments.valid_sizes > 0
+    dense = live & (tile_segments < 0)
+    video = live & (tile_segments >= 0)
 
-    # Order every query's key tiles by region index, and within a region by
+    # Order every query's key tiles by segment index, and within a segment by
     # descending score: a stable sort by score followed by a stable sort by
-    # region. The rank of a key within its region is its position in that
-    # order less the region's first position.
+    # segment. The rank of a key within its segment is its position in that
+    # order less the segment's first position.
     by_score = scores.argsort(dim=-1, descending=True, stable=True)
-    key_regions = tile_regions[by_score]
-    by_region = key_regions.argsort(dim=-1, stable=True)
-    order = by_score.gather(-1, by_region)
-    ordered_regions = key_regions.gather(-1, by_region)
-    region = ordered_regions.clamp_min(0)
+    key_segments = tile_segments[by_score]
+    by_segment = key_segments.argsort(dim=-1, stable=True)
+    order = by_score.gather(-1, by_segment)
+    ordered_segments = key_segments.gather(-1, by_segment)
+    segment = ordered_segments.clamp_min(0)
     rank = (
         torch.arange(tiles, device=device)
-        - regions.region_starts.long()[region]
+        - segments.segment_starts.long()[segment]
     )
-    kept = (ordered_regions >= 0) & (rank < regions.region_keep.long()[region])
+    kept = (ordered_segments >= 0) & (
+        rank < segments.segment_keep.long()[segment]
+    )
     chosen = torch.zeros_like(kept).scatter_(-1, order, kept)
 
     mask = (video[:, None] & dense[None, :]) | (dense[:, None] & live[None, :])
@@ -118,8 +122,8 @@ def select(
     return indices, counts
 
 
-class RegionAttention(nn.Module):
-    """Attend every row through region-wise VSA and gated tile compression.
+class SegmentAttention(nn.Module):
+    """Attend every row through segment-wise VSA and gated tile compression.
 
     The inputs cover the complete packed sequence for this rank's heads, as
     a head-parallel projection of the gathered sequence produces them. Under
@@ -144,7 +148,7 @@ class RegionAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         gate: torch.Tensor,
-        regions: Regions,
+        segments: Segments,
     ) -> torch.Tensor:
         """Attend ``[padded_tokens, heads, width]`` projections of all rows.
 
@@ -157,20 +161,20 @@ class RegionAttention(nn.Module):
         size hold unspecified values.
 
         Raises:
-            ValueError: Projections that do not cover the region tiles, or a
+            ValueError: Projections that do not cover the segment tiles, or a
                 tile size other than the block attention's.
         """
-        tile = regions.tile
+        tile = segments.tile
         if (
             tile != self.attention.tile_size
             or q.ndim != 3
             or any(value.shape != q.shape for value in (k, v, gate))
-            or q.shape[0] != regions.padded_tokens
+            or q.shape[0] != segments.padded_tokens
         ):
             raise ValueError(
-                "region attention projections must cover the region tiles"
+                "segment attention projections must cover the segment tiles"
             )
-        tiles, heads, width = regions.tiles, q.shape[1], q.shape[2]
+        tiles, heads, width = segments.tiles, q.shape[1], q.shape[2]
 
         # Pooled scores [heads, query tile, key tile] in FP32: the tile means
         # of the queries and keys, scaled by the inverse square root of the
@@ -178,15 +182,15 @@ class RegionAttention(nn.Module):
         # valid size are masked and padded query rows are unspecified), so
         # zeroing them leaves every valid result as it was.
         for value in (q, k, v):
-            zero_padding(value, regions)
+            zero_padding(value, segments)
         pooled_query, pooled_key, pooled_value = (
-            pool(value, regions).permute(1, 0, 2) for value in (q, k, v)
+            pool(value, segments).permute(1, 0, 2) for value in (q, k, v)
         )
         scores = torch.matmul(
             pooled_query, pooled_key.transpose(-1, -2)
         ) / math.sqrt(width)
 
-        indices, counts = select(scores, regions)
+        indices, counts = select(scores, segments)
         # Every query tile keeps at most every tile; the device counts state
         # how many each actually keeps.
         pattern = Pattern(((tiles,) * tiles,), 0, 0, tile)
@@ -194,19 +198,19 @@ class RegionAttention(nn.Module):
             q,
             k,
             v,
-            BlockInput(pattern, indices, counts, regions.valid_sizes, 0),
+            BlockInput(pattern, indices, counts, segments.valid_sizes, 0),
         )
 
         # Compression: each query tile's softmax over the live key tiles
         # weights their mean values. The BF16 tile result then scales the
         # gate and adds to the fine rows, each operation rounding to BF16.
-        live = regions.valid_sizes > 0
+        live = segments.valid_sizes > 0
         weights = scores.masked_fill(~live, -torch.inf).softmax(-1)
         compressed = torch.matmul(weights, pooled_value).to(q.dtype)
         if fine.is_cuda:
-            from uniserve_kernels.attention import vsa_regions
+            from uniserve_kernels.attention import vsa_segments
 
-            vsa_regions.add_gated_tiles(fine, compressed, gate, tile)
+            vsa_segments.add_gated_tiles(fine, compressed, gate, tile)
         else:
             tiled = (tiles, tile, heads, width)
             gated = compressed.permute(1, 0, 2)[:, None] * gate.view(tiled)

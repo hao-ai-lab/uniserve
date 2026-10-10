@@ -71,7 +71,7 @@ def base_denoiser(
 def omniref_denoiser(
     transformer: TransformerConfig = TransformerConfig(),
 ) -> DenoiserConfig:
-    """A FastH3 OmniRef PDD student: 32 heads, multi-region tile-128 VSA."""
+    """A FastH3 OmniRef PDD student: 32 heads, multi-segment tile-128 VSA."""
     return DenoiserConfig(
         transformer=replace(transformer, output_heads=32),
         grids={
