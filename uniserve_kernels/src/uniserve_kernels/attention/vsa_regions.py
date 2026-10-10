@@ -28,6 +28,12 @@ from uniserve_kernels.triton import launchable, tl, triton
 # Rows one program covers: a tile is a whole number of row blocks.
 _BLOCK_ROWS = 16
 
+# Bits of a selection's packed sort key that carry the key tile. The 32 bits
+# above them carry the score and the bits above those the region, below bit
+# 62, which marks a lane past the last tile: 13 tile bits order 8192 tiles
+# and leave 17 bits for the regions, which number at most the tiles.
+_TILE_BITS = 13
+
 if triton is not None:
 
     @triton.jit
@@ -148,6 +154,7 @@ if triton is not None:
         counts,
         tiles,
         block: tl.constexpr,
+        tile_bits: tl.constexpr,
     ):
         """Choose one query tile's key tiles for one head.
 
@@ -184,8 +191,8 @@ if triton is not None:
             # One packed key orders the key tiles by region (dense and empty
             # tiles first), then descending score, then ascending tile.
             packed = (
-                ((regions + 1).to(tl.int64) << 43)
-                | ((0xFFFFFFFF - ascending) << 11)
+                ((regions + 1).to(tl.int64) << (32 + tile_bits))
+                | ((0xFFFFFFFF - ascending) << tile_bits)
                 | keys.to(tl.int64)
             )
             # Lanes past the last tile sort after every key tile, so the
@@ -198,8 +205,8 @@ if triton is not None:
             # less the region's first position. The trailing lanes decode to
             # tile 0 of a region past every table, so they neither read the
             # region tables nor store a choice.
-            ordered_regions = (ordered >> 43).to(tl.int32) - 1
-            ordered_keys = (ordered & 0x7FF).to(tl.int32)
+            ordered_regions = (ordered >> (32 + tile_bits)).to(tl.int32) - 1
+            ordered_keys = (ordered & ((1 << tile_bits) - 1)).to(tl.int32)
             ranked = present & (ordered_regions >= 0)
             region = tl.maximum(ordered_regions, 0)
             first = tl.load(region_starts + region, mask=ranked, other=0)
@@ -353,7 +360,7 @@ def select_tiles(
     Raises:
         RuntimeError: Triton cannot launch on the scores' device.
         ValueError: The scores or tables do not describe one tile set, or
-            there are more tiles than the packed key's 11 tile bits hold.
+            there are more tiles than the packed key's 13 tile bits hold.
     """
     if not launchable(scores.device):
         raise RuntimeError("tile selection requires Triton")
@@ -370,11 +377,11 @@ def select_tiles(
             or table.device != scores.device
             for table in tables
         )
-        or tiles > 2048
+        or tiles > 1 << _TILE_BITS
     ):
         raise ValueError(
             "tile selection needs [heads, tiles, tiles] FP32 scores, int32 "
-            "tables of the same tiles and at most 2048 tiles"
+            f"tables of the same tiles and at most {1 << _TILE_BITS} tiles"
         )
     indices = torch.empty(
         (heads, tiles, tiles), dtype=torch.int32, device=scores.device
@@ -400,6 +407,7 @@ def select_tiles(
         counts,
         tiles,
         block,
+        _TILE_BITS,
         num_warps=8 if block >= 1024 else 4,
     )
     return indices, counts

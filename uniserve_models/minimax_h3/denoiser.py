@@ -38,9 +38,10 @@ from uniserve.diffusion import (
     BlockGrid,
     CleanSampleEulerSolver,
 )
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.model import (
     Condition,
+    ConditionRole,
     ConditionTiles,
     LatentInput,
     VideoDenoiser,
@@ -56,6 +57,7 @@ from .config import (
     DenseAttention,
     SparseAttention,
     canvas,
+    rule_canvases,
 )
 from .inputs import (
     AttentionInput,
@@ -66,6 +68,7 @@ from .inputs import (
 )
 from .packing import (
     AUDIO_TAG,
+    FPS,
     VIDEO_TILE_SHAPES,
     DensePacking,
     RegionPacking,
@@ -81,6 +84,14 @@ from .packing import (
     region_tiles,
     tile_packing,
     video_latent_frames,
+)
+from .processing import (
+    AUDIO_SAMPLE_RATE,
+    MAX_IMAGE_REFERENCES,
+    MAX_VIDEO_REFERENCES,
+    VAE_FRAMES_PER_CHUNK,
+    VAE_LATENTS_PER_CHUNK,
+    reference_image_size,
 )
 from .transformer import Transformer, TransformerLayer
 
@@ -225,6 +236,73 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         if not self.regional:
             return None
         return ConditionTiles(self._tile, VIDEO_TILE_SHAPES[self._tile])
+
+    def max_conditions(
+        self, num_frames: int, canvas: image.Config
+    ) -> tuple[Condition, ...]:
+        """The largest condition set the checkpoint documents for a request.
+
+        A ``ref2va`` request carries up to nine image and three video
+        references, twelve references in all: nine images of the widest
+        reference raster and three videos of the generated length with
+        their soundtracks, on the canvas of the canvas rule where a video
+        packs the most rows. A network that packs keyframes also holds the
+        two keyframes of ``canvas``, which are all an ``fl2va`` request
+        carries. Single-region sparse attention takes no conditions.
+        """
+        tasks = set(self.config.tasks)
+        if not (self.dense or self.regional) or not tasks & {"fl2va", "ref2va"}:
+            return ()
+
+        keyframes: tuple[Condition, ...] = ()
+        if not self.regional:
+            frame = video.Config(1, canvas)
+            keyframes = (
+                Condition(ConditionRole.FIRST_FRAME, frame),
+                Condition(ConditionRole.LAST_FRAME, frame),
+            )
+        if "ref2va" not in tasks:
+            return keyframes
+
+        def rows(condition: Condition) -> int:
+            size = self.make_size(
+                num_frames, 1, canvas=canvas, conditions=(condition,)
+            )
+            return size.condition_rows
+
+        # A reference video keeps the leading whole VAE windows of the
+        # generated frames, and its soundtrack the generated duration.
+        windows = max(
+            1, (num_frames - VAE_LATENTS_PER_CHUNK) // VAE_FRAMES_PER_CHUNK
+        )
+        frames = windows * VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK
+        samples = math.ceil(num_frames * AUDIO_SAMPLE_RATE / FPS)
+        clip = max(
+            (
+                Condition(
+                    ConditionRole.REFERENCE,
+                    video.Config(frames, raster),
+                    samples,
+                )
+                for raster in rule_canvases()
+            ),
+            key=rows,
+        )
+        still = max(
+            (
+                Condition(
+                    ConditionRole.REFERENCE,
+                    video.Config(1, reference_image_size(*aspect)),
+                )
+                for aspect in ((4, 1), (1, 4))
+            ),
+            key=rows,
+        )
+        return (
+            *keyframes,
+            *(still,) * MAX_IMAGE_REFERENCES,
+            *(clip,) * MAX_VIDEO_REFERENCES,
+        )
 
     @property
     def dense(self) -> bool:
@@ -405,8 +483,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
         Conditions occupy whole tiles (64 rows, or the region packing's
         tile), as ``layout_size`` rounds them, and a larger region is kept.
-        The checkpoint's ``max_sequence_rows`` bounds the widened layout's
-        generated, text and condition rows.
+        ``max_sequence_rows`` bounds the widened layout's generated, text and
+        condition rows.
 
         Raises:
             ValueError: Single-region sparse attention, which takes no
@@ -436,7 +514,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
             if rows > limit:
                 raise ValueError(
-                    f"an H3 layout of {rows} rows exceeds the checkpoint's "
+                    f"an H3 layout of {rows} rows exceeds the denoiser's "
                     f"{limit} sequence rows"
                 )
         return widened

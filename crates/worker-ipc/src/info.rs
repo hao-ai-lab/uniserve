@@ -333,7 +333,7 @@ pub struct VideoDenoiserInfo {
     /// declares every canvas of the model's canvas rule.
     #[serde(default)]
     pub canvases: Vec<uniserve_core::Canvas>,
-    /// The checkpoint's packed sequence capacity in rows, when it has one.
+    /// Rows the denoiser packs at most, when it states such a bound.
     #[serde(default)]
     pub max_sequence_rows: Option<u32>,
     /// How the denoiser packs condition rows: in whole tiles for a
@@ -341,6 +341,12 @@ pub struct VideoDenoiserInfo {
     /// absent.
     #[serde(default)]
     pub condition_tiles: Option<ConditionTiles>,
+    /// Packed condition rows the deployment provisioned for one request:
+    /// its stated condition capacity, or the rows of the largest condition
+    /// set the denoiser's tasks admit when it states none. Zero for a
+    /// denoiser that serves no conditioned task.
+    #[serde(default)]
+    pub max_condition_rows: u32,
 }
 
 impl VideoDenoiserInfo {

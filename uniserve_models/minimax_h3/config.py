@@ -17,12 +17,14 @@ import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
 from functools import partial
+from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, cast
 
 from uniserve.diffusion import BlockGrid, FixedGrid, RungGrid, UniformGrid
 from uniserve.media import image
+from uniserve.nn.attention import vsa
 from uniserve.nn.functional import Rounding
 from uniserve_models import qwen3_vl
 
@@ -94,6 +96,40 @@ def canvas(aspect_width: float, aspect_height: float) -> image.Config:
     )
 
 
+def rule_canvases() -> tuple[image.Config, ...]:
+    """List every canvas the canvas rule resolves an aspect ratio to.
+
+    ``canvas`` is piecewise constant in the ratio: a side changes only where
+    its unrounded length crosses a half multiple of 32. Those ratios, the
+    ends of the range and the ratio the area cap starts at cut the range
+    into intervals of one canvas each, so the canvases at the cuts and at
+    the interval midpoints are all of them.
+    """
+    cap = CANVAS_MAX_PIXELS / CANVAS_SHORT_EDGE**2
+    cuts = {MIN_ASPECT_RATIO, MAX_ASPECT_RATIO, 1.0, cap, 1 / cap}
+    longest = (CANVAS_MAX_PIXELS * MAX_ASPECT_RATIO) ** 0.5
+    edge = CANVAS_MULTIPLE / 2
+    while edge <= longest + CANVAS_MULTIPLE:
+        # Below the cap the long side is the short edge times the ratio.
+        # Above it the long side is the square root of the cap times the
+        # ratio, and the short side that of the cap over the ratio.
+        for ratio in (
+            edge / CANVAS_SHORT_EDGE,
+            edge**2 / CANVAS_MAX_PIXELS,
+            CANVAS_MAX_PIXELS / edge**2,
+        ):
+            cuts.update((ratio, 1 / ratio))
+        edge += CANVAS_MULTIPLE
+
+    ordered = sorted(
+        ratio for ratio in cuts if MIN_ASPECT_RATIO <= ratio <= MAX_ASPECT_RATIO
+    )
+    probes = sorted(
+        (*ordered, *((low + high) / 2 for low, high in pairwise(ordered)))
+    )
+    return tuple(dict.fromkeys(canvas(ratio, 1.0) for ratio in probes))
+
+
 # FastH3 DMD exports are trained on, and generate only, 12 buckets: the named
 # aspect ratios at the 768p and 480p resolutions. The 768p buckets are the
 # canvas rule's canvases; the 480p buckets, (height, width) below in the same
@@ -108,10 +144,6 @@ DMD_CANVASES = (
     image.Config(640, 480),
     image.Config(832, 480),
 )
-
-# A FastVideo PDD student's packed sequence capacity in rows; the checkpoint
-# owns this bound and serving options may only tighten it.
-PDD_MAX_SEQUENCE_ROWS = 131_072
 
 
 def _is_integer(value: object) -> TypeGuard[int]:
@@ -273,8 +305,8 @@ class DenoiserConfig:
         tasks: The tasks this DiT serves, in canonical order.
         canvases: The only canvases the checkpoint generates, or None when it
             generates every canvas of the canvas rules.
-        max_sequence_rows: The checkpoint's packed sequence capacity, or None
-            when only memory and serving options bound it.
+        max_sequence_rows: Rows the denoiser's attention packs at most, or
+            None when only memory and serving options bound them.
     """
 
     transformer: TransformerConfig
@@ -621,18 +653,21 @@ def _pdd_denoiser(
         raise _reject("vsa_ref_keep_rate", "a value in (0, 1]", keep)
     sparsity = _sparsity(contract)
     _contract_shifts(contract, shifts)
+    attention = SparseAttention(
+        tile=128, sparsity=sparsity, reference_keep=float(keep)
+    )
     return DenoiserConfig(
         transformer=transformer,
         grids=_modality_grids(
             partial(BlockGrid, intervals, tuple(nodes), max_t=float(max_t)),
             shifts,
         ),
-        attention=SparseAttention(
-            tile=128, sparsity=sparsity, reference_keep=float(keep)
-        ),
+        attention=attention,
         tasks=DENOISER_TASKS[component],
         canvases=None,
-        max_sequence_rows=PDD_MAX_SEQUENCE_ROWS,
+        # Region selection orders that many tiles; the export states no
+        # sequence bound of its own.
+        max_sequence_rows=vsa.MAX_REGION_TILES * attention.tile,
     )
 
 

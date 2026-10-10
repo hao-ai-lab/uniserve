@@ -162,7 +162,8 @@ def test_component_export_states_its_parallel_decoding_contract(checkpoint):
         tile=128, sparsity=0.9, reference_keep=0.1
     )
     assert denoiser.tasks == ("ref2va",)
-    assert denoiser.max_sequence_rows == 131_072
+    # Region selection's 8192 tiles of 128 rows, not a checkpoint bound.
+    assert denoiser.max_sequence_rows == 1_048_576
     # Component exports follow their reference's eager BF16 arithmetic.
     assert denoiser.transformer.rounding is Rounding.STEPWISE
     # A student whose heads disagree with its contract is rejected.

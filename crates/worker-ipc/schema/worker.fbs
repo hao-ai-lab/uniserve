@@ -212,7 +212,9 @@ struct ConditionTiles { rows:uint; frames:uint; height:uint; width:uint; }
 /// (sigma points including the clean endpoint, and the per-modality shifts)
 /// and the canvases and packed rows it accepts. An empty canvas list is the
 /// model's canvas rule; an absent capacity is unbounded by the checkpoint;
-/// absent condition tiles pack conditions densely, one row per token.
+/// absent condition tiles pack conditions densely, one row per token. The
+/// condition rows are the packed rows the deployment provisioned for one
+/// request's conditions.
 table VideoDenoiserInfo {
   tasks:[string];
   schedule_points:uint;
@@ -221,6 +223,7 @@ table VideoDenoiserInfo {
   canvases:[Canvas];
   max_sequence_rows:uint = null;
   condition_tiles:ConditionTiles;
+  max_condition_rows:uint;
 }
 
 /// Binds a media call to the component that runs it; the decoder rejects a
@@ -451,6 +454,9 @@ table DecodeRange {
   call_id:CallId;
   cursor:uint;
   max_units:uint;
+  /// Component ranks holding the round's units, in unit order; empty deals
+  /// them in the component's configured rank order.
+  ranks:[uint];
 }
 
 /// A byte span of the rank's persistent-buffer arena reserved for one buffer.

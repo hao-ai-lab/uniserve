@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from uniserve.diffusion import BlockGrid, RungGrid, UniformGrid
 from uniserve.media import image
+from uniserve.nn.attention import vsa
 from uniserve.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     Config,
@@ -84,7 +85,7 @@ def omniref_denoiser(
         attention=SparseAttention(tile=128, sparsity=0.9, reference_keep=0.1),
         tasks=("ref2va",),
         canvases=None,
-        max_sequence_rows=131_072,
+        max_sequence_rows=vsa.MAX_REGION_TILES * 128,
     )
 
 

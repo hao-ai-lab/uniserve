@@ -771,7 +771,10 @@ def _token_worker_layout(
 
 
 def video_denoiser_info(
-    denoiser: VideoDenoiser, *, canvases: tuple[image.Config, ...] = ()
+    denoiser: VideoDenoiser,
+    *,
+    canvases: tuple[image.Config, ...] = (),
+    max_condition_rows: int = 0,
 ) -> VideoDenoiserInfo:
     """Describe what the deployment's video denoiser serves.
 
@@ -780,6 +783,8 @@ def video_denoiser_info(
     the clean endpoint the network never evaluates. The canvases are
     ``canvases``, those the deployment prepares and admits, or without any
     every canvas the denoiser offers (``VideoDenoiser.canvases``).
+    ``max_condition_rows`` is the packed condition rows the deployment
+    provisioned for one request.
 
     Raises:
         WorkerError: ``UnsupportedSetup`` when the worker executes none of
@@ -801,6 +806,7 @@ def video_denoiser_info(
         canvases=tuple((canvas.width, canvas.height) for canvas in served),
         max_sequence_rows=denoiser.max_sequence_rows,
         condition_tiles=denoiser.condition_tiles,
+        max_condition_rows=max_condition_rows,
     )
 
 
@@ -856,7 +862,9 @@ def _request_tensor_worker_layout(
         ),
         num_inference_steps=builder.num_steps,
         video_denoiser=video_denoiser_info(
-            builder.denoiser, canvases=builder.canvases
+            builder.denoiser,
+            canvases=builder.canvases,
+            max_condition_rows=builder.condition_rows,
         ),
         host_lane_capacity=1,
     )

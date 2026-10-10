@@ -326,8 +326,9 @@ def prepare_denoising(
 ) -> None:
     """Make every capacity layout's steps ready before the worker serves.
 
-    Each layout of ``MediaBuilder.layouts`` is prepared, largest first, so
-    the first allocates the storage every other layout shares. A placeholder
+    ``MediaBuilder.maximum_layout`` and then each layout of
+    ``MediaBuilder.layouts`` is prepared, largest first, so the first
+    allocates the storage every other layout shares. A placeholder
     request filling the layout's text capacity on slot one runs one eager
     step, which prepares the layout's kernels, plans and scratch; once every
     layout is warm, a capturing runner captures one graph per layout. A

@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
-from tests.python.fixtures.h3 import WIDE, base_config, fasth3_config
+from tests.python.fixtures.h3 import (
+    WIDE,
+    base_config,
+    fasth3_config,
+    omniref_denoiser,
+)
 from uniserve.media import image, video
 from uniserve.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import Model
+from uniserve_models.minimax_h3 import config as h3_config
+from uniserve_models.minimax_h3.processing import reference_image_size
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
 pytestmark = pytest.mark.unit
@@ -299,3 +308,98 @@ def test_a_condition_capacity_bounds_each_conditioned_layout():
         builder.size(124, 100, WIDE, conditions=(first, first, first))
     with pytest.raises(ValueError, match="condition capacity"):
         plain.size(124, 100, WIDE, conditions=(first,))
+
+
+def test_reference_denoiser_has_no_text_only_layout():
+    """A denoiser that serves only ``ref2va`` shares no layout at startup.
+
+    Every request it admits brings a reference and evaluates in a layout of
+    its own, which the widened maximum still bounds.
+    """
+    with torch.device("meta"):
+        denoiser = Model(base_config()).reference_denoiser
+    builder = MediaBuilder(
+        denoiser,
+        max_frames=124,
+        max_text_tokens=4096,
+        min_frames=96,
+        condition_rows=8192,
+    )
+    assert builder.layouts() == ()
+
+    # One 16:9 reference image beside its 100 prompt tokens.
+    reference = Condition(ConditionRole.REFERENCE, video.Config(1, WIDE))
+    size = builder.size(124, 100, WIDE, conditions=(reference,))
+    layout = builder.layout(size)
+    assert denoiser.holds(layout, size)
+    assert layout.num_text_tokens == 1024
+    maximum = denoiser.workspace_buffers(builder.maximum_layout)
+    for name, config in denoiser.workspace_buffers(layout).items():
+        assert all(
+            extent <= bound
+            for extent, bound in zip(
+                config.shape, maximum[name].shape, strict=True
+            )
+        ), name
+
+
+def test_the_largest_condition_set_follows_the_served_tasks():
+    """A denoiser declares the largest condition set its tasks admit.
+
+    Text-to-video takes none and keyframe generation the two keyframes of
+    the target canvas. A reference request carries up to nine images and
+    three videos: images of the widest reference raster, 4:1 at the
+    2048-pixel short edge, and videos of the generated 124 frames with their
+    124 / 24 seconds of 32 kHz sound. A dense network packs the keyframes
+    beside them; the region packing holds none.
+    """
+    with torch.device("meta"):
+        base = Model(base_config())
+        text_only = Model(fasth3_config()).denoiser
+        regional = Model(
+            replace(
+                base_config(),
+                denoisers={"reference_denoiser": omniref_denoiser()},
+            )
+        ).reference_denoiser
+    keyframes = (
+        Condition(ConditionRole.FIRST_FRAME, video.Config(1, WIDE)),
+        Condition(ConditionRole.LAST_FRAME, video.Config(1, WIDE)),
+    )
+    assert text_only.max_conditions(124, WIDE) == ()
+    assert base.denoiser.max_conditions(124, WIDE) == keyframes
+
+    for denoiser, leading in (
+        (base.reference_denoiser, keyframes),
+        (regional, ()),
+    ):
+        conditions = denoiser.max_conditions(124, WIDE)
+        references = conditions[len(leading) :]
+        assert conditions[: len(leading)] == leading
+        stills = [item for item in references if item.video.num_frames == 1]
+        clips = [item for item in references if item.video.num_frames > 1]
+        assert len(stills) == 9 and len(clips) == 3
+        assert {
+            (item.video.num_frames, item.audio_samples) for item in clips
+        } == {(124, 165_334)}
+
+        def rows(condition, denoiser=denoiser):
+            size = denoiser.make_size(
+                124, 100, canvas=WIDE, conditions=(condition,)
+            )
+            return size.condition_rows
+
+        # No reference a request may bring packs more rows than the
+        # declared one of its kind, at any aspect from 1:4 to 4:1.
+        for width in range(250, 4001, 7):
+            still = Condition(
+                ConditionRole.REFERENCE,
+                video.Config(1, reference_image_size(width, 1000)),
+            )
+            clip = Condition(
+                ConditionRole.REFERENCE,
+                video.Config(124, h3_config.canvas(width, 1000)),
+                165_334,
+            )
+            assert rows(still) <= rows(stills[0]), width
+            assert rows(clip) <= rows(clips[0]), width

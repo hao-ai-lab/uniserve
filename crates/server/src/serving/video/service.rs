@@ -75,19 +75,19 @@ pub struct VideoService {
     denoiser: VideoDenoiserInfo,
     tasks: Vec<VideoTask>,
     max_video_seconds: f64,
-    max_condition_rows: u32,
-    /// Condition units one latent encoding round covers, which reference
-    /// images are banded to fill (`RequestPlan::image_bands`).
+    /// Condition units one latent encoding round covers while a request's
+    /// prompt is encoded, which reference images are banded to fill
+    /// (`RequestPlan::image_bands`).
     latent_encoding_lane: u32,
     media: VideoMediaSettings,
     ingest: VideoIngest,
 }
 
 impl VideoService {
-    /// Binds the served denoiser, the checkpoint's vision processor, the
-    /// deployment's duration and condition-row capacities, the condition
-    /// units its latent encoder covers in one round, its media policy, and
-    /// the tokenizer.
+    /// Binds the served denoiser, whose handshake states the condition rows
+    /// the deployment provisioned, the checkpoint's vision processor, the
+    /// deployment's duration capacity, the condition units its latent
+    /// encoder covers in one round, its media policy, and the tokenizer.
     ///
     /// # Errors
     ///
@@ -97,7 +97,6 @@ impl VideoService {
         denoiser: VideoDenoiserInfo,
         vision: VisionConfig,
         max_video_seconds: f64,
-        max_condition_rows: u32,
         latent_encoding_lane: u32,
         media: &VideoMediaSettings,
         tokenizer: DynTokenizer,
@@ -134,7 +133,6 @@ impl VideoService {
             denoiser,
             tasks,
             max_video_seconds,
-            max_condition_rows,
             latent_encoding_lane: latent_encoding_lane.max(1),
             media: media.clone(),
         })
@@ -215,7 +213,7 @@ impl VideoService {
             },
             "max_prompt_tokens": max_prompt_tokens,
             "max_sequence_rows": self.denoiser.max_sequence_rows,
-            "max_condition_rows": self.max_condition_rows,
+            "max_condition_rows": self.denoiser.max_condition_rows,
             "media": {
                 "data": true,
                 "http": self.media.remote_media,
@@ -338,7 +336,7 @@ impl VideoService {
     /// deployment's condition capacity, and the packed sequence (the
     /// presentation's text rows, the condition rows and the generated audio
     /// and video rows, not counting alignment padding) may not exceed the
-    /// denoiser's sequence capacity, when its checkpoint has one.
+    /// denoiser's sequence capacity, when it states one.
     ///
     /// # Errors
     ///
@@ -353,12 +351,12 @@ impl VideoService {
                 Some("conditions"),
             ));
         };
-        if condition_rows > u64::from(self.max_condition_rows) {
+        if condition_rows > u64::from(self.denoiser.max_condition_rows) {
             return Err(ApiError::invalid_request(
                 format!(
                     "conditions: the conditions take {condition_rows} denoiser rows, more than \
                      the {} this deployment serves; serve with a larger --max-condition-rows",
-                    self.max_condition_rows
+                    self.denoiser.max_condition_rows
                 ),
                 Some("conditions"),
             ));
@@ -373,7 +371,7 @@ impl VideoService {
             return Err(ApiError::invalid_request(
                 format!(
                     "conditions: the request packs {sequence_rows} denoiser rows, more than the \
-                     checkpoint's {capacity}"
+                     denoiser's {capacity}"
                 ),
                 Some("conditions"),
             ));
@@ -552,10 +550,10 @@ mod tests {
                 canvases: Vec::new(),
                 max_sequence_rows,
                 condition_tiles,
+                max_condition_rows,
             },
             vision(&fixture()),
             15.0,
-            max_condition_rows,
             latent_encoding_lane,
             &VideoMediaSettings::default(),
             Arc::new(character_tokenizer()),

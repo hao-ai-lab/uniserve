@@ -335,7 +335,7 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
 
     @property
     def max_sequence_rows(self) -> int | None:
-        """The checkpoint's packed sequence capacity, or None without one."""
+        """Rows the denoiser packs at most, or None without such a bound."""
         raise NotImplementedError
 
     @property
@@ -347,6 +347,20 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         serving owner admits requests by the same count.
         """
         return None
+
+    def max_conditions(
+        self, num_frames: int, canvas: image.Config
+    ) -> tuple[Condition, ...]:
+        """The largest condition set a request of this network may carry.
+
+        Returns the conditions, among those a request generating
+        ``num_frames`` frames on ``canvas`` may bring under the network's
+        tasks, whose packed rows (``make_size``) are the most. A serving
+        owner that states no smaller condition capacity provisions for them,
+        so it refuses no request for its conditions. Empty for a network
+        without a conditioned task.
+        """
+        return ()
 
     def text_condition_rows(self, layout: VideoSizeT) -> int:
         """Rows of a request's retained conditioning in ``layout``.

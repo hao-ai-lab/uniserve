@@ -618,6 +618,7 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
             rows: tiles.rows(),
             video: [tiles.frames(), tiles.height(), tiles.width()],
         }),
+        max_condition_rows: table.max_condition_rows(),
     }
 }
 
@@ -689,6 +690,10 @@ fn decode_range_from_table(params: fbs::DecodeRange<'_>) -> CodecResult<DecodeRa
         call_id: computation_id_from_fb(params.call_id())?,
         cursor: params.cursor(),
         max_units: params.max_units(),
+        ranks: params
+            .ranks()
+            .map(|ranks| ranks.iter().collect())
+            .unwrap_or_default(),
     })
 }
 

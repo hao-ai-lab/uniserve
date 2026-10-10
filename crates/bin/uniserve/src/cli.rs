@@ -167,7 +167,10 @@ pub(crate) struct SharedRuntimeArgs {
     pub base_model: Option<std::path::PathBuf>,
 
     /// Override the maximum model context length. When unset, the model's real
-    /// context length (`max_position_embeddings`) is used.
+    /// context length (`max_position_embeddings`) is used. A video deployment
+    /// that serves references, whose vision tokens are prompt tokens,
+    /// defaults to its text encoder's context, and one whose prompts are
+    /// text and keyframes alone to 16384 tokens.
     #[arg(long = "max-model-len")]
     pub max_model_len: Option<u32>,
     /// Longest video duration, in seconds, a media deployment provisions and
@@ -198,15 +201,13 @@ pub(crate) struct SharedRuntimeArgs {
     /// Most denoiser rows the conditions of one video request may take: a
     /// capacity video workers provision their condition products, request
     /// slots and largest denoiser layout for, advertised as
-    /// `max_condition_rows`. The default holds two keyframes on the largest
-    /// canvas, every `fl2va` request; a `ref2va` deployment raises it to the
-    /// rows its references take, about 38,000 for a five-second reference
-    /// video with its soundtrack.
-    #[arg(
-        long = "max-condition-rows",
-        default_value_t = uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS
-    )]
-    pub max_condition_rows: u32,
+    /// `max_condition_rows`. Without it the workers provision the largest
+    /// condition set their denoiser admits (two keyframes for `fl2va`, nine
+    /// images and three videos with soundtracks for `ref2va`), so no request
+    /// is refused for its conditions and a machine that cannot hold that
+    /// set fails at startup; state a smaller capacity to serve less.
+    #[arg(long = "max-condition-rows")]
+    pub max_condition_rows: Option<u32>,
     /// Directory that `file://` condition media of video requests resolves
     /// under. Without it, `file://` media is refused.
     #[arg(long = "media-directory", value_name = "DIR")]

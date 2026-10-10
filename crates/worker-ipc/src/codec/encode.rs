@@ -469,6 +469,7 @@ fn decode_range<'a>(
 ) -> WIPOffset<fbs::DecodeRange<'a>> {
     let request_key = Some(request_key(b, &v.request_key));
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
+    let ranks = Some(b.create_vector(&v.ranks));
     fbs::DecodeRange::create(
         b,
         &fbs::DecodeRangeArgs {
@@ -476,6 +477,7 @@ fn decode_range<'a>(
             call_id: Some(&call_id),
             cursor: v.cursor,
             max_units: v.max_units,
+            ranks,
         },
     )
 }
@@ -1523,6 +1525,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 canvases,
                 max_sequence_rows: value.max_sequence_rows,
                 condition_tiles: condition_tiles.as_ref(),
+                max_condition_rows: value.max_condition_rows,
             },
         )
     });

@@ -780,8 +780,8 @@ fn latent_params_to_py<'py>(
     construct(py, "LatentParams", &dict)
 }
 
-/// Converts the cursor and unit bound of one diffusion decode call into a
-/// Python `DecodeRange` record.
+/// Converts the cursor, unit bound and holding ranks of one diffusion decode
+/// call into a Python `DecodeRange` record.
 fn decode_range_to_py<'py>(
     py: Python<'py>,
     params: &DecodeRange,
@@ -798,6 +798,10 @@ fn decode_range_to_py<'py>(
     )?;
     dict.set_item(intern!(py, "cursor"), params.cursor)?;
     dict.set_item(intern!(py, "max_units"), params.max_units)?;
+    dict.set_item(
+        intern!(py, "ranks"),
+        pyo3::types::PyTuple::new(py, &params.ranks)?,
+    )?;
     construct(py, "DecodeRange", &dict)
 }
 

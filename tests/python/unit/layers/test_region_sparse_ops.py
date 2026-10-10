@@ -131,8 +131,15 @@ def test_tile_selection_keeps_each_regions_best_scores_in_stable_order():
         ),
         # A video region first, its first tile empty.
         ([0] * 70 + [-1] * 9 + [1] * 50, (0, 7, 75), [12, 5]),
+        # A 15-second target beside a 15-second reference video: more tiles
+        # than one 2048-lane sort holds.
+        (
+            [-1] * 120 + [0] * 972 + [-1] * 10 + [1] * 998,
+            (5, 300, 2099),
+            [98, 100],
+        ),
     ],
-    ids=["dense_first", "region_first"],
+    ids=["dense_first", "region_first", "long_video_pair"],
 )
 @pytest.mark.parametrize("ties", [False, True])
 def test_tile_selection_matches_the_eager_sort_composition(

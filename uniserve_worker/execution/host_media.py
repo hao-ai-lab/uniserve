@@ -68,19 +68,20 @@ def encoded_unit_positions(
 ) -> tuple[int, ...]:
     """Return the positions within the decode round this rank encodes.
 
-    A round's units are dealt to the encoder's ranks in order, each taking
-    ``units_per_rank`` consecutive positions, the same order the engine used
+    A round's units are dealt to the ranks the call names, or to the
+    encoder's ranks in configured order when it names none, each taking
+    ``units_per_rank`` consecutive positions: the same order the engine used
     to project the call onto its ranks. The result is empty for a rank whose
     first position is at or past the round's ``max_units``.
 
     Raises:
-        ValueError: When ``rank`` is not one of the component's ranks.
+        ValueError: When ``rank`` is not one of the round's ranks.
     """
     from uniserve_worker.execution.media import decode_range
 
     params = decode_range(call, state=state)
     per_rank = max(1, int(component.units_per_rank))
-    position = component.ranks.index(rank)
+    position = (params.ranks or component.ranks).index(rank)
     first = position * per_rank
     return tuple(range(first, min(first + per_rank, int(params.max_units))))
 

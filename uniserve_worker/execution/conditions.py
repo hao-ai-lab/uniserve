@@ -186,8 +186,9 @@ def condition_layout(
     docstring); the trailing extents and dtype are the declared ones. A
     visual latent round's product holds only the round's units, and a rank
     of a temporally distributed latent encoder publishes the rows of the
-    units ``ComponentBinding.media_units`` deals it within the round. Returns
-    None for a rank that publishes none of the product.
+    units ``ComponentBinding.media_units`` deals it within the round, among
+    the ranks ``decode`` names. Returns None for a rank that publishes none
+    of the product.
 
     Raises:
         WorkerError: ``invalid_descriptor`` when a visual latent round names
@@ -230,8 +231,8 @@ def condition_layout(
     local = slice(0, rows)
 
     if name in (CONDITION_VIDEO_LATENTS, CONDITION_AUDIO_LATENTS):
-        # Units are dealt to a distributed encoder's ranks from the round's
-        # first unit; the audio call is one unit, the first rank's.
+        # Units are dealt to the ranks the call names from the round's first
+        # unit; the audio call is one unit, its first rank's.
         units = (
             _unit_rows(video)[covered.start : covered.stop]
             if name == CONDITION_VIDEO_LATENTS
@@ -240,7 +241,9 @@ def condition_layout(
         run = (
             range(len(units))
             if binding is None
-            else binding.media_units(0, len(units))
+            else binding.media_units(
+                0, len(units), () if decode is None else decode.ranks
+            )
         )
         if not run:
             return None
@@ -630,9 +633,10 @@ def encode_latents(
     if encoder is VideoEncoder:
         # This rank encodes its share of the round's units, which follow
         # the earlier rounds' units.
-        covered = _round_units(video, decode_range(call, state=state))
+        decode = decode_range(call, state=state)
+        covered = _round_units(video, decode)
         run = model_runner.bindings[call.component].media_units(
-            covered.start, len(covered)
+            covered.start, len(covered), decode.ranks
         )
         if not run:
             raise invalid_descriptor(

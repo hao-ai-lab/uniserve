@@ -212,7 +212,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 .context("the video worker reported no video denoiser")?;
             let vision = vision.context("the video checkpoint has no vision processor")?;
             // Reference images are banded to the units one latent encoding
-            // round covers on the deployment's latent encoder.
+            // round covers on the deployment's latent encoder while a
+            // request's prompt is encoded.
             let latent_encoding_lane = engine
                 .media_lane_units(uniserve_engine::MediaCall::LatentEncoding)
                 .unwrap_or(1);
@@ -221,7 +222,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                     denoiser,
                     vision,
                     *max_video_seconds,
-                    config.engine.max_condition_rows,
                     latent_encoding_lane,
                     &config.video_media,
                     Arc::clone(&tokenizer),
