@@ -135,7 +135,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     // `resp_slot_cap` only when it is larger.
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
-        base_model: config.base_model.clone(),
         req_slot_cap: channel_payload_capacity,
         resp_slot_cap: config
             .engine
@@ -211,12 +210,18 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 .video_denoiser()
                 .context("the video worker reported no video denoiser")?;
             let vision = vision.context("the video checkpoint has no vision processor")?;
+            // Reference images are banded to the units one latent encoding
+            // round covers on the deployment's latent encoder while a
+            // request's prompt is encoded.
+            let latent_encoding_lane = engine
+                .media_lane_units(uniserve_engine::MediaCall::LatentEncoding)
+                .unwrap_or(1);
             Some(
                 crate::serving::video::VideoService::new(
                     denoiser,
                     vision,
                     *max_video_seconds,
-                    config.engine.max_condition_rows,
+                    latent_encoding_lane,
                     &config.video_media,
                     Arc::clone(&tokenizer),
                 )

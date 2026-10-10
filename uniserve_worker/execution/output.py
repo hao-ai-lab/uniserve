@@ -367,6 +367,8 @@ class PendingOutput:
         self.finish_flags = FinishFlags()
         self.product_generations: tuple[int, ...] = ()
         self.error_code: ErrorCode | None = None
+        # Why the worker refuses the request, with ErrorCode.INVALID_REQUEST.
+        self.error_message: str | None = None
 
         # Exports, store reads and writes, and the predicate are borrowed from
         # their owning stores until the batch commits or is discarded. On
@@ -660,6 +662,11 @@ class PendingOutput:
             status=status,
             product_generations=() if suppressed else self.product_generations,
             error_code=error_code,
+            # A materialization failure replaces a refusal's code, and with it
+            # the refusal's reason.
+            error_message=self.error_message
+            if error_code is ErrorCode.INVALID_REQUEST
+            else None,
             timing_counters=timing,
             kind=self.kind,
             position=0 if runtime is None else int(runtime.logical_position),

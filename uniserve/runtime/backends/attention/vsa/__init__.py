@@ -239,8 +239,7 @@ def resolve(backend, *, device, tile):
 
     Raises:
         RuntimeError: No installed provider (or not the named one) serves
-            ``tile``-row tiles on ``device``. Only SM100 (data-center
-            Blackwell) devices serve 128-row tiles.
+            ``tile``-row tiles on ``device``.
         ValueError: An unknown backend name.
     """
     if isinstance(backend, Backend):
@@ -254,12 +253,6 @@ def resolve(backend, *, device, tile):
                 return candidate.Backend()
         raise RuntimeError(
             f"no installed VSA backend serves {tile}-row tiles on {device}"
-            + (
-                "; 128-row tiles require an SM100 (data-center Blackwell) "
-                "device"
-                if tile == 128
-                else ""
-            )
         )
 
     if backend not in {"sm100", "cute", "flashinfer", "triton"}:

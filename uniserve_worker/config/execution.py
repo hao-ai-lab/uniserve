@@ -342,8 +342,11 @@ class WorkerConfig:
     max_video_seconds: float = 15.0
     # Most denoiser rows a video request's conditions may take. It bounds the
     # condition products a video worker provisions; zero provisions none, as
-    # a deployment serving text-to-video alone does.
-    max_condition_rows: int = 0
+    # a deployment serving text-to-video alone does. None provisions the
+    # largest condition set the deployment's denoiser admits
+    # (``bootstrap.inputs.condition_capacity``), and
+    # ``bootstrap.model_loader.loaded_worker_config`` states those rows here.
+    max_condition_rows: int | None = None
     # The ffmpeg executable the media reader decodes reference videos with.
     ffmpeg: str = "ffmpeg"
     # Shortest duration the server admits, which bounds the frame counts the
@@ -439,7 +442,7 @@ class WorkerConfig:
             raise invalid_descriptor(
                 "video duration capacity must be finite and positive"
             )
-        if self.max_condition_rows < 0:
+        if self.max_condition_rows is not None and self.max_condition_rows < 0:
             raise invalid_descriptor(
                 "video condition capacity must not be negative"
             )
@@ -529,7 +532,9 @@ def worker_config_from_namespace(
         max_request_pool_size=int(namespace.max_request_pool_size),
         max_sequence_tokens=int(namespace.max_model_len),
         max_video_seconds=float(namespace.max_video_seconds),
-        max_condition_rows=int(namespace.max_condition_rows),
+        max_condition_rows=None
+        if namespace.max_condition_rows is None
+        else int(namespace.max_condition_rows),
         ffmpeg=str(namespace.ffmpeg),
         min_video_seconds=_optional_float(
             getattr(namespace, "min_video_seconds", None)

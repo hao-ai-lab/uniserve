@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(feature = "testing", test))]
 use uniserve_worker_ipc::DEFAULT_COMPONENT;
-use uniserve_worker_ipc::ForwardMode;
+use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -458,6 +458,9 @@ impl EngineConfig {
 pub struct EngineCore {
     handle: EngineHandle,
     info: WorkerInfo,
+    /// Media units one call of each routed media call covers at once
+    /// (`ExecutorInfo::media_lane_units`).
+    media_lanes: BTreeMap<MediaCall, u32>,
     stats: Arc<SchedulerStats>,
     model_name: String,
     model_dtype: ModelDtype,
@@ -788,6 +791,19 @@ impl EngineCore {
         waker: CommandWaker,
     ) -> anyhow::Result<Self> {
         let ctrl = config.control_tokens();
+        // The scheduler takes the executor; the server sizes media work by
+        // these widths before it submits requests.
+        let media_lanes = executor
+            .info()
+            .media_routing()?
+            .into_keys()
+            .filter_map(|call| {
+                executor
+                    .info()
+                    .media_lane_units(call)
+                    .map(|units| (call, units))
+            })
+            .collect();
         let mut sched = Scheduler::with_model_limits(
             executor,
             ctrl,
@@ -831,6 +847,7 @@ impl EngineCore {
         Ok(Self {
             handle,
             info,
+            media_lanes,
             stats,
             model_name: config.worker_process.model,
             model_dtype,
@@ -854,6 +871,13 @@ impl EngineCore {
     /// (`ExecutorInfo::runtime_info`), not any single group's report.
     pub fn info(&self) -> &WorkerInfo {
         &self.info
+    }
+
+    /// Returns the media units one call of `call` covers at once: the ranks
+    /// of a distributed serving component times its units per rank, or one;
+    /// `None` when no worker serves `call`.
+    pub fn media_lane_units(&self, call: MediaCall) -> Option<u32> {
+        self.media_lanes.get(&call).copied()
     }
 
     /// Returns the generation limits resolved against worker capabilities.

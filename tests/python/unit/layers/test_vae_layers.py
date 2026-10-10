@@ -84,3 +84,75 @@ def test_spatial_encoder_tiles_reproduce_a_local_encoding():
 
     assert tiled.shape == (2, 3, 18, 15)
     torch.testing.assert_close(tiled, encoder.encode_tile(pixels))
+
+
+def test_spatial_encoder_bands_are_rows_of_the_whole_encoding():
+    """Every band of latent rows equals those rows of the whole encoding.
+
+    A padded convolution reads across tile edges, so tiles disagree on their
+    overlaps and each band's seams must blend exactly as the whole raster's
+    do, including bands that start inside a cross-fade.
+    """
+    from uniserve.nn.vae import SpatialEncoder
+
+    torch.manual_seed(0)
+    encoder = SpatialEncoder(
+        torch.nn.Sequential(
+            torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.AvgPool2d(4)
+        ),
+        spatial_compression=4,
+        tile_height=32,
+        tile_width=16,
+        overlap_height=8,
+        overlap_width=4,
+    )
+    pixels = torch.randn(2, 3, 76, 40)
+
+    with torch.inference_mode():
+        whole = encoder(pixels)
+        for start in range(whole.shape[-2]):
+            for stop in range(start + 1, whole.shape[-2] + 1):
+                band = encoder(pixels, rows=slice(start, stop))
+                assert torch.equal(band, whole[..., start:stop, :])
+
+    with pytest.raises(ValueError, match="latent rows"):
+        encoder(pixels, rows=slice(4, 4))
+    with pytest.raises(ValueError, match="latent rows"):
+        encoder(pixels, rows=slice(0, whole.shape[-2] + 1))
+
+
+def test_spatial_encoder_encodes_tiles_through_a_bound_operator():
+    """A context's tile operator encodes every tile, bands included.
+
+    Doubling a tile's latents doubles every cross-fade exactly, so the
+    encoding equals twice the unbound one only if every tile went through
+    the operator; outside the context the encoder is unbound again.
+    """
+    from uniserve.nn.vae import SpatialEncoder
+    from uniserve.runtime import ExecutionContext
+
+    torch.manual_seed(0)
+    encoder = SpatialEncoder(
+        torch.nn.Sequential(
+            torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.AvgPool2d(4)
+        ),
+        spatial_compression=4,
+        tile_height=32,
+        tile_width=16,
+        overlap_height=8,
+        overlap_width=4,
+    )
+    pixels = torch.randn(2, 3, 76, 40)
+
+    with torch.inference_mode():
+        whole = encoder(pixels)
+        with ExecutionContext(
+            encoder, tiles={encoder: lambda tile: 2 * encoder.encode_tile(tile)}
+        ):
+            bound = encoder(pixels)
+            band = encoder(pixels, rows=slice(3, 11))
+        unbound = encoder(pixels)
+
+    assert torch.equal(bound, 2 * whole)
+    assert torch.equal(band, 2 * whole[..., 3:11, :])
+    assert torch.equal(unbound, whole)

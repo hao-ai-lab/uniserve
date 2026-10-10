@@ -469,6 +469,7 @@ fn decode_range<'a>(
 ) -> WIPOffset<fbs::DecodeRange<'a>> {
     let request_key = Some(request_key(b, &v.request_key));
     let call_id = fbs::CallId::new(v.call_id.batch_id, v.call_id.request_index);
+    let ranks = Some(b.create_vector(&v.ranks));
     fbs::DecodeRange::create(
         b,
         &fbs::DecodeRangeArgs {
@@ -476,6 +477,7 @@ fn decode_range<'a>(
             call_id: Some(&call_id),
             cursor: v.cursor,
             max_units: v.max_units,
+            ranks,
         },
     )
 }
@@ -1107,6 +1109,10 @@ fn completion<'a>(
     let status = call_status_to_fb(v.status);
     let product_generations = Some(b.create_vector(&v.product_generations));
     let error_code = v.error_code.map(error_code_to_fb);
+    let error_message = v
+        .error_message
+        .as_deref()
+        .map(|message| b.create_string(message));
     let timing_counters = Some(timing(b, &v.timing_counters));
     let code = computation_to_fb(v.code);
     let committed_tokens = Some(b.create_vector(&v.committed_tokens));
@@ -1134,6 +1140,7 @@ fn completion<'a>(
             status,
             product_generations,
             error_code,
+            error_message,
             timing_counters,
             code: Some(&code),
             position: v.position,
@@ -1495,7 +1502,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             .collect::<Vec<_>>();
         Some(b.create_vector(&values))
     };
-    let checkpoint_identity = Some(b.create_string(&v.checkpoint_identity));
     let video_denoiser = v.video_denoiser.as_ref().map(|value| {
         let tasks = value
             .tasks
@@ -1509,10 +1515,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             .map(|canvas| fbs::Canvas::new(canvas.width, canvas.height))
             .collect::<Vec<_>>();
         let canvases = Some(b.create_vector(&canvases));
-        let condition_tiles = value.condition_tiles.map(|tiles| {
-            let [frames, height, width] = tiles.video;
-            fbs::ConditionTiles::new(tiles.rows, frames, height, width)
-        });
         fbs::VideoDenoiserInfo::create(
             b,
             &fbs::VideoDenoiserInfoArgs {
@@ -1521,8 +1523,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 video_shift: value.video_shift,
                 audio_shift: value.audio_shift,
                 canvases,
-                max_sequence_rows: value.max_sequence_rows,
-                condition_tiles: condition_tiles.as_ref(),
             },
         )
     });
@@ -1555,7 +1555,6 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             media_components,
             num_inference_steps: v.num_inference_steps,
             host_lane_capacity: v.host_lane_capacity,
-            checkpoint_identity,
             video_denoiser,
             max_prefill_calls: v.max_prefill_calls,
             max_decode_calls: v.max_decode_calls,

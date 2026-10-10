@@ -54,39 +54,39 @@ def reference_attention(q, k, v, gate, valid, *, scale=128**-0.5):
     return result.to(q.dtype), live
 
 
-# A region domain of 128-row tiles: two dense tiles, an empty one, a region
-# of three tiles, another dense tile, a region of four tiles and an empty
-# alignment tile, each region keeping its own key tiles.
-REGION_TILE = 128
-REGION_VALID = (128, 40, 0, 128, 128, 96, 77, 128, 128, 128, 64, 0)
-REGION_INDICES = (-1, -1, -1, 0, 0, 0, -1, 1, 1, 1, 1, -1)
-REGION_KEEP = (2, 1)
+# A segment domain of 128-row tiles: two dense tiles, an empty one, a segment
+# of three tiles, another dense tile, a segment of four tiles and an empty
+# alignment tile, each segment keeping its own key tiles.
+SEGMENT_TILE = 128
+SEGMENT_VALID = (128, 40, 0, 128, 128, 96, 77, 128, 128, 128, 64, 0)
+SEGMENT_INDICES = (-1, -1, -1, 0, 0, 0, -1, 1, 1, 1, 1, -1)
+SEGMENT_KEEP = (2, 1)
 
 
-def region_tables(device):
-    """Return the domain's ``(valid, regions, starts, keep)`` int32 tables."""
-    regions = torch.tensor(REGION_INDICES, dtype=torch.int32)
-    starts = torch.zeros(len(REGION_VALID), dtype=torch.int32)
-    keep = torch.zeros(len(REGION_VALID), dtype=torch.int32)
-    for region, kept in enumerate(REGION_KEEP):
-        starts[region] = int((regions < region).sum())
-        keep[region] = kept
-    valid = torch.tensor(REGION_VALID, dtype=torch.int32)
-    return tuple(value.to(device) for value in (valid, regions, starts, keep))
+def segment_tables(device):
+    """Return the domain's ``(valid, segments, starts, keep)`` int32 tables."""
+    segments = torch.tensor(SEGMENT_INDICES, dtype=torch.int32)
+    starts = torch.zeros(len(SEGMENT_VALID), dtype=torch.int32)
+    keep = torch.zeros(len(SEGMENT_VALID), dtype=torch.int32)
+    for segment, kept in enumerate(SEGMENT_KEEP):
+        starts[segment] = int((segments < segment).sum())
+        keep[segment] = kept
+    valid = torch.tensor(SEGMENT_VALID, dtype=torch.int32)
+    return tuple(value.to(device) for value in (valid, segments, starts, keep))
 
 
-def region_reference(q, k, v, gate):
-    """Evaluate region selection, fine attention and compression in FP64.
+def segment_reference(q, k, v, gate):
+    """Evaluate segment selection, fine attention and compression in FP64.
 
     Dense tiles attend every live tile; video tiles attend the live dense
-    tiles and each region's top-scoring tiles; each row adds its gate times
+    tiles and each segment's top-scoring tiles; each row adds its gate times
     the softmax over live tiles of their mean values. Returns the result and
     the rows that attend (valid rows of live tiles).
     """
-    tiles, tile = len(REGION_VALID), REGION_TILE
+    tiles, tile = len(SEGMENT_VALID), SEGMENT_TILE
     heads, width = q.shape[1], q.shape[2]
-    valid = torch.tensor(REGION_VALID, device=q.device)
-    regions = torch.tensor(REGION_INDICES, device=q.device)
+    valid = torch.tensor(SEGMENT_VALID, device=q.device)
+    segments = torch.tensor(SEGMENT_INDICES, device=q.device)
     live = torch.arange(tiles * tile, device=q.device) % tile < (
         valid.repeat_interleave(tile)
     )
@@ -101,12 +101,12 @@ def region_reference(q, k, v, gate):
         )
     scores = means[0] @ means[1].transpose(-1, -2) / width**0.5
     occupied = valid > 0
-    dense, video = occupied & (regions < 0), occupied & (regions >= 0)
+    dense, video = occupied & (segments < 0), occupied & (segments >= 0)
     mask = torch.zeros(heads, tiles, tiles, dtype=torch.bool, device=q.device)
     mask[:, dense] = occupied
     mask[:, video] = dense
-    for region, kept in enumerate(REGION_KEEP):
-        members = torch.nonzero(regions == region).flatten()
+    for segment, kept in enumerate(SEGMENT_KEEP):
+        members = torch.nonzero(segments == segment).flatten()
         best = scores[:, :, members].topk(kept, dim=-1).indices
         chosen = torch.zeros_like(mask)
         chosen.scatter_(-1, members[best], True)

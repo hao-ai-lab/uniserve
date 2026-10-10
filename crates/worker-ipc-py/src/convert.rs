@@ -780,8 +780,8 @@ fn latent_params_to_py<'py>(
     construct(py, "LatentParams", &dict)
 }
 
-/// Converts the cursor and unit bound of one diffusion decode call into a
-/// Python `DecodeRange` record.
+/// Converts the cursor, unit bound and holding ranks of one diffusion decode
+/// call into a Python `DecodeRange` record.
 fn decode_range_to_py<'py>(
     py: Python<'py>,
     params: &DecodeRange,
@@ -798,6 +798,10 @@ fn decode_range_to_py<'py>(
     )?;
     dict.set_item(intern!(py, "cursor"), params.cursor)?;
     dict.set_item(intern!(py, "max_units"), params.max_units)?;
+    dict.set_item(
+        intern!(py, "ranks"),
+        pyo3::types::PyTuple::new(py, &params.ranks)?,
+    )?;
     construct(py, "DecodeRange", &dict)
 }
 
@@ -1594,6 +1598,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
             "compute_error" => ErrorCode::ComputeError,
             "cancelled" => ErrorCode::Cancelled,
             "internal" => ErrorCode::Internal,
+            "invalid_request" => ErrorCode::InvalidRequest,
             _ => return None,
         }),
     };
@@ -1661,6 +1666,10 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
         status,
         product_generations: u32_vec(&get(dict, intern!(py, "product_generations"))?)?,
         error_code,
+        error_message: match get(dict, intern!(py, "error_message")) {
+            Some(value) if !value.is_none() => Some(string_of(&value)?),
+            _ => None,
+        },
         timing_counters,
         code: {
             let name = string_of(&get(dict, intern!(py, "code"))?)?;
@@ -2527,6 +2536,7 @@ mod tests {
                 status: CallStatus::Ok,
                 product_generations: vec![5],
                 error_code: None,
+                error_message: None,
                 timing_counters: TimingCounters::default(),
                 code: CallKind::Forward(ForwardMode::Decode),
                 position: 2,

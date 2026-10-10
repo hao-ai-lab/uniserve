@@ -275,48 +275,9 @@ impl WorkerEndpoint {
     }
 }
 
-/// Python package of the weightless stub model, the one model that reports
-/// no checkpoint identity because it loads no checkpoint.
-const STUB_MODEL_PREFIX: &str = "uniserve_models.stub";
-
-/// Whole-tile condition packing of a multi-region video denoiser.
-///
-/// Each condition occupies whole tiles of `rows` rows: its audio rows fill
-/// tiles of their own, then an image's rows fill tiles, while a video's
-/// `(latent frames, height, width)` token grid is cut into tiles of `video`
-/// tokens along those axes, each tile taking `rows` rows however few tokens
-/// it holds. A condition's packed rows are its tile count times `rows`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConditionTiles {
-    /// Rows of one tile.
-    pub rows: u32,
-    /// Tokens of one video tile along latent frames, height and width; their
-    /// product is `rows`.
-    pub video: [u32; 3],
-}
-
-impl ConditionTiles {
-    /// Packed rows of a condition with `audio_rows` audio rows and either
-    /// `image_rows` image rows or a video token grid `(frames, height,
-    /// width)`.
-    pub fn rows(&self, audio_rows: u32, image_rows: u32, video_grid: Option<[u32; 3]>) -> u64 {
-        let tiles = |count: u32, size: u32| u64::from(count.div_ceil(size));
-        let visual = match video_grid {
-            Some(grid) => grid
-                .iter()
-                .zip(self.video)
-                .map(|(&extent, size)| tiles(extent, size))
-                .product(),
-            None => tiles(image_rows, self.rows),
-        };
-        (tiles(audio_rows, self.rows) + visual) * u64::from(self.rows)
-    }
-}
-
 /// What the video denoiser a deployment places serves.
 ///
-/// The denoiser fixes its schedule, so requests may only restate it; the
-/// tasks, canvases, condition packing and sequence capacity bound what
+/// The denoiser fixes its schedule; the tasks and canvases bound what
 /// admission accepts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
@@ -333,20 +294,11 @@ pub struct VideoDenoiserInfo {
     /// declares every canvas of the model's canvas rule.
     #[serde(default)]
     pub canvases: Vec<uniserve_core::Canvas>,
-    /// The checkpoint's packed sequence capacity in rows, when it has one.
-    #[serde(default)]
-    pub max_sequence_rows: Option<u32>,
-    /// How the denoiser packs condition rows: in whole tiles for a
-    /// multi-region denoiser, or densely, one row per condition token, when
-    /// absent.
-    #[serde(default)]
-    pub condition_tiles: Option<ConditionTiles>,
 }
 
 impl VideoDenoiserInfo {
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, every canvas and the capacity are
-    /// positive, and condition tiles are video tiles of their row count.
+    /// and positive finite shifts, and every canvas is positive.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -364,22 +316,8 @@ impl VideoDenoiserInfo {
         ensure_valid!(
             self.canvases
                 .iter()
-                .all(|canvas| canvas.width > 0 && canvas.height > 0)
-                && self.max_sequence_rows != Some(0),
-            "a video denoiser declares an empty canvas or sequence capacity"
-        );
-        ensure_valid!(
-            self.condition_tiles.is_none_or(|tiles| {
-                tiles.rows > 0
-                    && tiles.video.iter().all(|&size| size > 0)
-                    && tiles
-                        .video
-                        .iter()
-                        .map(|&size| u64::from(size))
-                        .product::<u64>()
-                        == u64::from(tiles.rows)
-            }),
-            "a video denoiser's condition tiles are not video tiles of their rows"
+                .all(|canvas| canvas.width > 0 && canvas.height > 0),
+            "a video denoiser declares an empty canvas"
         );
         Ok(())
     }
@@ -430,11 +368,6 @@ pub struct WorkerInfo {
     /// Resolved activation quantization formats on this physical rank.
     #[serde(default)]
     pub activation_formats: Vec<String>,
-    /// Identity of the loaded checkpoint files: the lowercase hex SHA-256 the
-    /// checkpoint identity rule defines over the checkpoint directory. The
-    /// weightless stub model reports none; every other worker must.
-    #[serde(default)]
-    pub checkpoint_identity: String,
     /// Finalized component membership and logical degrees.
     #[serde(default)]
     pub components: Vec<ComponentInfo>,
@@ -660,20 +593,6 @@ impl WorkerInfo {
 
         // Model identity remains mandatory independently of enabled resources.
         ensure_valid!(!self.model_name.is_empty(), "worker model name is empty");
-        // Only the stub model has no checkpoint behind it; a served checkpoint
-        // must be identified so ranks can be held to the same one.
-        ensure_valid!(
-            if self.checkpoint_identity.is_empty() {
-                self.model_name.starts_with(STUB_MODEL_PREFIX)
-            } else {
-                self.checkpoint_identity.len() == 64
-                    && self
-                        .checkpoint_identity
-                        .bytes()
-                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-            },
-            "worker checkpoint identity is missing or malformed"
-        );
         Ok(())
     }
 }
@@ -701,7 +620,6 @@ impl Default for WorkerInfo {
             attention_backend: String::new(),
             weight_formats: Vec::new(),
             activation_formats: Vec::new(),
-            checkpoint_identity: "0".repeat(64),
             components: Vec::new(),
             supported_calls: vec![
                 CallKind::Forward(ForwardMode::Prefill),

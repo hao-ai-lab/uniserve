@@ -159,13 +159,6 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
 
-    /// Local copy of the base checkpoint that a component export (such as
-    /// FastH3 OmniRef) pins for its other components. The server and the
-    /// workers verify its revision from its Hugging Face download records;
-    /// without it they read the pinned revision from the Hugging Face cache.
-    #[arg(long, value_name = "PATH")]
-    pub base_model: Option<std::path::PathBuf>,
-
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
     #[arg(long = "max-model-len")]
@@ -198,15 +191,13 @@ pub(crate) struct SharedRuntimeArgs {
     /// Most denoiser rows the conditions of one video request may take: a
     /// capacity video workers provision their condition products, request
     /// slots and largest denoiser layout for, advertised as
-    /// `max_condition_rows`. The default holds two keyframes on the largest
-    /// canvas, every `fl2va` request; a `ref2va` deployment raises it to the
-    /// rows its references take, about 38,000 for a five-second reference
-    /// video with its soundtrack.
-    #[arg(
-        long = "max-condition-rows",
-        default_value_t = uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS
-    )]
-    pub max_condition_rows: u32,
+    /// `max_condition_rows`. Without it the workers provision the largest
+    /// condition set their denoiser admits (two keyframes for `fl2va`, nine
+    /// images and three videos with soundtracks for `ref2va`), so no request
+    /// is refused for its conditions and a machine that cannot hold that
+    /// set fails at startup; state a smaller capacity to serve less.
+    #[arg(long = "max-condition-rows")]
+    pub max_condition_rows: Option<u32>,
     /// Directory that `file://` condition media of video requests resolves
     /// under. Without it, `file://` media is refused.
     #[arg(long = "media-directory", value_name = "DIR")]
@@ -474,7 +465,6 @@ impl SharedRuntimeArgs {
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
-        worker_process.base_model = self.base_model.clone();
         let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
         worker_process.resp_slot_cap = self.resp_slot_cap;
@@ -535,7 +525,6 @@ impl SharedRuntimeArgs {
         Config {
             engine,
             model,
-            base_model: self.base_model,
             served_model_name: self.served_model_name,
             listener_mode,
             chat_template: self.chat_template,
@@ -993,23 +982,6 @@ mod tests {
             worker.quantization_config["components"]["transformer.mlp"],
             "nvfp4"
         );
-    }
-
-    #[test]
-    fn serve_forwards_a_local_base_checkpoint() {
-        let parsed = <Cli as clap::Parser>::try_parse_from([
-            "uniserve",
-            "serve",
-            "/models/FastH3-OmniRef",
-            "--base-model",
-            "/models/MiniMax-H3",
-        ])
-        .expect("component export with a local base");
-        let Command::Serve(args) = parsed.command;
-        let config = args.to_uniserve_config();
-        let base = Some(std::path::PathBuf::from("/models/MiniMax-H3"));
-        assert_eq!(config.base_model, base);
-        assert_eq!(config.engine.worker_process.base_model, base);
     }
 
     #[test]

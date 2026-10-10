@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from uniserve.model import ConditionTiles
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.protocol.call import (
@@ -297,11 +296,7 @@ class VideoDenoiserInfo:
 
     Mirrors the Rust ``VideoDenoiserInfo``. ``schedule_points`` counts the
     fixed schedule's sigma points, the clean endpoint included; ``canvases``
-    lists the only canvases the deployment serves, those it prepares;
-    ``max_sequence_rows`` is the checkpoint's packed sequence capacity,
-    ``None`` when the checkpoint sets none; ``condition_tiles`` is the
-    whole-tile condition packing of a multi-region denoiser, ``None`` for
-    dense packing.
+    lists the only canvases the deployment serves, those it prepares.
     """
 
     tasks: tuple[str, ...]
@@ -309,8 +304,6 @@ class VideoDenoiserInfo:
     video_shift: float
     audio_shift: float
     canvases: tuple[tuple[int, int], ...] = ()
-    max_sequence_rows: int | None = None
-    condition_tiles: ConditionTiles | None = None
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -322,37 +315,11 @@ class VideoDenoiserInfo:
                 {"width": width, "height": height}
                 for width, height in self.canvases
             ],
-            "max_sequence_rows": self.max_sequence_rows,
-            "condition_tiles": None
-            if self.condition_tiles is None
-            else {
-                "rows": self.condition_tiles.rows,
-                "video": list(self.condition_tiles.video),
-            },
         }
 
     @classmethod
     def from_mapping(cls, value: object, where: str) -> VideoDenoiserInfo:
         data = _map(value, where)
-        rows = data.get("max_sequence_rows")
-        tiles = data.get("condition_tiles")
-        if tiles is not None:
-            tiles = _map(tiles, f"{where}.condition_tiles")
-            video = tuple(
-                _uint(size, f"{where}.condition_tiles.video")
-                for size in _seq(
-                    tiles.get("video", ()), f"{where}.condition_tiles.video"
-                )
-            )
-            try:
-                tiles = ConditionTiles(
-                    _uint(tiles.get("rows"), f"{where}.condition_tiles.rows"),
-                    video,  # type: ignore[arg-type]
-                )
-            except ValueError as error:
-                raise invalid_descriptor(
-                    f"{where}.condition_tiles: {error}"
-                ) from None
         return cls(
             tasks=tuple(
                 _str(task, f"{where}.tasks")
@@ -375,10 +342,6 @@ class VideoDenoiserInfo:
                     )
                 )
             ),
-            max_sequence_rows=None
-            if rows is None
-            else _uint(rows, f"{where}.max_sequence_rows"),
-            condition_tiles=tiles,
         )
 
 
@@ -431,12 +394,6 @@ class WorkerInfo:
     attention_backend: str = ""
     weight_formats: tuple[str, ...] = ()
     activation_formats: tuple[str, ...] = ()
-    # Identity of the loaded checkpoint files, distinct from the resolved
-    # execution configuration: a lowercase hex SHA-256, or empty for a model
-    # loaded without a checkpoint. The worker-ipc crate's
-    # `WorkerInfo::validate` accepts an empty identity only from the weightless
-    # stub model.
-    checkpoint_identity: str = ""
     components: tuple[ComponentInfo, ...] = ()
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
@@ -454,9 +411,12 @@ class WorkerInfo:
         """Return the rank that publishes a component's host products.
 
         Host products belong to the component's first member rank, the rank
-        whose reports the engine's `WorkerGroup` joins a call's results on.
-        Cooperative numerical outputs may reside on other ranks. A
-        single-rank worker without the component resolves to rank 0.
+        whose reports the engine's `WorkerGroup` joins a call's results on
+        whenever the call runs there. A call whose units are dealt to other
+        ranks publishes no host product, and the engine joins it on the
+        first rank it is dealt to. Cooperative numerical outputs may reside
+        on other ranks. A single-rank worker without the component resolves
+        to rank 0.
 
         Raises:
             WorkerError: `unsupported_setup` when the component is not
@@ -583,12 +543,6 @@ class WorkerInfo:
 
         if not self.model_name:
             raise invalid_descriptor("worker model name is empty")
-        if self.checkpoint_identity and not _is_sha256_hex(
-            self.checkpoint_identity
-        ):
-            raise invalid_descriptor(
-                "worker checkpoint identity must be a lowercase hex SHA-256"
-            )
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "info") -> WorkerInfo:
@@ -634,10 +588,6 @@ class WorkerInfo:
                 for value in _seq(
                     data.get("weight_formats", ()), f"{where}.weight_formats"
                 )
-            ),
-            checkpoint_identity=_str(
-                data.get("checkpoint_identity", ""),
-                f"{where}.checkpoint_identity",
             ),
             components=tuple(
                 ComponentInfo.from_mapping(item, f"{where}.components[{index}]")
@@ -738,7 +688,6 @@ class WorkerInfo:
             "attention_backend": self.attention_backend,
             "weight_formats": list(self.weight_formats),
             "activation_formats": list(self.activation_formats),
-            "checkpoint_identity": self.checkpoint_identity,
             "components": [
                 component.to_mapping() for component in self.components
             ],
@@ -819,13 +768,6 @@ def _str(value: object, where: str) -> str:
     if not isinstance(value, str):
         raise invalid_descriptor(f"{where} must be a string")
     return value
-
-
-def _is_sha256_hex(value: str) -> bool:
-    """Report whether text is the lowercase hex form of one SHA-256 digest."""
-    return len(value) == 64 and all(
-        character in "0123456789abcdef" for character in value
-    )
 
 
 __all__ = [

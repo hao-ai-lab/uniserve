@@ -147,8 +147,6 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         video_shift: 12.0,
         audio_shift: 3.0,
         canvases: Vec::new(),
-        max_sequence_rows: None,
-        condition_tiles: None,
     });
     // The denoiser's latent pool holds the reserved sentinel page plus two
     // pages of samples per request slot.
@@ -931,10 +929,11 @@ fn leading(product: &uniserve_worker_ipc::TensorRef) -> u32 {
 
 /// A reference request reads its media first, then encodes its vision blocks
 /// before the text that splices them in, encodes its visual condition units
-/// in rounds across the latent encoder's ranks and its audio tracks in one
-/// further call, and prepares its latents from the text features and every
-/// condition's rows, in order. Each product carries the request's exact
-/// size, and each call names the components its graph reads it with.
+/// in rounds on the latent encoder's ranks that the prompt's encoding leaves
+/// free, and its audio tracks in one further call, and prepares its latents
+/// from the text features and every condition's rows, in order. Each product
+/// carries the request's exact size, and each call names the components its
+/// graph reads it with.
 #[test]
 fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let request = RequestId(5);
@@ -973,6 +972,16 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
         vision[0] < text[0],
         "the vision tokens precede the text encoding"
     );
+    // The text encoding is submitted once its vision features exist, so it
+    // never waits in its worker's queue ahead of other calls.
+    let (text_submission, text_batch) = served.submissions_of(request, MediaCall::TextEncoding)[0];
+    assert!(
+        !text_batch
+            .in_flight
+            .iter()
+            .any(|call| call.is(request, MediaCall::VisionEncoding)),
+        "the text encoding was submitted while the vision encoding was in flight"
+    );
 
     // The vision encoding reads the patches and writes one row per token;
     // the text encoding reads those features.
@@ -982,21 +991,61 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let (text_call, _) = &served.calls[text[0]];
     assert_eq!(text_call.inputs, vision_call.outputs);
 
-    // Four visual units over two ranks: two rounds of two units writing the
-    // rows of their own units, then the audio call writing both tracks.
-    let rounds = latents
-        .iter()
-        .map(|index| {
-            let (call, placement) = &served.calls[*index];
-            let range = placement.decode.as_ref().unwrap();
-            (range.cursor, range.max_units, leading(&call.outputs[0]))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(rounds, [(0, 2, 2 + 10), (2, 2, 10 + 4), (0, 1, 80)]);
-    for index in &latents[..2] {
-        assert_eq!(served.calls[*index].0.inputs, [read.outputs[0].clone()]);
+    // Four visual units, one per rank of each round: the rounds cover them
+    // in order, each writing the rows of its own units, then the audio call
+    // writes both tracks on one rank.
+    const UNIT_ROWS: [u32; 4] = [2, 10, 10, 4];
+    let (audio, rounds) = latents.split_last().unwrap();
+    let mut cursor = 0;
+    for index in rounds {
+        let (call, placement) = &served.calls[*index];
+        let range = placement.decode.as_ref().unwrap();
+        assert_eq!(range.cursor, cursor);
+        let rows = &UNIT_ROWS[cursor as usize..(cursor + range.max_units) as usize];
+        assert_eq!(leading(&call.outputs[0]), rows.iter().sum::<u32>());
+        assert_eq!(range.ranks.len() as u32, range.max_units);
+        assert!(range.ranks.iter().all(|rank| *rank < 2));
+        assert_eq!(call.inputs, [read.outputs[0].clone()]);
+        cursor += range.max_units;
     }
-    assert_eq!(served.calls[latents[2]].0.inputs, [read.outputs[1].clone()]);
+    assert_eq!(cursor, UNIT_ROWS.len() as u32);
+    let (audio_call, audio_placement) = &served.calls[*audio];
+    let range = audio_placement.decode.as_ref().unwrap();
+    assert_eq!(
+        (range.cursor, range.max_units, range.ranks.len()),
+        (0, 1, 1)
+    );
+    assert_eq!(leading(&audio_call.outputs[0]), 80);
+    assert_eq!(audio_call.inputs, [read.outputs[1].clone()]);
+
+    // A latent encoding call is dealt only to free ranks. Rank 0 encodes
+    // the prompt, so until the text encoding has completed a call names
+    // rank 1 alone, and none is submitted while an earlier one holds rank 1
+    // as well. The first round starts beside the vision encoding.
+    let dealt = served.submissions_of(request, MediaCall::LatentEncoding);
+    assert_eq!(dealt.len(), latents.len());
+    let beside = |submission: &Submission, media_call| {
+        submission
+            .in_flight
+            .iter()
+            .any(|call| call.is(request, media_call))
+    };
+    assert!(
+        dealt[0].0 < text_submission,
+        "the first round waited for the text encoding"
+    );
+    for ((position, submission), index) in dealt.iter().zip(&latents) {
+        let prompt_encoded =
+            *position > text_submission && !beside(submission, MediaCall::TextEncoding);
+        if !prompt_encoded {
+            let range = served.calls[*index].1.decode.as_ref().unwrap();
+            assert_eq!(range.ranks, [1]);
+            assert!(
+                !beside(submission, MediaCall::LatentEncoding),
+                "a call was dealt to a rank that held an earlier one"
+            );
+        }
+    }
 
     // Latent preparation follows every encoding and reads the text features,
     // the visual rounds in unit order, then the audio rows.
@@ -1077,6 +1126,27 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
             && message.contains(&(3 * MAX_CONDITION_ROWS + 2).to_string()),
         "{message}"
     );
+}
+
+/// A worker that refuses a request's admitted size states why: the request
+/// is rejected as invalid with that reason, and a request admitted beside it
+/// still completes.
+#[test]
+fn a_request_the_worker_refuses_is_rejected_with_its_reason() {
+    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
+    let mut sim = video_worker(2, 2);
+    let reason = "the conditions take 46848 rows, more than the 40960 this worker provisions";
+    sim.refuse_request(RequestId(1), reason);
+    let served = serve(sim, vec![reference_request(1, &media), video_request(2, 2)]);
+
+    let refused = served.outcomes[&RequestId(1)]
+        .iter()
+        .find_map(|event| match event {
+            EngineCoreOutput::Rejected { kind, message } => Some((*kind, message.clone())),
+            _ => None,
+        });
+    assert_eq!(refused, Some((RejectionKind::Invalid, reason.to_owned())));
+    served.assert_completed(RequestId(2));
 }
 
 /// A `t2va` request of two media units at `canvas`.

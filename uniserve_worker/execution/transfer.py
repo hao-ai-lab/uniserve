@@ -527,8 +527,10 @@ def publish_deferred_product(
     """Publish a product whose write host work filled after its call committed.
 
     The committed call released its execution references, so the caller
-    hands over the write it retained. The product is published as host
-    bytes, registered for retirement, and committed here; the caller reports
+    hands over the write it retained. The product is published where its
+    write lies: a device rank's write over the device transport, which
+    ranks on other hosts read too, and a host rank's write as host bytes.
+    It is registered for retirement and committed here; the caller reports
     the publication with the completion the work belongs to. If only regions
     are initialized, publish those views at their logical offsets. Consumers
     must read these regions rather than the uninitialized reserved capacity.
@@ -584,7 +586,7 @@ def publish_deferred_product(
                         )
                     ),
                     consumers=consumers,
-                    host=True,
+                    host=not value.is_cuda,
                 )
             )
     except BaseException:

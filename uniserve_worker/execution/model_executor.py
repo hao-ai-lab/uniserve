@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     from uniserve.runtime.weight_prefetch import WeightPrefetch
     from uniserve_worker.model_executor.canvas_runner import CanvasRunner
     from uniserve_worker.model_executor.cuda_graph import Execution
+    from uniserve_worker.model_executor.encoder_runner import EncoderRunner
     from uniserve_worker.model_executor.media_inputs import MediaBuilder
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.canvas_slots import CanvasSlots
@@ -303,6 +304,12 @@ class ModelExecutor:
         # Transient work areas the startup contexts of one (entry, path,
         # method) borrow on that entry's stream; see ``prepare_module``.
         self._module_scratch: dict[tuple[str, str, str], Scratch] = {}
+        # Replays of the still-frame tile encodings startup captured, by
+        # ``SpatialEncoder``; every context prepared afterwards binds them
+        # (see ``capture_tiles``).
+        self._tile_operators: dict[
+            nn.Module, Callable[[torch.Tensor], torch.Tensor]
+        ] = {}
 
         self._lane_streams: list[tuple[LaneConfig | None, CUDAStream]] = []
         self._preparation_stream: torch.cuda.Stream | None = None
@@ -503,6 +510,7 @@ class ModelExecutor:
                 # Serving inputs carry their host sequence lengths; a call
                 # that lacks one fails rather than copying it from the device.
                 derive_host_lengths=False,
+                tiles=self._tile_operators,
             )
             # An entry given graph devices captures a graph the first time it
             # executes each input signature during startup
@@ -1881,7 +1889,38 @@ class ModelExecutor:
             self.prepare_text_capacities()
             warmup_decoders(self)
             warmup_postprocess(self, storage)
+        self.capture_tiles()
         self.synchronize()
+
+    def capture_tiles(self):
+        """Capture every video encoder's still-frame tile encoding.
+
+        A still frame encodes as a run of same-shape tiles, each many small
+        kernels, so its eager encoding is bound by the host launching them.
+        A video encoder that tiles still frames (``VideoEncoder.still_tile``)
+        captures one tile in a startup context of its entry, and every
+        context the entry prepares afterwards binds the replay, so a still
+        frame's tiles run at device speed. Video clips' tiles stay eager:
+        their encoding already keeps the device busy, and a graph would hold
+        a clip tile's activations resident. Without graph pools nothing is
+        captured.
+        """
+        for (name, path, method), (binding, call) in self._module_calls.items():
+            module = call.module
+            if method != "encode" or not isinstance(module, VideoEncoder):
+                continue
+            tile = module.still_tile(binding.device)
+            if tile is None:
+                continue
+            encoder, pixels = tile
+            runner = self.prepare_module(
+                name, tuple(pixels.shape), method=method, path=path
+            )
+            operator = cast("EncoderRunner", runner).capture_tile(
+                encoder, pixels
+            )
+            if operator is not None:
+                self._tile_operators[encoder] = operator
 
     @torch.inference_mode()
     def capture(self, *, tokenizer, latents):

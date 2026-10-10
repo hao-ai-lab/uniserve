@@ -936,6 +936,10 @@ pub enum ErrorCode {
     Cancelled = 3,
     /// An invariant failed within the worker.
     Internal = 4,
+    /// The worker refuses the request itself: its admitted size does not fit
+    /// what the worker's model serves or provisioned, such as conditions
+    /// beyond the condition capacity. The completion states why.
+    InvalidRequest = 5,
 }
 
 /// Device-observed finish candidates for a token call.
@@ -1009,6 +1013,10 @@ pub struct RequestOutput {
     pub product_generations: Vec<u32>,
     /// Error classification when `status` is [`CallStatus::Error`].
     pub error_code: Option<ErrorCode>,
+    /// Why the worker refused the request, exactly when `error_code` is
+    /// [`ErrorCode::InvalidRequest`].
+    #[serde(default)]
+    pub error_message: Option<String>,
     /// Worker timing measurements for the call.
     pub timing_counters: TimingCounters,
     /// Kind that produced this result; must match the submitted call.
@@ -1072,6 +1080,10 @@ impl RequestOutput {
                 "a non-error completion must not carry an error code"
             ),
         }
+        ensure_valid!(
+            self.error_message.is_some() == (self.error_code == Some(ErrorCode::InvalidRequest)),
+            "a refused request's completion, and only one, states why"
+        );
         ensure_valid!(
             self.candidate_logprobs.is_empty()
                 || (self.status == CallStatus::Ok
@@ -1588,10 +1600,17 @@ pub struct DecodeRange {
     pub cursor: u32,
     /// Maximum decoder units the call may process.
     pub max_units: u32,
+    /// Ranks of a distributed component that hold the call's units, in unit
+    /// order: each takes the next `units_per_rank` units and the last what
+    /// remains. Empty deals the units to the component's ranks in configured
+    /// order, the deal of every call whose units follow that order.
+    #[serde(default)]
+    pub ranks: Vec<u32>,
 }
 
 impl DecodeRange {
-    /// Validates decode identity and unit capacity.
+    /// Validates decode identity, unit capacity, and that no rank holds two
+    /// runs of the call's units.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.call_id.batch_id > 0,
@@ -1600,6 +1619,10 @@ impl DecodeRange {
         ensure_valid!(
             self.max_units > 0,
             "decode params unit bound must be positive"
+        );
+        ensure_valid!(
+            self.ranks.iter().collect::<HashSet<_>>().len() == self.ranks.len(),
+            "decode params name each rank once"
         );
         Ok(())
     }

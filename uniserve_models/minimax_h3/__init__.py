@@ -5,13 +5,13 @@ optional image, video and audio conditions. The package composes
 independently placeable components (see ``entry_points``): the Qwen text
 encoder, one denoiser per DiT partition the checkpoint holds (each with its
 token refiner), the video decoder with its RGB post-processor, and the audio
-decoder. ``read_config`` recognizes the checkpoint layout and normalizes its
-JSON sidecars, ``base_checkpoint`` names the pinned base a component export
-draws its other components from, and ``checkpoint_mappings`` maps its
-tensors onto the modules.
+decoder. ``read_config`` recognizes the base release or a FastH3 export and
+normalizes its JSON sidecars, ``base_checkpoint`` names the base revision a
+FastH3 export reads its omitted components from, and
+``checkpoint_mappings`` maps the tensors onto the modules.
 """
 
-from .attention import Dense, RegionSparse, Sparse
+from .attention import Dense, SegmentSparse, Sparse
 from .checkpoint import base_checkpoint
 from .conditioning import Conditioner, RefinerBlock, TokenRefiner
 from .config import (
@@ -31,13 +31,13 @@ from .inputs import (
     AttentionInput,
     DenoiserInput,
     DenoiserSize,
-    RegionInput,
+    SegmentInput,
     SequenceInput,
 )
 from .model import Model, entry_points
 from .modulation import OutputNorm, TimestepEmbedding
 from .output import VideoPostprocessor
-from .packing import DensePacking, RegionPacking, TilePacking
+from .packing import DensePacking, SegmentPacking, TilePacking
 from .precision import checkpoint_precision, precisions, weight_config
 from .transformer import StepProjection, Transformer, TransformerLayer
 from .weights import checkpoint_mappings, checkpoint_sources
@@ -56,7 +56,7 @@ __all__ = [
     "Model",
     "Config",
     "Dense",
-    "RegionSparse",
+    "SegmentSparse",
     "Sparse",
     "Conditioner",
     "RefinerBlock",
@@ -74,13 +74,13 @@ __all__ = [
     "AttentionInput",
     "DenoiserInput",
     "DenoiserSize",
-    "RegionInput",
+    "SegmentInput",
     "SequenceInput",
     "OutputNorm",
     "TimestepEmbedding",
     "VideoPostprocessor",
     "DensePacking",
-    "RegionPacking",
+    "SegmentPacking",
     "TilePacking",
     "StepProjection",
     "Transformer",

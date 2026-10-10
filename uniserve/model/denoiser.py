@@ -22,39 +22,6 @@ InputT = TypeVar("InputT", bound=DenoiserInput)
 SizeT = TypeVar("SizeT")
 
 
-@dataclass(frozen=True, slots=True)
-class ConditionTiles:
-    """Whole-tile condition packing of a multi-region video denoiser.
-
-    Each condition occupies whole tiles of ``rows`` rows: its audio rows
-    fill tiles of their own, then an image's rows fill tiles, while a
-    video's ``(latent frames, height, width)`` token grid is cut into tiles
-    of ``video`` tokens along those axes, each taking ``rows`` rows however
-    few tokens it holds. A keyframe has no place in such a packing.
-
-    Attributes:
-        rows: Rows of one tile.
-        video: Tokens of one video tile along latent frames, height and
-            width; their product is ``rows``.
-    """
-
-    rows: int
-    video: tuple[int, int, int]
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.rows) is not int
-            or self.rows < 1
-            or len(self.video) != 3
-            or any(type(size) is not int or size < 1 for size in self.video)
-            or self.video[0] * self.video[1] * self.video[2] != self.rows
-        ):
-            raise ValueError(
-                "condition tiles need positive video tile sides whose "
-                "product is the tile's rows"
-            )
-
-
 class ConditionRole(StrEnum):
     """How a conditioning input relates to the generated video."""
 
@@ -333,20 +300,19 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         """
         raise NotImplementedError
 
-    @property
-    def max_sequence_rows(self) -> int | None:
-        """The checkpoint's packed sequence capacity, or None without one."""
-        raise NotImplementedError
+    def max_conditions(
+        self, num_frames: int, canvas: image.Config
+    ) -> tuple[Condition, ...]:
+        """The largest condition set a request of this network may carry.
 
-    @property
-    def condition_tiles(self) -> ConditionTiles | None:
-        """How ``make_size`` counts condition rows.
-
-        ``None`` packs conditions densely, one row per condition token; a
-        multi-region network returns the whole tiles it packs them in. A
-        serving owner admits requests by the same count.
+        Returns the conditions, among those a request generating
+        ``num_frames`` frames on ``canvas`` may bring under the network's
+        tasks, whose packed rows (``make_size``) are the most. A serving
+        owner that states no smaller condition capacity provisions for them,
+        so it refuses no request for its conditions. Empty for a network
+        without a conditioned task.
         """
-        return None
+        return ()
 
     def text_condition_rows(self, layout: VideoSizeT) -> int:
         """Rows of a request's retained conditioning in ``layout``.
@@ -417,8 +383,7 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         sizes the layout that bounds its condition capacity this way.
 
         Raises:
-            ValueError: The network takes no conditions, or the widened
-                layout exceeds ``max_sequence_rows``.
+            ValueError: The network takes no conditions.
         """
         raise ValueError("this network takes no conditioning inputs")
 

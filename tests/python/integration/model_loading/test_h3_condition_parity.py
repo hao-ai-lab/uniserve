@@ -81,9 +81,9 @@ EAGER_MARGIN = 48 << 30
 # Each workload's denoiser, duration, text capacity and the condition rows
 # its worker provisions, enough for the workload's own conditions.
 WORKLOADS = {
-    "fl2va_first_8s": ("denoiser", 8.0, 2048, 1024),
-    "ref2va_image_audio_5s": ("reference_denoiser", 5.0, 8192, 40_960),
-    "ref2va_video_audio_5s": ("reference_denoiser", 5.0, 8192, 40_960),
+    "fl2va_first_8s": ("transformer", 8.0, 2048, 1024),
+    "ref2va_image_audio_5s": ("transformer_ref", 5.0, 8192, 40_960),
+    "ref2va_video_audio_5s": ("transformer_ref", 5.0, 8192, 40_960),
 }
 
 

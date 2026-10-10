@@ -276,3 +276,53 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
     for owner in owners:
         if owner is not None:
             owner.close()
+
+
+class ChannelsLastConvolution(nn.Module):
+    """A convolution whose weight is declared in channels-last storage."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.convolution = nn.Conv3d(2, 3, 2, bias=False)
+        self.convolution.weight = nn.Parameter(
+            self.convolution.weight.detach().contiguous(
+                memory_format=torch.channels_last_3d
+            )
+        )
+
+
+@pytest.mark.parametrize("mode", ["eager", "layered"])
+def test_loaded_weight_keeps_its_declared_channels_last_storage(tmp_path, mode):
+    weight = torch.arange(48, dtype=torch.float32).reshape(3, 2, 2, 2, 2)
+    save_file({"weight": weight}, tmp_path / "model.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"weight": "model.safetensors"}})
+    )
+
+    def mapping(model):
+        layer = model.convolution
+        return (
+            weights.ModuleMapping(
+                layer,
+                "primary",
+                lambda reader: (
+                    weights.Assignment(layer.weight, reader.get("weight")),
+                ),
+                frozenset({"weight"}),
+            ),
+        )
+
+    io = replace(loading.Config(), mode=mode)
+    loaded = loading.load_model(
+        ChannelsLastConvolution,
+        Config(),
+        checkpoint=(checkpoint.Config().resolve(tmp_path, io=io),),
+        mapping=mapping,
+        device="cpu",
+        weights=weights.Config(dtype=torch.float32),
+        io=io,
+    ).model.convolution.weight
+
+    assert torch.equal(loaded, weight)
+    assert loaded.is_contiguous(memory_format=torch.channels_last_3d)
+    assert not loaded.is_contiguous()

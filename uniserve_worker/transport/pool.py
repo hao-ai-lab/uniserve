@@ -403,6 +403,7 @@ class TransferPool:
         Runs on a transport thread, inside the `call` given to `submit`. A
         CPU destination is copied synchronously and completes the ticket with
         no fence. A CUDA destination is copied on this thread's read stream,
+        from pinned or pageable host memory or from device memory,
         ordered after the caller's destination stream recorded by `submit`
         and after `producer`; the ticket completes with a fence recorded on
         the read stream, and this thread then waits for the fence and drains
@@ -469,15 +470,31 @@ class TransferPool:
                     ticket._destination_stream = None
                 if producer is not None:
                     stream.wait_event(producer)
+                # Pinned staging of pageable spans that cannot be copied in one
+                # piece; the stream drain below retires their DMA before the
+                # buffers are dropped.
+                staged = []
                 for target, value in pairs:
-                    if value.device.type == "cpu":
-                        from uniserve_kernels.peer_storage import (
-                            copy_host_device,
-                        )
-
-                        copy_host_device(target, value, stream)
-                    else:
+                    if value.device.type != "cpu":
                         target.copy_(value, non_blocking=True)
+                        continue
+                    from uniserve_kernels.peer_storage import copy_host_device
+
+                    if value.is_pinned():
+                        copy_host_device(target, value, stream)
+                    elif value.is_contiguous() and target.is_contiguous():
+                        # A contiguous pageable source is consumed before the
+                        # copy call returns and needs no device temporary.
+                        target.copy_(value, non_blocking=True)
+                    else:
+                        # The strided DMA reaches reserved pages without a
+                        # device packing buffer, but only from pinned memory.
+                        pinned = torch.empty(
+                            value.shape, dtype=value.dtype, pin_memory=True
+                        )
+                        pinned.copy_(value)
+                        copy_host_device(target, pinned, stream)
+                        staged.append(pinned)
                 if acknowledgment is not None:
                     # A pinned host word makes this a memcpy on the read
                     # stream. Filling the word would launch a kernel, and the

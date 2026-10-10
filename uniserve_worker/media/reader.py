@@ -7,9 +7,10 @@ reference conditioning applies, in its order, so the results equal the
 reference's own:
 
 - ``read_image``: PIL decoding with the EXIF orientation applied and RGB
-  conversion (diffusers' ``load_image``), then a LANCZOS resize and the
-  planned crop (``ImageFit``): a stretched keyframe, a cover-cropped one,
-  or an image reference at its 2048-pixel short edge.
+  conversion (diffusers' ``load_image``), then Pillow's LANCZOS resize, run
+  on several threads (``resample.lanczos``), and the planned crop
+  (``ImageFit``): a stretched keyframe, a cover-cropped one, or an image
+  reference at its 2048-pixel short edge.
 - ``read_video``: one FFmpeg pass resampling the video to 24 fps, skipping
   the planned start frames and scaling onto the planned canvas with LANCZOS
   (``fps=24,trim=start_frame=S,scale=W:H:flags=lanczos,setsar=1``) to RGB24.
@@ -77,20 +78,22 @@ def read_image(data: bytes, fit: ImageFit) -> np.ndarray:
     """
     from PIL import Image, ImageOps
 
+    from uniserve_worker.media.resample import lanczos
+
     image = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
     image = image.convert("RGB")
-    resized = (fit.resized.width, fit.resized.height)
-    # Pillow returns a copy for a resize to the image's own size, so an
-    # image already at its raster passes through unchanged.
-    if image.size != resized:
-        image = image.resize(resized, Image.Resampling.LANCZOS)
+    # Pillow's own LANCZOS resize, split across threads; an image already at
+    # its raster passes through unchanged. The result is a writable array,
+    # which tensors may view.
+    resized = lanczos(image, (fit.resized.width, fit.resized.height))
+    # The planned window lies inside the resized raster (``ImageFit``), so
+    # slicing keeps exactly the pixels Pillow's crop keeps.
     size = fit.size
-    if (fit.left, fit.top, size.width, size.height) != (0, 0, *resized):
-        image = image.crop(
-            (fit.left, fit.top, fit.left + size.width, fit.top + size.height)
-        )
-    # A writable copy, which tensors may view.
-    pixels = np.array(image)
+    pixels = np.ascontiguousarray(
+        resized[
+            fit.top : fit.top + size.height, fit.left : fit.left + size.width
+        ]
+    )
     if pixels.shape != (size.height, size.width, 3):
         raise ValueError("a condition image decoded to another raster")
     return pixels[None]

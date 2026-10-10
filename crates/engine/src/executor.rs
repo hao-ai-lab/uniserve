@@ -75,13 +75,12 @@ impl ExecutorInfo {
         let mut ids = std::collections::HashSet::new();
         let mut components: BTreeMap<&str, &uniserve_worker_ipc::ComponentInfo> = BTreeMap::new();
         let model_name = &pools[0].1.model_name;
-        let checkpoint = &pools[0].1.checkpoint_identity;
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "executor info repeats pool id {id}");
             info.validate()?;
             anyhow::ensure!(
-                &info.model_name == model_name && &info.checkpoint_identity == checkpoint,
-                "worker {id} loaded a different model or checkpoint"
+                &info.model_name == model_name,
+                "worker {id} loaded a different model"
             );
             for component in &info.components {
                 if let Some(other) = components.get(component.name.as_str()) {
@@ -140,6 +139,52 @@ impl ExecutorInfo {
             .into_iter()
             .map(|(call, (component, _))| (call, component))
             .collect())
+    }
+
+    /// Returns the media units one call of `call` covers at once: the ranks
+    /// of a distributed serving component times its `units_per_rank`, or one
+    /// for any other component, on the narrowest worker serving the call.
+    ///
+    /// A latent encoding round is dealt to the latent encoder's ranks that a
+    /// request's prompt does not take (`Scheduler::latent_round`), so while
+    /// the prompt is encoded a round covers only the ranks the latent
+    /// encoder does not share with the text encoder of its worker. Those
+    /// ranks count; a latent encoder that shares every rank encodes after
+    /// the prompt, on all of them.
+    ///
+    /// Returns `None` when no worker serves `call`, or the width does not
+    /// fit in `u32`.
+    pub fn media_lane_units(&self, call: MediaCall) -> Option<u32> {
+        self.workers
+            .iter()
+            .filter_map(|(_, info)| {
+                let component = info.media_components.get(&call)?;
+                let find =
+                    |name: &String| info.components.iter().find(|binding| &binding.name == name);
+                let binding = find(component)?;
+                if binding.config.distribution.is_none() {
+                    return Some(1);
+                }
+
+                let prompt = info
+                    .media_components
+                    .get(&MediaCall::TextEncoding)
+                    .filter(|_| call == MediaCall::LatentEncoding)
+                    .and_then(find);
+                let unshared = binding
+                    .config
+                    .ranks
+                    .iter()
+                    .filter(|rank| prompt.is_none_or(|prompt| !prompt.config.ranks.contains(rank)))
+                    .count();
+                let ranks = if unshared == 0 {
+                    binding.config.ranks.len()
+                } else {
+                    unshared
+                };
+                u32::try_from(ranks * binding.config.units_per_rank.max(1)).ok()
+            })
+            .min()
     }
 
     /// Returns the sole worker capability record.
@@ -1448,6 +1493,74 @@ mod tests {
         assert_eq!(routing[&MediaCall::VideoDecoding], "video_decoder");
     }
 
+    /// A distributed component's lane is its ranks times its units per rank,
+    /// an undistributed one's a single unit, and the narrowest replica binds;
+    /// a call no worker serves has no lane. A latent encoder's lane leaves
+    /// out the ranks its worker's text encoder takes.
+    #[test]
+    fn media_lanes_count_the_units_one_call_covers() {
+        let encoder = |id: &str, ranks: usize, units_per_rank: usize| {
+            let (id, mut info) =
+                media_pool(id, &[(MediaCall::LatentEncoding, "latent_encoder")], 0, 1);
+            let config = &mut info.components[0].config;
+            config.ranks = (0..ranks).collect();
+            config.distribution = Some(uniserve_core::ComponentDistribution::TemporalUnits);
+            config.units_per_rank = units_per_rank;
+            (id, info)
+        };
+        let lanes = |workers| {
+            ExecutorInfo {
+                workers,
+                video_codecs: BTreeMap::new(),
+            }
+            .media_lane_units(MediaCall::LatentEncoding)
+        };
+
+        assert_eq!(lanes(vec![encoder("a", 4, 1)]), Some(4));
+        assert_eq!(lanes(vec![encoder("a", 4, 2)]), Some(8));
+        assert_eq!(lanes(vec![encoder("a", 4, 1), encoder("b", 2, 1)]), Some(2));
+        let (id, mut single) = encoder("a", 4, 1);
+        single.components[0].config.distribution = None;
+        assert_eq!(lanes(vec![(id, single)]), Some(1));
+
+        // A latent encoding round covers the ranks the prompt's encoding
+        // leaves free: those the latent encoder does not share with its
+        // worker's text encoder, or all of them when it shares every one.
+        let beside = |text: Vec<usize>| {
+            let (id, mut info) = media_pool(
+                "a",
+                &[
+                    (MediaCall::LatentEncoding, "latent_encoder"),
+                    (MediaCall::TextEncoding, "text_encoder"),
+                ],
+                0,
+                1,
+            );
+            for binding in &mut info.components {
+                if binding.name == "text_encoder" {
+                    binding.config.ranks = text.clone();
+                } else {
+                    binding.config.ranks = vec![4, 5, 6, 7, 0, 1, 2, 3];
+                    binding.config.distribution =
+                        Some(uniserve_core::ComponentDistribution::TemporalUnits);
+                }
+            }
+            lanes(vec![(id, info)])
+        };
+        assert_eq!(beside(vec![0, 1, 2, 3]), Some(4));
+        assert_eq!(beside(vec![0]), Some(7));
+        assert_eq!(beside((0..8).collect()), Some(8));
+        assert_eq!(
+            lanes(vec![media_pool(
+                "a",
+                &[(MediaCall::Denoising, "denoiser")],
+                4,
+                1
+            )]),
+            None
+        );
+    }
+
     /// A deployment whose denoiser serves a conditioned task must place the
     /// media reader and both condition encoders; one serving `t2va` alone
     /// needs only the generation calls.
@@ -1471,8 +1584,6 @@ mod tests {
                 video_shift: 12.0,
                 audio_shift: 3.0,
                 canvases: Vec::new(),
-                max_sequence_rows: None,
-                condition_tiles: None,
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],

@@ -118,6 +118,10 @@ class RequestState:
     # evicts it or `RequestPool.drop` removes it.
     closed: bool = False
     retired: bool = False
+    # Why this rank's model refuses the request, decided from its admitted
+    # size when its `Start` is applied (`media.begin_noise`); each of its
+    # calls then reports the refusal instead of running.
+    refusal: str | None = None
 
     @property
     def request_id(self) -> int:
@@ -206,7 +210,8 @@ class RequestPool:
                 aligned with the calls, a request or slot repeats, a slot is
                 out of range, a call names an unknown, stale, or closed
                 request or a slot the request does not hold, or a call is
-                already pending.
+                already pending. A refused request's calls still in flight
+                when its refusal closed it bind, and report the refusal.
             RuntimeError: The pool is closed.
         """
         if len(calls) != len(request_pool_indices):
@@ -236,7 +241,7 @@ class RequestPool:
                 raise invalid_descriptor(
                     f"call {call.call_id} has a stale request slot"
                 )
-            if request.closed:
+            if request.closed and request.refusal is None:
                 raise invalid_descriptor(
                     f"call {call.call_id} targets a closed request"
                 )

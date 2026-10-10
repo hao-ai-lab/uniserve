@@ -486,6 +486,11 @@ pub struct SimEngine {
     /// Admitted requests by id, removed when a `Finish` for the same request
     /// key executes.
     requests: HashMap<RequestId, SimRequestState>,
+    /// Requests the simulated model refuses, with the reason it states: each
+    /// of their media calls completes with `ErrorCode::InvalidRequest`, as a
+    /// worker reports a request whose admitted size its model does not
+    /// serve.
+    refused: HashMap<RequestId, String>,
 }
 
 impl SimEngine {
@@ -515,6 +520,7 @@ impl SimEngine {
             non_finite_candidate: None,
             predicated_release: None,
             requests: HashMap::new(),
+            refused: HashMap::new(),
         }
     }
 
@@ -685,6 +691,7 @@ impl SimEngine {
             status: CallStatus::Ok,
             product_generations: call.tensor_outputs().map(|out| out.generation).collect(),
             error_code: None,
+            error_message: None,
             timing_counters: TimingCounters::default(),
             code: call.code,
             position: 0,
@@ -994,6 +1001,7 @@ impl SimEngine {
             status: CallStatus::Predicated,
             product_generations: Vec::new(),
             error_code: None,
+            error_message: None,
             timing_counters: TimingCounters::default(),
             code: call.code,
             position: request.logical_position,
@@ -1102,6 +1110,11 @@ impl SimEngine {
         let (release, held) = crossbeam_channel::unbounded();
         self.predicated_release = Some(held);
         release
+    }
+
+    /// Refuses request `id` for `reason` at each of its media calls.
+    pub fn refuse_request(&mut self, id: RequestId, reason: &str) {
+        self.refused.insert(id, reason.to_owned());
     }
 
     /// Returns mutable access to the simulator's advertised capabilities.
@@ -1252,6 +1265,7 @@ impl SimEngine {
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
         let non_finite_candidate = self.non_finite_candidate;
+        let refused = &self.refused;
         let mut completions = Vec::with_capacity(batch.requests.len());
         for (call, _) in batch.requests {
             let request = self
@@ -1307,7 +1321,7 @@ impl SimEngine {
                 continue;
             }
 
-            let completion = Self::execute_call(
+            let mut completion = Self::execute_call(
                 vocab,
                 text_len,
                 fake_eos,
@@ -1315,6 +1329,15 @@ impl SimEngine {
                 &call,
                 request,
             )?;
+            if let (CallKind::Media(_), Some(reason)) =
+                (call.code, refused.get(&call.request_key.request_id))
+            {
+                completion.status = CallStatus::Error;
+                completion.product_generations.clear();
+                completion.media_output = None;
+                completion.error_code = Some(ErrorCode::InvalidRequest);
+                completion.error_message = Some(reason.clone());
+            }
             if completion.status == CallStatus::Ok && call.advances_state() {
                 request.state_call_id = call.call_id;
             }

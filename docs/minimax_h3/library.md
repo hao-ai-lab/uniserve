@@ -1,6 +1,6 @@
 # MiniMax-H3 computation library
 
-The model package loads base MiniMax-H3, FastH3 DMD and FastH3 OmniRef checkpoints through the public model catalog. Each checkpoint determines its denoising components, attention layout, schedule, output heads and elementwise rounding. Component exports resolve their missing text encoder, processor and VAE components at the base revision recorded in the export.
+The model package loads the base MiniMax-H3 checkpoint and FastH3, its fast variant, through the public model catalog. The base checkpoint holds two DiT partitions, `transformer` (`t2va`, `fl2va`) and `transformer_ref` (`ref2va`); a FastH3 student replaces the partition its task selects (DMD students `t2va`, OmniRef students `ref2va`), and its `fastvideo_inference.json` determines its schedule, sparse attention and output heads. An export reads the components it omits, such as the text encoder, processor and VAEs, at the base revision it records.
 
 Models are ordinary PyTorch modules. Text and latent encoders, denoisers, video and audio decoders compose the shared numerical capabilities. Execution contexts own kernel workspaces and communication backing; callers own request state and advance the solver. Serving workers use these same modules and numerical calls.
 
@@ -23,7 +23,7 @@ config = loading.read_config(
     modules=frozenset(
         {
             "text_encoder",
-            "denoiser",
+            "transformer",
             "video_decoder",
             "video_postprocessor",
             "audio_decoder",
@@ -57,8 +57,8 @@ result = generate(
 
 ## Layouts and conditions
 
-A denoiser's `make_size` describes the request's frame count, canvas, prompt and ordered conditions. `layout_size` derives the numerical layout; `holds` checks whether a capacity layout can evaluate a request. Dense layouts pack keyframes and references into their declared prefix. Regional sparse layouts retain each reference region's independent selection domain. Layout indices and latent buffers are borrowed tensors, without request identities or pool ownership.
+A denoiser's `make_size` describes the request's frame count, canvas, prompt and ordered conditions. `layout_size` derives the numerical layout; `holds` checks whether a capacity layout can evaluate a request. Dense layouts pack keyframes and references into their declared prefix. Segment-sparse layouts retain each reference video segment's independent selection domain. Layout indices and latent buffers are borrowed tensors, without request identities or pool ownership.
 
-Visual conditions are encoded in independent temporal units and assembled in the declared latent order. Audio conditions supply whole stereo tracks. The denoiser's `encode_conditions`, `prepare_latents`, `prepare_state` and solver calls preserve the checkpoint's condition-noise order, modality schedules and output-head mathematics. Encoded conditions remain fixed while generated video and audio evolve.
+Visual conditions are encoded in independent temporal units and assembled in the declared latent order. A still image may also be encoded in bands of whole latent patch rows: `VideoEncoder.row_bands` partitions it, `encode(..., rows=...)` encodes one band from the tiles it depends on, and the bands assemble the whole encoding exactly. An `ExecutionContext` created with `tiles={encoder: operator}` encodes that `SpatialEncoder`'s tiles through a borrowed operator equal to its `encode_tile`, such as the replay of a graph captured at `VideoEncoder.still_tile`. Audio conditions supply whole stereo tracks. The denoiser's `encode_conditions`, `prepare_latents`, `prepare_state` and solver calls preserve the checkpoint's condition-noise order, modality schedules and output-head mathematics. Encoded conditions remain fixed while generated video and audio evolve.
 
 For a partitioned model, load and bind component meshes through the public loader and execution context interfaces. Every participating rank executes the same numerical entry; runtime communication owns collective resources. Passing the server's capacity layout to `generate(..., layout=...)` also preserves the prompt padding and conditioning layout used by serving.

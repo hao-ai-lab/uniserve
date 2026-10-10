@@ -191,6 +191,22 @@ def _rows(shape: tuple[int, ...], dtype: torch.dtype) -> OutputLayout:
     )
 
 
+def _condition_rows(config: WorkerConfig) -> int:
+    """Return the condition rows a loaded worker's configuration states.
+
+    Raises:
+        ValueError: The capacity is unstated: a worker states it from its
+            model before it sizes any product
+            (``bootstrap.model_loader.loaded_worker_config``).
+    """
+    rows = config.max_condition_rows
+    if rows is None:
+        raise ValueError(
+            "condition products are sized once the condition capacity is stated"
+        )
+    return rows
+
+
 def condition_media_layouts(
     config: WorkerConfig,
     *,
@@ -216,7 +232,7 @@ def condition_media_layouts(
     - ``vision_pixels``: the vision encoder's packed patch rows of every
       vision block, whose tokens all lie in the presentation.
     """
-    rows = config.max_condition_rows
+    rows = _condition_rows(config)
     # A 32-pixel square is the smallest raster whose rows are whole latent
     # patches, so its rows per frame count the rows of one patch.
     patch = image.Config(32, 32)
@@ -295,7 +311,8 @@ def output_layouts(
         isinstance(component, PatchEncoder) and builder is not None
     )
     if condition_encoder and call.entry_point.method == "encode":
-        if config.max_condition_rows == 0:
+        condition_rows = _condition_rows(config)
+        if condition_rows == 0:
             return {}
         if isinstance(component, PatchEncoder):
             return component.features_layout(config.max_sequence_tokens)
@@ -305,19 +322,13 @@ def output_layouts(
                 video.Config(1, image.Config(32, 32))
             )["video"]
             return {
-                "video": _rows(
-                    (config.max_condition_rows, sample.shape[1]), sample.dtype
-                )
+                "video": _rows((condition_rows, sample.shape[1]), sample.dtype)
             }
         # Past the vision and video encoders, ``condition_encoder`` leaves
         # the audio encoder.
         audio = cast(AudioEncoder, component)
         sample = audio.output_layout(audio.latent_rate)["audio"]
-        return {
-            "audio": _rows(
-                (config.max_condition_rows, sample.shape[1]), sample.dtype
-            )
-        }
+        return {"audio": _rows((condition_rows, sample.shape[1]), sample.dtype)}
 
     if isinstance(component, VideoPostprocessor):
         # The post-processor's RGB media units are the decoding call's

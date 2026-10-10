@@ -262,7 +262,7 @@ impl DynamoFastH3Engine {
                 video_aspect_ratios: self.args.video_aspect_ratios.clone(),
                 // The Dynamo request form carries no conditions, so the
                 // worker provisions no condition rows.
-                max_condition_rows: 0,
+                max_condition_rows: Some(0),
                 workers: self.args.workers.to_vec(),
                 transfer: Default::default(),
                 data_parallel_size: 1,
@@ -654,16 +654,6 @@ fn prepare_request(
                 duration_seconds: Some(seconds),
             },
             seed,
-            num_inference_steps: None,
-            flow_shift: None,
-            audio_flow_shift: None,
-            num_outputs_per_prompt: None,
-            n: None,
-            quality: None,
-            seconds: None,
-            size: None,
-            width: None,
-            height: None,
         },
         response_format: request.response_format.unwrap_or_default(),
     })

@@ -13,7 +13,6 @@
 //! rank channel's death wake when a rank process this engine spawned exits.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-mod checkpoint;
 mod death_watch;
 mod executor;
 mod instance;
@@ -49,16 +48,6 @@ pub struct WorkerProcessArgs {
     pub python: std::path::PathBuf,
     /// Model identifier or local model path.
     pub model: String,
-    /// Identity of the checkpoint at `model`, derived by the head when the
-    /// model is a local directory of a non-stub launch and left unset
-    /// otherwise. Every rank verifies the checkpoint it loads against it and
-    /// reports what it loaded; a launch fills it once before any rank starts.
-    pub checkpoint_identity: Option<String>,
-    /// Local copy of the base checkpoint a component export at `model` pins,
-    /// passed to every rank, which verifies its revision from its Hugging
-    /// Face download records. Unset, ranks read the base from the Hugging
-    /// Face cache; a checkpoint that pins no base refuses one.
-    pub base_model: Option<std::path::PathBuf>,
     /// Ordered physical members of this WorkerGroup instance.
     pub ranks: Vec<crate::WorkerRank>,
     /// This process's own host identity. The engine owns exactly the ranks
@@ -191,8 +180,9 @@ pub struct WorkerProcessArgs {
     /// Maximum accepted video duration in seconds.
     pub max_video_seconds: f64,
     /// Most denoiser rows a video request's conditions may take, which bounds
-    /// the condition products a video worker provisions.
-    pub max_condition_rows: u32,
+    /// the condition products a video worker provisions. `None` provisions
+    /// the largest condition set the worker's denoiser admits.
+    pub max_condition_rows: Option<u32>,
     /// The `ffmpeg` executable a media reader decodes reference videos with.
     pub ffmpeg: std::path::PathBuf,
     /// Shortest video duration in seconds the serving API admits, which

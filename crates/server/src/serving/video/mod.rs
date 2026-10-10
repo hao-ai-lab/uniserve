@@ -1,10 +1,10 @@
-//! MiniMax-H3 condition ingestion: media sources, probing, request planning
+//! MiniMax-H3 condition processing: media sources, probing, request planning
 //! and the conditioner presentation.
 //!
 //! A MiniMax-H3 request must be sized before admission: the engine reserves
 //! the conditioner's token count and the denoiser's condition rows, so both
 //! are known exactly before any pixel is decoded. One request flows through
-//! four stages, which [`VideoIngest::prepare`] runs in order:
+//! four stages, which [`VideoProcessor::process`] runs in order:
 //!
 //! 1. [`plan::check_request`] applies every rule that needs no media
 //!    (task, roles, counts, target), so a malformed request is rejected
@@ -37,7 +37,7 @@ pub mod probe;
 pub mod service;
 pub mod sources;
 
-pub use service::{PreparedVideo, VideoService};
+pub use service::{ProcessedVideo, VideoService};
 
 use std::fmt;
 
@@ -94,7 +94,7 @@ impl fmt::Display for RequestField {
 }
 
 /// A conditioned video request the server does not serve, or could not
-/// ingest.
+/// process.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VideoInputError {
     /// The request breaks a rule; the same request fails again on retry.
@@ -105,7 +105,7 @@ pub enum VideoInputError {
         /// What is wrong with it.
         message: String,
     },
-    /// The server failed while ingesting valid input, for example because
+    /// The server failed while processing valid input, for example because
     /// `ffprobe` could not run or scratch storage failed.
     #[error("{0}")]
     Internal(String),
@@ -125,7 +125,7 @@ impl VideoInputError {
         Self::invalid(RequestField::Condition(index), message)
     }
 
-    /// Reports a server-side ingestion failure.
+    /// Reports a server-side processing failure.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
@@ -148,7 +148,7 @@ impl From<VideoInputError> for ApiError {
                 ApiError::invalid_request(error.to_string(), Some(field.param()))
             }
             VideoInputError::Internal(message) => {
-                ApiError::server_error(format!("video condition ingestion failed: {message}"))
+                ApiError::server_error(format!("video condition processing failed: {message}"))
             }
         }
     }
@@ -163,9 +163,9 @@ pub struct ConditionInput<'a> {
     pub uri: &'a str,
 }
 
-/// The fields of a MiniMax-H3 request that ingestion reads.
+/// The fields of a MiniMax-H3 request that the processor reads.
 #[derive(Debug, Clone, PartialEq)]
-pub struct VideoRequestInput<'a> {
+pub struct VideoInputs<'a> {
     /// The request's task.
     pub task: VideoTask,
     /// The prompt, presented after the conditions.
@@ -179,7 +179,7 @@ pub struct VideoRequestInput<'a> {
 /// A request ready for admission: its sizes, its presentation and the media
 /// bytes of its conditions.
 #[derive(Debug, Clone)]
-pub struct PreparedVideoRequest {
+pub struct ProcessedVideoRequest {
     /// Canvas, frame counts, condition preparation and rows.
     pub plan: RequestPlan,
     /// The conditioner's token ids and their AdaLN tags.
@@ -188,11 +188,11 @@ pub struct PreparedVideoRequest {
     pub media: Vec<FetchedMedia>,
 }
 
-/// Ingests MiniMax-H3 requests for one served checkpoint.
+/// Processes MiniMax-H3 video requests for one served checkpoint.
 ///
-/// One instance is shared by all requests; [`VideoIngest::prepare`] takes
+/// One instance is shared by all requests; [`VideoProcessor::process`] takes
 /// `&self` and runs concurrently.
-pub struct VideoIngest {
+pub struct VideoProcessor {
     fetcher: MediaFetcher,
     prober: MediaProber,
     vision: VisionConfig,
@@ -200,7 +200,7 @@ pub struct VideoIngest {
     tokenizer: DynTokenizer,
 }
 
-impl VideoIngest {
+impl VideoProcessor {
     /// Combines the media policy, the prober, the checkpoint's vision
     /// processor geometry and serving limits, and its tokenizer.
     pub fn new(
@@ -234,11 +234,11 @@ impl VideoIngest {
     ///
     /// Returns [`VideoInputError::Invalid`] naming the field at fault for a
     /// request the server does not serve, and [`VideoInputError::Internal`]
-    /// when the server's own ingestion resources fail.
-    pub async fn prepare(
+    /// when the server's own processing resources fail.
+    pub async fn process(
         &self,
-        request: &VideoRequestInput<'_>,
-    ) -> Result<PreparedVideoRequest, VideoInputError> {
+        request: &VideoInputs<'_>,
+    ) -> Result<ProcessedVideoRequest, VideoInputError> {
         let specs: Vec<ConditionSpec> = request
             .conditions
             .iter()
@@ -268,7 +268,7 @@ impl VideoIngest {
             &self.limits,
         )?;
         let presentation = presentation::present(&self.tokenizer, &plan, request.prompt)?;
-        Ok(PreparedVideoRequest {
+        Ok(ProcessedVideoRequest {
             plan,
             presentation,
             media,
@@ -293,11 +293,11 @@ mod tests {
     use super::presentation::{TEXT_TAG, VIDEO_TAG};
     use super::probe::{MediaProber, ProbeConfig};
     use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
-    use super::{ConditionInput, RequestField, VideoIngest, VideoInputError, VideoRequestInput};
+    use super::{ConditionInput, RequestField, VideoInputError, VideoInputs, VideoProcessor};
     use crate::openai::ApiError;
     use uniserve_core::VideoTask;
 
-    fn ingest(scratch: &std::path::Path) -> VideoIngest {
+    fn processor(scratch: &std::path::Path) -> VideoProcessor {
         let fetcher = MediaFetcher::new(MediaPolicy {
             media_directory: None,
             remote: RemoteMediaPolicy {
@@ -314,7 +314,7 @@ mod tests {
             scratch_directory: scratch.to_path_buf(),
             max_concurrent_probes: 2,
         });
-        VideoIngest::new(
+        VideoProcessor::new(
             fetcher,
             prober,
             vision(&fixture()),
@@ -351,9 +351,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_is_prepared_end_to_end() {
         let scratch = tempfile::tempdir().unwrap();
-        let ingest = ingest(scratch.path());
+        let processor = processor(scratch.path());
         let uri = png_data_uri(160, 90);
-        let request = VideoRequestInput {
+        let request = VideoInputs {
             task: VideoTask::Ref2va,
             prompt: "a fox",
             target: Target {
@@ -366,21 +366,21 @@ mod tests {
                 uri: &uri,
             }],
         };
-        let prepared = ingest.prepare(&request).await.unwrap();
+        let processed = processor.process(&request).await.unwrap();
 
         // A 16:9 image reference is encoded at 3648x2048: 7296 rows and as
         // many vision tokens.
-        let plan = &prepared.plan;
+        let plan = &processed.plan;
         assert_eq!((plan.canvas.width, plan.canvas.height), (1344, 768));
         assert_eq!(plan.num_frames, 124);
         let Prepared::Image(size) = plan.conditions[0].prepared else {
             panic!("not an image reference");
         };
         assert_eq!((size.width, size.height), (3648, 2048));
-        assert_eq!(plan.condition_video_rows(), 7296);
+        assert_eq!(plan.conditions[0].video_rows, 7296);
 
         let label = "<Picture 1>: ".chars().count();
-        let tags = &prepared.presentation.tags;
+        let tags = &processed.presentation.tags;
         assert_eq!(tags.len(), label + 7296 + 2 + "a fox".len());
         assert!(tags[..label].iter().all(|&tag| tag == TEXT_TAG));
         assert!(
@@ -389,8 +389,8 @@ mod tests {
                 .all(|&tag| tag == VIDEO_TAG)
         );
         assert!(tags[label + 7298..].iter().all(|&tag| tag == TEXT_TAG));
-        assert_eq!(prepared.media.len(), 1);
-        assert!(prepared.media[0].bytes.starts_with(b"\x89PNG"));
+        assert_eq!(processed.media.len(), 1);
+        assert!(processed.media[0].bytes.starts_with(b"\x89PNG"));
     }
 
     /// A request that breaks a request-only rule is rejected before any of
@@ -411,9 +411,9 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
         let scratch = tempfile::tempdir().unwrap();
-        let ingest = ingest(scratch.path());
+        let processor = processor(scratch.path());
         let uri = format!("http://{address}/image.png");
-        let request = VideoRequestInput {
+        let request = VideoInputs {
             task: VideoTask::Ref2va,
             prompt: "a fox",
             target: Target {
@@ -426,7 +426,7 @@ mod tests {
                 uri: &uri,
             }],
         };
-        let error = ingest.prepare(&request).await.unwrap_err();
+        let error = processor.process(&request).await.unwrap_err();
         assert_eq!(error.field(), Some(RequestField::TargetDuration));
         assert_eq!(fetches.load(Ordering::Relaxed), 0);
     }

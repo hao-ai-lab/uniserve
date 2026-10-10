@@ -9,6 +9,7 @@ reproduce the conditioning recipe of the diffusers MiniMax-H3 pipeline.
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Mapping
 
@@ -34,6 +35,28 @@ POSTERIOR_SEED = 42
 _PATCH = 2
 
 
+@functools.lru_cache(maxsize=16)
+def _posterior_draw(
+    channels: int, frames: int, height: int, width: int
+) -> torch.Tensor:
+    """Return the host FP32 posterior draw of one latent shape.
+
+    One standard normal draw of ``[1, channels, frames, height, width]``
+    from a fresh generator seeded with ``POSTERIOR_SEED``: the draw is a
+    function of the shape alone, so every encoding round and request of a
+    condition size shares it instead of drawing it again on the host. The
+    shared tensor is read-only; callers copy the slices they use. Sixteen
+    shapes bound the cache at about 230 MB for five-second 16:9 videos.
+    """
+    draw = torch.empty(
+        (1, 1, channels, frames, height, width),
+        dtype=torch.float32,
+        device="cpu",
+    )
+    normal_noise((POSTERIOR_SEED,), out=(draw,))
+    return draw[0]
+
+
 class VideoEncoder(BaseVideoEncoder):
     """Encode H3 visual conditions into normalized latent patch rows.
 
@@ -45,7 +68,9 @@ class VideoEncoder(BaseVideoEncoder):
     ``5 * n + 2`` latent frames. A single frame (an image or a keyframe) runs
     through the same network alone and yields one latent frame. Clips share
     no state, because causal padding restarts at every clip and
-    normalization never mixes frames, so every clip is one unit.
+    normalization never mixes frames, so every clip is one unit. A still
+    frame's row groups are its rows of 2x2 patches, so its bands are runs of
+    whole patch rows, which its tiled encoder encodes on their own.
 
     The posterior is sampled with a host FP32 draw seeded with
     ``POSTERIOR_SEED`` over the condition's complete ``[1, channels, frames,
@@ -56,6 +81,9 @@ class VideoEncoder(BaseVideoEncoder):
 
     pixel_mean: torch.Tensor
     pixel_std: torch.Tensor
+
+    # A row of 2x2 patches spans two latent rows.
+    row_group = _PATCH
 
     def __init__(self, config: video_vae.Config):
         # Each causal stride maps T frames to ceil(T / stride).
@@ -104,17 +132,17 @@ class VideoEncoder(BaseVideoEncoder):
         clips = math.ceil(num_frames / self.config.clip_length)
         return clips * self.clip_latents - self.config.token_drop
 
-    def _latent_size(self, frame_size: image.Config) -> tuple[int, int]:
+    def latent_size(self, frame: image.Config) -> tuple[int, int]:
         # Latent rows are whole 2x2 patches of the latent raster.
         alignment = self.config.spatial_compression * _PATCH
-        if frame_size.height % alignment or frame_size.width % alignment:
+        if frame.height % alignment or frame.width % alignment:
             raise ValueError(
                 f"H3 condition frames must align with {alignment}-pixel "
                 "latent patches"
             )
         return (
-            frame_size.height // self.config.spatial_compression,
-            frame_size.width // self.config.spatial_compression,
+            frame.height // self.config.spatial_compression,
+            frame.width // self.config.spatial_compression,
         )
 
     def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
@@ -134,7 +162,7 @@ class VideoEncoder(BaseVideoEncoder):
         )
 
     def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
-        height, width = self._latent_size(size.frame)
+        height, width = self.latent_size(size.frame)
         rows = (
             self._latent_frames(size.num_frames)
             * (height // _PATCH)
@@ -154,21 +182,13 @@ class VideoEncoder(BaseVideoEncoder):
         # One standard normal FP32 draw of the complete latent from a fresh
         # host generator, which is the reference's draw; the shape fixes how
         # the generator's stream maps onto latent positions.
-        height, width = self._latent_size(size.frame)
-        draw = torch.empty(
-            (
-                1,
-                1,
-                self.config.latent_channels,
-                self._latent_frames(size.num_frames),
-                height,
-                width,
-            ),
-            dtype=torch.float32,
-            device="cpu",
+        height, width = self.latent_size(size.frame)
+        return _posterior_draw(
+            self.config.latent_channels,
+            self._latent_frames(size.num_frames),
+            height,
+            width,
         )
-        normal_noise((POSTERIOR_SEED,), out=(draw,))
-        return draw[0]
 
     def unpack_pixels(
         self, pixels: torch.Tensor, frames: slice, num_frames: int

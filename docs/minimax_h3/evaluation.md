@@ -10,7 +10,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
 | --- | --- |
 | `uniserve_eval/fast_h3.toml` | The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) measurements |
 | `uniserve_eval/fast_h3_h200.toml` | The H200 measurements below |
-| `uniserve_eval/minimax_h3.toml` | The W1–W5 workloads across checkpoints and engines |
+| `uniserve_eval/minimax_h3.toml` | The W1–W5 workloads across checkpoints and engines, and the OmniRef reference matrix |
 
 ## FastH3 post
 
@@ -72,6 +72,33 @@ export UNISERVE_MINIMAX_H3_FFMPEG=/workspace/tools/ffmpeg-8.1.2/bin
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-w3
 ```
 
-The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF` and its pinned base copy `UNISERVE_MINIMAX_H3_OMNIREF_BASE`; two-host points need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`.
+The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, and the Hugging Face cache supplies the base revision it pins; two-host points need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`.
+
+## OmniRef reference compositions
+
+The reference matrix measures FastH3 OmniRef (`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`) on nine reference compositions of MiniMax-H3's ref2va interface, each at 5, 10 and 15 seconds, every target 16:9 (1344×768). A workload is `ref-<composition>-<seconds>s`:
+
+| Composition | References | Prompt tokens with vision | Condition rows |
+| --- | --- | --- | --- |
+| `image` | One 16:9 subject image | about 7,600 | 7,296 |
+| `image-voice` | One 16:9 subject image and a reference voice | about 7,650 | 7,808 to 8,064 |
+| `images3` | Three 16:9 images: a subject, a product sheet and a scene | about 22,400 | 22,016 |
+| `images9` | Nine square images | 37,701 | 36,864 |
+| `clip` | One 2-second reference clip with its soundtrack | about 3,500 | 14,080 |
+| `video` | One reference video (6 s, with its soundtrack) | 6,458 to 7,630 | 46,592 to 51,200 |
+| `clips3` | Three 2-second reference clips, each with its soundtrack | 9,718 | 42,240 |
+| `mixed` | One 16:9 image, one reference video with its soundtrack and a reference voice | 13,911 to 15,118 | 54,400 to 59,264 |
+| `full` | Nine square images and three 2-second clips with their soundtracks | 47,160 | 79,104 |
+
+A request's packed sequence is its prompt, which carries every visual reference's vision tokens, its condition rows and its generated rows: 37,710 at 5 s, 73,386 at 10 s and 109,062 at 15 s. A reference image, resized to a 2048-pixel short edge, is 7,296 prompt tokens and 7,296 condition rows at 16:9 and 4,096 of each when square. A reference video or voice longer than the target contributes the target's duration, so its rows grow with the target up to its own length. The largest cell, `ref-full-15s`, packs 236,294 rows. The square images are centred crops and the clips the leading two seconds of their sources, cut without re-encoding; each row's `metadata.condition_media` names the source and the derivation.
+
+A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2. One deployment across two four-GB200 hosts (`ulysses8-reference-two-node.json`) serves every cell: `--max-video-seconds 15 --max-model-len 48128 --video-text-capacities 4096,7168,8192,10240,14336,15360,22528,37888,48128 --max-condition-rows 79104`, a text capacity for each cell's prompt and the condition rows of `full`.
+
+```bash
+export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastH3-OmniRef-v5-DMPDD8-w03-cfg2-step3500
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs --reuse-deployment
+```
+
+Start `uniserve-host` on `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts). The `sglang-gb200-8-reference` suite measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup; start SGLang's node rank 1 on `rank-1` beside the head, as for `sglang-gb200-8`.
 
 Cross-engine results are not equal-work ratios: the engines differ in reference-image resizing, noise generators, media codecs and distributed attention. vLLM-Omni's W4 image processing keeps a smaller condition layout than the others, and its diffusion worker does not implement the two-host placement.

@@ -173,6 +173,7 @@ fn completion_record() -> RequestOutput {
 
         product_generations: vec![3, 4],
         error_code: None,
+        error_message: None,
         timing_counters: TimingCounters::default(),
         code: CallKind::Forward(ForwardMode::Decode),
         position: 5,
@@ -474,6 +475,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 call_id: call.call_id,
                 cursor: 0,
                 max_units: 1,
+                ranks: Vec::new(),
             });
         }
     }
@@ -2057,6 +2059,7 @@ fn full_run_result() -> BatchOutput {
 
         product_generations: vec![3, 5],
         error_code: None,
+        error_message: None,
         timing_counters: TimingCounters {
             queued_us: 41,
             device_us: 42,

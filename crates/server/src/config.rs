@@ -88,7 +88,9 @@ pub struct EngineSettings {
     /// Most denoiser rows a video request's conditions may take
     /// (`--max-condition-rows`). Video workers provision their condition
     /// products for it, and the video service rejects requests above it.
-    pub max_condition_rows: u32,
+    /// `None` provisions the largest condition set the deployment's
+    /// denoiser admits, so no request is refused for its conditions.
+    pub max_condition_rows: Option<u32>,
     /// Static Worker configurations with ordered ranks and named computation components.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
@@ -124,7 +126,7 @@ impl Default for EngineSettings {
             video_aspect_ratios: crate::profile::video::VideoRasters::default()
                 .aspect_ratios()
                 .to_vec(),
-            max_condition_rows: EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
+            max_condition_rows: None,
             // One local CUDA rank running `DEFAULT_COMPONENT`. The `uniserve`
             // CLI and the Dynamo worker binary both replace this with a
             // placement built from their own arguments.
@@ -155,12 +157,6 @@ pub struct Config {
     /// repository ID or a local model directory. Empty by default; callers
     /// must set it.
     pub model: String,
-    /// Local copy of the base checkpoint that a component export (such as
-    /// FastH3 OmniRef) pins for its other components, verified against the
-    /// pinned revision by its Hugging Face download records. Without it the
-    /// server and the workers read the pinned revision from the Hugging Face
-    /// cache. Only a component export takes a base.
-    pub base_model: Option<PathBuf>,
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
@@ -263,7 +259,6 @@ impl Default for Config {
         Self {
             engine: EngineSettings::default(),
             model: String::new(),
-            base_model: None,
             served_model_name: None,
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),
@@ -333,15 +328,6 @@ impl EngineSettings {
     /// transport (64 MiB). `build_state` raises the configured capacity to the
     /// model's channel payload capacity when that is larger.
     pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
-
-    /// Default condition capacity in denoiser rows: two keyframes on the
-    /// largest named canvas, 1008 rows each, so every `fl2va` request fits.
-    /// The capacity sizes each request slot's retained conditioning and the
-    /// denoiser's largest layout, so a deployment that also serves `ref2va`
-    /// states the capacity its references need (a five-second reference
-    /// video with its soundtrack takes about 38,000 rows). A checkpoint's own
-    /// sequence capacity bounds requests independently.
-    pub const DEFAULT_MAX_CONDITION_ROWS: u32 = 2048;
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`

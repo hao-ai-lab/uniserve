@@ -137,8 +137,8 @@ def test_h3_worker_advertises_bounded_media_products():
         MediaCall.VISION_ENCODING: "text_encoder",
         MediaCall.LATENT_ENCODING: "latent_encoder",
         MediaCall.TEXT_ENCODING: "text_encoder",
-        MediaCall.LATENT_PREPARATION: "denoiser",
-        MediaCall.DENOISING: "denoiser",
+        MediaCall.LATENT_PREPARATION: "transformer",
+        MediaCall.DENOISING: "transformer",
         MediaCall.VIDEO_DECODING: "video_decoder",
         MediaCall.AUDIO_DECODING: "audio_decoder",
         # The host components own no numerical method: the media reader
@@ -388,7 +388,7 @@ def test_h3_media_units_follow_each_request_canvas():
         device="cpu",
         max_sequence_tokens=65,
         max_video_seconds=5.0,
-        deployment_components=("denoiser", "video_decoder", "video_codec"),
+        deployment_components=("transformer", "video_decoder", "video_codec"),
     )
     products = {
         value.name: value
@@ -506,3 +506,52 @@ def test_h3_video_capacity_rounds_half_frames_to_even():
     assert products["video_latents"].shape_bound.max_elements == (
         video_latent_frames(124) * 24 * 42 * 96
     )
+
+
+def test_a_deployment_without_condition_capacity_serves_the_largest_set():
+    """An unstated condition capacity refuses no request for its conditions.
+
+    The loaded configuration states the rows of the largest condition set
+    the placed denoiser admits, so the input builder sizes that set; a
+    stated capacity stands, and a deployment whose denoiser takes no
+    condition provisions none.
+    """
+    from dataclasses import replace
+
+    from tests.python.fixtures.h3 import WIDE, base_config, fasth3_config
+    from uniserve_models.minimax_h3 import Model
+    from uniserve_worker.bootstrap.inputs import media_builder
+    from uniserve_worker.bootstrap.model_loader import loaded_worker_config
+    from uniserve_worker.config.execution import WorkerConfig
+
+    with torch.device("meta"):
+        model = Model(base_config())
+        text_only = Model(fasth3_config())
+    config = WorkerConfig(
+        device="cpu",
+        max_sequence_tokens=4096,
+        max_video_seconds=5.0,
+        max_batch_calls=2,
+        max_request_pool_size=2,
+        min_request_pool_size=2,
+        video_frame_sizes=((768, 1344),),
+        deployment_components=("transformer_ref",),
+    )
+    assert config.max_condition_rows is None
+
+    open_capacity = loaded_worker_config(model, config, 6)
+    builder = media_builder(model, open_capacity)
+    frames = builder.frame_counts[-1]
+    largest = builder.denoiser.max_conditions(frames, WIDE)
+    size = builder.size(frames, 100, WIDE, conditions=largest)
+    assert size.condition_rows == open_capacity.max_condition_rows > 0
+
+    stated = loaded_worker_config(
+        model, replace(config, max_condition_rows=2048), 6
+    )
+    assert stated.max_condition_rows == 2048
+    with pytest.raises(ValueError, match="more than the 2048 this deployment"):
+        media_builder(model, stated).size(frames, 100, WIDE, conditions=largest)
+
+    plain = replace(config, deployment_components=("transformer",))
+    assert loaded_worker_config(text_only, plain, 6).max_condition_rows == 0

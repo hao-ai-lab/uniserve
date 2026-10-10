@@ -40,7 +40,7 @@ use crate::serving::input::{
 };
 use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
 use crate::serving::video::plan::VisionConfig;
-use crate::serving::video::{PreparedVideo, VideoService};
+use crate::serving::video::{ProcessedVideo, VideoService};
 use crate::serving::{
     CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key,
 };
@@ -292,13 +292,10 @@ impl ModelConfig {
         // A diffusers pipeline declares its class and component folders in a
         // root index rather than a root `config.json`, so the index selects the
         // profile and locates the tokenizer component before any other asset
-        // is resolved. A component export reads the components its pinned
-        // base supplies from `base_model`, or from the Hub cache at the
-        // pinned revision, as its workers do; `base_model` is refused for
-        // any other checkpoint.
+        // is resolved. A component folder the checkpoint omits is read from
+        // the base revision it pins, as its workers read it.
         let mut indexed_description = None;
-        let base_model = config.base_model.as_deref();
-        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model, base_model).await? {
+        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model).await? {
             let description = ModelDescription::from_pipeline_class(pipeline.class_name())
                 .ok_or_else(|| crate::profile::assets::Error::UnsupportedPipeline {
                     class_name: pipeline.class_name().to_owned(),
@@ -617,7 +614,7 @@ impl InputProcessor {
         &self,
         request_id: &crate::serving::ServeRequestId,
         request: &crate::openai::VideoGenerationRequest,
-    ) -> std::result::Result<PreparedVideo, crate::openai::ApiError> {
+    ) -> std::result::Result<ProcessedVideo, crate::openai::ApiError> {
         let Some(video) = &self.video else {
             return Err(crate::openai::serve_error_to_api(
                 ServeError::UnsupportedFeature {
@@ -628,7 +625,7 @@ impl InputProcessor {
         };
         crate::openai::utils::check_model_served(&request.model, self.served_model_name())?;
         video
-            .prepare(request_id, request, self.config.max_model_tokens())
+            .process(request_id, request, self.config.max_model_tokens())
             .await
     }
 

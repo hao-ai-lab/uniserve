@@ -14,7 +14,6 @@ partitioning, and resolves the load-time ``WorkerConfig``. The launch's
 from __future__ import annotations
 
 import logging
-import socket
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -37,7 +36,6 @@ from uniserve.nn.attention import (
     ContextParallelConfig,
     Ulysses,
 )
-from uniserve.nn.attention.vsa import BlockAttention
 from uniserve.nn.moe import FusedMoE
 from uniserve.nn.vae.patch import PatchAutoencoder
 from uniserve.processing import (
@@ -80,8 +78,6 @@ class WorkerModel:
             host worker, or for a checkpoint without one.
         image_processor: The model's image preprocessing, if any.
         flow_prompt: The checkpoint's flow prompt template, if any.
-        checkpoint_identity: Identity of the loaded checkpoint; empty for a
-            model without one.
         entry_points: The checkpoint's IPC entry declarations; ``None`` for
             the stub model, whose declarations ``describe_components`` reads
             from the model's module.
@@ -92,28 +88,8 @@ class WorkerModel:
     tokenizer: Any | None = None
     image_processor: ImageProcessor | None = None
     flow_prompt: FlowPrompt | None = None
-    checkpoint_identity: str = ""
     entry_points: Mapping[str, ComponentEntry] | None = None
     model_name: str | None = None
-
-
-def verify_checkpoint_identity(
-    expected: str | None, actual: str, *, rank: int, host: str
-) -> None:
-    """Refuse a rank whose loaded checkpoint is not the one the head derived.
-
-    ``expected`` is absent when the launching side could not read the
-    checkpoint locally; the engine then still requires every rank to report
-    the same identity. The refusal names the rank and host so an operator can
-    find the divergent copy.
-    """
-    if expected is None or expected == actual:
-        return
-
-    raise unsupported_setup(
-        f"rank {rank} on host {host} loaded checkpoint {actual}, but the "
-        f"head derived checkpoint {expected}"
-    )
 
 
 def prepare_worker_model(
@@ -121,13 +97,10 @@ def prepare_worker_model(
 ) -> tuple[models.Config | None, nn.Module, dict[str, tuple[Call, ...]]]:
     """Resolve the checkpoint configuration and this rank's resident modules.
 
-    This runs before process groups exist. The checkpoint identity is
-    verified against the launch expectation before ``load_worker_model``
-    materializes any weight. A placement that does not fit the model's
-    declarations, or a checkpoint identity that differs from the launch
-    expectation, raises ``WorkerError`` with ``UNSUPPORTED_SETUP``. Errors
-    from reading the checkpoint configuration and from ``_weight_config``
-    propagate.
+    This runs before process groups exist. A placement that does not fit the
+    model's declarations raises ``WorkerError`` with ``UNSUPPORTED_SETUP``.
+    Errors from reading the checkpoint configuration and from
+    ``_weight_config`` propagate.
 
     Returns:
         A tuple of the checkpoint configuration, narrowed to the module paths
@@ -156,7 +129,6 @@ def prepare_worker_model(
         launch.path,
         io=config.load,
         modules=frozenset(),
-        base=launch.base_model,
     )
     with torch.device("meta"):
         model = metadata.model_class(metadata.model)
@@ -201,19 +173,9 @@ def prepare_worker_model(
         launch.path,
         io=config.load,
         modules=resident,
-        base=launch.base_model,
         exclude_modules=expert_paths
         if split and not dedicated
         else frozenset(),
-    )
-
-    # The host name is the ``node`` the rank's ``WorkerEndpoint`` reports, so
-    # the refusal and the engine's own report name one host.
-    verify_checkpoint_identity(
-        launch.checkpoint_identity,
-        source.checkpoint_identity,
-        rank=config.execution.rank,
-        host=socket.gethostname(),
     )
 
     return (
@@ -427,7 +389,6 @@ def load_worker_model(
             None,
             source.image_processor,
             source.flow_prompt,
-            source.checkpoint_identity,
             source.entry_points,
         )
 
@@ -452,16 +413,6 @@ def load_worker_model(
             meshes[path] = binding.mesh
             attention[path] = attention_parallel(binding.config)
 
-    _require_sparse_tiles(
-        description,
-        {
-            call.path
-            for name in bindings
-            if not is_host_component(name)
-            for call in declarations.get(name, ())
-        },
-        config.execution.device,
-    )
     partition = None if experts is None or experts.size == 1 else experts
     placement = config.expert_parallel
     if placement is not None and placement.attention_ranks:
@@ -516,41 +467,9 @@ def load_worker_model(
         else load_tokenizer(source.tokenizer),
         source.image_processor,
         source.flow_prompt,
-        source.checkpoint_identity,
         {} if dedicated else source.entry_points,
         model_name,
     )
-
-
-def _require_sparse_tiles(
-    model: nn.Module, paths: set[str], device: str
-) -> None:
-    """Refuse a device that no installed VSA provider serves for a tile.
-
-    A resident sparse attention layer's tile size fixes the block kernel it
-    needs, and 128-row tiles have an SM100 (data-center Blackwell) kernel
-    only. Reading the meta-device ``model`` under the resident module
-    ``paths`` refuses such a deployment at startup, before any weight loads.
-
-    Raises:
-        WorkerError: With ``UNSUPPORTED_SETUP`` naming the tile size and the
-            device.
-    """
-    from uniserve.runtime.backends.attention import vsa as providers
-
-    tiles = sorted(
-        {
-            child.tile_size
-            for path in paths
-            for child in model.get_submodule(path).modules()
-            if isinstance(child, BlockAttention)
-        }
-    )
-    for tile in tiles:
-        try:
-            providers.resolve("auto", device=torch.device(device), tile=tile)
-        except RuntimeError as error:
-            raise unsupported_setup(str(error)) from error
 
 
 def _devices(
@@ -607,8 +526,14 @@ def _devices(
 def loaded_worker_config(
     model: nn.Module, config: WorkerConfig, queue_depth: int
 ) -> WorkerConfig:
-    """Resolve media request slots from the worker's publication lifetime.
+    """Resolve the capacities that follow from the loaded model.
 
+    The condition capacity becomes the rows the deployment's video denoiser
+    provisions (``bootstrap.inputs.condition_capacity``): the configured
+    rows, the largest condition set the denoiser admits when none are
+    configured, and zero for a model without a video denoiser.
+
+    Media request slots follow from the worker's publication lifetime.
     A resident media slot occupies three positions of the worker's batch
     queue, one reserved pipeline position and two unresolved outputs, and a
     media worker keeps at least two slots resident. The same three-position
@@ -624,7 +549,23 @@ def loaded_worker_config(
     Raises:
         WorkerError: With ``UNSUPPORTED_SETUP`` when the queue depth or
             ``max_batch_calls`` leaves fewer than two slots.
+        ValueError: The errors of ``video_denoiser`` and
+            ``condition_capacity``.
     """
+    # Imported here: the input builders import this module's siblings.
+    from uniserve_worker.bootstrap.inputs import (
+        condition_capacity,
+        video_denoiser,
+    )
+
+    denoiser = video_denoiser(model, config)
+    config = replace(
+        config,
+        max_condition_rows=0
+        if denoiser is None
+        else condition_capacity(model, denoiser, config),
+    )
+
     if any(isinstance(module, VideoDecoder) for module in model.modules()):
         state_slots = min(config.max_batch_calls, queue_depth // 3)
         if state_slots < 2:

@@ -613,11 +613,6 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
                     .collect()
             })
             .unwrap_or_default(),
-        max_sequence_rows: table.max_sequence_rows(),
-        condition_tiles: table.condition_tiles().map(|tiles| crate::ConditionTiles {
-            rows: tiles.rows(),
-            video: [tiles.frames(), tiles.height(), tiles.width()],
-        }),
     }
 }
 
@@ -689,6 +684,10 @@ fn decode_range_from_table(params: fbs::DecodeRange<'_>) -> CodecResult<DecodeRa
         call_id: computation_id_from_fb(params.call_id())?,
         cursor: params.cursor(),
         max_units: params.max_units(),
+        ranks: params
+            .ranks()
+            .map(|ranks| ranks.iter().collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -1093,6 +1092,7 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
         error_code: record.error_code().map(error_code_from_fb).transpose()?,
+        error_message: record.error_message().map(str::to_owned),
         timing_counters: TimingCounters {
             queued_us: timing_counters.queued_us(),
             device_us: timing_counters.device_us(),
@@ -1154,9 +1154,9 @@ fn error_call_from_table(call: fbs::ErrorCallIdentity<'_>) -> CodecResult<ErrorC
 
 /// Decodes worker capabilities and validates them with `WorkerInfo::validate`.
 ///
-/// Absent `model_dtype`, `attention_backend`, and `checkpoint_identity` decode
-/// as empty strings, and absent optional vectors as empty. A media call bound
-/// more than once is a malformed frame.
+/// Absent `model_dtype` and `attention_backend` decode as empty strings, and
+/// absent optional vectors as empty. A media call bound more than once is a
+/// malformed frame.
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
         model_name: required_str(info.model_name(), "info.model_name")?,
@@ -1180,7 +1180,6 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .activation_formats()
             .map(|values| values.iter().map(str::to_owned).collect())
             .unwrap_or_default(),
-        checkpoint_identity: info.checkpoint_identity().unwrap_or_default().to_owned(),
         components: info
             .components()
             .map(|items| {
@@ -1971,6 +1970,7 @@ fn error_code_to_fb(code: ErrorCode) -> fbs::ErrorCode {
         ErrorCode::ComputeError => fbs::ErrorCode::ComputeError,
         ErrorCode::Cancelled => fbs::ErrorCode::Cancelled,
         ErrorCode::Internal => fbs::ErrorCode::Internal,
+        ErrorCode::InvalidRequest => fbs::ErrorCode::InvalidRequest,
     }
 }
 
@@ -1982,6 +1982,7 @@ fn error_code_from_fb(code: fbs::ErrorCode) -> CodecResult<ErrorCode> {
         fbs::ErrorCode::ComputeError => ErrorCode::ComputeError,
         fbs::ErrorCode::Cancelled => ErrorCode::Cancelled,
         fbs::ErrorCode::Internal => ErrorCode::Internal,
+        fbs::ErrorCode::InvalidRequest => ErrorCode::InvalidRequest,
         other => codec_bail!("unknown error code {}", other.0),
     })
 }

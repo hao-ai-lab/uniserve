@@ -106,7 +106,7 @@ def _runner(checkpoint: Path, modules, placed) -> ModelExecutor:
         device=DEVICE,
         max_sequence_tokens=8192,
         max_video_seconds=15.0,
-        deployment_components=(*(name for name, _ in placed), "denoiser"),
+        deployment_components=(*(name for name, _ in placed), "transformer"),
     )
     dimensions = ParallelConfig().dimensions
     group = Communicator((0,), 0, device=torch.device(DEVICE))
@@ -126,21 +126,26 @@ def _runner(checkpoint: Path, modules, placed) -> ModelExecutor:
         for name, distribution in placed
     }
     runner = ModelExecutor(model, config, bindings=bindings)
-    # A worker seals startup before it admits requests, so request calls
-    # without a graph captured at startup, as condition encodings are, run
-    # eagerly.
+    # A worker captures the video encoder's still-frame tile before it seals
+    # startup and admits requests (``ModelExecutor.warmup``), so keyframes
+    # and reference images encode through its replay; the other condition
+    # encodings have no graph captured at startup and run eagerly.
+    runner.capture_tiles()
     runner.complete_startup()
     return runner
 
 
-def _request(root: Path, case: str, ffmpeg: str):
+def _request(root: Path, case: str, ffmpeg: str, image_bands: int = 1):
     """Read a recorded request's conditions as the media reader does.
 
     Returns the run directory, the recorded presentation, the request's
-    video admission and its condition products.
+    video admission and its condition products. Reference images are
+    admitted in ``image_bands`` bands.
     """
     with published() as publish:
-        run, plan, _, conditions = recorded_request(root, case, ffmpeg, publish)
+        run, plan, _, conditions = recorded_request(
+            root, case, ffmpeg, publish, image_bands
+        )
         products = read(conditions, vision_encoder(), ffmpeg)
     presentation = json.loads((run / "presentation.json").read_text())
     video = VideoAdmission(
@@ -165,7 +170,10 @@ def test_condition_latents_match_the_recorded_encoding(
         (("latent_encoder", "temporal_units"),),
     )
     try:
-        run, _, video, (pixels, samples, _) = _request(root, case, ffmpeg)
+        # A four-rank latent encoder bands a reference image into four units.
+        run, _, video, (pixels, samples, _) = _request(
+            root, case, ffmpeg, image_bands=4
+        )
         recorded = load_file(run / "conditions.safetensors")
 
         # Every unit in its own call, in reverse, as separate ranks encode

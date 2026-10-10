@@ -1,28 +1,17 @@
-"""Recognize the three MiniMax-H3 checkpoint layouts and their denoisers.
+"""Recognize MiniMax-H3 checkpoints and the DiT partitions they hold.
 
-A MiniMax-H3 checkpoint is one of:
-
-* a FastVideo full export (FastH3 V1/V2 and their NVFP4 exports): every
-  component lives under the root, and ``fastvideo_inference.json`` carries
-  a DMD contract (``dmd_denoising_steps``) for its ``transformer``;
-* the MiniMax-H3 diffusers root (``model_index.json`` naming
-  ``MiniMaxH3ModularPipeline``, no inference contract): every component
-  lives under the root and both DiTs, ``transformer`` and
-  ``transformer_ref``, use the full-step uniform schedule;
-* a FastVideo component export (FastH3-OmniRef): the root holds one DiT and
-  its schedulers, ``fastvideo_inference.json`` carries a PDD contract
-  (``pdd_steps``) and ``base_model_revision`` pins the diffusers root that
-  supplies every other component.
-
-``Layout`` names the denoising components each layout holds: the
-``transformer`` partition is the ``denoiser`` component and serves t2va and
-fl2va, the ``transformer_ref`` partition is the ``reference_denoiser``
-component and serves ref2va.
+The base release (``model_index.json`` naming ``MiniMaxH3ModularPipeline``)
+holds every component and two DiT partitions: ``transformer`` serves t2va
+and fl2va, and ``transformer_ref`` serves ref2va. FastH3 is its fast variant:
+a FastVideo student of one partition, whose ``fastvideo_inference.json``
+states the student's task, schedule and sparse attention. The task selects
+the partition the student replaces. A FastH3 export that omits a component
+directory reads it from the base revision its contract pins in
+``base_model_revision``.
 """
 
 from __future__ import annotations
 
-import enum
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -30,68 +19,14 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from uniserve_models.loading import Base
-
-# Inference contract schema every FastVideo MiniMax-H3 export publishes.
-INFERENCE_SCHEMA = "fasth3-inference-contract-v1"
-
-# Checkpoint subdirectory of each denoising component.
-DENOISER_DIRECTORIES: Mapping[str, str] = MappingProxyType(
-    {"denoiser": "transformer", "reference_denoiser": "transformer_ref"}
+# The DiT partition of the base release that serves each task.
+TASK_PARTITIONS: Mapping[str, str] = MappingProxyType(
+    {"t2va": "transformer", "fl2va": "transformer", "ref2va": "transformer_ref"}
 )
 
-# Tasks each denoising component serves; the DiT partition fixes them.
-DENOISER_TASKS: Mapping[str, tuple[str, ...]] = MappingProxyType(
-    {"denoiser": ("t2va", "fl2va"), "reference_denoiser": ("ref2va",)}
-)
-
-# Components a component export draws from its pinned base: everything but
-# its own DiT partition and schedulers.
-BASE_DIRECTORIES = frozenset(
-    {"text_encoder", "tokenizer", "processor", "vae", "audio_vae"}
-)
-
-
-class Kind(enum.Enum):
-    """The checkpoint layouts this package loads."""
-
-    FASTVIDEO_EXPORT = "fastvideo_export"
-    DIFFUSERS_ROOT = "diffusers_root"
-    COMPONENT_EXPORT = "component_export"
-
-
-@dataclass(frozen=True, slots=True)
-class BaseRevision:
-    """A Hugging Face repository pinned at one commit."""
-
-    repository: str
-    revision: str
-
-    @classmethod
-    def parse(cls, value: object) -> BaseRevision:
-        """Parse ``hf://<repository>@<revision>``.
-
-        Raises:
-            ValueError: ``value`` is not of that form.
-        """
-        prefix = "hf://"
-        if not isinstance(value, str) or not value.startswith(prefix):
-            raise ValueError(
-                "MiniMax-H3 base_model_revision must be "
-                f"hf://<repository>@<revision>, got {value!r}"
-            )
-        repository, separator, revision = value[len(prefix) :].rpartition("@")
-        if (
-            not separator
-            or repository.count("/") != 1
-            or not all(repository.split("/"))
-            or not revision
-        ):
-            raise ValueError(
-                "MiniMax-H3 base_model_revision must be "
-                f"hf://<repository>@<revision>, got {value!r}"
-            )
-        return cls(repository, revision)
+# FastVideo states a student's task as ``task`` (``t2av`` for
+# text-to-video-and-audio) or as ``model_type``.
+_FASTVIDEO_TASKS = MappingProxyType({"t2av": "t2va", "ref2va": "ref2va"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,19 +34,14 @@ class Layout:
     """One recognized checkpoint.
 
     Attributes:
-        kind: Which of the three layouts the root holds.
-        denoisers: Denoising components the root holds, keyed by component
-            name, valued by their checkpoint subdirectory.
-        contract: The FastVideo inference contract, or None for the
-            diffusers root.
-        base: The diffusers root a component export draws its other
-            components from, or None when the root holds every component.
+        partitions: Each DiT partition the root holds, mapped to the tasks it
+            serves.
+        contract: A FastH3 export's ``fastvideo_inference.json``, or None for
+            the base release.
     """
 
-    kind: Kind
-    denoisers: Mapping[str, str]
+    partitions: Mapping[str, tuple[str, ...]]
     contract: Mapping[str, Any] | None
-    base: BaseRevision | None
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -122,53 +52,27 @@ def _json(path: Path) -> dict[str, Any]:
 
 
 def detect(root: Path) -> Layout:
-    """Classify ``root`` and list the denoising components it holds.
+    """Classify ``root`` and list the DiT partitions it holds.
 
     Raises:
-        FileNotFoundError: The root holds neither an inference contract nor a
-            diffusers pipeline index.
-        ValueError: The contract or index is not a MiniMax-H3 layout this
-            package serves, naming the offending field.
+        FileNotFoundError: The root holds neither a FastH3 contract nor a
+            pipeline index.
+        ValueError: The contract names a task no partition serves, or the
+            index is not a MiniMax-H3 release holding a DiT.
     """
     contract_path = root / "fastvideo_inference.json"
     if contract_path.is_file():
         contract = _json(contract_path)
-        if contract.get("schema_version") != INFERENCE_SCHEMA:
+        stated = contract.get("task", contract.get("model_type"))
+        task = _FASTVIDEO_TASKS.get(stated) if isinstance(stated, str) else None
+        if task is None:
             raise ValueError(
-                "unsupported MiniMax-H3 checkpoint: schema_version must be "
-                f"{INFERENCE_SCHEMA!r}, got {contract.get('schema_version')!r}"
+                "unsupported FastH3 checkpoint: its task must be one of "
+                f"{sorted(_FASTVIDEO_TASKS)}, got {stated!r}"
             )
-        if "pdd_steps" in contract:
-            component = contract.get("transformer_component")
-            if (
-                not isinstance(component, str)
-                or component not in DENOISER_DIRECTORIES.values()
-            ):
-                raise ValueError(
-                    "unsupported MiniMax-H3 checkpoint: transformer_component "
-                    f"must name a DiT partition, got {component!r}"
-                )
-            name = next(
-                key
-                for key, value in DENOISER_DIRECTORIES.items()
-                if value == component
-            )
-            return Layout(
-                Kind.COMPONENT_EXPORT,
-                MappingProxyType({name: component}),
-                MappingProxyType(contract),
-                BaseRevision.parse(contract.get("base_model_revision")),
-            )
-        if "dmd_denoising_steps" in contract:
-            return Layout(
-                Kind.FASTVIDEO_EXPORT,
-                MappingProxyType({"denoiser": "transformer"}),
-                MappingProxyType(contract),
-                None,
-            )
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint: fastvideo_inference.json "
-            "declares neither dmd_denoising_steps nor pdd_steps"
+        return Layout(
+            MappingProxyType({TASK_PARTITIONS[task]: (task,)}),
+            MappingProxyType(contract),
         )
 
     index_path = root / "model_index.json"
@@ -183,31 +87,46 @@ def detect(root: Path) -> Layout:
             "unsupported MiniMax-H3 checkpoint: model_index.json must name "
             "MiniMaxH3ModularPipeline"
         )
-    denoisers = {
-        name: directory
-        for name, directory in DENOISER_DIRECTORIES.items()
-        if directory in index and (root / directory / "config.json").is_file()
-    }
-    if not denoisers:
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint: the diffusers root holds "
-            "neither transformer nor transformer_ref"
+    partitions = {
+        partition: tuple(
+            task
+            for task, owner in TASK_PARTITIONS.items()
+            if owner == partition
         )
-    return Layout(Kind.DIFFUSERS_ROOT, MappingProxyType(denoisers), None, None)
+        for partition in dict.fromkeys(TASK_PARTITIONS.values())
+        if partition in index and (root / partition / "config.json").is_file()
+    }
+    if not partitions:
+        raise ValueError(
+            "unsupported MiniMax-H3 checkpoint: the release holds neither "
+            "transformer nor transformer_ref"
+        )
+    return Layout(MappingProxyType(partitions), None)
 
 
-def base_checkpoint(root: Path) -> Base | None:
-    """Name the base checkpoint a component export draws components from.
+def base_checkpoint(root: Path) -> tuple[str, str] | None:
+    """Return the ``(repository, revision)`` a FastH3 export pins, if any.
 
-    A component export pins its base with ``base_model_revision``; the base
-    supplies ``BASE_DIRECTORIES``. Returns ``None`` for the layouts that
-    hold every component.
+    The export states it as ``hf://<repository>@<revision>``; directories the
+    export omits are read from that revision. The base release and an export
+    that pins nothing return ``None``.
 
     Raises:
         FileNotFoundError: As ``detect``.
-        ValueError: As ``detect``.
+        ValueError: As ``detect``, or a pin of another form.
     """
-    layout = detect(root)
-    if layout.base is None:
+    contract = detect(root).contract
+    pinned = None if contract is None else contract.get("base_model_revision")
+    if pinned is None:
         return None
-    return Base(layout.base.repository, layout.base.revision, BASE_DIRECTORIES)
+    repository, separator, revision = (
+        pinned.removeprefix("hf://").rpartition("@")
+        if isinstance(pinned, str) and pinned.startswith("hf://")
+        else ("", "", "")
+    )
+    if not separator or not repository or not revision:
+        raise ValueError(
+            "FastH3 base_model_revision must be hf://<repository>@<revision>, "
+            f"got {pinned!r}"
+        )
+    return repository, revision

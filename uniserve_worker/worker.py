@@ -272,7 +272,6 @@ class Worker:
                 transfer_backends=config.data_plane.backends,
                 publication_backends=config.data_plane.publication_backends,
                 worker_id=config.worker_id,
-                checkpoint_identity=loaded.checkpoint_identity,
                 model_name=loaded.model_name,
                 attention_ranks=0
                 if config.expert_parallel is None
@@ -317,7 +316,6 @@ class Worker:
         components: tuple[tuple[str, ComponentConfig], ...] = (),
         process_groups: ProcessGroups | None = None,
         bindings: Mapping[str, ComponentBinding] | None = None,
-        checkpoint_identity: str = "",
         model_name: str | None = None,
         attention_ranks: int = 0,
         entry_points=None,
@@ -454,7 +452,6 @@ class Worker:
                 allowed_calls=allowed_calls,
                 transfer_backends=transfer_backends,
                 components=components,
-                checkpoint_identity=checkpoint_identity,
                 model_name=model_name,
                 attention_backend=runner.attention.name,
                 # The scheduler's page indices address every rank's resident
